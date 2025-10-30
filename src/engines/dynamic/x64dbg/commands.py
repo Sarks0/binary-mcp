@@ -6,7 +6,8 @@ Provides convenient functions for common debugging workflows.
 
 import logging
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
+
 from .bridge import X64DbgBridge
 
 logger = logging.getLogger(__name__)
@@ -15,7 +16,7 @@ logger = logging.getLogger(__name__)
 class X64DbgCommands:
     """High-level command interface for x64dbg."""
 
-    def __init__(self, bridge: Optional[X64DbgBridge] = None):
+    def __init__(self, bridge: X64DbgBridge | None = None):
         """
         Initialize commands interface.
 
@@ -154,7 +155,7 @@ class X64DbgCommands:
 
         return calls
 
-    def search_pattern(self, pattern: bytes, start: Optional[str] = None) -> list[str]:
+    def search_pattern(self, pattern: bytes, start: str | None = None) -> list[str]:
         """
         Search for byte pattern in memory.
 

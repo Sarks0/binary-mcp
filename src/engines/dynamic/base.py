@@ -7,7 +7,7 @@ All debuggers should implement this interface for consistency.
 from abc import ABC, abstractmethod
 from enum import Enum
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 
 class DebuggerState(Enum):

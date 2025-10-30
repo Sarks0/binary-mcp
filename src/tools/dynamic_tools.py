@@ -5,18 +5,17 @@ Provides debugger-based analysis capabilities.
 """
 
 import logging
-from typing import Optional
-from pathlib import Path
 
 from mcp.server import Server
+
 from src.engines.dynamic.x64dbg.bridge import X64DbgBridge
 from src.engines.dynamic.x64dbg.commands import X64DbgCommands
 
 logger = logging.getLogger(__name__)
 
 # Global x64dbg instances (initialized on first use)
-_x64dbg_bridge: Optional[X64DbgBridge] = None
-_x64dbg_commands: Optional[X64DbgCommands] = None
+_x64dbg_bridge: X64DbgBridge | None = None
+_x64dbg_commands: X64DbgCommands | None = None
 
 
 def get_x64dbg_bridge() -> X64DbgBridge:
@@ -150,7 +149,7 @@ def register_dynamic_tools(app: Server) -> None:
             bridge = get_x64dbg_bridge()
 
             for i in range(steps):
-                state = bridge.step_into()
+                bridge.step_into()
 
             registers = bridge.get_registers()
             location = bridge.get_current_location()
@@ -185,7 +184,7 @@ def register_dynamic_tools(app: Server) -> None:
             bridge = get_x64dbg_bridge()
 
             for i in range(steps):
-                state = bridge.step_over()
+                bridge.step_over()
 
             location = bridge.get_current_location()
             return f"Stepped over {steps} instruction(s)\nCurrent address: 0x{location['address']}"

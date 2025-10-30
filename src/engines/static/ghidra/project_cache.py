@@ -8,7 +8,6 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -16,7 +15,7 @@ logger = logging.getLogger(__name__)
 class ProjectCache:
     """Manages caching of Ghidra analysis results."""
 
-    def __init__(self, cache_dir: Optional[str] = None):
+    def __init__(self, cache_dir: str | None = None):
         """
         Initialize project cache.
 
@@ -73,7 +72,7 @@ class ProjectCache:
             logger.error(f"Error checking cache: {e}")
             return False
 
-    def get_cached(self, binary_path: str) -> Optional[dict]:
+    def get_cached(self, binary_path: str) -> dict | None:
         """
         Retrieve cached analysis results.
 
@@ -91,7 +90,7 @@ class ProjectCache:
                 logger.debug(f"No cache found for {binary_path}")
                 return None
 
-            with open(cache_path, "r") as f:
+            with open(cache_path) as f:
                 data = json.load(f)
 
             logger.info(f"Cache hit for {binary_path} (hash: {binary_hash[:8]}...)")
@@ -167,7 +166,7 @@ class ProjectCache:
             logger.error(f"Error invalidating cache: {e}")
             return False
 
-    def get_metadata(self, binary_path: str) -> Optional[dict]:
+    def get_metadata(self, binary_path: str) -> dict | None:
         """
         Get cache metadata for a binary.
 
@@ -184,7 +183,7 @@ class ProjectCache:
             if not metadata_path.exists():
                 return None
 
-            with open(metadata_path, "r") as f:
+            with open(metadata_path) as f:
                 return json.load(f)
 
         except Exception as e:
@@ -202,7 +201,7 @@ class ProjectCache:
 
         for meta_file in self.cache_dir.glob("*.meta.json"):
             try:
-                with open(meta_file, "r") as f:
+                with open(meta_file) as f:
                     metadata = json.load(f)
                 cached_binaries.append(metadata)
             except Exception as e:

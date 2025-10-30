@@ -2,13 +2,12 @@
 Test suite for Ghidra MCP Server.
 """
 
-import json
-import pytest
-from pathlib import Path
-from unittest.mock import Mock, patch, MagicMock
-
 # Mock the MCP imports before importing server
 import sys
+from unittest.mock import MagicMock
+
+import pytest
+
 sys.modules['mcp'] = MagicMock()
 sys.modules['mcp.server'] = MagicMock()
 sys.modules['mcp.types'] = MagicMock()
@@ -31,8 +30,9 @@ class TestGhidraRunner:
 
     def test_normalize_binary_path(self):
         """Test binary path normalization."""
-        from src.ghidra.runner import GhidraRunner
         import platform
+
+        from src.ghidra.runner import GhidraRunner
 
         try:
             runner = GhidraRunner()

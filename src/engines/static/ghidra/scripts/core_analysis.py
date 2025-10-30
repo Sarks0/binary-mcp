@@ -1,14 +1,16 @@
 # Ghidra Jython script for comprehensive malware analysis extraction
 # This script runs inside Ghidra's JVM environment
 # @category: MalwareAnalysis
+# ruff: noqa: F821
+# Note: currentProgram and other Ghidra globals are provided at runtime
 
 import json
 import os
-from ghidra.app.decompiler import DecompInterface, DecompileOptions
-from ghidra.program.model.symbol import SymbolType, SourceType
-from ghidra.program.model.listing import CodeUnit
-from ghidra.program.model.pcode import HighFunctionDBUtil
+
+from ghidra.app.decompiler import DecompInterface
+from ghidra.program.model.symbol import SymbolType
 from ghidra.util.task import ConsoleTaskMonitor
+
 
 def extract_comprehensive_analysis():
     """Extract comprehensive analysis data from the current program."""
@@ -133,7 +135,7 @@ def extract_comprehensive_analysis():
         function_count += 1
 
         if function_count % 100 == 0:
-            print("    Processed {} functions...".format(function_count))
+            print(f"    Processed {function_count} functions...")
 
         # Get function signature
         signature = function.getSignature()
@@ -192,7 +194,7 @@ def extract_comprehensive_analysis():
                 }
                 function_info["basic_blocks"].append(block_info)
         except Exception as e:
-            print("    Warning: Could not extract basic blocks for {}: {}".format(function.getName(), str(e)))
+            print(f"    Warning: Could not extract basic blocks for {function.getName()}: {str(e)}")
 
         # Decompile function (for non-thunk, non-external functions)
         if not function.isThunk() and not function.isExternal():
@@ -203,7 +205,7 @@ def extract_comprehensive_analysis():
                     if pseudocode:
                         function_info["pseudocode"] = pseudocode.getC()
             except Exception as e:
-                print("    Warning: Could not decompile {}: {}".format(function.getName(), str(e)))
+                print(f"    Warning: Could not decompile {function.getName()}: {str(e)}")
 
         context["functions"].append(function_info)
 
@@ -270,21 +272,21 @@ def main():
             return
 
         print("[*] Starting comprehensive analysis extraction...")
-        print("[*] Program: {}".format(currentProgram.getName()))
-        print("[*] Output: {}".format(output_path))
+        print(f"[*] Program: {currentProgram.getName()}")
+        print(f"[*] Output: {output_path}")
 
         # Extract all analysis data
         context = extract_comprehensive_analysis()
 
         # Write to JSON file
-        print("[*] Writing output to {}...".format(output_path))
+        print(f"[*] Writing output to {output_path}...")
         with open(output_path, 'w') as f:
             json.dump(context, f, indent=2)
 
-        print("[+] Analysis complete! Output saved to: {}".format(output_path))
+        print(f"[+] Analysis complete! Output saved to: {output_path}")
 
     except Exception as e:
-        print("[!] ERROR during analysis: {}".format(str(e)))
+        print(f"[!] ERROR during analysis: {str(e)}")
         import traceback
         traceback.print_exc()
 

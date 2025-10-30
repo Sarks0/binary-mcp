@@ -2,10 +2,6 @@
 Pattern databases for malware API detection and crypto identification.
 """
 
-import json
-import re
-from pathlib import Path
-from typing import Optional, List
 
 
 class APIPatterns:
@@ -382,7 +378,7 @@ class APIPatterns:
             },
         }
 
-    def get_api_info(self, api_name: str) -> Optional[dict]:
+    def get_api_info(self, api_name: str) -> dict | None:
         """
         Get information about an API.
 
@@ -394,7 +390,7 @@ class APIPatterns:
         """
         return self.patterns.get(api_name)
 
-    def get_by_category(self, category: str) -> List[str]:
+    def get_by_category(self, category: str) -> list[str]:
         """
         Get all APIs in a category.
 
@@ -406,7 +402,7 @@ class APIPatterns:
         """
         return [api for api, info in self.patterns.items() if info['category'] == category]
 
-    def get_by_severity(self, severity: str) -> List[str]:
+    def get_by_severity(self, severity: str) -> list[str]:
         """
         Get all APIs with a severity level.
 
@@ -517,7 +513,7 @@ class CryptoPatterns:
             },
         }
 
-    def detect_in_context(self, context: dict) -> List[dict]:
+    def detect_in_context(self, context: dict) -> list[dict]:
         """
         Detect crypto patterns in analysis context.
 

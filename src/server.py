@@ -10,16 +10,13 @@ import json
 import logging
 import re
 from pathlib import Path
-from typing import Optional
 
 from mcp.server import Server
-from mcp.types import Tool, TextContent
 
-from src.engines.static.ghidra.runner import GhidraRunner
 from src.engines.static.ghidra.project_cache import ProjectCache
-from src.utils.patterns import APIPatterns, CryptoPatterns
-from src.utils.formatters import format_function_list, format_iocs
+from src.engines.static.ghidra.runner import GhidraRunner
 from src.tools.dynamic_tools import register_dynamic_tools
+from src.utils.patterns import APIPatterns, CryptoPatterns
 
 # Configure logging
 logging.basicConfig(
@@ -78,7 +75,7 @@ def get_analysis_context(binary_path: str, force_reanalyze: bool = False) -> dic
         )
 
         # Load analysis results
-        with open(output_path, 'r') as f:
+        with open(output_path) as f:
             context = json.load(f)
 
         # Cache the results
@@ -155,7 +152,7 @@ Use other tools like get_functions, get_imports, decompile_function to explore t
 @app.tool()
 def get_functions(
     binary_path: str,
-    filter_name: Optional[str] = None,
+    filter_name: str | None = None,
     exclude_external: bool = True,
     limit: int = 100
 ) -> str:
@@ -216,8 +213,8 @@ def get_functions(
 @app.tool()
 def get_imports(
     binary_path: str,
-    filter_library: Optional[str] = None,
-    filter_function: Optional[str] = None
+    filter_library: str | None = None,
+    filter_function: str | None = None
 ) -> str:
     """
     Extract imported functions and libraries.
@@ -273,7 +270,7 @@ def get_imports(
 def get_strings(
     binary_path: str,
     min_length: int = 4,
-    filter_pattern: Optional[str] = None,
+    filter_pattern: str | None = None,
     limit: int = 100
 ) -> str:
     """
@@ -337,8 +334,8 @@ def get_strings(
 @app.tool()
 def get_xrefs(
     binary_path: str,
-    address: Optional[str] = None,
-    function_name: Optional[str] = None,
+    address: str | None = None,
+    function_name: str | None = None,
     direction: str = "to"
 ) -> str:
     """
@@ -514,7 +511,7 @@ def get_call_graph(
 @app.tool()
 def find_api_calls(
     binary_path: str,
-    category: Optional[str] = None,
+    category: str | None = None,
     suspicious_only: bool = False
 ) -> str:
     """
@@ -622,9 +619,12 @@ def get_memory_map(
             end = block.get('end', 'Unknown')
             size = block.get('size', 0)
             perms = ""
-            if block.get('read'): perms += "R"
-            if block.get('write'): perms += "W"
-            if block.get('execute'): perms += "X"
+            if block.get('read'):
+                perms += "R"
+            if block.get('write'):
+                perms += "W"
+            if block.get('execute'):
+                perms += "X"
 
             initialized = "YES" if block.get('initialized') else "NO"
 
@@ -859,7 +859,7 @@ def diagnose_setup() -> str:
 
         # Cache info
         cached_binaries = cache.list_cached()
-        result += f"**Cache Information:**\n"
+        result += "**Cache Information:**\n"
         result += f"- Cached Binaries: {len(cached_binaries)}\n"
         result += f"- Cache Directory: `{cache.cache_dir}`\n"
         result += f"- Cache Size: {cache.get_cache_size() / 1024 / 1024:.2f} MB\n"
@@ -939,6 +939,7 @@ def list_data_types(
 def main():
     """Run the MCP server."""
     import asyncio
+
     from mcp.server.stdio import stdio_server
 
     logger.info("Starting Binary MCP Server...")

@@ -3,14 +3,12 @@ Ghidra headless runner with cross-platform support.
 Handles Ghidra installation detection, project management, and script execution.
 """
 
-import json
 import logging
 import os
 import platform
 import subprocess
 import time
 from pathlib import Path
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +16,7 @@ logger = logging.getLogger(__name__)
 class GhidraRunner:
     """Manages Ghidra headless analysis execution."""
 
-    def __init__(self, ghidra_path: Optional[str] = None):
+    def __init__(self, ghidra_path: str | None = None):
         """
         Initialize Ghidra runner.
 
@@ -123,7 +121,7 @@ class GhidraRunner:
         script_path: str,
         script_name: str,
         output_path: str,
-        project_name: Optional[str] = None,
+        project_name: str | None = None,
         keep_project: bool = False,
         timeout: int = 600,
     ) -> dict:

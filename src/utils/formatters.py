@@ -2,10 +2,9 @@
 Output formatting utilities for analysis results.
 """
 
-from typing import List, Dict
 
 
-def format_function_list(functions: List[dict], limit: int = 50) -> str:
+def format_function_list(functions: list[dict], limit: int = 50) -> str:
     """
     Format a list of functions for display.
 
@@ -32,7 +31,7 @@ def format_function_list(functions: List[dict], limit: int = 50) -> str:
     return result
 
 
-def format_iocs(iocs: Dict[str, List[str]]) -> str:
+def format_iocs(iocs: dict[str, list[str]]) -> str:
     """
     Format IOCs for display.
 
@@ -55,7 +54,7 @@ def format_iocs(iocs: Dict[str, List[str]]) -> str:
     return result
 
 
-def format_api_calls(api_calls: List[dict]) -> str:
+def format_api_calls(api_calls: list[dict]) -> str:
     """
     Format API calls for display.
 
@@ -84,7 +83,7 @@ def format_api_calls(api_calls: List[dict]) -> str:
     return result
 
 
-def format_memory_map(memory_blocks: List[dict]) -> str:
+def format_memory_map(memory_blocks: list[dict]) -> str:
     """
     Format memory map for display.
 
@@ -103,9 +102,12 @@ def format_memory_map(memory_blocks: List[dict]) -> str:
         size = block.get('size', 0)
         perms = ""
 
-        if block.get('read'): perms += "R"
-        if block.get('write'): perms += "W"
-        if block.get('execute'): perms += "X"
+        if block.get('read'):
+            perms += "R"
+        if block.get('write'):
+            perms += "W"
+        if block.get('execute'):
+            perms += "X"
 
         result += f"- **{name}** [{perms}]\n"
         result += f"  {start} - {end} ({size} bytes)\n\n"

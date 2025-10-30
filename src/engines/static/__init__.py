@@ -10,7 +10,7 @@ Future support planned:
 - radare2
 """
 
-from .ghidra.runner import GhidraRunner
 from .ghidra.project_cache import ProjectCache
+from .ghidra.runner import GhidraRunner
 
 __all__ = ["GhidraRunner", "ProjectCache"]

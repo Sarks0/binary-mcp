@@ -6,8 +6,10 @@ Communicates with the x64dbg native plugin via HTTP API.
 
 import logging
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
+
 import requests
+
 from ..base import Debugger, DebuggerState
 
 logger = logging.getLogger(__name__)
@@ -31,7 +33,7 @@ class X64DbgBridge(Debugger):
 
         logger.info(f"Initialized x64dbg bridge: {self.base_url}")
 
-    def _request(self, endpoint: str, data: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    def _request(self, endpoint: str, data: dict[str, Any] | None = None) -> dict[str, Any]:
         """
         Make HTTP request to plugin API.
 
@@ -114,7 +116,7 @@ class X64DbgBridge(Debugger):
         }
 
         try:
-            result = self._request("/api/load", data)
+            self._request("/api/load", data)
             logger.info(f"Loaded binary: {binary_path}")
             return True
         except RuntimeError:
@@ -136,7 +138,7 @@ class X64DbgBridge(Debugger):
             address = address[2:]
 
         data = {"address": address}
-        result = self._request("/api/breakpoint/set", data)
+        self._request("/api/breakpoint/set", data)
         logger.info(f"Set breakpoint at {address}")
         return True
 
@@ -154,7 +156,7 @@ class X64DbgBridge(Debugger):
             address = address[2:]
 
         data = {"address": address}
-        result = self._request("/api/breakpoint/delete", data)
+        self._request("/api/breakpoint/delete", data)
         logger.info(f"Deleted breakpoint at {address}")
         return True
 
@@ -187,7 +189,7 @@ class X64DbgBridge(Debugger):
         Returns:
             True if paused successfully
         """
-        result = self._request("/api/pause")
+        self._request("/api/pause")
         logger.info("Debugger paused")
         return True
 
@@ -332,7 +334,7 @@ class X64DbgBridge(Debugger):
             "data": data.hex()
         }
 
-        result = self._request("/api/memory/write", payload)
+        self._request("/api/memory/write", payload)
         logger.info(f"Wrote {len(data)} bytes to {address}")
         return True
 
@@ -400,5 +402,5 @@ class X64DbgBridge(Debugger):
         try:
             self._request("/api/status")
             return True
-        except:
+        except Exception:
             return False

@@ -10,17 +10,24 @@ A comprehensive Model Context Protocol (MCP) server that provides Claude with ad
 
 ## Quick Install
 
-### Windows (PowerShell)
-```powershell
+### Clone & Run (Recommended)
+```bash
+git clone https://github.com/Sarks0/binary-mcp.git
+cd binary-mcp
+# Linux/macOS: python3 install.py
+# Windows: .\install.ps1
+```
+
+### One-Line Install
+```bash
+# Linux/macOS
+curl -fsSL https://raw.githubusercontent.com/Sarks0/binary-mcp/main/install.py | python3 -
+
+# Windows (PowerShell)
 irm https://raw.githubusercontent.com/Sarks0/binary-mcp/main/install.ps1 | iex
 ```
 
-### Linux / macOS
-```bash
-curl -fsSL https://raw.githubusercontent.com/Sarks0/binary-mcp/main/install.py | python3 -
-```
-
-** Full installation guide:** [INSTALL.md](INSTALL.md)
+**Full installation guide:** [INSTALL.md](INSTALL.md)
 
 ## Features
 

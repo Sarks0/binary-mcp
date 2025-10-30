@@ -4,34 +4,46 @@ Complete automated installation guide for Windows, Linux, and macOS.
 
 ## Quick Start
 
-### Windows (PowerShell)
+### Method 1: Clone & Run (Recommended)
 
-```powershell
-# Run as Administrator
-irm https://raw.githubusercontent.com/Sarks0/binary-mcp/main/install.ps1 | iex
+**Linux / macOS:**
+```bash
+git clone https://github.com/Sarks0/binary-mcp.git
+cd binary-mcp
+python3 install.py
 ```
 
-Or download and run locally:
-
+**Windows (PowerShell):**
 ```powershell
-# Download
-Invoke-WebRequest -Uri "https://raw.githubusercontent.com/Sarks0/binary-mcp/main/install.ps1" -OutFile "install.ps1"
-
-# Run as Administrator
+git clone https://github.com/Sarks0/binary-mcp.git
+cd binary-mcp
 .\install.ps1
 ```
 
-### Linux / macOS (Python)
+### Method 2: Direct Download
 
+**Linux / macOS:**
 ```bash
-# One-line install
+# One-line install (if raw URL is accessible)
 curl -fsSL https://raw.githubusercontent.com/Sarks0/binary-mcp/main/install.py | python3 -
 
-# Or download and run locally
+# Or download manually
 curl -O https://raw.githubusercontent.com/Sarks0/binary-mcp/main/install.py
 chmod +x install.py
 python3 install.py
 ```
+
+**Windows (PowerShell):**
+```powershell
+# One-line install (if raw URL is accessible)
+irm https://raw.githubusercontent.com/Sarks0/binary-mcp/main/install.ps1 | iex
+
+# Or download manually
+Invoke-WebRequest -Uri "https://raw.githubusercontent.com/Sarks0/binary-mcp/main/install.ps1" -OutFile "install.ps1"
+.\install.ps1
+```
+
+**Note:** If you get a 404 error, GitHub's CDN may still be updating. Use Method 1 instead.
 
 ---
 

@@ -9,6 +9,7 @@ Provides 30+ tools for static and dynamic binary analysis:
 import json
 import logging
 import re
+import sys
 from pathlib import Path
 
 from fastmcp import FastMCP
@@ -74,18 +75,29 @@ def get_analysis_context(binary_path: str, force_reanalyze: bool = False) -> dic
             timeout=600
         )
 
-        # Log Ghidra output for debugging
-        if result.get('stdout'):
-            logger.info(f"Ghidra stdout (last 1000 chars):\n{result.get('stdout', '')[-1000:]}")
-        if result.get('stderr'):
-            logger.info(f"Ghidra stderr:\n{result.get('stderr', 'N/A')}")
+        # Save Ghidra output to debug file for inspection
+        debug_file = cache.cache_dir / "ghidra_debug.log"
+        try:
+            with open(debug_file, 'w') as f:
+                f.write("=== GHIDRA ANALYSIS DEBUG LOG ===\n")
+                f.write(f"Binary: {binary_path}\n")
+                f.write(f"Output Path: {output_path}\n")
+                f.write(f"Script Path: {script_path}\n\n")
+                f.write("=== STDOUT ===\n")
+                f.write(result.get('stdout', 'N/A'))
+                f.write("\n\n=== STDERR ===\n")
+                f.write(result.get('stderr', 'N/A'))
+            print(f"DEBUG: Ghidra output saved to {debug_file}", file=sys.stderr)
+        except Exception as e:
+            print(f"DEBUG: Failed to write debug log: {e}", file=sys.stderr)
 
         # Check if output file was created
         if not output_path.exists():
             error_msg = f"Ghidra did not create output file: {output_path}\n"
-            error_msg += f"Ghidra stdout:\n{result.get('stdout', 'N/A')[-1000:]}\n"
-            error_msg += f"Ghidra stderr:\n{result.get('stderr', 'N/A')[-1000:]}"
-            logger.error(error_msg)
+            error_msg += f"Check debug log at: {debug_file}\n\n"
+            error_msg += f"Ghidra stdout (last 500 chars):\n{result.get('stdout', 'N/A')[-500:]}\n\n"
+            error_msg += f"Ghidra stderr:\n{result.get('stderr', 'N/A')[-500:]}"
+            print(f"ERROR: {error_msg}", file=sys.stderr)
             raise RuntimeError(error_msg)
 
         # Load analysis results

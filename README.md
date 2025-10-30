@@ -1,18 +1,18 @@
-# Ghidra MCP Server for Malware Analysis
+# Binary MCP Server - Static & Dynamic Analysis
 
-[![CI](https://github.com/yourusername/ghidra-mcp-headless/workflows/CI/badge.svg)](https://github.com/yourusername/ghidra-mcp-headless/actions)
+[![CI](https://github.com/yourusername/binary-mcp/workflows/CI/badge.svg)](https://github.com/yourusername/binary-mcp/actions)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Code style: ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg)](https://github.com/astral-sh/ruff)
 [![Security: bandit](https://img.shields.io/badge/security-bandit-yellow.svg)](https://github.com/PyCQA/bandit)
 
-A comprehensive Model Context Protocol (MCP) server that provides Claude with advanced malware analysis capabilities through Ghidra headless mode. Built for defensive security research and binary analysis.
+A comprehensive Model Context Protocol (MCP) server that provides Claude with advanced binary analysis capabilities through both **static** (Ghidra) and **dynamic** (x64dbg) analysis. Built for defensive security research, malware analysis, and reverse engineering.
 
 ## Features
 
-### Analysis Tools (15+ MCP Tools)
+### Static Analysis Tools (13 tools via Ghidra)
 
-**Phase 1: Core Analysis (P0)**
+**Core Analysis:**
 - `analyze_binary` - Run Ghidra headless analysis on a binary
 - `get_functions` - List all identified functions with signatures
 - `get_imports` - Extract imported functions and libraries
@@ -20,35 +20,58 @@ A comprehensive Model Context Protocol (MCP) server that provides Claude with ad
 - `get_xrefs` - Get cross-references for addresses/functions
 - `decompile_function` - Decompile to C-like pseudocode
 
-**Phase 2: Enhanced Analysis (P1)**
+**Enhanced Analysis:**
 - `get_call_graph` - Generate function call graphs
 - `find_api_calls` - Identify suspicious Windows API calls by category
 - `get_memory_map` - Extract memory layout with permissions
 - `extract_metadata` - Get binary headers and metadata
 - `search_bytes` - Search for byte patterns
 - `list_data_types` - List structures and enums
+- `detect_crypto` - Identify cryptographic constants
+- `generate_iocs` - Extract indicators of compromise
+- `diagnose_setup` - Diagnostic checks
 
-**Phase 3: Advanced Features (P2)**
-- `detect_crypto` - Identify cryptographic constants and algorithms
-- `generate_iocs` - Extract indicators of compromise (IPs, domains, URLs, etc.)
-- `diagnose_setup` - Diagnostic checks for Ghidra installation
+### Dynamic Analysis Tools (14 tools via x64dbg) 🆕
+
+**Debugger Control:**
+- `x64dbg_connect` - Connect to x64dbg debugger
+- `x64dbg_status` - Get current debugger state
+- `x64dbg_run` - Start/resume execution
+- `x64dbg_pause` - Pause execution
+- `x64dbg_step_into` - Step into next instruction
+- `x64dbg_step_over` - Step over next instruction
+
+**Breakpoints:**
+- `x64dbg_set_breakpoint` - Set breakpoint at address
+- `x64dbg_delete_breakpoint` - Delete breakpoint
+- `x64dbg_list_breakpoints` - List all breakpoints
+
+**Information:**
+- `x64dbg_get_registers` - Get CPU register values
+- `x64dbg_read_memory` - Read memory contents
+- `x64dbg_disassemble` - Disassemble at address
+
+**Advanced:**
+- `x64dbg_trace_execution` - Trace execution for N steps
+- `x64dbg_run_to_address` - Run until reaching address
 
 ### Key Capabilities
 
+**Static Analysis (Ghidra):**
 - **Cross-Platform**: Windows, Linux, macOS support
 - **Intelligent Caching**: Fast repeated queries with SHA256-based caching
-- **Malware Pattern Detection**:
-  - 100+ Windows API patterns categorized by behavior
-  - Severity ratings (critical, high, medium, low)
-  - Crypto constant detection (AES, MD5, SHA, RSA, RC4)
-- **Comprehensive Extraction**:
-  - Functions with decompilation
-  - Import/export tables
-  - Strings with xrefs
-  - Memory map
-  - Control flow graphs
-  - Data types (structs, enums)
-- **IOC Generation**: Automatic extraction of IPs, domains, URLs, file paths, registry keys, emails
+- **Malware Pattern Detection**: 100+ Windows API patterns categorized by behavior
+- **Crypto Detection**: AES, MD5, SHA, RSA, RC4 constants
+- **Comprehensive Extraction**: Functions, imports, strings, memory map, control flow
+- **IOC Generation**: Automatic extraction of IPs, domains, URLs, file paths, registry keys
+
+**Dynamic Analysis (x64dbg):** 🆕
+- **Live Debugging**: Step through code, inspect registers, read memory
+- **Breakpoint Management**: Set, delete, and list breakpoints
+- **Execution Control**: Run, pause, step into/over, run to address
+- **Memory Inspection**: Read memory, disassemble, trace execution
+- **HTTP API**: Native C++ plugin with embedded HTTP server
+- **Real-time Analysis**: Complement static analysis with dynamic behavior
 
 ## Prerequisites
 
@@ -114,7 +137,30 @@ brew install python@3.12
 **Windows:**
 Download from: https://www.python.org/downloads/
 
-### 4. uv (Python Package Manager)
+### 4. x64dbg (Optional - for Dynamic Analysis) 🆕
+
+**Windows only** - Download from: https://x64dbg.com/
+
+1. Download the latest release (snapshot recommended)
+2. Extract to desired location (e.g., `C:\Program Files\x64dbg`)
+3. Run `x64dbg.exe` to verify installation
+
+**Building the MCP Plugin:**
+See `src/engines/dynamic/x64dbg/plugin/README.md` for detailed build instructions.
+
+Quick start:
+```bash
+# Requires Visual Studio 2019+ and CMake
+cd src/engines/dynamic/x64dbg/plugin
+mkdir build && cd build
+cmake .. -DX64DBG_SDK_PATH="path/to/x64dbg_sdk"
+cmake --build . --config Release
+# Copy x64dbg_mcp.dp64 to x64dbg/x64/plugins/
+```
+
+**Note:** Dynamic analysis features are optional. All static analysis features work without x64dbg.
+
+### 5. uv (Python Package Manager)
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -129,7 +175,8 @@ powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
 
 1. **Clone or navigate to the repository:**
 ```bash
-cd /home/rinzler/Documents/codeProjects/GhidraMCP_headless
+# After renaming on GitHub (see GITHUB_RENAME.md)
+cd /home/rinzler/Documents/codeProjects/binary-mcp
 ```
 
 2. **Install dependencies:**

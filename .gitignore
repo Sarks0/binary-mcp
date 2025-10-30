@@ -71,3 +71,12 @@ uv.lock
 # OS
 Thumbs.db
 .DS_Store
+
+# Documentation and development files
+CLAUDE.md
+docs/
+*.md.bak
+GITHUB_RENAME.md
+GITHUB_SETUP.md
+REFACTORING.md
+REFACTORING_SUMMARY.md

@@ -1,6 +1,9 @@
 """
-Ghidra MCP Server for comprehensive malware analysis.
-Provides 25+ tools for binary analysis using Ghidra headless mode.
+Binary MCP Server for comprehensive binary analysis.
+
+Provides 30+ tools for static and dynamic binary analysis:
+- Static analysis via Ghidra (headless mode)
+- Dynamic analysis via x64dbg (native plugin)
 """
 
 import json
@@ -12,10 +15,11 @@ from typing import Optional
 from mcp.server import Server
 from mcp.types import Tool, TextContent
 
-from src.ghidra.runner import GhidraRunner
-from src.ghidra.project_cache import ProjectCache
+from src.engines.static.ghidra.runner import GhidraRunner
+from src.engines.static.ghidra.project_cache import ProjectCache
 from src.utils.patterns import APIPatterns, CryptoPatterns
 from src.utils.formatters import format_function_list, format_iocs
+from src.tools.dynamic_tools import register_dynamic_tools
 
 # Configure logging
 logging.basicConfig(
@@ -25,7 +29,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Initialize components
-app = Server("ghidra-mcp-headless")
+app = Server("binary-mcp")
 runner = GhidraRunner()
 cache = ProjectCache()
 api_patterns = APIPatterns()
@@ -61,7 +65,7 @@ def get_analysis_context(binary_path: str, force_reanalyze: bool = False) -> dic
     logger.info(f"Analyzing {binary_path} with Ghidra...")
 
     output_path = cache.cache_dir / f"temp_analysis_{Path(binary_path).stem}.json"
-    script_path = Path(__file__).parent / "ghidra" / "scripts"
+    script_path = Path(__file__).parent / "engines" / "static" / "ghidra" / "scripts"
 
     try:
         result = runner.analyze(
@@ -937,9 +941,13 @@ def main():
     import asyncio
     from mcp.server.stdio import stdio_server
 
-    logger.info("Starting Ghidra MCP Server...")
+    logger.info("Starting Binary MCP Server...")
     logger.info(f"Ghidra Path: {runner.ghidra_path}")
     logger.info(f"Cache Directory: {cache.cache_dir}")
+
+    # Register dynamic analysis tools
+    register_dynamic_tools(app)
+    logger.info("Registered static + dynamic analysis tools")
 
     async def run():
         async with stdio_server() as (read_stream, write_stream):

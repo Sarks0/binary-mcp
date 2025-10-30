@@ -185,6 +185,17 @@ def install_ghidra(install_dir: Path, skip_if_exists: bool = True) -> Optional[P
 
 def setup_project(install_dir: Path) -> bool:
     """Clone/setup the binary-mcp project."""
+
+    # Check if we're already running from within the repo
+    current_dir = Path.cwd()
+    if (current_dir / ".git").exists() and (current_dir / "install.py").exists():
+        print_info("Already running from repository directory")
+        print_success("Using current directory for installation")
+        # Update install_dir to current directory
+        install_dir = current_dir
+        os.chdir(install_dir)
+        return True
+
     print_info("Setting up Binary MCP Server...")
 
     if install_dir.exists():
@@ -355,7 +366,14 @@ def main() -> int:
                         help="Don't configure Claude Desktop")
     args = parser.parse_args()
 
-    install_dir = args.install_dir
+    # Check if we're already running from within the repo
+    current_dir = Path.cwd()
+    if (current_dir / ".git").exists() and (current_dir / "install.py").exists():
+        print_info("Detected running from repository directory")
+        install_dir = current_dir
+        print_success(f"Using current directory: {install_dir}")
+    else:
+        install_dir = args.install_dir
 
     # Check prerequisites
     print_info("Checking prerequisites...")

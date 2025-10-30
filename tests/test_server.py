@@ -18,7 +18,7 @@ class TestGhidraRunner:
 
     def test_ghidra_detection(self):
         """Test Ghidra auto-detection."""
-        from src.ghidra.runner import GhidraRunner
+        from src.engines.static.ghidra.runner import GhidraRunner
 
         # This will fail if Ghidra is not installed
         # In a real test, we would mock the filesystem
@@ -32,7 +32,7 @@ class TestGhidraRunner:
         """Test binary path normalization."""
         import platform
 
-        from src.ghidra.runner import GhidraRunner
+        from src.engines.static.ghidra.runner import GhidraRunner
 
         try:
             runner = GhidraRunner()
@@ -54,14 +54,14 @@ class TestProjectCache:
 
     def test_cache_initialization(self, tmp_path):
         """Test cache directory creation."""
-        from src.ghidra.project_cache import ProjectCache
+        from src.engines.static.ghidra.project_cache import ProjectCache
 
         cache = ProjectCache(str(tmp_path / "cache"))
         assert cache.cache_dir.exists()
 
     def test_cache_operations(self, tmp_path):
         """Test cache save and retrieve."""
-        from src.ghidra.project_cache import ProjectCache
+        from src.engines.static.ghidra.project_cache import ProjectCache
 
         cache = ProjectCache(str(tmp_path / "cache"))
 
@@ -91,7 +91,7 @@ class TestProjectCache:
 
     def test_cache_invalidation(self, tmp_path):
         """Test cache invalidation."""
-        from src.ghidra.project_cache import ProjectCache
+        from src.engines.static.ghidra.project_cache import ProjectCache
 
         cache = ProjectCache(str(tmp_path / "cache"))
 
@@ -113,14 +113,14 @@ class TestProjectCache:
 
     def test_cache_list(self, tmp_path):
         """Test listing cached binaries."""
-        from src.ghidra.project_cache import ProjectCache
+        from src.engines.static.ghidra.project_cache import ProjectCache
 
         cache = ProjectCache(str(tmp_path / "cache"))
 
-        # Create multiple cached binaries
+        # Create multiple cached binaries with unique content
         for i in range(3):
             test_file = tmp_path / f"binary_{i}"
-            test_file.write_bytes(b"test")
+            test_file.write_bytes(f"test content {i}".encode())
             cache.save_cached(str(test_file), {"index": i})
 
         # List cached
@@ -129,7 +129,7 @@ class TestProjectCache:
 
     def test_cache_size(self, tmp_path):
         """Test cache size calculation."""
-        from src.ghidra.project_cache import ProjectCache
+        from src.engines.static.ghidra.project_cache import ProjectCache
 
         cache = ProjectCache(str(tmp_path / "cache"))
 

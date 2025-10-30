@@ -6,7 +6,7 @@ Handles Ghidra installation detection, project management, and script execution.
 import logging
 import os
 import platform
-import subprocess
+import subprocess  # nosec B404 - Required for Ghidra headless execution
 import time
 from pathlib import Path
 
@@ -190,7 +190,7 @@ class GhidraRunner:
                 capture_output=True,
                 text=True,
                 timeout=timeout,
-                shell=use_shell,
+                shell=use_shell,  # nosec B602 - Required for Windows .bat execution
                 check=True,
             )
 
@@ -247,7 +247,7 @@ class GhidraRunner:
 
         # Check Java
         try:
-            java_result = subprocess.run(
+            java_result = subprocess.run(  # nosec B603 B607 - Safe diagnostic check for Java
                 ["java", "-version"],
                 capture_output=True,
                 text=True,

@@ -135,7 +135,7 @@ def extract_comprehensive_analysis():
         function_count += 1
 
         if function_count % 100 == 0:
-            print(f"    Processed {function_count} functions...")
+            print("    Processed {} functions...".format(function_count))
 
         # Get function signature
         signature = function.getSignature()
@@ -194,7 +194,7 @@ def extract_comprehensive_analysis():
                 }
                 function_info["basic_blocks"].append(block_info)
         except Exception as e:
-            print(f"    Warning: Could not extract basic blocks for {function.getName()}: {str(e)}")
+            print("    Warning: Could not extract basic blocks for {}: {}".format(function.getName(), str(e)))
 
         # Decompile function (for non-thunk, non-external functions)
         if not function.isThunk() and not function.isExternal():
@@ -205,7 +205,7 @@ def extract_comprehensive_analysis():
                     if pseudocode:
                         function_info["pseudocode"] = pseudocode.getC()
             except Exception as e:
-                print(f"    Warning: Could not decompile {function.getName()}: {str(e)}")
+                print("    Warning: Could not decompile {}: {}".format(function.getName(), str(e)))
 
         context["functions"].append(function_info)
 
@@ -272,21 +272,21 @@ def main():
             return
 
         print("[*] Starting comprehensive analysis extraction...")
-        print(f"[*] Program: {currentProgram.getName()}")
-        print(f"[*] Output: {output_path}")
+        print("[*] Program: {}".format(currentProgram.getName()))
+        print("[*] Output: {}".format(output_path))
 
         # Extract all analysis data
         context = extract_comprehensive_analysis()
 
         # Write to JSON file
-        print(f"[*] Writing output to {output_path}...")
+        print("[*] Writing output to {}...".format(output_path))
         with open(output_path, 'w') as f:
             json.dump(context, f, indent=2)
 
-        print(f"[+] Analysis complete! Output saved to: {output_path}")
+        print("[+] Analysis complete! Output saved to: {}".format(output_path))
 
     except Exception as e:
-        print(f"[!] ERROR during analysis: {str(e)}")
+        print("[!] ERROR during analysis: {}".format(str(e)))
         import traceback
         traceback.print_exc()
 

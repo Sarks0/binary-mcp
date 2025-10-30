@@ -8,6 +8,20 @@
 
 A comprehensive Model Context Protocol (MCP) server that provides Claude with advanced binary analysis capabilities through both **static** (Ghidra) and **dynamic** (x64dbg) analysis. Built for defensive security research, malware analysis, and reverse engineering.
 
+## Quick Install
+
+### Windows (PowerShell)
+```powershell
+irm https://raw.githubusercontent.com/Sarks0/binary-mcp/main/install.ps1 | iex
+```
+
+### Linux / macOS
+```bash
+curl -fsSL https://raw.githubusercontent.com/Sarks0/binary-mcp/main/install.py | python3 -
+```
+
+**📖 Full installation guide:** [INSTALL.md](INSTALL.md)
+
 ## Features
 
 ### Static Analysis Tools (13 tools via Ghidra)

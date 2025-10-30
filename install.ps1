@@ -87,8 +87,8 @@ if (Test-Command uv) {
 if (-not $SkipGhidra) {
     Write-Info "Checking Java..."
     if (Test-Command java) {
-        $javaVersion = java -version 2>&1 | Select-String -Pattern "version"
-        Write-Success "Java found: $javaVersion"
+        $javaVersion = (java -version 2>&1) | Out-String | Select-String -Pattern "version"
+        Write-Success "Java found: $($javaVersion.Line.Trim())"
     } else {
         Write-Warning "Java not found - required for Ghidra"
         Write-Info "Download Java 17+ from: https://adoptium.net/"

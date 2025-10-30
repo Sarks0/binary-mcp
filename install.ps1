@@ -39,10 +39,10 @@ function Get-LatestGitHubRelease {
 
 # Banner
 Write-Host ""
-Write-Host "╔════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
-Write-Host "║      Binary MCP Server - Automated Installer              ║" -ForegroundColor Cyan
-Write-Host "║      Static (Ghidra) + Dynamic (x64dbg) Analysis          ║" -ForegroundColor Cyan
-Write-Host "╚════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host "     Binary MCP Server - Automated Installer               " -ForegroundColor Cyan
+Write-Host "     Static (Ghidra) + Dynamic (x64dbg) Analysis           " -ForegroundColor Cyan
+Write-Host "============================================================" -ForegroundColor Cyan
 Write-Host ""
 
 # Check prerequisites
@@ -314,9 +314,9 @@ if (-not $SkipX64Dbg -and -not (Test-Path $X64DbgDir)) {
 
 # Summary
 Write-Host ""
-Write-Host "╔════════════════════════════════════════════════════════════╗" -ForegroundColor Green
-Write-Host "║              Installation Complete!                       ║" -ForegroundColor Green
-Write-Host "╚════════════════════════════════════════════════════════════╝" -ForegroundColor Green
+Write-Host "============================================================" -ForegroundColor Green
+Write-Host "             Installation Complete!                        " -ForegroundColor Green
+Write-Host "============================================================" -ForegroundColor Green
 Write-Host ""
 
 Write-Success "Binary MCP Server installed to: $InstallDir"

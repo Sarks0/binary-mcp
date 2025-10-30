@@ -90,13 +90,17 @@ def extract_comprehensive_analysis():
     print("[*] Extracting exports...")
     entry_points = symbol_table.getExternalEntryPointIterator()
     while entry_points.hasNext():
-        symbol = entry_points.next()
-        export_info = {
-            "name": symbol.getName(),
-            "address": str(symbol.getAddress()),
-            "type": str(symbol.getSymbolType())
-        }
-        context["exports"].append(export_info)
+        address = entry_points.next()
+        # Get symbols at this address
+        symbols = symbol_table.getSymbols(address)
+        for symbol in symbols:
+            export_info = {
+                "name": symbol.getName(),
+                "address": str(address),
+                "type": str(symbol.getSymbolType())
+            }
+            context["exports"].append(export_info)
+            break  # Usually only one export per address
 
     # Extract strings
     print("[*] Extracting strings...")

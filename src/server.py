@@ -11,7 +11,7 @@ import logging
 import re
 from pathlib import Path
 
-from mcp.server import Server
+from fastmcp import FastMCP
 
 from src.engines.static.ghidra.project_cache import ProjectCache
 from src.engines.static.ghidra.runner import GhidraRunner
@@ -26,7 +26,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Initialize components
-app = Server("binary-mcp")
+app = FastMCP("binary-mcp")
 runner = GhidraRunner()
 cache = ProjectCache()
 api_patterns = APIPatterns()
@@ -938,10 +938,6 @@ def list_data_types(
 
 def main():
     """Run the MCP server."""
-    import asyncio
-
-    from mcp.server.stdio import stdio_server
-
     logger.info("Starting Binary MCP Server...")
     logger.info(f"Ghidra Path: {runner.ghidra_path}")
     logger.info(f"Cache Directory: {cache.cache_dir}")
@@ -950,15 +946,8 @@ def main():
     register_dynamic_tools(app)
     logger.info("Registered static + dynamic analysis tools")
 
-    async def run():
-        async with stdio_server() as (read_stream, write_stream):
-            await app.run(
-                read_stream,
-                write_stream,
-                app.create_initialization_options()
-            )
-
-    asyncio.run(run())
+    # Run the FastMCP server (handles stdio automatically)
+    app.run()
 
 
 if __name__ == "__main__":

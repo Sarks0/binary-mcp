@@ -6,7 +6,7 @@ Provides debugger-based analysis capabilities.
 
 import logging
 
-from mcp.server import Server
+from fastmcp import FastMCP
 
 from src.engines.dynamic.x64dbg.bridge import X64DbgBridge
 from src.engines.dynamic.x64dbg.commands import X64DbgCommands
@@ -36,12 +36,12 @@ def get_x64dbg_commands() -> X64DbgCommands:
     return _x64dbg_commands
 
 
-def register_dynamic_tools(app: Server) -> None:
+def register_dynamic_tools(app: FastMCP) -> None:
     """
     Register all dynamic analysis tools with the MCP server.
 
     Args:
-        app: MCP Server instance
+        app: FastMCP Server instance
     """
 
     @app.tool()

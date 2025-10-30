@@ -23,13 +23,12 @@ jobs:
         python-version: ${{ matrix.python-version }}
 
     - name: Install uv
-      run: |
-        curl -LsSf https://astral.sh/uv/install.sh | sh
-      shell: bash
+      uses: astral-sh/setup-uv@v5
+      with:
+        enable-cache: true
 
     - name: Install dependencies
-      run: |
-        uv sync --extra dev
+      run: uv sync --extra dev
 
     - name: Lint with ruff
       run: |
@@ -59,12 +58,12 @@ jobs:
         python-version: '3.12'
 
     - name: Install uv
-      run: |
-        curl -LsSf https://astral.sh/uv/install.sh | sh
+      uses: astral-sh/setup-uv@v5
+      with:
+        enable-cache: true
 
     - name: Install dependencies
-      run: |
-        uv sync --extra dev
+      run: uv sync --extra dev
 
     - name: Run security checks with bandit
       run: |

@@ -1,0 +1,222 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  build-plugin:
+    name: Build x64dbg Plugin
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Setup MSBuild
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Setup CMake
+      uses: jwlawson/actions-setup-cmake@v2
+      with:
+        cmake-version: '3.27.x'
+
+    - name: Download x64dbg SDK
+      run: |
+        Write-Host "Downloading x64dbg SDK..."
+        $sdkUrl = "https://github.com/x64dbg/x64dbg/archive/refs/heads/development.zip"
+        Invoke-WebRequest -Uri $sdkUrl -OutFile x64dbg-sdk.zip
+
+        Write-Host "Extracting SDK..."
+        Expand-Archive -Path x64dbg-sdk.zip -DestinationPath .
+
+        Write-Host "Setting up SDK directory..."
+        New-Item -ItemType Directory -Force -Path extern/x64dbg_sdk
+        Copy-Item -Recurse -Path x64dbg-development/src/pluginsdk/* -Destination extern/x64dbg_sdk/
+
+        Write-Host "SDK ready at: extern/x64dbg_sdk"
+      shell: pwsh
+
+    - name: Build x64 Plugin
+      run: |
+        Write-Host "Building 64-bit plugin..."
+        cd src/engines/dynamic/x64dbg/plugin
+
+        New-Item -ItemType Directory -Force -Path build-x64
+        cd build-x64
+
+        cmake .. -G "Visual Studio 17 2022" -A x64 `
+          -DX64DBG_SDK_PATH="$PWD/../../../../../extern/x64dbg_sdk" `
+          -DCMAKE_BUILD_TYPE=Release
+
+        cmake --build . --config Release
+
+        Write-Host "x64 plugin built successfully"
+      shell: pwsh
+
+    - name: Build x32 Plugin
+      run: |
+        Write-Host "Building 32-bit plugin..."
+        cd src/engines/dynamic/x64dbg/plugin
+
+        New-Item -ItemType Directory -Force -Path build-x32
+        cd build-x32
+
+        cmake .. -G "Visual Studio 17 2022" -A Win32 `
+          -DX64DBG_SDK_PATH="$PWD/../../../../../extern/x64dbg_sdk" `
+          -DCMAKE_BUILD_TYPE=Release
+
+        cmake --build . --config Release
+
+        Write-Host "x32 plugin built successfully"
+      shell: pwsh
+
+    - name: Prepare Release Artifacts
+      run: |
+        Write-Host "Preparing release artifacts..."
+        New-Item -ItemType Directory -Force -Path release
+
+        # Copy plugins
+        Copy-Item src/engines/dynamic/x64dbg/plugin/build-x64/Release/x64dbg_mcp.dp64 release/
+        Copy-Item src/engines/dynamic/x64dbg/plugin/build-x32/Release/x64dbg_mcp.dp32 release/
+
+        # Create README for plugins
+        @"
+# x64dbg MCP Plugin
+
+Pre-built plugins for x64dbg dynamic analysis integration.
+
+## Installation
+
+1. Copy x64dbg_mcp.dp64 to: x64dbg/x64/plugins/
+2. Copy x64dbg_mcp.dp32 to: x64dbg/x32/plugins/
+3. Restart x64dbg
+
+## Usage
+
+1. Load a binary in x64dbg (use x64dbg.exe for 64-bit, x32dbg.exe for 32-bit)
+2. The plugin will start an HTTP server on port 8765
+3. Use binary-mcp dynamic analysis tools in Claude
+
+## Version
+
+Built from: ${{ github.ref_name }}
+Commit: ${{ github.sha }}
+"@ | Out-File -FilePath release/README.md -Encoding UTF8
+
+        Write-Host "Artifacts prepared in release/"
+        Get-ChildItem release/
+      shell: pwsh
+
+    - name: Upload Build Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: x64dbg-plugins
+        path: release/*
+
+  create-release:
+    name: Create GitHub Release
+    needs: build-plugin
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Download Build Artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: x64dbg-plugins
+        path: release/
+
+    - name: Extract Version
+      id: version
+      run: |
+        VERSION=${GITHUB_REF#refs/tags/}
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        echo "Version: $VERSION"
+
+    - name: Generate Release Notes
+      id: release_notes
+      run: |
+        cat > release_notes.md << 'EOF'
+        ## Binary MCP Server ${{ steps.version.outputs.version }}
+
+        ### What's Included
+
+        **Python Package:**
+        - Install via: `pip install binary-mcp` (PyPI - coming soon)
+        - Or use: `git clone` + `uv sync`
+
+        **x64dbg Plugins (Pre-built):**
+        - `x64dbg_mcp.dp64` - 64-bit debugger plugin
+        - `x64dbg_mcp.dp32` - 32-bit debugger plugin
+
+        ### Installation
+
+        **Automated (Recommended):**
+        ```bash
+        # Windows
+        irm https://raw.githubusercontent.com/Sarks0/binary-mcp/main/install.ps1 | iex
+
+        # Linux/macOS
+        curl -fsSL https://raw.githubusercontent.com/Sarks0/binary-mcp/main/install.py | python3 -
+        ```
+
+        **x64dbg Plugin Setup:**
+        1. Download `x64dbg_mcp.dp64` and `x64dbg_mcp.dp32` from assets below
+        2. Copy to your x64dbg installation:
+           - `x64dbg_mcp.dp64` → `x64dbg/x64/plugins/`
+           - `x64dbg_mcp.dp32` → `x64dbg/x32/plugins/`
+        3. Restart x64dbg
+
+        ### Features
+
+        **Static Analysis (Ghidra):**
+        - 15+ analysis tools
+        - Function decompilation
+        - API call detection
+        - Crypto constant identification
+        - IOC extraction
+
+        **Dynamic Analysis (x64dbg):**
+        - Live debugging control
+        - Breakpoint management
+        - Memory inspection
+        - Execution tracing
+
+        ### Requirements
+
+        - Python 3.12+
+        - Java 21+ (for Ghidra)
+        - Ghidra (auto-detected or set GHIDRA_HOME)
+        - x64dbg (optional, for dynamic analysis)
+
+        ### Documentation
+
+        - [Installation Guide](https://github.com/Sarks0/binary-mcp/blob/main/INSTALL.md)
+        - [README](https://github.com/Sarks0/binary-mcp/blob/main/README.md)
+        - [Plugin Build Guide](https://github.com/Sarks0/binary-mcp/blob/main/src/engines/dynamic/x64dbg/plugin/README.md)
+
+        EOF
+        cat release_notes.md
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v2
+      with:
+        name: Release ${{ steps.version.outputs.version }}
+        body_path: release_notes.md
+        files: |
+          release/x64dbg_mcp.dp64
+          release/x64dbg_mcp.dp32
+          release/README.md
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

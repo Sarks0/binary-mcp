@@ -199,6 +199,44 @@ if (-not $SkipX64Dbg) {
             $env:X64DBG_HOME = $X64DbgDir
 
             Remove-Item $x64dbgZip -ErrorAction SilentlyContinue
+
+            # Install MCP plugins
+            Write-Info "Installing x64dbg MCP plugins..."
+            try {
+                # Get latest release
+                $pluginRelease = Get-LatestGitHubRelease "Sarks0/binary-mcp"
+
+                # Find plugin assets
+                $plugin64 = $pluginRelease.assets | Where-Object { $_.name -eq "x64dbg_mcp.dp64" } | Select-Object -First 1
+                $plugin32 = $pluginRelease.assets | Where-Object { $_.name -eq "x64dbg_mcp.dp32" } | Select-Object -First 1
+
+                if ($plugin64 -and $plugin32) {
+                    Write-Info "Downloading MCP plugins from release $($pluginRelease.tag_name)..."
+
+                    # Create plugin directories if they don't exist
+                    $plugin64Dir = "$X64DbgDir\release\x64\plugins"
+                    $plugin32Dir = "$X64DbgDir\release\x32\plugins"
+                    New-Item -ItemType Directory -Force -Path $plugin64Dir | Out-Null
+                    New-Item -ItemType Directory -Force -Path $plugin32Dir | Out-Null
+
+                    # Download x64 plugin
+                    Invoke-WebRequest -Uri $plugin64.browser_download_url -OutFile "$plugin64Dir\x64dbg_mcp.dp64" -UseBasicParsing
+                    Write-Success "Installed x64dbg_mcp.dp64"
+
+                    # Download x32 plugin
+                    Invoke-WebRequest -Uri $plugin32.browser_download_url -OutFile "$plugin32Dir\x64dbg_mcp.dp32" -UseBasicParsing
+                    Write-Success "Installed x64dbg_mcp.dp32"
+
+                    Write-Success "x64dbg MCP plugins installed successfully"
+                } else {
+                    Write-Warning "Pre-built MCP plugins not found in latest release"
+                    Write-Info "You can build them manually following: src/engines/dynamic/x64dbg/plugin/README.md"
+                }
+            } catch {
+                Write-Warning "Failed to install MCP plugins: $_"
+                Write-Info "You can build them manually following: src/engines/dynamic/x64dbg/plugin/README.md"
+            }
+
         } catch {
             Write-Error "Failed to install x64dbg: $_"
             $SkipX64Dbg = $true
@@ -332,14 +370,18 @@ if (-not $SkipGhidra) {
 
 if (-not $SkipX64Dbg) {
     Write-Success "x64dbg installed to: $X64DbgDir"
+    Write-Success "x64dbg MCP plugins installed (x64dbg_mcp.dp64 and x64dbg_mcp.dp32)"
 }
 
 Write-Host ""
 Write-Info "Next steps:"
 Write-Host "  1. Restart Claude Desktop to load the MCP server" -ForegroundColor White
-Write-Host "  2. Test the server: " -ForegroundColor White -NoNewline
+Write-Host "  2. Test static analysis: Use Claude to analyze binaries with Ghidra" -ForegroundColor White
+Write-Host "  3. For dynamic analysis: Launch x64dbg and load a binary" -ForegroundColor White
+Write-Host "     - Use x64dbg.exe for 64-bit binaries" -ForegroundColor White
+Write-Host "     - Use x32dbg.exe for 32-bit binaries" -ForegroundColor White
+Write-Host "  4. Test the server: " -ForegroundColor White -NoNewline
 Write-Host "cd $InstallDir && uv run python -m src.server" -ForegroundColor Yellow
-Write-Host "  3. Use binary analysis tools in Claude conversations!" -ForegroundColor White
 Write-Host ""
 
 if (-not $NoClaudeConfig) {

@@ -38,21 +38,21 @@ python3 install.py
 ## What Gets Installed
 
 ### Core Components (All Platforms)
-- ✅ **Python 3.12+** (verified, not installed by script)
-- ✅ **uv** - Fast Python package manager
-- ✅ **Binary MCP Server** - The main server with all dependencies
-- ✅ **Claude Desktop Integration** - Automatic MCP configuration
+- [OK] **Python 3.12+** (verified, not installed by script)
+- [OK] **uv** - Fast Python package manager
+- [OK] **Binary MCP Server** - The main server with all dependencies
+- [OK] **Claude Desktop Integration** - Automatic MCP configuration
 
 ### Platform-Specific Tools
 
 #### Windows
-- ✅ **Ghidra** - Static analysis (NSA reverse engineering framework)
-- ✅ **x64dbg** - Dynamic analysis (debugger for Windows binaries)
-- ✅ **Java 17+** (required for Ghidra, verified only)
+- [OK] **Ghidra** - Static analysis (NSA reverse engineering framework)
+- [OK] **x64dbg** - Dynamic analysis (debugger for Windows binaries)
+- [OK] **Java 17+** (required for Ghidra, verified only)
 
 #### Linux / macOS
-- ✅ **Ghidra** - Static analysis
-- ✅ **Java 17+** (required for Ghidra, verified only)
+- [OK] **Ghidra** - Static analysis
+- [OK] **Java 17+** (required for Ghidra, verified only)
 
 ---
 

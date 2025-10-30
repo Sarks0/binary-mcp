@@ -15,10 +15,10 @@ param(
 $ErrorActionPreference = "Stop"
 
 # Colors for output
-function Write-Success { param($msg) Write-Host "[✓] $msg" -ForegroundColor Green }
+function Write-Success { param($msg) Write-Host "[OK] $msg" -ForegroundColor Green }
 function Write-Info { param($msg) Write-Host "[i] $msg" -ForegroundColor Cyan }
 function Write-Warning { param($msg) Write-Host "[!] $msg" -ForegroundColor Yellow }
-function Write-Error { param($msg) Write-Host "[✗] $msg" -ForegroundColor Red }
+function Write-Error { param($msg) Write-Host "[X] $msg" -ForegroundColor Red }
 
 function Test-Command {
     param($CommandName)

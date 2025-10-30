@@ -27,7 +27,7 @@ class Colors:
     BOLD = '\033[1m'
 
 def print_success(msg: str) -> None:
-    print(f"{Colors.GREEN}[✓]{Colors.RESET} {msg}")
+    print(f"{Colors.GREEN}[OK]{Colors.RESET} {msg}")
 
 def print_info(msg: str) -> None:
     print(f"{Colors.BLUE}[i]{Colors.RESET} {msg}")
@@ -36,7 +36,7 @@ def print_warning(msg: str) -> None:
     print(f"{Colors.YELLOW}[!]{Colors.RESET} {msg}")
 
 def print_error(msg: str) -> None:
-    print(f"{Colors.RED}[✗]{Colors.RESET} {msg}")
+    print(f"{Colors.RED}[X]{Colors.RESET} {msg}")
 
 def print_banner() -> None:
     print()

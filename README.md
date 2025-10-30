@@ -20,7 +20,7 @@ irm https://raw.githubusercontent.com/Sarks0/binary-mcp/main/install.ps1 | iex
 curl -fsSL https://raw.githubusercontent.com/Sarks0/binary-mcp/main/install.py | python3 -
 ```
 
-**📖 Full installation guide:** [INSTALL.md](INSTALL.md)
+** Full installation guide:** [INSTALL.md](INSTALL.md)
 
 ## Features
 
@@ -45,7 +45,7 @@ curl -fsSL https://raw.githubusercontent.com/Sarks0/binary-mcp/main/install.py |
 - `generate_iocs` - Extract indicators of compromise
 - `diagnose_setup` - Diagnostic checks
 
-### Dynamic Analysis Tools (14 tools via x64dbg) 🆕
+### Dynamic Analysis Tools (14 tools via x64dbg) 
 
 **Debugger Control:**
 - `x64dbg_connect` - Connect to x64dbg debugger
@@ -79,7 +79,7 @@ curl -fsSL https://raw.githubusercontent.com/Sarks0/binary-mcp/main/install.py |
 - **Comprehensive Extraction**: Functions, imports, strings, memory map, control flow
 - **IOC Generation**: Automatic extraction of IPs, domains, URLs, file paths, registry keys
 
-**Dynamic Analysis (x64dbg):** 🆕
+**Dynamic Analysis (x64dbg):** 
 - **Live Debugging**: Step through code, inspect registers, read memory
 - **Breakpoint Management**: Set, delete, and list breakpoints
 - **Execution Control**: Run, pause, step into/over, run to address
@@ -151,7 +151,7 @@ brew install python@3.12
 **Windows:**
 Download from: https://www.python.org/downloads/
 
-### 4. x64dbg (Optional - for Dynamic Analysis) 🆕
+### 4. x64dbg (Optional - for Dynamic Analysis) 
 
 **Windows only** - Download from: https://x64dbg.com/
 

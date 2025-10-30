@@ -74,6 +74,20 @@ def get_analysis_context(binary_path: str, force_reanalyze: bool = False) -> dic
             timeout=600
         )
 
+        # Log Ghidra output for debugging
+        if result.get('stdout'):
+            logger.info(f"Ghidra stdout (last 1000 chars):\n{result.get('stdout', '')[-1000:]}")
+        if result.get('stderr'):
+            logger.info(f"Ghidra stderr:\n{result.get('stderr', 'N/A')}")
+
+        # Check if output file was created
+        if not output_path.exists():
+            error_msg = f"Ghidra did not create output file: {output_path}\n"
+            error_msg += f"Ghidra stdout:\n{result.get('stdout', 'N/A')[-1000:]}\n"
+            error_msg += f"Ghidra stderr:\n{result.get('stderr', 'N/A')[-1000:]}"
+            logger.error(error_msg)
+            raise RuntimeError(error_msg)
+
         # Load analysis results
         with open(output_path) as f:
             context = json.load(f)

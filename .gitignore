@@ -42,6 +42,9 @@ htmlcov/
 .tox/
 .hypothesis/
 
+# Linting
+.ruff_cache/
+
 # MCP and Ghidra
 .ghidra_mcp_cache/
 ghidra_projects/
@@ -71,11 +74,5 @@ temp_analysis_*.json
 Thumbs.db
 .DS_Store
 
-# Documentation and development files
-CLAUDE.md
-docs/
+# Backups
 *.md.bak
-GITHUB_RENAME.md
-GITHUB_SETUP.md
-REFACTORING.md
-REFACTORING_SUMMARY.md

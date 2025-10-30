@@ -1,0 +1,19 @@
+{
+  "mcpServers": {
+    "ghidra-mcp-headless": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "/home/rinzler/Documents/codeProjects/GhidraMCP_headless",
+        "run",
+        "python",
+        "-m",
+        "src.server"
+      ],
+      "env": {
+        "GHIDRA_HOME": "/path/to/ghidra_11.2.1_PUBLIC",
+        "PYTHONPATH": "/home/rinzler/Documents/codeProjects/GhidraMCP_headless"
+      }
+    }
+  }
+}

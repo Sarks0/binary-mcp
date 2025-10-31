@@ -1,5 +1,8 @@
 #pragma once
 
+#include "pluginsdk/_plugins.h"
+#include "pluginsdk/_scriptapi.h"
+
 #define PLUGIN_NAME "x64dbg_mcp"
 #define PLUGIN_VERSION 1
 #define PLUGIN_VERSION_STR "0.1.0"

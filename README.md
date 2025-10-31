@@ -31,7 +31,7 @@ irm https://raw.githubusercontent.com/Sarks0/binary-mcp/main/install.ps1 | iex
 
 ## Features
 
-### Static Analysis Tools (13 tools via Ghidra)
+### Static Analysis Tools (18 tools via Ghidra)
 
 **Core Analysis:**
 - `analyze_binary` - Run Ghidra headless analysis on a binary
@@ -51,6 +51,13 @@ irm https://raw.githubusercontent.com/Sarks0/binary-mcp/main/install.ps1 | iex
 - `detect_crypto` - Identify cryptographic constants
 - `generate_iocs` - Extract indicators of compromise
 - `diagnose_setup` - Diagnostic checks
+
+**Analysis Storage (NEW - Persistent Across Sessions):**
+- `save_analysis` - Save comprehensive analysis reports with unique ID
+- `get_analysis` - Retrieve saved analysis by ID
+- `list_analyses` - List all saved analyses with filters
+- `delete_analysis` - Delete a saved analysis
+- `append_to_analysis` - Add content to existing analysis
 
 ### Dynamic Analysis Tools (14 tools via x64dbg) 
 
@@ -86,13 +93,22 @@ irm https://raw.githubusercontent.com/Sarks0/binary-mcp/main/install.ps1 | iex
 - **Comprehensive Extraction**: Functions, imports, strings, memory map, control flow
 - **IOC Generation**: Automatic extraction of IPs, domains, URLs, file paths, registry keys
 
-**Dynamic Analysis (x64dbg):** 
+**Dynamic Analysis (x64dbg):**
 - **Live Debugging**: Step through code, inspect registers, read memory
 - **Breakpoint Management**: Set, delete, and list breakpoints
 - **Execution Control**: Run, pause, step into/over, run to address
 - **Memory Inspection**: Read memory, disassemble, trace execution
 - **HTTP API**: Native C++ plugin with embedded HTTP server
 - **Real-time Analysis**: Complement static analysis with dynamic behavior
+
+**Analysis Storage (NEW):**
+- **Persistent Reports**: Save comprehensive analysis reports that survive conversation crashes
+- **Unique IDs**: Each analysis gets a UUID for easy retrieval
+- **Tagging System**: Organize analyses by tags (malware, trojan, apt, etc.)
+- **Cross-Session Access**: Retrieve analyses in any conversation, even weeks later
+- **Search & Filter**: Find analyses by tags, binary name, or date
+- **Incremental Updates**: Append new findings to existing analyses
+- **Works with Claude Code**: Use same storage across Claude Desktop and Claude Code
 
 ## Prerequisites
 
@@ -337,6 +353,76 @@ Show me the call graph for the main function, depth 3
 ```
 Check if this binary uses any cryptographic algorithms
 ```
+
+### Persistent Analysis Storage (NEW)
+
+The analysis storage system allows you to save comprehensive analysis reports that persist across conversations. This is especially useful when:
+- Claude Desktop crashes during long analysis sessions
+- You want to reference previous analyses later
+- Building a knowledge base of analyzed samples
+- Sharing analysis reports across sessions
+
+**Save an analysis:**
+```
+save_analysis(
+    name="TrojanX Initial Analysis",
+    content="""Complete analysis report here...""",
+    binary_path="/samples/trojanx.exe",
+    tags=["malware", "trojan", "network"]
+)
+```
+
+Returns a unique analysis ID (UUID) like: `a1b2c3d4-e5f6-7890-...`
+
+**Retrieve a saved analysis:**
+```
+get_analysis("a1b2c3d4-e5f6-7890-...")
+```
+
+**List all saved analyses:**
+```
+list_analyses()
+
+# Filter by tag
+list_analyses(tag_filter="malware")
+
+# Filter by binary name
+list_analyses(binary_name_filter="trojan")
+```
+
+**Append new findings:**
+```
+append_to_analysis(
+    analysis_id="a1b2c3d4-...",
+    content="## Follow-up Analysis\n\nFound additional C2 servers..."
+)
+```
+
+**Storage location:** `~/.ghidra_mcp_cache/analyses/`
+
+### Claude Code Integration
+
+This MCP server works with both **Claude Desktop** and **Claude Code**. To use with Claude Code:
+
+1. **See the setup guide:** [CLAUDE_CODE_SETUP.md](CLAUDE_CODE_SETUP.md)
+2. **Quick config:** Add to `~/.config/claude-code/mcp_settings.json`:
+```json
+{
+  "mcpServers": {
+    "binary-mcp": {
+      "command": "uv",
+      "args": ["--directory", "/path/to/binary-mcp", "run", "binary-mcp"]
+    }
+  }
+}
+```
+3. **Restart Claude Code**
+
+**Benefits:**
+- All analysis tools available in Claude Code
+- Shared analysis storage between Claude Desktop and Claude Code
+- Code-aware binary analysis
+- Persistent analysis reports survive conversation resets
 
 ## Tool Reference
 

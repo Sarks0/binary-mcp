@@ -14,6 +14,7 @@ from pathlib import Path
 
 from fastmcp import FastMCP
 
+from src.engines.static.ghidra.analysis_store import AnalysisStore
 from src.engines.static.ghidra.project_cache import ProjectCache
 from src.engines.static.ghidra.runner import GhidraRunner
 from src.tools.dynamic_tools import register_dynamic_tools
@@ -30,6 +31,7 @@ logger = logging.getLogger(__name__)
 app = FastMCP("binary-mcp")
 runner = GhidraRunner()
 cache = ProjectCache()
+analysis_store = AnalysisStore()
 api_patterns = APIPatterns()
 crypto_patterns = CryptoPatterns()
 
@@ -888,7 +890,14 @@ def diagnose_setup() -> str:
         result += "**Cache Information:**\n"
         result += f"- Cached Binaries: {len(cached_binaries)}\n"
         result += f"- Cache Directory: `{cache.cache_dir}`\n"
-        result += f"- Cache Size: {cache.get_cache_size() / 1024 / 1024:.2f} MB\n"
+        result += f"- Cache Size: {cache.get_cache_size() / 1024 / 1024:.2f} MB\n\n"
+
+        # Analysis store info
+        store_stats = analysis_store.get_stats()
+        result += "**Analysis Storage:**\n"
+        result += f"- Stored Analyses: {store_stats['total_analyses']}\n"
+        result += f"- Storage Size: {store_stats['total_size_mb']:.2f} MB\n"
+        result += f"- Storage Directory: `{analysis_store.store_dir}`\n"
 
         if not diag['ghidra_exists']:
             result += "\n**WARNING:** Ghidra not found! Please install Ghidra or set GHIDRA_HOME environment variable.\n"
@@ -959,6 +968,244 @@ def list_data_types(
 
     except Exception as e:
         logger.error(f"list_data_types failed: {e}")
+        return f"Error: {e}"
+
+
+# ============================================================================
+# ANALYSIS STORAGE TOOLS
+# ============================================================================
+
+@app.tool()
+def save_analysis(
+    name: str,
+    content: str,
+    binary_path: str | None = None,
+    tags: list[str] | None = None
+) -> str:
+    """
+    Save an analysis report for later retrieval.
+
+    Use this to persist comprehensive analysis reports that can be retrieved
+    later, even if the conversation crashes or resets. Each analysis is stored
+    with a unique ID.
+
+    Args:
+        name: Human-readable name for the analysis (e.g., "Malware Sample XYZ Analysis")
+        content: Full analysis content (markdown/text format)
+        binary_path: Path to the analyzed binary (optional)
+        tags: List of tags for categorization (e.g., ["malware", "trojan", "ransomware"])
+
+    Returns:
+        Success message with analysis ID
+    """
+    try:
+        # Get binary hash if path provided
+        binary_hash = None
+        if binary_path:
+            try:
+                import hashlib
+                sha256 = hashlib.sha256()
+                with open(binary_path, "rb") as f:
+                    for chunk in iter(lambda: f.read(8192), b""):
+                        sha256.update(chunk)
+                binary_hash = sha256.hexdigest()
+            except Exception as e:
+                logger.warning(f"Could not hash binary: {e}")
+
+        # Save analysis
+        analysis_id = analysis_store.save(
+            name=name,
+            content=content,
+            binary_path=binary_path,
+            binary_hash=binary_hash,
+            tags=tags or []
+        )
+
+        result = f"**Analysis Saved Successfully**\n\n"
+        result += f"- **Analysis ID:** `{analysis_id}`\n"
+        result += f"- **Name:** {name}\n"
+        result += f"- **Content Length:** {len(content):,} characters\n"
+        if binary_path:
+            result += f"- **Binary:** {Path(binary_path).name}\n"
+        if tags:
+            result += f"- **Tags:** {', '.join(tags)}\n"
+        result += f"\n**To retrieve this analysis later, use:**\n"
+        result += f"```\nget_analysis('{analysis_id}')\n```\n"
+
+        return result
+
+    except Exception as e:
+        logger.error(f"save_analysis failed: {e}")
+        return f"Error: {e}"
+
+
+@app.tool()
+def get_analysis(analysis_id: str) -> str:
+    """
+    Retrieve a previously saved analysis report.
+
+    Args:
+        analysis_id: UUID of the saved analysis
+
+    Returns:
+        The saved analysis content
+    """
+    try:
+        analysis = analysis_store.get(analysis_id)
+
+        if not analysis:
+            return f"Error: Analysis '{analysis_id}' not found. Use list_analyses() to see available analyses."
+
+        result = f"# {analysis.get('name', 'Unknown')}\n\n"
+        result += f"**Analysis ID:** `{analysis_id}`\n"
+        result += f"**Created:** {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(analysis.get('created_at', 0)))}\n"
+        result += f"**Updated:** {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(analysis.get('updated_at', 0)))}\n"
+
+        if analysis.get('binary_path'):
+            result += f"**Binary:** {Path(analysis.get('binary_path')).name}\n"
+        if analysis.get('tags'):
+            result += f"**Tags:** {', '.join(analysis.get('tags', []))}\n"
+
+        result += "\n---\n\n"
+        result += analysis.get('content', '')
+
+        return result
+
+    except Exception as e:
+        logger.error(f"get_analysis failed: {e}")
+        return f"Error: {e}"
+
+
+@app.tool()
+def list_analyses(
+    tag_filter: str | None = None,
+    binary_name_filter: str | None = None,
+    limit: int = 20
+) -> str:
+    """
+    List all saved analysis reports.
+
+    Args:
+        tag_filter: Filter by tag (optional)
+        binary_name_filter: Filter by binary name pattern (optional)
+        limit: Maximum number of results (default: 20)
+
+    Returns:
+        List of saved analyses with metadata
+    """
+    try:
+        analyses = analysis_store.list(
+            tag_filter=tag_filter,
+            binary_name_filter=binary_name_filter,
+            limit=limit
+        )
+
+        if not analyses:
+            result = "**No Saved Analyses Found**\n\n"
+            if tag_filter or binary_name_filter:
+                result += "Try removing filters or save a new analysis using save_analysis().\n"
+            else:
+                result += "Save your first analysis using save_analysis().\n"
+            return result
+
+        result = f"**Saved Analyses: {len(analyses)} found**\n\n"
+
+        for analysis in analyses:
+            analysis_id = analysis.get('analysis_id', 'Unknown')
+            name = analysis.get('name', 'Unknown')
+            created = time.strftime('%Y-%m-%d %H:%M', time.localtime(analysis.get('created_at', 0)))
+            updated = time.strftime('%Y-%m-%d %H:%M', time.localtime(analysis.get('updated_at', 0)))
+            binary_name = analysis.get('binary_name', 'Unknown')
+            tags = analysis.get('tags', [])
+            size_kb = analysis.get('size_bytes', 0) / 1024
+
+            result += f"### {name}\n"
+            result += f"- **ID:** `{analysis_id[:8]}...` (use full ID: `{analysis_id}`)\n"
+            result += f"- **Binary:** {binary_name}\n"
+            result += f"- **Created:** {created}\n"
+            result += f"- **Updated:** {updated}\n"
+            result += f"- **Size:** {size_kb:.1f} KB\n"
+            if tags:
+                result += f"- **Tags:** {', '.join(tags)}\n"
+            result += f"\n**Retrieve:** `get_analysis('{analysis_id}')`\n\n"
+
+        # Show stats
+        stats = analysis_store.get_stats()
+        result += f"\n**Storage Stats:**\n"
+        result += f"- Total: {stats['total_analyses']} analyses\n"
+        result += f"- Size: {stats['total_size_mb']:.2f} MB\n"
+
+        return result
+
+    except Exception as e:
+        logger.error(f"list_analyses failed: {e}")
+        return f"Error: {e}"
+
+
+@app.tool()
+def delete_analysis(analysis_id: str) -> str:
+    """
+    Delete a saved analysis report.
+
+    Args:
+        analysis_id: UUID of the analysis to delete
+
+    Returns:
+        Success/failure message
+    """
+    try:
+        # Get analysis name first
+        analysis = analysis_store.get(analysis_id)
+        if analysis:
+            name = analysis.get('name', 'Unknown')
+        else:
+            return f"Error: Analysis '{analysis_id}' not found."
+
+        # Delete
+        success = analysis_store.delete(analysis_id)
+
+        if success:
+            return f"**Analysis Deleted**\n\nSuccessfully deleted: {name} (ID: {analysis_id[:8]}...)"
+        else:
+            return f"Error: Failed to delete analysis '{analysis_id}'"
+
+    except Exception as e:
+        logger.error(f"delete_analysis failed: {e}")
+        return f"Error: {e}"
+
+
+@app.tool()
+def append_to_analysis(analysis_id: str, content: str) -> str:
+    """
+    Append additional content to an existing analysis report.
+
+    Useful for adding follow-up analysis, new findings, or updates to
+    previously saved reports.
+
+    Args:
+        analysis_id: UUID of the analysis to append to
+        content: Content to append
+
+    Returns:
+        Success message
+    """
+    try:
+        success = analysis_store.append(analysis_id, content)
+
+        if success:
+            analysis = analysis_store.get(analysis_id)
+            new_length = analysis.get('content_length', 0) if analysis else 0
+
+            result = f"**Content Appended Successfully**\n\n"
+            result += f"- **Analysis ID:** `{analysis_id[:8]}...`\n"
+            result += f"- **New Length:** {new_length:,} characters\n"
+            result += f"- **Added:** {len(content):,} characters\n"
+            return result
+        else:
+            return f"Error: Failed to append to analysis '{analysis_id}'. Analysis may not exist."
+
+    except Exception as e:
+        logger.error(f"append_to_analysis failed: {e}")
         return f"Error: {e}"
 
 

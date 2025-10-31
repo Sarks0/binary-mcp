@@ -137,8 +137,8 @@ jobs:
         ### Pre-built x64dbg Plugins
 
         This release includes pre-built x64dbg plugins for dynamic analysis:
-        - `x64dbg_mcp.dp64` - 64-bit debugger plugin
-        - `x64dbg_mcp.dp32` - 32-bit debugger plugin
+        - `x64dbg_mcp.dpx64` - 64-bit debugger plugin
+        - `x64dbg_mcp.dpx32` - 32-bit debugger plugin
 
         ### Installation
 
@@ -154,8 +154,8 @@ jobs:
         **Manual Plugin Installation:**
         1. Download the plugin files from assets below
         2. Copy to your x64dbg installation:
-           - `x64dbg_mcp.dp64` → `x64dbg/x64/plugins/`
-           - `x64dbg_mcp.dp32` → `x64dbg/x32/plugins/`
+           - `x64dbg_mcp.dpx64` → `x64dbg/x64/plugins/`
+           - `x64dbg_mcp.dpx32` → `x64dbg/x32/plugins/`
         3. Restart x64dbg
 
         ### Features
@@ -191,8 +191,8 @@ jobs:
         name: Release ${{ steps.version.outputs.version }}
         body_path: release_notes.md
         files: |
-          release/x64dbg_mcp.dp64
-          release/x64dbg_mcp.dp32
+          release/x64dbg_mcp.dpx64
+          release/x64dbg_mcp.dpx32
         draft: false
         prerelease: false
       env:

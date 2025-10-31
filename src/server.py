@@ -10,6 +10,7 @@ import json
 import logging
 import re
 import sys
+import time
 from pathlib import Path
 
 from fastmcp import FastMCP
@@ -1021,7 +1022,7 @@ def save_analysis(
             tags=tags or []
         )
 
-        result = f"**Analysis Saved Successfully**\n\n"
+        result = "**Analysis Saved Successfully**\n\n"
         result += f"- **Analysis ID:** `{analysis_id}`\n"
         result += f"- **Name:** {name}\n"
         result += f"- **Content Length:** {len(content):,} characters\n"
@@ -1029,7 +1030,7 @@ def save_analysis(
             result += f"- **Binary:** {Path(binary_path).name}\n"
         if tags:
             result += f"- **Tags:** {', '.join(tags)}\n"
-        result += f"\n**To retrieve this analysis later, use:**\n"
+        result += "\n**To retrieve this analysis later, use:**\n"
         result += f"```\nget_analysis('{analysis_id}')\n```\n"
 
         return result
@@ -1131,7 +1132,7 @@ def list_analyses(
 
         # Show stats
         stats = analysis_store.get_stats()
-        result += f"\n**Storage Stats:**\n"
+        result += "\n**Storage Stats:**\n"
         result += f"- Total: {stats['total_analyses']} analyses\n"
         result += f"- Size: {stats['total_size_mb']:.2f} MB\n"
 
@@ -1196,7 +1197,7 @@ def append_to_analysis(analysis_id: str, content: str) -> str:
             analysis = analysis_store.get(analysis_id)
             new_length = analysis.get('content_length', 0) if analysis else 0
 
-            result = f"**Content Appended Successfully**\n\n"
+            result = "**Content Appended Successfully**\n\n"
             result += f"- **Analysis ID:** `{analysis_id[:8]}...`\n"
             result += f"- **New Length:** {new_length:,} characters\n"
             result += f"- **Added:** {len(content):,} characters\n"

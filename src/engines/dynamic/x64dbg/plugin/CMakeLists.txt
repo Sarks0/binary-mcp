@@ -33,7 +33,7 @@ add_library(x64dbg_mcp SHARED ${PLUGIN_SOURCES} ${PLUGIN_HEADERS})
 
 # Include directories
 target_include_directories(x64dbg_mcp PRIVATE
-    ${X64DBG_SDK_PATH}/pluginsdk
+    ${X64DBG_SDK_PATH}
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 

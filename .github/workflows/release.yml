@@ -37,15 +37,29 @@ jobs:
         Write-Host "Checking extracted directory..."
         Get-ChildItem -Name
 
-        Write-Host "Setting up SDK directory..."
-        New-Item -ItemType Directory -Force -Path extern/x64dbg_sdk
-
         # Find the extracted directory (it includes a commit hash)
         $extractedDir = Get-ChildItem -Directory | Where-Object { $_.Name -like "x64dbg-*" } | Select-Object -First 1
         Write-Host "Found extracted directory: $($extractedDir.Name)"
 
-        # Copy SDK files
-        Copy-Item -Recurse -Path "$($extractedDir.Name)/src/pluginsdk/*" -Destination extern/x64dbg_sdk/
+        Write-Host "Checking SDK structure..."
+        Get-ChildItem -Path "$($extractedDir.Name)" -Name
+        Get-ChildItem -Path "$($extractedDir.Name)/src" -Name
+
+        Write-Host "Setting up SDK directory..."
+        New-Item -ItemType Directory -Force -Path extern/x64dbg_sdk
+
+        # Check if pluginsdk exists, if not try sdk
+        if (Test-Path "$($extractedDir.Name)/src/pluginsdk") {
+            Write-Host "Using pluginsdk directory"
+            Copy-Item -Recurse -Path "$($extractedDir.Name)/src/pluginsdk/*" -Destination extern/x64dbg_sdk/
+        } elseif (Test-Path "$($extractedDir.Name)/src/sdk") {
+            Write-Host "Using sdk directory"
+            Copy-Item -Recurse -Path "$($extractedDir.Name)/src/sdk/*" -Destination extern/x64dbg_sdk/
+        } else {
+            Write-Host "ERROR: Could not find SDK directory"
+            Get-ChildItem -Path "$($extractedDir.Name)/src" -Recurse -Directory | Select-Object FullName
+            exit 1
+        }
 
         Write-Host "SDK ready at: extern/x64dbg_sdk"
 

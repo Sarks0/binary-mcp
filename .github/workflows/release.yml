@@ -84,7 +84,7 @@ jobs:
         Copy-Item src/engines/dynamic/x64dbg/plugin/build-x32/Release/x64dbg_mcp.dp32 release/
 
         # Create README for plugins
-        @"
+        $readmeContent = @"
 # x64dbg MCP Plugin
 
 Pre-built plugins for x64dbg dynamic analysis integration.
@@ -103,13 +103,17 @@ Pre-built plugins for x64dbg dynamic analysis integration.
 
 ## Version
 
-Built from: ${{ github.ref_name }}
-Commit: ${{ github.sha }}
-"@ | Out-File -FilePath release/README.md -Encoding UTF8
+Built from: $env:GITHUB_REF_NAME
+Commit: $env:GITHUB_SHA
+"@
+        $readmeContent | Out-File -FilePath release/README.md -Encoding UTF8
 
         Write-Host "Artifacts prepared in release/"
         Get-ChildItem release/
       shell: pwsh
+      env:
+        GITHUB_REF_NAME: ${{ github.ref_name }}
+        GITHUB_SHA: ${{ github.sha }}
 
     - name: Upload Build Artifacts
       uses: actions/upload-artifact@v4

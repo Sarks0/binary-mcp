@@ -2,12 +2,44 @@
 #include "http_server.h"
 #include "debugger_state.h"
 #include "plugin.h"
-#include "pluginsdk/_scriptapi.h"
 #include <sstream>
 #include <iomanip>
 
-using namespace Script;
-using namespace Json;
+// TODO: Script API integration needs proper SDK headers
+// For now, stub out JSON helpers
+static std::string Object(std::initializer_list<std::pair<const char*, std::string>> items) {
+    std::ostringstream oss;
+    oss << "{";
+    bool first = true;
+    for (const auto& item : items) {
+        if (!first) oss << ",";
+        oss << "\"" << item.first << "\":" << item.second;
+        first = false;
+    }
+    oss << "}";
+    return oss.str();
+}
+
+static std::string Bool(bool value) {
+    return value ? "true" : "false";
+}
+
+static std::string String(const std::string& value) {
+    return "\"" + value + "\"";
+}
+
+static std::string Array(std::initializer_list<std::string> items) {
+    std::ostringstream oss;
+    oss << "[";
+    bool first = true;
+    for (const auto& item : items) {
+        if (!first) oss << ",";
+        oss << item;
+        first = false;
+    }
+    oss << "]";
+    return oss.str();
+}
 
 namespace Commands {
 
@@ -50,127 +82,53 @@ std::string Status(const std::string& jsonBody) {
 }
 
 std::string LoadBinary(const std::string& jsonBody) {
-    // Parse binary_path from JSON
-    // TODO: Add proper JSON parsing
-    // For now, use Script::Misc::OpenFile
-
-    try {
-        // This would be called from Python with proper path
-        LogInfo("Load binary requested");
-        return Object({
-            {"success", Bool(true)},
-            {"message", String("Binary loading not yet implemented")}
-        });
-    }
-    catch (const std::exception& e) {
-        return Object({
-            {"success", Bool(false)},
-            {"error", String(e.what())}
-        });
-    }
+    return Object({
+        {"success", Bool(false)},
+        {"error", String("Binary loading requires Script API - not yet implemented")}
+    });
 }
 
 std::string Run(const std::string& jsonBody) {
-    try {
-        Debug::Run();
-        return Object({
-            {"success", Bool(true)},
-            {"state", String("running")}
-        });
-    }
-    catch (const std::exception& e) {
-        return Object({
-            {"success", Bool(false)},
-            {"error", String(e.what())}
-        });
-    }
+    // TODO: Implement with proper x64dbg API calls
+    return Object({
+        {"success", Bool(false)},
+        {"error", String("Debug::Run requires Script API - not yet implemented")}
+    });
 }
 
 std::string Pause(const std::string& jsonBody) {
-    try {
-        Debug::Pause();
-        return Object({
-            {"success", Bool(true)},
-            {"state", String("paused")}
-        });
-    }
-    catch (const std::exception& e) {
-        return Object({
-            {"success", Bool(false)},
-            {"error", String(e.what())}
-        });
-    }
+    // TODO: Implement with proper x64dbg API calls
+    return Object({
+        {"success", Bool(false)},
+        {"error", String("Debug::Pause requires Script API - not yet implemented")}
+    });
 }
 
 std::string StepInto(const std::string& jsonBody) {
-    try {
-        Debug::StepIn();
-        Debug::Wait();
-
-        duint rip = Register::Get(Register::RIP);
-        char ripStr[32];
-        sprintf_s(ripStr, "%llX", rip);
-
-        return Object({
-            {"success", Bool(true)},
-            {"address", String(ripStr)},
-            {"registers", String("use /api/registers for full state")}
-        });
-    }
-    catch (const std::exception& e) {
-        return Object({
-            {"success", Bool(false)},
-            {"error", String(e.what())}
-        });
-    }
+    // TODO: Implement with proper x64dbg API calls
+    return Object({
+        {"success", Bool(false)},
+        {"error", String("Debug::StepIn requires Script API - not yet implemented")}
+    });
 }
 
 std::string StepOver(const std::string& jsonBody) {
-    try {
-        Debug::StepOver();
-        Debug::Wait();
-
-        duint rip = Register::Get(Register::RIP);
-        char ripStr[32];
-        sprintf_s(ripStr, "%llX", rip);
-
-        return Object({
-            {"success", Bool(true)},
-            {"address", String(ripStr)}
-        });
-    }
-    catch (const std::exception& e) {
-        return Object({
-            {"success", Bool(false)},
-            {"error", String(e.what())}
-        });
-    }
+    // TODO: Implement with proper x64dbg API calls
+    return Object({
+        {"success", Bool(false)},
+        {"error", String("Debug::StepOver requires Script API - not yet implemented")}
+    });
 }
 
 std::string StepOut(const std::string& jsonBody) {
-    try {
-        Debug::StepOut();
-        Debug::Wait();
-
-        duint rip = Register::Get(Register::RIP);
-        char ripStr[32];
-        sprintf_s(ripStr, "%llX", rip);
-
-        return Object({
-            {"success", Bool(true)},
-            {"address", String(ripStr)}
-        });
-    }
-    catch (const std::exception& e) {
-        return Object({
-            {"success", Bool(false)},
-            {"error", String(e.what())}
-        });
-    }
+    // TODO: Implement with proper x64dbg API calls
+    return Object({
+        {"success", Bool(false)},
+        {"error", String("Debug::StepOut requires Script API - not yet implemented")}
+    });
 }
 
 std::string SetBreakpoint(const std::string& jsonBody) {
-    // TODO: Parse address from JSON
     return Object({
         {"success", Bool(false)},
         {"error", String("Not yet implemented")}
@@ -192,40 +150,11 @@ std::string ListBreakpoints(const std::string& jsonBody) {
 }
 
 std::string GetRegisters(const std::string& jsonBody) {
-    try {
-        char buffer[32];
-
-        #define REG_STR(reg) sprintf_s(buffer, "%llX", Register::Get(Register::reg)), String(buffer)
-
-        return Object({
-            {"success", Bool(true)},
-            {"rax", REG_STR(RAX)},
-            {"rbx", REG_STR(RBX)},
-            {"rcx", REG_STR(RCX)},
-            {"rdx", REG_STR(RDX)},
-            {"rsi", REG_STR(RSI)},
-            {"rdi", REG_STR(RDI)},
-            {"rbp", REG_STR(RBP)},
-            {"rsp", REG_STR(RSP)},
-            {"rip", REG_STR(RIP)},
-            {"r8", REG_STR(R8)},
-            {"r9", REG_STR(R9)},
-            {"r10", REG_STR(R10)},
-            {"r11", REG_STR(R11)},
-            {"r12", REG_STR(R12)},
-            {"r13", REG_STR(R13)},
-            {"r14", REG_STR(R14)},
-            {"r15", REG_STR(R15)}
-        });
-
-        #undef REG_STR
-    }
-    catch (const std::exception& e) {
-        return Object({
-            {"success", Bool(false)},
-            {"error", String(e.what())}
-        });
-    }
+    // TODO: Implement with proper x64dbg API calls
+    return Object({
+        {"success", Bool(false)},
+        {"error", String("Register::Get requires Script API - not yet implemented")}
+    });
 }
 
 std::string GetStack(const std::string& jsonBody) {

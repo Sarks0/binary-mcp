@@ -19,6 +19,7 @@ set(PLUGIN_SOURCES
     http_server.cpp
     commands.cpp
     debugger_state.cpp
+    x64dbg_stubs.cpp
 )
 
 set(PLUGIN_HEADERS

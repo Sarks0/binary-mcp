@@ -83,30 +83,27 @@ jobs:
         Copy-Item src/engines/dynamic/x64dbg/plugin/build-x64/Release/x64dbg_mcp.dp64 release/
         Copy-Item src/engines/dynamic/x64dbg/plugin/build-x32/Release/x64dbg_mcp.dp32 release/
 
-        # Create README for plugins
-        $readmeContent = @"
-# x64dbg MCP Plugin
-
-Pre-built plugins for x64dbg dynamic analysis integration.
-
-## Installation
-
-1. Copy x64dbg_mcp.dp64 to: x64dbg/x64/plugins/
-2. Copy x64dbg_mcp.dp32 to: x64dbg/x32/plugins/
-3. Restart x64dbg
-
-## Usage
-
-1. Load a binary in x64dbg (use x64dbg.exe for 64-bit, x32dbg.exe for 32-bit)
-2. The plugin will start an HTTP server on port 8765
-3. Use binary-mcp dynamic analysis tools in Claude
-
-## Version
-
-Built from: $env:GITHUB_REF_NAME
-Commit: $env:GITHUB_SHA
-"@
-        $readmeContent | Out-File -FilePath release/README.md -Encoding UTF8
+        # Create README for plugins (avoiding here-string to fix YAML parsing)
+        "# x64dbg MCP Plugin" | Out-File -FilePath release/README.md -Encoding UTF8
+        "" | Out-File -FilePath release/README.md -Encoding UTF8 -Append
+        "Pre-built plugins for x64dbg dynamic analysis integration." | Out-File -FilePath release/README.md -Encoding UTF8 -Append
+        "" | Out-File -FilePath release/README.md -Encoding UTF8 -Append
+        "## Installation" | Out-File -FilePath release/README.md -Encoding UTF8 -Append
+        "" | Out-File -FilePath release/README.md -Encoding UTF8 -Append
+        "1. Copy x64dbg_mcp.dp64 to: x64dbg/x64/plugins/" | Out-File -FilePath release/README.md -Encoding UTF8 -Append
+        "2. Copy x64dbg_mcp.dp32 to: x64dbg/x32/plugins/" | Out-File -FilePath release/README.md -Encoding UTF8 -Append
+        "3. Restart x64dbg" | Out-File -FilePath release/README.md -Encoding UTF8 -Append
+        "" | Out-File -FilePath release/README.md -Encoding UTF8 -Append
+        "## Usage" | Out-File -FilePath release/README.md -Encoding UTF8 -Append
+        "" | Out-File -FilePath release/README.md -Encoding UTF8 -Append
+        "1. Load a binary in x64dbg (use x64dbg.exe for 64-bit, x32dbg.exe for 32-bit)" | Out-File -FilePath release/README.md -Encoding UTF8 -Append
+        "2. The plugin will start an HTTP server on port 8765" | Out-File -FilePath release/README.md -Encoding UTF8 -Append
+        "3. Use binary-mcp dynamic analysis tools in Claude" | Out-File -FilePath release/README.md -Encoding UTF8 -Append
+        "" | Out-File -FilePath release/README.md -Encoding UTF8 -Append
+        "## Version" | Out-File -FilePath release/README.md -Encoding UTF8 -Append
+        "" | Out-File -FilePath release/README.md -Encoding UTF8 -Append
+        "Built from: $env:GITHUB_REF_NAME" | Out-File -FilePath release/README.md -Encoding UTF8 -Append
+        "Commit: $env:GITHUB_SHA" | Out-File -FilePath release/README.md -Encoding UTF8 -Append
 
         Write-Host "Artifacts prepared in release/"
         Get-ChildItem release/

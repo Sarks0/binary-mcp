@@ -1,13 +1,11 @@
 #include "debugger_state.h"
-#include "pluginsdk/_scriptapi.h"
+#include "plugin.h"
 #include <cstdio>
-
-using namespace Script;
 
 DebuggerState DebuggerState::Get() {
     DebuggerState state;
 
-    // Check if debugger is active
+    // Use core x64dbg plugin API functions (available from _plugins.h)
     state.isRunning = DbgIsRunning();
     state.binaryLoaded = DbgIsDebugging();
 
@@ -19,18 +17,11 @@ DebuggerState DebuggerState::Get() {
         state.state = "not_loaded";
     }
 
-    // Get current address
+    // TODO: Get current address using proper x64dbg API
+    // Register::Get(Register::RIP) requires Script API headers we don't have
     if (state.binaryLoaded) {
-        duint rip = Register::Get(Register::RIP);
-        char buffer[32];
-        sprintf_s(buffer, "%llX", rip);
-        state.currentAddress = buffer;
-
-        // Get module path
-        char modPath[MAX_PATH];
-        if (Module::GetMainModulePath(modPath)) {
-            state.binaryPath = modPath;
-        }
+        state.currentAddress = "0x0";  // Stub for now
+        state.binaryPath = "";  // Stub for now
     }
 
     return state;

@@ -54,13 +54,14 @@ jobs:
       shell: pwsh
       run: |
         Write-Host "Building 64-bit plugin..."
+        $sdkPath = "$env:GITHUB_WORKSPACE/extern/x64dbg_sdk"
         cd src/engines/dynamic/x64dbg/plugin
 
         New-Item -ItemType Directory -Force -Path build-x64
         cd build-x64
 
         cmake .. -G "Visual Studio 17 2022" -A x64 `
-          -DX64DBG_SDK_PATH="$PWD/../../../../../extern/x64dbg_sdk" `
+          -DX64DBG_SDK_PATH="$sdkPath" `
           -DCMAKE_BUILD_TYPE=Release
 
         cmake --build . --config Release
@@ -71,13 +72,14 @@ jobs:
       shell: pwsh
       run: |
         Write-Host "Building 32-bit plugin..."
+        $sdkPath = "$env:GITHUB_WORKSPACE/extern/x64dbg_sdk"
         cd src/engines/dynamic/x64dbg/plugin
 
         New-Item -ItemType Directory -Force -Path build-x32
         cd build-x32
 
         cmake .. -G "Visual Studio 17 2022" -A Win32 `
-          -DX64DBG_SDK_PATH="$PWD/../../../../../extern/x64dbg_sdk" `
+          -DX64DBG_SDK_PATH="$sdkPath" `
           -DCMAKE_BUILD_TYPE=Release
 
         cmake --build . --config Release

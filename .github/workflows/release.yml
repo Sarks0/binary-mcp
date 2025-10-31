@@ -34,9 +34,18 @@ jobs:
         Write-Host "Extracting SDK..."
         Expand-Archive -Path x64dbg-sdk.zip -DestinationPath .
 
+        Write-Host "Checking extracted directory..."
+        Get-ChildItem -Name
+
         Write-Host "Setting up SDK directory..."
         New-Item -ItemType Directory -Force -Path extern/x64dbg_sdk
-        Copy-Item -Recurse -Path x64dbg-development/src/pluginsdk/* -Destination extern/x64dbg_sdk/
+
+        # Find the extracted directory (it includes a commit hash)
+        $extractedDir = Get-ChildItem -Directory | Where-Object { $_.Name -like "x64dbg-*" } | Select-Object -First 1
+        Write-Host "Found extracted directory: $($extractedDir.Name)"
+
+        # Copy SDK files
+        Copy-Item -Recurse -Path "$($extractedDir.Name)/src/pluginsdk/*" -Destination extern/x64dbg_sdk/
 
         Write-Host "SDK ready at: extern/x64dbg_sdk"
 

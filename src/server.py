@@ -6,6 +6,7 @@ Provides 30+ tools for static and dynamic binary analysis:
 - Dynamic analysis via x64dbg (native plugin)
 """
 
+import functools
 import json
 import logging
 import re
@@ -48,6 +49,7 @@ def log_to_session(func):
     Transparently captures tool name, arguments, and output without
     affecting tool behavior.
     """
+    @functools.wraps(func)
     def wrapper(*args, **kwargs):
         # Call the original function
         result = func(*args, **kwargs)
@@ -66,9 +68,6 @@ def log_to_session(func):
 
         return result
 
-    # Preserve original function metadata
-    wrapper.__name__ = func.__name__
-    wrapper.__doc__ = func.__doc__
     return wrapper
 
 

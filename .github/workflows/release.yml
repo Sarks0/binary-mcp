@@ -27,41 +27,34 @@ jobs:
     - name: Download x64dbg SDK
       shell: pwsh
       run: |
-        Write-Host "Downloading x64dbg SDK..."
-        $sdkUrl = "https://github.com/x64dbg/x64dbg/archive/refs/heads/development.zip"
-        Invoke-WebRequest -Uri $sdkUrl -OutFile x64dbg-sdk.zip
+        Write-Host "Downloading x64dbg release (includes SDK)..."
+        # Use snapshot release which includes the SDK
+        $releaseUrl = "https://sourceforge.net/projects/x64dbg/files/snapshots/snapshot_latest.zip/download"
+        Invoke-WebRequest -Uri $releaseUrl -OutFile x64dbg-snapshot.zip -UserAgent "Mozilla/5.0"
 
-        Write-Host "Extracting SDK..."
-        Expand-Archive -Path x64dbg-sdk.zip -DestinationPath .
+        Write-Host "Extracting x64dbg snapshot..."
+        Expand-Archive -Path x64dbg-snapshot.zip -DestinationPath x64dbg-snapshot
 
-        Write-Host "Checking extracted directory..."
-        Get-ChildItem -Name
-
-        # Find the extracted directory (it includes a commit hash)
-        $extractedDir = Get-ChildItem -Directory | Where-Object { $_.Name -like "x64dbg-*" } | Select-Object -First 1
-        Write-Host "Found extracted directory: $($extractedDir.Name)"
-
-        Write-Host "Checking SDK structure..."
-        Get-ChildItem -Path "$($extractedDir.Name)" -Name
-        Get-ChildItem -Path "$($extractedDir.Name)/src" -Name
+        Write-Host "Checking for SDK..."
+        Get-ChildItem -Path x64dbg-snapshot -Recurse -Directory | Where-Object { $_.Name -eq "pluginsdk" } | Select-Object FullName
 
         Write-Host "Setting up SDK directory..."
         New-Item -ItemType Directory -Force -Path extern/x64dbg_sdk
 
-        # Check if pluginsdk exists, if not try sdk
-        if (Test-Path "$($extractedDir.Name)/src/pluginsdk") {
-            Write-Host "Using pluginsdk directory"
-            Copy-Item -Recurse -Path "$($extractedDir.Name)/src/pluginsdk/*" -Destination extern/x64dbg_sdk/
-        } elseif (Test-Path "$($extractedDir.Name)/src/sdk") {
-            Write-Host "Using sdk directory"
-            Copy-Item -Recurse -Path "$($extractedDir.Name)/src/sdk/*" -Destination extern/x64dbg_sdk/
+        # Find and copy pluginsdk directory
+        $pluginsdkPath = Get-ChildItem -Path x64dbg-snapshot -Recurse -Directory | Where-Object { $_.Name -eq "pluginsdk" } | Select-Object -First 1
+        if ($pluginsdkPath) {
+            Write-Host "Found pluginsdk at: $($pluginsdkPath.FullName)"
+            Copy-Item -Recurse -Path "$($pluginsdkPath.FullName)/*" -Destination extern/x64dbg_sdk/
+            Write-Host "SDK files copied successfully"
         } else {
-            Write-Host "ERROR: Could not find SDK directory"
-            Get-ChildItem -Path "$($extractedDir.Name)/src" -Recurse -Directory | Select-Object FullName
+            Write-Host "ERROR: Could not find pluginsdk directory"
+            Get-ChildItem -Path x64dbg-snapshot -Recurse -Directory | Select-Object FullName
             exit 1
         }
 
         Write-Host "SDK ready at: extern/x64dbg_sdk"
+        Get-ChildItem extern/x64dbg_sdk
 
     - name: Build x64 Plugin
       shell: pwsh

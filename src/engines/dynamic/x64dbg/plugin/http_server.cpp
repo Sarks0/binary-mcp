@@ -1,7 +1,5 @@
 #include "http_server.h"
 #include "plugin.h"
-#include <winsock2.h>
-#include <ws2tcpip.h>
 #include <sstream>
 #include <algorithm>
 

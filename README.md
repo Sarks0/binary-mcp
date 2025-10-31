@@ -31,7 +31,7 @@ irm https://raw.githubusercontent.com/Sarks0/binary-mcp/main/install.ps1 | iex
 
 ## Features
 
-### Static Analysis Tools (18 tools via Ghidra)
+### Static Analysis Tools (22 tools via Ghidra)
 
 **Core Analysis:**
 - `analyze_binary` - Run Ghidra headless analysis on a binary
@@ -52,12 +52,14 @@ irm https://raw.githubusercontent.com/Sarks0/binary-mcp/main/install.ps1 | iex
 - `generate_iocs` - Extract indicators of compromise
 - `diagnose_setup` - Diagnostic checks
 
-**Analysis Storage (NEW - Persistent Across Sessions):**
-- `save_analysis` - Save comprehensive analysis reports with unique ID
-- `get_analysis` - Retrieve saved analysis by ID
-- `list_analyses` - List all saved analyses with filters
-- `delete_analysis` - Delete a saved analysis
-- `append_to_analysis` - Add content to existing analysis
+**Analysis Session System (NEW - Incremental Storage):**
+- `start_analysis_session` - Begin tracking tool outputs for a binary
+- `save_session` - Persist all tool call outputs (compressed)
+- `list_sessions` - List all saved sessions with filters
+- `get_session_summary` - Get lightweight session metadata
+- `load_session_section` - Load specific tool outputs (chunked retrieval)
+- `load_full_session` - Load complete session data
+- `delete_session` - Clean up old sessions
 
 ### Dynamic Analysis Tools (14 tools via x64dbg) 
 
@@ -101,14 +103,15 @@ irm https://raw.githubusercontent.com/Sarks0/binary-mcp/main/install.ps1 | iex
 - **HTTP API**: Native C++ plugin with embedded HTTP server
 - **Real-time Analysis**: Complement static analysis with dynamic behavior
 
-**Analysis Storage (NEW):**
-- **Persistent Reports**: Save comprehensive analysis reports that survive conversation crashes
-- **Unique IDs**: Each analysis gets a UUID for easy retrieval
-- **Tagging System**: Organize analyses by tags (malware, trojan, apt, etc.)
-- **Cross-Session Access**: Retrieve analyses in any conversation, even weeks later
-- **Search & Filter**: Find analyses by tags, binary name, or date
-- **Incremental Updates**: Append new findings to existing analyses
-- **Works with Claude Code**: Use same storage across Claude Desktop and Claude Code
+**Analysis Session System (NEW):**
+- **Incremental Logging**: Automatically saves tool outputs as you work
+- **Crash Recovery**: Never lose analysis work due to conversation limits or crashes
+- **Chunked Retrieval**: Load only the data you need to avoid context overflow
+- **Unique Session IDs**: Each analysis session gets a UUID for easy retrieval
+- **Compression**: GZIP compression reduces storage by ~10x
+- **Cross-Conversation Workflows**: Session 1: gather data → Session 2: generate report
+- **Tag Organization**: Categorize by malware type, campaign, or custom tags
+- **Flexible Loading**: Load full session or specific tool outputs (e.g., only decompiled functions)
 
 ## Prerequisites
 
@@ -354,51 +357,91 @@ Show me the call graph for the main function, depth 3
 Check if this binary uses any cryptographic algorithms
 ```
 
-### Persistent Analysis Storage (NEW)
+### Analysis Session System (NEW)
 
-The analysis storage system allows you to save comprehensive analysis reports that persist across conversations. This is especially useful when:
-- Claude Desktop crashes during long analysis sessions
-- You want to reference previous analyses later
-- Building a knowledge base of analyzed samples
-- Sharing analysis reports across sessions
+The session system automatically logs all tool outputs as you work, preventing data loss from conversation crashes or token limits. Use this for complex analyses that generate large amounts of data.
 
-**Save an analysis:**
+**Problem it solves:** When analyzing malware, you might run 20+ tools generating hundreds of KB of output. If the conversation crashes when generating the final report, all that work is lost. The session system saves everything incrementally.
+
+#### Workflow Example
+
+**Conversation 1: Data Gathering**
+
+Start a session to begin tracking:
 ```
-save_analysis(
-    name="TrojanX Initial Analysis",
-    content="""Complete analysis report here...""",
+start_analysis_session(
     binary_path="/samples/trojanx.exe",
-    tags=["malware", "trojan", "network"]
+    name="TrojanX Campaign Analysis",
+    tags=["malware", "trojan", "apt28"]
 )
 ```
 
-Returns a unique analysis ID (UUID) like: `a1b2c3d4-e5f6-7890-...`
+Returns session ID: `abc-123-def-456`
 
-**Retrieve a saved analysis:**
+Now run your analysis (all outputs automatically logged):
 ```
-get_analysis("a1b2c3d4-e5f6-7890-...")
+analyze_binary("/samples/trojanx.exe")
+get_functions(limit=500)
+find_api_calls(suspicious_only=True)
+decompile_function("main")
+decompile_function("c2_communication")
+generate_iocs()
+detect_crypto()
+get_strings(filter_pattern="http")
 ```
 
-**List all saved analyses:**
+Save when done (or periodically as checkpoint):
 ```
-list_analyses()
+save_session()
+```
+
+**Result:** All tool outputs saved in `~/.ghidra_mcp_cache/sessions/` (GZIP compressed)
+
+---
+
+**Conversation 2: Report Generation** (Fresh context, no risk of overflow)
+
+Load session summary to see what's available:
+```
+get_session_summary("abc-123-def-456")
+```
+
+Load specific sections you need:
+```
+# Load only API analysis
+load_session_section("abc-123-def-456", "tools", "find_api_calls")
+
+# Load only decompiled functions
+load_session_section("abc-123-def-456", "tools", "decompile_function")
+
+# Load IOCs
+load_session_section("abc-123-def-456", "tools", "generate_iocs")
+```
+
+Claude generates comprehensive report from loaded data. Copy report externally, then clean up:
+```
+delete_session("abc-123-def-456")
+```
+
+#### Management Commands
+
+**List all sessions:**
+```
+list_sessions()
 
 # Filter by tag
-list_analyses(tag_filter="malware")
+list_sessions(tag_filter="malware")
 
-# Filter by binary name
-list_analyses(binary_name_filter="trojan")
+# Filter by binary
+list_sessions(binary_name_filter="trojan")
 ```
 
-**Append new findings:**
+**Load full session** (warning - use chunked loading for large sessions):
 ```
-append_to_analysis(
-    analysis_id="a1b2c3d4-...",
-    content="## Follow-up Analysis\n\nFound additional C2 servers..."
-)
+load_full_session("abc-123-def-456")
 ```
 
-**Storage location:** `~/.ghidra_mcp_cache/analyses/`
+**Storage location:** `~/.ghidra_mcp_cache/sessions/`
 
 ### Claude Code Integration
 
@@ -420,9 +463,9 @@ This MCP server works with both **Claude Desktop** and **Claude Code**. To use w
 
 **Benefits:**
 - All analysis tools available in Claude Code
-- Shared analysis storage between Claude Desktop and Claude Code
-- Code-aware binary analysis
-- Persistent analysis reports survive conversation resets
+- Shared session storage between Claude Desktop and Claude Code
+- Start session in Claude Desktop, load in Claude Code (or vice versa)
+- Code-aware binary analysis with persistent sessions
 
 ## Tool Reference
 

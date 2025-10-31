@@ -15,7 +15,7 @@ from pathlib import Path
 
 from fastmcp import FastMCP
 
-from src.engines.static.ghidra.analysis_store import AnalysisStore
+from src.engines.static.ghidra.analysis_session import AnalysisSession
 from src.engines.static.ghidra.project_cache import ProjectCache
 from src.engines.static.ghidra.runner import GhidraRunner
 from src.tools.dynamic_tools import register_dynamic_tools
@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 app = FastMCP("binary-mcp")
 runner = GhidraRunner()
 cache = ProjectCache()
-analysis_store = AnalysisStore()
+session_manager = AnalysisSession()
 api_patterns = APIPatterns()
 crypto_patterns = CryptoPatterns()
 
@@ -40,6 +40,37 @@ crypto_patterns = CryptoPatterns()
 # ============================================================================
 # HELPER FUNCTIONS
 # ============================================================================
+
+def log_to_session(func):
+    """
+    Decorator to automatically log tool calls to active session.
+
+    Transparently captures tool name, arguments, and output without
+    affecting tool behavior.
+    """
+    def wrapper(*args, **kwargs):
+        # Call the original function
+        result = func(*args, **kwargs)
+
+        # Log to active session if one exists
+        if session_manager.active_session_id:
+            # Extract function name and arguments
+            tool_name = func.__name__
+
+            # Only log kwargs (args are usually 'self' for methods)
+            session_manager.log_tool_call(
+                tool_name=tool_name,
+                arguments=kwargs,
+                output=result
+            )
+
+        return result
+
+    # Preserve original function metadata
+    wrapper.__name__ = func.__name__
+    wrapper.__doc__ = func.__doc__
+    return wrapper
+
 
 def get_analysis_context(binary_path: str, force_reanalyze: bool = False) -> dict:
     """
@@ -126,6 +157,7 @@ def get_analysis_context(binary_path: str, force_reanalyze: bool = False) -> dic
 # ============================================================================
 
 @app.tool()
+@log_to_session
 def analyze_binary(
     binary_path: str,
     force_reanalyze: bool = False
@@ -179,6 +211,7 @@ Use other tools like get_functions, get_imports, decompile_function to explore t
 
 
 @app.tool()
+@log_to_session
 def get_functions(
     binary_path: str,
     filter_name: str | None = None,
@@ -240,6 +273,7 @@ def get_functions(
 
 
 @app.tool()
+@log_to_session
 def get_imports(
     binary_path: str,
     filter_library: str | None = None,
@@ -296,6 +330,7 @@ def get_imports(
 
 
 @app.tool()
+@log_to_session
 def get_strings(
     binary_path: str,
     min_length: int = 4,
@@ -361,6 +396,7 @@ def get_strings(
 
 
 @app.tool()
+@log_to_session
 def get_xrefs(
     binary_path: str,
     address: str | None = None,
@@ -420,6 +456,7 @@ def get_xrefs(
 
 
 @app.tool()
+@log_to_session
 def decompile_function(
     binary_path: str,
     function_name: str
@@ -478,6 +515,7 @@ def decompile_function(
 # ============================================================================
 
 @app.tool()
+@log_to_session
 def get_call_graph(
     binary_path: str,
     function_name: str,
@@ -538,6 +576,7 @@ def get_call_graph(
 
 
 @app.tool()
+@log_to_session
 def find_api_calls(
     binary_path: str,
     category: str | None = None,
@@ -624,6 +663,7 @@ def find_api_calls(
 
 
 @app.tool()
+@log_to_session
 def get_memory_map(
     binary_path: str
 ) -> str:
@@ -673,6 +713,7 @@ def get_memory_map(
 
 
 @app.tool()
+@log_to_session
 def extract_metadata(
     binary_path: str
 ) -> str:
@@ -703,6 +744,7 @@ def extract_metadata(
 
 
 @app.tool()
+@log_to_session
 def search_bytes(
     binary_path: str,
     pattern: str,
@@ -756,6 +798,7 @@ def search_bytes(
 # ============================================================================
 
 @app.tool()
+@log_to_session
 def detect_crypto(
     binary_path: str
 ) -> str:
@@ -792,6 +835,7 @@ def detect_crypto(
 
 
 @app.tool()
+@log_to_session
 def generate_iocs(
     binary_path: str
 ) -> str:
@@ -893,12 +937,15 @@ def diagnose_setup() -> str:
         result += f"- Cache Directory: `{cache.cache_dir}`\n"
         result += f"- Cache Size: {cache.get_cache_size() / 1024 / 1024:.2f} MB\n\n"
 
-        # Analysis store info
-        store_stats = analysis_store.get_stats()
-        result += "**Analysis Storage:**\n"
-        result += f"- Stored Analyses: {store_stats['total_analyses']}\n"
-        result += f"- Storage Size: {store_stats['total_size_mb']:.2f} MB\n"
-        result += f"- Storage Directory: `{analysis_store.store_dir}`\n"
+        # Session info
+        session_stats = session_manager.get_stats()
+        result += "**Analysis Sessions:**\n"
+        result += f"- Stored Sessions: {session_stats['total_sessions']}\n"
+        result += f"- Storage Size: {session_stats['total_size_mb']:.2f} MB\n"
+        result += f"- Storage Directory: `{session_manager.store_dir}`\n"
+        if session_stats['active_session']:
+            result += f"- Active Session: `{session_stats['active_session'][:8]}...`\n"
+        result += "\n"
 
         if not diag['ghidra_exists']:
             result += "\n**WARNING:** Ghidra not found! Please install Ghidra or set GHIDRA_HOME environment variable.\n"
@@ -919,6 +966,7 @@ def diagnose_setup() -> str:
 # ============================================================================
 
 @app.tool()
+@log_to_session
 def list_data_types(
     binary_path: str,
     type_filter: str = "all"
@@ -973,118 +1021,111 @@ def list_data_types(
 
 
 # ============================================================================
-# ANALYSIS STORAGE TOOLS
+# ANALYSIS SESSION TOOLS
 # ============================================================================
 
 @app.tool()
-def save_analysis(
+def start_analysis_session(
+    binary_path: str,
     name: str,
-    content: str,
-    binary_path: str | None = None,
     tags: list[str] | None = None
 ) -> str:
     """
-    Save an analysis report for later retrieval.
+    Start a new analysis session to track all tool outputs.
 
-    Use this to persist comprehensive analysis reports that can be retrieved
-    later, even if the conversation crashes or resets. Each analysis is stored
-    with a unique ID.
+    This should be called BEFORE running analysis tools. All subsequent tool
+    calls will be automatically logged to this session until it's saved or ended.
 
     Args:
-        name: Human-readable name for the analysis (e.g., "Malware Sample XYZ Analysis")
-        content: Full analysis content (markdown/text format)
-        binary_path: Path to the analyzed binary (optional)
-        tags: List of tags for categorization (e.g., ["malware", "trojan", "ransomware"])
+        binary_path: Path to the binary file to analyze
+        name: Human-readable name for the session (e.g., "Malware Sample XYZ Analysis")
+        tags: Optional tags for categorization (e.g., ["malware", "trojan", "ransomware"])
 
     Returns:
-        Success message with analysis ID
+        Session ID and instructions
     """
     try:
-        # Get binary hash if path provided
-        binary_hash = None
-        if binary_path:
-            try:
-                import hashlib
-                sha256 = hashlib.sha256()
-                with open(binary_path, "rb") as f:
-                    for chunk in iter(lambda: f.read(8192), b""):
-                        sha256.update(chunk)
-                binary_hash = sha256.hexdigest()
-            except Exception as e:
-                logger.warning(f"Could not hash binary: {e}")
-
-        # Save analysis
-        analysis_id = analysis_store.save(
-            name=name,
-            content=content,
+        session_id = session_manager.start_session(
             binary_path=binary_path,
-            binary_hash=binary_hash,
+            name=name,
             tags=tags or []
         )
 
-        result = "**Analysis Saved Successfully**\n\n"
-        result += f"- **Analysis ID:** `{analysis_id}`\n"
+        result = "**Analysis Session Started**\n\n"
+        result += f"- **Session ID:** `{session_id}`\n"
         result += f"- **Name:** {name}\n"
-        result += f"- **Content Length:** {len(content):,} characters\n"
-        if binary_path:
-            result += f"- **Binary:** {Path(binary_path).name}\n"
+        result += f"- **Binary:** {Path(binary_path).name}\n"
         if tags:
             result += f"- **Tags:** {', '.join(tags)}\n"
-        result += "\n**To retrieve this analysis later, use:**\n"
-        result += f"```\nget_analysis('{analysis_id}')\n```\n"
+        result += "\n**Status:** All tool calls will now be automatically logged.\n\n"
+        result += "**Next Steps:**\n"
+        result += "1. Run analysis tools (analyze_binary, decompile_function, etc.)\n"
+        result += "2. Call `save_session()` when done to persist all outputs\n"
+        result += "3. Use the session ID in a new conversation to load the data\n"
 
         return result
 
     except Exception as e:
-        logger.error(f"save_analysis failed: {e}")
+        logger.error(f"start_analysis_session failed: {e}")
         return f"Error: {e}"
 
 
 @app.tool()
-def get_analysis(analysis_id: str) -> str:
+def save_session(session_id: str | None = None) -> str:
     """
-    Retrieve a previously saved analysis report.
+    Save the current analysis session to disk.
+
+    Persists all tool call outputs in compressed format for later retrieval.
+    Call this periodically during long analysis sessions as a checkpoint.
 
     Args:
-        analysis_id: UUID of the saved analysis
+        session_id: Session ID to save. If not provided, saves the active session.
 
     Returns:
-        The saved analysis content
+        Success message with session details
     """
     try:
-        analysis = analysis_store.get(analysis_id)
+        # Use active session if no ID provided
+        if session_id is None:
+            if not session_manager.active_session_id:
+                return "Error: No active session. Start a session first with start_analysis_session()."
+            session_id = session_manager.active_session_id
 
-        if not analysis:
-            return f"Error: Analysis '{analysis_id}' not found. Use list_analyses() to see available analyses."
+        success = session_manager.save_session(session_id)
 
-        result = f"# {analysis.get('name', 'Unknown')}\n\n"
-        result += f"**Analysis ID:** `{analysis_id}`\n"
-        result += f"**Created:** {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(analysis.get('created_at', 0)))}\n"
-        result += f"**Updated:** {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(analysis.get('updated_at', 0)))}\n"
+        if not success:
+            return f"Error: Failed to save session '{session_id}'"
 
-        if analysis.get('binary_path'):
-            result += f"**Binary:** {Path(analysis.get('binary_path')).name}\n"
-        if analysis.get('tags'):
-            result += f"**Tags:** {', '.join(analysis.get('tags', []))}\n"
+        # Get metadata for confirmation
+        metadata = session_manager.get_metadata(session_id)
+        if not metadata:
+            return "Session saved but metadata unavailable."
 
-        result += "\n---\n\n"
-        result += analysis.get('content', '')
+        result = "**Session Saved Successfully**\n\n"
+        result += f"- **Session ID:** `{session_id}`\n"
+        result += f"- **Name:** {metadata.get('name')}\n"
+        result += f"- **Tools Used:** {metadata.get('tool_count')}\n"
+        result += f"- **Total Output:** {metadata.get('total_output_size') / 1024:.1f} KB\n"
+        result += f"- **Compressed Size:** {metadata.get('compressed_size') / 1024:.1f} KB\n"
+        result += "\n**To retrieve this session in a new conversation:**\n"
+        result += f"```\nload_session_section('{session_id}', 'summary')\n```\n"
+        result += "\nYou can now safely end this conversation. The session data is persisted.\n"
 
         return result
 
     except Exception as e:
-        logger.error(f"get_analysis failed: {e}")
+        logger.error(f"save_session failed: {e}")
         return f"Error: {e}"
 
 
 @app.tool()
-def list_analyses(
+def list_sessions(
     tag_filter: str | None = None,
     binary_name_filter: str | None = None,
     limit: int = 20
 ) -> str:
     """
-    List all saved analysis reports.
+    List all saved analysis sessions.
 
     Args:
         tag_filter: Filter by tag (optional)
@@ -1092,121 +1133,278 @@ def list_analyses(
         limit: Maximum number of results (default: 20)
 
     Returns:
-        List of saved analyses with metadata
+        List of sessions with metadata
     """
     try:
-        analyses = analysis_store.list(
+        sessions = session_manager.list_sessions(
             tag_filter=tag_filter,
             binary_name_filter=binary_name_filter,
             limit=limit
         )
 
-        if not analyses:
-            result = "**No Saved Analyses Found**\n\n"
+        if not sessions:
+            result = "**No Saved Sessions Found**\n\n"
             if tag_filter or binary_name_filter:
-                result += "Try removing filters or save a new analysis using save_analysis().\n"
+                result += "Try removing filters or start a new session using start_analysis_session().\n"
             else:
-                result += "Save your first analysis using save_analysis().\n"
+                result += "Start your first session using start_analysis_session().\n"
             return result
 
-        result = f"**Saved Analyses: {len(analyses)} found**\n\n"
+        result = f"**Saved Sessions: {len(sessions)} found**\n\n"
 
-        for analysis in analyses:
-            analysis_id = analysis.get('analysis_id', 'Unknown')
-            name = analysis.get('name', 'Unknown')
-            created = time.strftime('%Y-%m-%d %H:%M', time.localtime(analysis.get('created_at', 0)))
-            updated = time.strftime('%Y-%m-%d %H:%M', time.localtime(analysis.get('updated_at', 0)))
-            binary_name = analysis.get('binary_name', 'Unknown')
-            tags = analysis.get('tags', [])
-            size_kb = analysis.get('size_bytes', 0) / 1024
+        for session in sessions:
+            session_id = session.get('session_id', 'Unknown')
+            name = session.get('name', 'Unknown')
+            created = time.strftime('%Y-%m-%d %H:%M', time.localtime(session.get('created_at', 0)))
+            updated = time.strftime('%Y-%m-%d %H:%M', time.localtime(session.get('updated_at', 0)))
+            binary_name = session.get('binary_name', 'Unknown')
+            tags = session.get('tags', [])
+            tool_count = session.get('tool_count', 0)
+            size_kb = session.get('compressed_size', 0) / 1024
 
             result += f"### {name}\n"
-            result += f"- **ID:** `{analysis_id[:8]}...` (use full ID: `{analysis_id}`)\n"
+            result += f"- **ID:** `{session_id[:8]}...` (full ID: `{session_id}`)\n"
             result += f"- **Binary:** {binary_name}\n"
             result += f"- **Created:** {created}\n"
             result += f"- **Updated:** {updated}\n"
-            result += f"- **Size:** {size_kb:.1f} KB\n"
+            result += f"- **Tools Used:** {tool_count}\n"
+            result += f"- **Size:** {size_kb:.1f} KB (compressed)\n"
             if tags:
                 result += f"- **Tags:** {', '.join(tags)}\n"
-            result += f"\n**Retrieve:** `get_analysis('{analysis_id}')`\n\n"
+            result += f"\n**Load:** `get_session_summary('{session_id}')`\n\n"
 
         # Show stats
-        stats = analysis_store.get_stats()
+        stats = session_manager.get_stats()
         result += "\n**Storage Stats:**\n"
-        result += f"- Total: {stats['total_analyses']} analyses\n"
+        result += f"- Total: {stats['total_sessions']} sessions\n"
         result += f"- Size: {stats['total_size_mb']:.2f} MB\n"
 
         return result
 
     except Exception as e:
-        logger.error(f"list_analyses failed: {e}")
+        logger.error(f"list_sessions failed: {e}")
         return f"Error: {e}"
 
 
 @app.tool()
-def delete_analysis(analysis_id: str) -> str:
+def get_session_summary(session_id: str) -> str:
     """
-    Delete a saved analysis report.
+    Get a lightweight summary of a session without loading full data.
+
+    Use this first to see what's in a session before loading specific sections.
 
     Args:
-        analysis_id: UUID of the analysis to delete
+        session_id: UUID of the session
+
+    Returns:
+        Session summary with tools used and metadata
+    """
+    try:
+        summary = session_manager.get_section(session_id, "summary")
+
+        if not summary:
+            return f"Error: Session '{session_id}' not found. Use list_sessions() to see available sessions."
+
+        metadata = session_manager.get_metadata(session_id)
+
+        result = f"# {metadata.get('name', 'Unknown Session')}\n\n"
+        result += f"**Session ID:** `{session_id}`\n"
+        result += f"**Binary:** {metadata.get('binary_name')}\n"
+        result += f"**Binary Hash:** `{metadata.get('binary_hash', 'N/A')[:16]}...`\n"
+        result += f"**Created:** {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(metadata.get('created_at', 0)))}\n"
+        result += f"**Updated:** {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(metadata.get('updated_at', 0)))}\n"
+        result += f"**Status:** {metadata.get('status', 'unknown')}\n"
+
+        if metadata.get('tags'):
+            result += f"**Tags:** {', '.join(metadata.get('tags', []))}\n"
+
+        result += "\n**Analysis Summary:**\n"
+        result += f"- Total Tools Used: {summary.get('tool_count')}\n"
+        result += f"- Total Output: {metadata.get('total_output_size', 0) / 1024:.1f} KB\n"
+        result += f"- Compressed Size: {metadata.get('compressed_size', 0) / 1024:.1f} KB\n"
+
+        tools_used = summary.get('tools_used', [])
+        if tools_used:
+            result += "\n**Tools Used:**\n"
+            for tool in sorted(tools_used):
+                result += f"- {tool}\n"
+
+        result += "\n**Next Steps:**\n"
+        result += f"- Load specific tool outputs: `load_session_section('{session_id}', 'tools', 'decompile_function')`\n"
+        result += f"- Load all data (warning - may be large): `load_full_session('{session_id}')`\n"
+
+        return result
+
+    except Exception as e:
+        logger.error(f"get_session_summary failed: {e}")
+        return f"Error: {e}"
+
+
+@app.tool()
+def load_session_section(
+    session_id: str,
+    section: str,
+    tool_filter: str | None = None
+) -> str:
+    """
+    Load a specific section of session data (chunked retrieval).
+
+    Use this to load only the data you need, avoiding context overflow.
+
+    Args:
+        session_id: UUID of the session
+        section: Section to load: "metadata", "tools", or "summary"
+        tool_filter: Optional tool name filter (e.g., "decompile_function", "find_api_calls")
+
+    Returns:
+        Requested section data
+    """
+    try:
+        section_data = session_manager.get_section(
+            session_id=session_id,
+            section_type=section,
+            tool_filter=tool_filter
+        )
+
+        if not section_data:
+            return f"Error: Could not load section '{section}' from session '{session_id}'"
+
+        if section == "metadata":
+            result = "**Session Metadata**\n\n"
+            result += f"- Session ID: `{section_data.get('session_id')}`\n"
+            result += f"- Name: {section_data.get('name')}\n"
+            result += f"- Binary: {section_data.get('binary_name')}\n"
+            result += f"- Tool Count: {section_data.get('tool_count')}\n"
+            result += f"- Size: {section_data.get('total_output_size', 0) / 1024:.1f} KB\n"
+            return result
+
+        if section == "summary":
+            return get_session_summary(session_id)
+
+        if section == "tools":
+            tool_calls = section_data.get('tool_calls', [])
+
+            if not tool_calls:
+                return f"No tool calls found{f' for tool: {tool_filter}' if tool_filter else ''}"
+
+            result = f"**Tool Outputs** (Session: {session_id[:8]}...)\n"
+            if tool_filter:
+                result += f"**Filtered by:** {tool_filter}\n"
+            result += f"\n**Total Calls:** {len(tool_calls)}\n\n"
+            result += "---\n\n"
+
+            for i, call in enumerate(tool_calls, 1):
+                tool_name = call.get('tool_name')
+                timestamp = call.get('timestamp')
+                output = call.get('output', '')
+                args = call.get('arguments', {})
+
+                result += f"## Call #{i}: {tool_name}\n\n"
+                result += f"**Time:** {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(timestamp))}\n"
+
+                if args:
+                    result += "**Arguments:** "
+                    arg_str = ", ".join(f"{k}={v}" for k, v in args.items())
+                    result += f"{arg_str}\n"
+
+                result += f"\n{output}\n\n"
+                result += "---\n\n"
+
+            return result
+
+        return f"Error: Unknown section type: {section}"
+
+    except Exception as e:
+        logger.error(f"load_session_section failed: {e}")
+        return f"Error: {e}"
+
+
+@app.tool()
+def load_full_session(session_id: str) -> str:
+    """
+    Load ALL data from a session (WARNING: may be very large).
+
+    Only use this for small sessions or when you need everything at once.
+    For large sessions, use load_session_section() instead.
+
+    Args:
+        session_id: UUID of the session
+
+    Returns:
+        Complete session data with all tool outputs
+    """
+    try:
+        session_data = session_manager.get_session(session_id)
+
+        if not session_data:
+            return f"Error: Session '{session_id}' not found. Use list_sessions() to see available sessions."
+
+        result = f"# {session_data.get('name')}\n\n"
+        result += f"**Session ID:** `{session_id}`\n"
+        result += f"**Binary:** {session_data.get('binary_name')}\n"
+        result += f"**Binary Hash:** `{session_data.get('binary_hash', 'N/A')[:16]}...`\n"
+        result += f"**Created:** {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(session_data.get('created_at', 0)))}\n"
+
+        tool_calls = session_data.get('tool_calls', [])
+        result += f"**Tool Calls:** {len(tool_calls)}\n\n"
+        result += "---\n\n"
+
+        for i, call in enumerate(tool_calls, 1):
+            tool_name = call.get('tool_name')
+            timestamp = call.get('timestamp')
+            output = call.get('output', '')
+            args = call.get('arguments', {})
+
+            result += f"## Tool Call #{i}: {tool_name}\n\n"
+            result += f"**Time:** {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(timestamp))}\n"
+
+            if args:
+                result += "**Arguments:** "
+                arg_str = ", ".join(f"{k}={v}" for k, v in args.items())
+                result += f"{arg_str}\n"
+
+            result += f"\n{output}\n\n"
+            result += "---\n\n"
+
+        return result
+
+    except Exception as e:
+        logger.error(f"load_full_session failed: {e}")
+        return f"Error: {e}"
+
+
+@app.tool()
+def delete_session(session_id: str) -> str:
+    """
+    Delete a saved session.
+
+    Use this to clean up old sessions after you've generated reports and
+    no longer need the raw data.
+
+    Args:
+        session_id: UUID of the session to delete
 
     Returns:
         Success/failure message
     """
     try:
-        # Get analysis name first
-        analysis = analysis_store.get(analysis_id)
-        if analysis:
-            name = analysis.get('name', 'Unknown')
+        # Get metadata first for confirmation message
+        metadata = session_manager.get_metadata(session_id)
+        if metadata:
+            name = metadata.get('name', 'Unknown')
         else:
-            return f"Error: Analysis '{analysis_id}' not found."
+            return f"Error: Session '{session_id}' not found."
 
         # Delete
-        success = analysis_store.delete(analysis_id)
+        success = session_manager.delete_session(session_id)
 
         if success:
-            return f"**Analysis Deleted**\n\nSuccessfully deleted: {name} (ID: {analysis_id[:8]}...)"
+            return f"**Session Deleted**\n\nSuccessfully deleted: {name} (ID: {session_id[:8]}...)"
         else:
-            return f"Error: Failed to delete analysis '{analysis_id}'"
+            return f"Error: Failed to delete session '{session_id}'"
 
     except Exception as e:
-        logger.error(f"delete_analysis failed: {e}")
-        return f"Error: {e}"
-
-
-@app.tool()
-def append_to_analysis(analysis_id: str, content: str) -> str:
-    """
-    Append additional content to an existing analysis report.
-
-    Useful for adding follow-up analysis, new findings, or updates to
-    previously saved reports.
-
-    Args:
-        analysis_id: UUID of the analysis to append to
-        content: Content to append
-
-    Returns:
-        Success message
-    """
-    try:
-        success = analysis_store.append(analysis_id, content)
-
-        if success:
-            analysis = analysis_store.get(analysis_id)
-            new_length = analysis.get('content_length', 0) if analysis else 0
-
-            result = "**Content Appended Successfully**\n\n"
-            result += f"- **Analysis ID:** `{analysis_id[:8]}...`\n"
-            result += f"- **New Length:** {new_length:,} characters\n"
-            result += f"- **Added:** {len(content):,} characters\n"
-            return result
-        else:
-            return f"Error: Failed to append to analysis '{analysis_id}'. Analysis may not exist."
-
-    except Exception as e:
-        logger.error(f"append_to_analysis failed: {e}")
+        logger.error(f"delete_session failed: {e}")
         return f"Error: {e}"
 
 

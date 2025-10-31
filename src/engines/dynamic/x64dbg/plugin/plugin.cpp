@@ -1,5 +1,3 @@
-#include "pluginsdk/_plugins.h"
-#include "pluginsdk/_scriptapi.h"
 #include "plugin.h"
 #include "http_server.h"
 #include "commands.h"

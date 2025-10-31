@@ -25,6 +25,7 @@ jobs:
         cmake-version: '3.27.x'
 
     - name: Download x64dbg SDK
+      shell: pwsh
       run: |
         Write-Host "Downloading x64dbg SDK..."
         $sdkUrl = "https://github.com/x64dbg/x64dbg/archive/refs/heads/development.zip"
@@ -38,9 +39,9 @@ jobs:
         Copy-Item -Recurse -Path x64dbg-development/src/pluginsdk/* -Destination extern/x64dbg_sdk/
 
         Write-Host "SDK ready at: extern/x64dbg_sdk"
-      shell: pwsh
 
     - name: Build x64 Plugin
+      shell: pwsh
       run: |
         Write-Host "Building 64-bit plugin..."
         cd src/engines/dynamic/x64dbg/plugin
@@ -55,9 +56,9 @@ jobs:
         cmake --build . --config Release
 
         Write-Host "x64 plugin built successfully"
-      shell: pwsh
 
     - name: Build x32 Plugin
+      shell: pwsh
       run: |
         Write-Host "Building 32-bit plugin..."
         cd src/engines/dynamic/x64dbg/plugin
@@ -72,45 +73,18 @@ jobs:
         cmake --build . --config Release
 
         Write-Host "x32 plugin built successfully"
-      shell: pwsh
 
     - name: Prepare Release Artifacts
+      shell: pwsh
       run: |
         Write-Host "Preparing release artifacts..."
         New-Item -ItemType Directory -Force -Path release
 
-        # Copy plugins
         Copy-Item src/engines/dynamic/x64dbg/plugin/build-x64/Release/x64dbg_mcp.dp64 release/
         Copy-Item src/engines/dynamic/x64dbg/plugin/build-x32/Release/x64dbg_mcp.dp32 release/
 
-        # Create README for plugins (avoiding here-string to fix YAML parsing)
-        "# x64dbg MCP Plugin" | Out-File -FilePath release/README.md -Encoding UTF8
-        "" | Out-File -FilePath release/README.md -Encoding UTF8 -Append
-        "Pre-built plugins for x64dbg dynamic analysis integration." | Out-File -FilePath release/README.md -Encoding UTF8 -Append
-        "" | Out-File -FilePath release/README.md -Encoding UTF8 -Append
-        "## Installation" | Out-File -FilePath release/README.md -Encoding UTF8 -Append
-        "" | Out-File -FilePath release/README.md -Encoding UTF8 -Append
-        "1. Copy x64dbg_mcp.dp64 to: x64dbg/x64/plugins/" | Out-File -FilePath release/README.md -Encoding UTF8 -Append
-        "2. Copy x64dbg_mcp.dp32 to: x64dbg/x32/plugins/" | Out-File -FilePath release/README.md -Encoding UTF8 -Append
-        "3. Restart x64dbg" | Out-File -FilePath release/README.md -Encoding UTF8 -Append
-        "" | Out-File -FilePath release/README.md -Encoding UTF8 -Append
-        "## Usage" | Out-File -FilePath release/README.md -Encoding UTF8 -Append
-        "" | Out-File -FilePath release/README.md -Encoding UTF8 -Append
-        "1. Load a binary in x64dbg (use x64dbg.exe for 64-bit, x32dbg.exe for 32-bit)" | Out-File -FilePath release/README.md -Encoding UTF8 -Append
-        "2. The plugin will start an HTTP server on port 8765" | Out-File -FilePath release/README.md -Encoding UTF8 -Append
-        "3. Use binary-mcp dynamic analysis tools in Claude" | Out-File -FilePath release/README.md -Encoding UTF8 -Append
-        "" | Out-File -FilePath release/README.md -Encoding UTF8 -Append
-        "## Version" | Out-File -FilePath release/README.md -Encoding UTF8 -Append
-        "" | Out-File -FilePath release/README.md -Encoding UTF8 -Append
-        "Built from: $env:GITHUB_REF_NAME" | Out-File -FilePath release/README.md -Encoding UTF8 -Append
-        "Commit: $env:GITHUB_SHA" | Out-File -FilePath release/README.md -Encoding UTF8 -Append
-
         Write-Host "Artifacts prepared in release/"
         Get-ChildItem release/
-      shell: pwsh
-      env:
-        GITHUB_REF_NAME: ${{ github.ref_name }}
-        GITHUB_SHA: ${{ github.sha }}
 
     - name: Upload Build Artifacts
       uses: actions/upload-artifact@v4
@@ -143,25 +117,20 @@ jobs:
         echo "version=$VERSION" >> $GITHUB_OUTPUT
         echo "Version: $VERSION"
 
-    - name: Generate Release Notes
-      id: release_notes
+    - name: Create Release Notes
       run: |
-        cat > release_notes.md << 'EOF'
-        ## Binary MCP Server ${{ steps.version.outputs.version }}
+        cat > release_notes.md << 'NOTES_EOF'
+        ## Binary MCP Server Release
 
-        ### What's Included
+        ### Pre-built x64dbg Plugins
 
-        **Python Package:**
-        - Install via: `pip install binary-mcp` (PyPI - coming soon)
-        - Or use: `git clone` + `uv sync`
-
-        **x64dbg Plugins (Pre-built):**
+        This release includes pre-built x64dbg plugins for dynamic analysis:
         - `x64dbg_mcp.dp64` - 64-bit debugger plugin
         - `x64dbg_mcp.dp32` - 32-bit debugger plugin
 
         ### Installation
 
-        **Automated (Recommended):**
+        **Quick Install:**
         ```bash
         # Windows
         irm https://raw.githubusercontent.com/Sarks0/binary-mcp/main/install.ps1 | iex
@@ -170,8 +139,8 @@ jobs:
         curl -fsSL https://raw.githubusercontent.com/Sarks0/binary-mcp/main/install.py | python3 -
         ```
 
-        **x64dbg Plugin Setup:**
-        1. Download `x64dbg_mcp.dp64` and `x64dbg_mcp.dp32` from assets below
+        **Manual Plugin Installation:**
+        1. Download the plugin files from assets below
         2. Copy to your x64dbg installation:
            - `x64dbg_mcp.dp64` → `x64dbg/x64/plugins/`
            - `x64dbg_mcp.dp32` → `x64dbg/x32/plugins/`
@@ -184,7 +153,6 @@ jobs:
         - Function decompilation
         - API call detection
         - Crypto constant identification
-        - IOC extraction
 
         **Dynamic Analysis (x64dbg):**
         - Live debugging control
@@ -203,10 +171,7 @@ jobs:
 
         - [Installation Guide](https://github.com/Sarks0/binary-mcp/blob/main/INSTALL.md)
         - [README](https://github.com/Sarks0/binary-mcp/blob/main/README.md)
-        - [Plugin Build Guide](https://github.com/Sarks0/binary-mcp/blob/main/src/engines/dynamic/x64dbg/plugin/README.md)
-
-        EOF
-        cat release_notes.md
+        NOTES_EOF
 
     - name: Create Release
       uses: softprops/action-gh-release@v2
@@ -216,7 +181,6 @@ jobs:
         files: |
           release/x64dbg_mcp.dp64
           release/x64dbg_mcp.dp32
-          release/README.md
         draft: false
         prerelease: false
       env:

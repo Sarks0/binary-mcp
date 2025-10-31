@@ -19,7 +19,6 @@ set(PLUGIN_SOURCES
     http_server.cpp
     commands.cpp
     debugger_state.cpp
-    x64dbg_stubs.cpp
 )
 
 set(PLUGIN_HEADERS
@@ -57,6 +56,12 @@ set_target_properties(x64dbg_mcp PROPERTIES
     SUFFIX ".dp${PLUGIN_ARCH}"
     PREFIX ""
 )
+
+# x64dbg provides API functions at runtime
+# Allow linking despite unresolved externals
+if(MSVC)
+    target_link_options(x64dbg_mcp PRIVATE "/FORCE:UNRESOLVED")
+endif()
 
 # Install target
 install(TARGETS x64dbg_mcp

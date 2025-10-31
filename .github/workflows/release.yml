@@ -24,37 +24,31 @@ jobs:
       with:
         cmake-version: '3.27.x'
 
-    - name: Download x64dbg SDK
+    - name: Download x64dbg Plugin SDK
       shell: pwsh
       run: |
-        Write-Host "Downloading x64dbg release (includes SDK)..."
-        # Use snapshot release which includes the SDK
-        $releaseUrl = "https://sourceforge.net/projects/x64dbg/files/snapshots/snapshot_latest.zip/download"
-        Invoke-WebRequest -Uri $releaseUrl -OutFile x64dbg-snapshot.zip -UserAgent "Mozilla/5.0"
+        Write-Host "Fetching latest x64dbg release info..."
+        $release = Invoke-RestMethod -Uri "https://api.github.com/repos/x64dbg/x64dbg/releases/latest"
 
-        Write-Host "Extracting x64dbg snapshot..."
-        Expand-Archive -Path x64dbg-snapshot.zip -DestinationPath x64dbg-snapshot
+        Write-Host "Latest release: $($release.tag_name)"
+        $sdkAsset = $release.assets | Where-Object { $_.name -eq "x64dbg-pluginsdk.zip" }
 
-        Write-Host "Checking for SDK..."
-        Get-ChildItem -Path x64dbg-snapshot -Recurse -Directory | Where-Object { $_.Name -eq "pluginsdk" } | Select-Object FullName
-
-        Write-Host "Setting up SDK directory..."
-        New-Item -ItemType Directory -Force -Path extern/x64dbg_sdk
-
-        # Find and copy pluginsdk directory
-        $pluginsdkPath = Get-ChildItem -Path x64dbg-snapshot -Recurse -Directory | Where-Object { $_.Name -eq "pluginsdk" } | Select-Object -First 1
-        if ($pluginsdkPath) {
-            Write-Host "Found pluginsdk at: $($pluginsdkPath.FullName)"
-            Copy-Item -Recurse -Path "$($pluginsdkPath.FullName)/*" -Destination extern/x64dbg_sdk/
-            Write-Host "SDK files copied successfully"
-        } else {
-            Write-Host "ERROR: Could not find pluginsdk directory"
-            Get-ChildItem -Path x64dbg-snapshot -Recurse -Directory | Select-Object FullName
+        if (-not $sdkAsset) {
+            Write-Error "x64dbg-pluginsdk.zip not found in latest release"
             exit 1
         }
 
-        Write-Host "SDK ready at: extern/x64dbg_sdk"
-        Get-ChildItem extern/x64dbg_sdk
+        Write-Host "Downloading official x64dbg plugin SDK ($(($sdkAsset.size / 1KB).ToString('F2')) KB)..."
+        Invoke-WebRequest -Uri $sdkAsset.browser_download_url -OutFile sdk.zip
+
+        Write-Host "Creating SDK directory..."
+        New-Item -ItemType Directory -Force -Path extern/x64dbg_sdk/pluginsdk
+
+        Write-Host "Extracting SDK..."
+        Expand-Archive -Path sdk.zip -DestinationPath extern/x64dbg_sdk/pluginsdk -Force
+
+        Write-Host "SDK ready at: extern/x64dbg_sdk/pluginsdk"
+        Get-ChildItem extern/x64dbg_sdk/pluginsdk | Select-Object -First 10
 
     - name: Build x64 Plugin
       shell: pwsh

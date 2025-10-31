@@ -92,8 +92,8 @@ jobs:
         Write-Host "Preparing release artifacts..."
         New-Item -ItemType Directory -Force -Path release
 
-        Copy-Item src/engines/dynamic/x64dbg/plugin/build-x64/Release/x64dbg_mcp.dp64 release/
-        Copy-Item src/engines/dynamic/x64dbg/plugin/build-x32/Release/x64dbg_mcp.dp32 release/
+        Copy-Item src/engines/dynamic/x64dbg/plugin/build-x64/Release/x64dbg_mcp.dpx64 release/
+        Copy-Item src/engines/dynamic/x64dbg/plugin/build-x32/Release/x64dbg_mcp.dpx32 release/
 
         Write-Host "Artifacts prepared in release/"
         Get-ChildItem release/

@@ -71,13 +71,20 @@ def log_to_session(func):
     return wrapper
 
 
-def get_analysis_context(binary_path: str, force_reanalyze: bool = False) -> dict:
+def get_analysis_context(
+    binary_path: str,
+    force_reanalyze: bool = False,
+    processor: str | None = None,
+    loader: str | None = None
+) -> dict:
     """
     Get or create analysis context for a binary.
 
     Args:
         binary_path: Path to binary file
         force_reanalyze: Force re-analysis even if cached
+        processor: Optional processor specification (e.g., "x86:LE:64:default")
+        loader: Optional loader specification (e.g., "Portable Executable (PE)")
 
     Returns:
         Analysis context dict
@@ -85,8 +92,8 @@ def get_analysis_context(binary_path: str, force_reanalyze: bool = False) -> dic
     Raises:
         RuntimeError: If analysis fails
     """
-    # Check cache first
-    if not force_reanalyze:
+    # Check cache first (skip cache if processor/loader specified)
+    if not force_reanalyze and not processor and not loader:
         cached_context = cache.get_cached(binary_path)
         if cached_context:
             logger.info(f"Using cached analysis for {binary_path}")
@@ -94,6 +101,8 @@ def get_analysis_context(binary_path: str, force_reanalyze: bool = False) -> dic
 
     # Run Ghidra analysis
     logger.info(f"Analyzing {binary_path} with Ghidra...")
+    if processor or loader:
+        logger.info(f"Using explicit loader config - Processor: {processor}, Loader: {loader}")
 
     output_path = cache.cache_dir / f"temp_analysis_{Path(binary_path).stem}.json"
     script_path = Path(__file__).parent / "engines" / "static" / "ghidra" / "scripts"
@@ -105,7 +114,9 @@ def get_analysis_context(binary_path: str, force_reanalyze: bool = False) -> dic
             script_name="core_analysis.py",
             output_path=str(output_path),
             keep_project=True,  # Keep project for incremental analysis
-            timeout=600
+            timeout=600,
+            processor=processor,
+            loader=loader
         )
 
         # Save Ghidra output to debug file for inspection
@@ -159,7 +170,9 @@ def get_analysis_context(binary_path: str, force_reanalyze: bool = False) -> dic
 @log_to_session
 def analyze_binary(
     binary_path: str,
-    force_reanalyze: bool = False
+    force_reanalyze: bool = False,
+    processor: str | None = None,
+    loader: str | None = None
 ) -> str:
     """
     Analyze a binary file with Ghidra headless analyzer.
@@ -170,12 +183,19 @@ def analyze_binary(
     Args:
         binary_path: Path to the binary file to analyze
         force_reanalyze: Force re-analysis even if cached (default: False)
+        processor: Optional processor spec when AutoImporter fails (e.g., "x86:LE:64:default")
+        loader: Optional loader spec when AutoImporter fails (e.g., "Portable Executable (PE)")
 
     Returns:
         Analysis summary with basic statistics
+
+    Note:
+        If Ghidra's AutoImporter fails with "No load spec found", you can manually specify:
+        - For x86-64 Windows PE: processor="x86:LE:64:default", loader="Portable Executable (PE)"
+        - For x86-64 Linux ELF: processor="x86:LE:64:default", loader="Executable and Linking Format (ELF)"
     """
     try:
-        context = get_analysis_context(binary_path, force_reanalyze)
+        context = get_analysis_context(binary_path, force_reanalyze, processor, loader)
 
         metadata = context.get("metadata", {})
         functions = context.get("functions", [])

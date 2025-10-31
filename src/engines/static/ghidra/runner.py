@@ -124,6 +124,8 @@ class GhidraRunner:
         project_name: str | None = None,
         keep_project: bool = False,
         timeout: int = 600,
+        processor: str | None = None,
+        loader: str | None = None,
     ) -> dict:
         """
         Run Ghidra headless analysis on a binary.
@@ -136,6 +138,8 @@ class GhidraRunner:
             project_name: Ghidra project name (default: binary basename)
             keep_project: Whether to keep the project after analysis
             timeout: Maximum execution time in seconds
+            processor: Optional processor specification (e.g., "x86:LE:64:default")
+            loader: Optional loader specification (e.g., "Portable Executable (PE)")
 
         Returns:
             dict with analysis results and metadata
@@ -168,9 +172,18 @@ class GhidraRunner:
             project_name,
             "-import", str(binary_path),
             "-overwrite",
+        ]
+
+        # Add processor/loader if specified (helps when AutoImporter fails)
+        if processor:
+            cmd.extend(["-processor", processor])
+        if loader:
+            cmd.extend(["-loader", loader])
+
+        cmd.extend([
             "-scriptPath", str(script_path),
             "-postScript", script_name,
-        ]
+        ])
 
         if not keep_project:
             cmd.append("-deleteProject")
@@ -181,16 +194,15 @@ class GhidraRunner:
         start_time = time.time()
 
         try:
-            # On Windows, we need shell=True for .bat files
-            use_shell = self.system == "Windows"
-
+            # On Windows, don't use shell=True - it causes path handling issues
+            # The .bat file can be executed directly without shell
             result = subprocess.run(
                 cmd,
                 env=env,
                 capture_output=True,
                 text=True,
                 timeout=timeout,
-                shell=use_shell,  # nosec B602 - Required for Windows .bat execution
+                shell=False,  # Changed: shell=False to fix Windows path handling
                 check=True,
             )
 

@@ -1,5 +1,10 @@
 #pragma once
 
+// Include winsock2 before Windows headers to avoid conflicts
+#define WIN32_LEAN_AND_MEAN
+#include <winsock2.h>
+#include <ws2tcpip.h>
+
 #include "pluginsdk/_plugins.h"
 #include "pluginsdk/_scriptapi.h"
 

@@ -7,7 +7,6 @@
 #include <ws2tcpip.h>
 
 #include "pluginsdk/_plugins.h"
-#include "pluginsdk/_scriptapi.h"
 
 #define PLUGIN_NAME "x64dbg_mcp"
 #define PLUGIN_VERSION 1

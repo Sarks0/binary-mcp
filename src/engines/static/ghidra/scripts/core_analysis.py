@@ -46,6 +46,34 @@ def safe_unicode(value):
             return u"<encoding_error>"
 
 
+def safe_format(fmt_string, *args, **kwargs):
+    """
+    Safely format and encode a string for printing, handling Unicode.
+
+    In Python 2/Jython, formatting with Unicode values creates a Unicode string,
+    which print() tries to encode with ASCII, causing UnicodeEncodeError.
+    This function formats and encodes to UTF-8 in one step.
+
+    Returns a UTF-8 encoded byte string safe for printing.
+    """
+    try:
+        # Format the string (may contain Unicode)
+        result = fmt_string.format(*args, **kwargs)
+        # If it's Unicode, encode to UTF-8; otherwise return as-is
+        if isinstance(result, unicode):
+            return result.encode('utf-8', 'replace')
+        return result
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        # Fallback: use ASCII with replacement chars
+        try:
+            result = fmt_string.format(*args, **kwargs)
+            if isinstance(result, unicode):
+                return result.encode('ascii', 'replace')
+            return result
+        except Exception:
+            return "<formatting_error>"
+
+
 def extract_comprehensive_analysis():
     """Extract comprehensive analysis data from the current program."""
 
@@ -175,7 +203,7 @@ def extract_comprehensive_analysis():
         function_count += 1
 
         if function_count % 100 == 0:
-            print("    Processed {} functions...".format(function_count))
+            print(safe_format("    Processed {} functions...", function_count))
 
         # Get function signature
         signature = function.getSignature()
@@ -234,7 +262,7 @@ def extract_comprehensive_analysis():
                 }
                 function_info["basic_blocks"].append(block_info)
         except Exception as e:
-            print("    Warning: Could not extract basic blocks for {}: {}".format(safe_unicode(function.getName()), safe_unicode(e)))
+            print(safe_format("    Warning: Could not extract basic blocks for {}: {}", safe_unicode(function.getName()), safe_unicode(e)))
 
         # Decompile function (for non-thunk, non-external functions)
         if not function.isThunk() and not function.isExternal():
@@ -245,7 +273,7 @@ def extract_comprehensive_analysis():
                     if pseudocode:
                         function_info["pseudocode"] = safe_unicode(pseudocode.getC())
             except Exception as e:
-                print("    Warning: Could not decompile {}: {}".format(safe_unicode(function.getName()), safe_unicode(e)))
+                print(safe_format("    Warning: Could not decompile {}: {}", safe_unicode(function.getName()), safe_unicode(e)))
 
         context["functions"].append(function_info)
 
@@ -293,12 +321,12 @@ def extract_comprehensive_analysis():
             context["data_types"]["enums"].append(enum_info)
 
     print("[*] Extraction complete!")
-    print("    Functions: {}".format(len(context["functions"])))
-    print("    Imports: {}".format(len(context["imports"])))
-    print("    Exports: {}".format(len(context["exports"])))
-    print("    Strings: {}".format(len(context["strings"])))
-    print("    Structures: {}".format(len(context["data_types"]["structures"])))
-    print("    Enums: {}".format(len(context["data_types"]["enums"])))
+    print(safe_format("    Functions: {}", len(context["functions"])))
+    print(safe_format("    Imports: {}", len(context["imports"])))
+    print(safe_format("    Exports: {}", len(context["exports"])))
+    print(safe_format("    Strings: {}", len(context["strings"])))
+    print(safe_format("    Structures: {}", len(context["data_types"]["structures"])))
+    print(safe_format("    Enums: {}", len(context["data_types"]["enums"])))
 
     return context
 
@@ -313,21 +341,21 @@ def main():
             return
 
         print("[*] Starting comprehensive analysis extraction...")
-        print("[*] Program: {}".format(currentProgram.getName()))
-        print("[*] Output: {}".format(output_path))
+        print(safe_format("[*] Program: {}", safe_unicode(currentProgram.getName())))
+        print(safe_format("[*] Output: {}", output_path))
 
         # Extract all analysis data
         context = extract_comprehensive_analysis()
 
         # Write to JSON file with UTF-8 encoding to handle Unicode characters
-        print("[*] Writing output to {}...".format(output_path))
+        print(safe_format("[*] Writing output to {}...", output_path))
         with codecs.open(output_path, 'w', encoding='utf-8') as f:
             json.dump(context, f, indent=2, ensure_ascii=False)
 
-        print("[+] Analysis complete! Output saved to: {}".format(output_path))
+        print(safe_format("[+] Analysis complete! Output saved to: {}", output_path))
 
     except Exception as e:
-        print("[!] ERROR during analysis: {}".format(str(e)))
+        print(safe_format("[!] ERROR during analysis: {}", safe_unicode(e)))
         import traceback
         traceback.print_exc()
 

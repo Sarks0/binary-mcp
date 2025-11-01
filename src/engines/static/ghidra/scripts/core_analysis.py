@@ -4,12 +4,46 @@
 # ruff: noqa: F821
 # Note: currentProgram and other Ghidra globals are provided at runtime
 
+import codecs
 import json
 import os
 
 from ghidra.app.decompiler import DecompInterface
 from ghidra.program.model.symbol import SymbolType
 from ghidra.util.task import ConsoleTaskMonitor
+
+
+def safe_unicode(value):
+    """
+    Safely convert a value to unicode string, handling non-ASCII characters.
+
+    In Jython/Python 2, str() fails on unicode strings with non-ASCII characters.
+    This function handles both str and unicode types safely.
+    """
+    if value is None:
+        return u""
+
+    # If it's already unicode, return it
+    if isinstance(value, unicode):
+        return value
+
+    # If it's a regular string (bytes), decode it
+    if isinstance(value, str):
+        try:
+            return value.decode('utf-8')
+        except (UnicodeDecodeError, AttributeError):
+            # If UTF-8 fails, try latin-1 (which accepts all byte values)
+            return value.decode('latin-1', 'replace')
+
+    # For other types (Java objects, numbers, etc), convert to unicode
+    try:
+        return unicode(value)
+    except UnicodeDecodeError:
+        # Last resort: convert to str first, then decode
+        try:
+            return str(value).decode('utf-8', 'replace')
+        except (UnicodeDecodeError, AttributeError, TypeError):
+            return u"<encoding_error>"
 
 
 def extract_comprehensive_analysis():
@@ -110,7 +144,9 @@ def extract_comprehensive_analysis():
         data = defined_data.next()
         if data.hasStringValue():
             string_value = data.getValue()
-            if string_value and len(str(string_value)) > 0:
+            # Use safe_unicode to handle non-ASCII characters (like copyright symbols)
+            unicode_value = safe_unicode(string_value)
+            if unicode_value and len(unicode_value) > 0:
                 # Get cross-references to this string
                 refs = []
                 for ref in reference_manager.getReferencesTo(data.getAddress()):
@@ -121,8 +157,8 @@ def extract_comprehensive_analysis():
 
                 string_info = {
                     "address": str(data.getAddress()),
-                    "value": str(string_value)[:1000],  # Limit string length
-                    "length": len(str(string_value)),
+                    "value": unicode_value[:1000],  # Limit string length
+                    "length": len(unicode_value),
                     "type": str(data.getDataType()),
                     "xrefs": refs[:50]  # Limit xrefs per string
                 }
@@ -282,10 +318,10 @@ def main():
         # Extract all analysis data
         context = extract_comprehensive_analysis()
 
-        # Write to JSON file
+        # Write to JSON file with UTF-8 encoding to handle Unicode characters
         print("[*] Writing output to {}...".format(output_path))
-        with open(output_path, 'w') as f:
-            json.dump(context, f, indent=2)
+        with codecs.open(output_path, 'w', encoding='utf-8') as f:
+            json.dump(context, f, indent=2, ensure_ascii=False)
 
         print("[+] Analysis complete! Output saved to: {}".format(output_path))
 

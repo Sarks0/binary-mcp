@@ -150,6 +150,9 @@ jobs:
           --exclude='*.swp' \
           --exclude='.claude' \
           --exclude='release' \
+          --exclude='CODE_OF_CONDUCT.md' \
+          --exclude='RELEASING.md' \
+          --exclude='SECURITY.md' \
           . "$PACKAGE_NAME/"
 
         # Copy x64dbg plugins to dedicated directory

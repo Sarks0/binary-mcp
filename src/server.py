@@ -21,6 +21,14 @@ from src.engines.static.ghidra.project_cache import ProjectCache
 from src.engines.static.ghidra.runner import GhidraRunner
 from src.tools.dynamic_tools import register_dynamic_tools
 from src.utils.patterns import APIPatterns, CryptoPatterns
+from src.utils.security import (
+    sanitize_binary_path,
+    validate_hex_address,
+    validate_numeric_range,
+    safe_regex_compile,
+    PathTraversalError,
+    FileSizeError
+)
 
 # Configure logging
 logging.basicConfig(
@@ -91,7 +99,24 @@ def get_analysis_context(
 
     Raises:
         RuntimeError: If analysis fails
+        PathTraversalError: If path is outside allowed directories
+        FileSizeError: If file exceeds size limits
     """
+    # Validate and sanitize binary path (SECURITY FIX)
+    # TODO: Configure allowed_dirs from a config file
+    # For now, allow any directory but still validate the path exists and is a file
+    try:
+        validated_path = sanitize_binary_path(
+            binary_path,
+            allowed_dirs=None,  # None = allow any directory (can be restricted in production)
+            max_size_bytes=500 * 1024 * 1024  # 500MB max
+        )
+        # Use string representation for consistency with rest of codebase
+        binary_path = str(validated_path)
+    except (PathTraversalError, FileSizeError, FileNotFoundError, ValueError) as e:
+        logger.error(f"Path validation failed: {e}")
+        raise RuntimeError(f"Invalid binary path: {e}")
+
     # Check cache first (skip cache if processor/loader specified)
     if not force_reanalyze and not processor and not loader:
         cached_context = cache.get_cached(binary_path)

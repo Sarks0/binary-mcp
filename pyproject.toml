@@ -3,7 +3,7 @@ name = "binary-mcp"
 version = "0.2.0"
 description = "MCP server for comprehensive binary analysis - static (Ghidra) and dynamic (x64dbg)"
 authors = [
-    {name = "Rinzler", email = "rinzler@example.com"}
+    {name = "Sarks0", email = "Sarks0@users.noreply.github.com"}
 ]
 readme = "README.md"
 requires-python = ">=3.12"

@@ -464,3 +464,276 @@ class X64DbgBridge(Debugger):
             return True
         except Exception:
             return False
+
+    def dump_memory(self, address: str, size: int, output_file: str) -> bool:
+        """
+        Dump memory region to file.
+
+        Args:
+            address: Start address (hex string)
+            size: Number of bytes to dump
+            output_file: Path to save dumped memory
+
+        Returns:
+            True if dump successful
+
+        Note:
+            Requires C++ plugin implementation of /api/memory/dump
+        """
+        if address.startswith("0x"):
+            address = address[2:]
+
+        data = {
+            "address": address,
+            "size": size
+        }
+
+        result = self._request("/api/memory/dump", data)
+        hex_data = result.get("data", "")
+
+        # Convert hex string to bytes and write to file
+        memory_bytes = bytes.fromhex(hex_data)
+        with open(output_file, 'wb') as f:
+            f.write(memory_bytes)
+
+        logger.info(f"Dumped {len(memory_bytes)} bytes to {output_file}")
+        return True
+
+    def search_memory(self, pattern: str, memory_region: str = "all") -> list[dict[str, str]]:
+        """
+        Search memory for byte pattern.
+
+        Args:
+            pattern: Hex pattern to search for (e.g., "90 90 90" or "909090")
+            memory_region: Region to search ("all", "executable", "writable")
+
+        Returns:
+            List of addresses where pattern was found
+
+        Note:
+            Requires C++ plugin implementation of /api/memory/search
+        """
+        # Normalize pattern
+        hex_pattern = pattern.replace(" ", "").replace("0x", "")
+
+        data = {
+            "pattern": hex_pattern,
+            "region": memory_region
+        }
+
+        result = self._request("/api/memory/search", data)
+        matches = result.get("matches", [])
+
+        logger.debug(f"Found {len(matches)} matches for pattern {pattern}")
+        return matches
+
+    def get_memory_map(self) -> list[dict[str, Any]]:
+        """
+        Get memory map showing all regions.
+
+        Returns:
+            List of memory region dictionaries with base, size, permissions
+
+        Note:
+            Requires C++ plugin implementation of /api/memory/map
+        """
+        result = self._request("/api/memory/map")
+        regions = result.get("regions", [])
+
+        logger.debug(f"Got {len(regions)} memory regions")
+        return regions
+
+    def get_memory_info(self, address: str) -> dict[str, Any]:
+        """
+        Get information about memory at address.
+
+        Args:
+            address: Memory address to query
+
+        Returns:
+            Dictionary with base, size, permissions, type
+
+        Note:
+            Requires C++ plugin implementation of /api/memory/info
+        """
+        if address.startswith("0x"):
+            address = address[2:]
+
+        data = {"address": address}
+        result = self._request("/api/memory/info", data)
+
+        return {
+            "base": result.get("base", "unknown"),
+            "size": result.get("size", 0),
+            "permissions": result.get("permissions", "unknown"),
+            "type": result.get("type", "unknown"),
+            "module": result.get("module", "")
+        }
+
+    def get_instruction(self, address: str | None = None) -> dict[str, Any]:
+        """
+        Get current or specific instruction details.
+
+        Args:
+            address: Optional address (uses current RIP if None)
+
+        Returns:
+            Dictionary with address, bytes, mnemonic, operands, etc.
+
+        Note:
+            Requires C++ plugin implementation of /api/instruction
+        """
+        data = {}
+        if address:
+            if address.startswith("0x"):
+                address = address[2:]
+            data["address"] = address
+
+        result = self._request("/api/instruction", data)
+
+        return {
+            "address": result.get("address", "unknown"),
+            "bytes": result.get("bytes", ""),
+            "mnemonic": result.get("mnemonic", ""),
+            "operands": result.get("operands", ""),
+            "size": result.get("size", 0),
+            "type": result.get("type", "")  # "call", "jmp", "ret", etc.
+        }
+
+    def evaluate_expression(self, expression: str) -> dict[str, Any]:
+        """
+        Evaluate expression (e.g., "[rsp+8]", "kernel32.CreateFileA").
+
+        Args:
+            expression: Expression to evaluate
+
+        Returns:
+            Dictionary with value and type
+
+        Note:
+            Requires C++ plugin implementation of /api/evaluate
+        """
+        data = {"expression": expression}
+        result = self._request("/api/evaluate", data)
+
+        return {
+            "value": result.get("value", "unknown"),
+            "type": result.get("type", "unknown"),
+            "valid": result.get("valid", False)
+        }
+
+    def set_comment(self, address: str, comment: str) -> bool:
+        """
+        Set comment at address.
+
+        Args:
+            address: Address for comment
+            comment: Comment text
+
+        Returns:
+            True if successful
+
+        Note:
+            Requires C++ plugin implementation of /api/comment/set
+        """
+        if address.startswith("0x"):
+            address = address[2:]
+
+        data = {
+            "address": address,
+            "comment": comment
+        }
+
+        self._request("/api/comment/set", data)
+        logger.debug(f"Set comment at {address}: {comment}")
+        return True
+
+    def get_comment(self, address: str) -> str:
+        """
+        Get comment at address.
+
+        Args:
+            address: Address to query
+
+        Returns:
+            Comment text or empty string
+
+        Note:
+            Requires C++ plugin implementation of /api/comment/get
+        """
+        if address.startswith("0x"):
+            address = address[2:]
+
+        data = {"address": address}
+        result = self._request("/api/comment/get", data)
+
+        return result.get("comment", "")
+
+    def get_module_imports(self, module_name: str) -> list[dict[str, str]]:
+        """
+        Get import table for module.
+
+        Args:
+            module_name: Module name (e.g., "malware.exe", "kernel32.dll")
+
+        Returns:
+            List of import entries with module, function, address
+
+        Note:
+            Requires C++ plugin implementation of /api/module/imports
+        """
+        data = {"module": module_name}
+        result = self._request("/api/module/imports", data)
+
+        imports = result.get("imports", [])
+        logger.debug(f"Got {len(imports)} imports for {module_name}")
+        return imports
+
+    def get_module_exports(self, module_name: str) -> list[dict[str, str]]:
+        """
+        Get export table for module.
+
+        Args:
+            module_name: Module name
+
+        Returns:
+            List of export entries with name, address, ordinal
+
+        Note:
+            Requires C++ plugin implementation of /api/module/exports
+        """
+        data = {"module": module_name}
+        result = self._request("/api/module/exports", data)
+
+        exports = result.get("exports", [])
+        logger.debug(f"Got {len(exports)} exports for {module_name}")
+        return exports
+
+    def set_hardware_breakpoint(self, address: str, hw_type: str = "execute", hw_size: int = 1) -> bool:
+        """
+        Set hardware breakpoint using debug registers.
+
+        Args:
+            address: Address for breakpoint
+            hw_type: Type ("execute", "read", "write", "access")
+            hw_size: Size in bytes (1, 2, 4, 8)
+
+        Returns:
+            True if successful
+
+        Note:
+            Requires C++ plugin implementation of /api/breakpoint/hardware
+            Uses DR0-DR7 registers (max 4 hardware breakpoints)
+        """
+        if address.startswith("0x"):
+            address = address[2:]
+
+        data = {
+            "address": address,
+            "type": hw_type,
+            "size": hw_size
+        }
+
+        self._request("/api/breakpoint/hardware", data)
+        logger.info(f"Set hardware breakpoint at {address} ({hw_type}, {hw_size} bytes)")
+        return True

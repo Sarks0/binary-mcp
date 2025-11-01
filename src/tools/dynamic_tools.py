@@ -412,4 +412,753 @@ def register_dynamic_tools(app: FastMCP) -> None:
             logger.error(f"x64dbg_run_to_address failed: {e}")
             return f"Error: {e}"
 
-    logger.info("Registered 14 dynamic analysis tools")
+    @app.tool()
+    def x64dbg_step_out() -> str:
+        """
+        Step out of current function.
+
+        Executes until the current function returns.
+
+        Returns:
+            Current execution state after returning
+
+        Example:
+            Useful for skipping over function internals
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            result = bridge.step_out()
+
+            return f"Stepped out of function\nCurrent address: 0x{result['address']}\nState: {result['state']}"
+
+        except Exception as e:
+            logger.error(f"x64dbg_step_out failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    def x64dbg_get_stack(depth: int = 20) -> str:
+        """
+        Get call stack trace.
+
+        Shows the chain of function calls leading to current location.
+
+        Args:
+            depth: Number of stack frames to retrieve (default: 20)
+
+        Returns:
+            Formatted call stack with return addresses
+
+        Example output:
+            Call Stack (20 frames):
+            ----------------------------------------
+            0. 0x00401234 (return to)
+            1. 0x00402000 (return to)
+            ...
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            frames = bridge.get_stack(depth)
+
+            if not frames:
+                return "No stack frames available"
+
+            result = [f"Call Stack ({len(frames)} frames):", "-" * 60]
+
+            for i, frame in enumerate(frames):
+                addr = frame.get("address", "unknown")
+                comment = frame.get("comment", "")
+                if comment:
+                    result.append(f"{i}. 0x{addr} ({comment})")
+                else:
+                    result.append(f"{i}. 0x{addr}")
+
+            return "\n".join(result)
+
+        except Exception as e:
+            logger.error(f"x64dbg_get_stack failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    def x64dbg_get_modules() -> str:
+        r"""
+        Get list of loaded modules/DLLs.
+
+        Shows all libraries loaded in the debugged process.
+
+        Returns:
+            List of modules with base address, size, and path
+
+        Example output:
+            Loaded Modules:
+            ----------------------------------------
+            malware.exe
+              Base: 0x00400000
+              Size: 0x00010000
+              Path: C:\malware.exe
+
+            kernel32.dll
+              Base: 0x76D00000
+              Size: 0x000C0000
+              Path: C:\Windows\System32\kernel32.dll
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            modules = bridge.get_modules()
+
+            if not modules:
+                return "No modules loaded"
+
+            result = ["Loaded Modules:", "-" * 60]
+
+            for mod in modules:
+                name = mod.get("name", "unknown")
+                base = mod.get("base", "unknown")
+                size = mod.get("size", "unknown")
+                path = mod.get("path", "")
+
+                result.append(f"\n{name}")
+                result.append(f"  Base: 0x{base}")
+                result.append(f"  Size: 0x{size}")
+                if path:
+                    result.append(f"  Path: {path}")
+
+            return "\n".join(result)
+
+        except Exception as e:
+            logger.error(f"x64dbg_get_modules failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    def x64dbg_get_threads() -> str:
+        """
+        Get list of process threads.
+
+        Shows all threads in the debugged process.
+
+        Returns:
+            List of threads with ID, entry point, and status
+
+        Example output:
+            Threads:
+            ----------------------------------------
+            Thread 1234 (Main)
+              Entry: 0x00401000
+              Status: Running
+
+            Thread 5678
+              Entry: 0x76D12340
+              Status: Suspended
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            threads = bridge.get_threads()
+
+            if not threads:
+                return "No threads found"
+
+            result = ["Threads:", "-" * 60]
+
+            for thread in threads:
+                tid = thread.get("id", "unknown")
+                entry = thread.get("entry", "unknown")
+                status = thread.get("status", "unknown")
+                is_main = thread.get("main", False)
+
+                main_marker = " (Main)" if is_main else ""
+                result.append(f"\nThread {tid}{main_marker}")
+                result.append(f"  Entry: 0x{entry}")
+                result.append(f"  Status: {status}")
+
+            return "\n".join(result)
+
+        except Exception as e:
+            logger.error(f"x64dbg_get_threads failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    def x64dbg_write_memory(address: str, data: str) -> str:
+        """
+        Write bytes to process memory.
+
+        Modify memory in the debugged process.
+
+        Args:
+            address: Memory address to write to (hex string)
+            data: Hex string of bytes to write (e.g., "90 90 90" for 3 NOPs)
+
+        Returns:
+            Confirmation message
+
+        Example:
+            x64dbg_write_memory("0x00401000", "90 90 90")  # Write 3 NOP instructions
+            x64dbg_write_memory("0x00402000", "C3")        # Write RET instruction
+
+        Warning:
+            Writing to wrong addresses can crash the debugged process!
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+
+            # Parse hex string to bytes
+            hex_data = data.replace(" ", "").replace("0x", "")
+            byte_data = bytes.fromhex(hex_data)
+
+            bridge.write_memory(address, byte_data)
+
+            return f"Wrote {len(byte_data)} bytes to {address}\nData: {data}"
+
+        except ValueError as e:
+            return f"Error: Invalid hex data format. Use format like '90 90 90' or '909090'\nDetails: {e}"
+        except Exception as e:
+            logger.error(f"x64dbg_write_memory failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    def x64dbg_dump_memory(address: str, size: int, output_file: str) -> str:
+        """
+        Dump memory region to file.
+
+        Essential for unpacking malware and extracting payloads.
+
+        Args:
+            address: Start address (hex, e.g., "0x400000")
+            size: Number of bytes to dump
+            output_file: Path to save dumped memory (e.g., "/tmp/unpacked.bin")
+
+        Returns:
+            Confirmation with file path
+
+        Example:
+            x64dbg_dump_memory("0x400000", 4096, "/tmp/dump.bin")
+
+        Use Cases:
+            - Dump unpacked malware from memory
+            - Extract injected code
+            - Save decrypted payloads
+            - Reconstruct PE files
+
+        Note:
+            Requires x64dbg plugin C++ implementation
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            bridge.dump_memory(address, size, output_file)
+
+            return f"Memory dumped successfully\n" \
+                   f"Address: {address}\n" \
+                   f"Size: {size} bytes ({size / 1024:.2f} KB)\n" \
+                   f"Output: {output_file}"
+
+        except Exception as e:
+            logger.error(f"x64dbg_dump_memory failed: {e}")
+            if "Not yet implemented" in str(e):
+                return ("Error: Memory dump requires C++ plugin implementation\n"
+                        "This feature is planned but not yet available in the plugin.\n"
+                        "See FUTURE_FEATURES.md for implementation status.")
+            return f"Error: {e}"
+
+    @app.tool()
+    def x64dbg_search_memory(pattern: str, region: str = "all") -> str:
+        """
+        Search memory for byte pattern.
+
+        Find encryption keys, shellcode, or specific byte sequences.
+
+        Args:
+            pattern: Hex bytes to search for (e.g., "90 90 90" for NOPs)
+            region: Memory region ("all", "executable", "writable")
+
+        Returns:
+            List of addresses where pattern was found
+
+        Example:
+            x64dbg_search_memory("90 90 90")  # Find NOP sleds
+            x64dbg_search_memory("4D 5A", "executable")  # Find PE headers
+
+        Use Cases:
+            - Find encryption keys in memory
+            - Locate shellcode (NOP sleds, specific instructions)
+            - Search for strings/patterns
+            - Find injected code
+
+        Note:
+            Requires x64dbg plugin C++ implementation
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            matches = bridge.search_memory(pattern, region)
+
+            if not matches:
+                return f"No matches found for pattern: {pattern}"
+
+            result = [
+                "Memory Search Results:",
+                f"Pattern: {pattern}",
+                f"Region: {region}",
+                f"Found {len(matches)} match(es)",
+                "-" * 60
+            ]
+
+            for i, match in enumerate(matches[:50]):  # Limit to 50 results
+                addr = match.get("address", "unknown")
+                context = match.get("context", "")
+                result.append(f"{i+1}. 0x{addr} {context}")
+
+            if len(matches) > 50:
+                result.append(f"\n... and {len(matches) - 50} more matches")
+
+            return "\n".join(result)
+
+        except Exception as e:
+            logger.error(f"x64dbg_search_memory failed: {e}")
+            if "Not yet implemented" in str(e):
+                return ("Error: Memory search requires C++ plugin implementation\n"
+                        "This feature is planned but not yet available in the plugin.\n"
+                        "See FUTURE_FEATURES.md for implementation status.")
+            return f"Error: {e}"
+
+    @app.tool()
+    def x64dbg_get_memory_map() -> str:
+        """
+        Get memory map showing all regions.
+
+        Essential for understanding memory layout and finding code sections.
+
+        Returns:
+            List of memory regions with base address, size, permissions, and type
+
+        Example output:
+            Memory Map (15 regions):
+            ----------------------------------------
+            0x00400000  Size: 0x10000   RWX  Image (malware.exe)
+            0x76D00000  Size: 0xC0000   R-X  Image (kernel32.dll)
+            0x00B00000  Size: 0x1000    RW-  Private (Heap)
+
+        Use Cases:
+            - Find executable regions (potential unpacked code)
+            - Locate RWX regions (injected code)
+            - Understand memory layout
+            - Find heap/stack regions
+
+        Priority: P0 (Critical)
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            regions = bridge.get_memory_map()
+
+            if not regions:
+                return "No memory regions found"
+
+            result = [f"Memory Map ({len(regions)} regions):", "-" * 70]
+
+            for region in regions:
+                base = region.get("base", "unknown")
+                size = region.get("size", "0")
+                perms = region.get("permissions", "---")
+                reg_type = region.get("type", "unknown")
+                module = region.get("module", "")
+
+                size_kb = int(size, 16) // 1024 if size != "0" else 0
+                size_str = f"{size} ({size_kb} KB)" if size_kb > 0 else size
+
+                line = f"0x{base:}  Size: {size_str:20}  {perms:4}  {reg_type}"
+                if module:
+                    line += f" ({module})"
+                result.append(line)
+
+            return "\n".join(result)
+
+        except Exception as e:
+            logger.error(f"x64dbg_get_memory_map failed: {e}")
+            if "Not yet implemented" in str(e):
+                return ("Error: Memory map requires C++ plugin implementation\n"
+                        "This P0 feature is critical for analysis.\n"
+                        "See FUTURE_FEATURES.md for implementation status.")
+            return f"Error: {e}"
+
+    @app.tool()
+    def x64dbg_get_memory_info(address: str) -> str:
+        """
+        Get information about memory at specific address.
+
+        Check if address is readable/writable/executable before accessing.
+
+        Args:
+            address: Memory address to query (hex string)
+
+        Returns:
+            Memory region info including permissions and type
+
+        Example:
+            x64dbg_get_memory_info("0x00401000")
+
+        Use Cases:
+            - Check if address is valid before reading
+            - Verify write permissions before patching
+            - Find which module owns an address
+
+        Priority: P1 (High Value)
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            info = bridge.get_memory_info(address)
+
+            result = [
+                f"Memory Info for {address}:",
+                "-" * 60,
+                f"Base: 0x{info['base']}",
+                f"Size: 0x{info['size']:X} ({info['size']} bytes)",
+                f"Permissions: {info['permissions']}",
+                f"Type: {info['type']}"
+            ]
+
+            if info.get("module"):
+                result.append(f"Module: {info['module']}")
+
+            return "\n".join(result)
+
+        except Exception as e:
+            logger.error(f"x64dbg_get_memory_info failed: {e}")
+            if "Not yet implemented" in str(e):
+                return ("Error: Memory info requires C++ plugin implementation\n"
+                        "This P1 feature significantly improves workflow.\n"
+                        "See FUTURE_FEATURES.md for implementation status.")
+            return f"Error: {e}"
+
+    @app.tool()
+    def x64dbg_get_instruction(address: str = "") -> str:
+        """
+        Get current or specific instruction details.
+
+        Know exactly what instruction you're at and analyze it.
+
+        Args:
+            address: Optional address (uses current RIP if not specified)
+
+        Returns:
+            Instruction details including mnemonic, operands, bytes, type
+
+        Example output:
+            Instruction at 0x00401234:
+            Bytes: 48 8B 45 08
+            Mnemonic: mov
+            Operands: rax, [rbp+8]
+            Size: 4 bytes
+            Type: data_transfer
+
+        Use Cases:
+            - Know what instruction you're looking at
+            - Analyze instruction type (is it a call? jump? return?)
+            - See instruction bytes for pattern matching
+
+        Priority: P0 (Critical)
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            instr = bridge.get_instruction(address if address else None)
+
+            result = [
+                f"Instruction at 0x{instr['address']}:",
+                "-" * 60,
+                f"Bytes: {instr['bytes']}",
+                f"Mnemonic: {instr['mnemonic']}",
+                f"Operands: {instr['operands']}",
+                f"Size: {instr['size']} bytes"
+            ]
+
+            if instr.get("type"):
+                result.append(f"Type: {instr['type']}")
+
+            return "\n".join(result)
+
+        except Exception as e:
+            logger.error(f"x64dbg_get_instruction failed: {e}")
+            if "Not yet implemented" in str(e):
+                return ("Error: Get instruction requires C++ plugin implementation\n"
+                        "This P0 feature is critical for understanding execution.\n"
+                        "See FUTURE_FEATURES.md for implementation status.")
+            return f"Error: {e}"
+
+    @app.tool()
+    def x64dbg_evaluate_expression(expression: str) -> str:
+        """
+        Evaluate expression to get value.
+
+        Calculate addresses, resolve symbols, dereference pointers.
+
+        Args:
+            expression: Expression to evaluate (e.g., "[rsp+8]", "kernel32.CreateFileA", "rax+10")
+
+        Returns:
+            Evaluated value and type
+
+        Examples:
+            x64dbg_evaluate_expression("[rsp+8]")  # Dereference stack
+            x64dbg_evaluate_expression("kernel32.CreateFileA")  # Resolve symbol
+            x64dbg_evaluate_expression("rax+10")  # Calculate address
+
+        Use Cases:
+            - Calculate addresses dynamically
+            - Resolve API symbols to addresses
+            - Dereference pointers
+            - Evaluate stack/register expressions
+
+        Priority: P0 (Critical)
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            result_dict = bridge.evaluate_expression(expression)
+
+            if not result_dict.get("valid", False):
+                return f"Invalid expression: {expression}"
+
+            result = [
+                f"Expression: {expression}",
+                "-" * 60,
+                f"Value: {result_dict['value']}",
+                f"Type: {result_dict['type']}"
+            ]
+
+            return "\n".join(result)
+
+        except Exception as e:
+            logger.error(f"x64dbg_evaluate_expression failed: {e}")
+            if "Not yet implemented" in str(e):
+                return ("Error: Expression evaluation requires C++ plugin implementation\n"
+                        "This P0 feature is critical for address calculations.\n"
+                        "See FUTURE_FEATURES.md for implementation status.")
+            return f"Error: {e}"
+
+    @app.tool()
+    def x64dbg_set_comment(address: str, comment: str) -> str:
+        """
+        Set comment at address.
+
+        Document your findings during analysis.
+
+        Args:
+            address: Address for comment
+            comment: Comment text
+
+        Returns:
+            Confirmation message
+
+        Example:
+            x64dbg_set_comment("0x401000", "Entry point - checks debugger")
+            x64dbg_set_comment("0x402500", "Decryption routine for C2 address")
+
+        Use Cases:
+            - Document what code does
+            - Mark important locations
+            - Track analysis progress
+            - Share findings with team
+
+        Priority: P1 (High Value)
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            bridge.set_comment(address, comment)
+
+            return f"Comment set at {address}\n\"{comment}\""
+
+        except Exception as e:
+            logger.error(f"x64dbg_set_comment failed: {e}")
+            if "Not yet implemented" in str(e):
+                return ("Error: Set comment requires C++ plugin implementation\n"
+                        "This P1 feature improves documentation workflow.\n"
+                        "See FUTURE_FEATURES.md for implementation status.")
+            return f"Error: {e}"
+
+    @app.tool()
+    def x64dbg_get_comment(address: str) -> str:
+        """
+        Get comment at address.
+
+        Retrieve previously documented findings.
+
+        Args:
+            address: Address to query
+
+        Returns:
+            Comment text or message if none exists
+
+        Priority: P1 (High Value)
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            comment = bridge.get_comment(address)
+
+            if not comment:
+                return f"No comment at {address}"
+
+            return f"Comment at {address}:\n\"{comment}\""
+
+        except Exception as e:
+            logger.error(f"x64dbg_get_comment failed: {e}")
+            if "Not yet implemented" in str(e):
+                return ("Error: Get comment requires C++ plugin implementation\n"
+                        "This P1 feature improves documentation workflow.\n"
+                        "See FUTURE_FEATURES.md for implementation status.")
+            return f"Error: {e}"
+
+    @app.tool()
+    def x64dbg_get_module_imports(module_name: str) -> str:
+        """
+        Get import address table (IAT) for module.
+
+        See what Windows APIs the malware can call.
+
+        Args:
+            module_name: Module name (e.g., "malware.exe", "kernel32.dll")
+
+        Returns:
+            List of imported functions with addresses
+
+        Example output:
+            Imports for malware.exe (47 functions):
+            ----------------------------------------
+            kernel32.dll:
+              0x00401000  CreateFileA
+              0x00401004  WriteFile
+              0x00401008  ReadFile
+
+            advapi32.dll:
+              0x00401010  RegSetValueExA
+
+        Use Cases:
+            - Understand malware capabilities
+            - Find interesting API calls to breakpoint
+            - Identify suspicious imports
+            - Detect IAT hooking
+
+        Priority: P1 (High Value)
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            imports = bridge.get_module_imports(module_name)
+
+            if not imports:
+                return f"No imports found for {module_name}"
+
+            result = [f"Imports for {module_name} ({len(imports)} functions):", "-" * 70]
+
+            # Group by DLL
+            by_dll: dict[str, list] = {}
+            for imp in imports:
+                dll = imp.get("module", "unknown")
+                if dll not in by_dll:
+                    by_dll[dll] = []
+                by_dll[dll].append(imp)
+
+            for dll, funcs in by_dll.items():
+                result.append(f"\n{dll}:")
+                for func in funcs:
+                    addr = func.get("address", "unknown")
+                    name = func.get("function", "unknown")
+                    result.append(f"  0x{addr}  {name}")
+
+            return "\n".join(result)
+
+        except Exception as e:
+            logger.error(f"x64dbg_get_module_imports failed: {e}")
+            if "Not yet implemented" in str(e):
+                return ("Error: Module imports requires C++ plugin implementation\n"
+                        "This P1 feature is essential for capability analysis.\n"
+                        "See FUTURE_FEATURES.md for implementation status.")
+            return f"Error: {e}"
+
+    @app.tool()
+    def x64dbg_get_module_exports(module_name: str) -> str:
+        """
+        Get export address table (EAT) for module.
+
+        See what functions a DLL provides.
+
+        Args:
+            module_name: Module name (e.g., "kernel32.dll")
+
+        Returns:
+            List of exported functions with addresses and ordinals
+
+        Use Cases:
+            - See available DLL functions
+            - Find hooking targets
+            - Understand module capabilities
+
+        Priority: P1 (High Value)
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            exports = bridge.get_module_exports(module_name)
+
+            if not exports:
+                return f"No exports found for {module_name}"
+
+            result = [f"Exports for {module_name} ({len(exports)} functions):", "-" * 70]
+
+            for exp in exports:
+                addr = exp.get("address", "unknown")
+                name = exp.get("name", "unknown")
+                ordinal = exp.get("ordinal", "")
+
+                line = f"0x{addr}  {name}"
+                if ordinal:
+                    line += f" (ordinal {ordinal})"
+                result.append(line)
+
+            return "\n".join(result)
+
+        except Exception as e:
+            logger.error(f"x64dbg_get_module_exports failed: {e}")
+            if "Not yet implemented" in str(e):
+                return ("Error: Module exports requires C++ plugin implementation\n"
+                        "This P1 feature helps with module analysis.\n"
+                        "See FUTURE_FEATURES.md for implementation status.")
+            return f"Error: {e}"
+
+    @app.tool()
+    def x64dbg_set_hardware_bp(address: str, bp_type: str = "execute", size: int = 1) -> str:
+        """
+        Set hardware breakpoint using debug registers.
+
+        Stealth breakpoints that anti-debug malware can't detect via INT3 checks.
+
+        Args:
+            address: Address for breakpoint
+            bp_type: Type ("execute", "read", "write", "access")
+            size: Size in bytes (1, 2, 4, 8) - for memory breakpoints
+
+        Returns:
+            Confirmation message
+
+        Examples:
+            x64dbg_set_hardware_bp("0x401000", "execute")  # Break on execution
+            x64dbg_set_hardware_bp("0x500000", "write", 4)  # Break on 4-byte write
+
+        Use Cases:
+            - Bypass INT3 detection (malware scanning for 0xCC bytes)
+            - Set breakpoints on APIs without modifying code
+            - Monitor memory access (read/write breakpoints)
+            - Limited to 4 total hardware breakpoints (DR0-DR7)
+
+        Priority: P1 (High Value)
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            bridge.set_hardware_breakpoint(address, bp_type, size)
+
+            return (f"Hardware breakpoint set\n"
+                    f"Address: {address}\n"
+                    f"Type: {bp_type}\n"
+                    f"Size: {size} bytes\n\n"
+                    f"Note: Maximum 4 hardware breakpoints can be active.")
+
+        except Exception as e:
+            logger.error(f"x64dbg_set_hardware_bp failed: {e}")
+            if "Not yet implemented" in str(e):
+                return ("Error: Hardware breakpoints require C++ plugin implementation\n"
+                        "This P1 feature is essential for anti-debug bypass.\n"
+                        "See FUTURE_FEATURES.md for implementation status.")
+            return f"Error: {e}"
+
+    logger.info("Registered 30 dynamic analysis tools")

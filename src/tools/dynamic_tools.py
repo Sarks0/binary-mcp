@@ -412,4 +412,309 @@ def register_dynamic_tools(app: FastMCP) -> None:
             logger.error(f"x64dbg_run_to_address failed: {e}")
             return f"Error: {e}"
 
-    logger.info("Registered 14 dynamic analysis tools")
+    @app.tool()
+    def x64dbg_step_out() -> str:
+        """
+        Step out of current function.
+
+        Executes until the current function returns.
+
+        Returns:
+            Current execution state after returning
+
+        Example:
+            Useful for skipping over function internals
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            result = bridge.step_out()
+
+            return f"Stepped out of function\nCurrent address: 0x{result['address']}\nState: {result['state']}"
+
+        except Exception as e:
+            logger.error(f"x64dbg_step_out failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    def x64dbg_get_stack(depth: int = 20) -> str:
+        """
+        Get call stack trace.
+
+        Shows the chain of function calls leading to current location.
+
+        Args:
+            depth: Number of stack frames to retrieve (default: 20)
+
+        Returns:
+            Formatted call stack with return addresses
+
+        Example output:
+            Call Stack (20 frames):
+            ----------------------------------------
+            0. 0x00401234 (return to)
+            1. 0x00402000 (return to)
+            ...
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            frames = bridge.get_stack(depth)
+
+            if not frames:
+                return "No stack frames available"
+
+            result = [f"Call Stack ({len(frames)} frames):", "-" * 60]
+
+            for i, frame in enumerate(frames):
+                addr = frame.get("address", "unknown")
+                comment = frame.get("comment", "")
+                if comment:
+                    result.append(f"{i}. 0x{addr} ({comment})")
+                else:
+                    result.append(f"{i}. 0x{addr}")
+
+            return "\n".join(result)
+
+        except Exception as e:
+            logger.error(f"x64dbg_get_stack failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    def x64dbg_get_modules() -> str:
+        r"""
+        Get list of loaded modules/DLLs.
+
+        Shows all libraries loaded in the debugged process.
+
+        Returns:
+            List of modules with base address, size, and path
+
+        Example output:
+            Loaded Modules:
+            ----------------------------------------
+            malware.exe
+              Base: 0x00400000
+              Size: 0x00010000
+              Path: C:\malware.exe
+
+            kernel32.dll
+              Base: 0x76D00000
+              Size: 0x000C0000
+              Path: C:\Windows\System32\kernel32.dll
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            modules = bridge.get_modules()
+
+            if not modules:
+                return "No modules loaded"
+
+            result = ["Loaded Modules:", "-" * 60]
+
+            for mod in modules:
+                name = mod.get("name", "unknown")
+                base = mod.get("base", "unknown")
+                size = mod.get("size", "unknown")
+                path = mod.get("path", "")
+
+                result.append(f"\n{name}")
+                result.append(f"  Base: 0x{base}")
+                result.append(f"  Size: 0x{size}")
+                if path:
+                    result.append(f"  Path: {path}")
+
+            return "\n".join(result)
+
+        except Exception as e:
+            logger.error(f"x64dbg_get_modules failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    def x64dbg_get_threads() -> str:
+        """
+        Get list of process threads.
+
+        Shows all threads in the debugged process.
+
+        Returns:
+            List of threads with ID, entry point, and status
+
+        Example output:
+            Threads:
+            ----------------------------------------
+            Thread 1234 (Main)
+              Entry: 0x00401000
+              Status: Running
+
+            Thread 5678
+              Entry: 0x76D12340
+              Status: Suspended
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            threads = bridge.get_threads()
+
+            if not threads:
+                return "No threads found"
+
+            result = ["Threads:", "-" * 60]
+
+            for thread in threads:
+                tid = thread.get("id", "unknown")
+                entry = thread.get("entry", "unknown")
+                status = thread.get("status", "unknown")
+                is_main = thread.get("main", False)
+
+                main_marker = " (Main)" if is_main else ""
+                result.append(f"\nThread {tid}{main_marker}")
+                result.append(f"  Entry: 0x{entry}")
+                result.append(f"  Status: {status}")
+
+            return "\n".join(result)
+
+        except Exception as e:
+            logger.error(f"x64dbg_get_threads failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    def x64dbg_write_memory(address: str, data: str) -> str:
+        """
+        Write bytes to process memory.
+
+        Modify memory in the debugged process.
+
+        Args:
+            address: Memory address to write to (hex string)
+            data: Hex string of bytes to write (e.g., "90 90 90" for 3 NOPs)
+
+        Returns:
+            Confirmation message
+
+        Example:
+            x64dbg_write_memory("0x00401000", "90 90 90")  # Write 3 NOP instructions
+            x64dbg_write_memory("0x00402000", "C3")        # Write RET instruction
+
+        Warning:
+            Writing to wrong addresses can crash the debugged process!
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+
+            # Parse hex string to bytes
+            hex_data = data.replace(" ", "").replace("0x", "")
+            byte_data = bytes.fromhex(hex_data)
+
+            bridge.write_memory(address, byte_data)
+
+            return f"Wrote {len(byte_data)} bytes to {address}\nData: {data}"
+
+        except ValueError as e:
+            return f"Error: Invalid hex data format. Use format like '90 90 90' or '909090'\nDetails: {e}"
+        except Exception as e:
+            logger.error(f"x64dbg_write_memory failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    def x64dbg_dump_memory(address: str, size: int, output_file: str) -> str:
+        """
+        Dump memory region to file.
+
+        Essential for unpacking malware and extracting payloads.
+
+        Args:
+            address: Start address (hex, e.g., "0x400000")
+            size: Number of bytes to dump
+            output_file: Path to save dumped memory (e.g., "/tmp/unpacked.bin")
+
+        Returns:
+            Confirmation with file path
+
+        Example:
+            x64dbg_dump_memory("0x400000", 4096, "/tmp/dump.bin")
+
+        Use Cases:
+            - Dump unpacked malware from memory
+            - Extract injected code
+            - Save decrypted payloads
+            - Reconstruct PE files
+
+        Note:
+            Requires x64dbg plugin C++ implementation
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            bridge.dump_memory(address, size, output_file)
+
+            return f"Memory dumped successfully\n" \
+                   f"Address: {address}\n" \
+                   f"Size: {size} bytes ({size / 1024:.2f} KB)\n" \
+                   f"Output: {output_file}"
+
+        except Exception as e:
+            logger.error(f"x64dbg_dump_memory failed: {e}")
+            if "Not yet implemented" in str(e):
+                return ("Error: Memory dump requires C++ plugin implementation\n"
+                        "This feature is planned but not yet available in the plugin.\n"
+                        "See FUTURE_FEATURES.md for implementation status.")
+            return f"Error: {e}"
+
+    @app.tool()
+    def x64dbg_search_memory(pattern: str, region: str = "all") -> str:
+        """
+        Search memory for byte pattern.
+
+        Find encryption keys, shellcode, or specific byte sequences.
+
+        Args:
+            pattern: Hex bytes to search for (e.g., "90 90 90" for NOPs)
+            region: Memory region ("all", "executable", "writable")
+
+        Returns:
+            List of addresses where pattern was found
+
+        Example:
+            x64dbg_search_memory("90 90 90")  # Find NOP sleds
+            x64dbg_search_memory("4D 5A", "executable")  # Find PE headers
+
+        Use Cases:
+            - Find encryption keys in memory
+            - Locate shellcode (NOP sleds, specific instructions)
+            - Search for strings/patterns
+            - Find injected code
+
+        Note:
+            Requires x64dbg plugin C++ implementation
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            matches = bridge.search_memory(pattern, region)
+
+            if not matches:
+                return f"No matches found for pattern: {pattern}"
+
+            result = [
+                "Memory Search Results:",
+                f"Pattern: {pattern}",
+                f"Region: {region}",
+                f"Found {len(matches)} match(es)",
+                "-" * 60
+            ]
+
+            for i, match in enumerate(matches[:50]):  # Limit to 50 results
+                addr = match.get("address", "unknown")
+                context = match.get("context", "")
+                result.append(f"{i+1}. 0x{addr} {context}")
+
+            if len(matches) > 50:
+                result.append(f"\n... and {len(matches) - 50} more matches")
+
+            return "\n".join(result)
+
+        except Exception as e:
+            logger.error(f"x64dbg_search_memory failed: {e}")
+            if "Not yet implemented" in str(e):
+                return ("Error: Memory search requires C++ plugin implementation\n"
+                        "This feature is planned but not yet available in the plugin.\n"
+                        "See FUTURE_FEATURES.md for implementation status.")
+            return f"Error: {e}"
+
+    logger.info("Registered 21 dynamic analysis tools")

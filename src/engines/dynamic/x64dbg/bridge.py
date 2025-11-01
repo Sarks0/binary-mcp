@@ -464,3 +464,65 @@ class X64DbgBridge(Debugger):
             return True
         except Exception:
             return False
+
+    def dump_memory(self, address: str, size: int, output_file: str) -> bool:
+        """
+        Dump memory region to file.
+
+        Args:
+            address: Start address (hex string)
+            size: Number of bytes to dump
+            output_file: Path to save dumped memory
+
+        Returns:
+            True if dump successful
+
+        Note:
+            Requires C++ plugin implementation of /api/memory/dump
+        """
+        if address.startswith("0x"):
+            address = address[2:]
+
+        data = {
+            "address": address,
+            "size": size
+        }
+
+        result = self._request("/api/memory/dump", data)
+        hex_data = result.get("data", "")
+
+        # Convert hex string to bytes and write to file
+        memory_bytes = bytes.fromhex(hex_data)
+        with open(output_file, 'wb') as f:
+            f.write(memory_bytes)
+
+        logger.info(f"Dumped {len(memory_bytes)} bytes to {output_file}")
+        return True
+
+    def search_memory(self, pattern: str, memory_region: str = "all") -> list[dict[str, str]]:
+        """
+        Search memory for byte pattern.
+
+        Args:
+            pattern: Hex pattern to search for (e.g., "90 90 90" or "909090")
+            memory_region: Region to search ("all", "executable", "writable")
+
+        Returns:
+            List of addresses where pattern was found
+
+        Note:
+            Requires C++ plugin implementation of /api/memory/search
+        """
+        # Normalize pattern
+        hex_pattern = pattern.replace(" ", "").replace("0x", "")
+
+        data = {
+            "pattern": hex_pattern,
+            "region": memory_region
+        }
+
+        result = self._request("/api/memory/search", data)
+        matches = result.get("matches", [])
+
+        logger.debug(f"Found {len(matches)} matches for pattern {pattern}")
+        return matches

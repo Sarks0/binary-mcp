@@ -115,6 +115,31 @@ class GhidraRunner:
 
         return path
 
+    def _cleanup_project(self, project_dir: Path, project_name: str) -> None:
+        """
+        Clean up a Ghidra project directory and lock files.
+
+        Called when analysis fails or times out to prevent lock issues.
+        """
+        import shutil
+
+        project_path = project_dir / f"{project_name}.rep"
+        lock_file = project_dir / f"{project_name}.lock"
+
+        try:
+            # Remove lock file
+            if lock_file.exists():
+                lock_file.unlink()
+                logger.debug(f"Removed lock file: {lock_file}")
+
+            # Remove project directory
+            if project_path.exists():
+                shutil.rmtree(project_path, ignore_errors=True)
+                logger.debug(f"Removed project directory: {project_path}")
+
+        except Exception as e:
+            logger.warning(f"Failed to cleanup project {project_name}: {e}")
+
     def analyze(
         self,
         binary_path: str,
@@ -165,21 +190,22 @@ class GhidraRunner:
         env = os.environ.copy()
         env["GHIDRA_CONTEXT_JSON"] = str(output_path)
 
-        # Build command
+        # Build command - processor/loader must come immediately after binary path
         cmd = [
             self._get_analyze_headless_cmd(),
             str(project_dir),
             project_name,
             "-import", str(binary_path),
-            "-overwrite",
         ]
 
-        # Add processor/loader if specified (helps when AutoImporter fails)
+        # Add processor/loader if specified (must be before other flags)
         if processor:
             cmd.extend(["-processor", processor])
         if loader:
             cmd.extend(["-loader", loader])
 
+        # Add remaining flags
+        cmd.append("-overwrite")
         cmd.extend([
             "-scriptPath", str(script_path),
             "-postScript", script_name,
@@ -224,6 +250,10 @@ class GhidraRunner:
         except subprocess.TimeoutExpired as e:
             elapsed_time = time.time() - start_time
             logger.error(f"Analysis timeout after {elapsed_time:.2f}s")
+
+            # Clean up locked project to prevent future lock errors
+            self._cleanup_project(project_dir, project_name)
+
             raise RuntimeError(
                 f"Ghidra analysis timed out after {timeout}s. "
                 f"Binary may be too large or complex."
@@ -234,6 +264,10 @@ class GhidraRunner:
             logger.error(f"Analysis failed after {elapsed_time:.2f}s")
             logger.error(f"stdout: {e.stdout}")
             logger.error(f"stderr: {e.stderr}")
+
+            # Clean up locked project to prevent future lock errors
+            self._cleanup_project(project_dir, project_name)
+
             raise RuntimeError(
                 f"Ghidra analysis failed with exit code {e.returncode}. "
                 f"Check logs for details."

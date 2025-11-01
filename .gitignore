@@ -77,5 +77,8 @@ Thumbs.db
 # Backups
 *.md.bak
 
+# Documentation
+docs/
+
 # Other
 .claude/

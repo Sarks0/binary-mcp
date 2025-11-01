@@ -2,17 +2,159 @@
 #include "plugin.h"
 #include <sstream>
 #include <algorithm>
+#include <fstream>
+#include <random>
+#include <iomanip>
+#include <Windows.h>
+#include <wincrypt.h>
 
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "advapi32.lib")
 
 // Static members
 std::atomic<bool> HttpServer::s_running(false);
 std::thread HttpServer::s_thread;
 std::map<std::string, HttpServer::Handler> HttpServer::s_handlers;
 int HttpServer::s_port = 0;
+std::string HttpServer::s_auth_token;
+
+// Generate cryptographically secure random authentication token
+std::string HttpServer::GenerateAuthToken() {
+    HCRYPTPROV hProvider = 0;
+    const size_t TOKEN_BYTES = 32;  // 256 bits
+    unsigned char randomBytes[TOKEN_BYTES];
+
+    // Use Windows Crypto API for secure random generation
+    if (!CryptAcquireContext(&hProvider, nullptr, nullptr, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
+        LogError("CryptAcquireContext failed");
+        // Fallback to less secure method
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::uniform_int_distribution<> dis(0, 255);
+        for (size_t i = 0; i < TOKEN_BYTES; i++) {
+            randomBytes[i] = static_cast<unsigned char>(dis(gen));
+        }
+    } else {
+        if (!CryptGenRandom(hProvider, TOKEN_BYTES, randomBytes)) {
+            LogError("CryptGenRandom failed");
+            CryptReleaseContext(hProvider, 0);
+            // Fallback
+            std::random_device rd;
+            std::mt19937 gen(rd());
+            std::uniform_int_distribution<> dis(0, 255);
+            for (size_t i = 0; i < TOKEN_BYTES; i++) {
+                randomBytes[i] = static_cast<unsigned char>(dis(gen));
+            }
+        } else {
+            CryptReleaseContext(hProvider, 0);
+        }
+    }
+
+    // Convert to hex string
+    std::ostringstream oss;
+    for (size_t i = 0; i < TOKEN_BYTES; i++) {
+        oss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(randomBytes[i]);
+    }
+
+    return oss.str();
+}
+
+// Save authentication token to file for Python bridge to read
+void HttpServer::SaveTokenToFile(const std::string& token) {
+    char tempPath[MAX_PATH];
+    if (GetTempPathA(MAX_PATH, tempPath) == 0) {
+        LogError("Failed to get temp path");
+        return;
+    }
+
+    std::string tokenFile = std::string(tempPath) + "x64dbg_mcp_token.txt";
+    std::ofstream file(tokenFile, std::ios::out | std::ios::trunc);
+    if (!file.is_open()) {
+        LogError("Failed to create token file: %s", tokenFile.c_str());
+        return;
+    }
+
+    file << token;
+    file.close();
+
+    LogInfo("Authentication token saved to: %s", tokenFile.c_str());
+}
+
+// Extract HTTP header value
+std::string HttpServer::ExtractHeader(const std::string& request, const std::string& header) {
+    std::string headerLower = header;
+    std::transform(headerLower.begin(), headerLower.end(), headerLower.begin(), ::tolower);
+
+    std::istringstream iss(request);
+    std::string line;
+
+    // Skip request line
+    std::getline(iss, line);
+
+    // Parse headers
+    while (std::getline(iss, line)) {
+        if (line == "\r" || line.empty()) break;
+
+        size_t colonPos = line.find(':');
+        if (colonPos != std::string::npos) {
+            std::string key = line.substr(0, colonPos);
+            std::transform(key.begin(), key.end(), key.begin(), ::tolower);
+
+            if (key == headerLower) {
+                std::string value = line.substr(colonPos + 1);
+                // Trim whitespace
+                value.erase(0, value.find_first_not_of(" \t\r\n"));
+                value.erase(value.find_last_not_of(" \t\r\n") + 1);
+                return value;
+            }
+        }
+    }
+
+    return "";
+}
+
+// Validate authentication token (constant-time comparison)
+bool HttpServer::ValidateAuthToken(const std::string& request) {
+    std::string authHeader = ExtractHeader(request, "Authorization");
+    if (authHeader.empty()) {
+        LogDebug("Missing Authorization header");
+        return false;
+    }
+
+    // Expected format: "Bearer <token>"
+    const std::string bearerPrefix = "Bearer ";
+    if (authHeader.find(bearerPrefix) != 0) {
+        LogDebug("Invalid Authorization format");
+        return false;
+    }
+
+    std::string providedToken = authHeader.substr(bearerPrefix.length());
+
+    // Constant-time comparison to prevent timing attacks
+    if (providedToken.length() != s_auth_token.length()) {
+        return false;
+    }
+
+    volatile int result = 0;
+    for (size_t i = 0; i < providedToken.length(); i++) {
+        result |= providedToken[i] ^ s_auth_token[i];
+    }
+
+    return result == 0;
+}
+
+// Get current authentication token
+std::string HttpServer::GetAuthToken() {
+    return s_auth_token;
+}
 
 bool HttpServer::Initialize(int port) {
     s_port = port;
+
+    // Generate and save authentication token
+    s_auth_token = GenerateAuthToken();
+    SaveTokenToFile(s_auth_token);
+    LogInfo("Generated authentication token (%zu chars)", s_auth_token.length());
 
     // Initialize Winsock
     WSADATA wsaData;
@@ -89,14 +231,28 @@ void HttpServer::ServerThread(int port) {
         SOCKET clientSocket = accept(serverSocket, nullptr, nullptr);
         if (clientSocket == INVALID_SOCKET) continue;
 
-        // Receive request
-        char buffer[8192];
-        int received = recv(clientSocket, buffer, sizeof(buffer) - 1, 0);
-        if (received > 0) {
-            buffer[received] = '\0';
-            std::string request(buffer);
+        // Receive request (SECURITY: Use dynamic allocation to prevent buffer overflow)
+        const size_t INITIAL_BUFFER_SIZE = 8192;
+        const size_t MAX_REQUEST_SIZE = 1024 * 1024;  // 1MB max
+        std::vector<char> buffer(INITIAL_BUFFER_SIZE);
+        std::string request;
+        size_t totalReceived = 0;
 
-            LogDebug("Received request: %d bytes", received);
+        while (totalReceived < MAX_REQUEST_SIZE) {
+            int received = recv(clientSocket, buffer.data(), buffer.size(), 0);
+            if (received <= 0) break;
+
+            request.append(buffer.data(), received);
+            totalReceived += received;
+
+            // Check if we have complete HTTP request (ends with \r\n\r\n)
+            if (request.find("\r\n\r\n") != std::string::npos) {
+                break;
+            }
+        }
+
+        if (!request.empty()) {
+            LogDebug("Received request: %zu bytes", totalReceived);
 
             // Handle request
             std::string response = HandleRequest(request);
@@ -122,11 +278,25 @@ std::string HttpServer::HandleRequest(const std::string& request) {
     std::string corsHeaders =
         "Access-Control-Allow-Origin: *\r\n"
         "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-        "Access-Control-Allow-Headers: Content-Type\r\n";
+        "Access-Control-Allow-Headers: Content-Type, Authorization\r\n";
 
     // Handle OPTIONS (CORS preflight)
     if (method == "OPTIONS") {
         return "HTTP/1.1 200 OK\r\n" + corsHeaders + "\r\n";
+    }
+
+    // Validate authentication token (SECURITY: Prevent unauthorized access)
+    if (!ValidateAuthToken(request)) {
+        std::string body = Json::Object({
+            {"error", Json::String("Unauthorized - Invalid or missing authentication token")},
+            {"hint", Json::String("Include 'Authorization: Bearer <token>' header")}
+        });
+        return "HTTP/1.1 401 Unauthorized\r\n"
+               "Content-Type: application/json\r\n" +
+               corsHeaders +
+               "WWW-Authenticate: Bearer\r\n"
+               "Content-Length: " + std::to_string(body.size()) + "\r\n"
+               "\r\n" + body;
     }
 
     // Find handler

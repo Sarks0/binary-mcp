@@ -14,16 +14,22 @@ public:
     static bool Initialize(int port);
     static void Shutdown();
     static void RegisterEndpoint(const std::string& path, Handler handler);
+    static std::string GetAuthToken();  // Get current auth token
 
 private:
     static void ServerThread(int port);
     static std::string HandleRequest(const std::string& request);
     static std::string ParseJsonBody(const std::string& request);
+    static std::string GenerateAuthToken();  // Generate secure random token
+    static bool ValidateAuthToken(const std::string& request);  // Validate Authorization header
+    static std::string ExtractHeader(const std::string& request, const std::string& header);
+    static void SaveTokenToFile(const std::string& token);  // Save token for client
 
     static std::atomic<bool> s_running;
     static std::thread s_thread;
     static std::map<std::string, Handler> s_handlers;
     static int s_port;
+    static std::string s_auth_token;  // Authentication token
 };
 
 // JSON helper functions

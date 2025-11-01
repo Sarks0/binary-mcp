@@ -153,8 +153,8 @@ jobs:
 
         # Copy x64dbg plugins to dedicated directory
         mkdir -p "$PACKAGE_NAME/x64dbg-plugins"
-        cp release/x64dbg_mcp.dpx64 "$PACKAGE_NAME/x64dbg-plugins/"
-        cp release/x64dbg_mcp.dpx32 "$PACKAGE_NAME/x64dbg-plugins/"
+        cp release/x64dbg-plugins/x64dbg_mcp.dpx64 "$PACKAGE_NAME/x64dbg-plugins/"
+        cp release/x64dbg-plugins/x64dbg_mcp.dpx32 "$PACKAGE_NAME/x64dbg-plugins/"
 
         # Create installation instructions for plugins
         cat > "$PACKAGE_NAME/x64dbg-plugins/README.md" << 'EOF'

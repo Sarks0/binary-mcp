@@ -1,8 +1,12 @@
 """Security utilities for input validation and sanitization."""
 
+import logging
 import re
+import uuid
 from pathlib import Path
 from typing import List, Optional
+
+logger = logging.getLogger(__name__)
 
 
 class SecurityError(Exception):
@@ -259,3 +263,58 @@ def safe_regex_compile(pattern: str, max_length: int = 100):
         return re.compile(pattern, re.IGNORECASE)
     except re.error as e:
         raise ValueError(f"Invalid regex pattern: {e}")
+
+
+class UserFacingError(Exception):
+    """
+    Exception with separate user-facing and internal error messages.
+
+    Prevents information disclosure by showing safe messages to users
+    while logging detailed internal errors.
+    """
+
+    def __init__(self, user_message: str, internal_details: str = None):
+        """
+        Initialize user-facing error.
+
+        Args:
+            user_message: Safe message shown to user
+            internal_details: Detailed error info logged internally
+        """
+        super().__init__(user_message)
+        self.user_message = user_message
+        self.internal_details = internal_details
+        self.error_id = str(uuid.uuid4())[:8]
+
+        # Log internal details with error ID for tracking
+        if internal_details:
+            logger.error(f"Error {self.error_id}: {internal_details}")
+
+    def __str__(self):
+        return f"{self.user_message}\nReference ID: {self.error_id}"
+
+
+def safe_error_message(
+    user_message: str,
+    internal_details: Exception = None,
+    error_id: str = None
+) -> str:
+    """
+    Create a safe error message for users without exposing internals.
+
+    Args:
+        user_message: User-friendly error description
+        internal_details: Exception or details to log internally
+        error_id: Optional error ID (generated if not provided)
+
+    Returns:
+        Safe error message with reference ID
+    """
+    if error_id is None:
+        error_id = str(uuid.uuid4())[:8]
+
+    # Log internal details
+    if internal_details:
+        logger.error(f"Error {error_id}: {internal_details}", exc_info=True)
+
+    return f"Error: {user_message}\nReference ID: {error_id}\nPlease contact support with this reference ID."

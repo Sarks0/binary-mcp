@@ -1050,7 +1050,7 @@ def list_data_types(
 def start_analysis_session(
     binary_path: str,
     name: str,
-    tags: list[str] | None = None
+    tags: str | list[str] | None = None
 ) -> str:
     """
     Start a new analysis session to track all tool outputs.
@@ -1067,18 +1067,33 @@ def start_analysis_session(
         Session ID and instructions
     """
     try:
+        # Handle tags: accept either list or JSON string (for MCP client compatibility)
+        parsed_tags: list[str] = []
+        if tags:
+            if isinstance(tags, str):
+                # Parse JSON string to list
+                try:
+                    parsed_tags = json.loads(tags)
+                    if not isinstance(parsed_tags, list):
+                        raise ValueError("Tags must be a list")
+                except (json.JSONDecodeError, ValueError) as e:
+                    logger.warning(f"Failed to parse tags string: {e}. Using as single tag.")
+                    parsed_tags = [tags]
+            else:
+                parsed_tags = tags
+
         session_id = session_manager.start_session(
             binary_path=binary_path,
             name=name,
-            tags=tags or []
+            tags=parsed_tags
         )
 
         result = "**Analysis Session Started**\n\n"
         result += f"- **Session ID:** `{session_id}`\n"
         result += f"- **Name:** {name}\n"
         result += f"- **Binary:** {Path(binary_path).name}\n"
-        if tags:
-            result += f"- **Tags:** {', '.join(tags)}\n"
+        if parsed_tags:
+            result += f"- **Tags:** {', '.join(parsed_tags)}\n"
         result += "\n**Status:** All tool calls will now be automatically logged.\n\n"
         result += "**Next Steps:**\n"
         result += "1. Run analysis tools (analyze_binary, decompile_function, etc.)\n"

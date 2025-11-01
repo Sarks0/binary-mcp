@@ -4,7 +4,6 @@ import logging
 import re
 import uuid
 from pathlib import Path
-from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +25,7 @@ class FileSizeError(SecurityError):
 
 def sanitize_binary_path(
     binary_path: str,
-    allowed_dirs: Optional[List[Path]] = None,
+    allowed_dirs: list[Path] | None = None,
     max_size_bytes: int = 500 * 1024 * 1024  # 500MB default
 ) -> Path:
     """

@@ -5,7 +5,6 @@ Communicates with the x64dbg native plugin via HTTP API.
 """
 
 import logging
-import os
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -57,7 +56,7 @@ class X64DbgBridge(Debugger):
             )
 
         try:
-            with open(token_file, 'r') as f:
+            with open(token_file) as f:
                 token = f.read().strip()
 
             if not token:

@@ -22,14 +22,13 @@ from src.engines.static.ghidra.runner import GhidraRunner
 from src.tools.dynamic_tools import register_dynamic_tools
 from src.utils.patterns import APIPatterns, CryptoPatterns
 from src.utils.security import (
-    sanitize_binary_path,
-    validate_hex_address,
-    validate_numeric_range,
-    safe_regex_compile,
-    safe_error_message,
-    UserFacingError,
+    FileSizeError,
     PathTraversalError,
-    FileSizeError
+    UserFacingError,
+    safe_error_message,
+    safe_regex_compile,
+    sanitize_binary_path,
+    validate_numeric_range,
 )
 
 # Configure logging

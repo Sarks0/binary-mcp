@@ -1161,4 +1161,232 @@ def register_dynamic_tools(app: FastMCP) -> None:
                         "See FUTURE_FEATURES.md for implementation status.")
             return f"Error: {e}"
 
-    logger.info("Registered 30 dynamic analysis tools")
+    @app.tool()
+    def x64dbg_set_register(register: str, value: str) -> str:
+        """
+        Set register value.
+
+        Modify CPU register contents.
+
+        Args:
+            register: Register name (e.g., "rax", "eip", "rsp", "rflags")
+            value: New value (hex string, e.g., "0x401000" or "401000")
+
+        Returns:
+            Confirmation message
+
+        Examples:
+            x64dbg_set_register("rip", "0x401000")  # Jump to address
+            x64dbg_set_register("rax", "0")         # Clear RAX
+            x64dbg_set_register("rflags", "0x246")  # Modify flags
+
+        Use Cases:
+            - Modify execution flow (change RIP)
+            - Manipulate function parameters
+            - Control conditional branches (modify flags)
+            - Patch register values for testing
+
+        Priority: P0 (Critical)
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            bridge.set_register(register, value)
+
+            return f"Register {register.upper()} set to {value}"
+
+        except Exception as e:
+            logger.error(f"x64dbg_set_register failed: {e}")
+            if "Not yet implemented" in str(e):
+                return ("Error: Set register requires C++ plugin implementation\n"
+                        "This P0 feature is critical for register manipulation.\n"
+                        "See FUTURE_FEATURES.md for implementation status.")
+            return f"Error: {e}"
+
+    @app.tool()
+    def x64dbg_skip(count: int = 1) -> str:
+        """
+        Skip N instructions without executing them.
+
+        Advance RIP past instructions without running them.
+
+        Args:
+            count: Number of instructions to skip (default: 1)
+
+        Returns:
+            Confirmation with new address
+
+        Examples:
+            x64dbg_skip(1)   # Skip one instruction
+            x64dbg_skip(10)  # Skip 10 instructions
+
+        Use Cases:
+            - Skip anti-debug checks
+            - Bypass problematic code
+            - Skip over loops
+            - Avoid crashes during analysis
+
+        Priority: P1 (High Value)
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            bridge.skip_instruction(count)
+
+            location = bridge.get_current_location()
+            return f"Skipped {count} instruction(s)\nCurrent address: 0x{location['address']}"
+
+        except Exception as e:
+            logger.error(f"x64dbg_skip failed: {e}")
+            if "Not yet implemented" in str(e):
+                return ("Error: Skip instruction requires C++ plugin implementation\n"
+                        "This P1 feature is useful for bypassing code.\n"
+                        "See FUTURE_FEATURES.md for implementation status.")
+            return f"Error: {e}"
+
+    @app.tool()
+    def x64dbg_run_until_return() -> str:
+        """
+        Run until current function returns.
+
+        Execute until RET instruction encountered.
+
+        Returns:
+            Execution state after return
+
+        Use Cases:
+            - Skip to end of function
+            - Bypass complex function internals
+            - Return from function quickly
+
+        Priority: P1 (High Value)
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            result = bridge.run_until_return()
+
+            return f"Returned from function\nAddress: 0x{result['address']}\nState: {result['state']}"
+
+        except Exception as e:
+            logger.error(f"x64dbg_run_until_return failed: {e}")
+            if "Not yet implemented" in str(e):
+                return ("Error: Run until return requires C++ plugin implementation\n"
+                        "This P1 feature speeds up function analysis.\n"
+                        "See FUTURE_FEATURES.md for implementation status.")
+            return f"Error: {e}"
+
+    @app.tool()
+    def x64dbg_set_memory_bp(address: str, bp_type: str = "access", size: int = 1) -> str:
+        """
+        Set memory breakpoint.
+
+        Break on memory access/read/write/execute.
+
+        Args:
+            address: Memory address
+            bp_type: Type ("access", "read", "write", "execute")
+            size: Size in bytes (1, 2, 4, 8)
+
+        Returns:
+            Confirmation message
+
+        Examples:
+            x64dbg_set_memory_bp("0x500000", "write", 4)    # Break on 4-byte write
+            x64dbg_set_memory_bp("0x401000", "access", 1)   # Break on any access
+            x64dbg_set_memory_bp("0x600000", "read", 8)     # Break on 8-byte read
+
+        Use Cases:
+            - Monitor variable changes (write breakpoint)
+            - Track memory access patterns
+            - Find where data is used (read breakpoint)
+            - Detect code execution in data regions
+
+        Priority: P0 (Critical)
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            bridge.set_memory_breakpoint(address, bp_type, size)
+
+            return (f"Memory breakpoint set\n"
+                    f"Address: {address}\n"
+                    f"Type: {bp_type}\n"
+                    f"Size: {size} bytes")
+
+        except Exception as e:
+            logger.error(f"x64dbg_set_memory_bp failed: {e}")
+            if "Not yet implemented" in str(e):
+                return ("Error: Memory breakpoints require C++ plugin implementation\n"
+                        "This P0 feature is essential for monitoring memory access.\n"
+                        "See FUTURE_FEATURES.md for implementation status.")
+            return f"Error: {e}"
+
+    @app.tool()
+    def x64dbg_delete_memory_bp(address: str) -> str:
+        """
+        Delete memory breakpoint.
+
+        Remove memory breakpoint at address.
+
+        Args:
+            address: Address of breakpoint to delete
+
+        Returns:
+            Confirmation message
+
+        Priority: P0 (Critical)
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            bridge.delete_memory_breakpoint(address)
+
+            return f"Memory breakpoint deleted at {address}"
+
+        except Exception as e:
+            logger.error(f"x64dbg_delete_memory_bp failed: {e}")
+            if "Not yet implemented" in str(e):
+                return ("Error: Delete memory breakpoint requires C++ plugin implementation\n"
+                        "See FUTURE_FEATURES.md for implementation status.")
+            return f"Error: {e}"
+
+    @app.tool()
+    def x64dbg_hide_debugger() -> str:
+        """
+        Hide debugger presence in Process Environment Block.
+
+        Bypass IsDebuggerPresent and PEB-based anti-debug checks.
+
+        Returns:
+            Confirmation message
+
+        Use Cases:
+            - Analyze anti-debug malware
+            - Bypass IsDebuggerPresent checks
+            - Hide from PEB.BeingDebugged checks
+            - Essential for modern ransomware/packers
+
+        Anti-Debug Techniques Bypassed:
+            - IsDebuggerPresent() API
+            - PEB.BeingDebugged flag
+            - PEB.NtGlobalFlag checks
+
+        Priority: P0 (Critical - Anti-Debug)
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            bridge.hide_debugger_peb()
+
+            return ("Debugger hidden in PEB\n\n"
+                    "Bypassed:\n"
+                    "- IsDebuggerPresent()\n"
+                    "- PEB.BeingDebugged\n"
+                    "- PEB.NtGlobalFlag\n\n"
+                    "Note: Does not bypass all anti-debug techniques.\n"
+                    "Some malware uses additional checks (timing, exceptions, etc.)")
+
+        except Exception as e:
+            logger.error(f"x64dbg_hide_debugger failed: {e}")
+            if "Not yet implemented" in str(e):
+                return ("Error: Hide debugger requires C++ plugin implementation\n"
+                        "This P0 feature is CRITICAL for anti-debug malware.\n"
+                        "See FUTURE_FEATURES.md for implementation status.")
+            return f"Error: {e}"
+
+    logger.info("Registered 36 dynamic analysis tools")

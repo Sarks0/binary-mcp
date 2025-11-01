@@ -737,3 +737,131 @@ class X64DbgBridge(Debugger):
         self._request("/api/breakpoint/hardware", data)
         logger.info(f"Set hardware breakpoint at {address} ({hw_type}, {hw_size} bytes)")
         return True
+
+    def set_register(self, register: str, value: str) -> bool:
+        """
+        Set register value.
+
+        Args:
+            register: Register name (e.g., "rax", "eip", "rsp")
+            value: New value (hex string)
+
+        Returns:
+            True if successful
+
+        Note:
+            Requires C++ plugin implementation of /api/register/set
+        """
+        if value.startswith("0x"):
+            value = value[2:]
+
+        data = {
+            "register": register.lower(),
+            "value": value
+        }
+
+        self._request("/api/register/set", data)
+        logger.info(f"Set {register} = 0x{value}")
+        return True
+
+    def skip_instruction(self, count: int = 1) -> bool:
+        """
+        Skip N instructions without executing them.
+
+        Args:
+            count: Number of instructions to skip
+
+        Returns:
+            True if successful
+
+        Note:
+            Requires C++ plugin implementation of /api/skip
+            Advances RIP without executing instructions
+        """
+        data = {"count": count}
+        self._request("/api/skip", data)
+        logger.info(f"Skipped {count} instruction(s)")
+        return True
+
+    def run_until_return(self) -> dict[str, Any]:
+        """
+        Run until current function returns.
+
+        Returns:
+            Execution state after return
+
+        Note:
+            Requires C++ plugin implementation of /api/run_until_return
+        """
+        result = self._request("/api/run_until_return")
+
+        return {
+            "address": result.get("address", "unknown"),
+            "state": result.get("state", "paused")
+        }
+
+    def set_memory_breakpoint(self, address: str, bp_type: str = "access", size: int = 1) -> bool:
+        """
+        Set memory breakpoint.
+
+        Args:
+            address: Address for breakpoint
+            bp_type: Type ("access", "read", "write", "execute")
+            size: Size in bytes
+
+        Returns:
+            True if successful
+
+        Note:
+            Requires C++ plugin implementation of /api/breakpoint/memory
+        """
+        if address.startswith("0x"):
+            address = address[2:]
+
+        data = {
+            "address": address,
+            "type": bp_type,
+            "size": size
+        }
+
+        self._request("/api/breakpoint/memory", data)
+        logger.info(f"Set memory breakpoint at {address} ({bp_type}, {size} bytes)")
+        return True
+
+    def delete_memory_breakpoint(self, address: str) -> bool:
+        """
+        Delete memory breakpoint.
+
+        Args:
+            address: Address of breakpoint to delete
+
+        Returns:
+            True if successful
+
+        Note:
+            Requires C++ plugin implementation of /api/breakpoint/memory/delete
+        """
+        if address.startswith("0x"):
+            address = address[2:]
+
+        data = {"address": address}
+        self._request("/api/breakpoint/memory/delete", data)
+        logger.info(f"Deleted memory breakpoint at {address}")
+        return True
+
+    def hide_debugger_peb(self) -> bool:
+        """
+        Hide debugger presence in Process Environment Block.
+
+        Bypasses IsDebuggerPresent and PEB checks.
+
+        Returns:
+            True if successful
+
+        Note:
+            Requires C++ plugin implementation of /api/hide_debugger
+            Essential for anti-debug malware analysis
+        """
+        self._request("/api/hide_debugger")
+        logger.info("Debugger hidden in PEB")
+        return True

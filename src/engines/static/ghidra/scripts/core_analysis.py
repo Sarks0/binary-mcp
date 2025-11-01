@@ -42,7 +42,7 @@ def safe_unicode(value):
         # Last resort: convert to str first, then decode
         try:
             return str(value).decode('utf-8', 'replace')
-        except:
+        except (UnicodeDecodeError, AttributeError, TypeError):
             return u"<encoding_error>"
 
 

@@ -79,30 +79,30 @@ def extract_comprehensive_analysis():
     # Extract metadata
     print("[*] Extracting metadata...")
     context["metadata"] = {
-        "name": program.getName(),
-        "executable_path": program.getExecutablePath(),
-        "executable_format": program.getExecutableFormat(),
-        "language": str(program.getLanguage()),
-        "compiler": str(program.getCompilerSpec()),
-        "image_base": str(program.getImageBase()),
-        "min_address": str(program.getMinAddress()),
-        "max_address": str(program.getMaxAddress()),
-        "creation_date": str(program.getCreationDate()),
+        "name": safe_unicode(program.getName()),
+        "executable_path": safe_unicode(program.getExecutablePath()),
+        "executable_format": safe_unicode(program.getExecutableFormat()),
+        "language": safe_unicode(program.getLanguage()),
+        "compiler": safe_unicode(program.getCompilerSpec()),
+        "image_base": safe_unicode(program.getImageBase()),
+        "min_address": safe_unicode(program.getMinAddress()),
+        "max_address": safe_unicode(program.getMaxAddress()),
+        "creation_date": safe_unicode(program.getCreationDate()),
     }
 
     # Extract memory map
     print("[*] Extracting memory map...")
     for block in memory.getBlocks():
         block_info = {
-            "name": block.getName(),
-            "start": str(block.getStart()),
-            "end": str(block.getEnd()),
+            "name": safe_unicode(block.getName()),
+            "start": safe_unicode(block.getStart()),
+            "end": safe_unicode(block.getEnd()),
             "size": block.getSize(),
             "read": block.isRead(),
             "write": block.isWrite(),
             "execute": block.isExecute(),
             "initialized": block.isInitialized(),
-            "comment": block.getComment() if block.getComment() else ""
+            "comment": safe_unicode(block.getComment()) if block.getComment() else u""
         }
         context["memory_map"].append(block_info)
 
@@ -113,9 +113,9 @@ def extract_comprehensive_analysis():
         for symbol in symbol_table.getExternalSymbols(external_name):
             if symbol.getSymbolType() == SymbolType.FUNCTION:
                 import_info = {
-                    "library": external_name,
-                    "name": symbol.getName(),
-                    "address": str(symbol.getAddress()) if symbol.getAddress() else None,
+                    "library": safe_unicode(external_name),
+                    "name": safe_unicode(symbol.getName()),
+                    "address": safe_unicode(symbol.getAddress()) if symbol.getAddress() else None,
                     "ordinal": None  # Ordinals would need additional parsing
                 }
                 context["imports"].append(import_info)
@@ -129,9 +129,9 @@ def extract_comprehensive_analysis():
         symbols = symbol_table.getSymbols(address)
         for symbol in symbols:
             export_info = {
-                "name": symbol.getName(),
-                "address": str(address),
-                "type": str(symbol.getSymbolType())
+                "name": safe_unicode(symbol.getName()),
+                "address": safe_unicode(address),
+                "type": safe_unicode(symbol.getSymbolType())
             }
             context["exports"].append(export_info)
             break  # Usually only one export per address
@@ -151,15 +151,15 @@ def extract_comprehensive_analysis():
                 refs = []
                 for ref in reference_manager.getReferencesTo(data.getAddress()):
                     refs.append({
-                        "from": str(ref.getFromAddress()),
-                        "type": str(ref.getReferenceType())
+                        "from": safe_unicode(ref.getFromAddress()),
+                        "type": safe_unicode(ref.getReferenceType())
                     })
 
                 string_info = {
-                    "address": str(data.getAddress()),
+                    "address": safe_unicode(data.getAddress()),
                     "value": unicode_value[:1000],  # Limit string length
                     "length": len(unicode_value),
-                    "type": str(data.getDataType()),
+                    "type": safe_unicode(data.getDataType()),
                     "xrefs": refs[:50]  # Limit xrefs per string
                 }
                 context["strings"].append(string_info)
@@ -183,9 +183,9 @@ def extract_comprehensive_analysis():
 
         # Get basic info
         function_info = {
-            "name": function.getName(),
-            "address": str(entry_point),
-            "signature": str(signature),
+            "name": safe_unicode(function.getName()),
+            "address": safe_unicode(entry_point),
+            "signature": safe_unicode(signature),
             "is_thunk": function.isThunk(),
             "is_external": function.isExternal(),
             "parameters": [],
@@ -198,18 +198,18 @@ def extract_comprehensive_analysis():
         # Get parameters
         for param in function.getParameters():
             param_info = {
-                "name": param.getName(),
-                "datatype": str(param.getDataType()),
-                "storage": str(param.getVariableStorage()) if param.getVariableStorage() else None
+                "name": safe_unicode(param.getName()),
+                "datatype": safe_unicode(param.getDataType()),
+                "storage": safe_unicode(param.getVariableStorage()) if param.getVariableStorage() else None
             }
             function_info["parameters"].append(param_info)
 
         # Get local variables
         for var in function.getLocalVariables():
             var_info = {
-                "name": var.getName(),
-                "datatype": str(var.getDataType()),
-                "storage": str(var.getVariableStorage()) if var.getVariableStorage() else None
+                "name": safe_unicode(var.getName()),
+                "datatype": safe_unicode(var.getDataType()),
+                "storage": safe_unicode(var.getVariableStorage()) if var.getVariableStorage() else None
             }
             function_info["local_variables"].append(var_info)
 
@@ -217,8 +217,8 @@ def extract_comprehensive_analysis():
         called_functions = function.getCalledFunctions(monitor)
         for called in called_functions:
             function_info["called_functions"].append({
-                "name": called.getName(),
-                "address": str(called.getEntryPoint())
+                "name": safe_unicode(called.getName()),
+                "address": safe_unicode(called.getEntryPoint())
             })
 
         # Get basic blocks
@@ -228,13 +228,13 @@ def extract_comprehensive_analysis():
             while code_block_iterator.hasNext():
                 block = code_block_iterator.next()
                 block_info = {
-                    "start": str(block.getMinAddress()),
-                    "end": str(block.getMaxAddress()),
+                    "start": safe_unicode(block.getMinAddress()),
+                    "end": safe_unicode(block.getMaxAddress()),
                     "num_instructions": block.getNumAddresses()
                 }
                 function_info["basic_blocks"].append(block_info)
         except Exception as e:
-            print("    Warning: Could not extract basic blocks for {}: {}".format(function.getName(), str(e)))
+            print("    Warning: Could not extract basic blocks for {}: {}".format(safe_unicode(function.getName()), safe_unicode(e)))
 
         # Decompile function (for non-thunk, non-external functions)
         if not function.isThunk() and not function.isExternal():
@@ -243,9 +243,9 @@ def extract_comprehensive_analysis():
                 if decompile_results and decompile_results.decompileCompleted():
                     pseudocode = decompile_results.getDecompiledFunction()
                     if pseudocode:
-                        function_info["pseudocode"] = pseudocode.getC()
+                        function_info["pseudocode"] = safe_unicode(pseudocode.getC())
             except Exception as e:
-                print("    Warning: Could not decompile {}: {}".format(function.getName(), str(e)))
+                print("    Warning: Could not decompile {}: {}".format(safe_unicode(function.getName()), safe_unicode(e)))
 
         context["functions"].append(function_info)
 
@@ -256,7 +256,7 @@ def extract_comprehensive_analysis():
 
         if "Structure" in type_name:
             struct_info = {
-                "name": data_type.getName(),
+                "name": safe_unicode(data_type.getName()),
                 "length": data_type.getLength(),
                 "members": []
             }
@@ -264,10 +264,11 @@ def extract_comprehensive_analysis():
             # Get structure members
             if hasattr(data_type, 'getComponents'):
                 for component in data_type.getComponents():
+                    field_name = component.getFieldName() if component.getFieldName() else component.getDefaultFieldName()
                     member_info = {
-                        "name": component.getFieldName() if component.getFieldName() else component.getDefaultFieldName(),
+                        "name": safe_unicode(field_name),
                         "offset": component.getOffset(),
-                        "datatype": str(component.getDataType()),
+                        "datatype": safe_unicode(component.getDataType()),
                         "length": component.getLength()
                     }
                     struct_info["members"].append(member_info)
@@ -276,7 +277,7 @@ def extract_comprehensive_analysis():
 
         elif "Enum" in type_name:
             enum_info = {
-                "name": data_type.getName(),
+                "name": safe_unicode(data_type.getName()),
                 "length": data_type.getLength(),
                 "values": []
             }
@@ -285,7 +286,7 @@ def extract_comprehensive_analysis():
             if hasattr(data_type, 'getNames'):
                 for name in data_type.getNames():
                     enum_info["values"].append({
-                        "name": name,
+                        "name": safe_unicode(name),
                         "value": data_type.getValue(name)
                     })
 

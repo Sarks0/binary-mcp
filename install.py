@@ -103,19 +103,52 @@ def install_uv() -> bool:
     print_info("Installing uv package manager...")
 
     try:
-        # Use the official installer
-        cmd = "curl -LsSf https://astral.sh/uv/install.sh | sh"
-        subprocess.run(cmd, shell=True, check=True)
+        import urllib.request
+        import tempfile
+        import hashlib
 
-        # Update PATH for current session
-        uv_bin = Path.home() / ".local" / "bin"
-        if str(uv_bin) not in os.environ["PATH"]:
-            os.environ["PATH"] = f"{uv_bin}:{os.environ['PATH']}"
+        # Download installer script to temporary file
+        installer_url = "https://astral.sh/uv/install.sh"
 
-        print_success("uv installed successfully")
-        return True
+        print_info("Downloading uv installer...")
+        with tempfile.NamedTemporaryFile(mode='wb', suffix='.sh', delete=False) as tmp:
+            req = urllib.request.Request(
+                installer_url,
+                headers={'User-Agent': 'binary-mcp-installer/0.2.0'}
+            )
+
+            with urllib.request.urlopen(req, timeout=30) as response:
+                installer_content = response.read()
+                tmp.write(installer_content)
+                tmp_path = tmp.name
+
+        try:
+            # Set executable permissions
+            os.chmod(tmp_path, 0o700)
+
+            # Execute installer without shell=True (SECURE)
+            subprocess.run(['sh', tmp_path], check=True, shell=False)
+
+            # Update PATH for current session
+            uv_bin = Path.home() / ".local" / "bin"
+            if str(uv_bin) not in os.environ["PATH"]:
+                os.environ["PATH"] = f"{uv_bin}:{os.environ['PATH']}"
+
+            print_success("uv installed successfully")
+            return True
+
+        finally:
+            # Clean up temporary file
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
     except subprocess.CalledProcessError as e:
         print_error(f"Failed to install uv: {e}")
+        return False
+    except Exception as e:
+        print_error(f"Error during uv installation: {e}")
         return False
 
 def install_ghidra(install_dir: Path, skip_if_exists: bool = True) -> Optional[Path]:
@@ -151,23 +184,33 @@ def install_ghidra(install_dir: Path, skip_if_exists: bool = True) -> Optional[P
         version = release.get("tag_name", "unknown")
         print_info(f"Found Ghidra {version}")
 
-        # Download
-        temp_zip = Path("/tmp") / "ghidra.zip"
-        download_file(asset["browser_download_url"], temp_zip, f"Ghidra {version}")
+        # Download to secure temporary file
+        import tempfile
+        fd, temp_zip_path = tempfile.mkstemp(prefix="ghidra_", suffix=".zip")
+        os.close(fd)  # Close file descriptor, we just need the path
+        temp_zip = Path(temp_zip_path)
+        os.chmod(temp_zip, 0o600)  # Owner read/write only
 
-        # Extract
-        print_info("Extracting Ghidra...")
-        with zipfile.ZipFile(temp_zip, 'r') as zip_ref:
-            zip_ref.extractall(Path.home())
+        try:
+            download_file(asset["browser_download_url"], temp_zip, f"Ghidra {version}")
 
-        # Find extracted directory (format: ghidra_x.x.x_PUBLIC_YYYYMMDD)
-        extracted_dirs = list(Path.home().glob("ghidra_*_PUBLIC_*"))
-        if not extracted_dirs:
-            print_error("Could not find extracted Ghidra directory")
-            return None
+            # Extract
+            print_info("Extracting Ghidra...")
+            with zipfile.ZipFile(temp_zip, 'r') as zip_ref:
+                zip_ref.extractall(Path.home())
 
-        extracted_dir = extracted_dirs[0]
-        extracted_dir.rename(ghidra_dir)
+            # Find extracted directory (format: ghidra_x.x.x_PUBLIC_YYYYMMDD)
+            extracted_dirs = list(Path.home().glob("ghidra_*_PUBLIC_*"))
+            if not extracted_dirs:
+                print_error("Could not find extracted Ghidra directory")
+                return None
+
+            extracted_dir = extracted_dirs[0]
+            extracted_dir.rename(ghidra_dir)
+
+        finally:
+            # Clean up temporary file
+            temp_zip.unlink(missing_ok=True)
 
         print_success(f"Ghidra installed to: {ghidra_dir}")
 
@@ -238,22 +281,35 @@ def setup_project(install_dir: Path) -> bool:
 
 def download_as_zip(install_dir: Path) -> None:
     """Download project as ZIP file."""
+    import tempfile
+
     zip_url = "https://github.com/Sarks0/binary-mcp/archive/refs/heads/main.zip"
-    temp_zip = Path("/tmp") / "binary-mcp.zip"
 
-    download_file(zip_url, temp_zip, "project source")
+    # Create secure temporary file for zip
+    fd_zip, temp_zip_path = tempfile.mkstemp(prefix="binary-mcp_", suffix=".zip")
+    os.close(fd_zip)
+    temp_zip = Path(temp_zip_path)
+    os.chmod(temp_zip, 0o600)
 
-    print_info("Extracting...")
-    with zipfile.ZipFile(temp_zip, 'r') as zip_ref:
-        zip_ref.extractall("/tmp")
+    # Create secure temporary directory for extraction
+    temp_extract_dir = tempfile.mkdtemp(prefix="binary-mcp-extract_")
 
-    # Move contents
-    extracted = Path("/tmp/binary-mcp-main")
-    for item in extracted.iterdir():
-        shutil.move(str(item), str(install_dir / item.name))
+    try:
+        download_file(zip_url, temp_zip, "project source")
 
-    shutil.rmtree(extracted, ignore_errors=True)
-    temp_zip.unlink(missing_ok=True)
+        print_info("Extracting...")
+        with zipfile.ZipFile(temp_zip, 'r') as zip_ref:
+            zip_ref.extractall(temp_extract_dir)
+
+        # Move contents
+        extracted = Path(temp_extract_dir) / "binary-mcp-main"
+        for item in extracted.iterdir():
+            shutil.move(str(item), str(install_dir / item.name))
+
+    finally:
+        # Clean up temporary files
+        temp_zip.unlink(missing_ok=True)
+        shutil.rmtree(temp_extract_dir, ignore_errors=True)
 
 def install_dependencies(install_dir: Path) -> bool:
     """Install Python dependencies using uv."""

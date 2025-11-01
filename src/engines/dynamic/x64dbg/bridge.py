@@ -5,6 +5,7 @@ Communicates with the x64dbg native plugin via HTTP API.
 """
 
 import logging
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -30,8 +31,42 @@ class X64DbgBridge(Debugger):
         self.base_url = f"http://{host}:{port}"
         self.timeout = timeout
         self.connected = False
+        self._auth_token = None
 
         logger.info(f"Initialized x64dbg bridge: {self.base_url}")
+
+    def _read_auth_token(self) -> str | None:
+        """
+        Read authentication token from file created by x64dbg plugin.
+
+        Returns:
+            Authentication token or None if not found
+
+        Raises:
+            RuntimeError: If token file cannot be read
+        """
+        # Token file is created by x64dbg plugin in %TEMP%
+        temp_dir = tempfile.gettempdir()
+        token_file = Path(temp_dir) / "x64dbg_mcp_token.txt"
+
+        if not token_file.exists():
+            raise RuntimeError(
+                f"Authentication token file not found: {token_file}\n"
+                "Ensure x64dbg plugin is loaded and running."
+            )
+
+        try:
+            with open(token_file) as f:
+                token = f.read().strip()
+
+            if not token:
+                raise RuntimeError("Authentication token file is empty")
+
+            logger.debug(f"Read authentication token ({len(token)} chars)")
+            return token
+
+        except Exception as e:
+            raise RuntimeError(f"Failed to read authentication token: {e}")
 
     def _request(self, endpoint: str, data: dict[str, Any] | None = None) -> dict[str, Any]:
         """
@@ -46,15 +81,32 @@ class X64DbgBridge(Debugger):
 
         Raises:
             ConnectionError: If request fails
-            RuntimeError: If API returns error
+            RuntimeError: If API returns error or authentication fails
         """
         url = f"{self.base_url}{endpoint}"
 
+        # Read authentication token if not already cached
+        if self._auth_token is None:
+            try:
+                self._auth_token = self._read_auth_token()
+            except RuntimeError as e:
+                logger.error(f"Authentication failed: {e}")
+                raise ConnectionError(
+                    f"Cannot authenticate with x64dbg plugin: {e}\n"
+                    "Make sure the x64dbg plugin is loaded and running."
+                )
+
+        # Prepare headers with authentication
+        headers = {
+            "Authorization": f"Bearer {self._auth_token}",
+            "Content-Type": "application/json"
+        }
+
         try:
             if data is None:
-                response = requests.get(url, timeout=self.timeout)
+                response = requests.get(url, headers=headers, timeout=self.timeout)
             else:
-                response = requests.post(url, json=data, timeout=self.timeout)
+                response = requests.post(url, json=data, headers=headers, timeout=self.timeout)
 
             response.raise_for_status()
             result = response.json()
@@ -67,6 +119,14 @@ class X64DbgBridge(Debugger):
 
         except requests.RequestException as e:
             logger.error(f"HTTP request failed: {e}")
+
+            # Check if it's an authentication error
+            if hasattr(e, 'response') and e.response is not None and e.response.status_code == 401:
+                raise ConnectionError(
+                    "Authentication failed: Invalid or expired token.\n"
+                    "Try restarting x64dbg to generate a new token."
+                )
+
             raise ConnectionError(f"Failed to connect to x64dbg: {e}")
 
     def connect(self, timeout: int = 10) -> bool:

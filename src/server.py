@@ -21,6 +21,15 @@ from src.engines.static.ghidra.project_cache import ProjectCache
 from src.engines.static.ghidra.runner import GhidraRunner
 from src.tools.dynamic_tools import register_dynamic_tools
 from src.utils.patterns import APIPatterns, CryptoPatterns
+from src.utils.security import (
+    FileSizeError,
+    PathTraversalError,
+    UserFacingError,
+    safe_error_message,
+    safe_regex_compile,
+    sanitize_binary_path,
+    validate_numeric_range,
+)
 
 # Configure logging
 logging.basicConfig(
@@ -91,7 +100,24 @@ def get_analysis_context(
 
     Raises:
         RuntimeError: If analysis fails
+        PathTraversalError: If path is outside allowed directories
+        FileSizeError: If file exceeds size limits
     """
+    # Validate and sanitize binary path (SECURITY FIX)
+    # TODO: Configure allowed_dirs from a config file
+    # For now, allow any directory but still validate the path exists and is a file
+    try:
+        validated_path = sanitize_binary_path(
+            binary_path,
+            allowed_dirs=None,  # None = allow any directory (can be restricted in production)
+            max_size_bytes=500 * 1024 * 1024  # 500MB max
+        )
+        # Use string representation for consistency with rest of codebase
+        binary_path = str(validated_path)
+    except (PathTraversalError, FileSizeError, FileNotFoundError, ValueError) as e:
+        logger.error(f"Path validation failed: {e}")
+        raise RuntimeError(f"Invalid binary path: {e}")
+
     # Check cache first (skip cache if processor/loader specified)
     if not force_reanalyze and not processor and not loader:
         cached_context = cache.get_cached(binary_path)
@@ -137,12 +163,17 @@ def get_analysis_context(
 
         # Check if output file was created
         if not output_path.exists():
-            error_msg = f"Ghidra did not create output file: {output_path}\n"
-            error_msg += f"Check debug log at: {debug_file}\n\n"
-            error_msg += f"Ghidra stdout (last 500 chars):\n{result.get('stdout', 'N/A')[-500:]}\n\n"
-            error_msg += f"Ghidra stderr:\n{result.get('stderr', 'N/A')[-500:]}"
-            print(f"ERROR: {error_msg}", file=sys.stderr)
-            raise RuntimeError(error_msg)
+            # Log detailed error internally
+            internal_details = f"Ghidra did not create output file: {output_path}\n"
+            internal_details += f"Debug log: {debug_file}\n"
+            internal_details += f"Stdout: {result.get('stdout', 'N/A')[-500:]}\n"
+            internal_details += f"Stderr: {result.get('stderr', 'N/A')[-500:]}"
+
+            # Return safe user-facing error
+            raise UserFacingError(
+                "Analysis failed. This may be due to an unsupported binary format or corrupted file.",
+                internal_details=internal_details
+            )
 
         # Load analysis results
         with open(output_path) as f:
@@ -227,9 +258,16 @@ Use other tools like get_functions, get_imports, decompile_function to explore t
 """
         return summary
 
+    except UserFacingError as e:
+        # Return safe error with reference ID
+        return str(e)
+    except (PathTraversalError, FileSizeError) as e:
+        # Security errors - return safe message
+        return safe_error_message("Invalid binary file or path", e)
     except Exception as e:
-        logger.error(f"analyze_binary failed: {e}")
-        return f"Error: {e}"
+        # Unexpected error - log internally, return safe message
+        logger.exception(f"analyze_binary failed: {e}")
+        return safe_error_message("Analysis failed unexpectedly", e)
 
 
 @app.tool()
@@ -253,6 +291,9 @@ def get_functions(
         Formatted list of functions with addresses and signatures
     """
     try:
+        # Validate inputs (SECURITY FIX)
+        limit = validate_numeric_range(limit, 1, 10000, "limit")
+
         context = get_analysis_context(binary_path)
         functions = context.get("functions", [])
 
@@ -261,7 +302,8 @@ def get_functions(
             functions = [f for f in functions if not f.get('is_external', False)]
 
         if filter_name:
-            pattern = re.compile(filter_name, re.IGNORECASE)
+            # Use safe regex compilation to prevent ReDoS (SECURITY FIX)
+            pattern = safe_regex_compile(filter_name, max_length=200)
             functions = [f for f in functions if pattern.search(f.get('name', ''))]
 
         # Limit results
@@ -372,6 +414,10 @@ def get_strings(
         Formatted list of strings with addresses and xrefs
     """
     try:
+        # Validate inputs (SECURITY FIX)
+        min_length = validate_numeric_range(min_length, 1, 1000, "min_length")
+        limit = validate_numeric_range(limit, 1, 10000, "limit")
+
         context = get_analysis_context(binary_path)
         strings = context.get("strings", [])
 
@@ -379,7 +425,8 @@ def get_strings(
         strings = [s for s in strings if s.get('length', 0) >= min_length]
 
         if filter_pattern:
-            pattern = re.compile(filter_pattern, re.IGNORECASE)
+            # Use safe regex compilation to prevent ReDoS (SECURITY FIX)
+            pattern = safe_regex_compile(filter_pattern, max_length=200)
             strings = [s for s in strings if pattern.search(s.get('value', ''))]
 
         # Limit results

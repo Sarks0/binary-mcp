@@ -84,7 +84,7 @@ def get_analysis_context(
         binary_path: Path to binary file
         force_reanalyze: Force re-analysis even if cached
         processor: Optional processor specification (e.g., "x86:LE:64:default")
-        loader: Optional loader specification (e.g., "Portable Executable (PE)")
+        loader: Optional loader name (e.g., "PeLoader" for Windows PE, "ElfLoader" for Linux ELF)
 
     Returns:
         Analysis context dict
@@ -184,15 +184,18 @@ def analyze_binary(
         binary_path: Path to the binary file to analyze
         force_reanalyze: Force re-analysis even if cached (default: False)
         processor: Optional processor spec when AutoImporter fails (e.g., "x86:LE:64:default")
-        loader: Optional loader spec when AutoImporter fails (e.g., "Portable Executable (PE)")
+        loader: Optional loader name when AutoImporter fails (e.g., "PeLoader" for Windows PE)
 
     Returns:
         Analysis summary with basic statistics
 
     Note:
         If Ghidra's AutoImporter fails with "No load spec found", you can manually specify:
-        - For x86-64 Windows PE: processor="x86:LE:64:default", loader="Portable Executable (PE)"
-        - For x86-64 Linux ELF: processor="x86:LE:64:default", loader="Executable and Linking Format (ELF)"
+        - For x86-64 Windows PE: processor="x86:LE:64:default", loader="PeLoader"
+        - For x86-64 Linux ELF: processor="x86:LE:64:default", loader="ElfLoader"
+        - For macOS Mach-O: processor="x86:LE:64:default", loader="MachoLoader"
+
+        Common Ghidra loaders: PeLoader, ElfLoader, MachoLoader, BinaryLoader, CoffLoader
     """
     try:
         context = get_analysis_context(binary_path, force_reanalyze, processor, loader)

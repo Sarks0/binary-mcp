@@ -149,6 +149,7 @@ jobs:
           --exclude='.DS_Store' \
           --exclude='*.swp' \
           --exclude='.claude' \
+          --exclude='release' \
           . "$PACKAGE_NAME/"
 
         # Copy x64dbg plugins to dedicated directory

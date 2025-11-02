@@ -3,8 +3,8 @@
 #include <string>
 #include <functional>
 #include <map>
-#include <thread>
 #include <atomic>
+#include <Windows.h>
 
 // Simple HTTP server for MCP bridge API
 class HttpServer {
@@ -17,7 +17,7 @@ public:
     static std::string GetAuthToken();  // Get current auth token
 
 private:
-    static void ServerThread(int port);
+    static DWORD WINAPI ServerThread(LPVOID lpParam);  // Windows native thread
     static std::string HandleRequest(const std::string& request);
     static std::string ParseJsonBody(const std::string& request);
     static std::string GenerateAuthToken();  // Generate secure random token
@@ -29,7 +29,7 @@ private:
     // Static objects initialize during DLL_PROCESS_ATTACH which is too early and unsafe
     // Pointers are just NULL until we allocate them in Initialize()
     static std::atomic<bool>* s_running;
-    static std::thread* s_thread;
+    static HANDLE s_thread;  // Windows native thread handle (not std::thread)
     static std::map<std::string, Handler>* s_handlers;
     static int s_port;
     static std::string* s_auth_token;  // Authentication token

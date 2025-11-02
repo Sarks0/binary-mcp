@@ -13,7 +13,7 @@
 
 // Static members - use pointers to avoid construction during DLL load
 std::atomic<bool>* HttpServer::s_running = nullptr;
-std::thread* HttpServer::s_thread = nullptr;
+HANDLE HttpServer::s_thread = nullptr;  // Windows native thread handle
 std::map<std::string, HttpServer::Handler>* HttpServer::s_handlers = nullptr;
 int HttpServer::s_port = 0;
 std::string* HttpServer::s_auth_token = nullptr;
@@ -155,7 +155,6 @@ bool HttpServer::Initialize(int port) {
     try {
         // Allocate static members on heap (safe to do after DLL is loaded)
         if (!s_running) s_running = new std::atomic<bool>(false);
-        if (!s_thread) s_thread = new std::thread();
         if (!s_handlers) s_handlers = new std::map<std::string, Handler>();
         if (!s_auth_token) s_auth_token = new std::string();
 
@@ -172,9 +171,27 @@ bool HttpServer::Initialize(int port) {
         }
 
         *s_running = true;
-        *s_thread = std::thread(ServerThread, port);
 
-        LogInfo("HTTP server starting on port %d", port);
+        // Use Windows native CreateThread instead of std::thread
+        // This is more compatible with DLL contexts and avoids loader lock issues
+        DWORD threadId;
+        s_thread = CreateThread(
+            nullptr,                // Default security attributes
+            0,                      // Default stack size
+            ServerThread,           // Thread function
+            (LPVOID)(intptr_t)port, // Pass port as parameter
+            0,                      // Start immediately
+            &threadId               // Thread ID
+        );
+
+        if (s_thread == nullptr) {
+            LogError("CreateThread failed: %d", GetLastError());
+            *s_running = false;
+            WSACleanup();
+            return false;
+        }
+
+        LogInfo("HTTP server starting on port %d (thread ID: %d)", port, threadId);
         return true;
     }
     catch (const std::exception& e) {
@@ -190,18 +207,25 @@ bool HttpServer::Initialize(int port) {
 void HttpServer::Shutdown() {
     if (!s_running) return;
     *s_running = false;
-    if (s_thread && s_thread->joinable()) {
-        s_thread->join();
+
+    // Wait for thread to finish (with timeout)
+    if (s_thread != nullptr) {
+        DWORD waitResult = WaitForSingleObject(s_thread, 5000);  // 5 second timeout
+        if (waitResult == WAIT_TIMEOUT) {
+            LogError("HTTP server thread did not exit cleanly, terminating");
+            TerminateThread(s_thread, 1);
+        }
+        CloseHandle(s_thread);
+        s_thread = nullptr;
     }
+
     WSACleanup();
 
     // Clean up heap allocations
     delete s_running;
-    delete s_thread;
     delete s_handlers;
     delete s_auth_token;
     s_running = nullptr;
-    s_thread = nullptr;
     s_handlers = nullptr;
     s_auth_token = nullptr;
 }
@@ -212,13 +236,16 @@ void HttpServer::RegisterEndpoint(const std::string& path, Handler handler) {
     LogDebug("Registered endpoint: %s", path.c_str());
 }
 
-void HttpServer::ServerThread(int port) {
+DWORD WINAPI HttpServer::ServerThread(LPVOID lpParam) {
+    // Extract port from parameter
+    int port = (int)(intptr_t)lpParam;
+
     try {
         // Create socket
         SOCKET serverSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (serverSocket == INVALID_SOCKET) {
             LogError("Failed to create socket");
-            return;
+            return 1;
         }
 
     // Allow reuse
@@ -234,14 +261,14 @@ void HttpServer::ServerThread(int port) {
     if (bind(serverSocket, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
         LogError("Bind failed on port %d", port);
         closesocket(serverSocket);
-        return;
+        return 1;
     }
 
     // Listen
     if (listen(serverSocket, 5) == SOCKET_ERROR) {
         LogError("Listen failed");
         closesocket(serverSocket);
-        return;
+        return 1;
     }
 
     LogInfo("HTTP server listening on port %d", port);
@@ -297,10 +324,14 @@ void HttpServer::ServerThread(int port) {
     }
     catch (const std::exception& e) {
         LogError("HTTP server thread crashed: %s", e.what());
+        return 1;
     }
     catch (...) {
         LogError("HTTP server thread crashed: unknown error");
+        return 1;
     }
+
+    return 0;  // Success
 }
 
 std::string HttpServer::HandleRequest(const std::string& request) {

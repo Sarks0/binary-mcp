@@ -92,8 +92,8 @@ jobs:
         Write-Host "Preparing release artifacts..."
         New-Item -ItemType Directory -Force -Path release/x64dbg-plugins
 
-        Copy-Item src/engines/dynamic/x64dbg/plugin/build-x64/Release/x64dbg_mcp.dpx64 release/x64dbg-plugins/
-        Copy-Item src/engines/dynamic/x64dbg/plugin/build-x32/Release/x64dbg_mcp.dpx32 release/x64dbg-plugins/
+        Copy-Item src/engines/dynamic/x64dbg/plugin/build-x64/Release/x64dbg_mcp.dp64 release/x64dbg-plugins/
+        Copy-Item src/engines/dynamic/x64dbg/plugin/build-x32/Release/x64dbg_mcp.dp32 release/x64dbg-plugins/
 
         Write-Host "Artifacts prepared in release/x64dbg-plugins/"
         Get-ChildItem release/x64dbg-plugins/
@@ -157,8 +157,8 @@ jobs:
 
         # Copy x64dbg plugins to dedicated directory
         mkdir -p "$PACKAGE_NAME/x64dbg-plugins"
-        cp release/x64dbg-plugins/x64dbg_mcp.dpx64 "$PACKAGE_NAME/x64dbg-plugins/"
-        cp release/x64dbg-plugins/x64dbg_mcp.dpx32 "$PACKAGE_NAME/x64dbg-plugins/"
+        cp release/x64dbg-plugins/x64dbg_mcp.dp64 "$PACKAGE_NAME/x64dbg-plugins/"
+        cp release/x64dbg-plugins/x64dbg_mcp.dp32 "$PACKAGE_NAME/x64dbg-plugins/"
 
         # Create installation instructions for plugins
         cat > "$PACKAGE_NAME/x64dbg-plugins/README.md" << 'EOF'
@@ -166,8 +166,8 @@ jobs:
 
         Copy the plugin files to your x64dbg installation:
 
-        - `x64dbg_mcp.dpx64` → `x64dbg/x64/plugins/`
-        - `x64dbg_mcp.dpx32` → `x64dbg/x32/plugins/`
+        - `x64dbg_mcp.dp64` → `x64dbg/x64/plugins/`
+        - `x64dbg_mcp.dp32` → `x64dbg/x32/plugins/`
 
         Then restart x64dbg.
         EOF
@@ -188,8 +188,8 @@ jobs:
         This release includes everything you need:
         - **MCP Server source code** - Full binary analysis server
         - **Pre-built x64dbg plugins** - Ready-to-use debugger plugins in `x64dbg-plugins/` directory
-          - `x64dbg_mcp.dpx64` - 64-bit debugger plugin
-          - `x64dbg_mcp.dpx32` - 32-bit debugger plugin
+          - `x64dbg_mcp.dp64` - 64-bit debugger plugin
+          - `x64dbg_mcp.dp32` - 32-bit debugger plugin
 
         ### Installation
 

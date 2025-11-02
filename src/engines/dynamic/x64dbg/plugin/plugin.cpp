@@ -211,6 +211,60 @@ static bool SpawnHTTPServer() {
     return true;
 }
 
+// Menu callback handler (handles all menu entries)
+void MenuEntryCallback(CBTYPE cbType, PLUG_CB_MENUENTRY* info) {
+    switch (info->hEntry) {
+        case 0: {  // About
+            MessageBoxA(
+                nullptr,
+                "x64dbg MCP Bridge Plugin\n\n"
+                "Version: 1.0\n"
+                "Architecture: External Process\n\n"
+                "This plugin provides MCP (Model Context Protocol) integration\n"
+                "for x64dbg, allowing AI assistants to interact with the debugger.\n\n"
+                "Components:\n"
+                "- Named Pipe server in plugin DLL\n"
+                "- HTTP REST API server (external process)\n"
+                "- Crash-isolated architecture\n\n"
+                "Status: Server running on http://127.0.0.1:8765\n"
+                "Pipe: \\\\.\\pipe\\x64dbg_mcp",
+                "About x64dbg_mcp",
+                MB_OK | MB_ICONINFORMATION
+            );
+            break;
+        }
+
+        case 1: {  // Status
+            char statusMsg[512];
+
+            const char* pipeStatus = (g_pipeServer != INVALID_HANDLE_VALUE) ? "Connected" : "Disconnected";
+            const char* serverStatus = (g_serverProcess != nullptr) ? "Running" : "Not Running";
+            DWORD serverPid = 0;
+            if (g_serverProcess) {
+                serverPid = GetProcessId(g_serverProcess);
+            }
+
+            snprintf(statusMsg, sizeof(statusMsg),
+                "MCP Bridge Plugin Status\n\n"
+                "Plugin State: %s\n"
+                "Named Pipe: %s\n"
+                "HTTP Server: %s\n"
+                "Server PID: %lu\n"
+                "Server Port: 8765\n\n"
+                "Pipe Name: \\\\.\\pipe\\x64dbg_mcp\n"
+                "HTTP Endpoint: http://127.0.0.1:8765",
+                g_running ? "Running" : "Stopped",
+                pipeStatus,
+                serverStatus,
+                serverPid
+            );
+
+            MessageBoxA(nullptr, statusMsg, "x64dbg_mcp Status", MB_OK | MB_ICONINFORMATION);
+            break;
+        }
+    }
+}
+
 // Plugin initialization
 bool pluginInit(PLUG_INITSTRUCT* initStruct) {
     g_pluginHandle = initStruct->pluginHandle;
@@ -307,6 +361,9 @@ void pluginSetup() {
         LogError("Failed to spawn HTTP server");
         return;
     }
+
+    // Register menu callback
+    _plugin_registercallback(g_pluginHandle, CB_MENUENTRY, (CBPLUGIN)MenuEntryCallback);
 
     // Add menu items
     if (g_hMenu) {

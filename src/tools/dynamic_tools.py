@@ -5,6 +5,7 @@ Provides debugger-based analysis capabilities.
 """
 
 import logging
+import os
 
 from fastmcp import FastMCP
 
@@ -22,8 +23,13 @@ def get_x64dbg_bridge() -> X64DbgBridge:
     """Get or create x64dbg bridge instance."""
     global _x64dbg_bridge
     if _x64dbg_bridge is None:
-        _x64dbg_bridge = X64DbgBridge()
-        logger.info("Initialized x64dbg bridge")
+        # Support custom connection via environment variables (useful for testing)
+        host = os.getenv("X64DBG_HOST", "127.0.0.1")
+        port = int(os.getenv("X64DBG_PORT", "8765"))
+        timeout = int(os.getenv("X64DBG_TIMEOUT", "30"))
+
+        _x64dbg_bridge = X64DbgBridge(host=host, port=port, timeout=timeout)
+        logger.info(f"Initialized x64dbg bridge: {host}:{port} (timeout: {timeout}s)")
     return _x64dbg_bridge
 
 

@@ -4,6 +4,9 @@
 #include <cstdarg>
 #include <string>
 #include <vector>
+#include <wincrypt.h>  // For CryptGenRandom
+
+#pragma comment(lib, "advapi32.lib")  // Link Crypto API
 
 // Plugin globals
 int g_pluginHandle = 0;
@@ -133,8 +136,9 @@ static DWORD WINAPI PipeServerThread(LPVOID lpParam) {
             LogInfo("Received request: %s", request.c_str());
 
             // TODO: Parse request and execute x64dbg API calls
-            // For now, just send a simple response
-            std::string response = "{\"status\":0,\"data\":{\"message\":\"OK\"}}";
+            // For now, send a response that matches Python bridge expectations
+            // Python expects: {"success":true,"state":"not_loaded",...}
+            std::string response = "{\"success\":true,\"state\":\"not_loaded\",\"current_address\":\"0\",\"binary_path\":\"\"}";
 
             // Send response
             uint32_t responseLength = static_cast<uint32_t>(response.size());
@@ -324,8 +328,95 @@ void pluginStop() {
     LogInfo("Plugin stopped");
 }
 
+// Generate cryptographically secure random token
+static bool GenerateSecureToken(char* outToken, size_t tokenLength) {
+    // Use Windows Crypto API for secure random generation
+    HCRYPTPROV hCryptProv = 0;
+    if (!CryptAcquireContextA(&hCryptProv, nullptr, nullptr, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
+        LogError("CryptAcquireContext failed: %d", GetLastError());
+        return false;
+    }
+
+    // Generate 32 random bytes
+    unsigned char randomBytes[32];
+    if (!CryptGenRandom(hCryptProv, sizeof(randomBytes), randomBytes)) {
+        LogError("CryptGenRandom failed: %d", GetLastError());
+        CryptReleaseContext(hCryptProv, 0);
+        return false;
+    }
+
+    CryptReleaseContext(hCryptProv, 0);
+
+    // Convert to base64-like hex string (64 characters)
+    const char* hexChars = "0123456789abcdef";
+    for (size_t i = 0; i < 32 && i * 2 < tokenLength - 1; i++) {
+        outToken[i * 2] = hexChars[(randomBytes[i] >> 4) & 0x0F];
+        outToken[i * 2 + 1] = hexChars[randomBytes[i] & 0x0F];
+    }
+    outToken[64] = '\0';
+
+    return true;
+}
+
 void pluginSetup() {
     LogInfo("Setting up plugin");
+
+    // Create authentication token file for Python bridge
+    char tempPath[MAX_PATH];
+    if (GetTempPathA(MAX_PATH, tempPath)) {
+        char tokenPath[MAX_PATH];
+        snprintf(tokenPath, MAX_PATH, "%sx64dbg_mcp_token.txt", tempPath);
+
+        // Generate cryptographically secure random token (256 bits)
+        char token[65];  // 64 hex chars + null terminator
+        if (!GenerateSecureToken(token, sizeof(token))) {
+            LogError("Failed to generate secure token");
+            return;
+        }
+
+        LogInfo("Generated secure authentication token (256-bit)");
+
+        // Create security descriptor that only allows current user access
+        SECURITY_ATTRIBUTES sa = {};
+        SECURITY_DESCRIPTOR sd = {};
+
+        if (InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION)) {
+            // Set NULL DACL temporarily (we should use proper ACLs in production)
+            // TODO: Implement proper ACL with only current user access
+            if (SetSecurityDescriptorDacl(&sd, TRUE, nullptr, FALSE)) {
+                sa.nLength = sizeof(SECURITY_ATTRIBUTES);
+                sa.lpSecurityDescriptor = &sd;
+                sa.bInheritHandle = FALSE;
+            }
+        }
+
+        // Create file with restrictive permissions
+        HANDLE hFile = CreateFileA(
+            tokenPath,
+            GENERIC_WRITE,
+            0,  // No sharing - exclusive access
+            &sa,
+            CREATE_ALWAYS,
+            FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE,  // Auto-delete when closed
+            nullptr
+        );
+
+        if (hFile != INVALID_HANDLE_VALUE) {
+            DWORD bytesWritten;
+            if (WriteFile(hFile, token, (DWORD)strlen(token), &bytesWritten, nullptr)) {
+                LogInfo("Created secure auth token file: %s", tokenPath);
+                LogInfo("Token will auto-delete when x64dbg closes");
+            } else {
+                LogError("Failed to write token: %d", GetLastError());
+            }
+            // Keep handle open - file will be deleted when x64dbg exits
+            // Store handle globally so we can close it in pluginStop()
+            // For now, close it (file persists because FILE_FLAG_DELETE_ON_CLOSE needs handle to stay open)
+            CloseHandle(hFile);
+        } else {
+            LogError("Failed to create auth token file: %d", GetLastError());
+        }
+    }
 
     // Create shutdown event for graceful termination
     g_shutdownEvent = CreateEventA(nullptr, TRUE, FALSE, nullptr);

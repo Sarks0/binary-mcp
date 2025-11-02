@@ -25,11 +25,14 @@ private:
     static std::string ExtractHeader(const std::string& request, const std::string& header);
     static void SaveTokenToFile(const std::string& token);  // Save token for client
 
-    static std::atomic<bool> s_running;
-    static std::thread s_thread;
-    static std::map<std::string, Handler> s_handlers;
+    // CRITICAL: Use pointers instead of static objects
+    // Static objects initialize during DLL_PROCESS_ATTACH which is too early and unsafe
+    // Pointers are just NULL until we allocate them in Initialize()
+    static std::atomic<bool>* s_running;
+    static std::thread* s_thread;
+    static std::map<std::string, Handler>* s_handlers;
     static int s_port;
-    static std::string s_auth_token;  // Authentication token
+    static std::string* s_auth_token;  // Authentication token
 };
 
 // JSON helper functions

@@ -13,6 +13,9 @@ int g_hMenuDisasm = 0;
 int g_hMenuDump = 0;
 int g_hMenuStack = 0;
 
+// DLL module handle (saved from DllMain)
+static HMODULE g_hModule = nullptr;
+
 // Server process handle
 static HANDLE g_serverProcess = nullptr;
 static HANDLE g_pipeServer = INVALID_HANDLE_VALUE;
@@ -136,8 +139,8 @@ static DWORD WINAPI PipeServerThread(LPVOID lpParam) {
 static bool SpawnHTTPServer() {
     // Get plugin directory
     char pluginPath[MAX_PATH];
-    if (!GetModuleFileNameA((HMODULE)g_pluginHandle, pluginPath, MAX_PATH)) {
-        LogError("Failed to get plugin path");
+    if (!GetModuleFileNameA(g_hModule, pluginPath, MAX_PATH)) {
+        LogError("Failed to get plugin path: %d", GetLastError());
         return false;
     }
 
@@ -284,6 +287,7 @@ extern "C" __declspec(dllexport) void plugsetup(PLUG_SETUPSTRUCT* setupStruct) {
 // DLL entry point
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
     if (fdwReason == DLL_PROCESS_ATTACH) {
+        g_hModule = hinstDLL;  // Save module handle for later use
         DisableThreadLibraryCalls(hinstDLL);
     }
     return TRUE;

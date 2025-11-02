@@ -151,23 +151,33 @@ std::string HttpServer::GetAuthToken() {
 bool HttpServer::Initialize(int port) {
     s_port = port;
 
-    // Generate and save authentication token
-    s_auth_token = GenerateAuthToken();
-    SaveTokenToFile(s_auth_token);
-    LogInfo("Generated authentication token (%zu chars)", s_auth_token.length());
+    try {
+        // Generate and save authentication token
+        s_auth_token = GenerateAuthToken();
+        SaveTokenToFile(s_auth_token);
+        LogInfo("Generated authentication token (%zu chars)", s_auth_token.length());
 
-    // Initialize Winsock
-    WSADATA wsaData;
-    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-        LogError("WSAStartup failed");
+        // Initialize Winsock
+        WSADATA wsaData;
+        if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+            LogError("WSAStartup failed");
+            return false;
+        }
+
+        s_running = true;
+        s_thread = std::thread(ServerThread, port);
+
+        LogInfo("HTTP server starting on port %d", port);
+        return true;
+    }
+    catch (const std::exception& e) {
+        LogError("Failed to initialize HTTP server: %s", e.what());
         return false;
     }
-
-    s_running = true;
-    s_thread = std::thread(ServerThread, port);
-
-    LogInfo("HTTP server starting on port %d", port);
-    return true;
+    catch (...) {
+        LogError("Failed to initialize HTTP server: unknown error");
+        return false;
+    }
 }
 
 void HttpServer::Shutdown() {
@@ -184,12 +194,13 @@ void HttpServer::RegisterEndpoint(const std::string& path, Handler handler) {
 }
 
 void HttpServer::ServerThread(int port) {
-    // Create socket
-    SOCKET serverSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (serverSocket == INVALID_SOCKET) {
-        LogError("Failed to create socket");
-        return;
-    }
+    try {
+        // Create socket
+        SOCKET serverSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (serverSocket == INVALID_SOCKET) {
+            LogError("Failed to create socket");
+            return;
+        }
 
     // Allow reuse
     int opt = 1;
@@ -259,11 +270,18 @@ void HttpServer::ServerThread(int port) {
             send(clientSocket, response.c_str(), (int)response.size(), 0);
         }
 
-        closesocket(clientSocket);
-    }
+            closesocket(clientSocket);
+        }
 
-    closesocket(serverSocket);
-    LogInfo("HTTP server stopped");
+        closesocket(serverSocket);
+        LogInfo("HTTP server stopped");
+    }
+    catch (const std::exception& e) {
+        LogError("HTTP server thread crashed: %s", e.what());
+    }
+    catch (...) {
+        LogError("HTTP server thread crashed: unknown error");
+    }
 }
 
 std::string HttpServer::HandleRequest(const std::string& request) {

@@ -47,18 +47,7 @@ bool pluginInit(PLUG_INITSTRUCT* initStruct) {
     g_pluginHandle = initStruct->pluginHandle;
 
     LogInfo("Initializing MCP Bridge Plugin v%s", PLUGIN_VERSION_STR);
-
-    // Initialize HTTP server
-    if (!HttpServer::Initialize(8765)) {
-        LogError("Failed to initialize HTTP server");
-        return false;
-    }
-
-    // Register custom commands
-    Commands::RegisterAll();
-
-    LogInfo("Plugin initialized successfully");
-    LogInfo("HTTP API available at: http://localhost:8765");
+    LogInfo("Plugin initialized - waiting for setup phase");
 
     return true;
 }
@@ -73,7 +62,18 @@ void pluginStop() {
 }
 
 void pluginSetup() {
-    LogInfo("Setting up plugin UI");
+    LogInfo("Setting up plugin");
+
+    // Initialize HTTP server (safe to do after x64dbg is fully initialized)
+    if (!HttpServer::Initialize(8765)) {
+        LogError("Failed to initialize HTTP server");
+        return;
+    }
+
+    // Register custom commands
+    Commands::RegisterAll();
+
+    LogInfo("HTTP API available at: http://localhost:8765");
 
     // Add menu items if needed
     _plugin_menuaddentry(g_hMenu, 0, "&About");

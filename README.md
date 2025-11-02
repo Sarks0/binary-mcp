@@ -22,6 +22,8 @@ A Model Context Protocol (MCP) server that provides AI assistants with binary an
 2. **Java 21+** - Required by Ghidra
 3. **Python 3.12+**
 4. **x64dbg** (optional) - For dynamic analysis on Windows
+   - Requires x64dbg plugin (see [x64dbg plugin README](src/engines/dynamic/x64dbg/plugin/README.md))
+   - Uses external process architecture for stability
 
 ### Installation
 
@@ -178,6 +180,12 @@ delete_session("session-id")
 
 ### Dynamic Analysis (14 tools)
 
+**x64dbg Integration** - Uses external process architecture:
+- Plugin DLL (`x64dbg_mcp.dp64`) spawns HTTP server process
+- Named Pipe IPC for crash isolation
+- Server failures don't affect debugger
+- See [ARCHITECTURE.md](src/engines/dynamic/x64dbg/ARCHITECTURE.md) for details
+
 **Debugger Control:**
 - `x64dbg_connect`, `x64dbg_status`, `x64dbg_run`, `x64dbg_pause`
 - `x64dbg_step_into`, `x64dbg_step_over`
@@ -299,7 +307,11 @@ binary-mcp/
 │   │   │   ├── project_cache.py    # SHA256 caching
 │   │   │   └── scripts/
 │   │   │       └── core_analysis.py # Jython extraction
-│   │   └── dynamic/x64dbg/         # x64dbg integration
+│   │   └── dynamic/x64dbg/         # x64dbg integration (external process)
+│   │       ├── ARCHITECTURE.md     # Architecture documentation
+│   │       ├── pipe_protocol.h     # IPC protocol definitions
+│   │       ├── plugin/             # Plugin DLL (minimal stub)
+│   │       └── server/             # HTTP server (separate process)
 │   └── utils/
 │       ├── patterns.py             # API/crypto patterns
 │       └── session_manager.py      # Session storage

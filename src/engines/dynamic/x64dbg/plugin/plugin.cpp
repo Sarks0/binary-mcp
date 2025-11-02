@@ -185,7 +185,7 @@ static bool SpawnHTTPServer() {
 // Plugin initialization
 bool pluginInit(PLUG_INITSTRUCT* initStruct) {
     g_pluginHandle = initStruct->pluginHandle;
-    LogInfo("Initializing MCP Bridge Plugin v%s", PLUGIN_VERSION_STR);
+    LogInfo("Initializing MCP Bridge Plugin v%d", PLUGIN_VERSION);
     return true;
 }
 

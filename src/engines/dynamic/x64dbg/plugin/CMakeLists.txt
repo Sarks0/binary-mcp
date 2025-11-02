@@ -21,6 +21,21 @@ set(PLUGIN_SOURCES
     debugger_state.cpp
 )
 
+# Add x64dbg SDK bridge source if it exists
+# The bridge provides implementations for DbgIsDebugging, DbgIsRunning, etc.
+if(EXISTS "${X64DBG_SDK_PATH}/pluginsdk/_plugin_types.h")
+    # Modern SDK structure
+    if(EXISTS "${X64DBG_SDK_PATH}/pluginsdk/bridgemain.cpp")
+        list(APPEND PLUGIN_SOURCES "${X64DBG_SDK_PATH}/pluginsdk/bridgemain.cpp")
+        message(STATUS "Using SDK bridgemain.cpp")
+    elseif(EXISTS "${X64DBG_SDK_PATH}/pluginsdk/_plugins.cpp")
+        list(APPEND PLUGIN_SOURCES "${X64DBG_SDK_PATH}/pluginsdk/_plugins.cpp")
+        message(STATUS "Using SDK _plugins.cpp")
+    else()
+        message(WARNING "SDK bridge source file not found")
+    endif()
+endif()
+
 set(PLUGIN_HEADERS
     plugin.h
     http_server.h
@@ -38,26 +53,50 @@ target_include_directories(x64dbg_mcp PRIVATE
 )
 
 # Link against x64dbg SDK
-# Note: x64dbg plugin SDK provides stubs that resolve at runtime when loaded by x64dbg
+# Note: x64dbg plugin SDK provides bridge libraries that export plugin API functions
 target_link_libraries(x64dbg_mcp PRIVATE
     ws2_32  # Windows sockets
 )
 
-# Link x64dbg SDK library if it exists
-if(EXISTS "${X64DBG_SDK_PATH}/pluginsdk/x64_dbg.lib")
-    target_link_libraries(x64dbg_mcp PRIVATE "${X64DBG_SDK_PATH}/pluginsdk/x64_dbg.lib")
-elseif(EXISTS "${X64DBG_SDK_PATH}/pluginsdk/x64dbg.lib")
-    target_link_libraries(x64dbg_mcp PRIVATE "${X64DBG_SDK_PATH}/pluginsdk/x64dbg.lib")
-endif()
-
-# Platform-specific settings
+# Platform-specific settings MUST come before we try to link libraries
 if(CMAKE_SIZEOF_VOID_P EQUAL 8)
     set(PLUGIN_ARCH "64")
+    set(BRIDGE_ARCH "x64")
 else()
     set(PLUGIN_ARCH "32")
+    set(BRIDGE_ARCH "x32")
+endif()
+
+# Link x64dbg SDK bridge library - provides DbgIsDebugging, DbgIsRunning, etc.
+# Try multiple possible locations and names
+set(BRIDGE_LIB_FOUND FALSE)
+set(POSSIBLE_LIBS
+    "${X64DBG_SDK_PATH}/pluginsdk/${BRIDGE_ARCH}bridge.lib"
+    "${X64DBG_SDK_PATH}/pluginsdk/lib/${BRIDGE_ARCH}bridge.lib"
+    "${X64DBG_SDK_PATH}/pluginsdk/bridgemain.lib"
+    "${X64DBG_SDK_PATH}/${BRIDGE_ARCH}bridge.lib"
+)
+
+foreach(LIB_PATH ${POSSIBLE_LIBS})
+    if(EXISTS "${LIB_PATH}" AND NOT BRIDGE_LIB_FOUND)
+        message(STATUS "Found x64dbg bridge library: ${LIB_PATH}")
+        target_link_libraries(x64dbg_mcp PRIVATE "${LIB_PATH}")
+        set(BRIDGE_LIB_FOUND TRUE)
+    endif()
+endforeach()
+
+if(NOT BRIDGE_LIB_FOUND)
+    message(WARNING "x64dbg bridge library not found - plugin may fail to link")
+    message(WARNING "Searched locations: ${POSSIBLE_LIBS}")
+    # List SDK contents for debugging
+    if(EXISTS "${X64DBG_SDK_PATH}/pluginsdk")
+        file(GLOB SDK_CONTENTS "${X64DBG_SDK_PATH}/pluginsdk/*")
+        message(STATUS "SDK contents: ${SDK_CONTENTS}")
+    endif()
 endif()
 
 # Output name: x64dbg_mcp.dp64 or x64dbg_mcp.dp32
+# (PLUGIN_ARCH already set above for bridge library detection)
 set_target_properties(x64dbg_mcp PROPERTIES
     OUTPUT_NAME "x64dbg_mcp"
     SUFFIX ".dp${PLUGIN_ARCH}"

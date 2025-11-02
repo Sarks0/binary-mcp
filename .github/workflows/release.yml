@@ -48,7 +48,8 @@ jobs:
         Expand-Archive -Path sdk.zip -DestinationPath extern/x64dbg_sdk/pluginsdk -Force
 
         Write-Host "SDK ready at: extern/x64dbg_sdk/pluginsdk"
-        Get-ChildItem extern/x64dbg_sdk/pluginsdk | Select-Object -First 10
+        Write-Host "`nSDK contents:"
+        Get-ChildItem extern/x64dbg_sdk/pluginsdk -Recurse | Select-Object FullName, Length | Format-Table -AutoSize
 
     - name: Build x64 Plugin
       shell: pwsh

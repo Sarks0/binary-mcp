@@ -6,8 +6,10 @@ DebuggerState DebuggerState::Get() {
     DebuggerState state;
 
     // Use core x64dbg plugin API functions (available from _plugins.h)
-    // These are safe to call after plugin initialization
-    try {
+    // CRITICAL: Use SEH (__try/__except) not C++ try/catch
+    // C++ exceptions don't catch access violations (0xC0000005)
+    // We use /FORCE:UNRESOLVED so these functions might not be properly resolved
+    __try {
         state.isRunning = DbgIsRunning();
         state.binaryLoaded = DbgIsDebugging();
 
@@ -26,9 +28,10 @@ DebuggerState DebuggerState::Get() {
             state.binaryPath = "";  // Stub for now
         }
     }
-    catch (...) {
-        // Fallback if x64dbg API calls fail
-        LogError("Failed to get debugger state");
+    __except(GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ?
+             EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+        // Catch access violations from unresolved x64dbg API functions
+        LogError("Access violation calling x64dbg API (exception 0x%08X)", GetExceptionCode());
         state.state = "error";
         state.isRunning = false;
         state.binaryLoaded = false;

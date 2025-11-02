@@ -7,10 +7,10 @@
 #include <ws2tcpip.h>
 
 #include "pluginsdk/_plugins.h"
+#include "pluginsdk/bridgemain.h"  // Required for PLUG_SDKVERSION
 
 #define PLUGIN_NAME "x64dbg_mcp"
 #define PLUGIN_VERSION 1
-#define PLUGIN_VERSION_STR "0.1.0"
 
 // Plugin handles
 extern int g_pluginHandle;

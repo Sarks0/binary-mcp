@@ -20,6 +20,7 @@ static HMODULE g_hModule = nullptr;
 static HANDLE g_serverProcess = nullptr;
 static HANDLE g_pipeServer = INVALID_HANDLE_VALUE;
 static HANDLE g_pipeThread = nullptr;
+static HANDLE g_shutdownEvent = nullptr;  // Event to signal shutdown
 static bool g_running = false;
 
 // Logging helpers
@@ -46,10 +47,10 @@ static DWORD WINAPI PipeServerThread(LPVOID lpParam) {
     LogInfo("Named Pipe server thread starting...");
 
     while (g_running) {
-        // Create named pipe instance
+        // Create named pipe instance with FILE_FLAG_OVERLAPPED for async operations
         g_pipeServer = CreateNamedPipeA(
             Protocol::PIPE_NAME,
-            PIPE_ACCESS_DUPLEX,
+            PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
             PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
             1,  // Max instances
             Protocol::MAX_MESSAGE_SIZE,
@@ -65,16 +66,41 @@ static DWORD WINAPI PipeServerThread(LPVOID lpParam) {
 
         LogInfo("Waiting for HTTP server to connect...");
 
-        // Wait for client connection
-        BOOL connected = ConnectNamedPipe(g_pipeServer, nullptr);
-        if (!connected && GetLastError() != ERROR_PIPE_CONNECTED) {
-            LogError("ConnectNamedPipe failed: %d", GetLastError());
+        // Use overlapped I/O for interruptible ConnectNamedPipe
+        OVERLAPPED overlapped = {};
+        overlapped.hEvent = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+
+        BOOL connected = ConnectNamedPipe(g_pipeServer, &overlapped);
+        DWORD error = GetLastError();
+
+        if (!connected && error == ERROR_IO_PENDING) {
+            // Wait for connection or shutdown event
+            HANDLE waitHandles[2] = { overlapped.hEvent, g_shutdownEvent };
+            DWORD waitResult = WaitForMultipleObjects(2, waitHandles, FALSE, INFINITE);
+
+            if (waitResult == WAIT_OBJECT_0) {
+                // Connection succeeded
+                LogInfo("HTTP server connected to pipe");
+            } else {
+                // Shutdown event signaled
+                CancelIo(g_pipeServer);
+                CloseHandle(overlapped.hEvent);
+                CloseHandle(g_pipeServer);
+                g_pipeServer = INVALID_HANDLE_VALUE;
+                LogInfo("Pipe server thread shutting down (no connection)");
+                return 0;
+            }
+        } else if (!connected && error != ERROR_PIPE_CONNECTED) {
+            LogError("ConnectNamedPipe failed: %d", error);
+            CloseHandle(overlapped.hEvent);
             CloseHandle(g_pipeServer);
             g_pipeServer = INVALID_HANDLE_VALUE;
             continue;
+        } else {
+            LogInfo("HTTP server connected to pipe");
         }
 
-        LogInfo("HTTP server connected to pipe");
+        CloseHandle(overlapped.hEvent);
 
         // Handle requests from HTTP server
         while (g_running) {
@@ -198,23 +224,45 @@ void pluginStop() {
     // Stop pipe server
     g_running = false;
 
+    // Signal shutdown event to wake up pipe thread
+    if (g_shutdownEvent) {
+        SetEvent(g_shutdownEvent);
+    }
+
+    // Close pipe to force any pending I/O to complete
     if (g_pipeServer != INVALID_HANDLE_VALUE) {
         DisconnectNamedPipe(g_pipeServer);
         CloseHandle(g_pipeServer);
         g_pipeServer = INVALID_HANDLE_VALUE;
     }
 
+    // Wait for pipe thread to exit (should be quick now with shutdown event)
     if (g_pipeThread) {
-        WaitForSingleObject(g_pipeThread, 5000);
+        DWORD waitResult = WaitForSingleObject(g_pipeThread, 1000);
+        if (waitResult == WAIT_TIMEOUT) {
+            LogError("Pipe thread did not exit in time");
+        }
         CloseHandle(g_pipeThread);
         g_pipeThread = nullptr;
     }
 
-    // Terminate server process
+    // Cleanup shutdown event
+    if (g_shutdownEvent) {
+        CloseHandle(g_shutdownEvent);
+        g_shutdownEvent = nullptr;
+    }
+
+    // Gracefully terminate server process (send Ctrl+C first)
     if (g_serverProcess) {
         LogInfo("Terminating HTTP server process...");
-        TerminateProcess(g_serverProcess, 0);
-        WaitForSingleObject(g_serverProcess, 5000);
+
+        // Try graceful shutdown first
+        if (!GenerateConsoleCtrlEvent(CTRL_C_EVENT, GetProcessId(g_serverProcess))) {
+            // If that fails, terminate forcefully
+            TerminateProcess(g_serverProcess, 0);
+        }
+
+        WaitForSingleObject(g_serverProcess, 2000);
         CloseHandle(g_serverProcess);
         g_serverProcess = nullptr;
     }
@@ -224,6 +272,13 @@ void pluginStop() {
 
 void pluginSetup() {
     LogInfo("Setting up plugin");
+
+    // Create shutdown event for graceful termination
+    g_shutdownEvent = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+    if (!g_shutdownEvent) {
+        LogError("Failed to create shutdown event: %d", GetLastError());
+        return;
+    }
 
     // Start Named Pipe server thread (safe to do here - no loader lock issues)
     g_running = true;
@@ -239,6 +294,8 @@ void pluginSetup() {
 
     if (!g_pipeThread) {
         LogError("Failed to create pipe server thread: %d", GetLastError());
+        CloseHandle(g_shutdownEvent);
+        g_shutdownEvent = nullptr;
         return;
     }
 

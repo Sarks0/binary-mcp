@@ -218,6 +218,10 @@ bool StartHTTPServer(int port) {
     int optval = 1;
     setsockopt(listenSocket, SOL_SOCKET, SO_REUSEADDR, (const char*)&optval, sizeof(optval));
 
+    // Set socket to non-blocking mode for accept() timeout
+    u_long mode = 1;
+    ioctlsocket(listenSocket, FIONBIO, &mode);
+
     // Bind to port
     sockaddr_in serverAddr = {};
     serverAddr.sin_family = AF_INET;
@@ -245,11 +249,50 @@ bool StartHTTPServer(int port) {
         sockaddr_in clientAddr = {};
         int clientAddrLen = sizeof(clientAddr);
 
-        SOCKET clientSocket = accept(listenSocket, (sockaddr*)&clientAddr, &clientAddrLen);
-        if (clientSocket == INVALID_SOCKET) {
-            Log("Accept failed: %d", WSAGetLastError());
+        // Use select() for timeout on accept
+        fd_set readfds;
+        FD_ZERO(&readfds);
+        FD_SET(listenSocket, &readfds);
+
+        timeval timeout = {1, 0};  // 1 second timeout
+        int selectResult = select(0, &readfds, nullptr, nullptr, &timeout);
+
+        if (selectResult == SOCKET_ERROR) {
+            Log("Select failed: %d", WSAGetLastError());
+            break;
+        }
+
+        if (selectResult == 0) {
+            // Timeout - periodically check if plugin is still alive
+            std::string response;
+            if (!g_pipeClient.SendRequest("{\"type\":99}", response)) {
+                Log("Lost connection to plugin, exiting...");
+                break;
+            }
             continue;
         }
+
+        // Accept new connection
+        SOCKET clientSocket = accept(listenSocket, (sockaddr*)&clientAddr, &clientAddrLen);
+        if (clientSocket == INVALID_SOCKET) {
+            int error = WSAGetLastError();
+            if (error != WSAEWOULDBLOCK) {
+                Log("Accept failed: %d", error);
+            }
+            continue;
+        }
+
+        // Set client socket to blocking mode
+        mode = 0;
+        ioctlsocket(clientSocket, FIONBIO, &mode);
+
+        // Set receive timeout (5 seconds)
+        int recvTimeout = 5000;
+        setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&recvTimeout, sizeof(recvTimeout));
+
+        // Set send timeout (5 seconds)
+        int sendTimeout = 5000;
+        setsockopt(clientSocket, SOL_SOCKET, SO_SNDTIMEO, (const char*)&sendTimeout, sizeof(sendTimeout));
 
         // Read HTTP request
         char buffer[8192];
@@ -262,6 +305,8 @@ bool StartHTTPServer(int port) {
             // Handle request and send response
             std::string response = HandleHTTPRequest(request);
             send(clientSocket, response.c_str(), (int)response.size(), 0);
+        } else if (bytesRead == SOCKET_ERROR) {
+            Log("Recv failed: %d", WSAGetLastError());
         }
 
         closesocket(clientSocket);

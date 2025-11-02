@@ -259,6 +259,12 @@ void pluginSetup() {
 
 // Plugin exports (required by x64dbg)
 extern "C" __declspec(dllexport) bool pluginit(PLUG_INITSTRUCT* initStruct) {
+    // Initialize SDK version info (CRITICAL - x64dbg needs this!)
+    initStruct->pluginVersion = PLUGIN_VERSION;
+    initStruct->sdkVersion = PLUG_SDKVERSION;
+    strncpy_s(initStruct->pluginName, PLUGIN_NAME, _TRUNCATE);
+    g_pluginHandle = initStruct->pluginHandle;
+
     return pluginInit(initStruct);
 }
 

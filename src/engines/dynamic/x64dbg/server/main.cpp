@@ -7,7 +7,11 @@
 #include <atomic>
 #include <thread>
 #include <cstdarg>  // for va_list, va_start, va_end
+#include <fstream>
 #include "../pipe_protocol.h"
+
+// Global authentication token
+static std::string g_authToken;
 
 // Simple logging
 void Log(const char* format, ...) {
@@ -17,6 +21,93 @@ void Log(const char* format, ...) {
     vsnprintf(buffer, sizeof(buffer), format, args);
     va_end(args);
     std::cout << "[x64dbg_mcp_server] " << buffer << std::endl;
+}
+
+// Constant-time string comparison to prevent timing attacks
+bool SecureCompare(const char* a, const char* b, size_t len) {
+    volatile unsigned char result = 0;
+    for (size_t i = 0; i < len; i++) {
+        result |= a[i] ^ b[i];
+    }
+    return result == 0;
+}
+
+// Load authentication token from file
+bool LoadAuthToken() {
+    // Get temp directory
+    char tempPath[MAX_PATH];
+    if (!GetTempPathA(MAX_PATH, tempPath)) {
+        Log("Failed to get temp path: %d", GetLastError());
+        return false;
+    }
+
+    std::string tokenPath = std::string(tempPath) + "x64dbg_mcp_token.txt";
+    Log("Loading auth token from: %s", tokenPath.c_str());
+
+    // Read token from file
+    std::ifstream file(tokenPath);
+    if (!file.is_open()) {
+        Log("Failed to open token file - plugin may not be loaded");
+        return false;
+    }
+
+    std::getline(file, g_authToken);
+    file.close();
+
+    if (g_authToken.empty()) {
+        Log("Token file is empty");
+        return false;
+    }
+
+    Log("Auth token loaded (%zu bytes)", g_authToken.size());
+    return true;
+}
+
+// Validate Authorization header
+bool ValidateAuthHeader(const std::string& request) {
+    // If no token configured, skip validation (for backwards compatibility)
+    if (g_authToken.empty()) {
+        return true;
+    }
+
+    // Find Authorization header
+    size_t authPos = request.find("Authorization:");
+    if (authPos == std::string::npos) {
+        authPos = request.find("authorization:");  // case-insensitive
+    }
+
+    if (authPos == std::string::npos) {
+        Log("Missing Authorization header");
+        return false;
+    }
+
+    // Extract token from "Authorization: Bearer <token>"
+    size_t bearerPos = request.find("Bearer ", authPos);
+    if (bearerPos == std::string::npos) {
+        Log("Invalid Authorization format (expected 'Bearer <token>')");
+        return false;
+    }
+
+    bearerPos += 7;  // Skip "Bearer "
+    size_t tokenEnd = request.find('\r', bearerPos);
+    if (tokenEnd == std::string::npos) {
+        tokenEnd = request.find('\n', bearerPos);
+    }
+
+    std::string providedToken = request.substr(bearerPos, tokenEnd - bearerPos);
+
+    // Constant-time comparison to prevent timing attacks
+    if (providedToken.length() != g_authToken.length()) {
+        Log("Invalid token (wrong length)");
+        return false;
+    }
+
+    if (!SecureCompare(providedToken.c_str(), g_authToken.c_str(), g_authToken.length())) {
+        Log("Invalid token (mismatch)");
+        return false;
+    }
+
+    return true;
 }
 
 // Named Pipe client to communicate with plugin
@@ -150,6 +241,13 @@ std::string HandleHTTPRequest(const std::string& request) {
     std::string path = request.substr(methodEnd + 1, pathEnd - methodEnd - 1);
 
     Log("HTTP %s %s", method.c_str(), path.c_str());
+
+    // Validate authentication (except for OPTIONS preflight)
+    if (method != "OPTIONS" && !ValidateAuthHeader(request)) {
+        Log("Authentication failed for %s %s", method.c_str(), path.c_str());
+        return BuildHTTPResponse(401, "Unauthorized", "application/json",
+                                "{\"error\":\"Invalid or missing authentication token\"}");
+    }
 
     // Handle OPTIONS (CORS preflight)
     if (method == "OPTIONS") {
@@ -337,6 +435,12 @@ int main(int argc, char* argv[]) {
         Log("Failed to connect to plugin - make sure x64dbg is running with plugin loaded");
         WSACleanup();
         return 1;
+    }
+
+    // Load authentication token
+    if (!LoadAuthToken()) {
+        Log("Warning: Could not load auth token - authentication disabled");
+        Log("This is insecure! Make sure the x64dbg plugin is loaded.");
     }
 
     // Start HTTP server

@@ -45,9 +45,9 @@ target_link_libraries(x64dbg_mcp PRIVATE
 
 # Platform-specific settings
 if(CMAKE_SIZEOF_VOID_P EQUAL 8)
-    set(PLUGIN_ARCH "x64")
+    set(PLUGIN_ARCH "64")
 else()
-    set(PLUGIN_ARCH "x32")
+    set(PLUGIN_ARCH "32")
 endif()
 
 # Output name: x64dbg_mcp.dp64 or x64dbg_mcp.dp32

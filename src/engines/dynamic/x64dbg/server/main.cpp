@@ -120,27 +120,154 @@ public:
 // Global pipe client
 static PipeClient g_pipeClient;
 
-// HTTP Server stub (minimal for now - we'll add full implementation later)
-bool StartHTTPServer(int port) {
-    Log("HTTP server would start on port %d", port);
-    Log("(Full HTTP server implementation to be added)");
+// Simple HTTP response builder
+std::string BuildHTTPResponse(int statusCode, const std::string& statusText,
+                               const std::string& contentType, const std::string& body) {
+    std::string response = "HTTP/1.1 " + std::to_string(statusCode) + " " + statusText + "\r\n";
+    response += "Content-Type: " + contentType + "\r\n";
+    response += "Content-Length: " + std::to_string(body.size()) + "\r\n";
+    response += "Access-Control-Allow-Origin: *\r\n";
+    response += "Connection: close\r\n";
+    response += "\r\n";
+    response += body;
+    return response;
+}
 
-    // For now, just keep the process alive
-    Log("Press Ctrl+C to stop server");
+// HTTP request handler
+std::string HandleHTTPRequest(const std::string& request) {
+    // Parse HTTP method and path
+    size_t methodEnd = request.find(' ');
+    if (methodEnd == std::string::npos) {
+        return BuildHTTPResponse(400, "Bad Request", "text/plain", "Invalid HTTP request");
+    }
 
-    while (true) {
-        Sleep(1000);
+    std::string method = request.substr(0, methodEnd);
+    size_t pathEnd = request.find(' ', methodEnd + 1);
+    if (pathEnd == std::string::npos) {
+        return BuildHTTPResponse(400, "Bad Request", "text/plain", "Invalid HTTP request");
+    }
 
-        // Periodically ping the plugin to keep connection alive
-        std::string response;
-        if (g_pipeClient.SendRequest("{\"type\":99}", response)) {
-            // Successfully communicated with plugin
+    std::string path = request.substr(methodEnd + 1, pathEnd - methodEnd - 1);
+
+    Log("HTTP %s %s", method.c_str(), path.c_str());
+
+    // Handle OPTIONS (CORS preflight)
+    if (method == "OPTIONS") {
+        std::string response = "HTTP/1.1 200 OK\r\n";
+        response += "Access-Control-Allow-Origin: *\r\n";
+        response += "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n";
+        response += "Access-Control-Allow-Headers: Content-Type\r\n";
+        response += "Connection: close\r\n";
+        response += "\r\n";
+        return response;
+    }
+
+    // Handle GET /health
+    if (method == "GET" && path == "/health") {
+        return BuildHTTPResponse(200, "OK", "application/json",
+                                "{\"status\":\"ok\",\"message\":\"x64dbg MCP server running\"}");
+    }
+
+    // Handle GET /status
+    if (method == "GET" && path == "/status") {
+        // Send GET_STATE request to plugin
+        std::string pipeResponse;
+        if (g_pipeClient.SendRequest("{\"type\":1}", pipeResponse)) {
+            return BuildHTTPResponse(200, "OK", "application/json", pipeResponse);
         } else {
-            Log("Lost connection to plugin, exiting...");
-            return false;
+            return BuildHTTPResponse(500, "Internal Server Error", "application/json",
+                                   "{\"error\":\"Failed to communicate with x64dbg plugin\"}");
         }
     }
 
+    // Handle POST requests (extract JSON body and forward to plugin)
+    if (method == "POST") {
+        // Find body (after \r\n\r\n)
+        size_t bodyStart = request.find("\r\n\r\n");
+        if (bodyStart == std::string::npos) {
+            return BuildHTTPResponse(400, "Bad Request", "text/plain", "Missing request body");
+        }
+
+        std::string body = request.substr(bodyStart + 4);
+
+        // Forward to plugin via Named Pipe
+        std::string pipeResponse;
+        if (g_pipeClient.SendRequest(body, pipeResponse)) {
+            return BuildHTTPResponse(200, "OK", "application/json", pipeResponse);
+        } else {
+            return BuildHTTPResponse(500, "Internal Server Error", "application/json",
+                                   "{\"error\":\"Failed to communicate with x64dbg plugin\"}");
+        }
+    }
+
+    return BuildHTTPResponse(404, "Not Found", "text/plain", "Endpoint not found");
+}
+
+// HTTP Server implementation
+bool StartHTTPServer(int port) {
+    Log("Starting HTTP server on port %d...", port);
+
+    // Create listening socket
+    SOCKET listenSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (listenSocket == INVALID_SOCKET) {
+        Log("Failed to create socket: %d", WSAGetLastError());
+        return false;
+    }
+
+    // Allow port reuse
+    int optval = 1;
+    setsockopt(listenSocket, SOL_SOCKET, SO_REUSEADDR, (const char*)&optval, sizeof(optval));
+
+    // Bind to port
+    sockaddr_in serverAddr = {};
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_addr.s_addr = INADDR_ANY;
+    serverAddr.sin_port = htons(port);
+
+    if (bind(listenSocket, (sockaddr*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR) {
+        Log("Failed to bind to port %d: %d", port, WSAGetLastError());
+        closesocket(listenSocket);
+        return false;
+    }
+
+    // Listen for connections
+    if (listen(listenSocket, SOMAXCONN) == SOCKET_ERROR) {
+        Log("Failed to listen: %d", WSAGetLastError());
+        closesocket(listenSocket);
+        return false;
+    }
+
+    Log("HTTP server listening on http://127.0.0.1:%d", port);
+    Log("Press Ctrl+C to stop server");
+
+    // Accept and handle connections
+    while (true) {
+        sockaddr_in clientAddr = {};
+        int clientAddrLen = sizeof(clientAddr);
+
+        SOCKET clientSocket = accept(listenSocket, (sockaddr*)&clientAddr, &clientAddrLen);
+        if (clientSocket == INVALID_SOCKET) {
+            Log("Accept failed: %d", WSAGetLastError());
+            continue;
+        }
+
+        // Read HTTP request
+        char buffer[8192];
+        int bytesRead = recv(clientSocket, buffer, sizeof(buffer) - 1, 0);
+
+        if (bytesRead > 0) {
+            buffer[bytesRead] = '\0';
+            std::string request(buffer, bytesRead);
+
+            // Handle request and send response
+            std::string response = HandleHTTPRequest(request);
+            send(clientSocket, response.c_str(), (int)response.size(), 0);
+        }
+
+        closesocket(clientSocket);
+    }
+
+    closesocket(listenSocket);
     return true;
 }
 

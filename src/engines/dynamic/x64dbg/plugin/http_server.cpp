@@ -11,12 +11,12 @@
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "advapi32.lib")
 
-// Static members
-std::atomic<bool> HttpServer::s_running(false);
-std::thread HttpServer::s_thread;
-std::map<std::string, HttpServer::Handler> HttpServer::s_handlers;
+// Static members - use pointers to avoid construction during DLL load
+std::atomic<bool>* HttpServer::s_running = nullptr;
+std::thread* HttpServer::s_thread = nullptr;
+std::map<std::string, HttpServer::Handler>* HttpServer::s_handlers = nullptr;
 int HttpServer::s_port = 0;
-std::string HttpServer::s_auth_token;
+std::string* HttpServer::s_auth_token = nullptr;
 
 // Generate cryptographically secure random authentication token
 std::string HttpServer::GenerateAuthToken() {
@@ -131,13 +131,13 @@ bool HttpServer::ValidateAuthToken(const std::string& request) {
     std::string providedToken = authHeader.substr(bearerPrefix.length());
 
     // Constant-time comparison to prevent timing attacks
-    if (providedToken.length() != s_auth_token.length()) {
+    if (!s_auth_token || providedToken.length() != s_auth_token->length()) {
         return false;
     }
 
     volatile int result = 0;
     for (size_t i = 0; i < providedToken.length(); i++) {
-        result |= providedToken[i] ^ s_auth_token[i];
+        result |= providedToken[i] ^ (*s_auth_token)[i];
     }
 
     return result == 0;
@@ -145,17 +145,24 @@ bool HttpServer::ValidateAuthToken(const std::string& request) {
 
 // Get current authentication token
 std::string HttpServer::GetAuthToken() {
-    return s_auth_token;
+    if (!s_auth_token) return "";
+    return *s_auth_token;
 }
 
 bool HttpServer::Initialize(int port) {
     s_port = port;
 
     try {
+        // Allocate static members on heap (safe to do after DLL is loaded)
+        if (!s_running) s_running = new std::atomic<bool>(false);
+        if (!s_thread) s_thread = new std::thread();
+        if (!s_handlers) s_handlers = new std::map<std::string, Handler>();
+        if (!s_auth_token) s_auth_token = new std::string();
+
         // Generate and save authentication token
-        s_auth_token = GenerateAuthToken();
-        SaveTokenToFile(s_auth_token);
-        LogInfo("Generated authentication token (%zu chars)", s_auth_token.length());
+        *s_auth_token = GenerateAuthToken();
+        SaveTokenToFile(*s_auth_token);
+        LogInfo("Generated authentication token (%zu chars)", s_auth_token->length());
 
         // Initialize Winsock
         WSADATA wsaData;
@@ -164,8 +171,8 @@ bool HttpServer::Initialize(int port) {
             return false;
         }
 
-        s_running = true;
-        s_thread = std::thread(ServerThread, port);
+        *s_running = true;
+        *s_thread = std::thread(ServerThread, port);
 
         LogInfo("HTTP server starting on port %d", port);
         return true;
@@ -181,15 +188,27 @@ bool HttpServer::Initialize(int port) {
 }
 
 void HttpServer::Shutdown() {
-    s_running = false;
-    if (s_thread.joinable()) {
-        s_thread.join();
+    if (!s_running) return;
+    *s_running = false;
+    if (s_thread && s_thread->joinable()) {
+        s_thread->join();
     }
     WSACleanup();
+
+    // Clean up heap allocations
+    delete s_running;
+    delete s_thread;
+    delete s_handlers;
+    delete s_auth_token;
+    s_running = nullptr;
+    s_thread = nullptr;
+    s_handlers = nullptr;
+    s_auth_token = nullptr;
 }
 
 void HttpServer::RegisterEndpoint(const std::string& path, Handler handler) {
-    s_handlers[path] = handler;
+    if (!s_handlers) s_handlers = new std::map<std::string, Handler>();
+    (*s_handlers)[path] = handler;
     LogDebug("Registered endpoint: %s", path.c_str());
 }
 
@@ -228,7 +247,7 @@ void HttpServer::ServerThread(int port) {
     LogInfo("HTTP server listening on port %d", port);
 
     // Accept loop
-    while (s_running) {
+    while (s_running && *s_running) {
         // Set timeout for accept
         fd_set readfds;
         FD_ZERO(&readfds);
@@ -318,8 +337,20 @@ std::string HttpServer::HandleRequest(const std::string& request) {
     }
 
     // Find handler
-    auto it = s_handlers.find(path);
-    if (it == s_handlers.end()) {
+    if (!s_handlers) {
+        std::string body = Json::Object({
+            {"error", Json::String("Server not initialized")},
+            {"path", Json::String(path)}
+        });
+        return "HTTP/1.1 500 Internal Server Error\r\n"
+               "Content-Type: application/json\r\n" +
+               corsHeaders +
+               "Content-Length: " + std::to_string(body.size()) + "\r\n"
+               "\r\n" + body;
+    }
+
+    auto it = s_handlers->find(path);
+    if (it == s_handlers->end()) {
         std::string body = Json::Object({
             {"error", Json::String("Endpoint not found")},
             {"path", Json::String(path)}

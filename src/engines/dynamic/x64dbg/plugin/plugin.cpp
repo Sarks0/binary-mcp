@@ -20,6 +20,7 @@ static HMODULE g_hModule = nullptr;
 static HANDLE g_serverProcess = nullptr;
 static HANDLE g_pipeServer = INVALID_HANDLE_VALUE;
 static HANDLE g_pipeThread = nullptr;
+static HANDLE g_shutdownEvent = nullptr;  // Event to signal shutdown
 static bool g_running = false;
 
 // Logging helpers
@@ -46,10 +47,10 @@ static DWORD WINAPI PipeServerThread(LPVOID lpParam) {
     LogInfo("Named Pipe server thread starting...");
 
     while (g_running) {
-        // Create named pipe instance
+        // Create named pipe instance with FILE_FLAG_OVERLAPPED for async operations
         g_pipeServer = CreateNamedPipeA(
             Protocol::PIPE_NAME,
-            PIPE_ACCESS_DUPLEX,
+            PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
             PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
             1,  // Max instances
             Protocol::MAX_MESSAGE_SIZE,
@@ -65,16 +66,41 @@ static DWORD WINAPI PipeServerThread(LPVOID lpParam) {
 
         LogInfo("Waiting for HTTP server to connect...");
 
-        // Wait for client connection
-        BOOL connected = ConnectNamedPipe(g_pipeServer, nullptr);
-        if (!connected && GetLastError() != ERROR_PIPE_CONNECTED) {
-            LogError("ConnectNamedPipe failed: %d", GetLastError());
+        // Use overlapped I/O for interruptible ConnectNamedPipe
+        OVERLAPPED overlapped = {};
+        overlapped.hEvent = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+
+        BOOL connected = ConnectNamedPipe(g_pipeServer, &overlapped);
+        DWORD error = GetLastError();
+
+        if (!connected && error == ERROR_IO_PENDING) {
+            // Wait for connection or shutdown event
+            HANDLE waitHandles[2] = { overlapped.hEvent, g_shutdownEvent };
+            DWORD waitResult = WaitForMultipleObjects(2, waitHandles, FALSE, INFINITE);
+
+            if (waitResult == WAIT_OBJECT_0) {
+                // Connection succeeded
+                LogInfo("HTTP server connected to pipe");
+            } else {
+                // Shutdown event signaled
+                CancelIo(g_pipeServer);
+                CloseHandle(overlapped.hEvent);
+                CloseHandle(g_pipeServer);
+                g_pipeServer = INVALID_HANDLE_VALUE;
+                LogInfo("Pipe server thread shutting down (no connection)");
+                return 0;
+            }
+        } else if (!connected && error != ERROR_PIPE_CONNECTED) {
+            LogError("ConnectNamedPipe failed: %d", error);
+            CloseHandle(overlapped.hEvent);
             CloseHandle(g_pipeServer);
             g_pipeServer = INVALID_HANDLE_VALUE;
             continue;
+        } else {
+            LogInfo("HTTP server connected to pipe");
         }
 
-        LogInfo("HTTP server connected to pipe");
+        CloseHandle(overlapped.hEvent);
 
         // Handle requests from HTTP server
         while (g_running) {
@@ -185,6 +211,60 @@ static bool SpawnHTTPServer() {
     return true;
 }
 
+// Menu callback handler (handles all menu entries)
+void MenuEntryCallback(CBTYPE cbType, PLUG_CB_MENUENTRY* info) {
+    switch (info->hEntry) {
+        case 0: {  // About
+            MessageBoxA(
+                nullptr,
+                "x64dbg MCP Bridge Plugin\n\n"
+                "Version: 1.0\n"
+                "Architecture: External Process\n\n"
+                "This plugin provides MCP (Model Context Protocol) integration\n"
+                "for x64dbg, allowing AI assistants to interact with the debugger.\n\n"
+                "Components:\n"
+                "- Named Pipe server in plugin DLL\n"
+                "- HTTP REST API server (external process)\n"
+                "- Crash-isolated architecture\n\n"
+                "Status: Server running on http://127.0.0.1:8765\n"
+                "Pipe: \\\\.\\pipe\\x64dbg_mcp",
+                "About x64dbg_mcp",
+                MB_OK | MB_ICONINFORMATION
+            );
+            break;
+        }
+
+        case 1: {  // Status
+            char statusMsg[512];
+
+            const char* pipeStatus = (g_pipeServer != INVALID_HANDLE_VALUE) ? "Connected" : "Disconnected";
+            const char* serverStatus = (g_serverProcess != nullptr) ? "Running" : "Not Running";
+            DWORD serverPid = 0;
+            if (g_serverProcess) {
+                serverPid = GetProcessId(g_serverProcess);
+            }
+
+            snprintf(statusMsg, sizeof(statusMsg),
+                "MCP Bridge Plugin Status\n\n"
+                "Plugin State: %s\n"
+                "Named Pipe: %s\n"
+                "HTTP Server: %s\n"
+                "Server PID: %lu\n"
+                "Server Port: 8765\n\n"
+                "Pipe Name: \\\\.\\pipe\\x64dbg_mcp\n"
+                "HTTP Endpoint: http://127.0.0.1:8765",
+                g_running ? "Running" : "Stopped",
+                pipeStatus,
+                serverStatus,
+                serverPid
+            );
+
+            MessageBoxA(nullptr, statusMsg, "x64dbg_mcp Status", MB_OK | MB_ICONINFORMATION);
+            break;
+        }
+    }
+}
+
 // Plugin initialization
 bool pluginInit(PLUG_INITSTRUCT* initStruct) {
     g_pluginHandle = initStruct->pluginHandle;
@@ -198,23 +278,45 @@ void pluginStop() {
     // Stop pipe server
     g_running = false;
 
+    // Signal shutdown event to wake up pipe thread
+    if (g_shutdownEvent) {
+        SetEvent(g_shutdownEvent);
+    }
+
+    // Close pipe to force any pending I/O to complete
     if (g_pipeServer != INVALID_HANDLE_VALUE) {
         DisconnectNamedPipe(g_pipeServer);
         CloseHandle(g_pipeServer);
         g_pipeServer = INVALID_HANDLE_VALUE;
     }
 
+    // Wait for pipe thread to exit (should be quick now with shutdown event)
     if (g_pipeThread) {
-        WaitForSingleObject(g_pipeThread, 5000);
+        DWORD waitResult = WaitForSingleObject(g_pipeThread, 1000);
+        if (waitResult == WAIT_TIMEOUT) {
+            LogError("Pipe thread did not exit in time");
+        }
         CloseHandle(g_pipeThread);
         g_pipeThread = nullptr;
     }
 
-    // Terminate server process
+    // Cleanup shutdown event
+    if (g_shutdownEvent) {
+        CloseHandle(g_shutdownEvent);
+        g_shutdownEvent = nullptr;
+    }
+
+    // Gracefully terminate server process (send Ctrl+C first)
     if (g_serverProcess) {
         LogInfo("Terminating HTTP server process...");
-        TerminateProcess(g_serverProcess, 0);
-        WaitForSingleObject(g_serverProcess, 5000);
+
+        // Try graceful shutdown first
+        if (!GenerateConsoleCtrlEvent(CTRL_C_EVENT, GetProcessId(g_serverProcess))) {
+            // If that fails, terminate forcefully
+            TerminateProcess(g_serverProcess, 0);
+        }
+
+        WaitForSingleObject(g_serverProcess, 2000);
         CloseHandle(g_serverProcess);
         g_serverProcess = nullptr;
     }
@@ -224,6 +326,13 @@ void pluginStop() {
 
 void pluginSetup() {
     LogInfo("Setting up plugin");
+
+    // Create shutdown event for graceful termination
+    g_shutdownEvent = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+    if (!g_shutdownEvent) {
+        LogError("Failed to create shutdown event: %d", GetLastError());
+        return;
+    }
 
     // Start Named Pipe server thread (safe to do here - no loader lock issues)
     g_running = true;
@@ -239,6 +348,8 @@ void pluginSetup() {
 
     if (!g_pipeThread) {
         LogError("Failed to create pipe server thread: %d", GetLastError());
+        CloseHandle(g_shutdownEvent);
+        g_shutdownEvent = nullptr;
         return;
     }
 
@@ -250,6 +361,9 @@ void pluginSetup() {
         LogError("Failed to spawn HTTP server");
         return;
     }
+
+    // Register menu callback
+    _plugin_registercallback(g_pluginHandle, CB_MENUENTRY, (CBPLUGIN)MenuEntryCallback);
 
     // Add menu items
     if (g_hMenu) {

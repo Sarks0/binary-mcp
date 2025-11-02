@@ -74,8 +74,11 @@ set_target_properties(x64dbg_mcp PROPERTIES
 # 3. We only call x64dbg APIs after the plugin is fully loaded
 # 4. This is the standard approach for x64dbg plugins
 if(MSVC)
-    # Use static runtime to avoid VC++ redistributable dependencies
-    set_property(TARGET x64dbg_mcp PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    # CRITICAL: Use DYNAMIC runtime to match x64dbg.exe
+    # Static runtime (/MT) causes "ModuleName: unknown" crashes due to heap corruption
+    # x64dbg uses dynamic runtime (/MD), so we must use it too
+    # This requires VC++ redistributables to be installed (standard for x64dbg users)
+    set_property(TARGET x64dbg_mcp PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreadedDLL$<$<CONFIG:Debug>:Debug>")
 
     # Allow unresolved symbols - x64dbg provides them at runtime
     target_link_options(x64dbg_mcp PRIVATE
@@ -83,6 +86,7 @@ if(MSVC)
         "/IGNORE:4199"  # Suppress /FORCE:UNRESOLVED warning
     )
 
+    message(STATUS "Using DYNAMIC runtime library (/MD) to match x64dbg")
     message(STATUS "Using /FORCE:UNRESOLVED for x64dbg API functions")
 endif()
 

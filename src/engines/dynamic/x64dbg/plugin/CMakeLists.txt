@@ -29,7 +29,7 @@ message(STATUS "Building for ${ARCH_BITS} architecture")
 # =============================================================================
 
 set(PLUGIN_SOURCES
-    plugin_new.cpp
+    plugin.cpp
 )
 
 set(PLUGIN_HEADERS

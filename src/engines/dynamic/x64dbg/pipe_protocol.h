@@ -26,7 +26,7 @@ namespace Protocol {
     // Response status codes
     enum class Status : uint32_t {
         SUCCESS = 0,
-        ERROR = 1,
+        FAILED = 1,             // Renamed from ERROR to avoid Windows macro conflict
         NOT_DEBUGGING = 2,
         INVALID_REQUEST = 3
     };

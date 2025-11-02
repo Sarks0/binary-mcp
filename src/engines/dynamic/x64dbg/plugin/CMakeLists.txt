@@ -38,10 +38,17 @@ target_include_directories(x64dbg_mcp PRIVATE
 )
 
 # Link against x64dbg SDK
+# Note: x64dbg plugin SDK provides stubs that resolve at runtime when loaded by x64dbg
 target_link_libraries(x64dbg_mcp PRIVATE
     ws2_32  # Windows sockets
-    # Add x64dbg SDK libs if needed
 )
+
+# Link x64dbg SDK library if it exists
+if(EXISTS "${X64DBG_SDK_PATH}/pluginsdk/x64_dbg.lib")
+    target_link_libraries(x64dbg_mcp PRIVATE "${X64DBG_SDK_PATH}/pluginsdk/x64_dbg.lib")
+elseif(EXISTS "${X64DBG_SDK_PATH}/pluginsdk/x64dbg.lib")
+    target_link_libraries(x64dbg_mcp PRIVATE "${X64DBG_SDK_PATH}/pluginsdk/x64dbg.lib")
+endif()
 
 # Platform-specific settings
 if(CMAKE_SIZEOF_VOID_P EQUAL 8)
@@ -57,10 +64,11 @@ set_target_properties(x64dbg_mcp PROPERTIES
     PREFIX ""
 )
 
-# x64dbg provides API functions at runtime
-# Allow linking despite unresolved externals
+# x64dbg provides API functions at runtime via the SDK
+# The plugin SDK provides stub implementations that resolve at runtime
 if(MSVC)
-    target_link_options(x64dbg_mcp PRIVATE "/FORCE:UNRESOLVED")
+    # Use static runtime to avoid VC++ redistributable dependencies
+    set_property(TARGET x64dbg_mcp PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
 # Install target

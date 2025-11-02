@@ -47,19 +47,30 @@ target_include_directories(x64dbg_mcp PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/..
 )
 
-# Find and link x64dbg bridge library (provides x64dbg API implementations)
+# Link x64dbg SDK libraries (provides x64dbg API implementations)
 if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    set(X64DBG_LIB "${X64DBG_SDK_PATH}/pluginsdk/x64dbg.lib")
     set(BRIDGE_LIB "${X64DBG_SDK_PATH}/pluginsdk/x64bridge.lib")
 else()
+    set(X64DBG_LIB "${X64DBG_SDK_PATH}/pluginsdk/x32dbg.lib")
     set(BRIDGE_LIB "${X64DBG_SDK_PATH}/pluginsdk/x32bridge.lib")
 endif()
 
+# Link x64dbg.lib (provides _plugin_* functions like _plugin_logprintf)
+if(EXISTS "${X64DBG_LIB}")
+    target_link_libraries(x64dbg_mcp PRIVATE "${X64DBG_LIB}")
+    message(STATUS "Plugin: Linking x64dbg API library: ${X64DBG_LIB}")
+else()
+    message(WARNING "x64dbg library not found: ${X64DBG_LIB}")
+    message(WARNING "Plugin will fail to link without x64dbg library!")
+endif()
+
+# Link x64bridge.lib (provides Bridge_* functions)
 if(EXISTS "${BRIDGE_LIB}")
     target_link_libraries(x64dbg_mcp PRIVATE "${BRIDGE_LIB}")
     message(STATUS "Plugin: Linking bridge library: ${BRIDGE_LIB}")
 else()
     message(WARNING "Bridge library not found: ${BRIDGE_LIB}")
-    message(WARNING "Plugin may fail to load without bridge library!")
 endif()
 
 # Output name: x64dbg_mcp.dp64 or x64dbg_mcp.dp32

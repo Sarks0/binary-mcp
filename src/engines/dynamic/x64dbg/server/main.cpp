@@ -3,8 +3,10 @@
 #include <Windows.h>
 #include <iostream>
 #include <string>
+#include <vector>
 #include <atomic>
 #include <thread>
+#include <cstdarg>  // for va_list, va_start, va_end
 #include "../pipe_protocol.h"
 
 // Simple logging

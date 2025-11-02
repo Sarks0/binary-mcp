@@ -1,6 +1,8 @@
 #pragma once
 
 #include <string>
+#include <cstdint>  // for uint32_t
+#include <cstddef>  // for size_t
 
 // Shared protocol definitions for Named Pipe communication
 // between x64dbg plugin (server) and HTTP server process (client)

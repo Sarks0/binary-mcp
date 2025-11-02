@@ -266,8 +266,8 @@ std::string HandleHTTPRequest(const std::string& request) {
                                 "{\"status\":\"ok\",\"message\":\"x64dbg MCP server running\"}");
     }
 
-    // Handle GET /status
-    if (method == "GET" && path == "/status") {
+    // Handle GET /api/status
+    if (method == "GET" && path == "/api/status") {
         // Send GET_STATE request to plugin
         std::string pipeResponse;
         if (g_pipeClient.SendRequest("{\"type\":1}", pipeResponse)) {
@@ -278,8 +278,8 @@ std::string HandleHTTPRequest(const std::string& request) {
         }
     }
 
-    // Handle POST requests (extract JSON body and forward to plugin)
-    if (method == "POST") {
+    // Handle POST requests to /api/* endpoints (extract JSON body and forward to plugin)
+    if (method == "POST" && path.rfind("/api/", 0) == 0) {
         // Find body (after \r\n\r\n)
         size_t bodyStart = request.find("\r\n\r\n");
         if (bodyStart == std::string::npos) {

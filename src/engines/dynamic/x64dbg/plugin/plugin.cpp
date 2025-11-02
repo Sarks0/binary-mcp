@@ -325,6 +325,21 @@ void pluginStop() {
         g_serverProcess = nullptr;
     }
 
+    // Delete authentication token file
+    char tempPath[MAX_PATH];
+    if (GetTempPathA(MAX_PATH, tempPath)) {
+        char tokenPath[MAX_PATH];
+        snprintf(tokenPath, MAX_PATH, "%sx64dbg_mcp_token.txt", tempPath);
+        if (DeleteFileA(tokenPath)) {
+            LogInfo("Deleted auth token file");
+        } else {
+            DWORD error = GetLastError();
+            if (error != ERROR_FILE_NOT_FOUND) {
+                LogError("Failed to delete token file: %d", error);
+            }
+        }
+    }
+
     LogInfo("Plugin stopped");
 }
 
@@ -390,14 +405,14 @@ void pluginSetup() {
             }
         }
 
-        // Create file with restrictive permissions
+        // Create file with restrictive permissions (removed DELETE_ON_CLOSE for now)
         HANDLE hFile = CreateFileA(
             tokenPath,
             GENERIC_WRITE,
-            0,  // No sharing - exclusive access
+            FILE_SHARE_READ,  // Allow reading while we have it open
             &sa,
             CREATE_ALWAYS,
-            FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE,  // Auto-delete when closed
+            FILE_ATTRIBUTE_TEMPORARY,  // Windows hint for temp file
             nullptr
         );
 
@@ -405,13 +420,9 @@ void pluginSetup() {
             DWORD bytesWritten;
             if (WriteFile(hFile, token, (DWORD)strlen(token), &bytesWritten, nullptr)) {
                 LogInfo("Created secure auth token file: %s", tokenPath);
-                LogInfo("Token will auto-delete when x64dbg closes");
             } else {
                 LogError("Failed to write token: %d", GetLastError());
             }
-            // Keep handle open - file will be deleted when x64dbg exits
-            // Store handle globally so we can close it in pluginStop()
-            // For now, close it (file persists because FILE_FLAG_DELETE_ON_CLOSE needs handle to stay open)
             CloseHandle(hFile);
         } else {
             LogError("Failed to create auth token file: %d", GetLastError());

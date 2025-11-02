@@ -5,8 +5,7 @@
 #include <fstream>
 #include <random>
 #include <iomanip>
-#include <Windows.h>
-#include <wincrypt.h>
+#include <wincrypt.h>  // Windows.h already included via http_server.h
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "advapi32.lib")

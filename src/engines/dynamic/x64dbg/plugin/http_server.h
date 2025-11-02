@@ -1,10 +1,12 @@
 #pragma once
 
+#define WIN32_LEAN_AND_MEAN  // Exclude rarely-used stuff from Windows headers
+#include <winsock2.h>        // Must come before Windows.h to avoid conflicts
+#include <Windows.h>
 #include <string>
 #include <functional>
 #include <map>
 #include <atomic>
-#include <Windows.h>
 
 // Simple HTTP server for MCP bridge API
 class HttpServer {

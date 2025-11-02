@@ -1,8 +1,9 @@
 #include "plugin.h"
-#include "http_server.h"
-#include "commands.h"
+#include "../pipe_protocol.h"
 #include <cstdio>
 #include <cstdarg>
+#include <string>
+#include <vector>
 
 // Plugin globals
 int g_pluginHandle = 0;
@@ -12,43 +13,11 @@ int g_hMenuDisasm = 0;
 int g_hMenuDump = 0;
 int g_hMenuStack = 0;
 
-// Timer for delayed HTTP server initialization
-static HANDLE g_initTimer = nullptr;
-static bool g_serverStarted = false;
-
-// Timer callback for delayed HTTP server initialization
-// This runs AFTER plugin loading is complete, avoiding loader lock issues
-static VOID CALLBACK DelayedInitCallback(PVOID lpParam, BOOLEAN TimerOrWaitFired) {
-    if (g_serverStarted) {
-        return;  // Already started
-    }
-
-    LogInfo("Starting HTTP server (delayed initialization)...");
-
-    // Now it's safe to initialize HTTP server, create threads, etc.
-    // We're no longer in DLL load context
-    __try {
-        if (!HttpServer::Initialize(8765)) {
-            LogError("Failed to initialize HTTP server");
-            return;
-        }
-
-        // Register custom commands
-        Commands::RegisterAll();
-
-        LogInfo("HTTP API available at: http://localhost:8765");
-        g_serverStarted = true;
-    }
-    __except(EXCEPTION_EXECUTE_HANDLER) {
-        LogError("Exception during delayed initialization: 0x%08X", GetExceptionCode());
-    }
-
-    // Clean up the timer
-    if (g_initTimer) {
-        DeleteTimerQueueTimer(nullptr, g_initTimer, nullptr);
-        g_initTimer = nullptr;
-    }
-}
+// Server process handle
+static HANDLE g_serverProcess = nullptr;
+static HANDLE g_pipeServer = INVALID_HANDLE_VALUE;
+static HANDLE g_pipeThread = nullptr;
+static bool g_running = false;
 
 // Logging helpers
 void LogInfo(const char* format, ...) {
@@ -69,38 +38,183 @@ void LogError(const char* format, ...) {
     _plugin_logprintf("[MCP ERROR] %s\n", buffer);
 }
 
-void LogDebug(const char* format, ...) {
-#ifdef _DEBUG
-    char buffer[1024];
-    va_list args;
-    va_start(args, format);
-    vsnprintf(buffer, sizeof(buffer), format, args);
-    va_end(args);
-    _plugin_logprintf("[MCP DEBUG] %s\n", buffer);
-#endif
+// Named Pipe server thread (handles requests from HTTP server process)
+static DWORD WINAPI PipeServerThread(LPVOID lpParam) {
+    LogInfo("Named Pipe server thread starting...");
+
+    while (g_running) {
+        // Create named pipe instance
+        g_pipeServer = CreateNamedPipeA(
+            Protocol::PIPE_NAME,
+            PIPE_ACCESS_DUPLEX,
+            PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+            1,  // Max instances
+            Protocol::MAX_MESSAGE_SIZE,
+            Protocol::MAX_MESSAGE_SIZE,
+            0,
+            nullptr
+        );
+
+        if (g_pipeServer == INVALID_HANDLE_VALUE) {
+            LogError("Failed to create named pipe: %d", GetLastError());
+            return 1;
+        }
+
+        LogInfo("Waiting for HTTP server to connect...");
+
+        // Wait for client connection
+        BOOL connected = ConnectNamedPipe(g_pipeServer, nullptr);
+        if (!connected && GetLastError() != ERROR_PIPE_CONNECTED) {
+            LogError("ConnectNamedPipe failed: %d", GetLastError());
+            CloseHandle(g_pipeServer);
+            g_pipeServer = INVALID_HANDLE_VALUE;
+            continue;
+        }
+
+        LogInfo("HTTP server connected to pipe");
+
+        // Handle requests from HTTP server
+        while (g_running) {
+            // Read request length
+            uint32_t requestLength = 0;
+            DWORD bytesRead = 0;
+
+            if (!ReadFile(g_pipeServer, &requestLength, sizeof(requestLength), &bytesRead, nullptr)) {
+                if (GetLastError() == ERROR_BROKEN_PIPE) {
+                    LogInfo("HTTP server disconnected");
+                } else {
+                    LogError("Failed to read request length: %d", GetLastError());
+                }
+                break;
+            }
+
+            if (requestLength > Protocol::MAX_MESSAGE_SIZE) {
+                LogError("Request too large: %u bytes", requestLength);
+                break;
+            }
+
+            // Read request data
+            std::vector<char> buffer(requestLength);
+            if (!ReadFile(g_pipeServer, buffer.data(), requestLength, &bytesRead, nullptr)) {
+                LogError("Failed to read request: %d", GetLastError());
+                break;
+            }
+
+            std::string request(buffer.data(), requestLength);
+            LogInfo("Received request: %s", request.c_str());
+
+            // TODO: Parse request and execute x64dbg API calls
+            // For now, just send a simple response
+            std::string response = "{\"status\":0,\"data\":{\"message\":\"OK\"}}";
+
+            // Send response
+            uint32_t responseLength = static_cast<uint32_t>(response.size());
+            DWORD bytesWritten = 0;
+
+            if (!WriteFile(g_pipeServer, &responseLength, sizeof(responseLength), &bytesWritten, nullptr)) {
+                LogError("Failed to write response length: %d", GetLastError());
+                break;
+            }
+
+            if (!WriteFile(g_pipeServer, response.c_str(), responseLength, &bytesWritten, nullptr)) {
+                LogError("Failed to write response: %d", GetLastError());
+                break;
+            }
+        }
+
+        // Disconnect client
+        DisconnectNamedPipe(g_pipeServer);
+        CloseHandle(g_pipeServer);
+        g_pipeServer = INVALID_HANDLE_VALUE;
+    }
+
+    LogInfo("Named Pipe server thread stopped");
+    return 0;
+}
+
+// Spawn HTTP server process
+static bool SpawnHTTPServer() {
+    // Get plugin directory
+    char pluginPath[MAX_PATH];
+    if (!GetModuleFileNameA((HMODULE)g_pluginHandle, pluginPath, MAX_PATH)) {
+        LogError("Failed to get plugin path");
+        return false;
+    }
+
+    // Get directory containing plugin
+    char* lastSlash = strrchr(pluginPath, '\\');
+    if (lastSlash) {
+        *(lastSlash + 1) = '\0';
+    }
+
+    // Build path to server executable
+    char serverPath[MAX_PATH];
+    snprintf(serverPath, MAX_PATH, "%sx64dbg_mcp_server.exe", pluginPath);
+
+    LogInfo("Spawning HTTP server: %s", serverPath);
+
+    // Spawn process
+    STARTUPINFOA si = {};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi = {};
+
+    if (!CreateProcessA(
+        serverPath,
+        nullptr,  // Command line
+        nullptr,  // Process attributes
+        nullptr,  // Thread attributes
+        FALSE,    // Inherit handles
+        0,        // Creation flags
+        nullptr,  // Environment
+        nullptr,  // Current directory
+        &si,
+        &pi
+    )) {
+        LogError("Failed to spawn HTTP server: %d", GetLastError());
+        LogError("Make sure x64dbg_mcp_server.exe is in the same directory as the plugin");
+        return false;
+    }
+
+    g_serverProcess = pi.hProcess;
+    CloseHandle(pi.hThread);  // Don't need thread handle
+
+    LogInfo("HTTP server process started (PID: %d)", pi.dwProcessId);
+    return true;
 }
 
 // Plugin initialization
 bool pluginInit(PLUG_INITSTRUCT* initStruct) {
     g_pluginHandle = initStruct->pluginHandle;
-
     LogInfo("Initializing MCP Bridge Plugin v%s", PLUGIN_VERSION_STR);
-    LogInfo("Plugin initialized - waiting for setup phase");
-
     return true;
 }
 
 void pluginStop() {
     LogInfo("Stopping plugin");
 
-    // Cancel pending timer if still active
-    if (g_initTimer) {
-        DeleteTimerQueueTimer(nullptr, g_initTimer, INVALID_HANDLE_VALUE);
-        g_initTimer = nullptr;
+    // Stop pipe server
+    g_running = false;
+
+    if (g_pipeServer != INVALID_HANDLE_VALUE) {
+        DisconnectNamedPipe(g_pipeServer);
+        CloseHandle(g_pipeServer);
+        g_pipeServer = INVALID_HANDLE_VALUE;
     }
 
-    // Shutdown HTTP server
-    HttpServer::Shutdown();
+    if (g_pipeThread) {
+        WaitForSingleObject(g_pipeThread, 5000);
+        CloseHandle(g_pipeThread);
+        g_pipeThread = nullptr;
+    }
+
+    // Terminate server process
+    if (g_serverProcess) {
+        LogInfo("Terminating HTTP server process...");
+        TerminateProcess(g_serverProcess, 0);
+        WaitForSingleObject(g_serverProcess, 5000);
+        CloseHandle(g_serverProcess);
+        g_serverProcess = nullptr;
+    }
 
     LogInfo("Plugin stopped");
 }
@@ -108,25 +222,39 @@ void pluginStop() {
 void pluginSetup() {
     LogInfo("Setting up plugin");
 
-    // CRITICAL: Don't start HTTP server immediately!
-    // Creating threads and initializing network during plugin load causes crashes
-    // Use timer to delay initialization until after plugin load completes (2 seconds)
-    // This avoids Windows loader lock issues
+    // Start Named Pipe server thread (safe to do here - no loader lock issues)
+    g_running = true;
+    DWORD threadId;
+    g_pipeThread = CreateThread(
+        nullptr,
+        0,
+        PipeServerThread,
+        nullptr,
+        0,
+        &threadId
+    );
 
-    if (!CreateTimerQueueTimer(&g_initTimer, nullptr, DelayedInitCallback,
-                                nullptr, 2000, 0, WT_EXECUTEONLYONCE)) {
-        LogError("Failed to create initialization timer: %d", GetLastError());
-        // Fallback: try immediate initialization (risky but better than nothing)
-        DelayedInitCallback(nullptr, FALSE);
-    } else {
-        LogInfo("HTTP server will start in 2 seconds (delayed init)");
+    if (!g_pipeThread) {
+        LogError("Failed to create pipe server thread: %d", GetLastError());
+        return;
     }
 
-    // Add menu items (safe to do immediately)
+    // Give pipe thread time to create the pipe
+    Sleep(100);
+
+    // Spawn HTTP server process
+    if (!SpawnHTTPServer()) {
+        LogError("Failed to spawn HTTP server");
+        return;
+    }
+
+    // Add menu items
     if (g_hMenu) {
         _plugin_menuaddentry(g_hMenu, 0, "&About");
         _plugin_menuaddentry(g_hMenu, 1, "&Status");
     }
+
+    LogInfo("Plugin setup complete - HTTP server should connect soon");
 }
 
 // Plugin exports (required by x64dbg)

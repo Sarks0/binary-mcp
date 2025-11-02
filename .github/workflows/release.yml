@@ -93,8 +93,12 @@ jobs:
         Write-Host "Preparing release artifacts..."
         New-Item -ItemType Directory -Force -Path release/x64dbg-plugins
 
+        # Copy plugin DLLs
         Copy-Item src/engines/dynamic/x64dbg/plugin/build-x64/Release/x64dbg_mcp.dp64 release/x64dbg-plugins/
         Copy-Item src/engines/dynamic/x64dbg/plugin/build-x32/Release/x64dbg_mcp.dp32 release/x64dbg-plugins/
+
+        # Copy HTTP server executable (same for both architectures)
+        Copy-Item src/engines/dynamic/x64dbg/plugin/build-x64/Release/x64dbg_mcp_server.exe release/x64dbg-plugins/
 
         Write-Host "Artifacts prepared in release/x64dbg-plugins/"
         Get-ChildItem release/x64dbg-plugins/
@@ -160,17 +164,44 @@ jobs:
         mkdir -p "$PACKAGE_NAME/x64dbg-plugins"
         cp release/x64dbg-plugins/x64dbg_mcp.dp64 "$PACKAGE_NAME/x64dbg-plugins/"
         cp release/x64dbg-plugins/x64dbg_mcp.dp32 "$PACKAGE_NAME/x64dbg-plugins/"
+        cp release/x64dbg-plugins/x64dbg_mcp_server.exe "$PACKAGE_NAME/x64dbg-plugins/"
 
         # Create installation instructions for plugins
         cat > "$PACKAGE_NAME/x64dbg-plugins/README.md" << 'EOF'
         # x64dbg Plugin Installation
 
-        Copy the plugin files to your x64dbg installation:
+        ## External Process Architecture
 
+        The plugin uses a two-process architecture for stability. You need to install **both** the plugin and the HTTP server.
+
+        ## Installation
+
+        Copy **all three files** to your x64dbg plugins directory:
+
+        **For 64-bit debugger:**
         - `x64dbg_mcp.dp64` → `x64dbg/x64/plugins/`
-        - `x64dbg_mcp.dp32` → `x64dbg/x32/plugins/`
+        - `x64dbg_mcp_server.exe` → `x64dbg/x64/plugins/`
 
-        Then restart x64dbg.
+        **For 32-bit debugger:**
+        - `x64dbg_mcp.dp32` → `x64dbg/x32/plugins/`
+        - `x64dbg_mcp_server.exe` → `x64dbg/x32/plugins/`
+
+        **IMPORTANT**: The server executable must be in the **same directory** as the plugin DLL!
+
+        ## What Happens
+
+        1. x64dbg loads the plugin DLL (`.dp64` or `.dp32`)
+        2. Plugin automatically spawns `x64dbg_mcp_server.exe`
+        3. HTTP server runs on port 8765
+        4. Communication via Named Pipe IPC
+
+        ## Troubleshooting
+
+        Check x64dbg log for:
+        - `[MCP] HTTP server process started (PID: ...)`
+        - `[MCP] HTTP server connected to pipe`
+
+        See [ARCHITECTURE.md](https://github.com/Sarks0/binary-mcp/blob/main/src/engines/dynamic/x64dbg/ARCHITECTURE.md) for details.
         EOF
 
         # Create the release zip
@@ -191,6 +222,7 @@ jobs:
         - **Pre-built x64dbg plugins** - Ready-to-use debugger plugins in `x64dbg-plugins/` directory
           - `x64dbg_mcp.dp64` - 64-bit debugger plugin
           - `x64dbg_mcp.dp32` - 32-bit debugger plugin
+          - `x64dbg_mcp_server.exe` - HTTP server (external process architecture)
 
         ### Installation
 

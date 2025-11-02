@@ -47,6 +47,21 @@ target_include_directories(x64dbg_mcp PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/..
 )
 
+# Find and link x64dbg bridge library (provides x64dbg API implementations)
+if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    set(BRIDGE_LIB "${X64DBG_SDK_PATH}/pluginsdk/x64bridge.lib")
+else()
+    set(BRIDGE_LIB "${X64DBG_SDK_PATH}/pluginsdk/x32bridge.lib")
+endif()
+
+if(EXISTS "${BRIDGE_LIB}")
+    target_link_libraries(x64dbg_mcp PRIVATE "${BRIDGE_LIB}")
+    message(STATUS "Plugin: Linking bridge library: ${BRIDGE_LIB}")
+else()
+    message(WARNING "Bridge library not found: ${BRIDGE_LIB}")
+    message(WARNING "Plugin may fail to load without bridge library!")
+endif()
+
 # Output name: x64dbg_mcp.dp64 or x64dbg_mcp.dp32
 set_target_properties(x64dbg_mcp PROPERTIES
     OUTPUT_NAME "x64dbg_mcp"
@@ -57,15 +72,7 @@ set_target_properties(x64dbg_mcp PROPERTIES
 if(MSVC)
     # Use DYNAMIC runtime to match x64dbg
     set_property(TARGET x64dbg_mcp PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreadedDLL$<$<CONFIG:Debug>:Debug>")
-
-    # Allow unresolved symbols - x64dbg provides them at runtime
-    target_link_options(x64dbg_mcp PRIVATE
-        "/FORCE:UNRESOLVED"
-        "/IGNORE:4199"
-    )
-
     message(STATUS "Plugin: Using DYNAMIC runtime library (/MD)")
-    message(STATUS "Plugin: Using /FORCE:UNRESOLVED for x64dbg API functions")
 endif()
 
 # =============================================================================

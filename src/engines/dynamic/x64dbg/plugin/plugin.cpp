@@ -4,9 +4,38 @@
 #include <cstdarg>
 #include <string>
 #include <vector>
+#include <sstream>
+#include <iomanip>
 #include <wincrypt.h>  // For CryptGenRandom
 
+// x64dbg SDK headers
+#include "pluginsdk/_plugins.h"
+#include "pluginsdk/bridgemain.h"
+
 #pragma comment(lib, "advapi32.lib")  // Link Crypto API
+
+// Request type enumeration
+enum RequestType {
+    GET_STATE = 1,
+    LOAD_BINARY = 2,
+    READ_MEMORY = 3,
+    WRITE_MEMORY = 4,
+    GET_REGISTERS = 5,
+    SET_REGISTER = 6,
+    DISASSEMBLE = 7,
+    RUN = 8,
+    PAUSE = 9,
+    STEP_INTO = 10,
+    STEP_OVER = 11,
+    STEP_OUT = 12,
+    GET_STACK = 13,
+    GET_MODULES = 14,
+    GET_THREADS = 15,
+    SET_BREAKPOINT = 20,
+    DELETE_BREAKPOINT = 21,
+    LIST_BREAKPOINTS = 22,
+    PING = 99
+};
 
 // Plugin globals
 int g_pluginHandle = 0;
@@ -43,6 +72,279 @@ void LogError(const char* format, ...) {
     vsnprintf(buffer, sizeof(buffer), format, args);
     va_end(args);
     _plugin_logprintf("[MCP ERROR] %s\n", buffer);
+}
+
+// ============================================================================
+// JSON HELPER FUNCTIONS (Simple parser - no external dependencies)
+// ============================================================================
+
+// Extract integer value from JSON string
+int ExtractIntField(const std::string& json, const char* fieldName, int defaultValue = 0) {
+    std::string searchStr = std::string("\"") + fieldName + "\":";
+    size_t pos = json.find(searchStr);
+    if (pos == std::string::npos) return defaultValue;
+
+    pos += searchStr.length();
+    while (pos < json.length() && (json[pos] == ' ' || json[pos] == '\t')) pos++;
+
+    int value = 0;
+    sscanf(json.c_str() + pos, "%d", &value);
+    return value;
+}
+
+// Extract string value from JSON string
+std::string ExtractStringField(const std::string& json, const char* fieldName, const char* defaultValue = "") {
+    std::string searchStr = std::string("\"") + fieldName + "\":\"";
+    size_t pos = json.find(searchStr);
+    if (pos == std::string::npos) return defaultValue;
+
+    pos += searchStr.length();
+    size_t endPos = json.find('"', pos);
+    if (endPos == std::string::npos) return defaultValue;
+
+    return json.substr(pos, endPos - pos);
+}
+
+// Build JSON response
+std::string BuildJsonResponse(bool success, const std::string& data = "") {
+    std::string response = "{\"success\":";
+    response += success ? "true" : "false";
+    if (!data.empty()) {
+        response += ",";
+        response += data;
+    }
+    response += "}";
+    return response;
+}
+
+// ============================================================================
+// REQUEST HANDLERS
+// ============================================================================
+
+// Handler: GET_STATE - Get current debugger state
+std::string HandleGetState(const std::string& request) {
+    std::stringstream data;
+
+    // Check if debugger is active
+    if (!DbgIsDebugging()) {
+        data << "\"state\":\"not_loaded\","
+             << "\"current_address\":\"0\","
+             << "\"binary_path\":\"\"";
+        return BuildJsonResponse(true, data.str());
+    }
+
+    // Get current state
+    DBGSTATE state = DbgGetState();
+    const char* stateStr = "unknown";
+    switch (state) {
+        case paused: stateStr = "paused"; break;
+        case running: stateStr = "running"; break;
+        case stopped: stateStr = "terminated"; break;
+        default: stateStr = "loaded"; break;
+    }
+
+    // Get current instruction pointer
+    duint cip = DbgValFromString("cip");
+
+    // Get binary path
+    char modulePath[MAX_PATH] = "";
+    DbgGetModuleAt(cip, modulePath);
+
+    data << "\"state\":\"" << stateStr << "\","
+         << "\"current_address\":\"" << std::hex << cip << std::dec << "\","
+         << "\"binary_path\":\"" << modulePath << "\"";
+
+    return BuildJsonResponse(true, data.str());
+}
+
+// Handler: GET_REGISTERS - Get all CPU registers
+std::string HandleGetRegisters(const std::string& request) {
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+    }
+
+    std::stringstream data;
+
+    // Get register context
+    REGDUMP registers;
+    if (!DbgGetRegDumpEx(&registers, sizeof(registers))) {
+        return BuildJsonResponse(false, "\"error\":\"Failed to get registers\"");
+    }
+
+    // Format all general-purpose registers as hex
+    data << std::hex << std::setfill('0');
+    data << "\"rax\":\"" << std::setw(16) << registers.regcontext.cax << "\","
+         << "\"rbx\":\"" << std::setw(16) << registers.regcontext.cbx << "\","
+         << "\"rcx\":\"" << std::setw(16) << registers.regcontext.ccx << "\","
+         << "\"rdx\":\"" << std::setw(16) << registers.regcontext.cdx << "\","
+         << "\"rsi\":\"" << std::setw(16) << registers.regcontext.csi << "\","
+         << "\"rdi\":\"" << std::setw(16) << registers.regcontext.cdi << "\","
+         << "\"rbp\":\"" << std::setw(16) << registers.regcontext.cbp << "\","
+         << "\"rsp\":\"" << std::setw(16) << registers.regcontext.csp << "\","
+         << "\"rip\":\"" << std::setw(16) << registers.regcontext.cip << "\","
+         << "\"r8\":\"" << std::setw(16) << registers.regcontext.r8 << "\","
+         << "\"r9\":\"" << std::setw(16) << registers.regcontext.r9 << "\","
+         << "\"r10\":\"" << std::setw(16) << registers.regcontext.r10 << "\","
+         << "\"r11\":\"" << std::setw(16) << registers.regcontext.r11 << "\","
+         << "\"r12\":\"" << std::setw(16) << registers.regcontext.r12 << "\","
+         << "\"r13\":\"" << std::setw(16) << registers.regcontext.r13 << "\","
+         << "\"r14\":\"" << std::setw(16) << registers.regcontext.r14 << "\","
+         << "\"r15\":\"" << std::setw(16) << registers.regcontext.r15 << "\","
+         << "\"rflags\":\"" << std::setw(16) << registers.regcontext.eflags << "\"";
+
+    return BuildJsonResponse(true, data.str());
+}
+
+// Handler: READ_MEMORY - Read memory from debugged process
+std::string HandleReadMemory(const std::string& request) {
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+    }
+
+    // Parse parameters
+    std::string addressStr = ExtractStringField(request, "address");
+    int size = ExtractIntField(request, "size", 0);
+
+    if (addressStr.empty() || size <= 0) {
+        return BuildJsonResponse(false, "\"error\":\"Missing or invalid address/size\"");
+    }
+
+    // Validate size (max 1MB)
+    if (size > 1024 * 1024) {
+        return BuildJsonResponse(false, "\"error\":\"Size too large (max 1MB)\"");
+    }
+
+    // Parse address
+    duint address = DbgValFromString(addressStr.c_str());
+    if (address == 0 && addressStr != "0") {
+        return BuildJsonResponse(false, "\"error\":\"Invalid address\"");
+    }
+
+    // Allocate buffer
+    std::vector<unsigned char> buffer(size);
+
+    // Read memory
+    if (!DbgMemRead(address, buffer.data(), size)) {
+        return BuildJsonResponse(false, "\"error\":\"Failed to read memory\"");
+    }
+
+    // Convert to hex string
+    std::stringstream hexStream;
+    hexStream << std::hex << std::setfill('0');
+    for (int i = 0; i < size; i++) {
+        hexStream << std::setw(2) << static_cast<int>(buffer[i]);
+    }
+
+    std::stringstream data;
+    data << "\"data\":\"" << hexStream.str() << "\"";
+
+    return BuildJsonResponse(true, data.str());
+}
+
+// Handler: STEP_INTO - Single-step into next instruction
+std::string HandleStepInto(const std::string& request) {
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+    }
+
+    // Execute step into
+    DbgCmdExec("StepInto");
+
+    // Wait for step to complete (with timeout)
+    int timeout = 100; // 100ms
+    while (DbgGetState() == running && timeout > 0) {
+        Sleep(10);
+        timeout -= 10;
+    }
+
+    // Get new address
+    duint cip = DbgValFromString("cip");
+    const char* stateStr = (DbgGetState() == paused) ? "paused" : "running";
+
+    std::stringstream data;
+    data << "\"address\":\"" << std::hex << cip << std::dec << "\","
+         << "\"state\":\"" << stateStr << "\"";
+
+    return BuildJsonResponse(true, data.str());
+}
+
+// Handler: STEP_OVER - Step over next instruction
+std::string HandleStepOver(const std::string& request) {
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+    }
+
+    DbgCmdExec("StepOver");
+
+    int timeout = 100;
+    while (DbgGetState() == running && timeout > 0) {
+        Sleep(10);
+        timeout -= 10;
+    }
+
+    duint cip = DbgValFromString("cip");
+    const char* stateStr = (DbgGetState() == paused) ? "paused" : "running";
+
+    std::stringstream data;
+    data << "\"address\":\"" << std::hex << cip << std::dec << "\","
+         << "\"state\":\"" << stateStr << "\"";
+
+    return BuildJsonResponse(true, data.str());
+}
+
+// Handler: STEP_OUT - Step out of current function
+std::string HandleStepOut(const std::string& request) {
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+    }
+
+    DbgCmdExec("StepOut");
+
+    // Step out may take longer
+    int timeout = 1000;
+    while (DbgGetState() == running && timeout > 0) {
+        Sleep(10);
+        timeout -= 10;
+    }
+
+    duint cip = DbgValFromString("cip");
+    const char* stateStr = (DbgGetState() == paused) ? "paused" : "running";
+
+    std::stringstream data;
+    data << "\"address\":\"" << std::hex << cip << std::dec << "\","
+         << "\"state\":\"" << stateStr << "\"";
+
+    return BuildJsonResponse(true, data.str());
+}
+
+// Handler: SET_BREAKPOINT - Set software breakpoint at address
+std::string HandleSetBreakpoint(const std::string& request) {
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+    }
+
+    // Parse address
+    std::string addressStr = ExtractStringField(request, "address");
+    if (addressStr.empty()) {
+        return BuildJsonResponse(false, "\"error\":\"Missing address\"");
+    }
+
+    duint address = DbgValFromString(addressStr.c_str());
+    if (address == 0 && addressStr != "0") {
+        return BuildJsonResponse(false, "\"error\":\"Invalid address\"");
+    }
+
+    // Set breakpoint
+    if (!DbgSetBreakpointAt(address, BP_NORMAL)) {
+        return BuildJsonResponse(false, "\"error\":\"Failed to set breakpoint\"");
+    }
+
+    LogInfo("Breakpoint set at 0x%llx", address);
+
+    std::stringstream data;
+    data << "\"address\":\"" << std::hex << address << std::dec << "\"";
+
+    return BuildJsonResponse(true, data.str());
 }
 
 // Named Pipe server thread (handles requests from HTTP server process)
@@ -135,10 +437,55 @@ static DWORD WINAPI PipeServerThread(LPVOID lpParam) {
             std::string request(buffer.data(), requestLength);
             LogInfo("Received request: %s", request.c_str());
 
-            // TODO: Parse request and execute x64dbg API calls
-            // For now, send a response that matches Python bridge expectations
-            // Python expects: {"success":true,"state":"not_loaded",...}
-            std::string response = "{\"success\":true,\"state\":\"not_loaded\",\"current_address\":\"0\",\"binary_path\":\"\"}";
+            // Parse request type and route to appropriate handler
+            std::string response;
+            int requestType = ExtractIntField(request, "type", -1);
+
+            if (requestType == -1) {
+                response = BuildJsonResponse(false, "\"error\":\"Missing 'type' field\"");
+            } else {
+                LogInfo("Request type: %d", requestType);
+
+                // Route to appropriate handler
+                switch (requestType) {
+                    case GET_STATE:
+                        response = HandleGetState(request);
+                        break;
+
+                    case GET_REGISTERS:
+                        response = HandleGetRegisters(request);
+                        break;
+
+                    case READ_MEMORY:
+                        response = HandleReadMemory(request);
+                        break;
+
+                    case STEP_INTO:
+                        response = HandleStepInto(request);
+                        break;
+
+                    case STEP_OVER:
+                        response = HandleStepOver(request);
+                        break;
+
+                    case STEP_OUT:
+                        response = HandleStepOut(request);
+                        break;
+
+                    case SET_BREAKPOINT:
+                        response = HandleSetBreakpoint(request);
+                        break;
+
+                    case PING:
+                        response = BuildJsonResponse(true, "\"message\":\"pong\"");
+                        break;
+
+                    default:
+                        LogError("Unknown request type: %d", requestType);
+                        response = BuildJsonResponse(false, "\"error\":\"Unknown request type\"");
+                        break;
+                }
+            }
 
             // Send response
             uint32_t responseLength = static_cast<uint32_t>(response.size());

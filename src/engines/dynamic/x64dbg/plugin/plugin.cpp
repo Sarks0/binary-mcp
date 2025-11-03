@@ -134,7 +134,7 @@ std::string HandleGetState(const std::string& request) {
     }
 
     // Get current state
-    DBGSTATE state = DbgGetState();
+    DBGSTATE state = DbgGetDbgState();
     const char* stateStr = "unknown";
     switch (state) {
         case paused: stateStr = "paused"; break;
@@ -165,32 +165,27 @@ std::string HandleGetRegisters(const std::string& request) {
 
     std::stringstream data;
 
-    // Get register context
-    REGDUMP registers;
-    if (!DbgGetRegDumpEx(&registers, sizeof(registers))) {
-        return BuildJsonResponse(false, "\"error\":\"Failed to get registers\"");
-    }
-
+    // Get register values using DbgValFromString
     // Format all general-purpose registers as hex
     data << std::hex << std::setfill('0');
-    data << "\"rax\":\"" << std::setw(16) << registers.regcontext.cax << "\","
-         << "\"rbx\":\"" << std::setw(16) << registers.regcontext.cbx << "\","
-         << "\"rcx\":\"" << std::setw(16) << registers.regcontext.ccx << "\","
-         << "\"rdx\":\"" << std::setw(16) << registers.regcontext.cdx << "\","
-         << "\"rsi\":\"" << std::setw(16) << registers.regcontext.csi << "\","
-         << "\"rdi\":\"" << std::setw(16) << registers.regcontext.cdi << "\","
-         << "\"rbp\":\"" << std::setw(16) << registers.regcontext.cbp << "\","
-         << "\"rsp\":\"" << std::setw(16) << registers.regcontext.csp << "\","
-         << "\"rip\":\"" << std::setw(16) << registers.regcontext.cip << "\","
-         << "\"r8\":\"" << std::setw(16) << registers.regcontext.r8 << "\","
-         << "\"r9\":\"" << std::setw(16) << registers.regcontext.r9 << "\","
-         << "\"r10\":\"" << std::setw(16) << registers.regcontext.r10 << "\","
-         << "\"r11\":\"" << std::setw(16) << registers.regcontext.r11 << "\","
-         << "\"r12\":\"" << std::setw(16) << registers.regcontext.r12 << "\","
-         << "\"r13\":\"" << std::setw(16) << registers.regcontext.r13 << "\","
-         << "\"r14\":\"" << std::setw(16) << registers.regcontext.r14 << "\","
-         << "\"r15\":\"" << std::setw(16) << registers.regcontext.r15 << "\","
-         << "\"rflags\":\"" << std::setw(16) << registers.regcontext.eflags << "\"";
+    data << "\"rax\":\"" << std::setw(16) << DbgValFromString("rax") << "\","
+         << "\"rbx\":\"" << std::setw(16) << DbgValFromString("rbx") << "\","
+         << "\"rcx\":\"" << std::setw(16) << DbgValFromString("rcx") << "\","
+         << "\"rdx\":\"" << std::setw(16) << DbgValFromString("rdx") << "\","
+         << "\"rsi\":\"" << std::setw(16) << DbgValFromString("rsi") << "\","
+         << "\"rdi\":\"" << std::setw(16) << DbgValFromString("rdi") << "\","
+         << "\"rbp\":\"" << std::setw(16) << DbgValFromString("rbp") << "\","
+         << "\"rsp\":\"" << std::setw(16) << DbgValFromString("rsp") << "\","
+         << "\"rip\":\"" << std::setw(16) << DbgValFromString("rip") << "\","
+         << "\"r8\":\"" << std::setw(16) << DbgValFromString("r8") << "\","
+         << "\"r9\":\"" << std::setw(16) << DbgValFromString("r9") << "\","
+         << "\"r10\":\"" << std::setw(16) << DbgValFromString("r10") << "\","
+         << "\"r11\":\"" << std::setw(16) << DbgValFromString("r11") << "\","
+         << "\"r12\":\"" << std::setw(16) << DbgValFromString("r12") << "\","
+         << "\"r13\":\"" << std::setw(16) << DbgValFromString("r13") << "\","
+         << "\"r14\":\"" << std::setw(16) << DbgValFromString("r14") << "\","
+         << "\"r15\":\"" << std::setw(16) << DbgValFromString("r15") << "\","
+         << "\"rflags\":\"" << std::setw(16) << DbgValFromString("rflags") << "\"";
 
     return BuildJsonResponse(true, data.str());
 }
@@ -252,14 +247,14 @@ std::string HandleStepInto(const std::string& request) {
 
     // Wait for step to complete (with timeout)
     int timeout = 100; // 100ms
-    while (DbgGetState() == running && timeout > 0) {
+    while (DbgGetDbgState() == running && timeout > 0) {
         Sleep(10);
         timeout -= 10;
     }
 
     // Get new address
     duint cip = DbgValFromString("cip");
-    const char* stateStr = (DbgGetState() == paused) ? "paused" : "running";
+    const char* stateStr = (DbgGetDbgState() == paused) ? "paused" : "running";
 
     std::stringstream data;
     data << "\"address\":\"" << std::hex << cip << std::dec << "\","
@@ -277,13 +272,13 @@ std::string HandleStepOver(const std::string& request) {
     DbgCmdExec("StepOver");
 
     int timeout = 100;
-    while (DbgGetState() == running && timeout > 0) {
+    while (DbgGetDbgState() == running && timeout > 0) {
         Sleep(10);
         timeout -= 10;
     }
 
     duint cip = DbgValFromString("cip");
-    const char* stateStr = (DbgGetState() == paused) ? "paused" : "running";
+    const char* stateStr = (DbgGetDbgState() == paused) ? "paused" : "running";
 
     std::stringstream data;
     data << "\"address\":\"" << std::hex << cip << std::dec << "\","
@@ -302,13 +297,13 @@ std::string HandleStepOut(const std::string& request) {
 
     // Step out may take longer
     int timeout = 1000;
-    while (DbgGetState() == running && timeout > 0) {
+    while (DbgGetDbgState() == running && timeout > 0) {
         Sleep(10);
         timeout -= 10;
     }
 
     duint cip = DbgValFromString("cip");
-    const char* stateStr = (DbgGetState() == paused) ? "paused" : "running";
+    const char* stateStr = (DbgGetDbgState() == paused) ? "paused" : "running";
 
     std::stringstream data;
     data << "\"address\":\"" << std::hex << cip << std::dec << "\","
@@ -334,8 +329,10 @@ std::string HandleSetBreakpoint(const std::string& request) {
         return BuildJsonResponse(false, "\"error\":\"Invalid address\"");
     }
 
-    // Set breakpoint
-    if (!DbgSetBreakpointAt(address, BP_NORMAL)) {
+    // Set breakpoint using command
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "bp %llx", address);
+    if (!DbgCmdExec(cmd)) {
         return BuildJsonResponse(false, "\"error\":\"Failed to set breakpoint\"");
     }
 

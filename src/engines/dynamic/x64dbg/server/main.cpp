@@ -266,31 +266,62 @@ std::string HandleHTTPRequest(const std::string& request) {
                                 "{\"status\":\"ok\",\"message\":\"x64dbg MCP server running\"}");
     }
 
-    // Handle GET /api/status
-    if (method == "GET" && path == "/api/status") {
-        // Send GET_STATE request to plugin
-        std::string pipeResponse;
-        if (g_pipeClient.SendRequest("{\"type\":1}", pipeResponse)) {
-            return BuildHTTPResponse(200, "OK", "application/json", pipeResponse);
-        } else {
-            return BuildHTTPResponse(500, "Internal Server Error", "application/json",
-                                   "{\"error\":\"Failed to communicate with x64dbg plugin\"}");
+    // Map endpoint URL to request type number
+    int requestType = -1;
+    std::string requestBody = "";
+
+    if (path == "/api/status") {
+        requestType = 1;  // GET_STATE
+    } else if (path == "/api/registers") {
+        requestType = 5;  // GET_REGISTERS
+    } else if (path == "/api/step_into") {
+        requestType = 10;  // STEP_INTO
+    } else if (path == "/api/step_over") {
+        requestType = 11;  // STEP_OVER
+    } else if (path == "/api/step_out") {
+        requestType = 12;  // STEP_OUT
+    } else if (path == "/api/memory/read") {
+        requestType = 3;  // READ_MEMORY
+        // Extract body for POST requests
+        if (method == "POST") {
+            size_t bodyStart = request.find("\r\n\r\n");
+            if (bodyStart != std::string::npos) {
+                requestBody = request.substr(bodyStart + 4);
+            }
+        }
+    } else if (path == "/api/breakpoint/set") {
+        requestType = 20;  // SET_BREAKPOINT
+        // Extract body for POST requests
+        if (method == "POST") {
+            size_t bodyStart = request.find("\r\n\r\n");
+            if (bodyStart != std::string::npos) {
+                requestBody = request.substr(bodyStart + 4);
+            }
         }
     }
 
-    // Handle POST requests to /api/* endpoints (extract JSON body and forward to plugin)
-    if (method == "POST" && path.rfind("/api/", 0) == 0) {
-        // Find body (after \r\n\r\n)
-        size_t bodyStart = request.find("\r\n\r\n");
-        if (bodyStart == std::string::npos) {
-            return BuildHTTPResponse(400, "Bad Request", "text/plain", "Missing request body");
+    // If we have a valid endpoint, build request and forward to plugin
+    if (requestType != -1) {
+        // Build JSON request with type field
+        std::string pluginRequest;
+        if (requestBody.empty() || requestBody == "{}" || requestBody == "{}") {
+            // No body or empty body - just send type
+            pluginRequest = "{\"type\":" + std::to_string(requestType) + "}";
+        } else {
+            // Merge type into existing JSON body
+            // Simple approach: inject "type" at the beginning
+            size_t firstBrace = requestBody.find('{');
+            if (firstBrace != std::string::npos) {
+                pluginRequest = "{\"type\":" + std::to_string(requestType) + ",";
+                pluginRequest += requestBody.substr(firstBrace + 1);
+            } else {
+                pluginRequest = "{\"type\":" + std::to_string(requestType) + "}";
+            }
         }
-
-        std::string body = request.substr(bodyStart + 4);
 
         // Forward to plugin via Named Pipe
         std::string pipeResponse;
-        if (g_pipeClient.SendRequest(body, pipeResponse)) {
+        if (g_pipeClient.SendRequest(pluginRequest, pipeResponse)) {
             return BuildHTTPResponse(200, "OK", "application/json", pipeResponse);
         } else {
             return BuildHTTPResponse(500, "Internal Server Error", "application/json",

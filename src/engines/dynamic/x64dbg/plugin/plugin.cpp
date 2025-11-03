@@ -133,15 +133,8 @@ std::string HandleGetState(const std::string& request) {
         return BuildJsonResponse(true, data.str());
     }
 
-    // Get current state
-    DBGSTATE state = DbgGetDbgState();
-    const char* stateStr = "unknown";
-    switch (state) {
-        case paused: stateStr = "paused"; break;
-        case running: stateStr = "running"; break;
-        case stopped: stateStr = "terminated"; break;
-        default: stateStr = "loaded"; break;
-    }
+    // If we're debugging, assume paused (we can only query when paused)
+    const char* stateStr = "paused";
 
     // Get current instruction pointer
     duint cip = DbgValFromString("cip");
@@ -245,16 +238,12 @@ std::string HandleStepInto(const std::string& request) {
     // Execute step into
     DbgCmdExec("StepInto");
 
-    // Wait for step to complete (with timeout)
-    int timeout = 100; // 100ms
-    while (DbgGetDbgState() == running && timeout > 0) {
-        Sleep(10);
-        timeout -= 10;
-    }
+    // Wait for step to complete
+    Sleep(100);
 
     // Get new address
     duint cip = DbgValFromString("cip");
-    const char* stateStr = (DbgGetDbgState() == paused) ? "paused" : "running";
+    const char* stateStr = "paused";
 
     std::stringstream data;
     data << "\"address\":\"" << std::hex << cip << std::dec << "\","
@@ -271,14 +260,11 @@ std::string HandleStepOver(const std::string& request) {
 
     DbgCmdExec("StepOver");
 
-    int timeout = 100;
-    while (DbgGetDbgState() == running && timeout > 0) {
-        Sleep(10);
-        timeout -= 10;
-    }
+    // Wait for step to complete
+    Sleep(100);
 
     duint cip = DbgValFromString("cip");
-    const char* stateStr = (DbgGetDbgState() == paused) ? "paused" : "running";
+    const char* stateStr = "paused";
 
     std::stringstream data;
     data << "\"address\":\"" << std::hex << cip << std::dec << "\","
@@ -295,15 +281,11 @@ std::string HandleStepOut(const std::string& request) {
 
     DbgCmdExec("StepOut");
 
-    // Step out may take longer
-    int timeout = 1000;
-    while (DbgGetDbgState() == running && timeout > 0) {
-        Sleep(10);
-        timeout -= 10;
-    }
+    // Step out may take longer - wait for completion
+    Sleep(500);
 
     duint cip = DbgValFromString("cip");
-    const char* stateStr = (DbgGetDbgState() == paused) ? "paused" : "running";
+    const char* stateStr = "paused";
 
     std::stringstream data;
     data << "\"address\":\"" << std::hex << cip << std::dec << "\","

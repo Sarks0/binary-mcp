@@ -266,10 +266,19 @@ std::string HandleHTTPRequest(const std::string& request) {
                                 "{\"status\":\"ok\",\"message\":\"x64dbg MCP server running\"}");
     }
 
+    // Extract request body for POST requests
+    std::string requestBody = "";
+    if (method == "POST") {
+        size_t bodyStart = request.find("\r\n\r\n");
+        if (bodyStart != std::string::npos) {
+            requestBody = request.substr(bodyStart + 4);
+        }
+    }
+
     // Map endpoint URL to request type number
     int requestType = -1;
-    std::string requestBody = "";
 
+    // P0 Handlers (Implemented)
     if (path == "/api/status") {
         requestType = 1;  // GET_STATE
     } else if (path == "/api/registers") {
@@ -282,22 +291,76 @@ std::string HandleHTTPRequest(const std::string& request) {
         requestType = 12;  // STEP_OUT
     } else if (path == "/api/memory/read") {
         requestType = 3;  // READ_MEMORY
-        // Extract body for POST requests
-        if (method == "POST") {
-            size_t bodyStart = request.find("\r\n\r\n");
-            if (bodyStart != std::string::npos) {
-                requestBody = request.substr(bodyStart + 4);
-            }
-        }
     } else if (path == "/api/breakpoint/set") {
         requestType = 20;  // SET_BREAKPOINT
-        // Extract body for POST requests
-        if (method == "POST") {
-            size_t bodyStart = request.find("\r\n\r\n");
-            if (bodyStart != std::string::npos) {
-                requestBody = request.substr(bodyStart + 4);
-            }
-        }
+
+    // Core Functionality (Not Yet Implemented)
+    } else if (path == "/api/load") {
+        requestType = 2;  // LOAD_BINARY
+    } else if (path == "/api/run") {
+        requestType = 8;  // RUN
+    } else if (path == "/api/pause") {
+        requestType = 9;  // PAUSE
+    } else if (path == "/api/memory/write") {
+        requestType = 4;  // WRITE_MEMORY
+    } else if (path == "/api/register/set") {
+        requestType = 6;  // SET_REGISTER
+
+    // Breakpoints (Not Yet Implemented)
+    } else if (path == "/api/breakpoint/delete") {
+        requestType = 21;  // DELETE_BREAKPOINT
+    } else if (path == "/api/breakpoint/list") {
+        requestType = 22;  // LIST_BREAKPOINTS
+    } else if (path == "/api/breakpoint/hardware") {
+        requestType = 30;  // SET_HARDWARE_BREAKPOINT
+    } else if (path == "/api/breakpoint/memory") {
+        requestType = 31;  // SET_MEMORY_BREAKPOINT
+    } else if (path == "/api/breakpoint/memory/delete") {
+        requestType = 32;  // DELETE_MEMORY_BREAKPOINT
+
+    // Analysis Tools (Not Yet Implemented)
+    } else if (path == "/api/disassemble") {
+        requestType = 7;  // DISASSEMBLE
+    } else if (path == "/api/stack") {
+        requestType = 13;  // GET_STACK
+    } else if (path == "/api/modules") {
+        requestType = 14;  // GET_MODULES
+    } else if (path == "/api/threads") {
+        requestType = 15;  // GET_THREADS
+    } else if (path == "/api/instruction") {
+        requestType = 40;  // GET_INSTRUCTION
+    } else if (path == "/api/evaluate") {
+        requestType = 41;  // EVALUATE_EXPRESSION
+
+    // Memory Tools (Not Yet Implemented)
+    } else if (path == "/api/memory/map") {
+        requestType = 50;  // GET_MEMORY_MAP
+    } else if (path == "/api/memory/info") {
+        requestType = 51;  // GET_MEMORY_INFO
+    } else if (path == "/api/memory/dump") {
+        requestType = 52;  // DUMP_MEMORY
+    } else if (path == "/api/memory/search") {
+        requestType = 53;  // SEARCH_MEMORY
+
+    // Module Tools (Not Yet Implemented)
+    } else if (path == "/api/module/imports") {
+        requestType = 60;  // GET_MODULE_IMPORTS
+    } else if (path == "/api/module/exports") {
+        requestType = 61;  // GET_MODULE_EXPORTS
+
+    // Comments (Not Yet Implemented)
+    } else if (path == "/api/comment/set") {
+        requestType = 70;  // SET_COMMENT
+    } else if (path == "/api/comment/get") {
+        requestType = 71;  // GET_COMMENT
+
+    // Advanced Control (Not Yet Implemented)
+    } else if (path == "/api/skip") {
+        requestType = 80;  // SKIP_INSTRUCTION
+    } else if (path == "/api/run_until_return") {
+        requestType = 81;  // RUN_UNTIL_RETURN
+    } else if (path == "/api/hide_debugger") {
+        requestType = 90;  // HIDE_DEBUGGER
     }
 
     // If we have a valid endpoint, build request and forward to plugin

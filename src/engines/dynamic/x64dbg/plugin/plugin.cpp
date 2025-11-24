@@ -109,6 +109,35 @@ void LogError(const char* format, ...) {
 // JSON HELPER FUNCTIONS (Simple parser - no external dependencies)
 // ============================================================================
 
+// Escape string for JSON output (handles backslashes, quotes, newlines, etc.)
+std::string JsonEscape(const std::string& str) {
+    std::string result;
+    result.reserve(str.length() * 2);  // Preallocate for potential escaping
+
+    for (char c : str) {
+        switch (c) {
+            case '\\': result += "\\\\"; break;
+            case '"':  result += "\\\""; break;
+            case '\n': result += "\\n"; break;
+            case '\r': result += "\\r"; break;
+            case '\t': result += "\\t"; break;
+            case '\b': result += "\\b"; break;
+            case '\f': result += "\\f"; break;
+            default:
+                // Handle control characters
+                if (static_cast<unsigned char>(c) < 0x20) {
+                    char buf[8];
+                    snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned char>(c));
+                    result += buf;
+                } else {
+                    result += c;
+                }
+                break;
+        }
+    }
+    return result;
+}
+
 // Extract integer value from JSON string
 int ExtractIntField(const std::string& json, const char* fieldName, int defaultValue = 0) {
     std::string searchStr = std::string("\"") + fieldName + "\":";
@@ -124,16 +153,62 @@ int ExtractIntField(const std::string& json, const char* fieldName, int defaultV
 }
 
 // Extract string value from JSON string
+// Handles both quoted strings ("field":"value") and unquoted values ("field":123)
 std::string ExtractStringField(const std::string& json, const char* fieldName, const char* defaultValue = "") {
-    std::string searchStr = std::string("\"") + fieldName + "\":\"";
+    std::string searchStr = std::string("\"") + fieldName + "\":";
     size_t pos = json.find(searchStr);
-    if (pos == std::string::npos) return defaultValue;
+    if (pos == std::string::npos) {
+        // Log for debugging
+        LogInfo("ExtractStringField: field '%s' not found in: %.100s...", fieldName, json.c_str());
+        return defaultValue;
+    }
 
     pos += searchStr.length();
-    size_t endPos = json.find('"', pos);
-    if (endPos == std::string::npos) return defaultValue;
 
-    return json.substr(pos, endPos - pos);
+    // Skip whitespace
+    while (pos < json.length() && (json[pos] == ' ' || json[pos] == '\t')) pos++;
+
+    if (pos >= json.length()) return defaultValue;
+
+    // Check if value is quoted or not
+    if (json[pos] == '"') {
+        // Quoted string value
+        pos++;  // Skip opening quote
+        std::string result;
+        while (pos < json.length() && json[pos] != '"') {
+            // Handle escape sequences
+            if (json[pos] == '\\' && pos + 1 < json.length()) {
+                pos++;
+                switch (json[pos]) {
+                    case 'n': result += '\n'; break;
+                    case 'r': result += '\r'; break;
+                    case 't': result += '\t'; break;
+                    case '\\': result += '\\'; break;
+                    case '"': result += '"'; break;
+                    default: result += json[pos]; break;
+                }
+            } else {
+                result += json[pos];
+            }
+            pos++;
+        }
+        return result;
+    } else {
+        // Unquoted value (number, boolean, null)
+        // Read until comma, closing brace, or end
+        size_t endPos = pos;
+        while (endPos < json.length() &&
+               json[endPos] != ',' &&
+               json[endPos] != '}' &&
+               json[endPos] != ']' &&
+               json[endPos] != ' ' &&
+               json[endPos] != '\t' &&
+               json[endPos] != '\n' &&
+               json[endPos] != '\r') {
+            endPos++;
+        }
+        return json.substr(pos, endPos - pos);
+    }
 }
 
 // Build JSON response
@@ -176,7 +251,7 @@ std::string HandleGetState(const std::string& request) {
 
     data << "\"state\":\"" << stateStr << "\","
          << "\"current_address\":\"" << std::hex << cip << std::dec << "\","
-         << "\"binary_path\":\"" << modulePath << "\"";
+         << "\"binary_path\":\"" << JsonEscape(modulePath) << "\"";
 
     return BuildJsonResponse(true, data.str());
 }
@@ -432,7 +507,7 @@ std::string HandleGetModules(const std::string& request) {
         data << "{\"base\":\"" << std::hex << mainBase << std::dec << "\","
              << "\"size\":" << modSize << ","
              << "\"entry\":\"" << std::hex << modEntry << std::dec << "\","
-             << "\"path\":\"" << mainPath << "\"}";
+             << "\"path\":\"" << JsonEscape(mainPath) << "\"}";
     }
 
     data << "]";
@@ -469,16 +544,27 @@ std::string HandleGetStack(const std::string& request) {
         return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
     }
 
-    // Get current RSP value
+    // Get current RSP and RBP values
     duint rsp = DbgValFromString("rsp");
+    duint rbp = DbgValFromString("rbp");
+    duint rip = DbgValFromString("rip");
     int count = ExtractIntField(request, "count", 16);
 
     // Limit count to reasonable range
     if (count < 1) count = 1;
     if (count > 256) count = 256;
 
+    LogInfo("GetStack: RSP=0x%llx, RBP=0x%llx, RIP=0x%llx, count=%d", rsp, rbp, rip, count);
+
     std::stringstream data;
-    data << "\"stack\":[";
+
+    // Include current context info
+    data << "\"rsp\":\"" << std::hex << rsp << std::dec << "\","
+         << "\"rbp\":\"" << std::hex << rbp << std::dec << "\","
+         << "\"rip\":\"" << std::hex << rip << std::dec << "\","
+         << "\"stack\":[";
+
+    int validEntries = 0;
 
     // Read stack entries
     for (int i = 0; i < count; i++) {
@@ -486,14 +572,33 @@ std::string HandleGetStack(const std::string& request) {
         duint stackValue = 0;
 
         if (!DbgMemRead(stackAddr, &stackValue, sizeof(stackValue))) {
+            LogInfo("GetStack: Failed to read at 0x%llx", stackAddr);
             break;
         }
 
-        if (i > 0) data << ",";
+        if (validEntries > 0) data << ",";
+
+        // Try to get module name for the value (if it's a code address)
+        char moduleName[MAX_MODULE_SIZE] = "";
+        if (DbgMemIsValidReadPtr(stackValue)) {
+            DbgGetModuleAt(stackValue, moduleName);
+        }
+
         data << "{\"address\":\"" << std::hex << stackAddr << "\","
-             << "\"value\":\"" << std::hex << stackValue << std::dec << "\"}";
+             << "\"value\":\"" << std::hex << stackValue << std::dec << "\"";
+
+        // Add module info if available
+        if (moduleName[0] != '\0') {
+            data << ",\"module\":\"" << JsonEscape(moduleName) << "\"";
+        }
+
+        data << "}";
+        validEntries++;
     }
-    data << "]";
+    data << "],"
+         << "\"count\":" << validEntries;
+
+    LogInfo("GetStack: Returned %d entries", validEntries);
 
     return BuildJsonResponse(true, data.str());
 }
@@ -531,8 +636,8 @@ std::string HandleDisassemble(const std::string& request) {
 
         if (i > 0) data << ",";
 
-        // Build instruction string
-        std::string instrText = instr.instruction;
+        // Build instruction string with proper JSON escaping
+        std::string instrText = JsonEscape(instr.instruction);
 
         data << "{\"address\":\"" << std::hex << currentAddr << std::dec << "\","
              << "\"size\":" << instr.instr_size << ","
@@ -664,7 +769,7 @@ std::string HandleGetMemoryMap(const std::string& request) {
         data << "{\"base\":\"" << std::hex << page->mbi.BaseAddress << std::dec << "\","
              << "\"size\":" << page->mbi.RegionSize << ","
              << "\"protection\":\"" << protStr << "\","
-             << "\"info\":\"" << page->info << "\"}";
+             << "\"info\":\"" << JsonEscape(page->info) << "\"}";
     }
     data << "]";
 
@@ -719,7 +824,7 @@ std::string HandleGetInstruction(const std::string& request) {
     std::stringstream data;
     data << "\"address\":\"" << std::hex << address << std::dec << "\","
          << "\"size\":" << instr.instr_size << ","
-         << "\"instruction\":\"" << instr.instruction << "\","
+         << "\"instruction\":\"" << JsonEscape(instr.instruction) << "\","
          << "\"type\":" << instr.type;
 
     return BuildJsonResponse(true, data.str());
@@ -764,7 +869,7 @@ std::string HandleGetComment(const std::string& request) {
     DbgGetCommentAt(address, comment);
 
     std::stringstream data;
-    data << "\"comment\":\"" << comment << "\"";
+    data << "\"comment\":\"" << JsonEscape(comment) << "\"";
 
     return BuildJsonResponse(true, data.str());
 }
@@ -996,7 +1101,7 @@ std::string HandleGetMemoryInfo(const std::string& request) {
 
     std::stringstream data;
     data << "\"address\":\"" << std::hex << address << std::dec << "\","
-         << "\"module\":\"" << moduleName << "\","
+         << "\"module\":\"" << JsonEscape(moduleName) << "\","
          << "\"readable\":" << (DbgMemIsValidReadPtr(address) ? "true" : "false");
 
     return BuildJsonResponse(true, data.str());

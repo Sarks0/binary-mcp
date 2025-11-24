@@ -14,8 +14,9 @@
 
 #pragma comment(lib, "advapi32.lib")  // Link Crypto API
 
-// Request type enumeration
+// Request type enumeration (must match server/main.cpp)
 enum RequestType {
+    // Core debugger state
     GET_STATE = 1,
     LOAD_BINARY = 2,
     READ_MEMORY = 3,
@@ -31,9 +32,39 @@ enum RequestType {
     GET_STACK = 13,
     GET_MODULES = 14,
     GET_THREADS = 15,
+
+    // Breakpoints
     SET_BREAKPOINT = 20,
     DELETE_BREAKPOINT = 21,
     LIST_BREAKPOINTS = 22,
+    SET_HARDWARE_BREAKPOINT = 30,
+    SET_MEMORY_BREAKPOINT = 31,
+    DELETE_MEMORY_BREAKPOINT = 32,
+
+    // Analysis tools
+    GET_INSTRUCTION = 40,
+    EVALUATE_EXPRESSION = 41,
+
+    // Memory tools
+    GET_MEMORY_MAP = 50,
+    GET_MEMORY_INFO = 51,
+    DUMP_MEMORY = 52,
+    SEARCH_MEMORY = 53,
+
+    // Module tools
+    GET_MODULE_IMPORTS = 60,
+    GET_MODULE_EXPORTS = 61,
+
+    // Comments
+    SET_COMMENT = 70,
+    GET_COMMENT = 71,
+
+    // Advanced control
+    SKIP_INSTRUCTION = 80,
+    RUN_UNTIL_RETURN = 81,
+    HIDE_DEBUGGER = 90,
+
+    // Health check
     PING = 99
 };
 
@@ -326,6 +357,680 @@ std::string HandleSetBreakpoint(const std::string& request) {
     return BuildJsonResponse(true, data.str());
 }
 
+// Handler: DELETE_BREAKPOINT - Delete software breakpoint at address
+std::string HandleDeleteBreakpoint(const std::string& request) {
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+    }
+
+    std::string addressStr = ExtractStringField(request, "address");
+    if (addressStr.empty()) {
+        return BuildJsonResponse(false, "\"error\":\"Missing address\"");
+    }
+
+    duint address = DbgValFromString(addressStr.c_str());
+
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "bc %llx", address);
+    DbgCmdExec(cmd);
+
+    LogInfo("Breakpoint deleted at 0x%llx", address);
+    return BuildJsonResponse(true, "\"message\":\"Breakpoint deleted\"");
+}
+
+// Handler: LIST_BREAKPOINTS - List all breakpoints
+std::string HandleListBreakpoints(const std::string& request) {
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+    }
+
+    // Get breakpoint list using x64dbg API
+    BPMAP bpmap;
+    if (!DbgGetBpList(bp_normal, &bpmap)) {
+        return BuildJsonResponse(true, "\"breakpoints\":[]");
+    }
+
+    std::stringstream data;
+    data << "\"breakpoints\":[";
+
+    for (int i = 0; i < bpmap.count; i++) {
+        if (i > 0) data << ",";
+        data << "{\"address\":\"" << std::hex << bpmap.bp[i].addr << std::dec << "\","
+             << "\"enabled\":" << (bpmap.bp[i].enabled ? "true" : "false") << ","
+             << "\"type\":\"software\"}";
+    }
+    data << "]";
+
+    // Free the breakpoint map
+    if (bpmap.bp) {
+        BridgeFree(bpmap.bp);
+    }
+
+    return BuildJsonResponse(true, data.str());
+}
+
+// Handler: GET_MODULES - List loaded modules
+std::string HandleGetModules(const std::string& request) {
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+    }
+
+    // Get module list
+    MODULELIST modList;
+    if (!DbgGetModuleList(&modList)) {
+        return BuildJsonResponse(false, "\"error\":\"Failed to get module list\"");
+    }
+
+    std::stringstream data;
+    data << "\"modules\":[";
+
+    for (int i = 0; i < modList.count; i++) {
+        if (i > 0) data << ",";
+
+        // Get module info
+        MODULEINFO* mod = &modList.modules[i];
+
+        data << "{\"base\":\"" << std::hex << mod->base << std::dec << "\","
+             << "\"size\":" << mod->size << ","
+             << "\"entry\":\"" << std::hex << mod->entry << std::dec << "\","
+             << "\"name\":\"" << mod->name << "\","
+             << "\"path\":\"" << mod->path << "\"}";
+    }
+    data << "]";
+
+    // Free the module list
+    if (modList.modules) {
+        BridgeFree(modList.modules);
+    }
+
+    return BuildJsonResponse(true, data.str());
+}
+
+// Handler: GET_THREADS - List threads
+std::string HandleGetThreads(const std::string& request) {
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+    }
+
+    // Get thread list
+    THREADLIST threadList;
+    if (!DbgGetThreadList(&threadList)) {
+        return BuildJsonResponse(false, "\"error\":\"Failed to get thread list\"");
+    }
+
+    std::stringstream data;
+    data << "\"threads\":[";
+
+    for (int i = 0; i < threadList.count; i++) {
+        if (i > 0) data << ",";
+
+        THREADALLINFO* thread = &threadList.list[i];
+
+        data << "{\"id\":" << thread->BasicInfo.ThreadId << ","
+             << "\"handle\":\"" << std::hex << thread->BasicInfo.Handle << std::dec << "\","
+             << "\"entry\":\"" << std::hex << thread->BasicInfo.ThreadStartAddress << std::dec << "\","
+             << "\"teb\":\"" << std::hex << thread->BasicInfo.ThreadLocalBase << std::dec << "\","
+             << "\"is_current\":" << (thread->BasicInfo.ThreadId == DbgGetThreadId() ? "true" : "false") << "}";
+    }
+    data << "]";
+
+    // Free the thread list
+    if (threadList.list) {
+        BridgeFree(threadList.list);
+    }
+
+    return BuildJsonResponse(true, data.str());
+}
+
+// Handler: GET_STACK - Get stack trace
+std::string HandleGetStack(const std::string& request) {
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+    }
+
+    // Get current RSP value
+    duint rsp = DbgValFromString("rsp");
+    int count = ExtractIntField(request, "count", 16);
+
+    // Limit count to reasonable range
+    if (count < 1) count = 1;
+    if (count > 256) count = 256;
+
+    std::stringstream data;
+    data << "\"stack\":[";
+
+    // Read stack entries
+    for (int i = 0; i < count; i++) {
+        duint stackAddr = rsp + (i * sizeof(duint));
+        duint stackValue = 0;
+
+        if (!DbgMemRead(stackAddr, &stackValue, sizeof(stackValue))) {
+            break;
+        }
+
+        if (i > 0) data << ",";
+        data << "{\"address\":\"" << std::hex << stackAddr << "\","
+             << "\"value\":\"" << std::hex << stackValue << std::dec << "\"}";
+    }
+    data << "]";
+
+    return BuildJsonResponse(true, data.str());
+}
+
+// Handler: DISASSEMBLE - Disassemble instructions at address
+std::string HandleDisassemble(const std::string& request) {
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+    }
+
+    std::string addressStr = ExtractStringField(request, "address");
+    duint address = addressStr.empty() ? DbgValFromString("cip") : DbgValFromString(addressStr.c_str());
+
+    int count = ExtractIntField(request, "count", 10);
+    if (count < 1) count = 1;
+    if (count > 100) count = 100;
+
+    std::stringstream data;
+    data << "\"instructions\":[";
+
+    duint currentAddr = address;
+    for (int i = 0; i < count; i++) {
+        DISASM_INSTR instr;
+        if (!DbgDisasmAt(currentAddr, &instr)) {
+            break;
+        }
+
+        if (i > 0) data << ",";
+
+        // Build instruction string
+        std::string instrText = instr.instruction;
+
+        data << "{\"address\":\"" << std::hex << currentAddr << std::dec << "\","
+             << "\"size\":" << instr.instr_size << ","
+             << "\"instruction\":\"" << instrText << "\"}";
+
+        currentAddr += instr.instr_size;
+    }
+    data << "]";
+
+    return BuildJsonResponse(true, data.str());
+}
+
+// Handler: WRITE_MEMORY - Write memory to debugged process
+std::string HandleWriteMemory(const std::string& request) {
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+    }
+
+    std::string addressStr = ExtractStringField(request, "address");
+    std::string dataHex = ExtractStringField(request, "data");
+
+    if (addressStr.empty() || dataHex.empty()) {
+        return BuildJsonResponse(false, "\"error\":\"Missing address or data\"");
+    }
+
+    duint address = DbgValFromString(addressStr.c_str());
+
+    // Convert hex string to bytes
+    std::vector<unsigned char> bytes;
+    for (size_t i = 0; i + 1 < dataHex.length(); i += 2) {
+        unsigned int byte;
+        if (sscanf(dataHex.c_str() + i, "%02x", &byte) == 1) {
+            bytes.push_back(static_cast<unsigned char>(byte));
+        }
+    }
+
+    if (bytes.empty()) {
+        return BuildJsonResponse(false, "\"error\":\"Invalid hex data\"");
+    }
+
+    if (!DbgMemWrite(address, bytes.data(), bytes.size())) {
+        return BuildJsonResponse(false, "\"error\":\"Failed to write memory\"");
+    }
+
+    LogInfo("Wrote %zu bytes to 0x%llx", bytes.size(), address);
+
+    std::stringstream resultData;
+    resultData << "\"bytes_written\":" << bytes.size();
+    return BuildJsonResponse(true, resultData.str());
+}
+
+// Handler: RUN - Continue execution
+std::string HandleRun(const std::string& request) {
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+    }
+
+    DbgCmdExec("run");
+
+    return BuildJsonResponse(true, "\"message\":\"Execution resumed\"");
+}
+
+// Handler: PAUSE - Pause execution
+std::string HandlePause(const std::string& request) {
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+    }
+
+    DbgCmdExec("pause");
+
+    return BuildJsonResponse(true, "\"message\":\"Execution paused\"");
+}
+
+// Handler: SET_REGISTER - Set register value
+std::string HandleSetRegister(const std::string& request) {
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+    }
+
+    std::string regName = ExtractStringField(request, "register");
+    std::string valueStr = ExtractStringField(request, "value");
+
+    if (regName.empty() || valueStr.empty()) {
+        return BuildJsonResponse(false, "\"error\":\"Missing register or value\"");
+    }
+
+    // Use x64dbg command to set register
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "mov %s, %s", regName.c_str(), valueStr.c_str());
+    if (!DbgCmdExec(cmd)) {
+        return BuildJsonResponse(false, "\"error\":\"Failed to set register\"");
+    }
+
+    return BuildJsonResponse(true, "\"message\":\"Register set\"");
+}
+
+// Handler: GET_MEMORY_MAP - Get memory regions
+std::string HandleGetMemoryMap(const std::string& request) {
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+    }
+
+    // Get memory map
+    MEMMAP memMap;
+    if (!DbgMemMap(&memMap)) {
+        return BuildJsonResponse(false, "\"error\":\"Failed to get memory map\"");
+    }
+
+    std::stringstream data;
+    data << "\"regions\":[";
+
+    for (int i = 0; i < memMap.count; i++) {
+        if (i > 0) data << ",";
+
+        MEMPAGE* page = &memMap.page[i];
+
+        // Build protection string
+        std::string protStr;
+        if (page->mbi.Protect & PAGE_EXECUTE) protStr += "X";
+        if (page->mbi.Protect & PAGE_EXECUTE_READ) protStr += "RX";
+        if (page->mbi.Protect & PAGE_EXECUTE_READWRITE) protStr += "RWX";
+        if (page->mbi.Protect & PAGE_EXECUTE_WRITECOPY) protStr += "WCX";
+        if (page->mbi.Protect & PAGE_READONLY) protStr += "R";
+        if (page->mbi.Protect & PAGE_READWRITE) protStr += "RW";
+        if (page->mbi.Protect & PAGE_WRITECOPY) protStr += "WC";
+        if (page->mbi.Protect & PAGE_NOACCESS) protStr += "NA";
+        if (protStr.empty()) protStr = "?";
+
+        data << "{\"base\":\"" << std::hex << page->mbi.BaseAddress << std::dec << "\","
+             << "\"size\":" << page->mbi.RegionSize << ","
+             << "\"protection\":\"" << protStr << "\","
+             << "\"info\":\"" << page->info << "\"}";
+    }
+    data << "]";
+
+    // Free the memory map
+    if (memMap.page) {
+        BridgeFree(memMap.page);
+    }
+
+    return BuildJsonResponse(true, data.str());
+}
+
+// Handler: EVALUATE_EXPRESSION - Evaluate expression
+std::string HandleEvaluateExpression(const std::string& request) {
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+    }
+
+    std::string expr = ExtractStringField(request, "expression");
+    if (expr.empty()) {
+        return BuildJsonResponse(false, "\"error\":\"Missing expression\"");
+    }
+
+    duint result = DbgValFromString(expr.c_str());
+
+    std::stringstream data;
+    data << "\"result\":\"" << std::hex << result << std::dec << "\","
+         << "\"decimal\":" << result;
+
+    return BuildJsonResponse(true, data.str());
+}
+
+// Handler: GET_INSTRUCTION - Get single instruction at address
+std::string HandleGetInstruction(const std::string& request) {
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+    }
+
+    std::string addressStr = ExtractStringField(request, "address");
+    duint address = addressStr.empty() ? DbgValFromString("cip") : DbgValFromString(addressStr.c_str());
+
+    DISASM_INSTR instr;
+    if (!DbgDisasmAt(address, &instr)) {
+        return BuildJsonResponse(false, "\"error\":\"Failed to disassemble\"");
+    }
+
+    std::stringstream data;
+    data << "\"address\":\"" << std::hex << address << std::dec << "\","
+         << "\"size\":" << instr.instr_size << ","
+         << "\"instruction\":\"" << instr.instruction << "\","
+         << "\"type\":" << instr.type;
+
+    return BuildJsonResponse(true, data.str());
+}
+
+// Handler: SET_COMMENT - Set comment at address
+std::string HandleSetComment(const std::string& request) {
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+    }
+
+    std::string addressStr = ExtractStringField(request, "address");
+    std::string comment = ExtractStringField(request, "comment");
+
+    if (addressStr.empty()) {
+        return BuildJsonResponse(false, "\"error\":\"Missing address\"");
+    }
+
+    duint address = DbgValFromString(addressStr.c_str());
+
+    if (!DbgSetCommentAt(address, comment.c_str())) {
+        return BuildJsonResponse(false, "\"error\":\"Failed to set comment\"");
+    }
+
+    return BuildJsonResponse(true, "\"message\":\"Comment set\"");
+}
+
+// Handler: GET_COMMENT - Get comment at address
+std::string HandleGetComment(const std::string& request) {
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+    }
+
+    std::string addressStr = ExtractStringField(request, "address");
+    if (addressStr.empty()) {
+        return BuildJsonResponse(false, "\"error\":\"Missing address\"");
+    }
+
+    duint address = DbgValFromString(addressStr.c_str());
+
+    char comment[MAX_COMMENT_SIZE] = "";
+    DbgGetCommentAt(address, comment);
+
+    std::stringstream data;
+    data << "\"comment\":\"" << comment << "\"";
+
+    return BuildJsonResponse(true, data.str());
+}
+
+// Handler: SKIP_INSTRUCTION - Skip current instruction (move IP forward)
+std::string HandleSkipInstruction(const std::string& request) {
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+    }
+
+    // Get current instruction size
+    duint cip = DbgValFromString("cip");
+    DISASM_INSTR instr;
+    if (!DbgDisasmAt(cip, &instr)) {
+        return BuildJsonResponse(false, "\"error\":\"Failed to get instruction size\"");
+    }
+
+    // Set RIP/EIP to next instruction
+    duint newCip = cip + instr.instr_size;
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "rip=%llx", newCip);
+    DbgCmdExec(cmd);
+
+    std::stringstream data;
+    data << "\"old_address\":\"" << std::hex << cip << "\","
+         << "\"new_address\":\"" << std::hex << newCip << std::dec << "\","
+         << "\"skipped_size\":" << instr.instr_size;
+
+    return BuildJsonResponse(true, data.str());
+}
+
+// Handler: RUN_UNTIL_RETURN - Run until return from current function
+std::string HandleRunUntilReturn(const std::string& request) {
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+    }
+
+    // Execute "rtr" command (run to return)
+    DbgCmdExec("rtr");
+
+    return BuildJsonResponse(true, "\"message\":\"Running until return\"");
+}
+
+// Handler: SET_HARDWARE_BREAKPOINT - Set hardware breakpoint
+std::string HandleSetHardwareBreakpoint(const std::string& request) {
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+    }
+
+    std::string addressStr = ExtractStringField(request, "address");
+    std::string typeStr = ExtractStringField(request, "bp_type");  // "execute", "read", "write", "access"
+    int size = ExtractIntField(request, "size", 1);
+
+    if (addressStr.empty()) {
+        return BuildJsonResponse(false, "\"error\":\"Missing address\"");
+    }
+
+    duint address = DbgValFromString(addressStr.c_str());
+
+    // Map type string to command
+    std::string hwType = "x";  // Default: execute
+    if (typeStr == "read") hwType = "r";
+    else if (typeStr == "write") hwType = "w";
+    else if (typeStr == "access") hwType = "a";
+
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "bph %llx, %s, %d", address, hwType.c_str(), size);
+    if (!DbgCmdExec(cmd)) {
+        return BuildJsonResponse(false, "\"error\":\"Failed to set hardware breakpoint\"");
+    }
+
+    LogInfo("Hardware breakpoint set at 0x%llx (type: %s, size: %d)", address, hwType.c_str(), size);
+
+    std::stringstream data;
+    data << "\"address\":\"" << std::hex << address << std::dec << "\","
+         << "\"type\":\"" << hwType << "\","
+         << "\"size\":" << size;
+
+    return BuildJsonResponse(true, data.str());
+}
+
+// Handler: SET_MEMORY_BREAKPOINT - Set memory breakpoint
+std::string HandleSetMemoryBreakpoint(const std::string& request) {
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+    }
+
+    std::string addressStr = ExtractStringField(request, "address");
+    std::string typeStr = ExtractStringField(request, "bp_type");  // "read", "write", "access"
+
+    if (addressStr.empty()) {
+        return BuildJsonResponse(false, "\"error\":\"Missing address\"");
+    }
+
+    duint address = DbgValFromString(addressStr.c_str());
+
+    // Map type string to command
+    std::string memType = "a";  // Default: access
+    if (typeStr == "read") memType = "r";
+    else if (typeStr == "write") memType = "w";
+
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "bpm %llx, %s", address, memType.c_str());
+    if (!DbgCmdExec(cmd)) {
+        return BuildJsonResponse(false, "\"error\":\"Failed to set memory breakpoint\"");
+    }
+
+    LogInfo("Memory breakpoint set at 0x%llx (type: %s)", address, memType.c_str());
+
+    std::stringstream data;
+    data << "\"address\":\"" << std::hex << address << std::dec << "\","
+         << "\"type\":\"" << memType << "\"";
+
+    return BuildJsonResponse(true, data.str());
+}
+
+// Handler: DELETE_MEMORY_BREAKPOINT - Delete memory breakpoint
+std::string HandleDeleteMemoryBreakpoint(const std::string& request) {
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+    }
+
+    std::string addressStr = ExtractStringField(request, "address");
+    if (addressStr.empty()) {
+        return BuildJsonResponse(false, "\"error\":\"Missing address\"");
+    }
+
+    duint address = DbgValFromString(addressStr.c_str());
+
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "bpmc %llx", address);
+    DbgCmdExec(cmd);
+
+    LogInfo("Memory breakpoint deleted at 0x%llx", address);
+    return BuildJsonResponse(true, "\"message\":\"Memory breakpoint deleted\"");
+}
+
+// Handler: HIDE_DEBUGGER - Apply anti-anti-debug techniques
+std::string HandleHideDebugger(const std::string& request) {
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+    }
+
+    // Use x64dbg's built-in hide debugger functionality
+    DbgCmdExec("hide");
+
+    return BuildJsonResponse(true, "\"message\":\"Debugger hidden from target\"");
+}
+
+// Handler: GET_MODULE_IMPORTS - Get imports for a module
+std::string HandleGetModuleImports(const std::string& request) {
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+    }
+
+    std::string moduleName = ExtractStringField(request, "module");
+    if (moduleName.empty()) {
+        return BuildJsonResponse(false, "\"error\":\"Missing module name\"");
+    }
+
+    // Get module base
+    duint modBase = DbgModBaseFromName(moduleName.c_str());
+    if (modBase == 0) {
+        return BuildJsonResponse(false, "\"error\":\"Module not found\"");
+    }
+
+    // Note: Full import enumeration requires more complex PE parsing
+    // For now, return basic info
+    std::stringstream data;
+    data << "\"module\":\"" << moduleName << "\","
+         << "\"base\":\"" << std::hex << modBase << std::dec << "\","
+         << "\"imports\":[]";  // TODO: Implement full import enumeration
+
+    return BuildJsonResponse(true, data.str());
+}
+
+// Handler: GET_MODULE_EXPORTS - Get exports for a module
+std::string HandleGetModuleExports(const std::string& request) {
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+    }
+
+    std::string moduleName = ExtractStringField(request, "module");
+    if (moduleName.empty()) {
+        return BuildJsonResponse(false, "\"error\":\"Missing module name\"");
+    }
+
+    // Get module base
+    duint modBase = DbgModBaseFromName(moduleName.c_str());
+    if (modBase == 0) {
+        return BuildJsonResponse(false, "\"error\":\"Module not found\"");
+    }
+
+    // Note: Full export enumeration requires more complex PE parsing
+    // For now, return basic info
+    std::stringstream data;
+    data << "\"module\":\"" << moduleName << "\","
+         << "\"base\":\"" << std::hex << modBase << std::dec << "\","
+         << "\"exports\":[]";  // TODO: Implement full export enumeration
+
+    return BuildJsonResponse(true, data.str());
+}
+
+// Handler: GET_MEMORY_INFO - Get info about specific memory region
+std::string HandleGetMemoryInfo(const std::string& request) {
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+    }
+
+    std::string addressStr = ExtractStringField(request, "address");
+    if (addressStr.empty()) {
+        return BuildJsonResponse(false, "\"error\":\"Missing address\"");
+    }
+
+    duint address = DbgValFromString(addressStr.c_str());
+
+    // Query memory info
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!DbgMemIsValidReadPtr(address)) {
+        return BuildJsonResponse(false, "\"error\":\"Invalid memory address\"");
+    }
+
+    // Get module at address if any
+    char moduleName[MAX_MODULE_SIZE] = "";
+    DbgGetModuleAt(address, moduleName);
+
+    std::stringstream data;
+    data << "\"address\":\"" << std::hex << address << std::dec << "\","
+         << "\"module\":\"" << moduleName << "\","
+         << "\"readable\":" << (DbgMemIsValidReadPtr(address) ? "true" : "false");
+
+    return BuildJsonResponse(true, data.str());
+}
+
+// Handler: LOAD_BINARY - Load binary into debugger
+std::string HandleLoadBinary(const std::string& request) {
+    std::string path = ExtractStringField(request, "path");
+    std::string args = ExtractStringField(request, "arguments");
+    std::string workingDir = ExtractStringField(request, "working_directory");
+
+    if (path.empty()) {
+        return BuildJsonResponse(false, "\"error\":\"Missing path\"");
+    }
+
+    // Build command
+    std::string cmd = "init \"" + path + "\"";
+    if (!args.empty()) {
+        cmd += ", \"" + args + "\"";
+    }
+    if (!workingDir.empty()) {
+        cmd += ", \"" + workingDir + "\"";
+    }
+
+    if (!DbgCmdExec(cmd.c_str())) {
+        return BuildJsonResponse(false, "\"error\":\"Failed to load binary\"");
+    }
+
+    LogInfo("Loaded binary: %s", path.c_str());
+    return BuildJsonResponse(true, "\"message\":\"Binary loaded\"");
+}
+
 // Named Pipe server thread (handles requests from HTTP server process)
 static DWORD WINAPI PipeServerThread(LPVOID lpParam) {
     LogInfo("Named Pipe server thread starting...");
@@ -427,34 +1132,119 @@ static DWORD WINAPI PipeServerThread(LPVOID lpParam) {
 
                 // Route to appropriate handler
                 switch (requestType) {
+                    // Core debugger state
                     case GET_STATE:
                         response = HandleGetState(request);
                         break;
-
+                    case LOAD_BINARY:
+                        response = HandleLoadBinary(request);
+                        break;
                     case GET_REGISTERS:
                         response = HandleGetRegisters(request);
                         break;
-
+                    case SET_REGISTER:
+                        response = HandleSetRegister(request);
+                        break;
                     case READ_MEMORY:
                         response = HandleReadMemory(request);
                         break;
+                    case WRITE_MEMORY:
+                        response = HandleWriteMemory(request);
+                        break;
 
+                    // Execution control
+                    case RUN:
+                        response = HandleRun(request);
+                        break;
+                    case PAUSE:
+                        response = HandlePause(request);
+                        break;
                     case STEP_INTO:
                         response = HandleStepInto(request);
                         break;
-
                     case STEP_OVER:
                         response = HandleStepOver(request);
                         break;
-
                     case STEP_OUT:
                         response = HandleStepOut(request);
                         break;
 
+                    // Analysis
+                    case GET_STACK:
+                        response = HandleGetStack(request);
+                        break;
+                    case GET_MODULES:
+                        response = HandleGetModules(request);
+                        break;
+                    case GET_THREADS:
+                        response = HandleGetThreads(request);
+                        break;
+                    case DISASSEMBLE:
+                        response = HandleDisassemble(request);
+                        break;
+                    case GET_INSTRUCTION:
+                        response = HandleGetInstruction(request);
+                        break;
+                    case EVALUATE_EXPRESSION:
+                        response = HandleEvaluateExpression(request);
+                        break;
+
+                    // Breakpoints
                     case SET_BREAKPOINT:
                         response = HandleSetBreakpoint(request);
                         break;
+                    case DELETE_BREAKPOINT:
+                        response = HandleDeleteBreakpoint(request);
+                        break;
+                    case LIST_BREAKPOINTS:
+                        response = HandleListBreakpoints(request);
+                        break;
+                    case SET_HARDWARE_BREAKPOINT:
+                        response = HandleSetHardwareBreakpoint(request);
+                        break;
+                    case SET_MEMORY_BREAKPOINT:
+                        response = HandleSetMemoryBreakpoint(request);
+                        break;
+                    case DELETE_MEMORY_BREAKPOINT:
+                        response = HandleDeleteMemoryBreakpoint(request);
+                        break;
 
+                    // Memory tools
+                    case GET_MEMORY_MAP:
+                        response = HandleGetMemoryMap(request);
+                        break;
+                    case GET_MEMORY_INFO:
+                        response = HandleGetMemoryInfo(request);
+                        break;
+
+                    // Module tools
+                    case GET_MODULE_IMPORTS:
+                        response = HandleGetModuleImports(request);
+                        break;
+                    case GET_MODULE_EXPORTS:
+                        response = HandleGetModuleExports(request);
+                        break;
+
+                    // Comments
+                    case SET_COMMENT:
+                        response = HandleSetComment(request);
+                        break;
+                    case GET_COMMENT:
+                        response = HandleGetComment(request);
+                        break;
+
+                    // Advanced control
+                    case SKIP_INSTRUCTION:
+                        response = HandleSkipInstruction(request);
+                        break;
+                    case RUN_UNTIL_RETURN:
+                        response = HandleRunUntilReturn(request);
+                        break;
+                    case HIDE_DEBUGGER:
+                        response = HandleHideDebugger(request);
+                        break;
+
+                    // Health check
                     case PING:
                         response = BuildJsonResponse(true, "\"message\":\"pong\"");
                         break;

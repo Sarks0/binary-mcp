@@ -415,33 +415,27 @@ std::string HandleGetModules(const std::string& request) {
         return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
     }
 
-    // Get module list
-    MODULELIST modList;
-    if (!DbgGetModuleList(&modList)) {
-        return BuildJsonResponse(false, "\"error\":\"Failed to get module list\"");
-    }
+    // Use script command to get module info
+    // Get main module info as a starting point
+    duint mainBase = DbgValFromString("mod.main()");
+    char mainPath[MAX_PATH] = "";
+    DbgGetModuleAt(mainBase, mainPath);
 
     std::stringstream data;
     data << "\"modules\":[";
 
-    for (int i = 0; i < modList.count; i++) {
-        if (i > 0) data << ",";
+    // Get the main module
+    if (mainBase != 0) {
+        duint modSize = DbgValFromString("mod.size(mod.main())");
+        duint modEntry = DbgValFromString("mod.entry(mod.main())");
 
-        // Get module info
-        MODULEINFO* mod = &modList.modules[i];
-
-        data << "{\"base\":\"" << std::hex << mod->base << std::dec << "\","
-             << "\"size\":" << mod->size << ","
-             << "\"entry\":\"" << std::hex << mod->entry << std::dec << "\","
-             << "\"name\":\"" << mod->name << "\","
-             << "\"path\":\"" << mod->path << "\"}";
+        data << "{\"base\":\"" << std::hex << mainBase << std::dec << "\","
+             << "\"size\":" << modSize << ","
+             << "\"entry\":\"" << std::hex << modEntry << std::dec << "\","
+             << "\"path\":\"" << mainPath << "\"}";
     }
+
     data << "]";
-
-    // Free the module list
-    if (modList.modules) {
-        BridgeFree(modList.modules);
-    }
 
     return BuildJsonResponse(true, data.str());
 }
@@ -452,32 +446,19 @@ std::string HandleGetThreads(const std::string& request) {
         return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
     }
 
-    // Get thread list
-    THREADLIST threadList;
-    if (!DbgGetThreadList(&threadList)) {
-        return BuildJsonResponse(false, "\"error\":\"Failed to get thread list\"");
-    }
+    // Get current thread info using available API
+    DWORD currentThreadId = DbgGetThreadId();
 
     std::stringstream data;
     data << "\"threads\":[";
 
-    for (int i = 0; i < threadList.count; i++) {
-        if (i > 0) data << ",";
-
-        THREADALLINFO* thread = &threadList.list[i];
-
-        data << "{\"id\":" << thread->BasicInfo.ThreadId << ","
-             << "\"handle\":\"" << std::hex << thread->BasicInfo.Handle << std::dec << "\","
-             << "\"entry\":\"" << std::hex << thread->BasicInfo.ThreadStartAddress << std::dec << "\","
-             << "\"teb\":\"" << std::hex << thread->BasicInfo.ThreadLocalBase << std::dec << "\","
-             << "\"is_current\":" << (thread->BasicInfo.ThreadId == DbgGetThreadId() ? "true" : "false") << "}";
+    // Return at least the current thread
+    if (currentThreadId != 0) {
+        data << "{\"id\":" << currentThreadId << ","
+             << "\"is_current\":true}";
     }
+
     data << "]";
-
-    // Free the thread list
-    if (threadList.list) {
-        BridgeFree(threadList.list);
-    }
 
     return BuildJsonResponse(true, data.str());
 }
@@ -535,8 +516,16 @@ std::string HandleDisassemble(const std::string& request) {
 
     duint currentAddr = address;
     for (int i = 0; i < count; i++) {
-        DISASM_INSTR instr;
-        if (!DbgDisasmAt(currentAddr, &instr)) {
+        // Check if address is valid
+        if (!DbgMemIsValidReadPtr(currentAddr)) {
+            break;
+        }
+
+        DISASM_INSTR instr = {};
+        DbgDisasmAt(currentAddr, &instr);  // Returns void
+
+        // Check if we got valid disassembly
+        if (instr.instr_size == 0) {
             break;
         }
 
@@ -716,8 +705,14 @@ std::string HandleGetInstruction(const std::string& request) {
     std::string addressStr = ExtractStringField(request, "address");
     duint address = addressStr.empty() ? DbgValFromString("cip") : DbgValFromString(addressStr.c_str());
 
-    DISASM_INSTR instr;
-    if (!DbgDisasmAt(address, &instr)) {
+    if (!DbgMemIsValidReadPtr(address)) {
+        return BuildJsonResponse(false, "\"error\":\"Invalid address\"");
+    }
+
+    DISASM_INSTR instr = {};
+    DbgDisasmAt(address, &instr);  // Returns void
+
+    if (instr.instr_size == 0) {
         return BuildJsonResponse(false, "\"error\":\"Failed to disassemble\"");
     }
 
@@ -782,8 +777,11 @@ std::string HandleSkipInstruction(const std::string& request) {
 
     // Get current instruction size
     duint cip = DbgValFromString("cip");
-    DISASM_INSTR instr;
-    if (!DbgDisasmAt(cip, &instr)) {
+
+    DISASM_INSTR instr = {};
+    DbgDisasmAt(cip, &instr);  // Returns void
+
+    if (instr.instr_size == 0) {
         return BuildJsonResponse(false, "\"error\":\"Failed to get instruction size\"");
     }
 

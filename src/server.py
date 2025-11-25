@@ -22,10 +22,7 @@ from src.engines.static.ghidra.runner import GhidraRunner
 from src.tools.dynamic_tools import register_dynamic_tools
 from src.utils.compatibility import (
     BinaryCompatibilityChecker,
-    BinaryFormat,
     CompatibilityLevel,
-    check_binary_compatibility,
-    format_compatibility_report,
 )
 from src.utils.patterns import APIPatterns, CryptoPatterns
 from src.utils.security import (

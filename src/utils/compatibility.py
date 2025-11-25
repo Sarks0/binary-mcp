@@ -209,7 +209,7 @@ class BinaryCompatibilityChecker:
             # Distinguish by checking if it looks like Java class file
             if len(header) >= 8:
                 # Java class has version numbers after magic
-                minor_version = struct.unpack('>H', header[4:6])[0]
+                # minor_version at offset 4-6, major_version at offset 6-8
                 major_version = struct.unpack('>H', header[6:8])[0]
                 # Java versions are typically 45-65 for major
                 if 45 <= major_version <= 70:
@@ -299,8 +299,7 @@ class BinaryCompatibilityChecker:
                 clr_data = pe.get_data(clr_rva, min(clr_dir.Size, 72))
 
                 if len(clr_data) >= 16:
-                    # Parse COR20 header
-                    cb = struct.unpack('<I', clr_data[0:4])[0]
+                    # Parse COR20 header (cb at offset 0-4, runtime version at 4-8)
                     major_runtime = struct.unpack('<H', clr_data[4:6])[0]
                     minor_runtime = struct.unpack('<H', clr_data[6:8])[0]
                     flags = struct.unpack('<I', clr_data[16:20])[0] if len(clr_data) >= 20 else 0

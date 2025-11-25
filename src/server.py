@@ -20,6 +20,10 @@ from src.engines.static.ghidra.analysis_session import AnalysisSession
 from src.engines.static.ghidra.project_cache import ProjectCache
 from src.engines.static.ghidra.runner import GhidraRunner
 from src.tools.dynamic_tools import register_dynamic_tools
+from src.utils.compatibility import (
+    BinaryCompatibilityChecker,
+    CompatibilityLevel,
+)
 from src.utils.patterns import APIPatterns, CryptoPatterns
 from src.utils.security import (
     FileSizeError,
@@ -45,6 +49,7 @@ cache = ProjectCache()
 session_manager = AnalysisSession()
 api_patterns = APIPatterns()
 crypto_patterns = CryptoPatterns()
+compatibility_checker = BinaryCompatibilityChecker()
 
 
 # ============================================================================
@@ -203,7 +208,8 @@ def analyze_binary(
     binary_path: str,
     force_reanalyze: bool = False,
     processor: str | None = None,
-    loader: str | None = None
+    loader: str | None = None,
+    skip_compatibility_check: bool = False
 ) -> str:
     """
     Analyze a binary file with Ghidra headless analyzer.
@@ -211,14 +217,19 @@ def analyze_binary(
     This is the foundation tool that must be called before using other analysis tools.
     It loads the binary, runs Ghidra's auto-analysis, and extracts comprehensive data.
 
+    IMPORTANT: This tool automatically checks binary compatibility before analysis.
+    For .NET assemblies or packed binaries, it will return recommendations for better tools.
+    Use skip_compatibility_check=True to bypass this check if you want to proceed anyway.
+
     Args:
         binary_path: Path to the binary file to analyze
         force_reanalyze: Force re-analysis even if cached (default: False)
         processor: Optional processor spec when AutoImporter fails (e.g., "x86:LE:64:default")
         loader: Optional loader name when AutoImporter fails (e.g., "PeLoader" for Windows PE)
+        skip_compatibility_check: Skip pre-analysis compatibility check (default: False)
 
     Returns:
-        Analysis summary with basic statistics
+        Analysis summary with basic statistics, or compatibility warning if issues detected
 
     Note:
         If Ghidra's AutoImporter fails with "No load spec found", you can manually specify:
@@ -228,7 +239,34 @@ def analyze_binary(
 
         Common Ghidra loaders: PeLoader, ElfLoader, MachoLoader, BinaryLoader, CoffLoader
     """
+    # Store compatibility info for inclusion in output
+    compat_warning = None
+
     try:
+        # Pre-analysis compatibility check (unless skipped or using cache)
+        if not skip_compatibility_check and not cache.get_cached(binary_path):
+            try:
+                compat_info = compatibility_checker.check_compatibility(binary_path)
+
+                # For any non-FULL compatibility, capture warning but PROCEED with analysis
+                if compat_info.compatibility != CompatibilityLevel.FULL:
+                    # Build a concise warning message
+                    issues_summary = []
+                    for issue in compat_info.issues:
+                        issues_summary.append(f"- [{issue.severity.upper()}] {issue.message}")
+                        issues_summary.append(f"  → {issue.recommendation}")
+
+                    compat_warning = f"""
+**⚠️ Compatibility Notice ({compat_info.compatibility.value.upper()}):**
+Format: {compat_info.format.value}
+{chr(10).join(issues_summary)}
+"""
+                    logger.warning(f"Compatibility issues for {binary_path}: {compat_info.compatibility.value}")
+
+            except Exception as e:
+                # Don't fail on compatibility check errors, just log and proceed
+                logger.warning(f"Compatibility check failed, proceeding with analysis: {e}")
+
         context = get_analysis_context(binary_path, force_reanalyze, processor, loader)
 
         metadata = context.get("metadata", {})
@@ -236,7 +274,26 @@ def analyze_binary(
         imports = context.get("imports", [])
         strings = context.get("strings", [])
 
-        summary = f"""Binary Analysis Complete: {metadata.get('name', 'Unknown')}
+        # Check for analysis quality indicators
+        warnings = []
+
+        # .NET/CLR indicator: high structure count + low imports
+        structure_count = len(context.get('data_types', {}).get('structures', []))
+        if structure_count > 10000 and len(imports) == 0:
+            warnings.append("⚠️ High structure count with no imports suggests .NET assembly - consider using dnSpy/ILSpy for better results")
+
+        # Packed indicator: very few imports
+        if 0 < len(imports) < 5 and len(functions) > 100:
+            warnings.append("⚠️ Very few imports detected - binary may be packed. Consider unpacking first.")
+
+        # Build the summary output
+        summary = ""
+
+        # Add compatibility warning at the top if present
+        if compat_warning:
+            summary += compat_warning + "\n"
+
+        summary += f"""Binary Analysis Complete: {metadata.get('name', 'Unknown')}
 
 **Metadata:**
 - Format: {metadata.get('executable_format', 'Unknown')}
@@ -250,9 +307,16 @@ def analyze_binary(
 - Imports: {len(imports)}
 - Strings: {len(strings)}
 - Memory Blocks: {len(context.get('memory_map', []))}
-- Structures: {len(context.get('data_types', {}).get('structures', []))}
+- Structures: {structure_count}
 - Enums: {len(context.get('data_types', {}).get('enums', []))}
+"""
 
+        if warnings:
+            summary += "\n**Analysis Warnings:**\n"
+            for warning in warnings:
+                summary += f"{warning}\n"
+
+        summary += """
 Analysis cached for fast subsequent queries.
 Use other tools like get_functions, get_imports, decompile_function to explore the binary.
 """
@@ -1033,6 +1097,71 @@ def diagnose_setup() -> str:
 # ============================================================================
 # ADDITIONAL TOOLS
 # ============================================================================
+
+@app.tool()
+def check_binary(binary_path: str) -> str:
+    """
+    Check binary compatibility BEFORE running Ghidra analysis.
+
+    This is a fast pre-analysis check that examines binary headers to detect:
+    - Binary format (PE, ELF, Mach-O, .NET, etc.)
+    - Architecture and bitness
+    - .NET assemblies (which have limited Ghidra support)
+    - Packed/protected binaries
+    - Potential analysis issues
+
+    Use this tool FIRST when you're unsure about a binary's format or want to
+    avoid long analysis times on incompatible files.
+
+    Args:
+        binary_path: Path to the binary file to check
+
+    Returns:
+        Detailed compatibility report with recommendations
+
+    Example:
+        check_binary("C:/samples/unknown.exe")
+        -> Returns format detection, compatibility level, and tool recommendations
+    """
+    try:
+        # Validate path exists
+        path = Path(binary_path)
+        if not path.exists():
+            return f"Error: File not found: {binary_path}"
+        if not path.is_file():
+            return f"Error: Path is not a file: {binary_path}"
+
+        # Run compatibility check
+        info = compatibility_checker.check_compatibility(binary_path)
+        report = compatibility_checker.format_report(info)
+
+        # Add guidance based on compatibility level
+        guidance = "\n**Next Steps:**\n"
+
+        if info.compatibility == CompatibilityLevel.FULL:
+            guidance += "- Binary is fully compatible - proceed with `analyze_binary()`\n"
+        elif info.compatibility == CompatibilityLevel.PARTIAL:
+            guidance += "- Analysis will work with some limitations\n"
+            guidance += "- Proceed with `analyze_binary()` but review warnings above\n"
+        elif info.compatibility == CompatibilityLevel.LIMITED:
+            if info.is_dotnet:
+                guidance += "- **RECOMMENDED:** Use dnSpy or ILSpy for .NET analysis\n"
+                guidance += "- If you must use Ghidra: `analyze_binary(binary_path, skip_compatibility_check=True)`\n"
+            else:
+                guidance += "- Consider alternative analysis tools\n"
+                guidance += "- To force Ghidra analysis: `analyze_binary(binary_path, skip_compatibility_check=True)`\n"
+        elif info.compatibility == CompatibilityLevel.UNSUPPORTED:
+            guidance += "- Binary is NOT recommended for Ghidra analysis\n"
+            guidance += "- Use specialized tools for this format\n"
+
+        return report + guidance
+
+    except FileNotFoundError as e:
+        return f"Error: {e}"
+    except Exception as e:
+        logger.error(f"check_binary failed: {e}")
+        return f"Error checking binary: {e}"
+
 
 @app.tool()
 @log_to_session

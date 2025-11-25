@@ -10,7 +10,7 @@ from pathlib import Path
 
 from fastmcp import FastMCP
 
-from src.engines.static.dotnet.ilspy_runner import ILSpyRunner, get_ilspy_runner
+from src.engines.static.dotnet.ilspy_runner import get_ilspy_runner
 
 logger = logging.getLogger(__name__)
 
@@ -429,7 +429,7 @@ After installation, restart your MCP client.
 
             # ILSpyCmd status
             if diag["ilspycmd_found"]:
-                result += f"✅ **ILSpyCmd:** Found\n"
+                result += "✅ **ILSpyCmd:** Found\n"
                 result += f"   - Path: `{diag['ilspycmd_path']}`\n"
                 if diag["ilspycmd_version"]:
                     result += f"   - Version: {diag['ilspycmd_version']}\n"
@@ -441,7 +441,7 @@ After installation, restart your MCP client.
 
             # .NET SDK status
             if diag["dotnet_found"]:
-                result += f"✅ **.NET SDK:** Found\n"
+                result += "✅ **.NET SDK:** Found\n"
                 result += f"   - Path: `{diag['dotnet_path']}`\n"
                 if diag["dotnet_version"]:
                     result += f"   - Version: {diag['dotnet_version']}\n"

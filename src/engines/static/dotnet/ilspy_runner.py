@@ -13,7 +13,6 @@ import platform
 import re
 import shutil
 import subprocess
-import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -218,7 +217,7 @@ class ILSpyRunner:
 
         if cache_file.exists():
             try:
-                with open(cache_file, "r", encoding="utf-8") as f:
+                with open(cache_file, encoding="utf-8") as f:
                     data = json.load(f)
                 logger.info(f"Cache hit for {assembly_path.name} ({cache_type})")
                 return data

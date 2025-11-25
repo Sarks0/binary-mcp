@@ -318,13 +318,14 @@ class BinaryCompatibilityChecker:
                     if flags & self.COMIMAGE_FLAGS_NATIVE_ENTRYPOINT:
                         info.warnings.append("Assembly has native entry point - uses P/Invoke heavily")
 
-            # Add .NET-specific issues
+            # Add .NET-specific issues with MCP tool recommendation
             info.issues.append(CompatibilityIssue(
                 severity="warning",
                 code="DOTNET_ASSEMBLY",
                 message=".NET assemblies have limited native code analysis in Ghidra",
-                recommendation="Use dnSpy, ILSpy, or dotPeek for better .NET decompilation. "
-                              "Ghidra will show CLR metadata but may miss managed code details."
+                recommendation="Use the built-in .NET tools instead: "
+                              "analyze_dotnet(), decompile_dotnet_type(), get_dotnet_types(). "
+                              "These use ILSpyCmd for proper C# decompilation."
             ))
 
             # Check for obfuscation indicators

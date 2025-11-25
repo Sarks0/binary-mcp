@@ -1,8 +1,9 @@
 """
 Binary MCP Server for comprehensive binary analysis.
 
-Provides 30+ tools for static and dynamic binary analysis:
-- Static analysis via Ghidra (headless mode)
+Provides 40+ tools for static and dynamic binary analysis:
+- Static analysis via Ghidra (headless mode) for native binaries
+- Static analysis via ILSpyCmd for .NET assemblies
 - Dynamic analysis via x64dbg (native plugin)
 """
 
@@ -19,6 +20,7 @@ from fastmcp import FastMCP
 from src.engines.static.ghidra.analysis_session import AnalysisSession
 from src.engines.static.ghidra.project_cache import ProjectCache
 from src.engines.static.ghidra.runner import GhidraRunner
+from src.tools.dotnet_tools import register_dotnet_tools
 from src.tools.dynamic_tools import register_dynamic_tools
 from src.utils.compatibility import (
     BinaryCompatibilityChecker,
@@ -1627,9 +1629,13 @@ def main():
     logger.info(f"Ghidra Path: {runner.ghidra_path}")
     logger.info(f"Cache Directory: {cache.cache_dir}")
 
+    # Register .NET analysis tools
+    register_dotnet_tools(app)
+
     # Register dynamic analysis tools
     register_dynamic_tools(app)
-    logger.info("Registered static + dynamic analysis tools")
+
+    logger.info("Registered static (Ghidra + .NET) + dynamic analysis tools")
 
     # Run the FastMCP server (handles stdio automatically)
     app.run()

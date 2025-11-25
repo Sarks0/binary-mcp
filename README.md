@@ -4,12 +4,14 @@
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
-A Model Context Protocol (MCP) server that provides AI assistants with binary analysis capabilities using Ghidra (static) and x64dbg (dynamic). Built for security research, malware analysis, and reverse engineering.
+A Model Context Protocol (MCP) server that provides AI assistants with comprehensive binary analysis capabilities. Supports native binaries via Ghidra, .NET assemblies via ILSpyCmd, and dynamic analysis via x64dbg. Built for security research, malware analysis, and reverse engineering.
 
 ## Features
 
-- **Static Analysis**: Ghidra integration with decompilation, function extraction, and pattern detection
+- **Native Binary Analysis**: Ghidra integration with decompilation, function extraction, and pattern detection
+- **.NET Assembly Analysis**: ILSpyCmd integration for C# decompilation (cross-platform)
 - **Dynamic Analysis**: x64dbg debugging with breakpoints, memory inspection, and execution tracing
+- **Binary Compatibility Checker**: Auto-detects format and recommends appropriate tools
 - **Intelligent Caching**: SHA256-based caching for fast repeated queries
 - **Session System**: Incremental analysis storage with compression for large binaries
 - **Malware Detection**: 100+ Windows API patterns and cryptographic constant detection
@@ -18,12 +20,12 @@ A Model Context Protocol (MCP) server that provides AI assistants with binary an
 
 ### Prerequisites
 
-1. **Ghidra** - Download from [ghidra-sre.org](https://ghidra-sre.org/)
+1. **Ghidra** - Download from [ghidra-sre.org](https://ghidra-sre.org/) (for native binaries)
 2. **Java 21+** - Required by Ghidra
 3. **Python 3.12+**
-4. **x64dbg** (optional) - For dynamic analysis on Windows
+4. **.NET 6.0+ SDK** (optional) - For .NET analysis, download from [dotnet.microsoft.com](https://dotnet.microsoft.com/download)
+5. **x64dbg** (optional) - For dynamic analysis on Windows
    - Requires x64dbg plugin (see [x64dbg plugin README](src/engines/dynamic/x64dbg/plugin/README.md))
-   - Uses external process architecture for stability
 
 ### Installation
 
@@ -37,6 +39,9 @@ uv sync
 
 # Verify installation
 uv run python -m src.server
+
+# (Optional) Install ILSpyCmd for .NET analysis
+dotnet tool install -g ilspycmd
 ```
 
 ### Configuration
@@ -85,10 +90,32 @@ Analyze the binary at /path/to/sample.exe
 ```
 
 Claude will automatically:
-- Run Ghidra analysis
+- Check binary compatibility and format
+- Run appropriate analysis (Ghidra for native, ILSpyCmd for .NET)
 - Extract functions, imports, exports, and strings
 - Identify suspicious API calls
 - Decompile key functions
+
+### .NET Assembly Analysis
+
+For .NET executables (.exe/.dll compiled with C#, VB.NET, F#):
+
+```
+Analyze the .NET assembly at /path/to/malware.exe
+```
+
+Or explicitly use .NET tools:
+
+```
+# List all types in the assembly
+analyze_dotnet("/path/to/sample.exe")
+
+# Decompile a specific class to C#
+decompile_dotnet_type("/path/to/sample.exe", "Namespace.ClassName")
+
+# Search for types by pattern
+search_dotnet_types("/path/to/sample.exe", "Crypto|Encrypt")
+```
 
 ### Common Tasks
 
@@ -117,6 +144,11 @@ Extract all IOCs (IP addresses, domains, URLs) from this binary
 Check if this binary uses any crypto algorithms
 ```
 
+**Check Binary Format:**
+```
+Check what type of binary this is before analyzing
+```
+
 ### Analysis Sessions
 
 For large binaries or multi-step analysis:
@@ -130,27 +162,13 @@ Sessions save all tool outputs incrementally, allowing you to:
 - Load specific sections to avoid context overflow
 - Recover from crashes or token limits
 
-**Session Management:**
-```
-# List all sessions
-list_sessions()
-
-# Get session summary
-get_session_summary("session-id")
-
-# Load specific tool outputs
-load_session_section("session-id", "tools", "find_api_calls")
-
-# Delete when done
-delete_session("session-id")
-```
-
 ## Available Tools
 
-### Static Analysis (22 tools)
+### Static Analysis - Native (22 tools)
 
-**Core Analysis:**
-- `analyze_binary` - Run Ghidra headless analysis
+**Core Analysis (Ghidra):**
+- `analyze_binary` - Run Ghidra headless analysis (auto-detects .NET and warns)
+- `check_binary` - Check binary compatibility before analysis
 - `get_functions` - List all functions with signatures
 - `get_imports` - Extract imported libraries and functions
 - `get_strings` - Extract strings with cross-references
@@ -169,14 +187,16 @@ delete_session("session-id")
 - `list_data_types` - List structures and enums
 - `extract_metadata` - Get binary headers and metadata
 
-**Session System:**
-- `start_analysis_session` - Begin tracking analysis outputs
-- `save_session` - Persist session data (compressed)
-- `list_sessions` - List all sessions with filters
-- `get_session_summary` - Get session metadata
-- `load_session_section` - Load specific tool outputs
-- `load_full_session` - Load complete session
-- `delete_session` - Clean up sessions
+### Static Analysis - .NET (7 tools)
+
+**.NET Analysis (ILSpyCmd):**
+- `analyze_dotnet` - Analyze .NET assembly and list all types
+- `get_dotnet_types` - List types with filtering (class, interface, enum, etc.)
+- `decompile_dotnet_type` - Decompile specific type to C# source code
+- `search_dotnet_types` - Search types by regex pattern
+- `decompile_dotnet_assembly` - Decompile entire assembly to C# files
+- `get_dotnet_il` - Get IL (Intermediate Language) disassembly
+- `diagnose_dotnet_setup` - Check ILSpyCmd installation status
 
 ### Dynamic Analysis (14 tools)
 
@@ -199,6 +219,38 @@ delete_session("session-id")
 **Advanced:**
 - `x64dbg_trace_execution`, `x64dbg_run_to_address`
 
+### Session Management (7 tools)
+
+- `start_analysis_session` - Begin tracking analysis outputs
+- `save_session` - Persist session data (compressed)
+- `list_sessions` - List all sessions with filters
+- `get_session_summary` - Get session metadata
+- `load_session_section` - Load specific tool outputs
+- `load_full_session` - Load complete session
+- `delete_session` - Clean up sessions
+
+## Supported Formats
+
+| Format | Engine | Analysis Type |
+|--------|--------|---------------|
+| **PE** (Windows .exe, .dll, .sys) | Ghidra | Native code decompilation |
+| **.NET Assembly** (.exe, .dll) | ILSpyCmd | C# decompilation |
+| **ELF** (Linux binaries) | Ghidra | Native code decompilation |
+| **Mach-O** (macOS binaries) | Ghidra | Native code decompilation |
+| **Raw Binary** | Ghidra | Custom processor/loader |
+
+### Binary Format Auto-Detection
+
+The server automatically detects binary format and recommends appropriate tools:
+
+```
+# For a .NET assembly, you'll see:
+⚠️ Compatibility Notice (LIMITED):
+Format: .NET Assembly (CLR)
+- [WARNING] .NET assemblies have limited native code analysis in Ghidra
+  → Use the built-in .NET tools instead: analyze_dotnet(), decompile_dotnet_type()
+```
+
 ## Configuration Options
 
 ### Environment Variables
@@ -212,27 +264,31 @@ delete_session("session-id")
 
 ### Auto-Detection
 
-Ghidra is auto-detected from standard paths:
+**Ghidra** is auto-detected from standard paths:
 - **Linux**: `/opt/ghidra`, `~/ghidra`, `~/Downloads/ghidra_*`
 - **macOS**: `~/Downloads/ghidra_*`, `/Applications/ghidra_*`
 - **Windows**: `C:\ghidra`, `C:\Program Files\ghidra`, `%USERPROFILE%\Downloads\ghidra_*`
 
-## Supported Formats
-
-- **PE**: Windows executables (`.exe`, `.dll`, `.sys`)
-- **ELF**: Linux binaries
-- **Mach-O**: macOS binaries
-- **Raw Binary**: Custom processor/loader specification
+**ILSpyCmd** is auto-detected from:
+- Global dotnet tools: `~/.dotnet/tools/ilspycmd`
+- System PATH
 
 ## Caching
 
-- **Location**: `~/.ghidra_mcp_cache/`
-- **Key**: SHA256 hash of binary file
-- **Benefits**: Initial analysis 30-120s, cached queries <1s
+**Ghidra Cache:**
+- Location: `~/.ghidra_mcp_cache/`
+- Key: SHA256 hash of binary file
+- Benefits: Initial analysis 30-120s, cached queries <1s
+
+**.NET Cache:**
+- Location: `~/.dotnet_mcp_cache/`
+- Stores: Type listings, decompiled source files
+- Benefits: Instant repeated queries
 
 **Clear cache:**
 ```bash
 rm -rf ~/.ghidra_mcp_cache/
+rm -rf ~/.dotnet_mcp_cache/
 ```
 
 ## Troubleshooting
@@ -246,6 +302,14 @@ Error: FileNotFoundError: Ghidra installation not found
 - Install Ghidra or set `GHIDRA_HOME` environment variable
 - Use `diagnose_setup` tool to check detection
 
+**ILSpyCmd not found:**
+```
+Error: ILSpyCmd not installed
+```
+- Install .NET SDK from [dotnet.microsoft.com](https://dotnet.microsoft.com/download)
+- Run: `dotnet tool install -g ilspycmd`
+- Use `diagnose_dotnet_setup` to verify installation
+
 **Analysis timeout:**
 ```
 Error: Ghidra analysis timed out
@@ -254,33 +318,53 @@ Error: Ghidra analysis timed out
 - Try smaller binaries first
 - Large/obfuscated binaries may take longer
 
-**Permission denied:**
-```
-Error: Permission denied
-```
-- Ensure binary has read permissions: `chmod +r /path/to/binary`
+### Diagnostic Tools
 
-**Invalid loader name:**
-```
-Error: Invalid loader name specified
-```
-- Server auto-detects loaders (PeLoader, ElfLoader, etc.)
-- Update to latest version if using old config
-
-### Diagnostic Tool
-
-After configuration, use the diagnostic tool:
+**Check Ghidra setup:**
 ```
 diagnose_setup
 ```
 
-This checks:
-- Ghidra installation and path
-- Java version
-- Python dependencies
-- Cache directory permissions
+**Check .NET tools setup:**
+```
+diagnose_dotnet_setup
+```
+
+**Check binary compatibility:**
+```
+check_binary("/path/to/sample.exe")
+```
 
 ## Development
+
+### Project Structure
+
+```
+binary-mcp/
+├── src/
+│   ├── server.py                   # Main MCP server
+│   ├── engines/
+│   │   ├── static/
+│   │   │   ├── ghidra/             # Ghidra integration
+│   │   │   │   ├── runner.py       # Process manager
+│   │   │   │   ├── project_cache.py # SHA256 caching
+│   │   │   │   └── scripts/
+│   │   │   │       └── core_analysis.py
+│   │   │   └── dotnet/             # .NET integration
+│   │   │       └── ilspy_runner.py # ILSpyCmd wrapper
+│   │   └── dynamic/x64dbg/         # x64dbg integration
+│   │       ├── plugin/             # Plugin DLL
+│   │       └── server/             # HTTP server
+│   ├── tools/
+│   │   ├── dotnet_tools.py         # .NET MCP tools
+│   │   └── dynamic_tools.py        # x64dbg MCP tools
+│   └── utils/
+│       ├── compatibility.py        # Binary format detection
+│       ├── patterns.py             # API/crypto patterns
+│       └── security.py             # Input validation
+├── tests/                          # Test suite
+└── pyproject.toml                  # Project config
+```
 
 ### Running Tests
 
@@ -293,30 +377,6 @@ uv run pytest --cov=src
 
 # Specific test
 uv run pytest tests/test_server.py::TestProjectCache
-```
-
-### Project Structure
-
-```
-binary-mcp/
-├── src/
-│   ├── server.py                   # Main MCP server
-│   ├── engines/
-│   │   ├── static/ghidra/          # Ghidra integration
-│   │   │   ├── runner.py           # Process manager
-│   │   │   ├── project_cache.py    # SHA256 caching
-│   │   │   └── scripts/
-│   │   │       └── core_analysis.py # Jython extraction
-│   │   └── dynamic/x64dbg/         # x64dbg integration (external process)
-│   │       ├── ARCHITECTURE.md     # Architecture documentation
-│   │       ├── pipe_protocol.h     # IPC protocol definitions
-│   │       ├── plugin/             # Plugin DLL (minimal stub)
-│   │       └── server/             # HTTP server (separate process)
-│   └── utils/
-│       ├── patterns.py             # API/crypto patterns
-│       └── session_manager.py      # Session storage
-├── tests/                          # Test suite
-└── pyproject.toml                  # Project config
 ```
 
 ## Security Notice
@@ -341,6 +401,7 @@ Contributions welcome! Please:
 ## Resources
 
 - **Ghidra Documentation**: [ghidra-sre.org/CheatSheet.html](https://ghidra-sre.org/CheatSheet.html)
+- **ILSpy Project**: [github.com/icsharpcode/ILSpy](https://github.com/icsharpcode/ILSpy)
 - **MCP Protocol**: [modelcontextprotocol.io](https://modelcontextprotocol.io/)
 - **Issues**: [github.com/Sarks0/binary-mcp/issues](https://github.com/Sarks0/binary-mcp/issues)
 
@@ -351,5 +412,6 @@ Apache 2.0 - See LICENSE file for details
 ## Acknowledgments
 
 - **Ghidra**: NSA's Software Reverse Engineering framework
+- **ILSpy/ILSpyCmd**: Open-source .NET decompiler by icsharpcode
 - **Anthropic**: Model Context Protocol and Claude
 - **FastMCP**: Python MCP framework by @jlowin

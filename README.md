@@ -46,11 +46,37 @@ Invoke-WebRequest -Uri "https://raw.githubusercontent.com/Sarks0/binary-mcp/main
 
 ### Linux / macOS
 
+Use the interactive Python installer:
+
+```bash
+# Download and run installer
+curl -sSL https://raw.githubusercontent.com/Sarks0/binary-mcp/main/install.py | python3 -
+```
+
+Or clone and run manually:
 ```bash
 # Clone repository
 git clone https://github.com/Sarks0/binary-mcp.git
 cd binary-mcp
 
+# Run interactive installer
+python3 install.py
+
+# Or use unattended mode
+python3 install.py --profile full --unattended
+```
+
+**Installer Features:**
+- Interactive menu with installation profiles (Full, Static Only, Minimal, Custom, Repair)
+- Auto-detects installed components (Python, Java, .NET, Ghidra, ILSpyCmd)
+- **Automatic prerequisite installation** via package manager (apt, dnf, brew, pacman, zypper, apk)
+- Downloads and installs Ghidra
+- Installs ILSpyCmd for .NET analysis
+- Configures Claude Desktop and Claude Code automatically
+- Unattended mode for scripted deployments
+
+**Manual installation** (if you prefer):
+```bash
 # Install uv (if not installed)
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
@@ -63,17 +89,17 @@ uv run python -m src.server
 
 ### Prerequisites
 
-| Component | Required For | Install Command |
-|-----------|--------------|-----------------|
-| **Python 3.12+** | Core | `winget install Python.Python.3.12` |
-| **Java 21+** | Ghidra | `winget install EclipseAdoptium.Temurin.21.JDK` |
-| **Ghidra** | Native analysis | [ghidra-sre.org](https://ghidra-sre.org/) |
-| **.NET SDK 8.0** | .NET analysis | `winget install Microsoft.DotNet.SDK.8` |
-| **.NET Runtime 8.0** | ILSpyCmd | `winget install Microsoft.DotNet.Runtime.8` |
-| **ILSpyCmd** | .NET analysis | `dotnet tool install -g ilspycmd` |
-| **x64dbg** | Dynamic analysis | Windows installer or [x64dbg.com](https://x64dbg.com/) |
+| Component | Required For | Windows | Linux/macOS |
+|-----------|--------------|---------|-------------|
+| **Python 3.12+** | Core | `winget install Python.Python.3.12` | `apt install python3` / `brew install python` |
+| **Java 21+** | Ghidra | `winget install EclipseAdoptium.Temurin.21.JDK` | `apt install openjdk-21-jdk` / `brew install openjdk@21` |
+| **Ghidra** | Native analysis | [ghidra-sre.org](https://ghidra-sre.org/) | [ghidra-sre.org](https://ghidra-sre.org/) |
+| **.NET SDK 8.0** | .NET analysis | `winget install Microsoft.DotNet.SDK.8` | [docs.microsoft.com](https://docs.microsoft.com/dotnet/core/install/linux) / `brew install dotnet-sdk` |
+| **.NET Runtime 8.0** | ILSpyCmd | `winget install Microsoft.DotNet.Runtime.8` | Included with SDK |
+| **ILSpyCmd** | .NET analysis | `dotnet tool install -g ilspycmd` | `dotnet tool install -g ilspycmd` |
+| **x64dbg** | Dynamic analysis | [x64dbg.com](https://x64dbg.com/) | Windows only |
 
-> **Note:** The Windows installer can automatically install all prerequisites via winget if available.
+> **Note:** Both installers can automatically install prerequisites via their respective package managers (winget on Windows, apt/dnf/brew/pacman on Linux/macOS).
 
 ### Configuration
 
@@ -382,6 +408,7 @@ check_binary("/path/to/sample.exe")
 ```
 binary-mcp/
 ├── install.ps1                     # Windows interactive installer
+├── install.py                      # Linux/macOS interactive installer
 ├── src/
 │   ├── server.py                   # Main MCP server
 │   ├── engines/
@@ -419,6 +446,29 @@ uv run pytest --cov=src
 # Specific test
 uv run pytest tests/test_server.py::TestProjectCache
 ```
+
+## Future Features
+
+Planned enhancements for future releases:
+
+### Linux Dynamic Analysis
+- **GDB Integration**: Native Linux debugging with breakpoints, memory inspection, and execution tracing
+- **LLDB Support**: macOS/Linux debugging alternative
+- **Frida Integration**: Dynamic instrumentation for runtime analysis
+- **strace/ltrace**: System call and library call tracing
+
+### Additional Static Analysis
+- **Radare2/Rizin**: Alternative disassembly engine
+- **Binary Ninja**: Commercial disassembler integration (if licensed)
+- **YARA Rules**: Custom pattern matching for malware classification
+- **Capa Integration**: Automatic capability detection
+
+### Enhanced .NET Analysis
+- **dnSpy Integration**: Advanced .NET debugging (Windows)
+- **de4dot**: .NET deobfuscation support
+- **Assembly diffing**: Compare .NET assembly versions
+
+Contributions for any of these features are welcome!
 
 ## Security Notice
 

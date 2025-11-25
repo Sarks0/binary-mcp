@@ -18,31 +18,62 @@ A Model Context Protocol (MCP) server that provides AI assistants with comprehen
 
 ## Quick Start
 
-### Prerequisites
+### Windows (Recommended)
 
-1. **Ghidra** - Download from [ghidra-sre.org](https://ghidra-sre.org/) (for native binaries)
-2. **Java 21+** - Required by Ghidra
-3. **Python 3.12+**
-4. **.NET 6.0+ SDK** (optional) - For .NET analysis, download from [dotnet.microsoft.com](https://dotnet.microsoft.com/download)
-5. **x64dbg** (optional) - For dynamic analysis on Windows
-   - Requires x64dbg plugin (see [x64dbg plugin README](src/engines/dynamic/x64dbg/plugin/README.md))
+The easiest way to install on Windows is using the interactive installer:
 
-### Installation
+```powershell
+# Run as Administrator
+irm https://raw.githubusercontent.com/Sarks0/binary-mcp/main/install.ps1 | iex
+```
+
+Or download and run manually:
+```powershell
+# Download installer
+Invoke-WebRequest -Uri "https://raw.githubusercontent.com/Sarks0/binary-mcp/main/install.ps1" -OutFile "install.ps1"
+
+# Run installer (as Administrator)
+.\install.ps1
+```
+
+**Installer Features:**
+- Interactive menu with installation profiles (Full, Static Only, Dynamic Only, Custom)
+- Auto-detects installed components
+- **Automatic prerequisite installation via winget** (Python, Java, .NET SDK/Runtime, Git)
+- Downloads and installs Ghidra, x64dbg, and MCP plugins
+- Configures Claude Desktop and Claude Code automatically
+- Unattended mode for scripted deployments: `.\install.ps1 -InstallProfile full -Unattended`
+
+### Linux / macOS
 
 ```bash
 # Clone repository
 git clone https://github.com/Sarks0/binary-mcp.git
 cd binary-mcp
 
+# Install uv (if not installed)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
 # Install dependencies
 uv sync
 
 # Verify installation
 uv run python -m src.server
-
-# (Optional) Install ILSpyCmd for .NET analysis
-dotnet tool install -g ilspycmd
 ```
+
+### Prerequisites
+
+| Component | Required For | Install Command |
+|-----------|--------------|-----------------|
+| **Python 3.12+** | Core | `winget install Python.Python.3.12` |
+| **Java 21+** | Ghidra | `winget install EclipseAdoptium.Temurin.21.JDK` |
+| **Ghidra** | Native analysis | [ghidra-sre.org](https://ghidra-sre.org/) |
+| **.NET SDK 8.0** | .NET analysis | `winget install Microsoft.DotNet.SDK.8` |
+| **.NET Runtime 8.0** | ILSpyCmd | `winget install Microsoft.DotNet.Runtime.8` |
+| **ILSpyCmd** | .NET analysis | `dotnet tool install -g ilspycmd` |
+| **x64dbg** | Dynamic analysis | Windows installer or [x64dbg.com](https://x64dbg.com/) |
+
+> **Note:** The Windows installer can automatically install all prerequisites via winget if available.
 
 ### Configuration
 
@@ -306,9 +337,18 @@ Error: FileNotFoundError: Ghidra installation not found
 ```
 Error: ILSpyCmd not installed
 ```
-- Install .NET SDK from [dotnet.microsoft.com](https://dotnet.microsoft.com/download)
+- Install .NET SDK: `winget install Microsoft.DotNet.SDK.8`
 - Run: `dotnet tool install -g ilspycmd`
 - Use `diagnose_dotnet_setup` to verify installation
+
+**ILSpyCmd requires .NET 8 Runtime:**
+```
+You must install or update .NET to run this application.
+Framework: 'Microsoft.NETCore.App', version '8.0.0'
+```
+- ILSpyCmd is built for .NET 8 - you need the runtime even if you have a newer SDK
+- Install .NET 8 Runtime: `winget install Microsoft.DotNet.Runtime.8`
+- Multiple .NET runtimes can coexist on your system
 
 **Analysis timeout:**
 ```
@@ -341,6 +381,7 @@ check_binary("/path/to/sample.exe")
 
 ```
 binary-mcp/
+├── install.ps1                     # Windows interactive installer
 ├── src/
 │   ├── server.py                   # Main MCP server
 │   ├── engines/

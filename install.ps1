@@ -7,7 +7,8 @@ param(
     [string]$InstallDir = "$env:USERPROFILE\binary-mcp",
     [string]$GhidraDir = "$env:USERPROFILE\ghidra",
     [string]$X64DbgDir = "$env:USERPROFILE\x64dbg",
-    [string]$Profile = "",  # full, static, dynamic, custom
+    [ValidateSet("", "full", "static", "dynamic", "custom", "repair")]
+    [string]$InstallProfile = "",  # full, static, dynamic, custom, repair
     [switch]$Unattended
 )
 
@@ -145,7 +146,16 @@ function Show-SystemStatus {
     Write-Host "  Core Requirements:" -ForegroundColor White
 
     if ($Status.Python.Installed) {
-        $pyVersion = [version]($Status.Python.Version -replace "[^\d.]", "" -replace "^(\d+\.\d+).*", '$1')
+        try {
+            $pyVersionStr = $Status.Python.Version -replace "[^\d.]", ""
+            if ($pyVersionStr -match "^(\d+)\.(\d+)") {
+                $pyVersion = [version]"$($Matches[1]).$($Matches[2])"
+            } else {
+                $pyVersion = [version]"0.0"
+            }
+        } catch {
+            $pyVersion = [version]"0.0"
+        }
         if ($pyVersion -ge [version]"3.12") {
             Write-Host "    [" -NoNewline; Write-Host "OK" -ForegroundColor Green -NoNewline; Write-Host "] Python $($Status.Python.Version)"
         } else {
@@ -274,7 +284,10 @@ function Install-UV {
     Write-Info "Installing uv package manager..."
     try {
         Invoke-RestMethod https://astral.sh/uv/install.ps1 | Invoke-Expression
-        $env:Path = [System.Environment]::GetEnvironmentVariable("Path","User") + ";" + [System.Environment]::GetEnvironmentVariable("Path","Machine")
+        # Refresh PATH: Machine PATH first, then User PATH (standard Windows order)
+        $machinePath = [System.Environment]::GetEnvironmentVariable("Path", "Machine")
+        $userPath = [System.Environment]::GetEnvironmentVariable("Path", "User")
+        $env:Path = "$machinePath;$userPath"
         Write-Success "uv installed successfully"
         return $true
     } catch {
@@ -295,6 +308,10 @@ function Install-Ghidra {
 
     if (Test-Path $GhidraDir) {
         Write-Warn "Ghidra directory already exists: $GhidraDir"
+        if ($Unattended) {
+            Write-Info "Skipping Ghidra (already installed, unattended mode)"
+            return $true
+        }
         $reinstall = Read-Host "  Reinstall? (y/n)"
         if ($reinstall -ne "y") {
             Write-Info "Skipping Ghidra installation"
@@ -367,9 +384,13 @@ function Install-DotNetTools {
 
         # Add to PATH if needed
         $toolsPath = "$env:USERPROFILE\.dotnet\tools"
-        if ($env:Path -notlike "*$toolsPath*") {
+        $currentUserPath = [System.Environment]::GetEnvironmentVariable("Path", "User")
+        if ($currentUserPath -notlike "*$toolsPath*") {
+            # Add to current session
             $env:Path = "$toolsPath;$env:Path"
-            [System.Environment]::SetEnvironmentVariable("Path", "$toolsPath;" + [System.Environment]::GetEnvironmentVariable("Path", "User"), "User")
+            # Persist to user environment (prepend to avoid duplicates)
+            $newUserPath = "$toolsPath;$currentUserPath"
+            [System.Environment]::SetEnvironmentVariable("Path", $newUserPath, "User")
             Write-Info "Added .NET tools to PATH"
         }
 
@@ -385,6 +406,10 @@ function Install-X64Dbg {
 
     if (Test-Path $X64DbgDir) {
         Write-Warn "x64dbg directory already exists: $X64DbgDir"
+        if ($Unattended) {
+            Write-Info "Skipping x64dbg (already installed, unattended mode)"
+            return $true
+        }
         $reinstall = Read-Host "  Reinstall? (y/n)"
         if ($reinstall -ne "y") {
             Write-Info "Skipping x64dbg installation"
@@ -446,9 +471,13 @@ function Install-BinaryMCP {
 
     if (Test-Path $InstallDir) {
         Write-Warn "Installation directory already exists: $InstallDir"
-        $continue = Read-Host "  Update existing installation? (y/n)"
-        if ($continue -ne "y") {
-            return $true
+        if (-not $Unattended) {
+            $continue = Read-Host "  Update existing installation? (y/n)"
+            if ($continue -ne "y") {
+                return $true
+            }
+        } else {
+            Write-Info "Updating existing installation (unattended mode)"
         }
     } else {
         New-Item -ItemType Directory -Path $InstallDir | Out-Null
@@ -519,7 +548,7 @@ function Configure-ClaudeDesktop {
             args = @("--directory", $InstallDir, "run", "python", "-m", "src.server")
         } -Force
 
-        $config | ConvertTo-Json -Depth 10 | Set-Content $claudeConfigFile
+        $config | ConvertTo-Json -Depth 10 | Set-Content $claudeConfigFile -Encoding UTF8
         Write-Success "Claude Desktop configured"
         return $true
     } catch {
@@ -556,7 +585,7 @@ function Configure-ClaudeCode {
             args = @("--directory", $InstallDir, "run", "python", "-m", "src.server")
         } -Force
 
-        $config | ConvertTo-Json -Depth 10 | Set-Content $claudeCodeConfigFile
+        $config | ConvertTo-Json -Depth 10 | Set-Content $claudeCodeConfigFile -Encoding UTF8
         Write-Success "Claude Code configured"
         return $true
     } catch {
@@ -636,15 +665,23 @@ Show-SystemStatus $status
 
 # Install uv if needed
 if (-not $status.UV.Installed) {
-    $installUV = Read-Host "  uv package manager is required. Install now? (y/n)"
-    if ($installUV -eq "y") {
+    if ($Unattended) {
+        Write-Info "Installing uv (unattended mode)..."
         if (-not (Install-UV)) {
             Write-Err "Cannot proceed without uv"
             exit 1
         }
     } else {
-        Write-Err "uv is required for Binary MCP"
-        exit 1
+        $installUV = Read-Host "  uv package manager is required. Install now? (y/n)"
+        if ($installUV -eq "y") {
+            if (-not (Install-UV)) {
+                Write-Err "Cannot proceed without uv"
+                exit 1
+            }
+        } else {
+            Write-Err "uv is required for Binary MCP"
+            exit 1
+        }
     }
 }
 
@@ -659,15 +696,23 @@ $installed = @{
 }
 
 # Installation profile selection
-if ($Profile) {
-    $selection = $Profile.ToLower()
+if ($InstallProfile) {
+    # Map profile names to menu numbers
+    $selection = switch ($InstallProfile.ToLower()) {
+        "full"    { "1" }
+        "static"  { "2" }
+        "dynamic" { "3" }
+        "custom"  { "4" }
+        "repair"  { "5" }
+        default   { $InstallProfile }
+    }
 } else {
     Show-InstallMenu
     $selection = Get-UserSelection "Enter choice (1-5, Q to quit)"
 }
 
 switch ($selection.ToLower()) {
-    "1" {
+    { $_ -in "1", "full" } {
         # Full installation
         Write-Host ""
         Write-Info "Starting Full Installation..."
@@ -694,7 +739,7 @@ switch ($selection.ToLower()) {
         $installed.ClaudeCode = Configure-ClaudeCode
     }
 
-    "2" {
+    { $_ -in "2", "static" } {
         # Static analysis only
         Write-Host ""
         Write-Info "Starting Static Analysis Installation..."
@@ -717,7 +762,7 @@ switch ($selection.ToLower()) {
         $installed.ClaudeDesktop = Configure-ClaudeDesktop
     }
 
-    "3" {
+    { $_ -in "3", "dynamic" } {
         # Dynamic analysis only
         Write-Host ""
         Write-Info "Starting Dynamic Analysis Installation..."
@@ -728,15 +773,15 @@ switch ($selection.ToLower()) {
         $installed.ClaudeDesktop = Configure-ClaudeDesktop
     }
 
-    "4" {
+    { $_ -in "4", "custom" } {
         # Custom installation
         Show-CustomMenu $status
         $customSelection = Get-UserSelection "Enter components"
 
         if ($customSelection.ToLower() -eq "b") {
             Write-Info "Returning to main menu..."
-            # Re-run script
-            & $MyInvocation.MyCommand.Path
+            # Re-run script (quote path in case of spaces)
+            & "$($MyInvocation.MyCommand.Path)"
             exit 0
         }
 
@@ -776,7 +821,7 @@ switch ($selection.ToLower()) {
         }
     }
 
-    "5" {
+    { $_ -in "5", "repair" } {
         # Repair/Update
         Write-Host ""
         Write-Info "Repair/Update Mode"
@@ -786,7 +831,7 @@ switch ($selection.ToLower()) {
         $repairSelection = Get-UserSelection "Enter components"
 
         if ($repairSelection.ToLower() -eq "b") {
-            & $MyInvocation.MyCommand.Path
+            & "$($MyInvocation.MyCommand.Path)"
             exit 0
         }
 

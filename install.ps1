@@ -1,5 +1,5 @@
 # Binary MCP Server - Windows Installer
-# Automated installation script for Windows with Ghidra and x64dbg support
+# Interactive installation script with component selection
 
 #Requires -RunAsAdministrator
 
@@ -7,18 +7,18 @@ param(
     [string]$InstallDir = "$env:USERPROFILE\binary-mcp",
     [string]$GhidraDir = "$env:USERPROFILE\ghidra",
     [string]$X64DbgDir = "$env:USERPROFILE\x64dbg",
-    [switch]$SkipGhidra,
-    [switch]$SkipX64Dbg,
-    [switch]$NoClaudeConfig
+    [string]$Profile = "",  # full, static, dynamic, custom
+    [switch]$Unattended
 )
 
 $ErrorActionPreference = "Stop"
 
-# Colors for output
+# Helper Functions
+
 function Write-Success { param($msg) Write-Host "[OK] $msg" -ForegroundColor Green }
 function Write-Info { param($msg) Write-Host "[i] $msg" -ForegroundColor Cyan }
-function Write-Warning { param($msg) Write-Host "[!] $msg" -ForegroundColor Yellow }
-function Write-Error { param($msg) Write-Host "[X] $msg" -ForegroundColor Red }
+function Write-Warn { param($msg) Write-Host "[!] $msg" -ForegroundColor Yellow }
+function Write-Err { param($msg) Write-Host "[X] $msg" -ForegroundColor Red }
 
 function Test-Command {
     param($CommandName)
@@ -27,368 +27,796 @@ function Test-Command {
 
 function Get-LatestGitHubRelease {
     param($Repo)
-
     try {
         $release = Invoke-RestMethod "https://api.github.com/repos/$Repo/releases/latest"
         return $release
     } catch {
-        Write-Error "Failed to fetch latest release for $Repo"
+        Write-Err "Failed to fetch latest release for $Repo"
         throw
     }
 }
 
-# Banner
-Write-Host ""
-Write-Host "============================================================" -ForegroundColor Cyan
-Write-Host "     Binary MCP Server - Automated Installer               " -ForegroundColor Cyan
-Write-Host "     Static (Ghidra) + Dynamic (x64dbg) Analysis           " -ForegroundColor Cyan
-Write-Host "============================================================" -ForegroundColor Cyan
-Write-Host ""
-
-# Check prerequisites
-Write-Info "Checking prerequisites..."
-
-# Check Python
-if (Test-Command python) {
-    $pythonVersion = python --version 2>&1 | Select-String -Pattern "(\d+\.\d+)"
-    $version = [version]$pythonVersion.Matches.Groups[1].Value
-    if ($version -ge [version]"3.12") {
-        Write-Success "Python $version found"
-    } else {
-        Write-Warning "Python $version found, but 3.12+ recommended"
-        Write-Info "Download Python 3.12+ from: https://www.python.org/downloads/"
-        $continue = Read-Host "Continue anyway? (y/n)"
-        if ($continue -ne "y") { exit 1 }
-    }
-} else {
-    Write-Error "Python not found!"
-    Write-Info "Please install Python 3.12+ from: https://www.python.org/downloads/"
-    Write-Info "Make sure to check 'Add Python to PATH' during installation"
-    exit 1
+function Show-Banner {
+    Clear-Host
+    Write-Host ""
+    Write-Host "  ____  _                          __  __  ____ ____  " -ForegroundColor Magenta
+    Write-Host " | __ )(_)_ __   __ _ _ __ _   _  |  \/  |/ ___|  _ \ " -ForegroundColor Magenta
+    Write-Host " |  _ \| | '_ \ / _`` | '__| | | | | |\/| | |   | |_) |" -ForegroundColor Magenta
+    Write-Host " | |_) | | | | | (_| | |  | |_| | | |  | | |___|  __/ " -ForegroundColor Magenta
+    Write-Host " |____/|_|_| |_|\__,_|_|   \__, | |_|  |_|\____|_|    " -ForegroundColor Magenta
+    Write-Host "                           |___/                      " -ForegroundColor Magenta
+    Write-Host ""
+    Write-Host "  Binary Analysis MCP Server - Automated Installer" -ForegroundColor White
+    Write-Host "  https://github.com/Sarks0/binary-mcp" -ForegroundColor DarkGray
+    Write-Host ""
+    Write-Host "  ================================================" -ForegroundColor DarkGray
+    Write-Host ""
 }
 
-# Check/Install uv
-Write-Info "Checking uv package manager..."
-if (Test-Command uv) {
-    Write-Success "uv already installed"
-} else {
-    Write-Info "Installing uv..."
+function Get-ComponentStatus {
+    $status = @{
+        Python = @{ Installed = $false; Version = ""; Path = "" }
+        Java = @{ Installed = $false; Version = ""; Path = "" }
+        DotNet = @{ Installed = $false; Version = ""; Path = "" }
+        UV = @{ Installed = $false; Version = ""; Path = "" }
+        Ghidra = @{ Installed = $false; Version = ""; Path = $GhidraDir }
+        ILSpyCmd = @{ Installed = $false; Version = ""; Path = "" }
+        X64Dbg = @{ Installed = $false; Version = ""; Path = $X64DbgDir }
+        BinaryMCP = @{ Installed = $false; Version = ""; Path = $InstallDir }
+    }
+
+    # Check Python
+    if (Test-Command python) {
+        $status.Python.Installed = $true
+        try {
+            $pyVer = python --version 2>&1
+            $status.Python.Version = ($pyVer -replace "Python ", "").Trim()
+            $status.Python.Path = (Get-Command python).Source
+        } catch {}
+    }
+
+    # Check Java
+    if (Test-Command java) {
+        $status.Java.Installed = $true
+        try {
+            $javaOutput = java -version 2>&1
+            $status.Java.Version = (($javaOutput | Out-String) -split "`n" | Select-Object -First 1).Trim()
+            $status.Java.Path = (Get-Command java).Source
+        } catch {}
+    }
+
+    # Check .NET SDK
+    if (Test-Command dotnet) {
+        $status.DotNet.Installed = $true
+        try {
+            $status.DotNet.Version = (dotnet --version 2>&1).Trim()
+            $status.DotNet.Path = (Get-Command dotnet).Source
+        } catch {}
+    }
+
+    # Check uv
+    if (Test-Command uv) {
+        $status.UV.Installed = $true
+        try {
+            $status.UV.Version = (uv --version 2>&1).Trim()
+            $status.UV.Path = (Get-Command uv).Source
+        } catch {}
+    }
+
+    # Check Ghidra
+    if (Test-Path $GhidraDir) {
+        $status.Ghidra.Installed = $true
+        $status.Ghidra.Path = $GhidraDir
+    }
+
+    # Check ILSpyCmd
+    $ilspyPath = "$env:USERPROFILE\.dotnet\tools\ilspycmd.exe"
+    if (Test-Path $ilspyPath) {
+        $status.ILSpyCmd.Installed = $true
+        $status.ILSpyCmd.Path = $ilspyPath
+    } elseif (Test-Command ilspycmd) {
+        $status.ILSpyCmd.Installed = $true
+        $status.ILSpyCmd.Path = (Get-Command ilspycmd).Source
+    }
+
+    # Check x64dbg
+    if (Test-Path $X64DbgDir) {
+        $status.X64Dbg.Installed = $true
+        $status.X64Dbg.Path = $X64DbgDir
+    }
+
+    # Check Binary MCP
+    if (Test-Path "$InstallDir\pyproject.toml") {
+        $status.BinaryMCP.Installed = $true
+        $status.BinaryMCP.Path = $InstallDir
+    }
+
+    return $status
+}
+
+function Show-SystemStatus {
+    param($Status)
+
+    Write-Host "  SYSTEM STATUS" -ForegroundColor Yellow
+    Write-Host "  -------------" -ForegroundColor Yellow
+    Write-Host ""
+
+    # Core Requirements
+    Write-Host "  Core Requirements:" -ForegroundColor White
+
+    if ($Status.Python.Installed) {
+        $pyVersion = [version]($Status.Python.Version -replace "[^\d.]", "" -replace "^(\d+\.\d+).*", '$1')
+        if ($pyVersion -ge [version]"3.12") {
+            Write-Host "    [" -NoNewline; Write-Host "OK" -ForegroundColor Green -NoNewline; Write-Host "] Python $($Status.Python.Version)"
+        } else {
+            Write-Host "    [" -NoNewline; Write-Host "!!" -ForegroundColor Yellow -NoNewline; Write-Host "] Python $($Status.Python.Version) (3.12+ recommended)"
+        }
+    } else {
+        Write-Host "    [" -NoNewline; Write-Host "--" -ForegroundColor Red -NoNewline; Write-Host "] Python (not installed)"
+    }
+
+    if ($Status.UV.Installed) {
+        Write-Host "    [" -NoNewline; Write-Host "OK" -ForegroundColor Green -NoNewline; Write-Host "] uv package manager"
+    } else {
+        Write-Host "    [" -NoNewline; Write-Host "--" -ForegroundColor DarkGray -NoNewline; Write-Host "] uv (will be installed)"
+    }
+
+    Write-Host ""
+    Write-Host "  Analysis Components:" -ForegroundColor White
+
+    # Ghidra + Java
+    if ($Status.Ghidra.Installed) {
+        Write-Host "    [" -NoNewline; Write-Host "OK" -ForegroundColor Green -NoNewline; Write-Host "] Ghidra (native binary analysis)"
+    } else {
+        Write-Host "    [" -NoNewline; Write-Host "--" -ForegroundColor DarkGray -NoNewline; Write-Host "] Ghidra (not installed)"
+    }
+
+    if ($Status.Java.Installed) {
+        Write-Host "    [" -NoNewline; Write-Host "OK" -ForegroundColor Green -NoNewline; Write-Host "] Java 21+ (for Ghidra)"
+    } else {
+        Write-Host "    [" -NoNewline; Write-Host "--" -ForegroundColor DarkGray -NoNewline; Write-Host "] Java 21+ (required for Ghidra)"
+    }
+
+    # .NET Tools
+    if ($Status.ILSpyCmd.Installed) {
+        Write-Host "    [" -NoNewline; Write-Host "OK" -ForegroundColor Green -NoNewline; Write-Host "] ILSpyCmd (.NET decompilation)"
+    } else {
+        Write-Host "    [" -NoNewline; Write-Host "--" -ForegroundColor DarkGray -NoNewline; Write-Host "] ILSpyCmd (not installed)"
+    }
+
+    if ($Status.DotNet.Installed) {
+        Write-Host "    [" -NoNewline; Write-Host "OK" -ForegroundColor Green -NoNewline; Write-Host "] .NET SDK $($Status.DotNet.Version)"
+    } else {
+        Write-Host "    [" -NoNewline; Write-Host "--" -ForegroundColor DarkGray -NoNewline; Write-Host "] .NET SDK 6.0+ (required for ILSpyCmd)"
+    }
+
+    # x64dbg
+    if ($Status.X64Dbg.Installed) {
+        Write-Host "    [" -NoNewline; Write-Host "OK" -ForegroundColor Green -NoNewline; Write-Host "] x64dbg (dynamic analysis)"
+    } else {
+        Write-Host "    [" -NoNewline; Write-Host "--" -ForegroundColor DarkGray -NoNewline; Write-Host "] x64dbg (not installed)"
+    }
+
+    Write-Host ""
+    Write-Host "  Binary MCP Server:" -ForegroundColor White
+    if ($Status.BinaryMCP.Installed) {
+        Write-Host "    [" -NoNewline; Write-Host "OK" -ForegroundColor Green -NoNewline; Write-Host "] Installed at $($Status.BinaryMCP.Path)"
+    } else {
+        Write-Host "    [" -NoNewline; Write-Host "--" -ForegroundColor DarkGray -NoNewline; Write-Host "] Not installed"
+    }
+
+    Write-Host ""
+}
+
+function Show-InstallMenu {
+    Write-Host "  INSTALLATION OPTIONS" -ForegroundColor Yellow
+    Write-Host "  --------------------" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "  [1] Full Installation" -ForegroundColor White
+    Write-Host "      Everything: Ghidra + .NET Tools + x64dbg + Claude Config" -ForegroundColor DarkGray
+    Write-Host ""
+    Write-Host "  [2] Static Analysis Only" -ForegroundColor White
+    Write-Host "      Ghidra (native) + ILSpyCmd (.NET) - No debugger" -ForegroundColor DarkGray
+    Write-Host ""
+    Write-Host "  [3] Dynamic Analysis Only" -ForegroundColor White
+    Write-Host "      x64dbg with MCP plugins - No static analysis tools" -ForegroundColor DarkGray
+    Write-Host ""
+    Write-Host "  [4] Custom Installation" -ForegroundColor White
+    Write-Host "      Choose individual components to install" -ForegroundColor DarkGray
+    Write-Host ""
+    Write-Host "  [5] Repair/Update Existing" -ForegroundColor White
+    Write-Host "      Reinstall or update specific components" -ForegroundColor DarkGray
+    Write-Host ""
+    Write-Host "  [Q] Quit" -ForegroundColor DarkGray
+    Write-Host ""
+}
+
+function Show-CustomMenu {
+    param($Status)
+
+    Write-Host "  CUSTOM INSTALLATION" -ForegroundColor Yellow
+    Write-Host "  -------------------" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "  Select components (enter numbers separated by commas, e.g., 1,2,4):" -ForegroundColor White
+    Write-Host ""
+
+    $ghidraStatus = if ($Status.Ghidra.Installed) { "[Installed]" } else { "" }
+    $javaNote = if (-not $Status.Java.Installed) { "(requires Java 21+)" } else { "" }
+    Write-Host "  [1] Ghidra - Native binary analysis $ghidraStatus" -ForegroundColor White
+    if ($javaNote) { Write-Host "      $javaNote" -ForegroundColor Yellow }
+
+    $dotnetStatus = if ($Status.ILSpyCmd.Installed) { "[Installed]" } else { "" }
+    $dotnetNote = if (-not $Status.DotNet.Installed) { "(requires .NET SDK 6.0+)" } else { "" }
+    Write-Host "  [2] .NET Tools (ILSpyCmd) - C#/VB.NET decompilation $dotnetStatus" -ForegroundColor White
+    if ($dotnetNote) { Write-Host "      $dotnetNote" -ForegroundColor Yellow }
+
+    $x64dbgStatus = if ($Status.X64Dbg.Installed) { "[Installed]" } else { "" }
+    Write-Host "  [3] x64dbg - Dynamic debugging/analysis $x64dbgStatus" -ForegroundColor White
+
+    Write-Host "  [4] Configure Claude Desktop" -ForegroundColor White
+    Write-Host "  [5] Configure Claude Code" -ForegroundColor White
+    Write-Host ""
+    Write-Host "  [A] All components" -ForegroundColor Cyan
+    Write-Host "  [B] Back to main menu" -ForegroundColor DarkGray
+    Write-Host ""
+}
+
+function Get-UserSelection {
+    param($Prompt = "Select an option")
+    Write-Host "  $Prompt" -ForegroundColor Cyan -NoNewline
+    Write-Host ": " -NoNewline
+    return Read-Host
+}
+
+# Installation Functions
+
+function Install-UV {
+    Write-Info "Installing uv package manager..."
     try {
         Invoke-RestMethod https://astral.sh/uv/install.ps1 | Invoke-Expression
         $env:Path = [System.Environment]::GetEnvironmentVariable("Path","User") + ";" + [System.Environment]::GetEnvironmentVariable("Path","Machine")
         Write-Success "uv installed successfully"
+        return $true
     } catch {
-        Write-Error "Failed to install uv: $_"
-        exit 1
+        Write-Err "Failed to install uv: $_"
+        return $false
     }
 }
 
-# Check Java (required for Ghidra)
-if (-not $SkipGhidra) {
-    Write-Info "Checking Java..."
-    if (Test-Command java) {
-        try {
-            $javaOutput = java -version 2>&1
-            $javaVersion = ($javaOutput | Out-String) -split "`n" | Select-Object -First 1
-            Write-Success "Java found: $($javaVersion.Trim())"
-        } catch {
-            Write-Success "Java found (version check unavailable)"
-        }
-    } else {
-        Write-Warning "Java not found - required for Ghidra"
-        Write-Info "Download Java 17+ from: https://adoptium.net/"
-        $installJava = Read-Host "Skip Ghidra installation? (y/n)"
-        if ($installJava -eq "y") {
-            $SkipGhidra = $true
-        } else {
-            Write-Error "Please install Java and run this script again"
-            exit 1
-        }
-    }
-}
-
-# Install Ghidra
-if (-not $SkipGhidra) {
+function Install-Ghidra {
     Write-Info "Installing Ghidra..."
 
-    if (Test-Path $GhidraDir) {
-        Write-Warning "Ghidra directory already exists: $GhidraDir"
-        $reinstall = Read-Host "Reinstall Ghidra? (y/n)"
-        if ($reinstall -ne "y") {
-            Write-Info "Skipping Ghidra installation"
-        } else {
-            Remove-Item -Recurse -Force $GhidraDir
-        }
+    # Check Java first
+    if (-not (Test-Command java)) {
+        Write-Err "Java 21+ is required for Ghidra"
+        Write-Info "Download from: https://adoptium.net/"
+        return $false
     }
 
-    if (-not (Test-Path $GhidraDir)) {
-        Write-Info "Fetching latest Ghidra release..."
+    if (Test-Path $GhidraDir) {
+        Write-Warn "Ghidra directory already exists: $GhidraDir"
+        $reinstall = Read-Host "  Reinstall? (y/n)"
+        if ($reinstall -ne "y") {
+            Write-Info "Skipping Ghidra installation"
+            return $true
+        }
+        Remove-Item -Recurse -Force $GhidraDir
+    }
 
-        # Ghidra releases are on GitHub
+    try {
+        Write-Info "Fetching latest Ghidra release..."
         $ghidraRelease = Get-LatestGitHubRelease "NationalSecurityAgency/ghidra"
         $ghidraAsset = $ghidraRelease.assets | Where-Object { $_.name -match ".*\.zip$" -and $_.name -notmatch "DEV" } | Select-Object -First 1
 
         if ($null -eq $ghidraAsset) {
-            Write-Error "Could not find Ghidra release asset"
-            $SkipGhidra = $true
-        } else {
-            Write-Info "Downloading Ghidra $($ghidraRelease.tag_name)..."
-            $ghidraZip = "$env:TEMP\ghidra.zip"
-
-            try {
-                Invoke-WebRequest -Uri $ghidraAsset.browser_download_url -OutFile $ghidraZip -UseBasicParsing
-                Write-Success "Downloaded Ghidra"
-
-                Write-Info "Extracting Ghidra..."
-                Expand-Archive -Path $ghidraZip -DestinationPath "$env:USERPROFILE" -Force
-
-                # Find extracted directory (format: ghidra_x.x.x_PUBLIC_YYYYMMDD)
-                $extractedDir = Get-ChildItem "$env:USERPROFILE" -Directory | Where-Object { $_.Name -match "^ghidra_.*_PUBLIC" } | Select-Object -First 1
-
-                if ($extractedDir) {
-                    Rename-Item $extractedDir.FullName $GhidraDir
-                    Write-Success "Ghidra installed to: $GhidraDir"
-
-                    # Set environment variable
-                    [System.Environment]::SetEnvironmentVariable("GHIDRA_HOME", $GhidraDir, "User")
-                    $env:GHIDRA_HOME = $GhidraDir
-                } else {
-                    Write-Error "Could not find extracted Ghidra directory"
-                }
-
-                Remove-Item $ghidraZip -ErrorAction SilentlyContinue
-            } catch {
-                Write-Error "Failed to install Ghidra: $_"
-                $SkipGhidra = $true
-            }
+            Write-Err "Could not find Ghidra release asset"
+            return $false
         }
+
+        Write-Info "Downloading Ghidra $($ghidraRelease.tag_name)..."
+        $ghidraZip = "$env:TEMP\ghidra.zip"
+        Invoke-WebRequest -Uri $ghidraAsset.browser_download_url -OutFile $ghidraZip -UseBasicParsing
+        Write-Success "Downloaded Ghidra"
+
+        Write-Info "Extracting Ghidra..."
+        Expand-Archive -Path $ghidraZip -DestinationPath "$env:USERPROFILE" -Force
+
+        $extractedDir = Get-ChildItem "$env:USERPROFILE" -Directory | Where-Object { $_.Name -match "^ghidra_.*_PUBLIC" } | Select-Object -First 1
+
+        if ($extractedDir) {
+            Rename-Item $extractedDir.FullName $GhidraDir
+            [System.Environment]::SetEnvironmentVariable("GHIDRA_HOME", $GhidraDir, "User")
+            $env:GHIDRA_HOME = $GhidraDir
+            Write-Success "Ghidra installed to: $GhidraDir"
+        } else {
+            Write-Err "Could not find extracted Ghidra directory"
+            return $false
+        }
+
+        Remove-Item $ghidraZip -ErrorAction SilentlyContinue
+        return $true
+    } catch {
+        Write-Err "Failed to install Ghidra: $_"
+        return $false
     }
 }
 
-# Install x64dbg
-if (-not $SkipX64Dbg) {
+function Install-DotNetTools {
+    Write-Info "Installing .NET analysis tools..."
+
+    # Check .NET SDK
+    if (-not (Test-Command dotnet)) {
+        Write-Err ".NET SDK 6.0+ is required for ILSpyCmd"
+        Write-Info "Download from: https://dotnet.microsoft.com/download"
+        return $false
+    }
+
+    try {
+        Write-Info "Installing ILSpyCmd..."
+        $result = dotnet tool install -g ilspycmd 2>&1
+
+        if ($LASTEXITCODE -eq 0) {
+            Write-Success "ILSpyCmd installed successfully"
+        } elseif ($result -match "already installed") {
+            Write-Info "ILSpyCmd is already installed, updating..."
+            dotnet tool update -g ilspycmd
+            Write-Success "ILSpyCmd updated"
+        } else {
+            Write-Warn "ILSpyCmd installation returned: $result"
+        }
+
+        # Add to PATH if needed
+        $toolsPath = "$env:USERPROFILE\.dotnet\tools"
+        if ($env:Path -notlike "*$toolsPath*") {
+            $env:Path = "$toolsPath;$env:Path"
+            [System.Environment]::SetEnvironmentVariable("Path", "$toolsPath;" + [System.Environment]::GetEnvironmentVariable("Path", "User"), "User")
+            Write-Info "Added .NET tools to PATH"
+        }
+
+        return $true
+    } catch {
+        Write-Err "Failed to install ILSpyCmd: $_"
+        return $false
+    }
+}
+
+function Install-X64Dbg {
     Write-Info "Installing x64dbg..."
 
     if (Test-Path $X64DbgDir) {
-        Write-Warning "x64dbg directory already exists: $X64DbgDir"
-        $reinstall = Read-Host "Reinstall x64dbg? (y/n)"
+        Write-Warn "x64dbg directory already exists: $X64DbgDir"
+        $reinstall = Read-Host "  Reinstall? (y/n)"
         if ($reinstall -ne "y") {
             Write-Info "Skipping x64dbg installation"
-        } else {
-            Remove-Item -Recurse -Force $X64DbgDir
+            return $true
         }
+        Remove-Item -Recurse -Force $X64DbgDir
     }
 
-    if (-not (Test-Path $X64DbgDir)) {
-        Write-Info "Fetching latest x64dbg snapshot..."
+    try {
+        $x64dbgUrl = "https://github.com/x64dbg/x64dbg/releases/download/snapshot/snapshot_latest.zip"
+        $x64dbgZip = "$env:TEMP\x64dbg.zip"
 
+        Write-Info "Downloading x64dbg..."
+        Invoke-WebRequest -Uri $x64dbgUrl -OutFile $x64dbgZip -UseBasicParsing
+        Write-Success "Downloaded x64dbg"
+
+        Write-Info "Extracting x64dbg..."
+        Expand-Archive -Path $x64dbgZip -DestinationPath $X64DbgDir -Force
+        Write-Success "x64dbg installed to: $X64DbgDir"
+
+        [System.Environment]::SetEnvironmentVariable("X64DBG_HOME", $X64DbgDir, "User")
+        $env:X64DBG_HOME = $X64DbgDir
+
+        Remove-Item $x64dbgZip -ErrorAction SilentlyContinue
+
+        # Install MCP plugins
+        Write-Info "Installing x64dbg MCP plugins..."
         try {
-            $x64dbgUrl = "https://github.com/x64dbg/x64dbg/releases/download/snapshot/snapshot_latest.zip"
-            $x64dbgZip = "$env:TEMP\x64dbg.zip"
+            $pluginRelease = Get-LatestGitHubRelease "Sarks0/binary-mcp"
+            $plugin64 = $pluginRelease.assets | Where-Object { $_.name -eq "x64dbg_mcp.dp64" } | Select-Object -First 1
+            $plugin32 = $pluginRelease.assets | Where-Object { $_.name -eq "x64dbg_mcp.dp32" } | Select-Object -First 1
 
-            Write-Info "Downloading x64dbg..."
-            Invoke-WebRequest -Uri $x64dbgUrl -OutFile $x64dbgZip -UseBasicParsing
-            Write-Success "Downloaded x64dbg"
+            if ($plugin64 -and $plugin32) {
+                $plugin64Dir = "$X64DbgDir\release\x64\plugins"
+                $plugin32Dir = "$X64DbgDir\release\x32\plugins"
+                New-Item -ItemType Directory -Force -Path $plugin64Dir | Out-Null
+                New-Item -ItemType Directory -Force -Path $plugin32Dir | Out-Null
 
-            Write-Info "Extracting x64dbg..."
-            Expand-Archive -Path $x64dbgZip -DestinationPath $X64DbgDir -Force
-            Write-Success "x64dbg installed to: $X64DbgDir"
-
-            # Set environment variable
-            [System.Environment]::SetEnvironmentVariable("X64DBG_HOME", $X64DbgDir, "User")
-            $env:X64DBG_HOME = $X64DbgDir
-
-            Remove-Item $x64dbgZip -ErrorAction SilentlyContinue
-
-            # Install MCP plugins
-            Write-Info "Installing x64dbg MCP plugins..."
-            try {
-                # Get latest release
-                $pluginRelease = Get-LatestGitHubRelease "Sarks0/binary-mcp"
-
-                # Find plugin assets
-                $plugin64 = $pluginRelease.assets | Where-Object { $_.name -eq "x64dbg_mcp.dp64" } | Select-Object -First 1
-                $plugin32 = $pluginRelease.assets | Where-Object { $_.name -eq "x64dbg_mcp.dp32" } | Select-Object -First 1
-
-                if ($plugin64 -and $plugin32) {
-                    Write-Info "Downloading MCP plugins from release $($pluginRelease.tag_name)..."
-
-                    # Create plugin directories if they don't exist
-                    $plugin64Dir = "$X64DbgDir\release\x64\plugins"
-                    $plugin32Dir = "$X64DbgDir\release\x32\plugins"
-                    New-Item -ItemType Directory -Force -Path $plugin64Dir | Out-Null
-                    New-Item -ItemType Directory -Force -Path $plugin32Dir | Out-Null
-
-                    # Download x64 plugin
-                    Invoke-WebRequest -Uri $plugin64.browser_download_url -OutFile "$plugin64Dir\x64dbg_mcp.dp64" -UseBasicParsing
-                    Write-Success "Installed x64dbg_mcp.dp64"
-
-                    # Download x32 plugin
-                    Invoke-WebRequest -Uri $plugin32.browser_download_url -OutFile "$plugin32Dir\x64dbg_mcp.dp32" -UseBasicParsing
-                    Write-Success "Installed x64dbg_mcp.dp32"
-
-                    Write-Success "x64dbg MCP plugins installed successfully"
-                } else {
-                    Write-Warning "Pre-built MCP plugins not found in latest release"
-                    Write-Info "You can build them manually following: src/engines/dynamic/x64dbg/plugin/README.md"
-                }
-            } catch {
-                Write-Warning "Failed to install MCP plugins: $_"
-                Write-Info "You can build them manually following: src/engines/dynamic/x64dbg/plugin/README.md"
+                Invoke-WebRequest -Uri $plugin64.browser_download_url -OutFile "$plugin64Dir\x64dbg_mcp.dp64" -UseBasicParsing
+                Invoke-WebRequest -Uri $plugin32.browser_download_url -OutFile "$plugin32Dir\x64dbg_mcp.dp32" -UseBasicParsing
+                Write-Success "MCP plugins installed"
+            } else {
+                Write-Warn "Pre-built MCP plugins not found in latest release"
+                Write-Info "Build manually: src/engines/dynamic/x64dbg/plugin/README.md"
             }
-
         } catch {
-            Write-Error "Failed to install x64dbg: $_"
-            $SkipX64Dbg = $true
+            Write-Warn "Failed to install MCP plugins: $_"
         }
+
+        return $true
+    } catch {
+        Write-Err "Failed to install x64dbg: $_"
+        return $false
     }
 }
 
-# Clone/Setup project
-Write-Info "Setting up Binary MCP Server..."
+function Install-BinaryMCP {
+    Write-Info "Setting up Binary MCP Server..."
 
-if (Test-Path $InstallDir) {
-    Write-Warning "Installation directory already exists: $InstallDir"
-    $continue = Read-Host "Continue and update? (y/n)"
-    if ($continue -ne "y") {
-        Write-Info "Installation cancelled"
-        exit 0
-    }
-} else {
-    Write-Info "Creating installation directory..."
-    New-Item -ItemType Directory -Path $InstallDir | Out-Null
-}
-
-Push-Location $InstallDir
-
-# Check if git repo exists
-if (Test-Path ".git") {
-    Write-Info "Updating existing repository..."
-    git pull
-} else {
-    Write-Info "Cloning repository..."
-    if (Test-Command git) {
-        git clone https://github.com/Sarks0/binary-mcp.git .
+    if (Test-Path $InstallDir) {
+        Write-Warn "Installation directory already exists: $InstallDir"
+        $continue = Read-Host "  Update existing installation? (y/n)"
+        if ($continue -ne "y") {
+            return $true
+        }
     } else {
-        Write-Warning "Git not found. Downloading as ZIP..."
-        $zipUrl = "https://github.com/Sarks0/binary-mcp/archive/refs/heads/main.zip"
-        $zipFile = "$env:TEMP\binary-mcp.zip"
-        Invoke-WebRequest -Uri $zipUrl -OutFile $zipFile -UseBasicParsing
-        Expand-Archive -Path $zipFile -DestinationPath $InstallDir -Force
-        Move-Item "$InstallDir\binary-mcp-main\*" $InstallDir -Force
-        Remove-Item "$InstallDir\binary-mcp-main" -Recurse -Force
-        Remove-Item $zipFile -ErrorAction SilentlyContinue
+        New-Item -ItemType Directory -Path $InstallDir | Out-Null
+    }
+
+    Push-Location $InstallDir
+
+    try {
+        if (Test-Path ".git") {
+            Write-Info "Updating existing repository..."
+            git pull
+        } else {
+            Write-Info "Cloning repository..."
+            if (Test-Command git) {
+                git clone https://github.com/Sarks0/binary-mcp.git .
+            } else {
+                Write-Warn "Git not found. Downloading as ZIP..."
+                $zipUrl = "https://github.com/Sarks0/binary-mcp/archive/refs/heads/main.zip"
+                $zipFile = "$env:TEMP\binary-mcp.zip"
+                Invoke-WebRequest -Uri $zipUrl -OutFile $zipFile -UseBasicParsing
+                Expand-Archive -Path $zipFile -DestinationPath "$env:TEMP\binary-mcp-extract" -Force
+                Move-Item "$env:TEMP\binary-mcp-extract\binary-mcp-main\*" $InstallDir -Force
+                Remove-Item "$env:TEMP\binary-mcp-extract" -Recurse -Force
+                Remove-Item $zipFile -ErrorAction SilentlyContinue
+            }
+        }
+
+        Write-Success "Repository ready"
+
+        Write-Info "Installing Python dependencies..."
+        uv sync --extra dev
+        Write-Success "Dependencies installed"
+
+        Pop-Location
+        return $true
+    } catch {
+        Pop-Location
+        Write-Err "Failed to setup Binary MCP: $_"
+        return $false
     }
 }
 
-Write-Success "Repository ready"
-
-# Install Python dependencies
-Write-Info "Installing Python dependencies..."
-try {
-    uv sync --extra dev
-    Write-Success "Dependencies installed"
-} catch {
-    Write-Error "Failed to install dependencies: $_"
-    exit 1
-}
-
-# Configure Claude Desktop
-if (-not $NoClaudeConfig) {
+function Configure-ClaudeDesktop {
     Write-Info "Configuring Claude Desktop..."
 
     $claudeConfigDir = "$env:APPDATA\Claude"
     $claudeConfigFile = "$claudeConfigDir\claude_desktop_config.json"
 
-    if (Test-Path $claudeConfigFile) {
-        Write-Info "Claude Desktop config found"
+    if (-not (Test-Path $claudeConfigDir)) {
+        New-Item -ItemType Directory -Path $claudeConfigDir -Force | Out-Null
+    }
 
-        try {
+    try {
+        if (Test-Path $claudeConfigFile) {
             $config = Get-Content $claudeConfigFile -Raw | ConvertFrom-Json
-
-            if (-not $config.mcpServers) {
-                $config | Add-Member -MemberType NoteProperty -Name "mcpServers" -Value @{} -Force
-            }
-
-            # Add binary-mcp server
-            $config.mcpServers | Add-Member -MemberType NoteProperty -Name "binary-mcp" -Value @{
-                command = "uv"
-                args = @("--directory", $InstallDir, "run", "python", "-m", "src.server")
-            } -Force
-
-            # Backup existing config
             Copy-Item $claudeConfigFile "$claudeConfigFile.backup" -Force
-
-            # Save new config
-            $config | ConvertTo-Json -Depth 10 | Set-Content $claudeConfigFile
-
-            Write-Success "Claude Desktop configured"
             Write-Info "Backup saved to: $claudeConfigFile.backup"
-        } catch {
-            Write-Warning "Failed to configure Claude Desktop: $_"
-            Write-Info "You can manually configure it later"
+        } else {
+            $config = [PSCustomObject]@{ mcpServers = @{} }
         }
-    } else {
-        Write-Warning "Claude Desktop config not found"
-        Write-Info "Expected location: $claudeConfigFile"
-        Write-Info "You'll need to manually configure Claude Desktop after installation"
+
+        if (-not $config.mcpServers) {
+            $config | Add-Member -MemberType NoteProperty -Name "mcpServers" -Value @{} -Force
+        }
+
+        $config.mcpServers | Add-Member -MemberType NoteProperty -Name "binary-mcp" -Value @{
+            command = "uv"
+            args = @("--directory", $InstallDir, "run", "python", "-m", "src.server")
+        } -Force
+
+        $config | ConvertTo-Json -Depth 10 | Set-Content $claudeConfigFile
+        Write-Success "Claude Desktop configured"
+        return $true
+    } catch {
+        Write-Err "Failed to configure Claude Desktop: $_"
+        return $false
     }
 }
 
-Pop-Location
+function Configure-ClaudeCode {
+    Write-Info "Configuring Claude Code..."
 
-# Verify installation
-Write-Info "Verifying installation..."
+    $claudeCodeConfigDir = "$env:USERPROFILE\.config\claude-code"
+    $claudeCodeConfigFile = "$claudeCodeConfigDir\mcp_settings.json"
 
-$allGood = $true
+    if (-not (Test-Path $claudeCodeConfigDir)) {
+        New-Item -ItemType Directory -Path $claudeCodeConfigDir -Force | Out-Null
+    }
 
-if (-not (Test-Path $InstallDir)) {
-    Write-Error "Installation directory not found"
-    $allGood = $false
+    try {
+        if (Test-Path $claudeCodeConfigFile) {
+            $config = Get-Content $claudeCodeConfigFile -Raw | ConvertFrom-Json
+            Copy-Item $claudeCodeConfigFile "$claudeCodeConfigFile.backup" -Force
+            Write-Info "Backup saved to: $claudeCodeConfigFile.backup"
+        } else {
+            $config = [PSCustomObject]@{ mcpServers = @{} }
+        }
+
+        if (-not $config.mcpServers) {
+            $config | Add-Member -MemberType NoteProperty -Name "mcpServers" -Value @{} -Force
+        }
+
+        $config.mcpServers | Add-Member -MemberType NoteProperty -Name "binary-mcp" -Value @{
+            command = "uv"
+            args = @("--directory", $InstallDir, "run", "python", "-m", "src.server")
+        } -Force
+
+        $config | ConvertTo-Json -Depth 10 | Set-Content $claudeCodeConfigFile
+        Write-Success "Claude Code configured"
+        return $true
+    } catch {
+        Write-Err "Failed to configure Claude Code: $_"
+        return $false
+    }
 }
 
-if (-not $SkipGhidra -and -not (Test-Path $GhidraDir)) {
-    Write-Warning "Ghidra not installed"
+function Show-Summary {
+    param($Installed)
+
+    Write-Host ""
+    Write-Host "  ================================================" -ForegroundColor Green
+    Write-Host "           INSTALLATION COMPLETE!" -ForegroundColor Green
+    Write-Host "  ================================================" -ForegroundColor Green
+    Write-Host ""
+
+    if ($Installed.BinaryMCP) {
+        Write-Success "Binary MCP Server: $InstallDir"
+    }
+    if ($Installed.Ghidra) {
+        Write-Success "Ghidra: $GhidraDir"
+    }
+    if ($Installed.DotNet) {
+        Write-Success "ILSpyCmd: .NET decompilation ready"
+    }
+    if ($Installed.X64Dbg) {
+        Write-Success "x64dbg: $X64DbgDir"
+    }
+    if ($Installed.ClaudeDesktop) {
+        Write-Success "Claude Desktop: Configured"
+    }
+    if ($Installed.ClaudeCode) {
+        Write-Success "Claude Code: Configured"
+    }
+
+    Write-Host ""
+    Write-Info "Next steps:"
+    Write-Host "  1. Restart Claude Desktop/Code to load the MCP server" -ForegroundColor White
+
+    if ($Installed.Ghidra -or $Installed.DotNet) {
+        Write-Host "  2. Test static analysis:" -ForegroundColor White
+        if ($Installed.Ghidra) {
+            Write-Host "     - Native binaries: 'Analyze /path/to/binary.exe'" -ForegroundColor DarkGray
+        }
+        if ($Installed.DotNet) {
+            Write-Host "     - .NET assemblies: 'Analyze the .NET binary at /path/to/app.exe'" -ForegroundColor DarkGray
+        }
+    }
+
+    if ($Installed.X64Dbg) {
+        Write-Host "  3. For dynamic analysis: Launch x64dbg and load a binary" -ForegroundColor White
+        Write-Host "     - x64dbg.exe for 64-bit, x32dbg.exe for 32-bit" -ForegroundColor DarkGray
+    }
+
+    Write-Host ""
+    Write-Host "  Test the server: " -ForegroundColor White -NoNewline
+    Write-Host "cd $InstallDir && uv run python -m src.server" -ForegroundColor Yellow
+    Write-Host ""
 }
 
-if (-not $SkipX64Dbg -and -not (Test-Path $X64DbgDir)) {
-    Write-Warning "x64dbg not installed"
+# Main Installation Flow
+
+Show-Banner
+
+# Check Python first (required)
+if (-not (Test-Command python)) {
+    Write-Err "Python is required but not found!"
+    Write-Info "Please install Python 3.12+ from: https://www.python.org/downloads/"
+    Write-Info "Make sure to check 'Add Python to PATH' during installation"
+    exit 1
 }
 
-# Summary
+# Get current system status
+$status = Get-ComponentStatus
+Show-SystemStatus $status
+
+# Install uv if needed
+if (-not $status.UV.Installed) {
+    $installUV = Read-Host "  uv package manager is required. Install now? (y/n)"
+    if ($installUV -eq "y") {
+        if (-not (Install-UV)) {
+            Write-Err "Cannot proceed without uv"
+            exit 1
+        }
+    } else {
+        Write-Err "uv is required for Binary MCP"
+        exit 1
+    }
+}
+
+# Tracking what gets installed
+$installed = @{
+    BinaryMCP = $false
+    Ghidra = $false
+    DotNet = $false
+    X64Dbg = $false
+    ClaudeDesktop = $false
+    ClaudeCode = $false
+}
+
+# Installation profile selection
+if ($Profile) {
+    $selection = $Profile.ToLower()
+} else {
+    Show-InstallMenu
+    $selection = Get-UserSelection "Enter choice (1-5, Q to quit)"
+}
+
+switch ($selection.ToLower()) {
+    "1" {
+        # Full installation
+        Write-Host ""
+        Write-Info "Starting Full Installation..."
+        Write-Host ""
+
+        $installed.BinaryMCP = Install-BinaryMCP
+
+        if ($status.Java.Installed) {
+            $installed.Ghidra = Install-Ghidra
+        } else {
+            Write-Warn "Skipping Ghidra - Java 21+ not installed"
+            Write-Info "Install Java from: https://adoptium.net/"
+        }
+
+        if ($status.DotNet.Installed) {
+            $installed.DotNet = Install-DotNetTools
+        } else {
+            Write-Warn "Skipping ILSpyCmd - .NET SDK not installed"
+            Write-Info "Install .NET SDK from: https://dotnet.microsoft.com/download"
+        }
+
+        $installed.X64Dbg = Install-X64Dbg
+        $installed.ClaudeDesktop = Configure-ClaudeDesktop
+        $installed.ClaudeCode = Configure-ClaudeCode
+    }
+
+    "2" {
+        # Static analysis only
+        Write-Host ""
+        Write-Info "Starting Static Analysis Installation..."
+        Write-Host ""
+
+        $installed.BinaryMCP = Install-BinaryMCP
+
+        if ($status.Java.Installed) {
+            $installed.Ghidra = Install-Ghidra
+        } else {
+            Write-Warn "Skipping Ghidra - Java 21+ not installed"
+        }
+
+        if ($status.DotNet.Installed) {
+            $installed.DotNet = Install-DotNetTools
+        } else {
+            Write-Warn "Skipping ILSpyCmd - .NET SDK not installed"
+        }
+
+        $installed.ClaudeDesktop = Configure-ClaudeDesktop
+    }
+
+    "3" {
+        # Dynamic analysis only
+        Write-Host ""
+        Write-Info "Starting Dynamic Analysis Installation..."
+        Write-Host ""
+
+        $installed.BinaryMCP = Install-BinaryMCP
+        $installed.X64Dbg = Install-X64Dbg
+        $installed.ClaudeDesktop = Configure-ClaudeDesktop
+    }
+
+    "4" {
+        # Custom installation
+        Show-CustomMenu $status
+        $customSelection = Get-UserSelection "Enter components"
+
+        if ($customSelection.ToLower() -eq "b") {
+            Write-Info "Returning to main menu..."
+            # Re-run script
+            & $MyInvocation.MyCommand.Path
+            exit 0
+        }
+
+        $components = if ($customSelection.ToLower() -eq "a") {
+            @("1", "2", "3", "4", "5")
+        } else {
+            $customSelection -split "," | ForEach-Object { $_.Trim() }
+        }
+
+        Write-Host ""
+        Write-Info "Starting Custom Installation..."
+        Write-Host ""
+
+        # Always install base
+        $installed.BinaryMCP = Install-BinaryMCP
+
+        foreach ($comp in $components) {
+            switch ($comp) {
+                "1" {
+                    if ($status.Java.Installed) {
+                        $installed.Ghidra = Install-Ghidra
+                    } else {
+                        Write-Warn "Cannot install Ghidra - Java 21+ required"
+                    }
+                }
+                "2" {
+                    if ($status.DotNet.Installed) {
+                        $installed.DotNet = Install-DotNetTools
+                    } else {
+                        Write-Warn "Cannot install ILSpyCmd - .NET SDK 6.0+ required"
+                    }
+                }
+                "3" { $installed.X64Dbg = Install-X64Dbg }
+                "4" { $installed.ClaudeDesktop = Configure-ClaudeDesktop }
+                "5" { $installed.ClaudeCode = Configure-ClaudeCode }
+            }
+        }
+    }
+
+    "5" {
+        # Repair/Update
+        Write-Host ""
+        Write-Info "Repair/Update Mode"
+        Write-Host ""
+        Show-CustomMenu $status
+        Write-Info "Select components to reinstall/update"
+        $repairSelection = Get-UserSelection "Enter components"
+
+        if ($repairSelection.ToLower() -eq "b") {
+            & $MyInvocation.MyCommand.Path
+            exit 0
+        }
+
+        $components = $repairSelection -split "," | ForEach-Object { $_.Trim() }
+
+        foreach ($comp in $components) {
+            switch ($comp) {
+                "1" { $installed.Ghidra = Install-Ghidra }
+                "2" { $installed.DotNet = Install-DotNetTools }
+                "3" { $installed.X64Dbg = Install-X64Dbg }
+                "4" { $installed.ClaudeDesktop = Configure-ClaudeDesktop }
+                "5" { $installed.ClaudeCode = Configure-ClaudeCode }
+            }
+        }
+    }
+
+    { $_ -in "q", "quit", "exit" } {
+        Write-Info "Installation cancelled"
+        exit 0
+    }
+
+    default {
+        Write-Err "Invalid selection: $selection"
+        exit 1
+    }
+}
+
+# Show summary
+Show-Summary $installed
+
 Write-Host ""
-Write-Host "============================================================" -ForegroundColor Green
-Write-Host "             Installation Complete!                        " -ForegroundColor Green
-Write-Host "============================================================" -ForegroundColor Green
-Write-Host ""
-
-Write-Success "Binary MCP Server installed to: $InstallDir"
-
-if (-not $SkipGhidra) {
-    Write-Success "Ghidra installed to: $GhidraDir"
-}
-
-if (-not $SkipX64Dbg) {
-    Write-Success "x64dbg installed to: $X64DbgDir"
-    Write-Success "x64dbg MCP plugins installed (x64dbg_mcp.dp64 and x64dbg_mcp.dp32)"
-}
-
-Write-Host ""
-Write-Info "Next steps:"
-Write-Host "  1. Restart Claude Desktop to load the MCP server" -ForegroundColor White
-Write-Host "  2. Test static analysis: Use Claude to analyze binaries with Ghidra" -ForegroundColor White
-Write-Host "  3. For dynamic analysis: Launch x64dbg and load a binary" -ForegroundColor White
-Write-Host "     - Use x64dbg.exe for 64-bit binaries" -ForegroundColor White
-Write-Host "     - Use x32dbg.exe for 32-bit binaries" -ForegroundColor White
-Write-Host "  4. Test the server: " -ForegroundColor White -NoNewline
-Write-Host "cd $InstallDir && uv run python -m src.server" -ForegroundColor Yellow
-Write-Host ""
-
-if (-not $NoClaudeConfig) {
-    Write-Info "Configuration added to Claude Desktop"
-    Write-Info "Restart Claude Desktop to activate the MCP server"
-}
-
-Write-Host ""
-Write-Success "Installation finished successfully!"
+Write-Success "Installation finished!"
 Write-Host ""

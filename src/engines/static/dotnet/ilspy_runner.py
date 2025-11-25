@@ -277,22 +277,71 @@ class ILSpyRunner:
         logger.info(f"Listing types in {assembly_path.name}")
 
         try:
-            # Use -l flag to list types
-            result = subprocess.run(
-                [ilspycmd, str(assembly_path), "-l"],
-                capture_output=True,
-                text=True,
-                timeout=120
-            )
+            # ILSpyCmd -l requires a type filter (c=class, i=interface, etc.)
+            # We call -l for each type category to get all types
+            type_filters = {
+                "c": "class",
+                "i": "interface",
+                "s": "struct",
+                "d": "delegate",
+                "e": "enum"
+            }
 
-            if result.returncode != 0:
-                raise RuntimeError(f"ILSpyCmd failed: {result.stderr}")
+            all_types = []
+            seen_types = set()
 
-            # Parse type listing
-            assembly_info = self._parse_type_listing(
-                result.stdout,
-                assembly_path.name
-            )
+            for filter_code, type_kind in type_filters.items():
+                result = subprocess.run(
+                    [ilspycmd, "-l", filter_code, str(assembly_path)],
+                    capture_output=True,
+                    text=True,
+                    timeout=120
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    # Parse each line as a fully qualified type name
+                    for line in result.stdout.strip().split("\n"):
+                        line = line.strip()
+                        if not line or line in seen_types:
+                            continue
+                        seen_types.add(line)
+
+                        # Parse namespace and type name
+                        if "." in line:
+                            parts = line.rsplit(".", 1)
+                            namespace = parts[0]
+                            name = parts[1]
+                        else:
+                            namespace = ""
+                            name = line
+
+                        all_types.append(DotNetTypeInfo(
+                            name=name,
+                            namespace=namespace,
+                            full_name=line,
+                            kind=type_kind  # Use the known type kind
+                        ))
+
+            if not all_types:
+                # Fallback: try decompiling to stdout for basic info
+                result = subprocess.run(
+                    [ilspycmd, str(assembly_path)],
+                    capture_output=True,
+                    text=True,
+                    timeout=120
+                )
+                if result.returncode != 0:
+                    raise RuntimeError(f"ILSpyCmd failed: {result.stderr}")
+                # Parse the decompiled output to extract types
+                assembly_info = self._parse_decompiled_output(
+                    result.stdout,
+                    assembly_path.name
+                )
+            else:
+                assembly_info = DotNetAssemblyInfo(
+                    name=assembly_path.name,
+                    types=all_types,
+                    type_count=len(all_types)
+                )
 
             # Cache results
             self._save_cache(
@@ -309,15 +358,66 @@ class ILSpyRunner:
             logger.error(f"Failed to list types: {e}")
             raise RuntimeError(f"Failed to list types: {e}")
 
+    def _parse_decompiled_output(self, output: str, assembly_name: str) -> DotNetAssemblyInfo:
+        """Parse decompiled C# output to extract type information (fallback)."""
+        types = []
+        seen_types = set()
+
+        # Look for type declarations in decompiled C# code
+        # Patterns: class X, interface X, struct X, enum X, delegate X
+        type_patterns = [
+            (r'\b(?:public|internal|private|protected)?\s*(?:static|sealed|abstract)?\s*class\s+(\w+)', "class"),
+            (r'\b(?:public|internal|private|protected)?\s*interface\s+(\w+)', "interface"),
+            (r'\b(?:public|internal|private|protected)?\s*struct\s+(\w+)', "struct"),
+            (r'\b(?:public|internal|private|protected)?\s*enum\s+(\w+)', "enum"),
+            (r'\b(?:public|internal|private|protected)?\s*delegate\s+\w+\s+(\w+)', "delegate"),
+        ]
+
+        current_namespace = ""
+        for line in output.split("\n"):
+            # Track namespace
+            ns_match = re.match(r'namespace\s+([\w.]+)', line)
+            if ns_match:
+                current_namespace = ns_match.group(1)
+                continue
+
+            # Look for type declarations
+            for pattern, kind in type_patterns:
+                match = re.search(pattern, line)
+                if match:
+                    name = match.group(1)
+                    full_name = f"{current_namespace}.{name}" if current_namespace else name
+
+                    if full_name not in seen_types:
+                        seen_types.add(full_name)
+                        types.append(DotNetTypeInfo(
+                            name=name,
+                            namespace=current_namespace,
+                            full_name=full_name,
+                            kind=kind
+                        ))
+
+        return DotNetAssemblyInfo(
+            name=assembly_name,
+            types=types,
+            type_count=len(types)
+        )
+
     def _parse_type_listing(self, output: str, assembly_name: str) -> DotNetAssemblyInfo:
         """Parse ILSpyCmd -l output to extract type information."""
         types = []
+        seen_types = set()  # Avoid duplicates
 
         # ILSpyCmd -l outputs fully qualified type names, one per line
         for line in output.strip().split("\n"):
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
+
+            # Skip duplicates (can happen with multiple -l calls)
+            if line in seen_types:
+                continue
+            seen_types.add(line)
 
             # Parse namespace and type name
             if "." in line:
@@ -329,10 +429,12 @@ class ILSpyRunner:
                 name = line
 
             # Determine type kind from naming conventions
+            # Note: When using -l with type filters, we know the kind
+            # but when parsing mixed output, use heuristics
             kind = "class"
             if name.startswith("I") and len(name) > 1 and name[1].isupper():
                 kind = "interface"
-            elif name.endswith("Enum") or "<" not in name and name.isupper():
+            elif name.endswith("Enum") or ("<" not in name and name.isupper()):
                 kind = "enum"
             elif name.endswith("Delegate") or name.endswith("EventHandler"):
                 kind = "delegate"
@@ -511,7 +613,8 @@ class ILSpyRunner:
         logger.info(f"Getting IL for {assembly_path.name}")
 
         try:
-            cmd = [ilspycmd, str(assembly_path), "--il"]
+            # Use -il flag for IL disassembly (single dash, not double)
+            cmd = [ilspycmd, "-il", str(assembly_path)]
             if type_name:
                 cmd.extend(["-t", type_name])
 

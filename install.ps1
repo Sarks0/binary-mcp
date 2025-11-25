@@ -26,6 +26,66 @@ function Test-Command {
     return $null -ne (Get-Command $CommandName -ErrorAction SilentlyContinue)
 }
 
+function Test-WingetAvailable {
+    return (Test-Command winget)
+}
+
+function Install-WithWinget {
+    param(
+        [string]$PackageId,
+        [string]$PackageName
+    )
+
+    if (-not (Test-WingetAvailable)) {
+        Write-Err "winget is not available. Please install manually."
+        return $false
+    }
+
+    Write-Info "Installing $PackageName via winget..."
+    try {
+        $result = winget install --id $PackageId --accept-source-agreements --accept-package-agreements 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            Write-Success "$PackageName installed successfully"
+            # Refresh PATH
+            $machinePath = [System.Environment]::GetEnvironmentVariable("Path", "Machine")
+            $userPath = [System.Environment]::GetEnvironmentVariable("Path", "User")
+            $env:Path = "$machinePath;$userPath"
+            return $true
+        } else {
+            Write-Warn "winget returned: $result"
+            return $false
+        }
+    } catch {
+        Write-Err "Failed to install $PackageName : $_"
+        return $false
+    }
+}
+
+function Install-Python {
+    Write-Info "Installing Python 3.12..."
+    return Install-WithWinget -PackageId "Python.Python.3.12" -PackageName "Python 3.12"
+}
+
+function Install-Java {
+    Write-Info "Installing Eclipse Temurin JDK 21 (Java)..."
+    return Install-WithWinget -PackageId "EclipseAdoptium.Temurin.21.JDK" -PackageName "Eclipse Temurin JDK 21"
+}
+
+function Install-DotNetSDK {
+    Write-Info "Installing .NET SDK 8.0..."
+    return Install-WithWinget -PackageId "Microsoft.DotNet.SDK.8" -PackageName ".NET SDK 8.0"
+}
+
+function Install-DotNetRuntime {
+    Write-Info "Installing .NET Runtime 8.0 (required for ILSpyCmd)..."
+    return Install-WithWinget -PackageId "Microsoft.DotNet.Runtime.8" -PackageName ".NET Runtime 8.0"
+}
+
+function Install-Git {
+    Write-Info "Installing Git..."
+    return Install-WithWinget -PackageId "Git.Git" -PackageName "Git"
+}
+
 function Get-LatestGitHubRelease {
     param($Repo)
     try {
@@ -56,14 +116,34 @@ function Show-Banner {
 
 function Get-ComponentStatus {
     $status = @{
+        Winget = @{ Installed = $false; Version = ""; Path = "" }
         Python = @{ Installed = $false; Version = ""; Path = "" }
         Java = @{ Installed = $false; Version = ""; Path = "" }
         DotNet = @{ Installed = $false; Version = ""; Path = "" }
+        DotNet8Runtime = @{ Installed = $false; Version = ""; Path = "" }
+        Git = @{ Installed = $false; Version = ""; Path = "" }
         UV = @{ Installed = $false; Version = ""; Path = "" }
         Ghidra = @{ Installed = $false; Version = ""; Path = $GhidraDir }
         ILSpyCmd = @{ Installed = $false; Version = ""; Path = "" }
         X64Dbg = @{ Installed = $false; Version = ""; Path = $X64DbgDir }
         BinaryMCP = @{ Installed = $false; Version = ""; Path = $InstallDir }
+    }
+
+    # Check winget
+    if (Test-Command winget) {
+        $status.Winget.Installed = $true
+        try {
+            $status.Winget.Version = (winget --version 2>&1).Trim()
+        } catch {}
+    }
+
+    # Check Git
+    if (Test-Command git) {
+        $status.Git.Installed = $true
+        try {
+            $status.Git.Version = (git --version 2>&1).Trim()
+            $status.Git.Path = (Get-Command git).Source
+        } catch {}
     }
 
     # Check Python
@@ -92,6 +172,18 @@ function Get-ComponentStatus {
         try {
             $status.DotNet.Version = (dotnet --version 2>&1).Trim()
             $status.DotNet.Path = (Get-Command dotnet).Source
+        } catch {}
+
+        # Check for .NET 8 runtime specifically (required for ILSpyCmd)
+        try {
+            $runtimes = dotnet --list-runtimes 2>&1
+            if ($runtimes -match "Microsoft\.NETCore\.App 8\.") {
+                $status.DotNet8Runtime.Installed = $true
+                $runtime8 = ($runtimes | Select-String "Microsoft\.NETCore\.App 8\." | Select-Object -First 1).ToString()
+                if ($runtime8 -match "(\d+\.\d+\.\d+)") {
+                    $status.DotNet8Runtime.Version = $Matches[1]
+                }
+            }
         } catch {}
     }
 
@@ -142,6 +234,16 @@ function Show-SystemStatus {
     Write-Host "  -------------" -ForegroundColor Yellow
     Write-Host ""
 
+    # Package Manager
+    Write-Host "  Package Manager:" -ForegroundColor White
+    if ($Status.Winget.Installed) {
+        Write-Host "    [" -NoNewline; Write-Host "OK" -ForegroundColor Green -NoNewline; Write-Host "] winget $($Status.Winget.Version) (can auto-install prerequisites)"
+    } else {
+        Write-Host "    [" -NoNewline; Write-Host "--" -ForegroundColor Yellow -NoNewline; Write-Host "] winget (not available - manual install required)"
+    }
+
+    Write-Host ""
+
     # Core Requirements
     Write-Host "  Core Requirements:" -ForegroundColor White
 
@@ -171,6 +273,12 @@ function Show-SystemStatus {
         Write-Host "    [" -NoNewline; Write-Host "--" -ForegroundColor DarkGray -NoNewline; Write-Host "] uv (will be installed)"
     }
 
+    if ($Status.Git.Installed) {
+        Write-Host "    [" -NoNewline; Write-Host "OK" -ForegroundColor Green -NoNewline; Write-Host "] Git"
+    } else {
+        Write-Host "    [" -NoNewline; Write-Host "--" -ForegroundColor DarkGray -NoNewline; Write-Host "] Git (optional, for updates)"
+    }
+
     Write-Host ""
     Write-Host "  Analysis Components:" -ForegroundColor White
 
@@ -197,7 +305,13 @@ function Show-SystemStatus {
     if ($Status.DotNet.Installed) {
         Write-Host "    [" -NoNewline; Write-Host "OK" -ForegroundColor Green -NoNewline; Write-Host "] .NET SDK $($Status.DotNet.Version)"
     } else {
-        Write-Host "    [" -NoNewline; Write-Host "--" -ForegroundColor DarkGray -NoNewline; Write-Host "] .NET SDK 6.0+ (required for ILSpyCmd)"
+        Write-Host "    [" -NoNewline; Write-Host "--" -ForegroundColor DarkGray -NoNewline; Write-Host "] .NET SDK (required for ILSpyCmd)"
+    }
+
+    if ($Status.DotNet8Runtime.Installed) {
+        Write-Host "    [" -NoNewline; Write-Host "OK" -ForegroundColor Green -NoNewline; Write-Host "] .NET 8 Runtime $($Status.DotNet8Runtime.Version)"
+    } elseif ($Status.DotNet.Installed) {
+        Write-Host "    [" -NoNewline; Write-Host "!!" -ForegroundColor Yellow -NoNewline; Write-Host "] .NET 8 Runtime (required for ILSpyCmd)"
     }
 
     # x64dbg
@@ -302,8 +416,16 @@ function Install-Ghidra {
     # Check Java first
     if (-not (Test-Command java)) {
         Write-Err "Java 21+ is required for Ghidra"
-        Write-Info "Download from: https://adoptium.net/"
-        return $false
+        if (Test-WingetAvailable) {
+            Write-Info "Attempting to install Java 21 via winget..."
+            if (-not (Install-Java)) {
+                Write-Info "Download manually from: https://adoptium.net/"
+                return $false
+            }
+        } else {
+            Write-Info "Download from: https://adoptium.net/"
+            return $false
+        }
     }
 
     if (Test-Path $GhidraDir) {
@@ -363,9 +485,33 @@ function Install-DotNetTools {
 
     # Check .NET SDK
     if (-not (Test-Command dotnet)) {
-        Write-Err ".NET SDK 6.0+ is required for ILSpyCmd"
-        Write-Info "Download from: https://dotnet.microsoft.com/download"
-        return $false
+        Write-Err ".NET SDK is required for ILSpyCmd"
+        if (Test-WingetAvailable) {
+            Write-Info "Attempting to install .NET SDK 8.0 via winget..."
+            if (-not (Install-DotNetSDK)) {
+                Write-Info "Download manually from: https://dotnet.microsoft.com/download"
+                return $false
+            }
+        } else {
+            Write-Info "Download from: https://dotnet.microsoft.com/download"
+            return $false
+        }
+    }
+
+    # Check for .NET 8 runtime (required by ILSpyCmd)
+    $runtimes = dotnet --list-runtimes 2>&1
+    if ($runtimes -notmatch "Microsoft\.NETCore\.App 8\.") {
+        Write-Warn ".NET 8 Runtime is required for ILSpyCmd but not found"
+        if (Test-WingetAvailable) {
+            Write-Info "Attempting to install .NET 8 Runtime via winget..."
+            if (-not (Install-DotNetRuntime)) {
+                Write-Info "Download manually from: https://dotnet.microsoft.com/download/dotnet/8.0"
+                return $false
+            }
+        } else {
+            Write-Info "Download .NET 8 Runtime from: https://dotnet.microsoft.com/download/dotnet/8.0"
+            return $false
+        }
     }
 
     try {
@@ -651,17 +797,100 @@ function Show-Summary {
 
 Show-Banner
 
+# Get initial system status
+$status = Get-ComponentStatus
+
 # Check Python first (required)
-if (-not (Test-Command python)) {
+if (-not $status.Python.Installed) {
     Write-Err "Python is required but not found!"
-    Write-Info "Please install Python 3.12+ from: https://www.python.org/downloads/"
-    Write-Info "Make sure to check 'Add Python to PATH' during installation"
-    exit 1
+    if ($status.Winget.Installed) {
+        if ($Unattended) {
+            Write-Info "Installing Python via winget (unattended mode)..."
+            if (Install-Python) {
+                $status = Get-ComponentStatus
+            } else {
+                exit 1
+            }
+        } else {
+            $installPy = Read-Host "  Install Python 3.12 via winget? (y/n)"
+            if ($installPy -eq "y") {
+                if (Install-Python) {
+                    $status = Get-ComponentStatus
+                } else {
+                    exit 1
+                }
+            } else {
+                Write-Info "Please install Python 3.12+ from: https://www.python.org/downloads/"
+                Write-Info "Make sure to check 'Add Python to PATH' during installation"
+                exit 1
+            }
+        }
+    } else {
+        Write-Info "Please install Python 3.12+ from: https://www.python.org/downloads/"
+        Write-Info "Make sure to check 'Add Python to PATH' during installation"
+        exit 1
+    }
 }
 
-# Get current system status
-$status = Get-ComponentStatus
 Show-SystemStatus $status
+
+# Offer to install missing prerequisites if winget is available
+if ($status.Winget.Installed) {
+    $missingPrereqs = @()
+
+    if (-not $status.Java.Installed) {
+        $missingPrereqs += @{ Name = "Java 21 (Temurin)"; Key = "java"; Installer = { Install-Java } }
+    }
+    if (-not $status.DotNet.Installed) {
+        $missingPrereqs += @{ Name = ".NET SDK 8.0"; Key = "dotnetsdk"; Installer = { Install-DotNetSDK } }
+    } elseif (-not $status.DotNet8Runtime.Installed) {
+        $missingPrereqs += @{ Name = ".NET 8 Runtime"; Key = "dotnetruntime"; Installer = { Install-DotNetRuntime } }
+    }
+    if (-not $status.Git.Installed) {
+        $missingPrereqs += @{ Name = "Git"; Key = "git"; Installer = { Install-Git } }
+    }
+
+    if ($missingPrereqs.Count -gt 0) {
+        Write-Host ""
+        Write-Host "  MISSING PREREQUISITES" -ForegroundColor Yellow
+        Write-Host "  ---------------------" -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "  The following can be installed automatically via winget:" -ForegroundColor White
+        foreach ($prereq in $missingPrereqs) {
+            Write-Host "    - $($prereq.Name)" -ForegroundColor DarkGray
+        }
+        Write-Host ""
+
+        if ($Unattended) {
+            Write-Info "Installing all prerequisites (unattended mode)..."
+            foreach ($prereq in $missingPrereqs) {
+                & $prereq.Installer | Out-Null
+            }
+            $status = Get-ComponentStatus
+        } else {
+            $installPrereqs = Read-Host "  Install missing prerequisites? (y/n/select)"
+            if ($installPrereqs -eq "y") {
+                foreach ($prereq in $missingPrereqs) {
+                    & $prereq.Installer | Out-Null
+                }
+                $status = Get-ComponentStatus
+                Write-Host ""
+                Show-SystemStatus $status
+            } elseif ($installPrereqs -eq "select") {
+                Write-Host ""
+                foreach ($prereq in $missingPrereqs) {
+                    $install = Read-Host "    Install $($prereq.Name)? (y/n)"
+                    if ($install -eq "y") {
+                        & $prereq.Installer | Out-Null
+                    }
+                }
+                $status = Get-ComponentStatus
+                Write-Host ""
+                Show-SystemStatus $status
+            }
+        }
+    }
+}
 
 # Install uv if needed
 if (-not $status.UV.Installed) {

@@ -6,12 +6,15 @@ Communicates with the x64dbg native plugin via HTTP API.
 
 import logging
 import tempfile
+import time
+import traceback
 from pathlib import Path
 from typing import Any
 
 import requests
 
 from ..base import Debugger, DebuggerState
+from .error_logger import ErrorContext, X64DbgErrorLogger
 
 logger = logging.getLogger(__name__)
 
@@ -32,8 +35,10 @@ class X64DbgBridge(Debugger):
         self.timeout = timeout
         self.connected = False
         self._auth_token = None
+        self._error_logger = X64DbgErrorLogger()
 
         logger.info(f"Initialized x64dbg bridge: {self.base_url}")
+        logger.info(f"Error logging enabled: {self._error_logger.error_dir}")
 
     def _read_auth_token(self) -> str | None:
         """
@@ -70,7 +75,7 @@ class X64DbgBridge(Debugger):
 
     def _request(self, endpoint: str, data: dict[str, Any] | None = None) -> dict[str, Any]:
         """
-        Make HTTP request to plugin API.
+        Make HTTP request to plugin API with comprehensive error logging.
 
         Args:
             endpoint: API endpoint path
@@ -84,12 +89,27 @@ class X64DbgBridge(Debugger):
             RuntimeError: If API returns error or authentication fails
         """
         url = f"{self.base_url}{endpoint}"
+        start_time = time.time()
+        operation = endpoint.split("/")[-1]  # Extract operation name from endpoint
 
         # Read authentication token if not already cached
         if self._auth_token is None:
             try:
                 self._auth_token = self._read_auth_token()
             except RuntimeError as e:
+                # Log authentication error
+                context = ErrorContext(
+                    operation="authentication",
+                    additional={"endpoint": endpoint}
+                )
+                self._error_logger.log_error(
+                    operation="authentication",
+                    error=e,
+                    context=context,
+                    endpoint=endpoint,
+                    traceback_str=traceback.format_exc()
+                )
+
                 logger.error(f"Authentication failed: {e}")
                 raise ConnectionError(
                     f"Cannot authenticate with x64dbg plugin: {e}\n"
@@ -103,25 +123,91 @@ class X64DbgBridge(Debugger):
         }
 
         try:
+            # Make request
             if data is None:
                 response = requests.get(url, headers=headers, timeout=self.timeout)
             else:
                 response = requests.post(url, json=data, headers=headers, timeout=self.timeout)
 
+            duration_ms = int((time.time() - start_time) * 1000)
+
             response.raise_for_status()
             result = response.json()
 
+            # Check API-level error
             if not result.get("success", False):
-                error = result.get("error", "Unknown error")
-                raise RuntimeError(f"API error: {error}")
+                error_msg = result.get("error", "Unknown error")
+                error = RuntimeError(f"API error: {error_msg}")
+
+                # Build context from request data
+                context = ErrorContext(
+                    operation=operation,
+                    address=data.get("address") if data else None,
+                    register=data.get("register") if data else None,
+                    module=data.get("module") if data else None,
+                    request_data=data or {},
+                    additional={"url": url}
+                )
+
+                # Log API error
+                self._error_logger.log_error(
+                    operation=operation,
+                    error=error,
+                    context=context,
+                    http_status=response.status_code,
+                    api_response=result,
+                    endpoint=endpoint,
+                    duration_ms=duration_ms,
+                    traceback_str=traceback.format_exc()
+                )
+
+                raise error
 
             return result
 
         except requests.RequestException as e:
+            duration_ms = int((time.time() - start_time) * 1000)
+
+            # Extract HTTP status if available
+            http_status = None
+            api_response = None
+            if hasattr(e, 'response') and e.response is not None:
+                http_status = e.response.status_code
+                try:
+                    api_response = e.response.json()
+                except Exception:
+                    api_response = {"text": e.response.text[:500]}
+
+            # Build context
+            context = ErrorContext(
+                operation=operation,
+                address=data.get("address") if data else None,
+                register=data.get("register") if data else None,
+                module=data.get("module") if data else None,
+                request_data=data or {},
+                additional={
+                    "url": url,
+                    "timeout": self.timeout,
+                    "base_url": self.base_url
+                }
+            )
+
+            # Log HTTP error
+            self._error_logger.log_error(
+                operation=operation,
+                error=e,
+                context=context,
+                http_status=http_status,
+                api_response=api_response,
+                endpoint=endpoint,
+                duration_ms=duration_ms,
+                traceback_str=traceback.format_exc()
+            )
+
             logger.error(f"HTTP request failed: {e}")
 
             # Check if it's an authentication error
-            if hasattr(e, 'response') and e.response is not None and e.response.status_code == 401:
+            if http_status == 401:
                 raise ConnectionError(
                     "Authentication failed: Invalid or expired token.\n"
                     "Try restarting x64dbg to generate a new token."

@@ -14,7 +14,7 @@ from typing import Any
 import requests
 
 from ..base import Debugger, DebuggerState
-from .error_logger import X64DbgErrorLogger, ErrorContext
+from .error_logger import ErrorContext, X64DbgErrorLogger
 
 logger = logging.getLogger(__name__)
 

@@ -362,6 +362,18 @@ std::string HandleHTTPRequest(const std::string& request) {
     } else if (path == "/api/hide_debugger") {
         requestType = 90;  // HIDE_DEBUGGER
 
+    // Wait/Synchronization (Phase 1)
+    } else if (path == "/api/wait/paused") {
+        requestType = 91;  // WAIT_PAUSED
+    } else if (path == "/api/wait/running") {
+        requestType = 92;  // WAIT_RUNNING
+    } else if (path == "/api/wait/debugging") {
+        requestType = 93;  // WAIT_DEBUGGING
+
+    // Symbol resolution
+    } else if (path == "/api/resolve") {
+        requestType = 95;  // RESOLVE_SYMBOL
+
     // Events
     } else if (path == "/api/events") {
         requestType = 100;  // GET_EVENTS
@@ -393,6 +405,60 @@ std::string HandleHTTPRequest(const std::string& request) {
         requestType = 123;  // TOGGLE_MEMORY_BREAKPOINT
     } else if (path == "/api/breakpoint/list/all") {
         requestType = 124;  // LIST_ALL_BREAKPOINTS
+
+    // Phase 4: Tracing
+    } else if (path == "/api/trace/start") {
+        requestType = 130;  // START_TRACE
+    } else if (path == "/api/trace/stop") {
+        requestType = 131;  // STOP_TRACE
+    } else if (path == "/api/trace/data") {
+        requestType = 132;  // GET_TRACE_DATA
+    } else if (path == "/api/trace/clear") {
+        requestType = 133;  // CLEAR_TRACE
+    } else if (path == "/api/api_breakpoint") {
+        requestType = 134;  // SET_API_BREAKPOINT
+    } else if (path == "/api/api_log") {
+        requestType = 135;  // GET_API_LOG
+    } else if (path == "/api/api_log/clear") {
+        requestType = 136;  // CLEAR_API_LOG
+
+    // Phase 4: String & Pattern Search
+    } else if (path == "/api/strings") {
+        requestType = 140;  // FIND_STRINGS
+    } else if (path == "/api/pattern") {
+        requestType = 141;  // PATTERN_SCAN
+    } else if (path == "/api/xor") {
+        requestType = 142;  // XOR_DECRYPT
+
+    // Phase 4: References & Analysis
+    } else if (path == "/api/references") {
+        requestType = 145;  // FIND_REFERENCES
+    } else if (path == "/api/callstack/detailed") {
+        requestType = 146;  // GET_CALL_STACK_DETAILED
+
+    // Phase 5: Anti-Debug Bypass
+    } else if (path == "/api/antidebug/peb") {
+        requestType = 150;  // HIDE_DEBUG_PEB
+    } else if (path == "/api/antidebug/full") {
+        requestType = 151;  // HIDE_DEBUG_FULL
+    } else if (path == "/api/antidebug/status") {
+        requestType = 152;  // GET_ANTI_DEBUG_STATUS
+    } else if (path == "/api/antidebug/patch") {
+        requestType = 153;  // PATCH_DBG_CHECK
+
+    // Phase 6: Code Coverage
+    } else if (path == "/api/coverage/start") {
+        requestType = 160;  // START_COVERAGE
+    } else if (path == "/api/coverage/stop") {
+        requestType = 161;  // STOP_COVERAGE
+    } else if (path == "/api/coverage/data") {
+        requestType = 162;  // GET_COVERAGE_DATA
+    } else if (path == "/api/coverage/clear") {
+        requestType = 163;  // CLEAR_COVERAGE
+    } else if (path == "/api/coverage/stats") {
+        requestType = 164;  // GET_COVERAGE_STATS
+    } else if (path == "/api/coverage/export") {
+        requestType = 165;  // EXPORT_COVERAGE
     }
 
     // If we have a valid endpoint, build request and forward to plugin

@@ -708,6 +708,46 @@ class X64DbgBridge(Debugger):
             "valid": result.get("valid", False)
         }
 
+    def resolve_symbol(self, expression: str) -> dict[str, Any]:
+        """
+        Resolve a symbol or expression to an address.
+
+        This provides detailed feedback when symbol resolution fails,
+        explaining the reason (not debugging, not paused, symbol not found).
+
+        Args:
+            expression: Symbol or expression to resolve. Can be:
+                - Module!function format: "kernel32!CreateFileW"
+                - Simple function name: "CreateFileW" (may need module prefix)
+                - Address expression: "rax+0x10"
+                - Hex address: "0x401000"
+
+        Returns:
+            Dictionary with:
+                - success: True if resolved
+                - address: Resolved address (hex string)
+                - expression: Original expression
+                - module: Module containing the address (if applicable)
+                - symbol: Symbol name at address (if applicable)
+                - error: Error message (if resolution failed)
+
+        Example:
+            result = bridge.resolve_symbol("kernel32!CreateFileW")
+            if result["success"]:
+                print(f"CreateFileW is at 0x{result['address']}")
+            else:
+                print(f"Failed: {result.get('error')}")
+
+        Note:
+            Symbol resolution only works when:
+            - A binary is loaded (debugging active)
+            - Debugger is paused (not running)
+            - Module containing symbol is loaded
+        """
+        data = {"expression": expression}
+        result = self._request("/api/resolve", data)
+        return result
+
     def set_comment(self, address: str, comment: str) -> bool:
         """
         Set comment at address.
@@ -933,23 +973,6 @@ class X64DbgBridge(Debugger):
         data = {"address": address}
         self._request("/api/breakpoint/memory/delete", data)
         logger.info(f"Deleted memory breakpoint at {address}")
-        return True
-
-    def hide_debugger_peb(self) -> bool:
-        """
-        Hide debugger presence in Process Environment Block.
-
-        Bypasses IsDebuggerPresent and PEB checks.
-
-        Returns:
-            True if successful
-
-        Note:
-            Requires C++ plugin implementation of /api/hide_debugger
-            Essential for anti-debug malware analysis
-        """
-        self._request("/api/hide_debugger")
-        logger.info("Debugger hidden in PEB")
         return True
 
     # =========================================================================
@@ -1496,4 +1519,601 @@ class X64DbgBridge(Debugger):
                 print(f"HW BP at {bp['address']}, type={bp['type']}")
         """
         result = self._request("/api/breakpoint/list/all")
+        return result
+
+    # =========================================================================
+    # Phase 4: Tracing & Analysis Functions
+    # =========================================================================
+
+    def start_trace(
+        self,
+        trace_into: bool = True,
+        max_entries: int = 100000,
+        log_file: str | None = None
+    ) -> dict[str, Any]:
+        """
+        Start instruction tracing.
+
+        Records each instruction executed with address, disassembly, and timing.
+        Useful for understanding program flow and finding interesting code paths.
+
+        Args:
+            trace_into: If True, trace into function calls. If False, trace over.
+            max_entries: Maximum trace entries to keep in memory (default: 100000)
+            log_file: Optional file path to write trace log (for large traces)
+
+        Returns:
+            Dictionary with trace configuration
+
+        Example:
+            bridge.start_trace(trace_into=True, max_entries=50000)
+            bridge.run()
+            # ... execution happens ...
+            bridge.pause()
+            trace = bridge.get_trace_data()
+        """
+        data = {
+            "trace_into": 1 if trace_into else 0,
+            "max_entries": max_entries
+        }
+        if log_file:
+            data["log_file"] = log_file
+
+        result = self._request("/api/trace/start", data)
+        logger.info(f"Trace started (trace_into={trace_into}, max={max_entries})")
+        return result
+
+    def stop_trace(self) -> dict[str, Any]:
+        """
+        Stop instruction tracing.
+
+        Returns:
+            Dictionary with trace statistics (entry count, duration)
+        """
+        result = self._request("/api/trace/stop")
+        logger.info("Trace stopped")
+        return result
+
+    def get_trace_data(self, offset: int = 0, limit: int = 1000) -> dict[str, Any]:
+        """
+        Get trace data.
+
+        Args:
+            offset: Starting index in trace buffer
+            limit: Maximum entries to return (max 10000)
+
+        Returns:
+            Dictionary with:
+                - total: Total entries in trace
+                - offset: Current offset
+                - enabled: Whether tracing is active
+                - entries: List of trace entries with address, timestamp,
+                          instruction, module, thread_id
+
+        Example:
+            trace = bridge.get_trace_data(offset=0, limit=100)
+            for entry in trace["entries"]:
+                print(f"{entry['address']}: {entry['instruction']}")
+        """
+        data = {"offset": offset, "limit": limit}
+        return self._request("/api/trace/data", data)
+
+    def clear_trace(self) -> dict[str, Any]:
+        """
+        Clear trace data from memory.
+
+        Returns:
+            Confirmation message
+        """
+        return self._request("/api/trace/clear")
+
+    def set_api_breakpoint(self, api_name: str) -> dict[str, Any]:
+        """
+        Set a breakpoint on a Windows API function.
+
+        Resolves the API name to an address and sets a logging breakpoint.
+        Use get_api_log() to retrieve logged calls.
+
+        Args:
+            api_name: API function name in module!function format
+                     Examples: "kernel32!CreateFileW", "ntdll!NtCreateFile"
+
+        Returns:
+            Dictionary with api_name and resolved address
+
+        Example:
+            bridge.set_api_breakpoint("kernel32!CreateFileW")
+            bridge.set_api_breakpoint("kernel32!WriteFile")
+            bridge.run_and_wait()
+            log = bridge.get_api_log()
+        """
+        data = {"api_name": api_name}
+        result = self._request("/api/api_breakpoint", data)
+        logger.info(f"API breakpoint set: {api_name}")
+        return result
+
+    def get_api_log(self, offset: int = 0, limit: int = 100) -> dict[str, Any]:
+        """
+        Get API call log.
+
+        Returns logged API calls from breakpoints set with set_api_breakpoint().
+
+        Args:
+            offset: Starting index
+            limit: Maximum entries to return (max 1000)
+
+        Returns:
+            Dictionary with:
+                - total: Total logged calls
+                - entries: List of API call entries with:
+                    - id: Call ID
+                    - address: API function address
+                    - return_address: Where call originated
+                    - timestamp: When call occurred
+                    - api_name: Function name
+                    - module: Module name
+                    - thread_id: Calling thread
+                    - args: Function arguments (hex values)
+
+        Example:
+            log = bridge.get_api_log()
+            for call in log["entries"]:
+                print(f"{call['api_name']} called from {call['return_address']}")
+        """
+        data = {"offset": offset, "limit": limit}
+        return self._request("/api/api_log", data)
+
+    def clear_api_log(self) -> dict[str, Any]:
+        """
+        Clear the API call log.
+
+        Returns:
+            Confirmation message
+        """
+        return self._request("/api/api_log/clear")
+
+    def find_strings(
+        self,
+        address: str | None = None,
+        size: int = 0x10000,
+        min_length: int = 4,
+        ascii: bool = True,
+        unicode: bool = True
+    ) -> dict[str, Any]:
+        """
+        Search for strings in memory.
+
+        Scans a memory region for ASCII and/or Unicode strings.
+
+        Args:
+            address: Start address (hex string). If None, uses main module base.
+            size: Number of bytes to scan (default: 64KB, max: 10MB)
+            min_length: Minimum string length (default: 4)
+            ascii: Search for ASCII strings (default: True)
+            unicode: Search for UTF-16LE strings (default: True)
+
+        Returns:
+            Dictionary with:
+                - count: Number of strings found
+                - strings: List of found strings with:
+                    - address: String location
+                    - value: String content
+                    - length: String length
+
+        Example:
+            strings = bridge.find_strings(size=0x100000, min_length=6)
+            for s in strings["strings"]:
+                if "http" in s["value"].lower():
+                    print(f"URL at {s['address']}: {s['value']}")
+        """
+        data = {
+            "size": size,
+            "min_length": min_length,
+            "ascii": 1 if ascii else 0,
+            "unicode": 1 if unicode else 0
+        }
+        if address:
+            if address.startswith("0x"):
+                address = address[2:]
+            data["address"] = address
+
+        result = self._request("/api/strings", data)
+        logger.info(f"Found {result.get('count', 0)} strings")
+        return result
+
+    def pattern_scan(
+        self,
+        pattern: str,
+        address: str | None = None,
+        size: int = 0x100000
+    ) -> dict[str, Any]:
+        """
+        Search for byte pattern with wildcards.
+
+        Scans memory for a byte pattern, supporting wildcards (??) for
+        unknown bytes.
+
+        Args:
+            pattern: Hex pattern with optional wildcards
+                    Examples: "90 90 90", "E8 ?? ?? ?? ??", "48 8B ?? 48"
+            address: Start address (hex string). If None, uses main module.
+            size: Number of bytes to scan (default: 1MB, max: 100MB)
+
+        Returns:
+            Dictionary with:
+                - count: Number of matches
+                - pattern: The pattern searched for
+                - matches: List of addresses where pattern was found
+
+        Example:
+            # Find all CALL instructions
+            result = bridge.pattern_scan("E8 ?? ?? ?? ??")
+            for addr in result["matches"]:
+                print(f"CALL found at {addr}")
+
+            # Find specific byte sequence
+            result = bridge.pattern_scan("48 89 5C 24")
+        """
+        data = {"pattern": pattern, "size": size}
+        if address:
+            if address.startswith("0x"):
+                address = address[2:]
+            data["address"] = address
+
+        result = self._request("/api/pattern", data)
+        logger.info(f"Pattern scan found {result.get('count', 0)} matches")
+        return result
+
+    def xor_decrypt(
+        self,
+        address: str,
+        size: int = 256,
+        key: str | None = None,
+        try_all: bool = False
+    ) -> dict[str, Any]:
+        """
+        Try XOR decryption on a memory region.
+
+        Useful for decoding simple XOR-obfuscated strings common in malware.
+
+        Args:
+            address: Address of encrypted data (hex string)
+            size: Number of bytes to decrypt (default: 256, max: 1MB)
+            key: XOR key as hex string (e.g., "41" or "DEADBEEF") or ASCII
+            try_all: If True, try all single-byte keys and return promising results
+
+        Returns:
+            If try_all=True:
+                Dictionary with results list showing keys that produce
+                mostly printable output (>50% printable characters)
+
+            If key provided:
+                Dictionary with:
+                    - key: The key used
+                    - decrypted_hex: Decrypted bytes as hex string
+                    - decrypted_ascii: Decrypted bytes as ASCII (with . for non-printable)
+
+        Example:
+            # Try all single-byte keys
+            result = bridge.xor_decrypt("0x401000", size=64, try_all=True)
+            for r in result["results"]:
+                print(f"Key {r['key']}: {r['preview']}")
+
+            # Decrypt with known key
+            result = bridge.xor_decrypt("0x401000", size=100, key="37")
+            print(result["decrypted_ascii"])
+        """
+        if address.startswith("0x"):
+            address = address[2:]
+
+        data = {"address": address, "size": size}
+        if key:
+            data["key"] = key
+        if try_all:
+            data["try_all"] = 1
+
+        return self._request("/api/xor", data)
+
+    def find_references(self, address: str) -> dict[str, Any]:
+        """
+        Find references to an address.
+
+        Searches for code or data references pointing to the target address.
+
+        Args:
+            address: Target address to find references to
+
+        Returns:
+            Dictionary with target and list of reference addresses
+
+        Note:
+            This provides limited results. For comprehensive reference
+            search, use the x64dbg GUI.
+        """
+        if address.startswith("0x"):
+            address = address[2:]
+
+        data = {"address": address}
+        return self._request("/api/references", data)
+
+    def get_callstack_detailed(self) -> dict[str, Any]:
+        """
+        Get detailed call stack with symbol information.
+
+        Provides more information than get_stack(), including resolved
+        symbols and module names for each frame.
+
+        Returns:
+            Dictionary with:
+                - depth: Number of stack frames
+                - frames: List of stack frames with:
+                    - address: Frame address
+                    - from: Call source address
+                    - to: Call destination
+                    - symbol: Resolved symbol name
+                    - module: Module name
+                    - comment: Any associated comment
+
+        Example:
+            stack = bridge.get_callstack_detailed()
+            for frame in stack["frames"]:
+                sym = frame["symbol"] or frame["address"]
+                print(f"{frame['module']}!{sym}")
+        """
+        return self._request("/api/callstack/detailed")
+
+    # =========================================================================
+    # Phase 5: Anti-Debug Bypass Functions
+    # =========================================================================
+
+    def hide_debugger_peb(self) -> dict[str, Any]:
+        """
+        Patch PEB to hide debugger presence.
+
+        Patches the following PEB fields:
+        - BeingDebugged (PEB+0x2): Set to 0
+        - NtGlobalFlag (PEB+0x68/0xBC): Clear debug heap flags
+
+        This bypasses:
+        - IsDebuggerPresent()
+        - CheckRemoteDebuggerPresent() (partially)
+        - NtGlobalFlag checks
+
+        Returns:
+            Dictionary with:
+                - peb_address: Address of PEB
+                - patch_count: Number of fields patched
+                - patches: List of patches applied
+
+        Example:
+            result = bridge.hide_debugger_peb()
+            print(f"Patched {result['patch_count']} fields")
+        """
+        result = self._request("/api/antidebug/peb")
+        logger.info("PEB anti-debug bypass applied")
+        return result
+
+    def hide_debugger_full(self) -> dict[str, Any]:
+        """
+        Apply full anti-debug bypass.
+
+        Patches:
+        - PEB.BeingDebugged
+        - PEB.NtGlobalFlag
+        - ProcessHeap.Flags
+        - ProcessHeap.ForceFlags
+        - Calls x64dbg's HideDebugger command
+
+        This bypasses most common anti-debug checks including:
+        - IsDebuggerPresent()
+        - NtGlobalFlag checks
+        - Heap flags checks
+        - And more via x64dbg's built-in hiding
+
+        Returns:
+            Dictionary with patch results and status
+
+        Example:
+            bridge.hide_debugger_full()
+            bridge.run()  # Malware won't detect debugger
+        """
+        result = self._request("/api/antidebug/full")
+        logger.info("Full anti-debug bypass applied")
+        return result
+
+    def get_antidebug_status(self) -> dict[str, Any]:
+        """
+        Get current anti-debug bypass status.
+
+        Returns:
+            Dictionary with:
+                - peb_patched: Whether PEB.BeingDebugged is patched
+                - ntglobalflag_patched: Whether NtGlobalFlag is patched
+                - heap_patched: Whether heap flags are patched
+                - timing_hooked: Whether timing functions are hooked
+        """
+        return self._request("/api/antidebug/status")
+
+    def patch_debug_check(
+        self,
+        address: str,
+        patch_type: str = "ret0"
+    ) -> dict[str, Any]:
+        """
+        Patch a specific anti-debug check at an address.
+
+        Use this to patch individual IsDebuggerPresent calls or similar
+        debug checks in malware.
+
+        Args:
+            address: Address of the CALL instruction to patch
+            patch_type: Type of patch to apply:
+                - "ret0": XOR EAX,EAX + NOPs (makes function return 0)
+                - "ret1": MOV EAX,1 (makes function return 1)
+                - "nop": Just NOP the entire call (5 bytes)
+
+        Returns:
+            Dictionary with:
+                - address: Patched address
+                - patch_type: Type of patch applied
+                - original: Original bytes (hex)
+
+        Example:
+            # Find and patch IsDebuggerPresent call
+            result = bridge.pattern_scan("E8 ?? ?? ?? ?? 85 C0 75")
+            for addr in result["matches"]:
+                bridge.patch_debug_check(addr, "ret0")
+        """
+        if address.startswith("0x"):
+            address = address[2:]
+
+        data = {"address": address, "type": patch_type}
+        result = self._request("/api/antidebug/patch", data)
+        logger.info(f"Patched debug check at 0x{address}")
+        return result
+
+    # =========================================================================
+    # Phase 6: Code Coverage Functions
+    # =========================================================================
+
+    def start_coverage(
+        self,
+        module: str | None = None,
+        clear: bool = True
+    ) -> dict[str, Any]:
+        """
+        Start code coverage tracking.
+
+        Records which addresses are executed during debugging.
+        Useful for understanding code coverage during malware execution.
+
+        Args:
+            module: Module name to filter coverage (None = all modules)
+            clear: Whether to clear existing coverage data (default: True)
+
+        Returns:
+            Dictionary with confirmation message
+
+        Example:
+            bridge.start_coverage(module="malware.exe")
+            bridge.run_and_wait()
+            stats = bridge.get_coverage_stats()
+            print(f"Covered {stats['unique_addresses']} addresses")
+        """
+        data = {"clear": 1 if clear else 0}
+        if module:
+            data["module"] = module
+
+        result = self._request("/api/coverage/start", data)
+        logger.info(f"Coverage started for: {module or 'all modules'}")
+        return result
+
+    def stop_coverage(self) -> dict[str, Any]:
+        """
+        Stop code coverage tracking.
+
+        Returns:
+            Dictionary with:
+                - unique_addresses: Number of unique addresses executed
+                - total_hits: Total execution count
+                - duration_ms: Time coverage was active
+        """
+        result = self._request("/api/coverage/stop")
+        logger.info("Coverage stopped")
+        return result
+
+    def get_coverage_data(
+        self,
+        offset: int = 0,
+        limit: int = 1000,
+        sort: str | None = None
+    ) -> dict[str, Any]:
+        """
+        Get collected coverage data.
+
+        Args:
+            offset: Starting index for pagination
+            limit: Maximum entries to return (max 10000)
+            sort: Sort order - "hits" (most hit first), "address" (by address)
+
+        Returns:
+            Dictionary with:
+                - total: Total entries
+                - enabled: Whether coverage is active
+                - entries: List of coverage entries with:
+                    - address: Executed address
+                    - hit_count: Number of times executed
+                    - module: Module name
+                    - symbol: Symbol name (if available)
+
+        Example:
+            data = bridge.get_coverage_data(sort="hits", limit=100)
+            for entry in data["entries"]:
+                print(f"{entry['address']}: {entry['hit_count']} hits")
+        """
+        data = {"offset": offset, "limit": limit}
+        if sort:
+            data["sort"] = sort
+
+        return self._request("/api/coverage/data", data)
+
+    def clear_coverage(self) -> dict[str, Any]:
+        """
+        Clear all coverage data.
+
+        Returns:
+            Confirmation message
+        """
+        return self._request("/api/coverage/clear")
+
+    def get_coverage_stats(self) -> dict[str, Any]:
+        """
+        Get coverage statistics.
+
+        Returns:
+            Dictionary with:
+                - enabled: Whether coverage is active
+                - total_hits: Total execution count
+                - unique_addresses: Number of unique addresses
+                - modules: List of modules with per-module stats:
+                    - name: Module name
+                    - addresses: Unique addresses in module
+                    - hits: Total hits in module
+
+        Example:
+            stats = bridge.get_coverage_stats()
+            print(f"Total: {stats['unique_addresses']} addresses, {stats['total_hits']} hits")
+            for mod in stats["modules"]:
+                print(f"  {mod['name']}: {mod['addresses']} addrs, {mod['hits']} hits")
+        """
+        return self._request("/api/coverage/stats")
+
+    def export_coverage(
+        self,
+        file_path: str,
+        format: str = "csv"
+    ) -> dict[str, Any]:
+        """
+        Export coverage data to a file.
+
+        Args:
+            file_path: Path to save the coverage file
+            format: Output format:
+                - "csv": CSV format (address,hit_count,module,symbol)
+                - "json": JSON format
+                - "drcov": DynamoRIO coverage format (for Lighthouse/bncov)
+
+        Returns:
+            Dictionary with export status and entry count
+
+        Example:
+            # Export for use with Binary Ninja's bncov
+            bridge.export_coverage("coverage.drcov", format="drcov")
+
+            # Simple CSV export
+            bridge.export_coverage("coverage.csv", format="csv")
+        """
+        data = {"file": file_path, "format": format}
+        result = self._request("/api/coverage/export", data)
+        logger.info(f"Exported coverage to {file_path}")
         return result

@@ -82,6 +82,7 @@ docs/
 
 # Other
 .claude/
+logs/
 
 # Security reviews (internal only)
 security/

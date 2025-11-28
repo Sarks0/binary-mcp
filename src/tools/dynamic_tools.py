@@ -112,13 +112,177 @@ def register_dynamic_tools(app: FastMCP) -> None:
             Execution status
 
         Note: Execution will run until breakpoint hit or program terminates.
+        Use x64dbg_run_and_wait() to run and wait for a breakpoint hit.
         """
         try:
             bridge = get_x64dbg_bridge()
             bridge.run()
-            return "Debugger running...\nUse x64dbg_pause to pause execution."
+            return "Debugger running...\nUse x64dbg_pause to pause or x64dbg_wait_paused to wait for breakpoint."
         except Exception as e:
             logger.error(f"x64dbg_run failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    def x64dbg_wait_paused(timeout_seconds: int = 30) -> str:
+        """
+        Wait until debugger is paused (breakpoint hit, exception, etc.).
+
+        This is essential for automation - blocks until the debugger stops
+        instead of requiring manual polling.
+
+        Args:
+            timeout_seconds: Maximum wait time in seconds (default: 30)
+
+        Returns:
+            Wait result with state and elapsed time
+
+        Example:
+            x64dbg_set_breakpoint("0x401000")
+            x64dbg_run()
+            x64dbg_wait_paused(60)  # Wait up to 60 seconds for breakpoint
+
+        Use Cases:
+            - Wait for breakpoint to hit after run()
+            - Wait for exception to occur
+            - Synchronize automation scripts
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            result = bridge.wait_until_paused(timeout=timeout_seconds * 1000)
+
+            if result.get("success"):
+                return (
+                    f"Debugger paused\n"
+                    f"Address: {result.get('current_address', 'unknown')}\n"
+                    f"Elapsed: {result.get('elapsed_ms', 0)}ms"
+                )
+            else:
+                return (
+                    f"Timeout waiting for debugger to pause\n"
+                    f"Timeout: {timeout_seconds}s\n"
+                    f"Current state: {result.get('current_state', 'unknown')}\n"
+                    f"Error: {result.get('error', 'Unknown error')}"
+                )
+
+        except Exception as e:
+            logger.error(f"x64dbg_wait_paused failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    def x64dbg_wait_running(timeout_seconds: int = 10) -> str:
+        """
+        Wait until debugger is running.
+
+        Useful after calling run() to confirm execution has started.
+
+        Args:
+            timeout_seconds: Maximum wait time in seconds (default: 10)
+
+        Returns:
+            Wait result with state and elapsed time
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            result = bridge.wait_until_running(timeout=timeout_seconds * 1000)
+
+            if result.get("success"):
+                return (
+                    f"Debugger is running\n"
+                    f"Elapsed: {result.get('elapsed_ms', 0)}ms"
+                )
+            else:
+                return (
+                    f"Timeout waiting for debugger to run\n"
+                    f"Timeout: {timeout_seconds}s\n"
+                    f"Current state: {result.get('current_state', 'unknown')}"
+                )
+
+        except Exception as e:
+            logger.error(f"x64dbg_wait_running failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    def x64dbg_wait_debugging(timeout_seconds: int = 30) -> str:
+        """
+        Wait until debugging has started (binary is loaded).
+
+        Useful after loading a binary to confirm it's ready for debugging.
+
+        Args:
+            timeout_seconds: Maximum wait time in seconds (default: 30)
+
+        Returns:
+            Wait result with state and elapsed time
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            result = bridge.wait_until_debugging(timeout=timeout_seconds * 1000)
+
+            if result.get("success"):
+                state = "running" if result.get("is_running") else "paused"
+                return (
+                    f"Debugging active\n"
+                    f"State: {state}\n"
+                    f"Elapsed: {result.get('elapsed_ms', 0)}ms"
+                )
+            else:
+                return (
+                    f"Timeout waiting for debugging to start\n"
+                    f"Timeout: {timeout_seconds}s\n"
+                    f"Current state: {result.get('current_state', 'unknown')}"
+                )
+
+        except Exception as e:
+            logger.error(f"x64dbg_wait_debugging failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    def x64dbg_run_and_wait(timeout_seconds: int = 30) -> str:
+        """
+        Run execution and wait until it pauses (breakpoint, exception, etc.).
+
+        This is a convenience function combining run() and wait_paused().
+        Essential for automation scripts.
+
+        Args:
+            timeout_seconds: Maximum wait time in seconds (default: 30)
+
+        Returns:
+            Execution result with address where stopped
+
+        Example:
+            x64dbg_set_breakpoint("0x401000")
+            result = x64dbg_run_and_wait(60)
+            # Now at breakpoint, can inspect registers, memory, etc.
+
+        Use Cases:
+            - Run to breakpoint and inspect state
+            - Automate stepping through code
+            - Wait for specific program state
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            result = bridge.run_and_wait(timeout=timeout_seconds * 1000)
+
+            if result.get("success"):
+                return (
+                    f"Execution stopped\n"
+                    f"Address: {result.get('current_address', 'unknown')}\n"
+                    f"State: paused\n"
+                    f"Elapsed: {result.get('elapsed_ms', 0)}ms\n\n"
+                    f"Use x64dbg_get_registers() to see register values."
+                )
+            else:
+                return (
+                    f"Timeout waiting for execution to stop\n"
+                    f"Timeout: {timeout_seconds}s\n"
+                    f"Current state: {result.get('current_state', 'unknown')}\n"
+                    f"Error: {result.get('error', 'Unknown error')}\n\n"
+                    f"The program may still be running. Use x64dbg_pause() to stop it."
+                )
+
+        except Exception as e:
+            logger.error(f"x64dbg_run_and_wait failed: {e}")
             return f"Error: {e}"
 
     @app.tool()
@@ -1395,4 +1559,4 @@ def register_dynamic_tools(app: FastMCP) -> None:
                         "See FUTURE_FEATURES.md for implementation status.")
             return f"Error: {e}"
 
-    logger.info("Registered 36 dynamic analysis tools")
+    logger.info("Registered 41 dynamic analysis tools")

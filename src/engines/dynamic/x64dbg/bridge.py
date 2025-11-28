@@ -951,3 +951,100 @@ class X64DbgBridge(Debugger):
         self._request("/api/hide_debugger")
         logger.info("Debugger hidden in PEB")
         return True
+
+    # =========================================================================
+    # Wait/Synchronization Functions
+    # =========================================================================
+
+    def wait_until_paused(self, timeout: int = 30000) -> dict[str, Any]:
+        """
+        Wait until the debugger is paused (e.g., breakpoint hit, exception).
+
+        This is essential for automation - blocks until the debugger stops
+        instead of requiring polling loops.
+
+        Args:
+            timeout: Maximum wait time in milliseconds (default: 30 seconds)
+
+        Returns:
+            Dictionary with:
+                - success: True if paused, False if timeout
+                - state: Current state ("paused" or other)
+                - elapsed_ms: Time waited in milliseconds
+                - current_address: Address where paused (if successful)
+                - error: Error message (if timeout)
+
+        Example:
+            bridge.run()
+            result = bridge.wait_until_paused(timeout=60000)
+            if result["success"]:
+                print(f"Stopped at {result['current_address']}")
+            else:
+                print(f"Timeout after {result['elapsed_ms']}ms")
+        """
+        data = {"timeout": timeout}
+        result = self._request("/api/wait/paused", data)
+        return result
+
+    def wait_until_running(self, timeout: int = 10000) -> dict[str, Any]:
+        """
+        Wait until the debugger is running.
+
+        Useful after calling run() to confirm execution has started.
+
+        Args:
+            timeout: Maximum wait time in milliseconds (default: 10 seconds)
+
+        Returns:
+            Dictionary with:
+                - success: True if running, False if timeout
+                - state: Current state ("running" or other)
+                - elapsed_ms: Time waited in milliseconds
+                - error: Error message (if timeout)
+        """
+        data = {"timeout": timeout}
+        result = self._request("/api/wait/running", data)
+        return result
+
+    def wait_until_debugging(self, timeout: int = 30000) -> dict[str, Any]:
+        """
+        Wait until debugging has started (binary is loaded).
+
+        Useful after calling load_binary() to confirm the binary is ready.
+
+        Args:
+            timeout: Maximum wait time in milliseconds (default: 30 seconds)
+
+        Returns:
+            Dictionary with:
+                - success: True if debugging, False if timeout
+                - state: Current state
+                - elapsed_ms: Time waited in milliseconds
+                - is_running: Whether the debugger is running
+                - error: Error message (if timeout)
+        """
+        data = {"timeout": timeout}
+        result = self._request("/api/wait/debugging", data)
+        return result
+
+    def run_and_wait(self, timeout: int = 30000) -> dict[str, Any]:
+        """
+        Start execution and wait until it pauses (breakpoint, exception, etc.).
+
+        This is a convenience method combining run() and wait_until_paused().
+
+        Args:
+            timeout: Maximum wait time in milliseconds (default: 30 seconds)
+
+        Returns:
+            Dictionary with wait result (same as wait_until_paused)
+
+        Example:
+            bridge.set_breakpoint("0x401000")
+            result = bridge.run_and_wait(timeout=60000)
+            if result["success"]:
+                regs = bridge.get_registers()
+                print(f"Hit breakpoint, RAX={regs['rax']}")
+        """
+        self.run()
+        return self.wait_until_paused(timeout=timeout)

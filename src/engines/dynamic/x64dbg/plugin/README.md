@@ -128,6 +128,19 @@ Base URL: `http://localhost:8765`
 | `/api/step_over` | POST | Step over next instruction |
 | `/api/step_out` | POST | Step out of current function |
 
+### Wait/Synchronization (NEW)
+
+Essential for automation scripts - block until debugger reaches desired state.
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/wait/paused` | POST | Wait until debugger pauses (breakpoint, exception) |
+| `/api/wait/running` | POST | Wait until debugger is running |
+| `/api/wait/debugging` | POST | Wait until binary is loaded |
+
+**Parameters** (JSON body):
+- `timeout`: Maximum wait time in milliseconds (default: 30000, max: 300000)
+
 ### Breakpoints
 
 | Endpoint | Method | Description |
@@ -198,6 +211,38 @@ Response:
   "rbx": "0000000000000001",
   "rcx": "00007FF7ABCD1234",
   ...
+}
+```
+
+### Wait for Breakpoint (NEW)
+```bash
+# Start execution
+curl -X POST http://localhost:8765/api/run
+
+# Wait up to 60 seconds for breakpoint/exception
+curl -X POST http://localhost:8765/api/wait/paused \
+  -H "Content-Type: application/json" \
+  -d '{"timeout": 60000}'
+```
+
+Response (success):
+```json
+{
+  "success": true,
+  "state": "paused",
+  "elapsed_ms": "1234",
+  "current_address": "0x00401234"
+}
+```
+
+Response (timeout):
+```json
+{
+  "success": false,
+  "error": "Timeout waiting for debugger to pause",
+  "timeout_ms": "60000",
+  "elapsed_ms": "60000",
+  "current_state": "running"
 }
 ```
 

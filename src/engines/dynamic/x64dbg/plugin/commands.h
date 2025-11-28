@@ -30,4 +30,9 @@ namespace Commands {
     std::string ReadMemory(const std::string& jsonBody);
     std::string WriteMemory(const std::string& jsonBody);
     std::string Disassemble(const std::string& jsonBody);
+
+    // Wait/Synchronization
+    std::string WaitForPaused(const std::string& jsonBody);
+    std::string WaitForRunning(const std::string& jsonBody);
+    std::string WaitForDebugging(const std::string& jsonBody);
 }

@@ -112,13 +112,177 @@ def register_dynamic_tools(app: FastMCP) -> None:
             Execution status
 
         Note: Execution will run until breakpoint hit or program terminates.
+        Use x64dbg_run_and_wait() to run and wait for a breakpoint hit.
         """
         try:
             bridge = get_x64dbg_bridge()
             bridge.run()
-            return "Debugger running...\nUse x64dbg_pause to pause execution."
+            return "Debugger running...\nUse x64dbg_pause to pause or x64dbg_wait_paused to wait for breakpoint."
         except Exception as e:
             logger.error(f"x64dbg_run failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    def x64dbg_wait_paused(timeout_seconds: int = 30) -> str:
+        """
+        Wait until debugger is paused (breakpoint hit, exception, etc.).
+
+        This is essential for automation - blocks until the debugger stops
+        instead of requiring manual polling.
+
+        Args:
+            timeout_seconds: Maximum wait time in seconds (default: 30)
+
+        Returns:
+            Wait result with state and elapsed time
+
+        Example:
+            x64dbg_set_breakpoint("0x401000")
+            x64dbg_run()
+            x64dbg_wait_paused(60)  # Wait up to 60 seconds for breakpoint
+
+        Use Cases:
+            - Wait for breakpoint to hit after run()
+            - Wait for exception to occur
+            - Synchronize automation scripts
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            result = bridge.wait_until_paused(timeout=timeout_seconds * 1000)
+
+            if result.get("success"):
+                return (
+                    f"Debugger paused\n"
+                    f"Address: {result.get('current_address', 'unknown')}\n"
+                    f"Elapsed: {result.get('elapsed_ms', 0)}ms"
+                )
+            else:
+                return (
+                    f"Timeout waiting for debugger to pause\n"
+                    f"Timeout: {timeout_seconds}s\n"
+                    f"Current state: {result.get('current_state', 'unknown')}\n"
+                    f"Error: {result.get('error', 'Unknown error')}"
+                )
+
+        except Exception as e:
+            logger.error(f"x64dbg_wait_paused failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    def x64dbg_wait_running(timeout_seconds: int = 10) -> str:
+        """
+        Wait until debugger is running.
+
+        Useful after calling run() to confirm execution has started.
+
+        Args:
+            timeout_seconds: Maximum wait time in seconds (default: 10)
+
+        Returns:
+            Wait result with state and elapsed time
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            result = bridge.wait_until_running(timeout=timeout_seconds * 1000)
+
+            if result.get("success"):
+                return (
+                    f"Debugger is running\n"
+                    f"Elapsed: {result.get('elapsed_ms', 0)}ms"
+                )
+            else:
+                return (
+                    f"Timeout waiting for debugger to run\n"
+                    f"Timeout: {timeout_seconds}s\n"
+                    f"Current state: {result.get('current_state', 'unknown')}"
+                )
+
+        except Exception as e:
+            logger.error(f"x64dbg_wait_running failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    def x64dbg_wait_debugging(timeout_seconds: int = 30) -> str:
+        """
+        Wait until debugging has started (binary is loaded).
+
+        Useful after loading a binary to confirm it's ready for debugging.
+
+        Args:
+            timeout_seconds: Maximum wait time in seconds (default: 30)
+
+        Returns:
+            Wait result with state and elapsed time
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            result = bridge.wait_until_debugging(timeout=timeout_seconds * 1000)
+
+            if result.get("success"):
+                state = "running" if result.get("is_running") else "paused"
+                return (
+                    f"Debugging active\n"
+                    f"State: {state}\n"
+                    f"Elapsed: {result.get('elapsed_ms', 0)}ms"
+                )
+            else:
+                return (
+                    f"Timeout waiting for debugging to start\n"
+                    f"Timeout: {timeout_seconds}s\n"
+                    f"Current state: {result.get('current_state', 'unknown')}"
+                )
+
+        except Exception as e:
+            logger.error(f"x64dbg_wait_debugging failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    def x64dbg_run_and_wait(timeout_seconds: int = 30) -> str:
+        """
+        Run execution and wait until it pauses (breakpoint, exception, etc.).
+
+        This is a convenience function combining run() and wait_paused().
+        Essential for automation scripts.
+
+        Args:
+            timeout_seconds: Maximum wait time in seconds (default: 30)
+
+        Returns:
+            Execution result with address where stopped
+
+        Example:
+            x64dbg_set_breakpoint("0x401000")
+            result = x64dbg_run_and_wait(60)
+            # Now at breakpoint, can inspect registers, memory, etc.
+
+        Use Cases:
+            - Run to breakpoint and inspect state
+            - Automate stepping through code
+            - Wait for specific program state
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            result = bridge.run_and_wait(timeout=timeout_seconds * 1000)
+
+            if result.get("success"):
+                return (
+                    f"Execution stopped\n"
+                    f"Address: {result.get('current_address', 'unknown')}\n"
+                    f"State: paused\n"
+                    f"Elapsed: {result.get('elapsed_ms', 0)}ms\n\n"
+                    f"Use x64dbg_get_registers() to see register values."
+                )
+            else:
+                return (
+                    f"Timeout waiting for execution to stop\n"
+                    f"Timeout: {timeout_seconds}s\n"
+                    f"Current state: {result.get('current_state', 'unknown')}\n"
+                    f"Error: {result.get('error', 'Unknown error')}\n\n"
+                    f"The program may still be running. Use x64dbg_pause() to stop it."
+                )
+
+        except Exception as e:
+            logger.error(f"x64dbg_run_and_wait failed: {e}")
             return f"Error: {e}"
 
     @app.tool()
@@ -1395,4 +1559,609 @@ def register_dynamic_tools(app: FastMCP) -> None:
                         "See FUTURE_FEATURES.md for implementation status.")
             return f"Error: {e}"
 
-    logger.info("Registered 36 dynamic analysis tools")
+    # =========================================================================
+    # Event System Tools
+    # =========================================================================
+
+    @app.tool()
+    def x64dbg_get_events(max_events: int = 50) -> str:
+        """
+        Get pending debug events from the event queue.
+
+        The event system captures debug events as they occur:
+        - breakpoint_hit: Breakpoint was triggered
+        - exception: Exception occurred
+        - paused: Debugger paused
+        - running: Debugger resumed
+        - stepped: Single step completed
+        - process_started: Process created
+        - process_exited: Process terminated
+        - thread_created: New thread created
+        - thread_exited: Thread terminated
+        - module_loaded: DLL/module loaded
+        - module_unloaded: DLL/module unloaded
+        - debug_string: OutputDebugString message
+
+        Args:
+            max_events: Maximum number of events to return (default: 50)
+
+        Returns:
+            List of debug events with details
+
+        Example:
+            x64dbg_run()
+            # ... wait for execution ...
+            x64dbg_get_events()  # See what happened
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            result = bridge.get_events(max_events=max_events)
+
+            events = result.get("events", [])
+            queue_size = result.get("queue_size", 0)
+
+            if not events:
+                return f"No events in queue (queue size: {queue_size})"
+
+            output = [
+                f"Debug Events ({len(events)} returned, {queue_size} remaining):",
+                "-" * 60
+            ]
+
+            for event in events:
+                event_id = event.get("id", "?")
+                event_type = event.get("type", "unknown")
+                timestamp = event.get("timestamp", 0)
+                address = event.get("address", "0")
+                thread_id = event.get("thread_id", 0)
+                module = event.get("module", "")
+                details = event.get("details", "")
+
+                line = f"[{event_id}] {event_type}"
+                if address != "0":
+                    line += f" @ 0x{address}"
+                if thread_id:
+                    line += f" (thread {thread_id})"
+                if module:
+                    line += f" [{module}]"
+                line += f" +{timestamp}ms"
+
+                output.append(line)
+                if details:
+                    output.append(f"    {details}")
+
+            return "\n".join(output)
+
+        except Exception as e:
+            logger.error(f"x64dbg_get_events failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    def x64dbg_clear_events() -> str:
+        """
+        Clear all pending events from the event queue.
+
+        Use this before starting a new analysis to get a clean event history.
+
+        Returns:
+            Confirmation message
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            bridge.clear_events()
+            return "Event queue cleared"
+
+        except Exception as e:
+            logger.error(f"x64dbg_clear_events failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    def x64dbg_event_status() -> str:
+        """
+        Get event system status.
+
+        Shows whether event collection is enabled and queue size.
+
+        Returns:
+            Event system status information
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            result = bridge.get_event_status()
+
+            enabled = result.get("enabled", False)
+            queue_size = result.get("queue_size", 0)
+            next_id = result.get("next_event_id", 0)
+
+            return (
+                f"Event System Status:\n"
+                f"  Enabled: {enabled}\n"
+                f"  Queue Size: {queue_size}\n"
+                f"  Next Event ID: {next_id}"
+            )
+
+        except Exception as e:
+            logger.error(f"x64dbg_event_status failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    def x64dbg_run_until_event(
+        event_types: str = "breakpoint_hit,exception,paused",
+        timeout_seconds: int = 30
+    ) -> str:
+        """
+        Run execution and wait for a specific event type.
+
+        This is the recommended way to run and wait for events.
+        More reliable than run_and_wait() for complex scenarios.
+
+        Args:
+            event_types: Comma-separated event types to wait for
+                        Default: "breakpoint_hit,exception,paused"
+            timeout_seconds: Maximum wait time (default: 30 seconds)
+
+        Returns:
+            Event details when triggered, or timeout message
+
+        Example:
+            x64dbg_set_breakpoint("0x401000")
+            x64dbg_run_until_event("breakpoint_hit", 60)
+
+        Event Types:
+            - breakpoint_hit: Breakpoint triggered
+            - exception: Exception occurred
+            - paused: Debugger paused (any reason)
+            - system_breakpoint: Initial break on load
+            - stepped: Single step completed
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+
+            # Parse event types
+            types_list = [t.strip() for t in event_types.split(",")]
+
+            result = bridge.run_until_event(
+                event_types=types_list,
+                timeout=timeout_seconds * 1000
+            )
+
+            if result.get("success"):
+                event = result.get("event", {})
+                event_type = event.get("type", "unknown")
+                address = event.get("address", "0")
+                details = event.get("details", "")
+
+                output = (
+                    f"Event received: {event_type}\n"
+                    f"Address: 0x{address}\n"
+                )
+                if details:
+                    output += f"Details: {details}\n"
+
+                output += "\nUse x64dbg_get_registers() to inspect state."
+                return output
+            else:
+                error = result.get("error", "Unknown error")
+                return f"Timeout waiting for events\n{error}"
+
+        except Exception as e:
+            logger.error(f"x64dbg_run_until_event failed: {e}")
+            return f"Error: {e}"
+
+    # =========================================================================
+    # Memory Allocation Tools (Phase 3)
+    # =========================================================================
+
+    @app.tool()
+    def x64dbg_alloc_memory(size: int = 4096, address: str = "") -> str:
+        """
+        Allocate memory in the debugee's address space.
+
+        Uses VirtualAllocEx to allocate memory with read/write permissions.
+        Useful for injecting shellcode, storing analysis data, or code patches.
+
+        Args:
+            size: Number of bytes to allocate (default: 4096 = one page)
+            address: Optional preferred address (hex string). If empty, OS chooses.
+
+        Returns:
+            Address of allocated memory region
+
+        Examples:
+            x64dbg_alloc_memory(4096)  # Allocate one page
+            x64dbg_alloc_memory(0x10000, "0x10000000")  # 64KB at preferred address
+
+        Use Cases:
+            - Allocate memory for shellcode injection
+            - Create scratch space for analysis data
+            - Store patched code before writing to original location
+            - Allocate buffers for hooking trampolines
+
+        Priority: P1 (High Value)
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            result = bridge.virt_alloc(size, address if address else None)
+
+            if result.get("success"):
+                alloc_addr = result.get("address", "unknown")
+                alloc_size = result.get("size", size)
+                return (
+                    f"Memory allocated successfully\n"
+                    f"Address: 0x{alloc_addr}\n"
+                    f"Size: {alloc_size} bytes ({alloc_size // 1024} KB)\n\n"
+                    f"Use x64dbg_write_memory() to write data to this region."
+                )
+            else:
+                return f"Failed to allocate memory: {result.get('error', 'Unknown error')}"
+
+        except Exception as e:
+            logger.error(f"x64dbg_alloc_memory failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    def x64dbg_free_memory(address: str) -> str:
+        """
+        Free memory allocated in the debugee's address space.
+
+        Args:
+            address: Address of memory to free (hex string)
+
+        Returns:
+            Confirmation message
+
+        Example:
+            x64dbg_free_memory("0x12340000")
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            result = bridge.virt_free(address)
+
+            if result.get("success"):
+                return f"Memory freed at {address}"
+            else:
+                return f"Failed to free memory: {result.get('error', 'Unknown error')}"
+
+        except Exception as e:
+            logger.error(f"x64dbg_free_memory failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    def x64dbg_protect_memory(address: str, protection: str, size: int = 4096) -> str:
+        """
+        Change memory protection.
+
+        Modify page permissions for a memory region. Essential for:
+        - Making code regions writable for patching
+        - Making data regions executable for shellcode
+        - Restoring original permissions after patching
+
+        Args:
+            address: Address of memory region (hex string)
+            protection: New protection string:
+                - "rwx": Read/Write/Execute
+                - "rx": Read/Execute
+                - "rw": Read/Write
+                - "r": Read only
+                - "x": Execute only
+                - "n" or "none": No access
+            size: Size of region to change (default: 4096)
+
+        Returns:
+            Confirmation message
+
+        Examples:
+            # Make code region writable for patching
+            x64dbg_protect_memory("0x401000", "rwx", 0x1000)
+            x64dbg_write_memory("0x401000", "90909090")  # Write NOPs
+            x64dbg_protect_memory("0x401000", "rx", 0x1000)  # Restore
+
+        Use Cases:
+            - Patch code in .text section (needs writable)
+            - Execute shellcode in data region (needs executable)
+            - Protect sensitive data from reading
+
+        Priority: P1 (High Value)
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            result = bridge.virt_protect(address, protection, size)
+
+            if result.get("success"):
+                return (
+                    f"Memory protection changed\n"
+                    f"Address: 0x{result.get('address', address)}\n"
+                    f"Protection: {protection}\n"
+                    f"Size: {size} bytes"
+                )
+            else:
+                return f"Failed to change protection: {result.get('error', 'Unknown error')}"
+
+        except Exception as e:
+            logger.error(f"x64dbg_protect_memory failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    def x64dbg_memset(address: str, value: int, size: int) -> str:
+        """
+        Fill memory with a byte value.
+
+        Write repeated byte values to memory - useful for clearing buffers,
+        writing NOP sleds, or initializing memory regions.
+
+        Args:
+            address: Start address (hex string)
+            value: Byte value to fill (0-255)
+            size: Number of bytes to fill
+
+        Returns:
+            Confirmation message
+
+        Examples:
+            # Zero out a buffer
+            x64dbg_memset("0x12340000", 0, 1024)
+
+            # Fill with NOPs (0x90) for NOP sled
+            x64dbg_memset("0x401000", 0x90, 100)
+
+            # Fill with INT3 (0xCC) for breakpoint trap
+            x64dbg_memset("0x401000", 0xCC, 10)
+
+        Use Cases:
+            - Clear memory before writing shellcode
+            - Create NOP sleds for shellcode alignment
+            - Fill regions with INT3 to catch unexpected execution
+            - Zero out sensitive data
+
+        Priority: P1 (High Value)
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            result = bridge.memset(address, value, size)
+
+            if result.get("success"):
+                return (
+                    f"Memory filled\n"
+                    f"Address: 0x{result.get('address', address)}\n"
+                    f"Value: 0x{value & 0xFF:02X}\n"
+                    f"Size: {size} bytes"
+                )
+            else:
+                return f"Failed to fill memory: {result.get('error', 'Unknown error')}"
+
+        except Exception as e:
+            logger.error(f"x64dbg_memset failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    def x64dbg_check_memory(address: str) -> str:
+        """
+        Check if address is a valid readable memory address.
+
+        Use before reading memory to avoid errors.
+
+        Args:
+            address: Address to check (hex string)
+
+        Returns:
+            Validity status
+
+        Example:
+            x64dbg_check_memory("0x401000")
+            # If valid, then:
+            x64dbg_read_memory("0x401000", 16)
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            is_valid = bridge.check_valid_read_ptr(address)
+
+            if is_valid:
+                return f"Address {address} is valid and readable"
+            else:
+                return f"Address {address} is NOT valid (not mapped or not readable)"
+
+        except Exception as e:
+            logger.error(f"x64dbg_check_memory failed: {e}")
+            return f"Error: {e}"
+
+    # =========================================================================
+    # Enhanced Breakpoint Tools (Phase 3)
+    # =========================================================================
+
+    @app.tool()
+    def x64dbg_toggle_breakpoint(address: str, enable: bool = True) -> str:
+        """
+        Enable or disable a software breakpoint without deleting it.
+
+        Temporarily disable breakpoints to skip them, then re-enable later.
+        More efficient than delete/recreate for frequently toggled BPs.
+
+        Args:
+            address: Breakpoint address (hex string)
+            enable: True to enable, False to disable
+
+        Returns:
+            Confirmation message
+
+        Example:
+            x64dbg_set_breakpoint("0x401000")
+            x64dbg_toggle_breakpoint("0x401000", False)  # Temporarily disable
+            x64dbg_run()
+            x64dbg_toggle_breakpoint("0x401000", True)   # Re-enable
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            result = bridge.toggle_breakpoint(address, enable)
+
+            if result.get("success"):
+                status = "enabled" if enable else "disabled"
+                return f"Breakpoint at {address} {status}"
+            else:
+                return f"Failed to toggle breakpoint: {result.get('error', 'Unknown error')}"
+
+        except Exception as e:
+            logger.error(f"x64dbg_toggle_breakpoint failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    def x64dbg_delete_hardware_bp(address: str) -> str:
+        """
+        Delete a hardware breakpoint.
+
+        Frees up one of the 4 hardware breakpoint slots.
+
+        Args:
+            address: Breakpoint address (hex string)
+
+        Returns:
+            Confirmation message
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            result = bridge.delete_hardware_breakpoint(address)
+
+            if result.get("success"):
+                return f"Hardware breakpoint deleted at {address}"
+            else:
+                return f"Failed to delete hardware breakpoint: {result.get('error', 'Unknown error')}"
+
+        except Exception as e:
+            logger.error(f"x64dbg_delete_hardware_bp failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    def x64dbg_toggle_hardware_bp(address: str, enable: bool = True) -> str:
+        """
+        Enable or disable a hardware breakpoint without deleting it.
+
+        Args:
+            address: Breakpoint address (hex string)
+            enable: True to enable, False to disable
+
+        Returns:
+            Confirmation message
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            result = bridge.toggle_hardware_breakpoint(address, enable)
+
+            if result.get("success"):
+                status = "enabled" if enable else "disabled"
+                return f"Hardware breakpoint at {address} {status}"
+            else:
+                return f"Failed to toggle hardware breakpoint: {result.get('error', 'Unknown error')}"
+
+        except Exception as e:
+            logger.error(f"x64dbg_toggle_hardware_bp failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    def x64dbg_toggle_memory_bp(address: str, enable: bool = True) -> str:
+        """
+        Enable or disable a memory breakpoint without deleting it.
+
+        Args:
+            address: Breakpoint address (hex string)
+            enable: True to enable, False to disable
+
+        Returns:
+            Confirmation message
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            result = bridge.toggle_memory_breakpoint(address, enable)
+
+            if result.get("success"):
+                status = "enabled" if enable else "disabled"
+                return f"Memory breakpoint at {address} {status}"
+            else:
+                return f"Failed to toggle memory breakpoint: {result.get('error', 'Unknown error')}"
+
+        except Exception as e:
+            logger.error(f"x64dbg_toggle_memory_bp failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    def x64dbg_list_all_breakpoints() -> str:
+        """
+        List all breakpoints of all types (software, hardware, memory).
+
+        Comprehensive view of all active breakpoints in the debugger.
+
+        Returns:
+            Categorized list of all breakpoints with their status
+
+        Example output:
+            All Breakpoints:
+            ================
+
+            Software Breakpoints (3):
+              0x00401000  enabled  (single-shot: no)
+              0x00401234  disabled (single-shot: no)
+              0x00405000  enabled  (single-shot: yes)
+
+            Hardware Breakpoints (1):
+              0x00500000  enabled  type=write  size=4
+
+            Memory Breakpoints (0):
+              (none)
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            result = bridge.list_all_breakpoints()
+
+            if not result.get("success"):
+                return f"Failed to list breakpoints: {result.get('error', 'Unknown error')}"
+
+            bps = result.get("breakpoints", {})
+            software = bps.get("software", [])
+            hardware = bps.get("hardware", [])
+            memory = bps.get("memory", [])
+
+            output = ["All Breakpoints:", "=" * 60, ""]
+
+            # Software breakpoints
+            output.append(f"Software Breakpoints ({len(software)}):")
+            if software:
+                for bp in software:
+                    addr = bp.get("address", "unknown")
+                    enabled = "enabled" if bp.get("enabled") else "disabled"
+                    singleshot = "yes" if bp.get("singleshoot") else "no"
+                    output.append(f"  0x{addr}  {enabled:8}  (single-shot: {singleshot})")
+            else:
+                output.append("  (none)")
+
+            output.append("")
+
+            # Hardware breakpoints
+            output.append(f"Hardware Breakpoints ({len(hardware)}):")
+            if hardware:
+                for bp in hardware:
+                    addr = bp.get("address", "unknown")
+                    enabled = "enabled" if bp.get("enabled") else "disabled"
+                    hw_type = bp.get("type", "unknown")
+                    size = bp.get("size", 1)
+                    output.append(f"  0x{addr}  {enabled:8}  type={hw_type}  size={size}")
+            else:
+                output.append("  (none)")
+
+            output.append("")
+
+            # Memory breakpoints
+            output.append(f"Memory Breakpoints ({len(memory)}):")
+            if memory:
+                for bp in memory:
+                    addr = bp.get("address", "unknown")
+                    enabled = "enabled" if bp.get("enabled") else "disabled"
+                    bp_type = bp.get("type", "access")
+                    output.append(f"  0x{addr}  {enabled:8}  type={bp_type}")
+            else:
+                output.append("  (none)")
+
+            return "\n".join(output)
+
+        except Exception as e:
+            logger.error(f"x64dbg_list_all_breakpoints failed: {e}")
+            return f"Error: {e}"
+
+    logger.info("Registered 56 dynamic analysis tools")

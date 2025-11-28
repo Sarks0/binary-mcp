@@ -951,3 +951,549 @@ class X64DbgBridge(Debugger):
         self._request("/api/hide_debugger")
         logger.info("Debugger hidden in PEB")
         return True
+
+    # =========================================================================
+    # Wait/Synchronization Functions
+    # =========================================================================
+
+    def wait_until_paused(self, timeout: int = 30000) -> dict[str, Any]:
+        """
+        Wait until the debugger is paused (e.g., breakpoint hit, exception).
+
+        This is essential for automation - blocks until the debugger stops
+        instead of requiring polling loops.
+
+        Args:
+            timeout: Maximum wait time in milliseconds (default: 30 seconds)
+
+        Returns:
+            Dictionary with:
+                - success: True if paused, False if timeout
+                - state: Current state ("paused" or other)
+                - elapsed_ms: Time waited in milliseconds
+                - current_address: Address where paused (if successful)
+                - error: Error message (if timeout)
+
+        Example:
+            bridge.run()
+            result = bridge.wait_until_paused(timeout=60000)
+            if result["success"]:
+                print(f"Stopped at {result['current_address']}")
+            else:
+                print(f"Timeout after {result['elapsed_ms']}ms")
+        """
+        data = {"timeout": timeout}
+        result = self._request("/api/wait/paused", data)
+        return result
+
+    def wait_until_running(self, timeout: int = 10000) -> dict[str, Any]:
+        """
+        Wait until the debugger is running.
+
+        Useful after calling run() to confirm execution has started.
+
+        Args:
+            timeout: Maximum wait time in milliseconds (default: 10 seconds)
+
+        Returns:
+            Dictionary with:
+                - success: True if running, False if timeout
+                - state: Current state ("running" or other)
+                - elapsed_ms: Time waited in milliseconds
+                - error: Error message (if timeout)
+        """
+        data = {"timeout": timeout}
+        result = self._request("/api/wait/running", data)
+        return result
+
+    def wait_until_debugging(self, timeout: int = 30000) -> dict[str, Any]:
+        """
+        Wait until debugging has started (binary is loaded).
+
+        Useful after calling load_binary() to confirm the binary is ready.
+
+        Args:
+            timeout: Maximum wait time in milliseconds (default: 30 seconds)
+
+        Returns:
+            Dictionary with:
+                - success: True if debugging, False if timeout
+                - state: Current state
+                - elapsed_ms: Time waited in milliseconds
+                - is_running: Whether the debugger is running
+                - error: Error message (if timeout)
+        """
+        data = {"timeout": timeout}
+        result = self._request("/api/wait/debugging", data)
+        return result
+
+    def run_and_wait(self, timeout: int = 30000) -> dict[str, Any]:
+        """
+        Start execution and wait until it pauses (breakpoint, exception, etc.).
+
+        This is a convenience method combining run() and wait_until_paused().
+
+        Args:
+            timeout: Maximum wait time in milliseconds (default: 30 seconds)
+
+        Returns:
+            Dictionary with wait result (same as wait_until_paused)
+
+        Example:
+            bridge.set_breakpoint("0x401000")
+            result = bridge.run_and_wait(timeout=60000)
+            if result["success"]:
+                regs = bridge.get_registers()
+                print(f"Hit breakpoint, RAX={regs['rax']}")
+        """
+        self.run()
+        return self.wait_until_paused(timeout=timeout)
+
+    # =========================================================================
+    # Event System
+    # =========================================================================
+
+    def get_events(self, max_events: int = 100, peek: bool = False) -> dict[str, Any]:
+        """
+        Get pending debug events from the event queue.
+
+        The event system captures debug events as they occur:
+        - Breakpoint hits
+        - Exceptions
+        - Process/thread creation/exit
+        - Module load/unload
+        - Debug strings
+        - Step completion
+
+        Args:
+            max_events: Maximum number of events to return (default: 100)
+            peek: If True, don't remove events from queue (default: False)
+
+        Returns:
+            Dictionary with:
+                - events: List of event objects
+                - queue_size: Remaining events in queue
+                - next_event_id: Next event ID (for filtering)
+
+        Event object structure:
+            - id: Unique event ID
+            - type: Event type string (breakpoint_hit, exception, etc.)
+            - timestamp: Milliseconds since plugin start
+            - address: Address (hex string, if applicable)
+            - thread_id: Thread ID (if applicable)
+            - module: Module name (if applicable)
+            - details: Additional details string
+
+        Example:
+            events = bridge.get_events()
+            for event in events["events"]:
+                if event["type"] == "breakpoint_hit":
+                    print(f"Breakpoint at {event['address']}")
+        """
+        data = {"max_events": max_events, "peek": 1 if peek else 0}
+        return self._request("/api/events", data)
+
+    def clear_events(self) -> dict[str, Any]:
+        """
+        Clear all pending events from the event queue.
+
+        Returns:
+            Confirmation message
+        """
+        return self._request("/api/events/clear")
+
+    def get_event_status(self) -> dict[str, Any]:
+        """
+        Get event system status.
+
+        Returns:
+            Dictionary with:
+                - enabled: Whether event collection is enabled
+                - queue_size: Number of events in queue
+                - next_event_id: Next event ID
+        """
+        return self._request("/api/events/status")
+
+    def poll_for_event(
+        self,
+        event_types: list[str] | None = None,
+        timeout: int = 30000,
+        poll_interval: int = 100
+    ) -> dict[str, Any] | None:
+        """
+        Poll for a specific event type.
+
+        This is a convenience method that polls the event queue until
+        a matching event is found or timeout is reached.
+
+        Args:
+            event_types: List of event types to wait for (e.g., ["breakpoint_hit", "exception"])
+                        If None, returns first event of any type
+            timeout: Maximum wait time in milliseconds (default: 30 seconds)
+            poll_interval: How often to poll in milliseconds (default: 100ms)
+
+        Returns:
+            Matching event object, or None if timeout
+
+        Example:
+            bridge.run()
+            event = bridge.poll_for_event(["breakpoint_hit"], timeout=60000)
+            if event:
+                print(f"Hit breakpoint at {event['address']}")
+        """
+        import time
+
+        start_time = time.time()
+        timeout_sec = timeout / 1000
+
+        while True:
+            # Check timeout
+            elapsed = time.time() - start_time
+            if elapsed >= timeout_sec:
+                return None
+
+            # Get events (don't peek - we want to consume them)
+            result = self.get_events(max_events=10)
+            events = result.get("events", [])
+
+            for event in events:
+                event_type = event.get("type", "")
+                if event_types is None or event_type in event_types:
+                    return event
+
+            # Sleep before next poll
+            time.sleep(poll_interval / 1000)
+
+    def run_until_event(
+        self,
+        event_types: list[str] | None = None,
+        timeout: int = 30000
+    ) -> dict[str, Any]:
+        """
+        Run and wait for a specific event type.
+
+        Combines run() with poll_for_event() for convenience.
+
+        Args:
+            event_types: List of event types to wait for
+                        Default: ["breakpoint_hit", "exception", "paused"]
+            timeout: Maximum wait time in milliseconds
+
+        Returns:
+            Dictionary with:
+                - success: True if event received
+                - event: The event object (if success)
+                - error: Error message (if timeout)
+
+        Example:
+            bridge.set_breakpoint("kernel32.CreateFileA")
+            result = bridge.run_until_event(["breakpoint_hit"], timeout=60000)
+            if result["success"]:
+                print(f"Breakpoint hit at {result['event']['address']}")
+        """
+        if event_types is None:
+            event_types = ["breakpoint_hit", "exception", "paused", "system_breakpoint"]
+
+        # Clear existing events first
+        self.clear_events()
+
+        # Start execution
+        self.run()
+
+        # Poll for event
+        event = self.poll_for_event(event_types, timeout)
+
+        if event:
+            return {
+                "success": True,
+                "event": event
+            }
+        else:
+            return {
+                "success": False,
+                "error": f"Timeout waiting for events: {event_types}"
+            }
+
+    # =========================================================================
+    # Memory Allocation Functions (Phase 3)
+    # =========================================================================
+
+    def virt_alloc(self, size: int = 4096, address: str | None = None) -> dict[str, Any]:
+        """
+        Allocate memory in the debugee's address space.
+
+        Uses VirtualAllocEx to allocate memory with read/write permissions.
+
+        Args:
+            size: Number of bytes to allocate (default: 4096 = one page)
+            address: Optional preferred address (hex string). If None, OS chooses.
+
+        Returns:
+            Dictionary with:
+                - success: True if allocation succeeded
+                - address: Allocated address (hex string)
+                - size: Actual size allocated
+
+        Example:
+            result = bridge.virt_alloc(4096)
+            if result["success"]:
+                mem_addr = result["address"]
+                bridge.write_memory(mem_addr, b"Hello World")
+        """
+        data = {"size": size}
+        if address:
+            if address.startswith("0x"):
+                address = address[2:]
+            data["address"] = address
+
+        result = self._request("/api/memory/alloc", data)
+        logger.info(f"Allocated {size} bytes at 0x{result.get('address', 'unknown')}")
+        return result
+
+    def virt_free(self, address: str) -> dict[str, Any]:
+        """
+        Free memory allocated in the debugee's address space.
+
+        Args:
+            address: Address of memory to free (hex string)
+
+        Returns:
+            Dictionary with success status and message
+
+        Example:
+            bridge.virt_free("0x12340000")
+        """
+        if address.startswith("0x"):
+            address = address[2:]
+
+        data = {"address": address}
+        result = self._request("/api/memory/free", data)
+        logger.info(f"Freed memory at 0x{address}")
+        return result
+
+    def virt_protect(self, address: str, protection: str, size: int = 4096) -> dict[str, Any]:
+        """
+        Change memory protection.
+
+        Args:
+            address: Address of memory region (hex string)
+            protection: New protection string:
+                - "rwx" or "RWX": Read/Write/Execute
+                - "rx" or "RX": Read/Execute
+                - "rw" or "RW": Read/Write
+                - "r" or "R": Read only
+                - "x" or "X": Execute only
+                - "n" or "none": No access
+            size: Size of region to change (default: 4096)
+
+        Returns:
+            Dictionary with:
+                - success: True if protection changed
+                - address: Address that was modified
+                - protection: Windows protection constant value
+
+        Example:
+            # Make code region writable for patching
+            bridge.virt_protect("0x401000", "rwx", 0x1000)
+            bridge.write_memory("0x401000", b"\\x90\\x90")  # Write NOPs
+            bridge.virt_protect("0x401000", "rx", 0x1000)   # Restore
+        """
+        if address.startswith("0x"):
+            address = address[2:]
+
+        data = {
+            "address": address,
+            "protection": protection,
+            "size": size
+        }
+
+        result = self._request("/api/memory/protect", data)
+        logger.info(f"Changed protection at 0x{address} to {protection}")
+        return result
+
+    def memset(self, address: str, value: int, size: int) -> dict[str, Any]:
+        """
+        Fill memory with a byte value.
+
+        Args:
+            address: Start address (hex string)
+            value: Byte value to fill (0-255)
+            size: Number of bytes to fill
+
+        Returns:
+            Dictionary with success status
+
+        Example:
+            # Zero out a buffer
+            bridge.memset("0x12340000", 0, 1024)
+
+            # Fill with NOPs (0x90)
+            bridge.memset("0x401000", 0x90, 10)
+        """
+        if address.startswith("0x"):
+            address = address[2:]
+
+        data = {
+            "address": address,
+            "value": value & 0xFF,
+            "size": size
+        }
+
+        result = self._request("/api/memory/set", data)
+        logger.info(f"Filled {size} bytes at 0x{address} with 0x{value & 0xFF:02x}")
+        return result
+
+    def check_valid_read_ptr(self, address: str) -> bool:
+        """
+        Check if address is a valid readable memory address.
+
+        Args:
+            address: Address to check (hex string)
+
+        Returns:
+            True if address is readable, False otherwise
+
+        Example:
+            if bridge.check_valid_read_ptr("0x401000"):
+                data = bridge.read_memory("0x401000", 16)
+        """
+        if address.startswith("0x"):
+            address = address[2:]
+
+        data = {"address": address}
+        result = self._request("/api/memory/check", data)
+        return result.get("valid", False)
+
+    # =========================================================================
+    # Enhanced Breakpoint Functions (Phase 3)
+    # =========================================================================
+
+    def toggle_breakpoint(self, address: str, enable: bool = True) -> dict[str, Any]:
+        """
+        Enable or disable a software breakpoint without deleting it.
+
+        Args:
+            address: Breakpoint address (hex string)
+            enable: True to enable, False to disable
+
+        Returns:
+            Dictionary with address and enabled status
+
+        Example:
+            bridge.set_breakpoint("0x401000")
+            bridge.toggle_breakpoint("0x401000", enable=False)  # Temporarily disable
+            bridge.run()
+            bridge.toggle_breakpoint("0x401000", enable=True)   # Re-enable
+        """
+        if address.startswith("0x"):
+            address = address[2:]
+
+        data = {
+            "address": address,
+            "enable": 1 if enable else 0
+        }
+
+        result = self._request("/api/breakpoint/toggle", data)
+        logger.info(f"Breakpoint at 0x{address} {'enabled' if enable else 'disabled'}")
+        return result
+
+    def delete_hardware_breakpoint(self, address: str) -> dict[str, Any]:
+        """
+        Delete a hardware breakpoint.
+
+        Args:
+            address: Breakpoint address (hex string)
+
+        Returns:
+            Dictionary with success status
+
+        Example:
+            bridge.set_hardware_breakpoint("0x401000", "execute")
+            # ... later ...
+            bridge.delete_hardware_breakpoint("0x401000")
+        """
+        if address.startswith("0x"):
+            address = address[2:]
+
+        data = {"address": address}
+        result = self._request("/api/breakpoint/hardware/delete", data)
+        logger.info(f"Deleted hardware breakpoint at 0x{address}")
+        return result
+
+    def toggle_hardware_breakpoint(self, address: str, enable: bool = True) -> dict[str, Any]:
+        """
+        Enable or disable a hardware breakpoint without deleting it.
+
+        Args:
+            address: Breakpoint address (hex string)
+            enable: True to enable, False to disable
+
+        Returns:
+            Dictionary with address and enabled status
+
+        Example:
+            bridge.set_hardware_breakpoint("0x401000", "write", 4)
+            bridge.toggle_hardware_breakpoint("0x401000", enable=False)
+        """
+        if address.startswith("0x"):
+            address = address[2:]
+
+        data = {
+            "address": address,
+            "enable": 1 if enable else 0
+        }
+
+        result = self._request("/api/breakpoint/hardware/toggle", data)
+        logger.info(f"Hardware breakpoint at 0x{address} {'enabled' if enable else 'disabled'}")
+        return result
+
+    def toggle_memory_breakpoint(self, address: str, enable: bool = True) -> dict[str, Any]:
+        """
+        Enable or disable a memory breakpoint without deleting it.
+
+        Args:
+            address: Breakpoint address (hex string)
+            enable: True to enable, False to disable
+
+        Returns:
+            Dictionary with address and enabled status
+        """
+        if address.startswith("0x"):
+            address = address[2:]
+
+        data = {
+            "address": address,
+            "enable": 1 if enable else 0
+        }
+
+        result = self._request("/api/breakpoint/memory/toggle", data)
+        logger.info(f"Memory breakpoint at 0x{address} {'enabled' if enable else 'disabled'}")
+        return result
+
+    def list_all_breakpoints(self) -> dict[str, Any]:
+        """
+        List all breakpoints of all types (software, hardware, memory).
+
+        Returns:
+            Dictionary with:
+                - breakpoints: Dictionary containing:
+                    - software: List of software breakpoints
+                    - hardware: List of hardware breakpoints
+                    - memory: List of memory breakpoints
+
+        Each breakpoint entry contains:
+            - address: Breakpoint address (hex string)
+            - enabled: Whether breakpoint is enabled
+            - type: Breakpoint type (for hw/memory)
+            - singleshoot: Whether it's a single-shot BP (software only)
+            - size: Access size (hardware only)
+
+        Example:
+            bps = bridge.list_all_breakpoints()
+            for bp in bps["breakpoints"]["software"]:
+                print(f"SW BP at {bp['address']}, enabled={bp['enabled']}")
+            for bp in bps["breakpoints"]["hardware"]:
+                print(f"HW BP at {bp['address']}, type={bp['type']}")
+        """
+        result = self._request("/api/breakpoint/list/all")
+        return result

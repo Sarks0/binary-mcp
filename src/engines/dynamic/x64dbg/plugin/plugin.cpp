@@ -1,4 +1,5 @@
 #include "plugin.h"
+#include "event_system.h"
 #include "../pipe_protocol.h"
 #include <cstdio>
 #include <cstdarg>
@@ -65,7 +66,26 @@ enum RequestType {
     HIDE_DEBUGGER = 90,
 
     // Health check
-    PING = 99
+    PING = 99,
+
+    // Events
+    GET_EVENTS = 100,
+    CLEAR_EVENTS = 101,
+    GET_EVENT_STATUS = 102,
+
+    // Memory allocation (Phase 3)
+    VIRT_ALLOC = 110,
+    VIRT_FREE = 111,
+    VIRT_PROTECT = 112,
+    MEM_SET = 113,
+    CHECK_VALID_PTR = 114,
+
+    // Enhanced breakpoints (Phase 3)
+    TOGGLE_BREAKPOINT = 120,
+    DELETE_HARDWARE_BREAKPOINT = 121,
+    TOGGLE_HARDWARE_BREAKPOINT = 122,
+    TOGGLE_MEMORY_BREAKPOINT = 123,
+    LIST_ALL_BREAKPOINTS = 124
 };
 
 // Plugin globals
@@ -1107,6 +1127,653 @@ std::string HandleGetMemoryInfo(const std::string& request) {
     return BuildJsonResponse(true, data.str());
 }
 
+// ============================================================================
+// MEMORY ALLOCATION HANDLERS (Phase 3)
+// ============================================================================
+
+// Handler: VIRT_ALLOC - Allocate memory in debugee's address space
+std::string HandleVirtAlloc(const std::string& request) {
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+    }
+
+    int size = ExtractIntField(request, "size", 4096);  // Default: 4KB (one page)
+    std::string addressStr = ExtractStringField(request, "address");
+    duint preferredAddr = addressStr.empty() ? 0 : DbgValFromString(addressStr.c_str());
+
+    // Validate size (max 16MB)
+    if (size <= 0 || size > 16 * 1024 * 1024) {
+        return BuildJsonResponse(false, "\"error\":\"Invalid size (must be 1 to 16MB)\"");
+    }
+
+    // Use VirtualAllocEx via x64dbg command
+    // Format: alloc size [, address]
+    char cmd[256];
+    if (preferredAddr != 0) {
+        snprintf(cmd, sizeof(cmd), "alloc %d, %llx", size, preferredAddr);
+    } else {
+        snprintf(cmd, sizeof(cmd), "alloc %d", size);
+    }
+
+    if (!DbgCmdExec(cmd)) {
+        return BuildJsonResponse(false, "\"error\":\"Failed to allocate memory\"");
+    }
+
+    // Get the result from $result register
+    duint allocatedAddr = DbgValFromString("$result");
+
+    if (allocatedAddr == 0) {
+        return BuildJsonResponse(false, "\"error\":\"VirtualAllocEx returned NULL\"");
+    }
+
+    LogInfo("Allocated %d bytes at 0x%llx", size, allocatedAddr);
+
+    std::stringstream data;
+    data << "\"address\":\"" << std::hex << allocatedAddr << std::dec << "\","
+         << "\"size\":" << size;
+
+    return BuildJsonResponse(true, data.str());
+}
+
+// Handler: VIRT_FREE - Free memory in debugee's address space
+std::string HandleVirtFree(const std::string& request) {
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+    }
+
+    std::string addressStr = ExtractStringField(request, "address");
+    if (addressStr.empty()) {
+        return BuildJsonResponse(false, "\"error\":\"Missing address\"");
+    }
+
+    duint address = DbgValFromString(addressStr.c_str());
+
+    // Use free command
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "free %llx", address);
+
+    if (!DbgCmdExec(cmd)) {
+        return BuildJsonResponse(false, "\"error\":\"Failed to free memory\"");
+    }
+
+    LogInfo("Freed memory at 0x%llx", address);
+    return BuildJsonResponse(true, "\"message\":\"Memory freed\"");
+}
+
+// Handler: VIRT_PROTECT - Change memory protection
+std::string HandleVirtProtect(const std::string& request) {
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+    }
+
+    std::string addressStr = ExtractStringField(request, "address");
+    std::string protectionStr = ExtractStringField(request, "protection");
+    int size = ExtractIntField(request, "size", 4096);
+
+    if (addressStr.empty()) {
+        return BuildJsonResponse(false, "\"error\":\"Missing address\"");
+    }
+
+    duint address = DbgValFromString(addressStr.c_str());
+
+    // Map protection string to Windows constants
+    // Common values: "rwx", "rx", "rw", "r", "x", "wx"
+    DWORD protection = PAGE_READWRITE;  // Default
+    if (protectionStr == "rwx" || protectionStr == "RWX") {
+        protection = PAGE_EXECUTE_READWRITE;
+    } else if (protectionStr == "rx" || protectionStr == "RX") {
+        protection = PAGE_EXECUTE_READ;
+    } else if (protectionStr == "rw" || protectionStr == "RW") {
+        protection = PAGE_READWRITE;
+    } else if (protectionStr == "r" || protectionStr == "R") {
+        protection = PAGE_READONLY;
+    } else if (protectionStr == "x" || protectionStr == "X") {
+        protection = PAGE_EXECUTE;
+    } else if (protectionStr == "wx" || protectionStr == "WX") {
+        protection = PAGE_EXECUTE_WRITECOPY;
+    } else if (protectionStr == "n" || protectionStr == "N" || protectionStr == "none") {
+        protection = PAGE_NOACCESS;
+    }
+
+    // Use setpagerights command (x64dbg specific)
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "setpagerights %llx, %d, %x", address, size, protection);
+
+    if (!DbgCmdExec(cmd)) {
+        return BuildJsonResponse(false, "\"error\":\"Failed to change memory protection\"");
+    }
+
+    LogInfo("Changed protection at 0x%llx to 0x%x", address, protection);
+
+    std::stringstream data;
+    data << "\"address\":\"" << std::hex << address << std::dec << "\","
+         << "\"protection\":" << protection;
+
+    return BuildJsonResponse(true, data.str());
+}
+
+// Handler: MEM_SET - Fill memory with a value
+std::string HandleMemSet(const std::string& request) {
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+    }
+
+    std::string addressStr = ExtractStringField(request, "address");
+    int value = ExtractIntField(request, "value", 0);
+    int size = ExtractIntField(request, "size", 0);
+
+    if (addressStr.empty() || size <= 0) {
+        return BuildJsonResponse(false, "\"error\":\"Missing address or invalid size\"");
+    }
+
+    // Validate size (max 1MB)
+    if (size > 1024 * 1024) {
+        return BuildJsonResponse(false, "\"error\":\"Size too large (max 1MB)\"");
+    }
+
+    duint address = DbgValFromString(addressStr.c_str());
+
+    // Create buffer with repeated value
+    std::vector<unsigned char> buffer(size, static_cast<unsigned char>(value & 0xFF));
+
+    // Write to memory
+    if (!DbgMemWrite(address, buffer.data(), size)) {
+        return BuildJsonResponse(false, "\"error\":\"Failed to write memory\"");
+    }
+
+    LogInfo("Filled %d bytes at 0x%llx with 0x%02x", size, address, value & 0xFF);
+
+    std::stringstream data;
+    data << "\"address\":\"" << std::hex << address << std::dec << "\","
+         << "\"size\":" << size << ","
+         << "\"value\":" << (value & 0xFF);
+
+    return BuildJsonResponse(true, data.str());
+}
+
+// Handler: CHECK_VALID_PTR - Check if address is readable
+std::string HandleCheckValidPtr(const std::string& request) {
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+    }
+
+    std::string addressStr = ExtractStringField(request, "address");
+    if (addressStr.empty()) {
+        return BuildJsonResponse(false, "\"error\":\"Missing address\"");
+    }
+
+    duint address = DbgValFromString(addressStr.c_str());
+
+    bool isValid = DbgMemIsValidReadPtr(address);
+
+    std::stringstream data;
+    data << "\"address\":\"" << std::hex << address << std::dec << "\","
+         << "\"valid\":" << (isValid ? "true" : "false");
+
+    return BuildJsonResponse(true, data.str());
+}
+
+// ============================================================================
+// ENHANCED BREAKPOINT HANDLERS (Phase 3)
+// ============================================================================
+
+// Handler: TOGGLE_BREAKPOINT - Enable/disable software breakpoint
+std::string HandleToggleBreakpoint(const std::string& request) {
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+    }
+
+    std::string addressStr = ExtractStringField(request, "address");
+    int enable = ExtractIntField(request, "enable", 1);  // Default: enable
+
+    if (addressStr.empty()) {
+        return BuildJsonResponse(false, "\"error\":\"Missing address\"");
+    }
+
+    duint address = DbgValFromString(addressStr.c_str());
+
+    // Use bpe (breakpoint enable) or bpd (breakpoint disable)
+    char cmd[256];
+    if (enable) {
+        snprintf(cmd, sizeof(cmd), "bpe %llx", address);
+    } else {
+        snprintf(cmd, sizeof(cmd), "bpd %llx", address);
+    }
+
+    if (!DbgCmdExec(cmd)) {
+        return BuildJsonResponse(false, "\"error\":\"Failed to toggle breakpoint\"");
+    }
+
+    LogInfo("Breakpoint at 0x%llx %s", address, enable ? "enabled" : "disabled");
+
+    std::stringstream data;
+    data << "\"address\":\"" << std::hex << address << std::dec << "\","
+         << "\"enabled\":" << (enable ? "true" : "false");
+
+    return BuildJsonResponse(true, data.str());
+}
+
+// Handler: DELETE_HARDWARE_BREAKPOINT - Delete hardware breakpoint
+std::string HandleDeleteHardwareBreakpoint(const std::string& request) {
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+    }
+
+    std::string addressStr = ExtractStringField(request, "address");
+    if (addressStr.empty()) {
+        return BuildJsonResponse(false, "\"error\":\"Missing address\"");
+    }
+
+    duint address = DbgValFromString(addressStr.c_str());
+
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "bphc %llx", address);
+    DbgCmdExec(cmd);
+
+    LogInfo("Hardware breakpoint deleted at 0x%llx", address);
+    return BuildJsonResponse(true, "\"message\":\"Hardware breakpoint deleted\"");
+}
+
+// Handler: TOGGLE_HARDWARE_BREAKPOINT - Enable/disable hardware breakpoint
+std::string HandleToggleHardwareBreakpoint(const std::string& request) {
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+    }
+
+    std::string addressStr = ExtractStringField(request, "address");
+    int enable = ExtractIntField(request, "enable", 1);
+
+    if (addressStr.empty()) {
+        return BuildJsonResponse(false, "\"error\":\"Missing address\"");
+    }
+
+    duint address = DbgValFromString(addressStr.c_str());
+
+    char cmd[256];
+    if (enable) {
+        snprintf(cmd, sizeof(cmd), "bphe %llx", address);
+    } else {
+        snprintf(cmd, sizeof(cmd), "bphd %llx", address);
+    }
+
+    if (!DbgCmdExec(cmd)) {
+        return BuildJsonResponse(false, "\"error\":\"Failed to toggle hardware breakpoint\"");
+    }
+
+    LogInfo("Hardware breakpoint at 0x%llx %s", address, enable ? "enabled" : "disabled");
+
+    std::stringstream data;
+    data << "\"address\":\"" << std::hex << address << std::dec << "\","
+         << "\"enabled\":" << (enable ? "true" : "false");
+
+    return BuildJsonResponse(true, data.str());
+}
+
+// Handler: TOGGLE_MEMORY_BREAKPOINT - Enable/disable memory breakpoint
+std::string HandleToggleMemoryBreakpoint(const std::string& request) {
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+    }
+
+    std::string addressStr = ExtractStringField(request, "address");
+    int enable = ExtractIntField(request, "enable", 1);
+
+    if (addressStr.empty()) {
+        return BuildJsonResponse(false, "\"error\":\"Missing address\"");
+    }
+
+    duint address = DbgValFromString(addressStr.c_str());
+
+    char cmd[256];
+    if (enable) {
+        snprintf(cmd, sizeof(cmd), "bpme %llx", address);
+    } else {
+        snprintf(cmd, sizeof(cmd), "bpmd %llx", address);
+    }
+
+    if (!DbgCmdExec(cmd)) {
+        return BuildJsonResponse(false, "\"error\":\"Failed to toggle memory breakpoint\"");
+    }
+
+    LogInfo("Memory breakpoint at 0x%llx %s", address, enable ? "enabled" : "disabled");
+
+    std::stringstream data;
+    data << "\"address\":\"" << std::hex << address << std::dec << "\","
+         << "\"enabled\":" << (enable ? "true" : "false");
+
+    return BuildJsonResponse(true, data.str());
+}
+
+// Handler: LIST_ALL_BREAKPOINTS - List all breakpoints (software, hardware, memory)
+std::string HandleListAllBreakpoints(const std::string& request) {
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+    }
+
+    std::stringstream data;
+    data << "\"breakpoints\":{";
+
+    // Software breakpoints
+    {
+        BPMAP bpmap;
+        data << "\"software\":[";
+        if (DbgGetBpList(bp_normal, &bpmap)) {
+            for (int i = 0; i < bpmap.count; i++) {
+                if (i > 0) data << ",";
+                data << "{\"address\":\"" << std::hex << bpmap.bp[i].addr << std::dec << "\","
+                     << "\"enabled\":" << (bpmap.bp[i].enabled ? "true" : "false") << ","
+                     << "\"singleshoot\":" << (bpmap.bp[i].singleshoot ? "true" : "false") << "}";
+            }
+            if (bpmap.bp) BridgeFree(bpmap.bp);
+        }
+        data << "],";
+    }
+
+    // Hardware breakpoints
+    {
+        BPMAP bpmap;
+        data << "\"hardware\":[";
+        if (DbgGetBpList(bp_hardware, &bpmap)) {
+            for (int i = 0; i < bpmap.count; i++) {
+                if (i > 0) data << ",";
+
+                // Map hardware type
+                const char* hwType = "unknown";
+                switch (bpmap.bp[i].hwSize) {
+                    case 0: hwType = "execute"; break;
+                    case 1: hwType = "write"; break;
+                    case 2: hwType = "io"; break;
+                    case 3: hwType = "access"; break;
+                }
+
+                data << "{\"address\":\"" << std::hex << bpmap.bp[i].addr << std::dec << "\","
+                     << "\"enabled\":" << (bpmap.bp[i].enabled ? "true" : "false") << ","
+                     << "\"type\":\"" << hwType << "\","
+                     << "\"size\":" << (1 << bpmap.bp[i].hwSize) << "}";
+            }
+            if (bpmap.bp) BridgeFree(bpmap.bp);
+        }
+        data << "],";
+    }
+
+    // Memory breakpoints
+    {
+        BPMAP bpmap;
+        data << "\"memory\":[";
+        if (DbgGetBpList(bp_memory, &bpmap)) {
+            for (int i = 0; i < bpmap.count; i++) {
+                if (i > 0) data << ",";
+
+                // Map memory type
+                const char* memType = "access";
+                if (bpmap.bp[i].type == bp_memory) {
+                    // Memory breakpoint type is stored differently
+                    memType = "access";  // Default for now
+                }
+
+                data << "{\"address\":\"" << std::hex << bpmap.bp[i].addr << std::dec << "\","
+                     << "\"enabled\":" << (bpmap.bp[i].enabled ? "true" : "false") << ","
+                     << "\"type\":\"" << memType << "\"}";
+            }
+            if (bpmap.bp) BridgeFree(bpmap.bp);
+        }
+        data << "]";
+    }
+
+    data << "}";
+
+    return BuildJsonResponse(true, data.str());
+}
+
+// ============================================================================
+// EVENT HANDLERS
+// ============================================================================
+
+// Handler: GET_EVENTS - Get pending debug events
+std::string HandleGetEvents(const std::string& request) {
+    int maxEvents = ExtractIntField(request, "max_events", 100);
+    bool peek = ExtractIntField(request, "peek", 0) != 0;
+
+    EventQueue& queue = EventQueue::Instance();
+
+    std::string events;
+    if (peek) {
+        events = queue.PeekEvents(maxEvents);
+    } else {
+        events = queue.PopEvents(maxEvents);
+    }
+
+    std::stringstream data;
+    data << "\"events\":" << events << ","
+         << "\"queue_size\":" << queue.Size() << ","
+         << "\"next_event_id\":" << queue.GetNextEventId();
+
+    return BuildJsonResponse(true, data.str());
+}
+
+// Handler: CLEAR_EVENTS - Clear event queue
+std::string HandleClearEvents(const std::string& request) {
+    EventQueue::Instance().Clear();
+    return BuildJsonResponse(true, "\"message\":\"Event queue cleared\"");
+}
+
+// Handler: GET_EVENT_STATUS - Get event system status
+std::string HandleGetEventStatus(const std::string& request) {
+    EventQueue& queue = EventQueue::Instance();
+
+    std::stringstream data;
+    data << "\"enabled\":" << (queue.IsEnabled() ? "true" : "false") << ","
+         << "\"queue_size\":" << queue.Size() << ","
+         << "\"next_event_id\":" << queue.GetNextEventId();
+
+    return BuildJsonResponse(true, data.str());
+}
+
+// ============================================================================
+// DEBUG EVENT CALLBACKS
+// These are called by x64dbg when debug events occur
+// ============================================================================
+
+// Callback: Breakpoint hit
+void OnBreakpoint(CBTYPE cbType, PLUG_CB_BREAKPOINT* info) {
+    if (!info) return;
+
+    std::stringstream details;
+    details << "name=" << (info->breakpoint->name ? info->breakpoint->name : "")
+            << ";type=" << info->breakpoint->type
+            << ";enabled=" << info->breakpoint->enabled;
+
+    EventQueue::Instance().PushEvent(
+        DebugEventType::BREAKPOINT_HIT,
+        info->breakpoint->addr,
+        0,  // Thread ID not available in this callback
+        "",
+        details.str()
+    );
+}
+
+// Callback: Exception occurred
+void OnException(CBTYPE cbType, PLUG_CB_EXCEPTION* info) {
+    if (!info) return;
+
+    std::stringstream details;
+    details << "code=" << std::hex << info->Exception->ExceptionRecord.ExceptionCode << std::dec
+            << ";first_chance=" << info->Exception->dwFirstChance
+            << ";flags=" << info->Exception->ExceptionRecord.ExceptionFlags;
+
+    EventQueue::Instance().PushEvent(
+        DebugEventType::EXCEPTION,
+        reinterpret_cast<uint64_t>(info->Exception->ExceptionRecord.ExceptionAddress),
+        0,
+        "",
+        details.str()
+    );
+}
+
+// Callback: Debugger paused
+void OnPausedDebug(CBTYPE cbType, PLUG_CB_PAUSEDEBUG* info) {
+    // Get current address
+    duint cip = DbgValFromString("cip");
+
+    EventQueue::Instance().PushEvent(
+        DebugEventType::PAUSED,
+        cip,
+        DbgGetThreadId(),
+        "",
+        ""
+    );
+}
+
+// Callback: Debugger resumed
+void OnResumedDebug(CBTYPE cbType, PLUG_CB_RESUMEDEBUG* info) {
+    EventQueue::Instance().PushEvent(
+        DebugEventType::RUNNING,
+        0,
+        DbgGetThreadId(),
+        "",
+        ""
+    );
+}
+
+// Callback: Stepped (single step completed)
+void OnStepped(CBTYPE cbType, PLUG_CB_STEPPED* info) {
+    duint cip = DbgValFromString("cip");
+
+    EventQueue::Instance().PushEvent(
+        DebugEventType::STEPPED,
+        cip,
+        DbgGetThreadId(),
+        "",
+        ""
+    );
+}
+
+// Callback: Process created (debugging started)
+void OnCreateProcess(CBTYPE cbType, PLUG_CB_CREATEPROCESS* info) {
+    if (!info || !info->CreateProcessInfo) return;
+
+    std::stringstream details;
+    details << "base=" << std::hex << info->CreateProcessInfo->lpBaseOfImage << std::dec;
+
+    char modulePath[MAX_PATH] = "";
+    if (info->CreateProcessInfo->lpBaseOfImage) {
+        DbgGetModuleAt(reinterpret_cast<duint>(info->CreateProcessInfo->lpBaseOfImage), modulePath);
+    }
+
+    EventQueue::Instance().PushEvent(
+        DebugEventType::PROCESS_STARTED,
+        reinterpret_cast<uint64_t>(info->CreateProcessInfo->lpBaseOfImage),
+        reinterpret_cast<uint32_t>(reinterpret_cast<uintptr_t>(info->CreateProcessInfo->hProcess)),
+        modulePath,
+        details.str()
+    );
+}
+
+// Callback: Process exited
+void OnExitProcess(CBTYPE cbType, PLUG_CB_EXITPROCESS* info) {
+    if (!info) return;
+
+    std::stringstream details;
+    details << "exit_code=" << info->ExitProcess->dwExitCode;
+
+    EventQueue::Instance().PushEvent(
+        DebugEventType::PROCESS_EXITED,
+        0,
+        0,
+        "",
+        details.str()
+    );
+}
+
+// Callback: Thread created
+void OnCreateThread(CBTYPE cbType, PLUG_CB_CREATETHREAD* info) {
+    if (!info || !info->CreateThread) return;
+
+    std::stringstream details;
+    details << "start_address=" << std::hex << info->CreateThread->lpStartAddress << std::dec;
+
+    EventQueue::Instance().PushEvent(
+        DebugEventType::THREAD_CREATED,
+        reinterpret_cast<uint64_t>(info->CreateThread->lpStartAddress),
+        info->dwThreadId,
+        "",
+        details.str()
+    );
+}
+
+// Callback: Thread exited
+void OnExitThread(CBTYPE cbType, PLUG_CB_EXITTHREAD* info) {
+    if (!info) return;
+
+    std::stringstream details;
+    details << "exit_code=" << info->ExitThread->dwExitCode;
+
+    EventQueue::Instance().PushEvent(
+        DebugEventType::THREAD_EXITED,
+        0,
+        info->dwThreadId,
+        "",
+        details.str()
+    );
+}
+
+// Callback: Module loaded
+void OnLoadDll(CBTYPE cbType, PLUG_CB_LOADDLL* info) {
+    if (!info || !info->LoadDll) return;
+
+    char modulePath[MAX_PATH] = "";
+    if (info->LoadDll->lpBaseOfDll) {
+        DbgGetModuleAt(reinterpret_cast<duint>(info->LoadDll->lpBaseOfDll), modulePath);
+    }
+
+    EventQueue::Instance().PushEvent(
+        DebugEventType::MODULE_LOADED,
+        reinterpret_cast<uint64_t>(info->LoadDll->lpBaseOfDll),
+        0,
+        modulePath,
+        ""
+    );
+}
+
+// Callback: Module unloaded
+void OnUnloadDll(CBTYPE cbType, PLUG_CB_UNLOADDLL* info) {
+    if (!info || !info->UnloadDll) return;
+
+    EventQueue::Instance().PushEvent(
+        DebugEventType::MODULE_UNLOADED,
+        reinterpret_cast<uint64_t>(info->UnloadDll->lpBaseOfDll),
+        0,
+        "",
+        ""
+    );
+}
+
+// Callback: Debug string output
+void OnDebugString(CBTYPE cbType, PLUG_CB_DEBUGSTRING* info) {
+    if (!info) return;
+
+    EventQueue::Instance().PushEvent(
+        DebugEventType::DEBUG_STRING,
+        0,
+        0,
+        "",
+        info->string ? info->string : ""
+    );
+}
+
+// Callback: System breakpoint (initial break)
+void OnSystemBreakpoint(CBTYPE cbType, PLUG_CB_SYSTEMBREAKPOINT* info) {
+    duint cip = DbgValFromString("cip");
+
+    EventQueue::Instance().PushEvent(
+        DebugEventType::SYSTEM_BREAKPOINT,
+        cip,
+        DbgGetThreadId(),
+        "",
+        ""
+    );
+}
+
 // Handler: LOAD_BINARY - Load binary into debugger
 std::string HandleLoadBinary(const std::string& request) {
     std::string path = ExtractStringField(request, "path");
@@ -1350,6 +2017,51 @@ static DWORD WINAPI PipeServerThread(LPVOID lpParam) {
                     // Health check
                     case PING:
                         response = BuildJsonResponse(true, "\"message\":\"pong\"");
+                        break;
+
+                    // Events
+                    case GET_EVENTS:
+                        response = HandleGetEvents(request);
+                        break;
+                    case CLEAR_EVENTS:
+                        response = HandleClearEvents(request);
+                        break;
+                    case GET_EVENT_STATUS:
+                        response = HandleGetEventStatus(request);
+                        break;
+
+                    // Memory allocation (Phase 3)
+                    case VIRT_ALLOC:
+                        response = HandleVirtAlloc(request);
+                        break;
+                    case VIRT_FREE:
+                        response = HandleVirtFree(request);
+                        break;
+                    case VIRT_PROTECT:
+                        response = HandleVirtProtect(request);
+                        break;
+                    case MEM_SET:
+                        response = HandleMemSet(request);
+                        break;
+                    case CHECK_VALID_PTR:
+                        response = HandleCheckValidPtr(request);
+                        break;
+
+                    // Enhanced breakpoints (Phase 3)
+                    case TOGGLE_BREAKPOINT:
+                        response = HandleToggleBreakpoint(request);
+                        break;
+                    case DELETE_HARDWARE_BREAKPOINT:
+                        response = HandleDeleteHardwareBreakpoint(request);
+                        break;
+                    case TOGGLE_HARDWARE_BREAKPOINT:
+                        response = HandleToggleHardwareBreakpoint(request);
+                        break;
+                    case TOGGLE_MEMORY_BREAKPOINT:
+                        response = HandleToggleMemoryBreakpoint(request);
+                        break;
+                    case LIST_ALL_BREAKPOINTS:
+                        response = HandleListAllBreakpoints(request);
                         break;
 
                     default:
@@ -1685,6 +2397,23 @@ void pluginSetup() {
 
     // Register menu callback
     _plugin_registercallback(g_pluginHandle, CB_MENUENTRY, (CBPLUGIN)MenuEntryCallback);
+
+    // Register debug event callbacks for event system
+    _plugin_registercallback(g_pluginHandle, CB_BREAKPOINT, (CBPLUGIN)OnBreakpoint);
+    _plugin_registercallback(g_pluginHandle, CB_EXCEPTION, (CBPLUGIN)OnException);
+    _plugin_registercallback(g_pluginHandle, CB_PAUSEDEBUG, (CBPLUGIN)OnPausedDebug);
+    _plugin_registercallback(g_pluginHandle, CB_RESUMEDEBUG, (CBPLUGIN)OnResumedDebug);
+    _plugin_registercallback(g_pluginHandle, CB_STEPPED, (CBPLUGIN)OnStepped);
+    _plugin_registercallback(g_pluginHandle, CB_CREATEPROCESS, (CBPLUGIN)OnCreateProcess);
+    _plugin_registercallback(g_pluginHandle, CB_EXITPROCESS, (CBPLUGIN)OnExitProcess);
+    _plugin_registercallback(g_pluginHandle, CB_CREATETHREAD, (CBPLUGIN)OnCreateThread);
+    _plugin_registercallback(g_pluginHandle, CB_EXITTHREAD, (CBPLUGIN)OnExitThread);
+    _plugin_registercallback(g_pluginHandle, CB_LOADDLL, (CBPLUGIN)OnLoadDll);
+    _plugin_registercallback(g_pluginHandle, CB_UNLOADDLL, (CBPLUGIN)OnUnloadDll);
+    _plugin_registercallback(g_pluginHandle, CB_DEBUGSTRING, (CBPLUGIN)OnDebugString);
+    _plugin_registercallback(g_pluginHandle, CB_SYSTEMBREAKPOINT, (CBPLUGIN)OnSystemBreakpoint);
+
+    LogInfo("Registered 13 debug event callbacks");
 
     // Add menu items
     if (g_hMenu) {

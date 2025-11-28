@@ -128,6 +128,19 @@ Base URL: `http://localhost:8765`
 | `/api/step_over` | POST | Step over next instruction |
 | `/api/step_out` | POST | Step out of current function |
 
+### Wait/Synchronization (NEW)
+
+Essential for automation scripts - block until debugger reaches desired state.
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/wait/paused` | POST | Wait until debugger pauses (breakpoint, exception) |
+| `/api/wait/running` | POST | Wait until debugger is running |
+| `/api/wait/debugging` | POST | Wait until binary is loaded |
+
+**Parameters** (JSON body):
+- `timeout`: Maximum wait time in milliseconds (default: 30000, max: 300000)
+
 ### Breakpoints
 
 | Endpoint | Method | Description |
@@ -152,6 +165,75 @@ Base URL: `http://localhost:8765`
 | `/api/memory/read` | POST | Read memory |
 | `/api/memory/write` | POST | Write memory |
 | `/api/disassemble` | POST | Disassemble at address |
+
+### Memory Allocation (NEW - Phase 3)
+
+Memory management functions for advanced debugging and analysis.
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/memory/alloc` | POST | Allocate memory in debugee's address space |
+| `/api/memory/free` | POST | Free previously allocated memory |
+| `/api/memory/protect` | POST | Change memory protection (rwx, rx, rw, etc.) |
+| `/api/memory/set` | POST | Fill memory with a byte value (memset) |
+| `/api/memory/check` | POST | Check if address is readable |
+
+**Parameters:**
+
+`/api/memory/alloc`:
+- `size`: Number of bytes to allocate (default: 4096, max: 16MB)
+- `address`: Optional preferred address
+
+`/api/memory/protect`:
+- `address`: Memory address
+- `protection`: "rwx", "rx", "rw", "r", "x", or "n" (none)
+- `size`: Size in bytes (default: 4096)
+
+`/api/memory/set`:
+- `address`: Start address
+- `value`: Byte value (0-255)
+- `size`: Number of bytes to fill
+
+### Enhanced Breakpoints (NEW - Phase 3)
+
+Extended breakpoint functionality for all breakpoint types.
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/breakpoint/toggle` | POST | Enable/disable software breakpoint |
+| `/api/breakpoint/hardware/delete` | POST | Delete hardware breakpoint |
+| `/api/breakpoint/hardware/toggle` | POST | Enable/disable hardware breakpoint |
+| `/api/breakpoint/memory/toggle` | POST | Enable/disable memory breakpoint |
+| `/api/breakpoint/list/all` | GET/POST | List all breakpoints (software, hardware, memory) |
+
+**Parameters:**
+- `address`: Breakpoint address
+- `enable`: 1 to enable, 0 to disable (for toggle endpoints)
+
+### Events (NEW - Phase 2)
+
+Debug event system for capturing breakpoints, exceptions, and other debug events.
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/events` | POST | Get pending events from queue |
+| `/api/events/clear` | POST | Clear event queue |
+| `/api/events/status` | GET/POST | Get event system status |
+
+**Event Types:**
+- `breakpoint_hit` - Breakpoint triggered
+- `exception` - Exception occurred
+- `paused` - Debugger paused
+- `running` - Debugger resumed
+- `stepped` - Single step completed
+- `process_started` - Process created
+- `process_exited` - Process terminated
+- `thread_created` - New thread created
+- `thread_exited` - Thread terminated
+- `module_loaded` - DLL/module loaded
+- `module_unloaded` - DLL/module unloaded
+- `debug_string` - OutputDebugString message
+- `system_breakpoint` - Initial system breakpoint
 
 ## API Examples
 
@@ -198,6 +280,155 @@ Response:
   "rbx": "0000000000000001",
   "rcx": "00007FF7ABCD1234",
   ...
+}
+```
+
+### Wait for Breakpoint (NEW)
+```bash
+# Start execution
+curl -X POST http://localhost:8765/api/run
+
+# Wait up to 60 seconds for breakpoint/exception
+curl -X POST http://localhost:8765/api/wait/paused \
+  -H "Content-Type: application/json" \
+  -d '{"timeout": 60000}'
+```
+
+Response (success):
+```json
+{
+  "success": true,
+  "state": "paused",
+  "elapsed_ms": "1234",
+  "current_address": "0x00401234"
+}
+```
+
+Response (timeout):
+```json
+{
+  "success": false,
+  "error": "Timeout waiting for debugger to pause",
+  "timeout_ms": "60000",
+  "elapsed_ms": "60000",
+  "current_state": "running"
+}
+```
+
+### Get Debug Events (NEW)
+```bash
+# Get up to 50 events from queue
+curl -X POST http://localhost:8765/api/events \
+  -H "Content-Type: application/json" \
+  -d '{"max_events": 50}'
+```
+
+Response:
+```json
+{
+  "success": true,
+  "events": [
+    {
+      "id": 1,
+      "type": "process_started",
+      "timestamp": 0,
+      "address": "0x00400000",
+      "thread_id": 1234,
+      "module": "C:\\malware.exe",
+      "details": "base=0x400000"
+    },
+    {
+      "id": 2,
+      "type": "module_loaded",
+      "timestamp": 15,
+      "address": "0x76D00000",
+      "thread_id": 0,
+      "module": "C:\\Windows\\System32\\kernel32.dll"
+    },
+    {
+      "id": 3,
+      "type": "breakpoint_hit",
+      "timestamp": 1234,
+      "address": "0x00401000",
+      "thread_id": 1234,
+      "details": "name=;type=0;enabled=1"
+    }
+  ],
+  "queue_size": 0,
+  "next_event_id": 4
+}
+```
+
+### Allocate Memory (NEW - Phase 3)
+```bash
+# Allocate 4KB of memory
+curl -X POST http://localhost:8765/api/memory/alloc \
+  -H "Content-Type: application/json" \
+  -d '{"size": 4096}'
+```
+
+Response:
+```json
+{
+  "success": true,
+  "address": "12340000",
+  "size": 4096
+}
+```
+
+### Change Memory Protection (NEW - Phase 3)
+```bash
+# Make code region writable for patching
+curl -X POST http://localhost:8765/api/memory/protect \
+  -H "Content-Type: application/json" \
+  -d '{"address": "401000", "protection": "rwx", "size": 4096}'
+```
+
+Response:
+```json
+{
+  "success": true,
+  "address": "401000",
+  "protection": 64
+}
+```
+
+### Fill Memory (NEW - Phase 3)
+```bash
+# Fill memory with NOPs (0x90)
+curl -X POST http://localhost:8765/api/memory/set \
+  -H "Content-Type: application/json" \
+  -d '{"address": "401000", "value": 144, "size": 10}'
+```
+
+Response:
+```json
+{
+  "success": true,
+  "address": "401000",
+  "size": 10,
+  "value": 144
+}
+```
+
+### List All Breakpoints (NEW - Phase 3)
+```bash
+curl http://localhost:8765/api/breakpoint/list/all
+```
+
+Response:
+```json
+{
+  "success": true,
+  "breakpoints": {
+    "software": [
+      {"address": "401000", "enabled": true, "singleshoot": false}
+    ],
+    "hardware": [
+      {"address": "500000", "enabled": true, "type": "write", "size": 4}
+    ],
+    "memory": []
+  }
 }
 ```
 

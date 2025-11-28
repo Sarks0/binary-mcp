@@ -166,6 +166,31 @@ Essential for automation scripts - block until debugger reaches desired state.
 | `/api/memory/write` | POST | Write memory |
 | `/api/disassemble` | POST | Disassemble at address |
 
+### Events (NEW - Phase 2)
+
+Debug event system for capturing breakpoints, exceptions, and other debug events.
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/events` | POST | Get pending events from queue |
+| `/api/events/clear` | POST | Clear event queue |
+| `/api/events/status` | GET/POST | Get event system status |
+
+**Event Types:**
+- `breakpoint_hit` - Breakpoint triggered
+- `exception` - Exception occurred
+- `paused` - Debugger paused
+- `running` - Debugger resumed
+- `stepped` - Single step completed
+- `process_started` - Process created
+- `process_exited` - Process terminated
+- `thread_created` - New thread created
+- `thread_exited` - Thread terminated
+- `module_loaded` - DLL/module loaded
+- `module_unloaded` - DLL/module unloaded
+- `debug_string` - OutputDebugString message
+- `system_breakpoint` - Initial system breakpoint
+
 ## API Examples
 
 ### Get Status
@@ -243,6 +268,50 @@ Response (timeout):
   "timeout_ms": "60000",
   "elapsed_ms": "60000",
   "current_state": "running"
+}
+```
+
+### Get Debug Events (NEW)
+```bash
+# Get up to 50 events from queue
+curl -X POST http://localhost:8765/api/events \
+  -H "Content-Type: application/json" \
+  -d '{"max_events": 50}'
+```
+
+Response:
+```json
+{
+  "success": true,
+  "events": [
+    {
+      "id": 1,
+      "type": "process_started",
+      "timestamp": 0,
+      "address": "0x00400000",
+      "thread_id": 1234,
+      "module": "C:\\malware.exe",
+      "details": "base=0x400000"
+    },
+    {
+      "id": 2,
+      "type": "module_loaded",
+      "timestamp": 15,
+      "address": "0x76D00000",
+      "thread_id": 0,
+      "module": "C:\\Windows\\System32\\kernel32.dll"
+    },
+    {
+      "id": 3,
+      "type": "breakpoint_hit",
+      "timestamp": 1234,
+      "address": "0x00401000",
+      "thread_id": 1234,
+      "details": "name=;type=0;enabled=1"
+    }
+  ],
+  "queue_size": 0,
+  "next_event_id": 4
 }
 ```
 

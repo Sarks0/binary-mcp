@@ -1559,4 +1559,193 @@ def register_dynamic_tools(app: FastMCP) -> None:
                         "See FUTURE_FEATURES.md for implementation status.")
             return f"Error: {e}"
 
-    logger.info("Registered 41 dynamic analysis tools")
+    # =========================================================================
+    # Event System Tools
+    # =========================================================================
+
+    @app.tool()
+    def x64dbg_get_events(max_events: int = 50) -> str:
+        """
+        Get pending debug events from the event queue.
+
+        The event system captures debug events as they occur:
+        - breakpoint_hit: Breakpoint was triggered
+        - exception: Exception occurred
+        - paused: Debugger paused
+        - running: Debugger resumed
+        - stepped: Single step completed
+        - process_started: Process created
+        - process_exited: Process terminated
+        - thread_created: New thread created
+        - thread_exited: Thread terminated
+        - module_loaded: DLL/module loaded
+        - module_unloaded: DLL/module unloaded
+        - debug_string: OutputDebugString message
+
+        Args:
+            max_events: Maximum number of events to return (default: 50)
+
+        Returns:
+            List of debug events with details
+
+        Example:
+            x64dbg_run()
+            # ... wait for execution ...
+            x64dbg_get_events()  # See what happened
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            result = bridge.get_events(max_events=max_events)
+
+            events = result.get("events", [])
+            queue_size = result.get("queue_size", 0)
+
+            if not events:
+                return f"No events in queue (queue size: {queue_size})"
+
+            output = [
+                f"Debug Events ({len(events)} returned, {queue_size} remaining):",
+                "-" * 60
+            ]
+
+            for event in events:
+                event_id = event.get("id", "?")
+                event_type = event.get("type", "unknown")
+                timestamp = event.get("timestamp", 0)
+                address = event.get("address", "0")
+                thread_id = event.get("thread_id", 0)
+                module = event.get("module", "")
+                details = event.get("details", "")
+
+                line = f"[{event_id}] {event_type}"
+                if address != "0":
+                    line += f" @ 0x{address}"
+                if thread_id:
+                    line += f" (thread {thread_id})"
+                if module:
+                    line += f" [{module}]"
+                line += f" +{timestamp}ms"
+
+                output.append(line)
+                if details:
+                    output.append(f"    {details}")
+
+            return "\n".join(output)
+
+        except Exception as e:
+            logger.error(f"x64dbg_get_events failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    def x64dbg_clear_events() -> str:
+        """
+        Clear all pending events from the event queue.
+
+        Use this before starting a new analysis to get a clean event history.
+
+        Returns:
+            Confirmation message
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            bridge.clear_events()
+            return "Event queue cleared"
+
+        except Exception as e:
+            logger.error(f"x64dbg_clear_events failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    def x64dbg_event_status() -> str:
+        """
+        Get event system status.
+
+        Shows whether event collection is enabled and queue size.
+
+        Returns:
+            Event system status information
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            result = bridge.get_event_status()
+
+            enabled = result.get("enabled", False)
+            queue_size = result.get("queue_size", 0)
+            next_id = result.get("next_event_id", 0)
+
+            return (
+                f"Event System Status:\n"
+                f"  Enabled: {enabled}\n"
+                f"  Queue Size: {queue_size}\n"
+                f"  Next Event ID: {next_id}"
+            )
+
+        except Exception as e:
+            logger.error(f"x64dbg_event_status failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    def x64dbg_run_until_event(
+        event_types: str = "breakpoint_hit,exception,paused",
+        timeout_seconds: int = 30
+    ) -> str:
+        """
+        Run execution and wait for a specific event type.
+
+        This is the recommended way to run and wait for events.
+        More reliable than run_and_wait() for complex scenarios.
+
+        Args:
+            event_types: Comma-separated event types to wait for
+                        Default: "breakpoint_hit,exception,paused"
+            timeout_seconds: Maximum wait time (default: 30 seconds)
+
+        Returns:
+            Event details when triggered, or timeout message
+
+        Example:
+            x64dbg_set_breakpoint("0x401000")
+            x64dbg_run_until_event("breakpoint_hit", 60)
+
+        Event Types:
+            - breakpoint_hit: Breakpoint triggered
+            - exception: Exception occurred
+            - paused: Debugger paused (any reason)
+            - system_breakpoint: Initial break on load
+            - stepped: Single step completed
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+
+            # Parse event types
+            types_list = [t.strip() for t in event_types.split(",")]
+
+            result = bridge.run_until_event(
+                event_types=types_list,
+                timeout=timeout_seconds * 1000
+            )
+
+            if result.get("success"):
+                event = result.get("event", {})
+                event_type = event.get("type", "unknown")
+                address = event.get("address", "0")
+                details = event.get("details", "")
+
+                output = (
+                    f"Event received: {event_type}\n"
+                    f"Address: 0x{address}\n"
+                )
+                if details:
+                    output += f"Details: {details}\n"
+
+                output += "\nUse x64dbg_get_registers() to inspect state."
+                return output
+            else:
+                error = result.get("error", "Unknown error")
+                return f"Timeout waiting for events\n{error}"
+
+        except Exception as e:
+            logger.error(f"x64dbg_run_until_event failed: {e}")
+            return f"Error: {e}"
+
+    logger.info("Registered 45 dynamic analysis tools")

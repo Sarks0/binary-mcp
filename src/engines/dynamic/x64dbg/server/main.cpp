@@ -361,6 +361,14 @@ std::string HandleHTTPRequest(const std::string& request) {
         requestType = 81;  // RUN_UNTIL_RETURN
     } else if (path == "/api/hide_debugger") {
         requestType = 90;  // HIDE_DEBUGGER
+
+    // Events
+    } else if (path == "/api/events") {
+        requestType = 100;  // GET_EVENTS
+    } else if (path == "/api/events/clear") {
+        requestType = 101;  // CLEAR_EVENTS
+    } else if (path == "/api/events/status") {
+        requestType = 102;  // GET_EVENT_STATUS
     }
 
     // If we have a valid endpoint, build request and forward to plugin

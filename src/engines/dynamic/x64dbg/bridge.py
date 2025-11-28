@@ -1048,3 +1048,168 @@ class X64DbgBridge(Debugger):
         """
         self.run()
         return self.wait_until_paused(timeout=timeout)
+
+    # =========================================================================
+    # Event System
+    # =========================================================================
+
+    def get_events(self, max_events: int = 100, peek: bool = False) -> dict[str, Any]:
+        """
+        Get pending debug events from the event queue.
+
+        The event system captures debug events as they occur:
+        - Breakpoint hits
+        - Exceptions
+        - Process/thread creation/exit
+        - Module load/unload
+        - Debug strings
+        - Step completion
+
+        Args:
+            max_events: Maximum number of events to return (default: 100)
+            peek: If True, don't remove events from queue (default: False)
+
+        Returns:
+            Dictionary with:
+                - events: List of event objects
+                - queue_size: Remaining events in queue
+                - next_event_id: Next event ID (for filtering)
+
+        Event object structure:
+            - id: Unique event ID
+            - type: Event type string (breakpoint_hit, exception, etc.)
+            - timestamp: Milliseconds since plugin start
+            - address: Address (hex string, if applicable)
+            - thread_id: Thread ID (if applicable)
+            - module: Module name (if applicable)
+            - details: Additional details string
+
+        Example:
+            events = bridge.get_events()
+            for event in events["events"]:
+                if event["type"] == "breakpoint_hit":
+                    print(f"Breakpoint at {event['address']}")
+        """
+        data = {"max_events": max_events, "peek": 1 if peek else 0}
+        return self._request("/api/events", data)
+
+    def clear_events(self) -> dict[str, Any]:
+        """
+        Clear all pending events from the event queue.
+
+        Returns:
+            Confirmation message
+        """
+        return self._request("/api/events/clear")
+
+    def get_event_status(self) -> dict[str, Any]:
+        """
+        Get event system status.
+
+        Returns:
+            Dictionary with:
+                - enabled: Whether event collection is enabled
+                - queue_size: Number of events in queue
+                - next_event_id: Next event ID
+        """
+        return self._request("/api/events/status")
+
+    def poll_for_event(
+        self,
+        event_types: list[str] | None = None,
+        timeout: int = 30000,
+        poll_interval: int = 100
+    ) -> dict[str, Any] | None:
+        """
+        Poll for a specific event type.
+
+        This is a convenience method that polls the event queue until
+        a matching event is found or timeout is reached.
+
+        Args:
+            event_types: List of event types to wait for (e.g., ["breakpoint_hit", "exception"])
+                        If None, returns first event of any type
+            timeout: Maximum wait time in milliseconds (default: 30 seconds)
+            poll_interval: How often to poll in milliseconds (default: 100ms)
+
+        Returns:
+            Matching event object, or None if timeout
+
+        Example:
+            bridge.run()
+            event = bridge.poll_for_event(["breakpoint_hit"], timeout=60000)
+            if event:
+                print(f"Hit breakpoint at {event['address']}")
+        """
+        import time
+
+        start_time = time.time()
+        timeout_sec = timeout / 1000
+
+        while True:
+            # Check timeout
+            elapsed = time.time() - start_time
+            if elapsed >= timeout_sec:
+                return None
+
+            # Get events (don't peek - we want to consume them)
+            result = self.get_events(max_events=10)
+            events = result.get("events", [])
+
+            for event in events:
+                event_type = event.get("type", "")
+                if event_types is None or event_type in event_types:
+                    return event
+
+            # Sleep before next poll
+            time.sleep(poll_interval / 1000)
+
+    def run_until_event(
+        self,
+        event_types: list[str] | None = None,
+        timeout: int = 30000
+    ) -> dict[str, Any]:
+        """
+        Run and wait for a specific event type.
+
+        Combines run() with poll_for_event() for convenience.
+
+        Args:
+            event_types: List of event types to wait for
+                        Default: ["breakpoint_hit", "exception", "paused"]
+            timeout: Maximum wait time in milliseconds
+
+        Returns:
+            Dictionary with:
+                - success: True if event received
+                - event: The event object (if success)
+                - error: Error message (if timeout)
+
+        Example:
+            bridge.set_breakpoint("kernel32.CreateFileA")
+            result = bridge.run_until_event(["breakpoint_hit"], timeout=60000)
+            if result["success"]:
+                print(f"Breakpoint hit at {result['event']['address']}")
+        """
+        if event_types is None:
+            event_types = ["breakpoint_hit", "exception", "paused", "system_breakpoint"]
+
+        # Clear existing events first
+        self.clear_events()
+
+        # Start execution
+        self.run()
+
+        # Poll for event
+        event = self.poll_for_event(event_types, timeout)
+
+        if event:
+            return {
+                "success": True,
+                "event": event
+            }
+        else:
+            return {
+                "success": False,
+                "error": f"Timeout waiting for events: {event_types}"
+            }

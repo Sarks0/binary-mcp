@@ -1,4 +1,5 @@
 #include "plugin.h"
+#include "event_system.h"
 #include "../pipe_protocol.h"
 #include <cstdio>
 #include <cstdarg>
@@ -65,7 +66,12 @@ enum RequestType {
     HIDE_DEBUGGER = 90,
 
     // Health check
-    PING = 99
+    PING = 99,
+
+    // Events
+    GET_EVENTS = 100,
+    CLEAR_EVENTS = 101,
+    GET_EVENT_STATUS = 102
 };
 
 // Plugin globals
@@ -1107,6 +1113,255 @@ std::string HandleGetMemoryInfo(const std::string& request) {
     return BuildJsonResponse(true, data.str());
 }
 
+// ============================================================================
+// EVENT HANDLERS
+// ============================================================================
+
+// Handler: GET_EVENTS - Get pending debug events
+std::string HandleGetEvents(const std::string& request) {
+    int maxEvents = ExtractIntField(request, "max_events", 100);
+    bool peek = ExtractIntField(request, "peek", 0) != 0;
+
+    EventQueue& queue = EventQueue::Instance();
+
+    std::string events;
+    if (peek) {
+        events = queue.PeekEvents(maxEvents);
+    } else {
+        events = queue.PopEvents(maxEvents);
+    }
+
+    std::stringstream data;
+    data << "\"events\":" << events << ","
+         << "\"queue_size\":" << queue.Size() << ","
+         << "\"next_event_id\":" << queue.GetNextEventId();
+
+    return BuildJsonResponse(true, data.str());
+}
+
+// Handler: CLEAR_EVENTS - Clear event queue
+std::string HandleClearEvents(const std::string& request) {
+    EventQueue::Instance().Clear();
+    return BuildJsonResponse(true, "\"message\":\"Event queue cleared\"");
+}
+
+// Handler: GET_EVENT_STATUS - Get event system status
+std::string HandleGetEventStatus(const std::string& request) {
+    EventQueue& queue = EventQueue::Instance();
+
+    std::stringstream data;
+    data << "\"enabled\":" << (queue.IsEnabled() ? "true" : "false") << ","
+         << "\"queue_size\":" << queue.Size() << ","
+         << "\"next_event_id\":" << queue.GetNextEventId();
+
+    return BuildJsonResponse(true, data.str());
+}
+
+// ============================================================================
+// DEBUG EVENT CALLBACKS
+// These are called by x64dbg when debug events occur
+// ============================================================================
+
+// Callback: Breakpoint hit
+void OnBreakpoint(CBTYPE cbType, PLUG_CB_BREAKPOINT* info) {
+    if (!info) return;
+
+    std::stringstream details;
+    details << "name=" << (info->breakpoint->name ? info->breakpoint->name : "")
+            << ";type=" << info->breakpoint->type
+            << ";enabled=" << info->breakpoint->enabled;
+
+    EventQueue::Instance().PushEvent(
+        DebugEventType::BREAKPOINT_HIT,
+        info->breakpoint->addr,
+        0,  // Thread ID not available in this callback
+        "",
+        details.str()
+    );
+}
+
+// Callback: Exception occurred
+void OnException(CBTYPE cbType, PLUG_CB_EXCEPTION* info) {
+    if (!info) return;
+
+    std::stringstream details;
+    details << "code=" << std::hex << info->Exception->ExceptionRecord.ExceptionCode << std::dec
+            << ";first_chance=" << info->Exception->dwFirstChance
+            << ";flags=" << info->Exception->ExceptionRecord.ExceptionFlags;
+
+    EventQueue::Instance().PushEvent(
+        DebugEventType::EXCEPTION,
+        reinterpret_cast<uint64_t>(info->Exception->ExceptionRecord.ExceptionAddress),
+        0,
+        "",
+        details.str()
+    );
+}
+
+// Callback: Debugger paused
+void OnPausedDebug(CBTYPE cbType, PLUG_CB_PAUSEDEBUG* info) {
+    // Get current address
+    duint cip = DbgValFromString("cip");
+
+    EventQueue::Instance().PushEvent(
+        DebugEventType::PAUSED,
+        cip,
+        DbgGetThreadId(),
+        "",
+        ""
+    );
+}
+
+// Callback: Debugger resumed
+void OnResumedDebug(CBTYPE cbType, PLUG_CB_RESUMEDEBUG* info) {
+    EventQueue::Instance().PushEvent(
+        DebugEventType::RUNNING,
+        0,
+        DbgGetThreadId(),
+        "",
+        ""
+    );
+}
+
+// Callback: Stepped (single step completed)
+void OnStepped(CBTYPE cbType, PLUG_CB_STEPPED* info) {
+    duint cip = DbgValFromString("cip");
+
+    EventQueue::Instance().PushEvent(
+        DebugEventType::STEPPED,
+        cip,
+        DbgGetThreadId(),
+        "",
+        ""
+    );
+}
+
+// Callback: Process created (debugging started)
+void OnCreateProcess(CBTYPE cbType, PLUG_CB_CREATEPROCESS* info) {
+    if (!info || !info->CreateProcessInfo) return;
+
+    std::stringstream details;
+    details << "base=" << std::hex << info->CreateProcessInfo->lpBaseOfImage << std::dec;
+
+    char modulePath[MAX_PATH] = "";
+    if (info->CreateProcessInfo->lpBaseOfImage) {
+        DbgGetModuleAt(reinterpret_cast<duint>(info->CreateProcessInfo->lpBaseOfImage), modulePath);
+    }
+
+    EventQueue::Instance().PushEvent(
+        DebugEventType::PROCESS_STARTED,
+        reinterpret_cast<uint64_t>(info->CreateProcessInfo->lpBaseOfImage),
+        reinterpret_cast<uint32_t>(reinterpret_cast<uintptr_t>(info->CreateProcessInfo->hProcess)),
+        modulePath,
+        details.str()
+    );
+}
+
+// Callback: Process exited
+void OnExitProcess(CBTYPE cbType, PLUG_CB_EXITPROCESS* info) {
+    if (!info) return;
+
+    std::stringstream details;
+    details << "exit_code=" << info->ExitProcess->dwExitCode;
+
+    EventQueue::Instance().PushEvent(
+        DebugEventType::PROCESS_EXITED,
+        0,
+        0,
+        "",
+        details.str()
+    );
+}
+
+// Callback: Thread created
+void OnCreateThread(CBTYPE cbType, PLUG_CB_CREATETHREAD* info) {
+    if (!info || !info->CreateThread) return;
+
+    std::stringstream details;
+    details << "start_address=" << std::hex << info->CreateThread->lpStartAddress << std::dec;
+
+    EventQueue::Instance().PushEvent(
+        DebugEventType::THREAD_CREATED,
+        reinterpret_cast<uint64_t>(info->CreateThread->lpStartAddress),
+        info->dwThreadId,
+        "",
+        details.str()
+    );
+}
+
+// Callback: Thread exited
+void OnExitThread(CBTYPE cbType, PLUG_CB_EXITTHREAD* info) {
+    if (!info) return;
+
+    std::stringstream details;
+    details << "exit_code=" << info->ExitThread->dwExitCode;
+
+    EventQueue::Instance().PushEvent(
+        DebugEventType::THREAD_EXITED,
+        0,
+        info->dwThreadId,
+        "",
+        details.str()
+    );
+}
+
+// Callback: Module loaded
+void OnLoadDll(CBTYPE cbType, PLUG_CB_LOADDLL* info) {
+    if (!info || !info->LoadDll) return;
+
+    char modulePath[MAX_PATH] = "";
+    if (info->LoadDll->lpBaseOfDll) {
+        DbgGetModuleAt(reinterpret_cast<duint>(info->LoadDll->lpBaseOfDll), modulePath);
+    }
+
+    EventQueue::Instance().PushEvent(
+        DebugEventType::MODULE_LOADED,
+        reinterpret_cast<uint64_t>(info->LoadDll->lpBaseOfDll),
+        0,
+        modulePath,
+        ""
+    );
+}
+
+// Callback: Module unloaded
+void OnUnloadDll(CBTYPE cbType, PLUG_CB_UNLOADDLL* info) {
+    if (!info || !info->UnloadDll) return;
+
+    EventQueue::Instance().PushEvent(
+        DebugEventType::MODULE_UNLOADED,
+        reinterpret_cast<uint64_t>(info->UnloadDll->lpBaseOfDll),
+        0,
+        "",
+        ""
+    );
+}
+
+// Callback: Debug string output
+void OnDebugString(CBTYPE cbType, PLUG_CB_DEBUGSTRING* info) {
+    if (!info) return;
+
+    EventQueue::Instance().PushEvent(
+        DebugEventType::DEBUG_STRING,
+        0,
+        0,
+        "",
+        info->string ? info->string : ""
+    );
+}
+
+// Callback: System breakpoint (initial break)
+void OnSystemBreakpoint(CBTYPE cbType, PLUG_CB_SYSTEMBREAKPOINT* info) {
+    duint cip = DbgValFromString("cip");
+
+    EventQueue::Instance().PushEvent(
+        DebugEventType::SYSTEM_BREAKPOINT,
+        cip,
+        DbgGetThreadId(),
+        "",
+        ""
+    );
+}
+
 // Handler: LOAD_BINARY - Load binary into debugger
 std::string HandleLoadBinary(const std::string& request) {
     std::string path = ExtractStringField(request, "path");
@@ -1350,6 +1605,17 @@ static DWORD WINAPI PipeServerThread(LPVOID lpParam) {
                     // Health check
                     case PING:
                         response = BuildJsonResponse(true, "\"message\":\"pong\"");
+                        break;
+
+                    // Events
+                    case GET_EVENTS:
+                        response = HandleGetEvents(request);
+                        break;
+                    case CLEAR_EVENTS:
+                        response = HandleClearEvents(request);
+                        break;
+                    case GET_EVENT_STATUS:
+                        response = HandleGetEventStatus(request);
                         break;
 
                     default:
@@ -1685,6 +1951,23 @@ void pluginSetup() {
 
     // Register menu callback
     _plugin_registercallback(g_pluginHandle, CB_MENUENTRY, (CBPLUGIN)MenuEntryCallback);
+
+    // Register debug event callbacks for event system
+    _plugin_registercallback(g_pluginHandle, CB_BREAKPOINT, (CBPLUGIN)OnBreakpoint);
+    _plugin_registercallback(g_pluginHandle, CB_EXCEPTION, (CBPLUGIN)OnException);
+    _plugin_registercallback(g_pluginHandle, CB_PAUSEDEBUG, (CBPLUGIN)OnPausedDebug);
+    _plugin_registercallback(g_pluginHandle, CB_RESUMEDEBUG, (CBPLUGIN)OnResumedDebug);
+    _plugin_registercallback(g_pluginHandle, CB_STEPPED, (CBPLUGIN)OnStepped);
+    _plugin_registercallback(g_pluginHandle, CB_CREATEPROCESS, (CBPLUGIN)OnCreateProcess);
+    _plugin_registercallback(g_pluginHandle, CB_EXITPROCESS, (CBPLUGIN)OnExitProcess);
+    _plugin_registercallback(g_pluginHandle, CB_CREATETHREAD, (CBPLUGIN)OnCreateThread);
+    _plugin_registercallback(g_pluginHandle, CB_EXITTHREAD, (CBPLUGIN)OnExitThread);
+    _plugin_registercallback(g_pluginHandle, CB_LOADDLL, (CBPLUGIN)OnLoadDll);
+    _plugin_registercallback(g_pluginHandle, CB_UNLOADDLL, (CBPLUGIN)OnUnloadDll);
+    _plugin_registercallback(g_pluginHandle, CB_DEBUGSTRING, (CBPLUGIN)OnDebugString);
+    _plugin_registercallback(g_pluginHandle, CB_SYSTEMBREAKPOINT, (CBPLUGIN)OnSystemBreakpoint);
+
+    LogInfo("Registered 13 debug event callbacks");
 
     // Add menu items
     if (g_hMenu) {

@@ -708,6 +708,46 @@ class X64DbgBridge(Debugger):
             "valid": result.get("valid", False)
         }
 
+    def resolve_symbol(self, expression: str) -> dict[str, Any]:
+        """
+        Resolve a symbol or expression to an address.
+
+        This provides detailed feedback when symbol resolution fails,
+        explaining the reason (not debugging, not paused, symbol not found).
+
+        Args:
+            expression: Symbol or expression to resolve. Can be:
+                - Module!function format: "kernel32!CreateFileW"
+                - Simple function name: "CreateFileW" (may need module prefix)
+                - Address expression: "rax+0x10"
+                - Hex address: "0x401000"
+
+        Returns:
+            Dictionary with:
+                - success: True if resolved
+                - address: Resolved address (hex string)
+                - expression: Original expression
+                - module: Module containing the address (if applicable)
+                - symbol: Symbol name at address (if applicable)
+                - error: Error message (if resolution failed)
+
+        Example:
+            result = bridge.resolve_symbol("kernel32!CreateFileW")
+            if result["success"]:
+                print(f"CreateFileW is at 0x{result['address']}")
+            else:
+                print(f"Failed: {result.get('error')}")
+
+        Note:
+            Symbol resolution only works when:
+            - A binary is loaded (debugging active)
+            - Debugger is paused (not running)
+            - Module containing symbol is loaded
+        """
+        data = {"expression": expression}
+        result = self._request("/api/resolve", data)
+        return result
+
     def set_comment(self, address: str, comment: str) -> bool:
         """
         Set comment at address.

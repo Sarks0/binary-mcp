@@ -7,6 +7,8 @@
 #include <vector>
 #include <sstream>
 #include <iomanip>
+#include <set>
+#include <cctype>
 #include <wincrypt.h>  // For CryptGenRandom
 
 // x64dbg SDK headers
@@ -69,6 +71,9 @@ enum RequestType {
     WAIT_PAUSED = 91,
     WAIT_RUNNING = 92,
     WAIT_DEBUGGING = 93,
+
+    // Symbol resolution
+    RESOLVE_SYMBOL = 95,
 
     // Health check
     PING = 99,
@@ -248,6 +253,57 @@ std::string BuildJsonResponse(bool success, const std::string& data = "") {
     return response;
 }
 
+// Helper: Resolve address string to duint with detailed error reporting
+// Returns 0 on failure and sets errorMsg
+duint ResolveAddress(const std::string& addressStr, std::string& errorMsg) {
+    if (addressStr.empty()) {
+        errorMsg = "Missing address";
+        return 0;
+    }
+
+    // Try to resolve the address/symbol
+    duint address = DbgValFromString(addressStr.c_str());
+
+    // If resolution failed (returned 0) and input wasn't "0"
+    if (address == 0 && addressStr != "0" && addressStr != "0x0") {
+        // Check why it failed and provide helpful error
+        if (!DbgIsDebugging()) {
+            errorMsg = "Not debugging - load a binary first to resolve symbols";
+        } else if (DbgIsRunning()) {
+            errorMsg = "Debugger must be paused to resolve symbols. Use pause first.";
+        } else {
+            // Debugger is paused but symbol not found
+            // Check if it looks like a symbol name vs hex address
+            bool looksLikeHex = true;
+            for (char c : addressStr) {
+                if (!isxdigit(c) && c != 'x' && c != 'X') {
+                    looksLikeHex = false;
+                    break;
+                }
+            }
+
+            if (looksLikeHex) {
+                errorMsg = "Invalid address: " + addressStr;
+            } else {
+                errorMsg = "Symbol not found: " + addressStr + ". Ensure the module is loaded and try module!symbol format (e.g., kernel32!CreateFileW)";
+            }
+        }
+        return 0;
+    }
+
+    return address;
+}
+
+// Helper: Build error response for address resolution failure
+std::string BuildAddressError(const std::string& errorMsg, const std::string& addressStr) {
+    std::stringstream data;
+    data << "\"error\":\"" << JsonEscape(errorMsg) << "\"";
+    if (!addressStr.empty()) {
+        data << ",\"input\":\"" << JsonEscape(addressStr) << "\"";
+    }
+    return BuildJsonResponse(false, data.str());
+}
+
 // ============================================================================
 // REQUEST HANDLERS
 // ============================================================================
@@ -333,10 +389,11 @@ std::string HandleReadMemory(const std::string& request) {
         return BuildJsonResponse(false, "\"error\":\"Size too large (max 1MB)\"");
     }
 
-    // Parse address
-    duint address = DbgValFromString(addressStr.c_str());
-    if (address == 0 && addressStr != "0") {
-        return BuildJsonResponse(false, "\"error\":\"Invalid address\"");
+    // Parse and resolve address
+    std::string errorMsg;
+    duint address = ResolveAddress(addressStr, errorMsg);
+    if (address == 0 && !errorMsg.empty()) {
+        return BuildAddressError(errorMsg, addressStr);
     }
 
     // Allocate buffer
@@ -431,15 +488,13 @@ std::string HandleSetBreakpoint(const std::string& request) {
         return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
     }
 
-    // Parse address
+    // Parse and resolve address
     std::string addressStr = ExtractStringField(request, "address");
-    if (addressStr.empty()) {
-        return BuildJsonResponse(false, "\"error\":\"Missing address\"");
-    }
+    std::string errorMsg;
+    duint address = ResolveAddress(addressStr, errorMsg);
 
-    duint address = DbgValFromString(addressStr.c_str());
-    if (address == 0 && addressStr != "0") {
-        return BuildJsonResponse(false, "\"error\":\"Invalid address\"");
+    if (address == 0 && !errorMsg.empty()) {
+        return BuildAddressError(errorMsg, addressStr);
     }
 
     // Set breakpoint using command
@@ -453,6 +508,10 @@ std::string HandleSetBreakpoint(const std::string& request) {
 
     std::stringstream data;
     data << "\"address\":\"" << std::hex << address << std::dec << "\"";
+    if (!addressStr.empty() && addressStr.find_first_not_of("0123456789abcdefABCDEFxX") != std::string::npos) {
+        // Include resolved symbol name in response
+        data << ",\"symbol\":\"" << JsonEscape(addressStr) << "\"";
+    }
 
     return BuildJsonResponse(true, data.str());
 }
@@ -464,11 +523,12 @@ std::string HandleDeleteBreakpoint(const std::string& request) {
     }
 
     std::string addressStr = ExtractStringField(request, "address");
-    if (addressStr.empty()) {
-        return BuildJsonResponse(false, "\"error\":\"Missing address\"");
-    }
+    std::string errorMsg;
+    duint address = ResolveAddress(addressStr, errorMsg);
 
-    duint address = DbgValFromString(addressStr.c_str());
+    if (address == 0 && !errorMsg.empty()) {
+        return BuildAddressError(errorMsg, addressStr);
+    }
 
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "bc %llx", address);
@@ -635,7 +695,17 @@ std::string HandleDisassemble(const std::string& request) {
     }
 
     std::string addressStr = ExtractStringField(request, "address");
-    duint address = addressStr.empty() ? DbgValFromString("cip") : DbgValFromString(addressStr.c_str());
+    duint address;
+
+    if (addressStr.empty()) {
+        address = DbgValFromString("cip");
+    } else {
+        std::string errorMsg;
+        address = ResolveAddress(addressStr, errorMsg);
+        if (address == 0 && !errorMsg.empty()) {
+            return BuildAddressError(errorMsg, addressStr);
+        }
+    }
 
     int count = ExtractIntField(request, "count", 10);
     if (count < 1) count = 1;
@@ -688,7 +758,17 @@ std::string HandleWriteMemory(const std::string& request) {
         return BuildJsonResponse(false, "\"error\":\"Missing address or data\"");
     }
 
-    duint address = DbgValFromString(addressStr.c_str());
+    // Validate hex data length (max 1MB = 2MB hex chars)
+    if (dataHex.length() > 2 * 1024 * 1024) {
+        return BuildJsonResponse(false, "\"error\":\"Data too large (max 1MB)\"");
+    }
+
+    // Resolve address with detailed error messages
+    std::string errorMsg;
+    duint address = ResolveAddress(addressStr, errorMsg);
+    if (address == 0 && !errorMsg.empty()) {
+        return BuildAddressError(errorMsg, addressStr);
+    }
 
     // Convert hex string to bytes
     std::vector<unsigned char> bytes;
@@ -747,6 +827,37 @@ std::string HandleSetRegister(const std::string& request) {
 
     if (regName.empty() || valueStr.empty()) {
         return BuildJsonResponse(false, "\"error\":\"Missing register or value\"");
+    }
+
+    // Validate register name (basic whitelist of common registers)
+    // Convert to lowercase for comparison
+    std::string regLower = regName;
+    for (char& c : regLower) {
+        c = tolower(c);
+    }
+
+    // Valid x64 general-purpose registers and common segment registers
+    static const std::set<std::string> validRegs = {
+        "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp", "rip",
+        "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+        "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp", "eip",
+        "ax", "bx", "cx", "dx", "si", "di", "bp", "sp",
+        "al", "bl", "cl", "dl", "ah", "bh", "ch", "dh",
+        "r8d", "r9d", "r10d", "r11d", "r12d", "r13d", "r14d", "r15d",
+        "r8w", "r9w", "r10w", "r11w", "r12w", "r13w", "r14w", "r15w",
+        "r8b", "r9b", "r10b", "r11b", "r12b", "r13b", "r14b", "r15b",
+        "sil", "dil", "bpl", "spl",
+        "rflags", "eflags", "flags",
+        "cs", "ds", "es", "fs", "gs", "ss"
+    };
+
+    if (validRegs.find(regLower) == validRegs.end()) {
+        return BuildJsonResponse(false, "\"error\":\"Invalid register name\"");
+    }
+
+    // Validate value length (prevent injection)
+    if (valueStr.length() > 32) {
+        return BuildJsonResponse(false, "\"error\":\"Value too long\"");
     }
 
     // Use x64dbg command to set register
@@ -833,7 +944,17 @@ std::string HandleGetInstruction(const std::string& request) {
     }
 
     std::string addressStr = ExtractStringField(request, "address");
-    duint address = addressStr.empty() ? DbgValFromString("cip") : DbgValFromString(addressStr.c_str());
+    duint address;
+
+    if (addressStr.empty()) {
+        address = DbgValFromString("cip");
+    } else {
+        std::string errorMsg;
+        address = ResolveAddress(addressStr, errorMsg);
+        if (address == 0 && !errorMsg.empty()) {
+            return BuildAddressError(errorMsg, addressStr);
+        }
+    }
 
     if (!DbgMemIsValidReadPtr(address)) {
         return BuildJsonResponse(false, "\"error\":\"Invalid address\"");
@@ -868,7 +989,17 @@ std::string HandleSetComment(const std::string& request) {
         return BuildJsonResponse(false, "\"error\":\"Missing address\"");
     }
 
-    duint address = DbgValFromString(addressStr.c_str());
+    // Validate comment length (max 2KB)
+    if (comment.length() > 2048) {
+        return BuildJsonResponse(false, "\"error\":\"Comment too long (max 2KB)\"");
+    }
+
+    // Resolve address with detailed error messages
+    std::string errorMsg;
+    duint address = ResolveAddress(addressStr, errorMsg);
+    if (address == 0 && !errorMsg.empty()) {
+        return BuildAddressError(errorMsg, addressStr);
+    }
 
     if (!DbgSetCommentAt(address, comment.c_str())) {
         return BuildJsonResponse(false, "\"error\":\"Failed to set comment\"");
@@ -888,7 +1019,12 @@ std::string HandleGetComment(const std::string& request) {
         return BuildJsonResponse(false, "\"error\":\"Missing address\"");
     }
 
-    duint address = DbgValFromString(addressStr.c_str());
+    // Resolve address with detailed error messages
+    std::string errorMsg;
+    duint address = ResolveAddress(addressStr, errorMsg);
+    if (address == 0 && !errorMsg.empty()) {
+        return BuildAddressError(errorMsg, addressStr);
+    }
 
     char comment[MAX_COMMENT_SIZE] = "";
     DbgGetCommentAt(address, comment);
@@ -951,11 +1087,16 @@ std::string HandleSetHardwareBreakpoint(const std::string& request) {
     std::string typeStr = ExtractStringField(request, "bp_type");  // "execute", "read", "write", "access"
     int size = ExtractIntField(request, "size", 1);
 
-    if (addressStr.empty()) {
-        return BuildJsonResponse(false, "\"error\":\"Missing address\"");
+    // Validate size - hardware breakpoints only support 1, 2, 4, or 8 bytes
+    if (size != 1 && size != 2 && size != 4 && size != 8) {
+        return BuildJsonResponse(false, "\"error\":\"Invalid size (must be 1, 2, 4, or 8 bytes)\"");
     }
 
-    duint address = DbgValFromString(addressStr.c_str());
+    std::string errorMsg;
+    duint address = ResolveAddress(addressStr, errorMsg);
+    if (address == 0 && !errorMsg.empty()) {
+        return BuildAddressError(errorMsg, addressStr);
+    }
 
     // Map type string to command
     std::string hwType = "x";  // Default: execute
@@ -988,11 +1129,11 @@ std::string HandleSetMemoryBreakpoint(const std::string& request) {
     std::string addressStr = ExtractStringField(request, "address");
     std::string typeStr = ExtractStringField(request, "bp_type");  // "read", "write", "access"
 
-    if (addressStr.empty()) {
-        return BuildJsonResponse(false, "\"error\":\"Missing address\"");
+    std::string errorMsg;
+    duint address = ResolveAddress(addressStr, errorMsg);
+    if (address == 0 && !errorMsg.empty()) {
+        return BuildAddressError(errorMsg, addressStr);
     }
-
-    duint address = DbgValFromString(addressStr.c_str());
 
     // Map type string to command
     std::string memType = "a";  // Default: access
@@ -1021,11 +1162,11 @@ std::string HandleDeleteMemoryBreakpoint(const std::string& request) {
     }
 
     std::string addressStr = ExtractStringField(request, "address");
-    if (addressStr.empty()) {
-        return BuildJsonResponse(false, "\"error\":\"Missing address\"");
+    std::string errorMsg;
+    duint address = ResolveAddress(addressStr, errorMsg);
+    if (address == 0 && !errorMsg.empty()) {
+        return BuildAddressError(errorMsg, addressStr);
     }
-
-    duint address = DbgValFromString(addressStr.c_str());
 
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "bpmc %llx", address);
@@ -1182,6 +1323,68 @@ std::string HandleWaitDebugging(const std::string& request) {
     }
 }
 
+// Handler: RESOLVE_SYMBOL - Resolve symbol/expression to address
+std::string HandleResolveSymbol(const std::string& request) {
+    std::string expression = ExtractStringField(request, "expression");
+    if (expression.empty()) {
+        return BuildJsonResponse(false, "\"error\":\"Missing expression\"");
+    }
+
+    // Check debugger state for helpful errors
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging - load a binary first\"");
+    }
+
+    if (DbgIsRunning()) {
+        return BuildJsonResponse(false, "\"error\":\"Debugger must be paused to resolve symbols\"");
+    }
+
+    // Try to resolve the expression
+    duint address = DbgValFromString(expression.c_str());
+
+    if (address == 0 && expression != "0" && expression != "0x0") {
+        // Resolution failed - provide helpful error
+        bool looksLikeHex = true;
+        for (char c : expression) {
+            if (!isxdigit(c) && c != 'x' && c != 'X') {
+                looksLikeHex = false;
+                break;
+            }
+        }
+
+        std::stringstream data;
+        if (looksLikeHex) {
+            data << "\"error\":\"Invalid address: " << JsonEscape(expression) << "\"";
+        } else {
+            data << "\"error\":\"Symbol not found: " << JsonEscape(expression)
+                 << ". Try module!symbol format (e.g., kernel32!CreateFileW)\"";
+        }
+        data << ",\"expression\":\"" << JsonEscape(expression) << "\"";
+        return BuildJsonResponse(false, data.str());
+    }
+
+    // Get module name at the address if any
+    char moduleName[MAX_MODULE_SIZE] = "";
+    DbgGetModuleAt(address, moduleName);
+
+    // Get symbol name at the address if any
+    char symbolName[MAX_LABEL_SIZE] = "";
+    DbgGetLabelAt(address, SEG_DEFAULT, symbolName);
+
+    std::stringstream data;
+    data << "\"address\":\"" << std::hex << address << std::dec << "\""
+         << ",\"expression\":\"" << JsonEscape(expression) << "\"";
+
+    if (strlen(moduleName) > 0) {
+        data << ",\"module\":\"" << JsonEscape(moduleName) << "\"";
+    }
+    if (strlen(symbolName) > 0) {
+        data << ",\"symbol\":\"" << JsonEscape(symbolName) << "\"";
+    }
+
+    return BuildJsonResponse(true, data.str());
+}
+
 // Handler: GET_MODULE_IMPORTS - Get imports for a module
 std::string HandleGetModuleImports(const std::string& request) {
     if (!DbgIsDebugging()) {
@@ -1247,7 +1450,12 @@ std::string HandleGetMemoryInfo(const std::string& request) {
         return BuildJsonResponse(false, "\"error\":\"Missing address\"");
     }
 
-    duint address = DbgValFromString(addressStr.c_str());
+    // Resolve address with detailed error messages
+    std::string errorMsg;
+    duint address = ResolveAddress(addressStr, errorMsg);
+    if (address == 0 && !errorMsg.empty()) {
+        return BuildAddressError(errorMsg, addressStr);
+    }
 
     // Query memory info
     MEMORY_BASIC_INFORMATION mbi;
@@ -1326,7 +1534,12 @@ std::string HandleVirtFree(const std::string& request) {
         return BuildJsonResponse(false, "\"error\":\"Missing address\"");
     }
 
-    duint address = DbgValFromString(addressStr.c_str());
+    // Resolve address with detailed error messages
+    std::string errorMsg;
+    duint address = ResolveAddress(addressStr, errorMsg);
+    if (address == 0 && !errorMsg.empty()) {
+        return BuildAddressError(errorMsg, addressStr);
+    }
 
     // Use free command
     char cmd[256];
@@ -1354,7 +1567,17 @@ std::string HandleVirtProtect(const std::string& request) {
         return BuildJsonResponse(false, "\"error\":\"Missing address\"");
     }
 
-    duint address = DbgValFromString(addressStr.c_str());
+    // Validate size (max 16MB - same as VirtAlloc)
+    if (size <= 0 || size > 16 * 1024 * 1024) {
+        return BuildJsonResponse(false, "\"error\":\"Invalid size (must be 1 to 16MB)\"");
+    }
+
+    // Resolve address with detailed error messages
+    std::string errorMsg;
+    duint address = ResolveAddress(addressStr, errorMsg);
+    if (address == 0 && !errorMsg.empty()) {
+        return BuildAddressError(errorMsg, addressStr);
+    }
 
     // Map protection string to Windows constants
     // Common values: "rwx", "rx", "rw", "r", "x", "wx"
@@ -1411,7 +1634,12 @@ std::string HandleMemSet(const std::string& request) {
         return BuildJsonResponse(false, "\"error\":\"Size too large (max 1MB)\"");
     }
 
-    duint address = DbgValFromString(addressStr.c_str());
+    // Resolve address with detailed error messages
+    std::string errorMsg;
+    duint address = ResolveAddress(addressStr, errorMsg);
+    if (address == 0 && !errorMsg.empty()) {
+        return BuildAddressError(errorMsg, addressStr);
+    }
 
     // Create buffer with repeated value
     std::vector<unsigned char> buffer(size, static_cast<unsigned char>(value & 0xFF));
@@ -1442,6 +1670,8 @@ std::string HandleCheckValidPtr(const std::string& request) {
         return BuildJsonResponse(false, "\"error\":\"Missing address\"");
     }
 
+    // Note: For CHECK_VALID_PTR we allow 0 to return as "not valid"
+    // so we don't use the full ResolveAddress with error checking
     duint address = DbgValFromString(addressStr.c_str());
 
     bool isValid = DbgMemIsValidReadPtr(address);
@@ -1470,7 +1700,12 @@ std::string HandleToggleBreakpoint(const std::string& request) {
         return BuildJsonResponse(false, "\"error\":\"Missing address\"");
     }
 
-    duint address = DbgValFromString(addressStr.c_str());
+    // Resolve address with detailed error messages
+    std::string errorMsg;
+    duint address = ResolveAddress(addressStr, errorMsg);
+    if (address == 0 && !errorMsg.empty()) {
+        return BuildAddressError(errorMsg, addressStr);
+    }
 
     // Use bpe (breakpoint enable) or bpd (breakpoint disable)
     char cmd[256];
@@ -1504,7 +1739,12 @@ std::string HandleDeleteHardwareBreakpoint(const std::string& request) {
         return BuildJsonResponse(false, "\"error\":\"Missing address\"");
     }
 
-    duint address = DbgValFromString(addressStr.c_str());
+    // Resolve address with detailed error messages
+    std::string errorMsg;
+    duint address = ResolveAddress(addressStr, errorMsg);
+    if (address == 0 && !errorMsg.empty()) {
+        return BuildAddressError(errorMsg, addressStr);
+    }
 
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "bphc %llx", address);
@@ -1527,7 +1767,12 @@ std::string HandleToggleHardwareBreakpoint(const std::string& request) {
         return BuildJsonResponse(false, "\"error\":\"Missing address\"");
     }
 
-    duint address = DbgValFromString(addressStr.c_str());
+    // Resolve address with detailed error messages
+    std::string errorMsg;
+    duint address = ResolveAddress(addressStr, errorMsg);
+    if (address == 0 && !errorMsg.empty()) {
+        return BuildAddressError(errorMsg, addressStr);
+    }
 
     char cmd[256];
     if (enable) {
@@ -1562,7 +1807,12 @@ std::string HandleToggleMemoryBreakpoint(const std::string& request) {
         return BuildJsonResponse(false, "\"error\":\"Missing address\"");
     }
 
-    duint address = DbgValFromString(addressStr.c_str());
+    // Resolve address with detailed error messages
+    std::string errorMsg;
+    duint address = ResolveAddress(addressStr, errorMsg);
+    if (address == 0 && !errorMsg.empty()) {
+        return BuildAddressError(errorMsg, addressStr);
+    }
 
     char cmd[256];
     if (enable) {
@@ -1673,6 +1923,10 @@ std::string HandleListAllBreakpoints(const std::string& request) {
 std::string HandleGetEvents(const std::string& request) {
     int maxEvents = ExtractIntField(request, "max_events", 100);
     bool peek = ExtractIntField(request, "peek", 0) != 0;
+
+    // Cap max_events to prevent memory issues
+    if (maxEvents <= 0) maxEvents = 100;
+    if (maxEvents > 1000) maxEvents = 1000;
 
     EventQueue& queue = EventQueue::Instance();
 
@@ -2150,6 +2404,11 @@ static DWORD WINAPI PipeServerThread(LPVOID lpParam) {
                         break;
                     case WAIT_DEBUGGING:
                         response = HandleWaitDebugging(request);
+                        break;
+
+                    // Symbol resolution
+                    case RESOLVE_SYMBOL:
+                        response = HandleResolveSymbol(request);
                         break;
 
                     // Health check

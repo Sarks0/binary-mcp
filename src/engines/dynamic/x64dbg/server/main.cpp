@@ -370,6 +370,10 @@ std::string HandleHTTPRequest(const std::string& request) {
     } else if (path == "/api/wait/debugging") {
         requestType = 93;  // WAIT_DEBUGGING
 
+    // Symbol resolution
+    } else if (path == "/api/resolve") {
+        requestType = 95;  // RESOLVE_SYMBOL
+
     // Events
     } else if (path == "/api/events") {
         requestType = 100;  // GET_EVENTS

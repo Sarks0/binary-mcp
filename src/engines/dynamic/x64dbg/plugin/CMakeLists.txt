@@ -30,10 +30,12 @@ message(STATUS "Building for ${ARCH_BITS} architecture")
 
 set(PLUGIN_SOURCES
     plugin.cpp
+    event_system.cpp
 )
 
 set(PLUGIN_HEADERS
     plugin.h
+    event_system.h
     ../pipe_protocol.h
 )
 

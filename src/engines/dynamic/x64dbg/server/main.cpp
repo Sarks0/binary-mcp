@@ -362,6 +362,14 @@ std::string HandleHTTPRequest(const std::string& request) {
     } else if (path == "/api/hide_debugger") {
         requestType = 90;  // HIDE_DEBUGGER
 
+    // Wait/Synchronization (Phase 1)
+    } else if (path == "/api/wait/paused") {
+        requestType = 91;  // WAIT_PAUSED
+    } else if (path == "/api/wait/running") {
+        requestType = 92;  // WAIT_RUNNING
+    } else if (path == "/api/wait/debugging") {
+        requestType = 93;  // WAIT_DEBUGGING
+
     // Events
     } else if (path == "/api/events") {
         requestType = 100;  // GET_EVENTS

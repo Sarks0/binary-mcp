@@ -65,6 +65,11 @@ enum RequestType {
     RUN_UNTIL_RETURN = 81,
     HIDE_DEBUGGER = 90,
 
+    // Wait/Synchronization (Phase 1)
+    WAIT_PAUSED = 91,
+    WAIT_RUNNING = 92,
+    WAIT_DEBUGGING = 93,
+
     // Health check
     PING = 99,
 
@@ -1042,6 +1047,141 @@ std::string HandleHideDebugger(const std::string& request) {
     return BuildJsonResponse(true, "\"message\":\"Debugger hidden from target\"");
 }
 
+// ============================================================================
+// WAIT/SYNCHRONIZATION HANDLERS (Phase 1)
+// ============================================================================
+
+// Handler: WAIT_PAUSED - Wait until debugger is paused
+std::string HandleWaitPaused(const std::string& request) {
+    int timeoutMs = ExtractIntField(request, "timeout", 30000);
+
+    // Cap timeout at 5 minutes
+    if (timeoutMs > 300000) timeoutMs = 300000;
+    if (timeoutMs < 100) timeoutMs = 100;
+
+    auto startTime = std::chrono::steady_clock::now();
+    const int pollInterval = 50;  // Check every 50ms
+
+    while (true) {
+        // Check if debugging and paused
+        if (DbgIsDebugging() && !DbgIsRunning()) {
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - startTime).count();
+
+            duint cip = DbgValFromString("cip");
+
+            std::stringstream data;
+            data << "\"state\":\"paused\","
+                 << "\"elapsed_ms\":" << elapsed << ","
+                 << "\"current_address\":\"" << std::hex << cip << std::dec << "\"";
+
+            return BuildJsonResponse(true, data.str());
+        }
+
+        // Check timeout
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - startTime).count();
+
+        if (elapsed >= timeoutMs) {
+            std::stringstream data;
+            data << "\"error\":\"Timeout waiting for debugger to pause\","
+                 << "\"timeout_ms\":" << timeoutMs << ","
+                 << "\"elapsed_ms\":" << elapsed << ","
+                 << "\"current_state\":\"" << (DbgIsDebugging() ? (DbgIsRunning() ? "running" : "paused") : "not_debugging") << "\"";
+
+            return BuildJsonResponse(false, data.str());
+        }
+
+        // Sleep before next check
+        Sleep(pollInterval);
+    }
+}
+
+// Handler: WAIT_RUNNING - Wait until debugger is running
+std::string HandleWaitRunning(const std::string& request) {
+    int timeoutMs = ExtractIntField(request, "timeout", 10000);
+
+    // Cap timeout at 5 minutes
+    if (timeoutMs > 300000) timeoutMs = 300000;
+    if (timeoutMs < 100) timeoutMs = 100;
+
+    auto startTime = std::chrono::steady_clock::now();
+    const int pollInterval = 50;
+
+    while (true) {
+        // Check if debugging and running
+        if (DbgIsDebugging() && DbgIsRunning()) {
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - startTime).count();
+
+            std::stringstream data;
+            data << "\"state\":\"running\","
+                 << "\"elapsed_ms\":" << elapsed;
+
+            return BuildJsonResponse(true, data.str());
+        }
+
+        // Check timeout
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - startTime).count();
+
+        if (elapsed >= timeoutMs) {
+            std::stringstream data;
+            data << "\"error\":\"Timeout waiting for debugger to run\","
+                 << "\"timeout_ms\":" << timeoutMs << ","
+                 << "\"elapsed_ms\":" << elapsed << ","
+                 << "\"current_state\":\"" << (DbgIsDebugging() ? (DbgIsRunning() ? "running" : "paused") : "not_debugging") << "\"";
+
+            return BuildJsonResponse(false, data.str());
+        }
+
+        Sleep(pollInterval);
+    }
+}
+
+// Handler: WAIT_DEBUGGING - Wait until debugging has started (binary loaded)
+std::string HandleWaitDebugging(const std::string& request) {
+    int timeoutMs = ExtractIntField(request, "timeout", 30000);
+
+    // Cap timeout at 5 minutes
+    if (timeoutMs > 300000) timeoutMs = 300000;
+    if (timeoutMs < 100) timeoutMs = 100;
+
+    auto startTime = std::chrono::steady_clock::now();
+    const int pollInterval = 50;
+
+    while (true) {
+        // Check if debugging
+        if (DbgIsDebugging()) {
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - startTime).count();
+
+            std::stringstream data;
+            data << "\"state\":\"debugging\","
+                 << "\"elapsed_ms\":" << elapsed << ","
+                 << "\"is_running\":" << (DbgIsRunning() ? "true" : "false");
+
+            return BuildJsonResponse(true, data.str());
+        }
+
+        // Check timeout
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - startTime).count();
+
+        if (elapsed >= timeoutMs) {
+            std::stringstream data;
+            data << "\"error\":\"Timeout waiting for debugging to start\","
+                 << "\"timeout_ms\":" << timeoutMs << ","
+                 << "\"elapsed_ms\":" << elapsed << ","
+                 << "\"current_state\":\"not_debugging\"";
+
+            return BuildJsonResponse(false, data.str());
+        }
+
+        Sleep(pollInterval);
+    }
+}
+
 // Handler: GET_MODULE_IMPORTS - Get imports for a module
 std::string HandleGetModuleImports(const std::string& request) {
     if (!DbgIsDebugging()) {
@@ -1999,6 +2139,17 @@ static DWORD WINAPI PipeServerThread(LPVOID lpParam) {
                         break;
                     case HIDE_DEBUGGER:
                         response = HandleHideDebugger(request);
+                        break;
+
+                    // Wait/Synchronization (Phase 1)
+                    case WAIT_PAUSED:
+                        response = HandleWaitPaused(request);
+                        break;
+                    case WAIT_RUNNING:
+                        response = HandleWaitRunning(request);
+                        break;
+                    case WAIT_DEBUGGING:
+                        response = HandleWaitDebugging(request);
                         break;
 
                     // Health check

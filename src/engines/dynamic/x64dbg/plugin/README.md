@@ -232,7 +232,6 @@ Debug event system for capturing breakpoints, exceptions, and other debug events
 - `thread_exited` - Thread terminated
 - `module_loaded` - DLL/module loaded
 - `module_unloaded` - DLL/module unloaded
-- `debug_string` - OutputDebugString message
 - `system_breakpoint` - Initial system breakpoint
 
 ## API Examples

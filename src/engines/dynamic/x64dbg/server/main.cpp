@@ -405,6 +405,36 @@ std::string HandleHTTPRequest(const std::string& request) {
         requestType = 123;  // TOGGLE_MEMORY_BREAKPOINT
     } else if (path == "/api/breakpoint/list/all") {
         requestType = 124;  // LIST_ALL_BREAKPOINTS
+
+    // Phase 4: Tracing
+    } else if (path == "/api/trace/start") {
+        requestType = 130;  // START_TRACE
+    } else if (path == "/api/trace/stop") {
+        requestType = 131;  // STOP_TRACE
+    } else if (path == "/api/trace/data") {
+        requestType = 132;  // GET_TRACE_DATA
+    } else if (path == "/api/trace/clear") {
+        requestType = 133;  // CLEAR_TRACE
+    } else if (path == "/api/api_breakpoint") {
+        requestType = 134;  // SET_API_BREAKPOINT
+    } else if (path == "/api/api_log") {
+        requestType = 135;  // GET_API_LOG
+    } else if (path == "/api/api_log/clear") {
+        requestType = 136;  // CLEAR_API_LOG
+
+    // Phase 4: String & Pattern Search
+    } else if (path == "/api/strings") {
+        requestType = 140;  // FIND_STRINGS
+    } else if (path == "/api/pattern") {
+        requestType = 141;  // PATTERN_SCAN
+    } else if (path == "/api/xor") {
+        requestType = 142;  // XOR_DECRYPT
+
+    // Phase 4: References & Analysis
+    } else if (path == "/api/references") {
+        requestType = 145;  // FIND_REFERENCES
+    } else if (path == "/api/callstack/detailed") {
+        requestType = 146;  // GET_CALL_STACK_DETAILED
     }
 
     // If we have a valid endpoint, build request and forward to plugin

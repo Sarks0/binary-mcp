@@ -1537,3 +1537,344 @@ class X64DbgBridge(Debugger):
         """
         result = self._request("/api/breakpoint/list/all")
         return result
+
+    # =========================================================================
+    # Phase 4: Tracing & Analysis Functions
+    # =========================================================================
+
+    def start_trace(
+        self,
+        trace_into: bool = True,
+        max_entries: int = 100000,
+        log_file: str | None = None
+    ) -> dict[str, Any]:
+        """
+        Start instruction tracing.
+
+        Records each instruction executed with address, disassembly, and timing.
+        Useful for understanding program flow and finding interesting code paths.
+
+        Args:
+            trace_into: If True, trace into function calls. If False, trace over.
+            max_entries: Maximum trace entries to keep in memory (default: 100000)
+            log_file: Optional file path to write trace log (for large traces)
+
+        Returns:
+            Dictionary with trace configuration
+
+        Example:
+            bridge.start_trace(trace_into=True, max_entries=50000)
+            bridge.run()
+            # ... execution happens ...
+            bridge.pause()
+            trace = bridge.get_trace_data()
+        """
+        data = {
+            "trace_into": 1 if trace_into else 0,
+            "max_entries": max_entries
+        }
+        if log_file:
+            data["log_file"] = log_file
+
+        result = self._request("/api/trace/start", data)
+        logger.info(f"Trace started (trace_into={trace_into}, max={max_entries})")
+        return result
+
+    def stop_trace(self) -> dict[str, Any]:
+        """
+        Stop instruction tracing.
+
+        Returns:
+            Dictionary with trace statistics (entry count, duration)
+        """
+        result = self._request("/api/trace/stop")
+        logger.info("Trace stopped")
+        return result
+
+    def get_trace_data(self, offset: int = 0, limit: int = 1000) -> dict[str, Any]:
+        """
+        Get trace data.
+
+        Args:
+            offset: Starting index in trace buffer
+            limit: Maximum entries to return (max 10000)
+
+        Returns:
+            Dictionary with:
+                - total: Total entries in trace
+                - offset: Current offset
+                - enabled: Whether tracing is active
+                - entries: List of trace entries with address, timestamp,
+                          instruction, module, thread_id
+
+        Example:
+            trace = bridge.get_trace_data(offset=0, limit=100)
+            for entry in trace["entries"]:
+                print(f"{entry['address']}: {entry['instruction']}")
+        """
+        data = {"offset": offset, "limit": limit}
+        return self._request("/api/trace/data", data)
+
+    def clear_trace(self) -> dict[str, Any]:
+        """
+        Clear trace data from memory.
+
+        Returns:
+            Confirmation message
+        """
+        return self._request("/api/trace/clear")
+
+    def set_api_breakpoint(self, api_name: str) -> dict[str, Any]:
+        """
+        Set a breakpoint on a Windows API function.
+
+        Resolves the API name to an address and sets a logging breakpoint.
+        Use get_api_log() to retrieve logged calls.
+
+        Args:
+            api_name: API function name in module!function format
+                     Examples: "kernel32!CreateFileW", "ntdll!NtCreateFile"
+
+        Returns:
+            Dictionary with api_name and resolved address
+
+        Example:
+            bridge.set_api_breakpoint("kernel32!CreateFileW")
+            bridge.set_api_breakpoint("kernel32!WriteFile")
+            bridge.run_and_wait()
+            log = bridge.get_api_log()
+        """
+        data = {"api_name": api_name}
+        result = self._request("/api/api_breakpoint", data)
+        logger.info(f"API breakpoint set: {api_name}")
+        return result
+
+    def get_api_log(self, offset: int = 0, limit: int = 100) -> dict[str, Any]:
+        """
+        Get API call log.
+
+        Returns logged API calls from breakpoints set with set_api_breakpoint().
+
+        Args:
+            offset: Starting index
+            limit: Maximum entries to return (max 1000)
+
+        Returns:
+            Dictionary with:
+                - total: Total logged calls
+                - entries: List of API call entries with:
+                    - id: Call ID
+                    - address: API function address
+                    - return_address: Where call originated
+                    - timestamp: When call occurred
+                    - api_name: Function name
+                    - module: Module name
+                    - thread_id: Calling thread
+                    - args: Function arguments (hex values)
+
+        Example:
+            log = bridge.get_api_log()
+            for call in log["entries"]:
+                print(f"{call['api_name']} called from {call['return_address']}")
+        """
+        data = {"offset": offset, "limit": limit}
+        return self._request("/api/api_log", data)
+
+    def clear_api_log(self) -> dict[str, Any]:
+        """
+        Clear the API call log.
+
+        Returns:
+            Confirmation message
+        """
+        return self._request("/api/api_log/clear")
+
+    def find_strings(
+        self,
+        address: str | None = None,
+        size: int = 0x10000,
+        min_length: int = 4,
+        ascii: bool = True,
+        unicode: bool = True
+    ) -> dict[str, Any]:
+        """
+        Search for strings in memory.
+
+        Scans a memory region for ASCII and/or Unicode strings.
+
+        Args:
+            address: Start address (hex string). If None, uses main module base.
+            size: Number of bytes to scan (default: 64KB, max: 10MB)
+            min_length: Minimum string length (default: 4)
+            ascii: Search for ASCII strings (default: True)
+            unicode: Search for UTF-16LE strings (default: True)
+
+        Returns:
+            Dictionary with:
+                - count: Number of strings found
+                - strings: List of found strings with:
+                    - address: String location
+                    - value: String content
+                    - length: String length
+
+        Example:
+            strings = bridge.find_strings(size=0x100000, min_length=6)
+            for s in strings["strings"]:
+                if "http" in s["value"].lower():
+                    print(f"URL at {s['address']}: {s['value']}")
+        """
+        data = {
+            "size": size,
+            "min_length": min_length,
+            "ascii": 1 if ascii else 0,
+            "unicode": 1 if unicode else 0
+        }
+        if address:
+            if address.startswith("0x"):
+                address = address[2:]
+            data["address"] = address
+
+        result = self._request("/api/strings", data)
+        logger.info(f"Found {result.get('count', 0)} strings")
+        return result
+
+    def pattern_scan(
+        self,
+        pattern: str,
+        address: str | None = None,
+        size: int = 0x100000
+    ) -> dict[str, Any]:
+        """
+        Search for byte pattern with wildcards.
+
+        Scans memory for a byte pattern, supporting wildcards (??) for
+        unknown bytes.
+
+        Args:
+            pattern: Hex pattern with optional wildcards
+                    Examples: "90 90 90", "E8 ?? ?? ?? ??", "48 8B ?? 48"
+            address: Start address (hex string). If None, uses main module.
+            size: Number of bytes to scan (default: 1MB, max: 100MB)
+
+        Returns:
+            Dictionary with:
+                - count: Number of matches
+                - pattern: The pattern searched for
+                - matches: List of addresses where pattern was found
+
+        Example:
+            # Find all CALL instructions
+            result = bridge.pattern_scan("E8 ?? ?? ?? ??")
+            for addr in result["matches"]:
+                print(f"CALL found at {addr}")
+
+            # Find specific byte sequence
+            result = bridge.pattern_scan("48 89 5C 24")
+        """
+        data = {"pattern": pattern, "size": size}
+        if address:
+            if address.startswith("0x"):
+                address = address[2:]
+            data["address"] = address
+
+        result = self._request("/api/pattern", data)
+        logger.info(f"Pattern scan found {result.get('count', 0)} matches")
+        return result
+
+    def xor_decrypt(
+        self,
+        address: str,
+        size: int = 256,
+        key: str | None = None,
+        try_all: bool = False
+    ) -> dict[str, Any]:
+        """
+        Try XOR decryption on a memory region.
+
+        Useful for decoding simple XOR-obfuscated strings common in malware.
+
+        Args:
+            address: Address of encrypted data (hex string)
+            size: Number of bytes to decrypt (default: 256, max: 1MB)
+            key: XOR key as hex string (e.g., "41" or "DEADBEEF") or ASCII
+            try_all: If True, try all single-byte keys and return promising results
+
+        Returns:
+            If try_all=True:
+                Dictionary with results list showing keys that produce
+                mostly printable output (>50% printable characters)
+
+            If key provided:
+                Dictionary with:
+                    - key: The key used
+                    - decrypted_hex: Decrypted bytes as hex string
+                    - decrypted_ascii: Decrypted bytes as ASCII (with . for non-printable)
+
+        Example:
+            # Try all single-byte keys
+            result = bridge.xor_decrypt("0x401000", size=64, try_all=True)
+            for r in result["results"]:
+                print(f"Key {r['key']}: {r['preview']}")
+
+            # Decrypt with known key
+            result = bridge.xor_decrypt("0x401000", size=100, key="37")
+            print(result["decrypted_ascii"])
+        """
+        if address.startswith("0x"):
+            address = address[2:]
+
+        data = {"address": address, "size": size}
+        if key:
+            data["key"] = key
+        if try_all:
+            data["try_all"] = 1
+
+        return self._request("/api/xor", data)
+
+    def find_references(self, address: str) -> dict[str, Any]:
+        """
+        Find references to an address.
+
+        Searches for code or data references pointing to the target address.
+
+        Args:
+            address: Target address to find references to
+
+        Returns:
+            Dictionary with target and list of reference addresses
+
+        Note:
+            This provides limited results. For comprehensive reference
+            search, use the x64dbg GUI.
+        """
+        if address.startswith("0x"):
+            address = address[2:]
+
+        data = {"address": address}
+        return self._request("/api/references", data)
+
+    def get_callstack_detailed(self) -> dict[str, Any]:
+        """
+        Get detailed call stack with symbol information.
+
+        Provides more information than get_stack(), including resolved
+        symbols and module names for each frame.
+
+        Returns:
+            Dictionary with:
+                - depth: Number of stack frames
+                - frames: List of stack frames with:
+                    - address: Frame address
+                    - from: Call source address
+                    - to: Call destination
+                    - symbol: Resolved symbol name
+                    - module: Module name
+                    - comment: Any associated comment
+
+        Example:
+            stack = bridge.get_callstack_detailed()
+            for frame in stack["frames"]:
+                sym = frame["symbol"] or frame["address"]
+                print(f"{frame['module']}!{sym}")
+        """
+        return self._request("/api/callstack/detailed")

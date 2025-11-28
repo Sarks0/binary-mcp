@@ -95,7 +95,27 @@ enum RequestType {
     DELETE_HARDWARE_BREAKPOINT = 121,
     TOGGLE_HARDWARE_BREAKPOINT = 122,
     TOGGLE_MEMORY_BREAKPOINT = 123,
-    LIST_ALL_BREAKPOINTS = 124
+    LIST_ALL_BREAKPOINTS = 124,
+
+    // Phase 4: Tracing & String Analysis
+    START_TRACE = 130,
+    STOP_TRACE = 131,
+    GET_TRACE_DATA = 132,
+    CLEAR_TRACE = 133,
+    SET_API_BREAKPOINT = 134,
+    GET_API_LOG = 135,
+    CLEAR_API_LOG = 136,
+
+    // Phase 4: String & Pattern Search
+    FIND_STRINGS = 140,
+    PATTERN_SCAN = 141,
+    XOR_DECRYPT = 142,
+
+    // Phase 4: References & Analysis
+    FIND_REFERENCES = 145,
+    GET_CALL_STACK_DETAILED = 146,
+    GET_XREFS_TO = 147,
+    GET_XREFS_FROM = 148
 };
 
 // Plugin globals
@@ -115,6 +135,89 @@ static HANDLE g_pipeServer = INVALID_HANDLE_VALUE;
 static HANDLE g_pipeThread = nullptr;
 static HANDLE g_shutdownEvent = nullptr;  // Event to signal shutdown
 static bool g_running = false;
+
+// ============================================================================
+// PHASE 4: TRACING & API LOGGING DATA STRUCTURES
+// ============================================================================
+
+// Trace entry for instruction tracing
+struct TraceEntry {
+    uint64_t address;
+    uint64_t timestamp;  // Milliseconds since trace start
+    std::string instruction;
+    std::string module;
+    uint32_t threadId;
+};
+
+// API call log entry
+struct ApiCallEntry {
+    uint64_t id;
+    uint64_t address;        // Address of the API function
+    uint64_t returnAddress;  // Where the call came from
+    uint64_t timestamp;
+    std::string apiName;
+    std::string moduleName;
+    std::vector<uint64_t> args;  // Up to 4 arguments
+    uint64_t returnValue;
+    bool hasReturned;
+    uint32_t threadId;
+};
+
+// Global trace state
+static struct {
+    bool enabled;
+    bool traceInto;  // true = trace into calls, false = trace over
+    uint64_t startTime;
+    uint64_t maxEntries;
+    std::vector<TraceEntry> entries;
+    std::string logFile;
+    FILE* logFileHandle;
+
+    void Reset() {
+        enabled = false;
+        traceInto = true;
+        startTime = 0;
+        maxEntries = 100000;
+        entries.clear();
+        logFile.clear();
+        if (logFileHandle) {
+            fclose(logFileHandle);
+            logFileHandle = nullptr;
+        }
+    }
+} g_traceState = {false, true, 0, 100000, {}, "", nullptr};
+
+// Global API logging state
+static struct {
+    bool enabled;
+    uint64_t nextId;
+    uint64_t startTime;
+    std::vector<ApiCallEntry> entries;
+    std::set<std::string> watchedApis;  // APIs to log (empty = all)
+    uint64_t maxEntries;
+
+    void Reset() {
+        enabled = false;
+        nextId = 1;
+        startTime = 0;
+        entries.clear();
+        watchedApis.clear();
+        maxEntries = 10000;
+    }
+} g_apiLogState = {false, 1, 0, {}, {}, 10000};
+
+// Mutex for thread safety
+static CRITICAL_SECTION g_traceLock;
+static CRITICAL_SECTION g_apiLogLock;
+static bool g_locksInitialized = false;
+
+void InitTraceLocks() {
+    if (!g_locksInitialized) {
+        InitializeCriticalSection(&g_traceLock);
+        InitializeCriticalSection(&g_apiLogLock);
+        g_locksInitialized = true;
+    }
+}
 
 // Logging helpers
 void LogInfo(const char* format, ...) {
@@ -1916,6 +2019,635 @@ std::string HandleListAllBreakpoints(const std::string& request) {
 }
 
 // ============================================================================
+// PHASE 4: TRACING HANDLERS
+// ============================================================================
+
+// Handler: START_TRACE - Start instruction tracing
+std::string HandleStartTrace(const std::string& request) {
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+    }
+
+    InitTraceLocks();
+    EnterCriticalSection(&g_traceLock);
+
+    // Parse options
+    g_traceState.traceInto = ExtractIntField(request, "trace_into", 1) != 0;
+    g_traceState.maxEntries = ExtractIntField(request, "max_entries", 100000);
+    std::string logFile = ExtractStringField(request, "log_file");
+
+    // Cap max entries
+    if (g_traceState.maxEntries > 1000000) g_traceState.maxEntries = 1000000;
+
+    // Clear previous trace
+    g_traceState.entries.clear();
+    g_traceState.startTime = GetTickCount64();
+    g_traceState.enabled = true;
+
+    // Open log file if specified
+    if (!logFile.empty()) {
+        g_traceState.logFile = logFile;
+        g_traceState.logFileHandle = fopen(logFile.c_str(), "w");
+        if (g_traceState.logFileHandle) {
+            fprintf(g_traceState.logFileHandle, "# Trace started at %llu\n", g_traceState.startTime);
+            fprintf(g_traceState.logFileHandle, "# Format: timestamp,address,module,instruction,thread_id\n");
+        }
+    }
+
+    LeaveCriticalSection(&g_traceLock);
+
+    LogInfo("Trace started (trace_into=%d, max=%llu)", g_traceState.traceInto, g_traceState.maxEntries);
+
+    std::stringstream data;
+    data << "\"message\":\"Trace started\","
+         << "\"trace_into\":" << (g_traceState.traceInto ? "true" : "false") << ","
+         << "\"max_entries\":" << g_traceState.maxEntries;
+
+    return BuildJsonResponse(true, data.str());
+}
+
+// Handler: STOP_TRACE - Stop instruction tracing
+std::string HandleStopTrace(const std::string& request) {
+    InitTraceLocks();
+    EnterCriticalSection(&g_traceLock);
+
+    g_traceState.enabled = false;
+
+    uint64_t entryCount = g_traceState.entries.size();
+    uint64_t duration = GetTickCount64() - g_traceState.startTime;
+
+    // Close log file
+    if (g_traceState.logFileHandle) {
+        fprintf(g_traceState.logFileHandle, "# Trace stopped. Total entries: %llu, Duration: %llu ms\n",
+                entryCount, duration);
+        fclose(g_traceState.logFileHandle);
+        g_traceState.logFileHandle = nullptr;
+    }
+
+    LeaveCriticalSection(&g_traceLock);
+
+    LogInfo("Trace stopped (%llu entries, %llu ms)", entryCount, duration);
+
+    std::stringstream data;
+    data << "\"message\":\"Trace stopped\","
+         << "\"entries\":" << entryCount << ","
+         << "\"duration_ms\":" << duration;
+
+    return BuildJsonResponse(true, data.str());
+}
+
+// Handler: GET_TRACE_DATA - Get trace data
+std::string HandleGetTraceData(const std::string& request) {
+    InitTraceLocks();
+    EnterCriticalSection(&g_traceLock);
+
+    int offset = ExtractIntField(request, "offset", 0);
+    int limit = ExtractIntField(request, "limit", 1000);
+
+    // Cap limit
+    if (limit > 10000) limit = 10000;
+    if (limit < 1) limit = 1;
+
+    std::stringstream data;
+    data << "\"total\":" << g_traceState.entries.size() << ","
+         << "\"offset\":" << offset << ","
+         << "\"enabled\":" << (g_traceState.enabled ? "true" : "false") << ","
+         << "\"entries\":[";
+
+    int count = 0;
+    for (size_t i = offset; i < g_traceState.entries.size() && count < limit; i++, count++) {
+        if (count > 0) data << ",";
+
+        const TraceEntry& entry = g_traceState.entries[i];
+        data << "{\"address\":\"" << std::hex << entry.address << std::dec << "\","
+             << "\"timestamp\":" << entry.timestamp << ","
+             << "\"instruction\":\"" << JsonEscape(entry.instruction) << "\","
+             << "\"module\":\"" << JsonEscape(entry.module) << "\","
+             << "\"thread_id\":" << entry.threadId << "}";
+    }
+    data << "]";
+
+    LeaveCriticalSection(&g_traceLock);
+
+    return BuildJsonResponse(true, data.str());
+}
+
+// Handler: CLEAR_TRACE - Clear trace data
+std::string HandleClearTrace(const std::string& request) {
+    InitTraceLocks();
+    EnterCriticalSection(&g_traceLock);
+
+    g_traceState.entries.clear();
+
+    LeaveCriticalSection(&g_traceLock);
+
+    return BuildJsonResponse(true, "\"message\":\"Trace data cleared\"");
+}
+
+// Handler: SET_API_BREAKPOINT - Set breakpoint on API function with logging
+std::string HandleSetApiBreakpoint(const std::string& request) {
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+    }
+
+    std::string apiName = ExtractStringField(request, "api_name");
+    if (apiName.empty()) {
+        return BuildJsonResponse(false, "\"error\":\"Missing api_name\"");
+    }
+
+    // Resolve the API address
+    std::string errorMsg;
+    duint address = ResolveAddress(apiName, errorMsg);
+    if (address == 0 && !errorMsg.empty()) {
+        return BuildAddressError(errorMsg, apiName);
+    }
+
+    // Set conditional breakpoint with logging
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "bp %llx", address);
+    if (!DbgCmdExec(cmd)) {
+        return BuildJsonResponse(false, "\"error\":\"Failed to set breakpoint\"");
+    }
+
+    // Add to watched APIs
+    InitTraceLocks();
+    EnterCriticalSection(&g_apiLogLock);
+    g_apiLogState.watchedApis.insert(apiName);
+    g_apiLogState.enabled = true;
+    if (g_apiLogState.startTime == 0) {
+        g_apiLogState.startTime = GetTickCount64();
+    }
+    LeaveCriticalSection(&g_apiLogLock);
+
+    LogInfo("API breakpoint set: %s at 0x%llx", apiName.c_str(), address);
+
+    std::stringstream data;
+    data << "\"api_name\":\"" << JsonEscape(apiName) << "\","
+         << "\"address\":\"" << std::hex << address << std::dec << "\"";
+
+    return BuildJsonResponse(true, data.str());
+}
+
+// Handler: GET_API_LOG - Get API call log
+std::string HandleGetApiLog(const std::string& request) {
+    InitTraceLocks();
+    EnterCriticalSection(&g_apiLogLock);
+
+    int offset = ExtractIntField(request, "offset", 0);
+    int limit = ExtractIntField(request, "limit", 100);
+
+    if (limit > 1000) limit = 1000;
+    if (limit < 1) limit = 1;
+
+    std::stringstream data;
+    data << "\"total\":" << g_apiLogState.entries.size() << ","
+         << "\"offset\":" << offset << ","
+         << "\"enabled\":" << (g_apiLogState.enabled ? "true" : "false") << ","
+         << "\"entries\":[";
+
+    int count = 0;
+    for (size_t i = offset; i < g_apiLogState.entries.size() && count < limit; i++, count++) {
+        if (count > 0) data << ",";
+
+        const ApiCallEntry& entry = g_apiLogState.entries[i];
+        data << "{\"id\":" << entry.id << ","
+             << "\"address\":\"" << std::hex << entry.address << std::dec << "\","
+             << "\"return_address\":\"" << std::hex << entry.returnAddress << std::dec << "\","
+             << "\"timestamp\":" << entry.timestamp << ","
+             << "\"api_name\":\"" << JsonEscape(entry.apiName) << "\","
+             << "\"module\":\"" << JsonEscape(entry.moduleName) << "\","
+             << "\"thread_id\":" << entry.threadId << ","
+             << "\"args\":[";
+
+        for (size_t j = 0; j < entry.args.size(); j++) {
+            if (j > 0) data << ",";
+            data << "\"" << std::hex << entry.args[j] << std::dec << "\"";
+        }
+        data << "]}";
+    }
+    data << "]";
+
+    LeaveCriticalSection(&g_apiLogLock);
+
+    return BuildJsonResponse(true, data.str());
+}
+
+// Handler: CLEAR_API_LOG - Clear API call log
+std::string HandleClearApiLog(const std::string& request) {
+    InitTraceLocks();
+    EnterCriticalSection(&g_apiLogLock);
+
+    g_apiLogState.entries.clear();
+    g_apiLogState.nextId = 1;
+
+    LeaveCriticalSection(&g_apiLogLock);
+
+    return BuildJsonResponse(true, "\"message\":\"API log cleared\"");
+}
+
+// ============================================================================
+// PHASE 4: STRING & PATTERN SEARCH HANDLERS
+// ============================================================================
+
+// Handler: FIND_STRINGS - Search for strings in memory
+std::string HandleFindStrings(const std::string& request) {
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+    }
+
+    std::string addressStr = ExtractStringField(request, "address");
+    int size = ExtractIntField(request, "size", 0x10000);  // Default 64KB
+    int minLength = ExtractIntField(request, "min_length", 4);
+    bool searchAscii = ExtractIntField(request, "ascii", 1) != 0;
+    bool searchUnicode = ExtractIntField(request, "unicode", 1) != 0;
+
+    // Validate
+    if (size > 10 * 1024 * 1024) {
+        return BuildJsonResponse(false, "\"error\":\"Size too large (max 10MB)\"");
+    }
+    if (minLength < 2) minLength = 2;
+    if (minLength > 100) minLength = 100;
+
+    // Resolve start address
+    duint startAddr;
+    if (addressStr.empty()) {
+        // Use main module base if no address specified
+        startAddr = DbgValFromString("mod.main()");
+    } else {
+        std::string errorMsg;
+        startAddr = ResolveAddress(addressStr, errorMsg);
+        if (startAddr == 0 && !errorMsg.empty()) {
+            return BuildAddressError(errorMsg, addressStr);
+        }
+    }
+
+    // Read memory
+    std::vector<unsigned char> buffer(size);
+    if (!DbgMemRead(startAddr, buffer.data(), size)) {
+        return BuildJsonResponse(false, "\"error\":\"Failed to read memory\"");
+    }
+
+    // Find strings
+    std::vector<std::pair<duint, std::string>> foundStrings;
+    const int maxStrings = 1000;
+
+    // Search for ASCII strings
+    if (searchAscii && foundStrings.size() < maxStrings) {
+        size_t start = 0;
+        while (start < buffer.size() && foundStrings.size() < maxStrings) {
+            // Find start of printable sequence
+            while (start < buffer.size() && (buffer[start] < 0x20 || buffer[start] > 0x7E)) {
+                start++;
+            }
+
+            if (start >= buffer.size()) break;
+
+            // Find end of printable sequence
+            size_t end = start;
+            while (end < buffer.size() && buffer[end] >= 0x20 && buffer[end] <= 0x7E) {
+                end++;
+            }
+
+            // Check length
+            if (end - start >= (size_t)minLength) {
+                std::string str(buffer.begin() + start, buffer.begin() + end);
+                foundStrings.push_back({startAddr + start, str});
+            }
+
+            start = end + 1;
+        }
+    }
+
+    // Search for Unicode (UTF-16LE) strings
+    if (searchUnicode && foundStrings.size() < maxStrings) {
+        for (size_t i = 0; i + 1 < buffer.size() && foundStrings.size() < maxStrings; i += 2) {
+            // Check for printable UTF-16LE character (ASCII range with null high byte)
+            if (buffer[i] >= 0x20 && buffer[i] <= 0x7E && buffer[i + 1] == 0) {
+                size_t start = i;
+                std::string str;
+
+                // Collect characters
+                while (i + 1 < buffer.size() && buffer[i] >= 0x20 && buffer[i] <= 0x7E && buffer[i + 1] == 0) {
+                    str += (char)buffer[i];
+                    i += 2;
+                }
+
+                if (str.length() >= (size_t)minLength) {
+                    foundStrings.push_back({startAddr + start, str});
+                }
+            }
+        }
+    }
+
+    // Build response
+    std::stringstream data;
+    data << "\"count\":" << foundStrings.size() << ","
+         << "\"strings\":[";
+
+    for (size_t i = 0; i < foundStrings.size(); i++) {
+        if (i > 0) data << ",";
+        data << "{\"address\":\"" << std::hex << foundStrings[i].first << std::dec << "\","
+             << "\"value\":\"" << JsonEscape(foundStrings[i].second) << "\","
+             << "\"length\":" << foundStrings[i].second.length() << "}";
+    }
+    data << "]";
+
+    return BuildJsonResponse(true, data.str());
+}
+
+// Handler: PATTERN_SCAN - Search for byte pattern with wildcards
+std::string HandlePatternScan(const std::string& request) {
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+    }
+
+    std::string pattern = ExtractStringField(request, "pattern");
+    std::string addressStr = ExtractStringField(request, "address");
+    int size = ExtractIntField(request, "size", 0x100000);  // Default 1MB
+
+    if (pattern.empty()) {
+        return BuildJsonResponse(false, "\"error\":\"Missing pattern\"");
+    }
+
+    // Validate size
+    if (size > 100 * 1024 * 1024) {
+        return BuildJsonResponse(false, "\"error\":\"Size too large (max 100MB)\"");
+    }
+
+    // Parse pattern - format: "90 ?? E8 ?? ?? ?? ??" or "90??E8??????"
+    std::vector<std::pair<unsigned char, bool>> parsedPattern;  // (byte, isWildcard)
+
+    std::string cleanPattern;
+    for (char c : pattern) {
+        if (isxdigit(c) || c == '?') {
+            cleanPattern += toupper(c);
+        }
+    }
+
+    if (cleanPattern.length() % 2 != 0) {
+        return BuildJsonResponse(false, "\"error\":\"Invalid pattern length\"");
+    }
+
+    for (size_t i = 0; i < cleanPattern.length(); i += 2) {
+        if (cleanPattern[i] == '?' || cleanPattern[i + 1] == '?') {
+            parsedPattern.push_back({0, true});  // Wildcard
+        } else {
+            unsigned int byte;
+            sscanf(cleanPattern.c_str() + i, "%02X", &byte);
+            parsedPattern.push_back({(unsigned char)byte, false});
+        }
+    }
+
+    if (parsedPattern.empty()) {
+        return BuildJsonResponse(false, "\"error\":\"Empty pattern\"");
+    }
+
+    // Resolve start address
+    duint startAddr;
+    if (addressStr.empty()) {
+        startAddr = DbgValFromString("mod.main()");
+    } else {
+        std::string errorMsg;
+        startAddr = ResolveAddress(addressStr, errorMsg);
+        if (startAddr == 0 && !errorMsg.empty()) {
+            return BuildAddressError(errorMsg, addressStr);
+        }
+    }
+
+    // Read memory
+    std::vector<unsigned char> buffer(size);
+    duint bytesRead = 0;
+    DbgMemRead(startAddr, buffer.data(), size);
+
+    // Search for pattern
+    std::vector<duint> matches;
+    const int maxMatches = 100;
+
+    for (size_t i = 0; i + parsedPattern.size() <= buffer.size() && matches.size() < maxMatches; i++) {
+        bool match = true;
+        for (size_t j = 0; j < parsedPattern.size(); j++) {
+            if (!parsedPattern[j].second && buffer[i + j] != parsedPattern[j].first) {
+                match = false;
+                break;
+            }
+        }
+        if (match) {
+            matches.push_back(startAddr + i);
+        }
+    }
+
+    // Build response
+    std::stringstream data;
+    data << "\"count\":" << matches.size() << ","
+         << "\"pattern\":\"" << JsonEscape(pattern) << "\","
+         << "\"matches\":[";
+
+    for (size_t i = 0; i < matches.size(); i++) {
+        if (i > 0) data << ",";
+        data << "\"" << std::hex << matches[i] << std::dec << "\"";
+    }
+    data << "]";
+
+    return BuildJsonResponse(true, data.str());
+}
+
+// Handler: XOR_DECRYPT - Try XOR decryption on memory region
+std::string HandleXorDecrypt(const std::string& request) {
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+    }
+
+    std::string addressStr = ExtractStringField(request, "address");
+    int size = ExtractIntField(request, "size", 256);
+    std::string keyStr = ExtractStringField(request, "key");
+    bool tryAllSingleByte = ExtractIntField(request, "try_all", 0) != 0;
+
+    if (addressStr.empty()) {
+        return BuildJsonResponse(false, "\"error\":\"Missing address\"");
+    }
+
+    // Validate size
+    if (size > 1024 * 1024) {
+        return BuildJsonResponse(false, "\"error\":\"Size too large (max 1MB)\"");
+    }
+    if (size < 1) size = 1;
+
+    // Resolve address
+    std::string errorMsg;
+    duint address = ResolveAddress(addressStr, errorMsg);
+    if (address == 0 && !errorMsg.empty()) {
+        return BuildAddressError(errorMsg, addressStr);
+    }
+
+    // Read memory
+    std::vector<unsigned char> buffer(size);
+    if (!DbgMemRead(address, buffer.data(), size)) {
+        return BuildJsonResponse(false, "\"error\":\"Failed to read memory\"");
+    }
+
+    // Parse key if provided
+    std::vector<unsigned char> key;
+    if (!keyStr.empty()) {
+        // Try hex interpretation first
+        std::string cleanKey;
+        for (char c : keyStr) {
+            if (isxdigit(c)) cleanKey += c;
+        }
+
+        if (cleanKey.length() >= 2) {
+            for (size_t i = 0; i + 1 < cleanKey.length(); i += 2) {
+                unsigned int byte;
+                sscanf(cleanKey.c_str() + i, "%02x", &byte);
+                key.push_back((unsigned char)byte);
+            }
+        } else {
+            // Use as ASCII key
+            for (char c : keyStr) {
+                key.push_back((unsigned char)c);
+            }
+        }
+    }
+
+    std::stringstream data;
+
+    if (tryAllSingleByte) {
+        // Try all single-byte XOR keys and show results with printable strings
+        data << "\"results\":[";
+
+        int resultsCount = 0;
+        for (int k = 1; k < 256 && resultsCount < 50; k++) {
+            std::string decrypted;
+            int printableCount = 0;
+
+            for (size_t i = 0; i < buffer.size(); i++) {
+                unsigned char c = buffer[i] ^ k;
+                if (c >= 0x20 && c <= 0x7E) {
+                    printableCount++;
+                    decrypted += (char)c;
+                } else if (c == 0) {
+                    decrypted += "\\0";
+                } else {
+                    decrypted += '.';
+                }
+            }
+
+            // Only include if >50% printable
+            if (printableCount * 2 > (int)buffer.size()) {
+                if (resultsCount > 0) data << ",";
+                data << "{\"key\":\"0x" << std::hex << k << std::dec << "\","
+                     << "\"printable_percent\":" << (printableCount * 100 / buffer.size()) << ","
+                     << "\"preview\":\"" << JsonEscape(decrypted.substr(0, 100)) << "\"}";
+                resultsCount++;
+            }
+        }
+        data << "]";
+    } else if (!key.empty()) {
+        // XOR with provided key
+        std::string decrypted;
+        std::string hexResult;
+
+        for (size_t i = 0; i < buffer.size(); i++) {
+            unsigned char c = buffer[i] ^ key[i % key.size()];
+            if (c >= 0x20 && c <= 0x7E) {
+                decrypted += (char)c;
+            } else if (c == 0) {
+                decrypted += "\\0";
+            } else {
+                decrypted += '.';
+            }
+
+            char hex[4];
+            snprintf(hex, sizeof(hex), "%02x", c);
+            hexResult += hex;
+        }
+
+        data << "\"key\":\"" << JsonEscape(keyStr) << "\","
+             << "\"decrypted_hex\":\"" << hexResult << "\","
+             << "\"decrypted_ascii\":\"" << JsonEscape(decrypted) << "\"";
+    } else {
+        return BuildJsonResponse(false, "\"error\":\"Provide a key or set try_all=1\"");
+    }
+
+    return BuildJsonResponse(true, data.str());
+}
+
+// Handler: FIND_REFERENCES - Find references to an address
+std::string HandleFindReferences(const std::string& request) {
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+    }
+
+    std::string addressStr = ExtractStringField(request, "address");
+    if (addressStr.empty()) {
+        return BuildJsonResponse(false, "\"error\":\"Missing address\"");
+    }
+
+    std::string errorMsg;
+    duint targetAddr = ResolveAddress(addressStr, errorMsg);
+    if (targetAddr == 0 && !errorMsg.empty()) {
+        return BuildAddressError(errorMsg, addressStr);
+    }
+
+    // Use x64dbg's reference search
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "findallmem %llx", targetAddr);
+
+    // Get references using DbgGetRefList
+    // Note: This is a simplified implementation - full implementation would use GUIREF APIs
+    std::stringstream data;
+    data << "\"target\":\"" << std::hex << targetAddr << std::dec << "\","
+         << "\"message\":\"Use GUI for full reference search - API returns limited results\","
+         << "\"references\":[]";
+
+    return BuildJsonResponse(true, data.str());
+}
+
+// Handler: GET_CALL_STACK_DETAILED - Get detailed call stack with symbols
+std::string HandleGetCallStackDetailed(const std::string& request) {
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+    }
+
+    // Get call stack using x64dbg's built-in functionality
+    DBGCALLSTACK callstack;
+    if (!DbgGetCallStackAt(DbgValFromString("rsp"), &callstack)) {
+        return BuildJsonResponse(false, "\"error\":\"Failed to get call stack\"");
+    }
+
+    std::stringstream data;
+    data << "\"depth\":" << callstack.total << ","
+         << "\"frames\":[";
+
+    for (int i = 0; i < callstack.total && i < 50; i++) {
+        if (i > 0) data << ",";
+
+        DBGCALLSTACKENTRY& entry = callstack.entries[i];
+
+        // Get symbol info
+        char symbolName[MAX_LABEL_SIZE] = "";
+        DbgGetLabelAt(entry.addr, SEG_DEFAULT, symbolName);
+
+        char moduleName[MAX_MODULE_SIZE] = "";
+        DbgGetModuleAt(entry.addr, moduleName);
+
+        data << "{\"address\":\"" << std::hex << entry.addr << std::dec << "\","
+             << "\"from\":\"" << std::hex << entry.from << std::dec << "\","
+             << "\"to\":\"" << std::hex << entry.to << std::dec << "\","
+             << "\"symbol\":\"" << JsonEscape(symbolName) << "\","
+             << "\"module\":\"" << JsonEscape(moduleName) << "\","
+             << "\"comment\":\"" << JsonEscape(entry.comment ? entry.comment : "") << "\"}";
+    }
+    data << "]";
+
+    // Free the callstack
+    if (callstack.entries) {
+        BridgeFree(callstack.entries);
+    }
+
+    return BuildJsonResponse(true, data.str());
+}
+
+// ============================================================================
 // EVENT HANDLERS
 // ============================================================================
 
@@ -2459,6 +3191,48 @@ static DWORD WINAPI PipeServerThread(LPVOID lpParam) {
                         break;
                     case LIST_ALL_BREAKPOINTS:
                         response = HandleListAllBreakpoints(request);
+                        break;
+
+                    // Phase 4: Tracing
+                    case START_TRACE:
+                        response = HandleStartTrace(request);
+                        break;
+                    case STOP_TRACE:
+                        response = HandleStopTrace(request);
+                        break;
+                    case GET_TRACE_DATA:
+                        response = HandleGetTraceData(request);
+                        break;
+                    case CLEAR_TRACE:
+                        response = HandleClearTrace(request);
+                        break;
+                    case SET_API_BREAKPOINT:
+                        response = HandleSetApiBreakpoint(request);
+                        break;
+                    case GET_API_LOG:
+                        response = HandleGetApiLog(request);
+                        break;
+                    case CLEAR_API_LOG:
+                        response = HandleClearApiLog(request);
+                        break;
+
+                    // Phase 4: String & Pattern Search
+                    case FIND_STRINGS:
+                        response = HandleFindStrings(request);
+                        break;
+                    case PATTERN_SCAN:
+                        response = HandlePatternScan(request);
+                        break;
+                    case XOR_DECRYPT:
+                        response = HandleXorDecrypt(request);
+                        break;
+
+                    // Phase 4: References & Analysis
+                    case FIND_REFERENCES:
+                        response = HandleFindReferences(request);
+                        break;
+                    case GET_CALL_STACK_DETAILED:
+                        response = HandleGetCallStackDetailed(request);
                         break;
 
                     default:

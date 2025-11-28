@@ -9,6 +9,7 @@
 #include <iomanip>
 #include <set>
 #include <map>
+#include <algorithm>
 #include <cctype>
 #include <wincrypt.h>  // For CryptGenRandom
 
@@ -2688,41 +2689,63 @@ std::string HandleGetCallStackDetailed(const std::string& request) {
         return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
     }
 
-    // Get call stack using x64dbg's built-in functionality
-    DBGCALLSTACK callstack;
-    if (!DbgGetCallStackAt(DbgValFromString("rsp"), &callstack)) {
-        return BuildJsonResponse(false, "\"error\":\"Failed to get call stack\"");
+    // Get current RSP/ESP and RIP/EIP
+    duint rsp = DbgValFromString("rsp");
+    duint rip = DbgValFromString("rip");
+
+    if (rsp == 0) {
+        return BuildJsonResponse(false, "\"error\":\"Failed to get stack pointer\"");
     }
 
     std::stringstream data;
-    data << "\"depth\":" << callstack.total << ","
+    std::vector<std::pair<duint, duint>> frames;  // (return_addr, frame_ptr)
+
+    // Add current instruction as first frame
+    frames.push_back({rip, rsp});
+
+    // Walk stack looking for return addresses
+    // Simple heuristic: read potential return addresses from stack
+    const int maxFrames = 50;
+    const int stackScanSize = 0x1000;  // Scan 4KB of stack
+
+    std::vector<duint> stackData(stackScanSize / sizeof(duint));
+    if (DbgMemRead(rsp, stackData.data(), stackScanSize)) {
+        for (size_t i = 0; i < stackData.size() && frames.size() < maxFrames; i++) {
+            duint potentialAddr = stackData[i];
+
+            // Check if this looks like a valid code address
+            if (potentialAddr != 0 && DbgMemIsValidReadPtr(potentialAddr)) {
+                char moduleName[MAX_MODULE_SIZE] = "";
+                if (DbgGetModuleAt(potentialAddr, moduleName) && moduleName[0] != '\0') {
+                    // It's in a module, likely a return address
+                    frames.push_back({potentialAddr, rsp + i * sizeof(duint)});
+                }
+            }
+        }
+    }
+
+    data << "\"depth\":" << frames.size() << ","
          << "\"frames\":[";
 
-    for (int i = 0; i < callstack.total && i < 50; i++) {
+    for (size_t i = 0; i < frames.size(); i++) {
         if (i > 0) data << ",";
 
-        DBGCALLSTACKENTRY& entry = callstack.entries[i];
+        duint addr = frames[i].first;
+        duint framePtr = frames[i].second;
 
         // Get symbol info
         char symbolName[MAX_LABEL_SIZE] = "";
-        DbgGetLabelAt(entry.addr, SEG_DEFAULT, symbolName);
+        DbgGetLabelAt(addr, SEG_DEFAULT, symbolName);
 
         char moduleName[MAX_MODULE_SIZE] = "";
-        DbgGetModuleAt(entry.addr, moduleName);
+        DbgGetModuleAt(addr, moduleName);
 
-        data << "{\"address\":\"" << std::hex << entry.addr << std::dec << "\","
-             << "\"from\":\"" << std::hex << entry.from << std::dec << "\","
-             << "\"to\":\"" << std::hex << entry.to << std::dec << "\","
+        data << "{\"address\":\"" << std::hex << addr << std::dec << "\","
+             << "\"frame_ptr\":\"" << std::hex << framePtr << std::dec << "\","
              << "\"symbol\":\"" << JsonEscape(symbolName) << "\","
-             << "\"module\":\"" << JsonEscape(moduleName) << "\","
-             << "\"comment\":\"" << JsonEscape(entry.comment ? entry.comment : "") << "\"}";
+             << "\"module\":\"" << JsonEscape(moduleName) << "\"}";
     }
     data << "]";
-
-    // Free the callstack
-    if (callstack.entries) {
-        BridgeFree(callstack.entries);
-    }
 
     return BuildJsonResponse(true, data.str());
 }

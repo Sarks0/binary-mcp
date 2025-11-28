@@ -1663,7 +1663,7 @@ void OnCreateProcess(CBTYPE cbType, PLUG_CB_CREATEPROCESS* info) {
     EventQueue::Instance().PushEvent(
         DebugEventType::PROCESS_STARTED,
         reinterpret_cast<uint64_t>(info->CreateProcessInfo->lpBaseOfImage),
-        reinterpret_cast<uint32_t>(reinterpret_cast<uintptr_t>(info->CreateProcessInfo->hProcess)),
+        static_cast<uint32_t>(GetProcessId(info->CreateProcessInfo->hProcess)),
         modulePath,
         details.str()
     );
@@ -1745,19 +1745,6 @@ void OnUnloadDll(CBTYPE cbType, PLUG_CB_UNLOADDLL* info) {
         0,
         "",
         ""
-    );
-}
-
-// Callback: Debug string output
-void OnDebugString(CBTYPE cbType, PLUG_CB_DEBUGSTRING* info) {
-    if (!info) return;
-
-    EventQueue::Instance().PushEvent(
-        DebugEventType::DEBUG_STRING,
-        0,
-        0,
-        "",
-        info->string ? info->string : ""
     );
 }
 
@@ -2410,10 +2397,9 @@ void pluginSetup() {
     _plugin_registercallback(g_pluginHandle, CB_EXITTHREAD, (CBPLUGIN)OnExitThread);
     _plugin_registercallback(g_pluginHandle, CB_LOADDLL, (CBPLUGIN)OnLoadDll);
     _plugin_registercallback(g_pluginHandle, CB_UNLOADDLL, (CBPLUGIN)OnUnloadDll);
-    _plugin_registercallback(g_pluginHandle, CB_DEBUGSTRING, (CBPLUGIN)OnDebugString);
     _plugin_registercallback(g_pluginHandle, CB_SYSTEMBREAKPOINT, (CBPLUGIN)OnSystemBreakpoint);
 
-    LogInfo("Registered 13 debug event callbacks");
+    LogInfo("Registered 12 debug event callbacks");
 
     // Add menu items
     if (g_hMenu) {

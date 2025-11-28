@@ -166,6 +166,50 @@ Essential for automation scripts - block until debugger reaches desired state.
 | `/api/memory/write` | POST | Write memory |
 | `/api/disassemble` | POST | Disassemble at address |
 
+### Memory Allocation (NEW - Phase 3)
+
+Memory management functions for advanced debugging and analysis.
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/memory/alloc` | POST | Allocate memory in debugee's address space |
+| `/api/memory/free` | POST | Free previously allocated memory |
+| `/api/memory/protect` | POST | Change memory protection (rwx, rx, rw, etc.) |
+| `/api/memory/set` | POST | Fill memory with a byte value (memset) |
+| `/api/memory/check` | POST | Check if address is readable |
+
+**Parameters:**
+
+`/api/memory/alloc`:
+- `size`: Number of bytes to allocate (default: 4096, max: 16MB)
+- `address`: Optional preferred address
+
+`/api/memory/protect`:
+- `address`: Memory address
+- `protection`: "rwx", "rx", "rw", "r", "x", or "n" (none)
+- `size`: Size in bytes (default: 4096)
+
+`/api/memory/set`:
+- `address`: Start address
+- `value`: Byte value (0-255)
+- `size`: Number of bytes to fill
+
+### Enhanced Breakpoints (NEW - Phase 3)
+
+Extended breakpoint functionality for all breakpoint types.
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/breakpoint/toggle` | POST | Enable/disable software breakpoint |
+| `/api/breakpoint/hardware/delete` | POST | Delete hardware breakpoint |
+| `/api/breakpoint/hardware/toggle` | POST | Enable/disable hardware breakpoint |
+| `/api/breakpoint/memory/toggle` | POST | Enable/disable memory breakpoint |
+| `/api/breakpoint/list/all` | GET/POST | List all breakpoints (software, hardware, memory) |
+
+**Parameters:**
+- `address`: Breakpoint address
+- `enable`: 1 to enable, 0 to disable (for toggle endpoints)
+
 ### Events (NEW - Phase 2)
 
 Debug event system for capturing breakpoints, exceptions, and other debug events.
@@ -312,6 +356,79 @@ Response:
   ],
   "queue_size": 0,
   "next_event_id": 4
+}
+```
+
+### Allocate Memory (NEW - Phase 3)
+```bash
+# Allocate 4KB of memory
+curl -X POST http://localhost:8765/api/memory/alloc \
+  -H "Content-Type: application/json" \
+  -d '{"size": 4096}'
+```
+
+Response:
+```json
+{
+  "success": true,
+  "address": "12340000",
+  "size": 4096
+}
+```
+
+### Change Memory Protection (NEW - Phase 3)
+```bash
+# Make code region writable for patching
+curl -X POST http://localhost:8765/api/memory/protect \
+  -H "Content-Type: application/json" \
+  -d '{"address": "401000", "protection": "rwx", "size": 4096}'
+```
+
+Response:
+```json
+{
+  "success": true,
+  "address": "401000",
+  "protection": 64
+}
+```
+
+### Fill Memory (NEW - Phase 3)
+```bash
+# Fill memory with NOPs (0x90)
+curl -X POST http://localhost:8765/api/memory/set \
+  -H "Content-Type: application/json" \
+  -d '{"address": "401000", "value": 144, "size": 10}'
+```
+
+Response:
+```json
+{
+  "success": true,
+  "address": "401000",
+  "size": 10,
+  "value": 144
+}
+```
+
+### List All Breakpoints (NEW - Phase 3)
+```bash
+curl http://localhost:8765/api/breakpoint/list/all
+```
+
+Response:
+```json
+{
+  "success": true,
+  "breakpoints": {
+    "software": [
+      {"address": "401000", "enabled": true, "singleshoot": false}
+    ],
+    "hardware": [
+      {"address": "500000", "enabled": true, "type": "write", "size": 4}
+    ],
+    "memory": []
+  }
 }
 ```
 

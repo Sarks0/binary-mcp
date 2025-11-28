@@ -1213,3 +1213,287 @@ class X64DbgBridge(Debugger):
                 "success": False,
                 "error": f"Timeout waiting for events: {event_types}"
             }
+
+    # =========================================================================
+    # Memory Allocation Functions (Phase 3)
+    # =========================================================================
+
+    def virt_alloc(self, size: int = 4096, address: str | None = None) -> dict[str, Any]:
+        """
+        Allocate memory in the debugee's address space.
+
+        Uses VirtualAllocEx to allocate memory with read/write permissions.
+
+        Args:
+            size: Number of bytes to allocate (default: 4096 = one page)
+            address: Optional preferred address (hex string). If None, OS chooses.
+
+        Returns:
+            Dictionary with:
+                - success: True if allocation succeeded
+                - address: Allocated address (hex string)
+                - size: Actual size allocated
+
+        Example:
+            result = bridge.virt_alloc(4096)
+            if result["success"]:
+                mem_addr = result["address"]
+                bridge.write_memory(mem_addr, b"Hello World")
+        """
+        data = {"size": size}
+        if address:
+            if address.startswith("0x"):
+                address = address[2:]
+            data["address"] = address
+
+        result = self._request("/api/memory/alloc", data)
+        logger.info(f"Allocated {size} bytes at 0x{result.get('address', 'unknown')}")
+        return result
+
+    def virt_free(self, address: str) -> dict[str, Any]:
+        """
+        Free memory allocated in the debugee's address space.
+
+        Args:
+            address: Address of memory to free (hex string)
+
+        Returns:
+            Dictionary with success status and message
+
+        Example:
+            bridge.virt_free("0x12340000")
+        """
+        if address.startswith("0x"):
+            address = address[2:]
+
+        data = {"address": address}
+        result = self._request("/api/memory/free", data)
+        logger.info(f"Freed memory at 0x{address}")
+        return result
+
+    def virt_protect(self, address: str, protection: str, size: int = 4096) -> dict[str, Any]:
+        """
+        Change memory protection.
+
+        Args:
+            address: Address of memory region (hex string)
+            protection: New protection string:
+                - "rwx" or "RWX": Read/Write/Execute
+                - "rx" or "RX": Read/Execute
+                - "rw" or "RW": Read/Write
+                - "r" or "R": Read only
+                - "x" or "X": Execute only
+                - "n" or "none": No access
+            size: Size of region to change (default: 4096)
+
+        Returns:
+            Dictionary with:
+                - success: True if protection changed
+                - address: Address that was modified
+                - protection: Windows protection constant value
+
+        Example:
+            # Make code region writable for patching
+            bridge.virt_protect("0x401000", "rwx", 0x1000)
+            bridge.write_memory("0x401000", b"\\x90\\x90")  # Write NOPs
+            bridge.virt_protect("0x401000", "rx", 0x1000)   # Restore
+        """
+        if address.startswith("0x"):
+            address = address[2:]
+
+        data = {
+            "address": address,
+            "protection": protection,
+            "size": size
+        }
+
+        result = self._request("/api/memory/protect", data)
+        logger.info(f"Changed protection at 0x{address} to {protection}")
+        return result
+
+    def memset(self, address: str, value: int, size: int) -> dict[str, Any]:
+        """
+        Fill memory with a byte value.
+
+        Args:
+            address: Start address (hex string)
+            value: Byte value to fill (0-255)
+            size: Number of bytes to fill
+
+        Returns:
+            Dictionary with success status
+
+        Example:
+            # Zero out a buffer
+            bridge.memset("0x12340000", 0, 1024)
+
+            # Fill with NOPs (0x90)
+            bridge.memset("0x401000", 0x90, 10)
+        """
+        if address.startswith("0x"):
+            address = address[2:]
+
+        data = {
+            "address": address,
+            "value": value & 0xFF,
+            "size": size
+        }
+
+        result = self._request("/api/memory/set", data)
+        logger.info(f"Filled {size} bytes at 0x{address} with 0x{value & 0xFF:02x}")
+        return result
+
+    def check_valid_read_ptr(self, address: str) -> bool:
+        """
+        Check if address is a valid readable memory address.
+
+        Args:
+            address: Address to check (hex string)
+
+        Returns:
+            True if address is readable, False otherwise
+
+        Example:
+            if bridge.check_valid_read_ptr("0x401000"):
+                data = bridge.read_memory("0x401000", 16)
+        """
+        if address.startswith("0x"):
+            address = address[2:]
+
+        data = {"address": address}
+        result = self._request("/api/memory/check", data)
+        return result.get("valid", False)
+
+    # =========================================================================
+    # Enhanced Breakpoint Functions (Phase 3)
+    # =========================================================================
+
+    def toggle_breakpoint(self, address: str, enable: bool = True) -> dict[str, Any]:
+        """
+        Enable or disable a software breakpoint without deleting it.
+
+        Args:
+            address: Breakpoint address (hex string)
+            enable: True to enable, False to disable
+
+        Returns:
+            Dictionary with address and enabled status
+
+        Example:
+            bridge.set_breakpoint("0x401000")
+            bridge.toggle_breakpoint("0x401000", enable=False)  # Temporarily disable
+            bridge.run()
+            bridge.toggle_breakpoint("0x401000", enable=True)   # Re-enable
+        """
+        if address.startswith("0x"):
+            address = address[2:]
+
+        data = {
+            "address": address,
+            "enable": 1 if enable else 0
+        }
+
+        result = self._request("/api/breakpoint/toggle", data)
+        logger.info(f"Breakpoint at 0x{address} {'enabled' if enable else 'disabled'}")
+        return result
+
+    def delete_hardware_breakpoint(self, address: str) -> dict[str, Any]:
+        """
+        Delete a hardware breakpoint.
+
+        Args:
+            address: Breakpoint address (hex string)
+
+        Returns:
+            Dictionary with success status
+
+        Example:
+            bridge.set_hardware_breakpoint("0x401000", "execute")
+            # ... later ...
+            bridge.delete_hardware_breakpoint("0x401000")
+        """
+        if address.startswith("0x"):
+            address = address[2:]
+
+        data = {"address": address}
+        result = self._request("/api/breakpoint/hardware/delete", data)
+        logger.info(f"Deleted hardware breakpoint at 0x{address}")
+        return result
+
+    def toggle_hardware_breakpoint(self, address: str, enable: bool = True) -> dict[str, Any]:
+        """
+        Enable or disable a hardware breakpoint without deleting it.
+
+        Args:
+            address: Breakpoint address (hex string)
+            enable: True to enable, False to disable
+
+        Returns:
+            Dictionary with address and enabled status
+
+        Example:
+            bridge.set_hardware_breakpoint("0x401000", "write", 4)
+            bridge.toggle_hardware_breakpoint("0x401000", enable=False)
+        """
+        if address.startswith("0x"):
+            address = address[2:]
+
+        data = {
+            "address": address,
+            "enable": 1 if enable else 0
+        }
+
+        result = self._request("/api/breakpoint/hardware/toggle", data)
+        logger.info(f"Hardware breakpoint at 0x{address} {'enabled' if enable else 'disabled'}")
+        return result
+
+    def toggle_memory_breakpoint(self, address: str, enable: bool = True) -> dict[str, Any]:
+        """
+        Enable or disable a memory breakpoint without deleting it.
+
+        Args:
+            address: Breakpoint address (hex string)
+            enable: True to enable, False to disable
+
+        Returns:
+            Dictionary with address and enabled status
+        """
+        if address.startswith("0x"):
+            address = address[2:]
+
+        data = {
+            "address": address,
+            "enable": 1 if enable else 0
+        }
+
+        result = self._request("/api/breakpoint/memory/toggle", data)
+        logger.info(f"Memory breakpoint at 0x{address} {'enabled' if enable else 'disabled'}")
+        return result
+
+    def list_all_breakpoints(self) -> dict[str, Any]:
+        """
+        List all breakpoints of all types (software, hardware, memory).
+
+        Returns:
+            Dictionary with:
+                - breakpoints: Dictionary containing:
+                    - software: List of software breakpoints
+                    - hardware: List of hardware breakpoints
+                    - memory: List of memory breakpoints
+
+        Each breakpoint entry contains:
+            - address: Breakpoint address (hex string)
+            - enabled: Whether breakpoint is enabled
+            - type: Breakpoint type (for hw/memory)
+            - singleshoot: Whether it's a single-shot BP (software only)
+            - size: Access size (hardware only)
+
+        Example:
+            bps = bridge.list_all_breakpoints()
+            for bp in bps["breakpoints"]["software"]:
+                print(f"SW BP at {bp['address']}, enabled={bp['enabled']}")
+            for bp in bps["breakpoints"]["hardware"]:
+                print(f"HW BP at {bp['address']}, type={bp['type']}")
+        """
+        result = self._request("/api/breakpoint/list/all")
+        return result

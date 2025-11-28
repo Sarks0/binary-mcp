@@ -369,6 +369,30 @@ std::string HandleHTTPRequest(const std::string& request) {
         requestType = 101;  // CLEAR_EVENTS
     } else if (path == "/api/events/status") {
         requestType = 102;  // GET_EVENT_STATUS
+
+    // Memory Allocation (Phase 3)
+    } else if (path == "/api/memory/alloc") {
+        requestType = 110;  // VIRT_ALLOC
+    } else if (path == "/api/memory/free") {
+        requestType = 111;  // VIRT_FREE
+    } else if (path == "/api/memory/protect") {
+        requestType = 112;  // VIRT_PROTECT
+    } else if (path == "/api/memory/set") {
+        requestType = 113;  // MEM_SET
+    } else if (path == "/api/memory/check") {
+        requestType = 114;  // CHECK_VALID_PTR
+
+    // Enhanced Breakpoints (Phase 3)
+    } else if (path == "/api/breakpoint/toggle") {
+        requestType = 120;  // TOGGLE_BREAKPOINT
+    } else if (path == "/api/breakpoint/hardware/delete") {
+        requestType = 121;  // DELETE_HARDWARE_BREAKPOINT
+    } else if (path == "/api/breakpoint/hardware/toggle") {
+        requestType = 122;  // TOGGLE_HARDWARE_BREAKPOINT
+    } else if (path == "/api/breakpoint/memory/toggle") {
+        requestType = 123;  // TOGGLE_MEMORY_BREAKPOINT
+    } else if (path == "/api/breakpoint/list/all") {
+        requestType = 124;  // LIST_ALL_BREAKPOINTS
     }
 
     // If we have a valid endpoint, build request and forward to plugin

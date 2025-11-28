@@ -975,23 +975,6 @@ class X64DbgBridge(Debugger):
         logger.info(f"Deleted memory breakpoint at {address}")
         return True
 
-    def hide_debugger_peb(self) -> bool:
-        """
-        Hide debugger presence in Process Environment Block.
-
-        Bypasses IsDebuggerPresent and PEB checks.
-
-        Returns:
-            True if successful
-
-        Note:
-            Requires C++ plugin implementation of /api/hide_debugger
-            Essential for anti-debug malware analysis
-        """
-        self._request("/api/hide_debugger")
-        logger.info("Debugger hidden in PEB")
-        return True
-
     # =========================================================================
     # Wait/Synchronization Functions
     # =========================================================================

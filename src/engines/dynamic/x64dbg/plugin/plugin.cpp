@@ -8,6 +8,7 @@
 #include <sstream>
 #include <iomanip>
 #include <set>
+#include <map>
 #include <cctype>
 #include <wincrypt.h>  // For CryptGenRandom
 
@@ -115,7 +116,21 @@ enum RequestType {
     FIND_REFERENCES = 145,
     GET_CALL_STACK_DETAILED = 146,
     GET_XREFS_TO = 147,
-    GET_XREFS_FROM = 148
+    GET_XREFS_FROM = 148,
+
+    // Phase 5: Anti-Debug Bypass
+    HIDE_DEBUG_PEB = 150,
+    HIDE_DEBUG_FULL = 151,
+    GET_ANTI_DEBUG_STATUS = 152,
+    PATCH_DBG_CHECK = 153,
+
+    // Phase 6: Code Coverage
+    START_COVERAGE = 160,
+    STOP_COVERAGE = 161,
+    GET_COVERAGE_DATA = 162,
+    CLEAR_COVERAGE = 163,
+    GET_COVERAGE_STATS = 164,
+    EXPORT_COVERAGE = 165
 };
 
 // Plugin globals
@@ -216,6 +231,71 @@ void InitTraceLocks() {
         InitializeCriticalSection(&g_traceLock);
         InitializeCriticalSection(&g_apiLogLock);
         g_locksInitialized = true;
+    }
+}
+
+// ============================================================================
+// PHASE 5: ANTI-DEBUG BYPASS STATE
+// ============================================================================
+
+static struct {
+    bool pebPatched;
+    bool ntGlobalFlagPatched;
+    bool heapFlagsPatched;
+    bool timingHooked;
+    uint64_t fakeTickCount;
+    uint64_t fakeQpcBase;
+
+    void Reset() {
+        pebPatched = false;
+        ntGlobalFlagPatched = false;
+        heapFlagsPatched = false;
+        timingHooked = false;
+        fakeTickCount = 0;
+        fakeQpcBase = 0;
+    }
+} g_antiDebugState = {false, false, false, false, 0, 0};
+
+// ============================================================================
+// PHASE 6: CODE COVERAGE DATA STRUCTURES
+// ============================================================================
+
+// Coverage entry for tracking executed addresses
+struct CoverageEntry {
+    uint64_t address;
+    uint64_t hitCount;
+    uint64_t firstHitTime;
+    uint64_t lastHitTime;
+    std::string module;
+    std::string symbol;
+};
+
+// Global coverage state
+static struct {
+    bool enabled;
+    uint64_t startTime;
+    std::map<uint64_t, CoverageEntry> entries;  // address -> entry
+    std::set<uint64_t> basicBlocks;  // Set of basic block start addresses
+    uint64_t totalHits;
+    std::string moduleName;  // Filter to specific module (empty = all)
+
+    void Reset() {
+        enabled = false;
+        startTime = 0;
+        entries.clear();
+        basicBlocks.clear();
+        totalHits = 0;
+        moduleName.clear();
+    }
+} g_coverageState = {false, 0, {}, {}, 0, ""};
+
+static CRITICAL_SECTION g_coverageLock;
+static bool g_coverageLockInitialized = false;
+
+void InitCoverageLock() {
+    if (!g_coverageLockInitialized) {
+        InitializeCriticalSection(&g_coverageLock);
+        g_coverageLockInitialized = true;
     }
 }
 
@@ -2648,6 +2728,505 @@ std::string HandleGetCallStackDetailed(const std::string& request) {
 }
 
 // ============================================================================
+// PHASE 5: ANTI-DEBUG BYPASS HANDLERS
+// ============================================================================
+
+// Handler: HIDE_DEBUG_PEB - Patch PEB to hide debugger
+std::string HandleHideDebugPeb(const std::string& request) {
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+    }
+
+    // Get PEB address
+    duint pebAddr = DbgValFromString("peb()");
+    if (pebAddr == 0) {
+        return BuildJsonResponse(false, "\"error\":\"Failed to get PEB address\"");
+    }
+
+    bool success = true;
+    std::stringstream details;
+    details << "\"patches\":[";
+    int patchCount = 0;
+
+    // Patch BeingDebugged (PEB+0x2)
+    unsigned char beingDebugged = 0;
+    if (DbgMemRead(pebAddr + 0x2, &beingDebugged, 1)) {
+        if (beingDebugged != 0) {
+            unsigned char zero = 0;
+            if (DbgMemWrite(pebAddr + 0x2, &zero, 1)) {
+                if (patchCount > 0) details << ",";
+                details << "{\"field\":\"BeingDebugged\",\"offset\":\"0x2\",\"old\":" << (int)beingDebugged << ",\"new\":0}";
+                patchCount++;
+                g_antiDebugState.pebPatched = true;
+            }
+        }
+    }
+
+    // Patch NtGlobalFlag (PEB+0x68 for x86, PEB+0xBC for x64)
+#ifdef _WIN64
+    duint ntGlobalFlagOffset = 0xBC;
+#else
+    duint ntGlobalFlagOffset = 0x68;
+#endif
+
+    uint32_t ntGlobalFlag = 0;
+    if (DbgMemRead(pebAddr + ntGlobalFlagOffset, &ntGlobalFlag, 4)) {
+        // Debug flags: FLG_HEAP_ENABLE_TAIL_CHECK (0x10) | FLG_HEAP_ENABLE_FREE_CHECK (0x20) | FLG_HEAP_VALIDATE_PARAMETERS (0x40)
+        uint32_t debugFlags = 0x70;
+        if (ntGlobalFlag & debugFlags) {
+            uint32_t newFlag = ntGlobalFlag & ~debugFlags;
+            if (DbgMemWrite(pebAddr + ntGlobalFlagOffset, &newFlag, 4)) {
+                if (patchCount > 0) details << ",";
+                details << "{\"field\":\"NtGlobalFlag\",\"offset\":\"0x" << std::hex << ntGlobalFlagOffset << std::dec
+                        << "\",\"old\":\"0x" << std::hex << ntGlobalFlag << "\",\"new\":\"0x" << newFlag << std::dec << "\"}";
+                patchCount++;
+                g_antiDebugState.ntGlobalFlagPatched = true;
+            }
+        }
+    }
+
+    details << "]";
+
+    LogInfo("PEB anti-debug patched: %d fields modified", patchCount);
+
+    std::stringstream data;
+    data << "\"message\":\"PEB anti-debug bypassed\","
+         << "\"peb_address\":\"" << std::hex << pebAddr << std::dec << "\","
+         << "\"patch_count\":" << patchCount << ","
+         << details.str();
+
+    return BuildJsonResponse(true, data.str());
+}
+
+// Handler: HIDE_DEBUG_FULL - Full anti-debug bypass (PEB + heap + more)
+std::string HandleHideDebugFull(const std::string& request) {
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+    }
+
+    std::stringstream details;
+    int totalPatches = 0;
+
+    // First do PEB patches
+    duint pebAddr = DbgValFromString("peb()");
+    if (pebAddr != 0) {
+        // BeingDebugged
+        unsigned char zero = 0;
+        if (DbgMemWrite(pebAddr + 0x2, &zero, 1)) {
+            totalPatches++;
+            g_antiDebugState.pebPatched = true;
+        }
+
+        // NtGlobalFlag
+#ifdef _WIN64
+        duint ntGlobalFlagOffset = 0xBC;
+#else
+        duint ntGlobalFlagOffset = 0x68;
+#endif
+        uint32_t ntGlobalFlag = 0;
+        if (DbgMemRead(pebAddr + ntGlobalFlagOffset, &ntGlobalFlag, 4)) {
+            uint32_t newFlag = ntGlobalFlag & ~0x70;
+            if (DbgMemWrite(pebAddr + ntGlobalFlagOffset, &newFlag, 4)) {
+                totalPatches++;
+                g_antiDebugState.ntGlobalFlagPatched = true;
+            }
+        }
+
+        // ProcessHeap flags (PEB+0x18 for x86, PEB+0x30 for x64 points to heap)
+#ifdef _WIN64
+        duint heapPtrOffset = 0x30;
+        duint heapFlagsOffset = 0x70;
+        duint heapForceFlagsOffset = 0x74;
+#else
+        duint heapPtrOffset = 0x18;
+        duint heapFlagsOffset = 0x40;
+        duint heapForceFlagsOffset = 0x44;
+#endif
+
+        duint heapAddr = 0;
+        if (DbgMemRead(pebAddr + heapPtrOffset, &heapAddr, sizeof(heapAddr)) && heapAddr != 0) {
+            // Patch Heap.Flags
+            uint32_t heapFlags = 0;
+            if (DbgMemRead(heapAddr + heapFlagsOffset, &heapFlags, 4)) {
+                uint32_t newFlags = heapFlags & ~0x50000062;  // Clear debug flags
+                newFlags |= 0x2;  // HEAP_GROWABLE
+                if (DbgMemWrite(heapAddr + heapFlagsOffset, &newFlags, 4)) {
+                    totalPatches++;
+                    g_antiDebugState.heapFlagsPatched = true;
+                }
+            }
+
+            // Patch Heap.ForceFlags
+            uint32_t forceFlags = 0;
+            if (DbgMemRead(heapAddr + heapForceFlagsOffset, &forceFlags, 4)) {
+                if (forceFlags != 0) {
+                    uint32_t newForceFlags = 0;
+                    if (DbgMemWrite(heapAddr + heapForceFlagsOffset, &newForceFlags, 4)) {
+                        totalPatches++;
+                    }
+                }
+            }
+        }
+    }
+
+    // Use x64dbg's built-in hide debugger command
+    DbgCmdExec("HideDebugger");
+
+    LogInfo("Full anti-debug bypass applied: %d patches", totalPatches);
+
+    std::stringstream data;
+    data << "\"message\":\"Full anti-debug bypass applied\","
+         << "\"patch_count\":" << totalPatches << ","
+         << "\"peb_patched\":" << (g_antiDebugState.pebPatched ? "true" : "false") << ","
+         << "\"ntglobalflag_patched\":" << (g_antiDebugState.ntGlobalFlagPatched ? "true" : "false") << ","
+         << "\"heap_patched\":" << (g_antiDebugState.heapFlagsPatched ? "true" : "false");
+
+    return BuildJsonResponse(true, data.str());
+}
+
+// Handler: GET_ANTI_DEBUG_STATUS - Get current anti-debug bypass status
+std::string HandleGetAntiDebugStatus(const std::string& request) {
+    std::stringstream data;
+    data << "\"peb_patched\":" << (g_antiDebugState.pebPatched ? "true" : "false") << ","
+         << "\"ntglobalflag_patched\":" << (g_antiDebugState.ntGlobalFlagPatched ? "true" : "false") << ","
+         << "\"heap_patched\":" << (g_antiDebugState.heapFlagsPatched ? "true" : "false") << ","
+         << "\"timing_hooked\":" << (g_antiDebugState.timingHooked ? "true" : "false");
+
+    return BuildJsonResponse(true, data.str());
+}
+
+// Handler: PATCH_DBG_CHECK - Patch a specific IsDebuggerPresent call
+std::string HandlePatchDbgCheck(const std::string& request) {
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+    }
+
+    std::string addressStr = ExtractStringField(request, "address");
+    std::string patchType = ExtractStringField(request, "type");
+
+    if (addressStr.empty()) {
+        return BuildJsonResponse(false, "\"error\":\"Missing address\"");
+    }
+
+    std::string errorMsg;
+    duint address = ResolveAddress(addressStr, errorMsg);
+    if (address == 0 && !errorMsg.empty()) {
+        return BuildAddressError(errorMsg, addressStr);
+    }
+
+    // Default: NOP out the call and make EAX=0
+    // Typical IsDebuggerPresent call: CALL <addr>; TEST EAX,EAX; JNZ <bad>
+    // We can patch the call to: XOR EAX,EAX; NOP; NOP; NOP (5 bytes for call)
+    unsigned char patch[5];
+    int patchSize = 5;
+
+    if (patchType == "ret0" || patchType.empty()) {
+        // XOR EAX, EAX (2 bytes) + NOP*3
+        patch[0] = 0x31;  // XOR
+        patch[1] = 0xC0;  // EAX, EAX
+        patch[2] = 0x90;  // NOP
+        patch[3] = 0x90;  // NOP
+        patch[4] = 0x90;  // NOP
+    } else if (patchType == "ret1") {
+        // MOV EAX, 1 (5 bytes)
+        patch[0] = 0xB8;  // MOV EAX
+        patch[1] = 0x01;
+        patch[2] = 0x00;
+        patch[3] = 0x00;
+        patch[4] = 0x00;
+    } else if (patchType == "nop") {
+        // Just NOP everything
+        patch[0] = 0x90;
+        patch[1] = 0x90;
+        patch[2] = 0x90;
+        patch[3] = 0x90;
+        patch[4] = 0x90;
+    } else {
+        return BuildJsonResponse(false, "\"error\":\"Invalid patch type (use ret0, ret1, or nop)\"");
+    }
+
+    // Read original bytes first
+    unsigned char original[5] = {0};
+    DbgMemRead(address, original, 5);
+
+    // Write the patch
+    if (!DbgMemWrite(address, patch, patchSize)) {
+        return BuildJsonResponse(false, "\"error\":\"Failed to write patch\"");
+    }
+
+    LogInfo("Patched debug check at 0x%llx with %s", address, patchType.c_str());
+
+    std::stringstream data;
+    data << "\"address\":\"" << std::hex << address << std::dec << "\","
+         << "\"patch_type\":\"" << patchType << "\","
+         << "\"original\":\"";
+    for (int i = 0; i < 5; i++) {
+        data << std::hex << std::setw(2) << std::setfill('0') << (int)original[i];
+    }
+    data << std::dec << "\"";
+
+    return BuildJsonResponse(true, data.str());
+}
+
+// ============================================================================
+// PHASE 6: CODE COVERAGE HANDLERS
+// ============================================================================
+
+// Handler: START_COVERAGE - Start code coverage tracking
+std::string HandleStartCoverage(const std::string& request) {
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+    }
+
+    InitCoverageLock();
+    EnterCriticalSection(&g_coverageLock);
+
+    // Parse options
+    std::string moduleName = ExtractStringField(request, "module");
+    bool clearExisting = ExtractIntField(request, "clear", 1) != 0;
+
+    if (clearExisting) {
+        g_coverageState.entries.clear();
+        g_coverageState.basicBlocks.clear();
+        g_coverageState.totalHits = 0;
+    }
+
+    g_coverageState.moduleName = moduleName;
+    g_coverageState.startTime = GetTickCount64();
+    g_coverageState.enabled = true;
+
+    LeaveCriticalSection(&g_coverageLock);
+
+    // Enable tracing to collect coverage
+    DbgCmdExec("TraceSetLogFile \"\"");  // Disable trace file
+    DbgCmdExec("TraceSetCondition 1");   // Always trace
+
+    LogInfo("Coverage started for module: %s", moduleName.empty() ? "(all)" : moduleName.c_str());
+
+    std::stringstream data;
+    data << "\"message\":\"Coverage tracking started\","
+         << "\"module\":\"" << JsonEscape(moduleName) << "\"";
+
+    return BuildJsonResponse(true, data.str());
+}
+
+// Handler: STOP_COVERAGE - Stop code coverage tracking
+std::string HandleStopCoverage(const std::string& request) {
+    InitCoverageLock();
+    EnterCriticalSection(&g_coverageLock);
+
+    g_coverageState.enabled = false;
+    uint64_t duration = GetTickCount64() - g_coverageState.startTime;
+    size_t uniqueAddrs = g_coverageState.entries.size();
+    uint64_t totalHits = g_coverageState.totalHits;
+
+    LeaveCriticalSection(&g_coverageLock);
+
+    LogInfo("Coverage stopped: %zu unique addresses, %llu total hits", uniqueAddrs, totalHits);
+
+    std::stringstream data;
+    data << "\"message\":\"Coverage tracking stopped\","
+         << "\"unique_addresses\":" << uniqueAddrs << ","
+         << "\"total_hits\":" << totalHits << ","
+         << "\"duration_ms\":" << duration;
+
+    return BuildJsonResponse(true, data.str());
+}
+
+// Handler: GET_COVERAGE_DATA - Get coverage data
+std::string HandleGetCoverageData(const std::string& request) {
+    InitCoverageLock();
+    EnterCriticalSection(&g_coverageLock);
+
+    int offset = ExtractIntField(request, "offset", 0);
+    int limit = ExtractIntField(request, "limit", 1000);
+    std::string sortBy = ExtractStringField(request, "sort");
+
+    if (limit > 10000) limit = 10000;
+    if (limit < 1) limit = 1;
+
+    // Build list for sorting/pagination
+    std::vector<std::pair<uint64_t, CoverageEntry*>> sortedEntries;
+    for (auto& pair : g_coverageState.entries) {
+        sortedEntries.push_back({pair.first, &pair.second});
+    }
+
+    // Sort if requested
+    if (sortBy == "hits") {
+        std::sort(sortedEntries.begin(), sortedEntries.end(),
+            [](const auto& a, const auto& b) { return a.second->hitCount > b.second->hitCount; });
+    } else if (sortBy == "address") {
+        std::sort(sortedEntries.begin(), sortedEntries.end(),
+            [](const auto& a, const auto& b) { return a.first < b.first; });
+    }
+
+    std::stringstream data;
+    data << "\"total\":" << sortedEntries.size() << ","
+         << "\"offset\":" << offset << ","
+         << "\"enabled\":" << (g_coverageState.enabled ? "true" : "false") << ","
+         << "\"entries\":[";
+
+    int count = 0;
+    for (size_t i = offset; i < sortedEntries.size() && count < limit; i++, count++) {
+        if (count > 0) data << ",";
+
+        CoverageEntry* entry = sortedEntries[i].second;
+        data << "{\"address\":\"" << std::hex << entry->address << std::dec << "\","
+             << "\"hit_count\":" << entry->hitCount << ","
+             << "\"module\":\"" << JsonEscape(entry->module) << "\","
+             << "\"symbol\":\"" << JsonEscape(entry->symbol) << "\"}";
+    }
+    data << "]";
+
+    LeaveCriticalSection(&g_coverageLock);
+
+    return BuildJsonResponse(true, data.str());
+}
+
+// Handler: CLEAR_COVERAGE - Clear coverage data
+std::string HandleClearCoverage(const std::string& request) {
+    InitCoverageLock();
+    EnterCriticalSection(&g_coverageLock);
+
+    g_coverageState.entries.clear();
+    g_coverageState.basicBlocks.clear();
+    g_coverageState.totalHits = 0;
+
+    LeaveCriticalSection(&g_coverageLock);
+
+    return BuildJsonResponse(true, "\"message\":\"Coverage data cleared\"");
+}
+
+// Handler: GET_COVERAGE_STATS - Get coverage statistics
+std::string HandleGetCoverageStats(const std::string& request) {
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+    }
+
+    InitCoverageLock();
+    EnterCriticalSection(&g_coverageLock);
+
+    // Calculate stats per module
+    std::map<std::string, uint64_t> moduleHits;
+    std::map<std::string, uint64_t> moduleAddresses;
+
+    for (const auto& pair : g_coverageState.entries) {
+        const std::string& mod = pair.second.module;
+        moduleHits[mod] += pair.second.hitCount;
+        moduleAddresses[mod]++;
+    }
+
+    uint64_t totalHits = g_coverageState.totalHits;
+    size_t totalAddresses = g_coverageState.entries.size();
+
+    LeaveCriticalSection(&g_coverageLock);
+
+    std::stringstream data;
+    data << "\"enabled\":" << (g_coverageState.enabled ? "true" : "false") << ","
+         << "\"total_hits\":" << totalHits << ","
+         << "\"unique_addresses\":" << totalAddresses << ","
+         << "\"modules\":[";
+
+    int modCount = 0;
+    for (const auto& pair : moduleAddresses) {
+        if (modCount > 0) data << ",";
+        data << "{\"name\":\"" << JsonEscape(pair.first) << "\","
+             << "\"addresses\":" << pair.second << ","
+             << "\"hits\":" << moduleHits[pair.first] << "}";
+        modCount++;
+    }
+    data << "]";
+
+    return BuildJsonResponse(true, data.str());
+}
+
+// Handler: EXPORT_COVERAGE - Export coverage data to file
+std::string HandleExportCoverage(const std::string& request) {
+    std::string filePath = ExtractStringField(request, "file");
+    std::string format = ExtractStringField(request, "format");
+
+    if (filePath.empty()) {
+        return BuildJsonResponse(false, "\"error\":\"Missing file path\"");
+    }
+
+    if (format.empty()) format = "csv";
+
+    InitCoverageLock();
+    EnterCriticalSection(&g_coverageLock);
+
+    FILE* file = fopen(filePath.c_str(), "w");
+    if (!file) {
+        LeaveCriticalSection(&g_coverageLock);
+        return BuildJsonResponse(false, "\"error\":\"Failed to open file for writing\"");
+    }
+
+    size_t entryCount = g_coverageState.entries.size();
+
+    if (format == "csv") {
+        fprintf(file, "address,hit_count,module,symbol\n");
+        for (const auto& pair : g_coverageState.entries) {
+            const CoverageEntry& entry = pair.second;
+            fprintf(file, "0x%llx,%llu,%s,%s\n",
+                entry.address, entry.hitCount,
+                entry.module.c_str(), entry.symbol.c_str());
+        }
+    } else if (format == "json") {
+        fprintf(file, "{\n  \"coverage\": [\n");
+        int count = 0;
+        for (const auto& pair : g_coverageState.entries) {
+            const CoverageEntry& entry = pair.second;
+            if (count > 0) fprintf(file, ",\n");
+            fprintf(file, "    {\"address\": \"0x%llx\", \"hits\": %llu, \"module\": \"%s\", \"symbol\": \"%s\"}",
+                entry.address, entry.hitCount, entry.module.c_str(), entry.symbol.c_str());
+            count++;
+        }
+        fprintf(file, "\n  ]\n}\n");
+    } else if (format == "drcov") {
+        // DynamoRIO coverage format (compatible with lighthouse/bncov)
+        fprintf(file, "DRCOV VERSION: 2\n");
+        fprintf(file, "DRCOV FLAVOR: x64dbg_mcp\n");
+        fprintf(file, "Module Table: version 2, count 1\n");
+        fprintf(file, "Columns: id, base, end, entry, path\n");
+
+        // Get main module info
+        char mainModule[MAX_MODULE_SIZE] = "";
+        duint mainBase = DbgValFromString("mod.main()");
+        duint mainSize = 0;
+        if (mainBase) {
+            DbgGetModuleAt(mainBase, mainModule);
+            // Get module size (simplified)
+            mainSize = 0x100000;  // Default estimate
+        }
+        fprintf(file, " 0, 0x%llx, 0x%llx, 0x%llx, %s\n",
+            mainBase, mainBase + mainSize, mainBase, mainModule);
+
+        fprintf(file, "BB Table: %zu bbs\n", entryCount);
+        for (const auto& pair : g_coverageState.entries) {
+            // Format: module_id, start_offset, size (we use 1 for basic block size estimate)
+            uint64_t offset = pair.first - mainBase;
+            fprintf(file, "module[ 0]: 0x%llx, 1\n", offset);
+        }
+    } else {
+        fclose(file);
+        LeaveCriticalSection(&g_coverageLock);
+        return BuildJsonResponse(false, "\"error\":\"Invalid format (use csv, json, or drcov)\"");
+    }
+
+    fclose(file);
+    LeaveCriticalSection(&g_coverageLock);
+
+    LogInfo("Exported %zu coverage entries to %s", entryCount, filePath.c_str());
+
+    std::stringstream data;
+    data << "\"message\":\"Coverage exported\","
+         << "\"file\":\"" << JsonEscape(filePath) << "\","
+         << "\"format\":\"" << format << "\","
+         << "\"entries\":" << entryCount;
+
+    return BuildJsonResponse(true, data.str());
+}
+
+// ============================================================================
 // EVENT HANDLERS
 // ============================================================================
 
@@ -3233,6 +3812,40 @@ static DWORD WINAPI PipeServerThread(LPVOID lpParam) {
                         break;
                     case GET_CALL_STACK_DETAILED:
                         response = HandleGetCallStackDetailed(request);
+                        break;
+
+                    // Phase 5: Anti-Debug Bypass
+                    case HIDE_DEBUG_PEB:
+                        response = HandleHideDebugPeb(request);
+                        break;
+                    case HIDE_DEBUG_FULL:
+                        response = HandleHideDebugFull(request);
+                        break;
+                    case GET_ANTI_DEBUG_STATUS:
+                        response = HandleGetAntiDebugStatus(request);
+                        break;
+                    case PATCH_DBG_CHECK:
+                        response = HandlePatchDbgCheck(request);
+                        break;
+
+                    // Phase 6: Code Coverage
+                    case START_COVERAGE:
+                        response = HandleStartCoverage(request);
+                        break;
+                    case STOP_COVERAGE:
+                        response = HandleStopCoverage(request);
+                        break;
+                    case GET_COVERAGE_DATA:
+                        response = HandleGetCoverageData(request);
+                        break;
+                    case CLEAR_COVERAGE:
+                        response = HandleClearCoverage(request);
+                        break;
+                    case GET_COVERAGE_STATS:
+                        response = HandleGetCoverageStats(request);
+                        break;
+                    case EXPORT_COVERAGE:
+                        response = HandleExportCoverage(request);
                         break;
 
                     default:

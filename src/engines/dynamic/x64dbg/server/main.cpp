@@ -435,6 +435,30 @@ std::string HandleHTTPRequest(const std::string& request) {
         requestType = 145;  // FIND_REFERENCES
     } else if (path == "/api/callstack/detailed") {
         requestType = 146;  // GET_CALL_STACK_DETAILED
+
+    // Phase 5: Anti-Debug Bypass
+    } else if (path == "/api/antidebug/peb") {
+        requestType = 150;  // HIDE_DEBUG_PEB
+    } else if (path == "/api/antidebug/full") {
+        requestType = 151;  // HIDE_DEBUG_FULL
+    } else if (path == "/api/antidebug/status") {
+        requestType = 152;  // GET_ANTI_DEBUG_STATUS
+    } else if (path == "/api/antidebug/patch") {
+        requestType = 153;  // PATCH_DBG_CHECK
+
+    // Phase 6: Code Coverage
+    } else if (path == "/api/coverage/start") {
+        requestType = 160;  // START_COVERAGE
+    } else if (path == "/api/coverage/stop") {
+        requestType = 161;  // STOP_COVERAGE
+    } else if (path == "/api/coverage/data") {
+        requestType = 162;  // GET_COVERAGE_DATA
+    } else if (path == "/api/coverage/clear") {
+        requestType = 163;  // CLEAR_COVERAGE
+    } else if (path == "/api/coverage/stats") {
+        requestType = 164;  // GET_COVERAGE_STATS
+    } else if (path == "/api/coverage/export") {
+        requestType = 165;  // EXPORT_COVERAGE
     }
 
     // If we have a valid endpoint, build request and forward to plugin

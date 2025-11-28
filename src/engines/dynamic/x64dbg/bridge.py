@@ -1878,3 +1878,259 @@ class X64DbgBridge(Debugger):
                 print(f"{frame['module']}!{sym}")
         """
         return self._request("/api/callstack/detailed")
+
+    # =========================================================================
+    # Phase 5: Anti-Debug Bypass Functions
+    # =========================================================================
+
+    def hide_debugger_peb(self) -> dict[str, Any]:
+        """
+        Patch PEB to hide debugger presence.
+
+        Patches the following PEB fields:
+        - BeingDebugged (PEB+0x2): Set to 0
+        - NtGlobalFlag (PEB+0x68/0xBC): Clear debug heap flags
+
+        This bypasses:
+        - IsDebuggerPresent()
+        - CheckRemoteDebuggerPresent() (partially)
+        - NtGlobalFlag checks
+
+        Returns:
+            Dictionary with:
+                - peb_address: Address of PEB
+                - patch_count: Number of fields patched
+                - patches: List of patches applied
+
+        Example:
+            result = bridge.hide_debugger_peb()
+            print(f"Patched {result['patch_count']} fields")
+        """
+        result = self._request("/api/antidebug/peb")
+        logger.info("PEB anti-debug bypass applied")
+        return result
+
+    def hide_debugger_full(self) -> dict[str, Any]:
+        """
+        Apply full anti-debug bypass.
+
+        Patches:
+        - PEB.BeingDebugged
+        - PEB.NtGlobalFlag
+        - ProcessHeap.Flags
+        - ProcessHeap.ForceFlags
+        - Calls x64dbg's HideDebugger command
+
+        This bypasses most common anti-debug checks including:
+        - IsDebuggerPresent()
+        - NtGlobalFlag checks
+        - Heap flags checks
+        - And more via x64dbg's built-in hiding
+
+        Returns:
+            Dictionary with patch results and status
+
+        Example:
+            bridge.hide_debugger_full()
+            bridge.run()  # Malware won't detect debugger
+        """
+        result = self._request("/api/antidebug/full")
+        logger.info("Full anti-debug bypass applied")
+        return result
+
+    def get_antidebug_status(self) -> dict[str, Any]:
+        """
+        Get current anti-debug bypass status.
+
+        Returns:
+            Dictionary with:
+                - peb_patched: Whether PEB.BeingDebugged is patched
+                - ntglobalflag_patched: Whether NtGlobalFlag is patched
+                - heap_patched: Whether heap flags are patched
+                - timing_hooked: Whether timing functions are hooked
+        """
+        return self._request("/api/antidebug/status")
+
+    def patch_debug_check(
+        self,
+        address: str,
+        patch_type: str = "ret0"
+    ) -> dict[str, Any]:
+        """
+        Patch a specific anti-debug check at an address.
+
+        Use this to patch individual IsDebuggerPresent calls or similar
+        debug checks in malware.
+
+        Args:
+            address: Address of the CALL instruction to patch
+            patch_type: Type of patch to apply:
+                - "ret0": XOR EAX,EAX + NOPs (makes function return 0)
+                - "ret1": MOV EAX,1 (makes function return 1)
+                - "nop": Just NOP the entire call (5 bytes)
+
+        Returns:
+            Dictionary with:
+                - address: Patched address
+                - patch_type: Type of patch applied
+                - original: Original bytes (hex)
+
+        Example:
+            # Find and patch IsDebuggerPresent call
+            result = bridge.pattern_scan("E8 ?? ?? ?? ?? 85 C0 75")
+            for addr in result["matches"]:
+                bridge.patch_debug_check(addr, "ret0")
+        """
+        if address.startswith("0x"):
+            address = address[2:]
+
+        data = {"address": address, "type": patch_type}
+        result = self._request("/api/antidebug/patch", data)
+        logger.info(f"Patched debug check at 0x{address}")
+        return result
+
+    # =========================================================================
+    # Phase 6: Code Coverage Functions
+    # =========================================================================
+
+    def start_coverage(
+        self,
+        module: str | None = None,
+        clear: bool = True
+    ) -> dict[str, Any]:
+        """
+        Start code coverage tracking.
+
+        Records which addresses are executed during debugging.
+        Useful for understanding code coverage during malware execution.
+
+        Args:
+            module: Module name to filter coverage (None = all modules)
+            clear: Whether to clear existing coverage data (default: True)
+
+        Returns:
+            Dictionary with confirmation message
+
+        Example:
+            bridge.start_coverage(module="malware.exe")
+            bridge.run_and_wait()
+            stats = bridge.get_coverage_stats()
+            print(f"Covered {stats['unique_addresses']} addresses")
+        """
+        data = {"clear": 1 if clear else 0}
+        if module:
+            data["module"] = module
+
+        result = self._request("/api/coverage/start", data)
+        logger.info(f"Coverage started for: {module or 'all modules'}")
+        return result
+
+    def stop_coverage(self) -> dict[str, Any]:
+        """
+        Stop code coverage tracking.
+
+        Returns:
+            Dictionary with:
+                - unique_addresses: Number of unique addresses executed
+                - total_hits: Total execution count
+                - duration_ms: Time coverage was active
+        """
+        result = self._request("/api/coverage/stop")
+        logger.info("Coverage stopped")
+        return result
+
+    def get_coverage_data(
+        self,
+        offset: int = 0,
+        limit: int = 1000,
+        sort: str | None = None
+    ) -> dict[str, Any]:
+        """
+        Get collected coverage data.
+
+        Args:
+            offset: Starting index for pagination
+            limit: Maximum entries to return (max 10000)
+            sort: Sort order - "hits" (most hit first), "address" (by address)
+
+        Returns:
+            Dictionary with:
+                - total: Total entries
+                - enabled: Whether coverage is active
+                - entries: List of coverage entries with:
+                    - address: Executed address
+                    - hit_count: Number of times executed
+                    - module: Module name
+                    - symbol: Symbol name (if available)
+
+        Example:
+            data = bridge.get_coverage_data(sort="hits", limit=100)
+            for entry in data["entries"]:
+                print(f"{entry['address']}: {entry['hit_count']} hits")
+        """
+        data = {"offset": offset, "limit": limit}
+        if sort:
+            data["sort"] = sort
+
+        return self._request("/api/coverage/data", data)
+
+    def clear_coverage(self) -> dict[str, Any]:
+        """
+        Clear all coverage data.
+
+        Returns:
+            Confirmation message
+        """
+        return self._request("/api/coverage/clear")
+
+    def get_coverage_stats(self) -> dict[str, Any]:
+        """
+        Get coverage statistics.
+
+        Returns:
+            Dictionary with:
+                - enabled: Whether coverage is active
+                - total_hits: Total execution count
+                - unique_addresses: Number of unique addresses
+                - modules: List of modules with per-module stats:
+                    - name: Module name
+                    - addresses: Unique addresses in module
+                    - hits: Total hits in module
+
+        Example:
+            stats = bridge.get_coverage_stats()
+            print(f"Total: {stats['unique_addresses']} addresses, {stats['total_hits']} hits")
+            for mod in stats["modules"]:
+                print(f"  {mod['name']}: {mod['addresses']} addrs, {mod['hits']} hits")
+        """
+        return self._request("/api/coverage/stats")
+
+    def export_coverage(
+        self,
+        file_path: str,
+        format: str = "csv"
+    ) -> dict[str, Any]:
+        """
+        Export coverage data to a file.
+
+        Args:
+            file_path: Path to save the coverage file
+            format: Output format:
+                - "csv": CSV format (address,hit_count,module,symbol)
+                - "json": JSON format
+                - "drcov": DynamoRIO coverage format (for Lighthouse/bncov)
+
+        Returns:
+            Dictionary with export status and entry count
+
+        Example:
+            # Export for use with Binary Ninja's bncov
+            bridge.export_coverage("coverage.drcov", format="drcov")
+
+            # Simple CSV export
+            bridge.export_coverage("coverage.csv", format="csv")
+        """
+        data = {"file": file_path, "format": format}
+        result = self._request("/api/coverage/export", data)
+        logger.info(f"Exported coverage to {file_path}")
+        return result

@@ -1,5 +1,7 @@
 # Binary MCP Server
 
+> **Note:** This project is under active development. Features may change, and some components are experimental. Feedback and contributions are welcome!
+
 [![CI](https://github.com/sarks0/binary-mcp/workflows/CI/badge.svg)](https://github.com/sarks0/binary-mcp/actions)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)

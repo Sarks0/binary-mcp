@@ -1220,6 +1220,135 @@ def list_data_types(
         return f"Error: {e}"
 
 
+@app.tool()
+@log_to_session
+def rename_function(
+    binary_path: str,
+    new_name: str,
+    address: str | None = None,
+    old_name: str | None = None
+) -> str:
+    """
+    Rename a function in the analysis cache.
+
+    Use this after analyzing a binary to give meaningful names to functions
+    once you understand what they do. The rename is stored in the analysis
+    cache and will be reflected in subsequent tool calls.
+
+    Args:
+        binary_path: Path to the analyzed binary
+        new_name: New name for the function (e.g., "decrypt_string", "init_network")
+        address: Hex address of the function to rename (e.g., "0x00401000")
+        old_name: Current name of the function (e.g., "FUN_00401000")
+
+    Returns:
+        Confirmation of the rename with old and new names
+
+    Note:
+        You must provide either address or old_name to identify the function.
+        If both are provided, address takes precedence.
+    """
+    try:
+        if not address and not old_name:
+            return "Error: Must provide either 'address' or 'old_name' to identify the function"
+
+        if not new_name or not new_name.strip():
+            return "Error: 'new_name' cannot be empty"
+
+        # Validate new_name is a valid identifier
+        new_name = new_name.strip()
+        if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', new_name):
+            return f"Error: '{new_name}' is not a valid function name. Use only letters, numbers, and underscores, starting with a letter or underscore."
+
+        # Get the analysis context (from cache)
+        context = get_analysis_context(binary_path)
+        functions = context.get("functions", [])
+
+        if not functions:
+            return "Error: No functions found in analysis. Run analyze_binary first."
+
+        # Find the function to rename
+        target_function = None
+        target_index = -1
+
+        if address:
+            # Normalize address format (handle with/without 0x prefix)
+            addr_normalized = address.lower().replace("0x", "")
+            for i, func in enumerate(functions):
+                func_addr = func.get('address', '').lower().replace("0x", "")
+                if func_addr == addr_normalized or func_addr.endswith(addr_normalized):
+                    target_function = func
+                    target_index = i
+                    break
+        elif old_name:
+            for i, func in enumerate(functions):
+                if func.get('name') == old_name:
+                    target_function = func
+                    target_index = i
+                    break
+
+        if not target_function:
+            identifier = address if address else old_name
+            # Suggest similar functions
+            if old_name:
+                matches = [f.get('name', '') for f in functions
+                          if old_name.lower() in f.get('name', '').lower()][:5]
+                if matches:
+                    return f"Error: Function '{old_name}' not found. Similar functions: {', '.join(matches)}"
+            return f"Error: Function '{identifier}' not found"
+
+        # Check if new name already exists
+        existing = next((f for f in functions if f.get('name') == new_name), None)
+        if existing and existing != target_function:
+            return f"Error: A function named '{new_name}' already exists at {existing.get('address')}"
+
+        # Store old name for confirmation message
+        original_name = target_function.get('name', 'unknown')
+        func_address = target_function.get('address', 'unknown')
+
+        # Update the function name
+        target_function['name'] = new_name
+
+        # Update the signature if it contains the old name
+        old_signature = target_function.get('signature', '')
+        if original_name in old_signature:
+            target_function['signature'] = old_signature.replace(original_name, new_name, 1)
+
+        # Update the pseudocode if it contains the old name (function definition line)
+        pseudocode = target_function.get('pseudocode', '')
+        if pseudocode and original_name in pseudocode:
+            # Only replace in the function definition, not all occurrences
+            # This handles the common case of "void FUN_00401000(void)" -> "void decrypt_string(void)"
+            lines = pseudocode.split('\n')
+            for i, line in enumerate(lines):
+                # Look for function definition pattern
+                if original_name in line and ('(' in line or '{' in line):
+                    lines[i] = line.replace(original_name, new_name, 1)
+                    break
+            target_function['pseudocode'] = '\n'.join(lines)
+
+        # Update the function in the context
+        context['functions'][target_index] = target_function
+
+        # Save the updated context back to cache
+        cache.save_cached(binary_path, context)
+
+        logger.info(f"Renamed function '{original_name}' to '{new_name}' at {func_address}")
+
+        result = f"**Function Renamed Successfully**\n\n"
+        result += f"- **Address:** `{func_address}`\n"
+        result += f"- **Old Name:** `{original_name}`\n"
+        result += f"- **New Name:** `{new_name}`\n"
+        result += f"- **New Signature:** `{target_function.get('signature', 'N/A')}`\n\n"
+        result += "*The rename is saved in the analysis cache and will be reflected in all subsequent tool calls.*"
+
+        return result
+
+    except Exception as e:
+        logger.error(f"rename_function failed: {e}")
+        return f"Error: {e}"
+
+
 # ============================================================================
 # ANALYSIS SESSION TOOLS
 # ============================================================================

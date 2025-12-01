@@ -437,6 +437,57 @@ std::string BuildJsonResponse(bool success, const std::string& data = "") {
     return response;
 }
 
+// Helper: Normalize symbol format to x64dbg's module!symbol format
+// Converts common formats like module.function or module::function
+std::string NormalizeSymbolFormat(const std::string& input) {
+    if (input.empty()) return input;
+
+    std::string result = input;
+
+    // Check if it looks like a symbol (contains letters, not just hex)
+    bool hasNonHex = false;
+    for (char c : input) {
+        if (!isxdigit(c) && c != 'x' && c != 'X') {
+            hasNonHex = true;
+            break;
+        }
+    }
+
+    if (!hasNonHex) {
+        // Pure hex address, return as-is
+        return result;
+    }
+
+    // Already in correct format with exclamation mark
+    if (result.find('!') != std::string::npos) {
+        return result;
+    }
+
+    // Convert C++ namespace style (module::function) to module!function
+    size_t doubleColon = result.find("::");
+    if (doubleColon != std::string::npos) {
+        result.replace(doubleColon, 2, "!");
+        return result;
+    }
+
+    // Convert dot notation (module.function) to module!function
+    // But be careful: some symbols legitimately contain dots
+    // Only convert if it looks like module.function pattern
+    size_t dot = result.find('.');
+    if (dot != std::string::npos && dot > 0 && dot < result.length() - 1) {
+        // Check if what's before the dot looks like a module name
+        // (no spaces, not starting with a number)
+        std::string beforeDot = result.substr(0, dot);
+        if (!beforeDot.empty() && !isdigit(beforeDot[0]) &&
+            beforeDot.find(' ') == std::string::npos) {
+            result.replace(dot, 1, "!");
+            return result;
+        }
+    }
+
+    return result;
+}
+
 // Helper: Resolve address string to duint with detailed error reporting
 // Returns 0 on failure and sets errorMsg
 duint ResolveAddress(const std::string& addressStr, std::string& errorMsg) {
@@ -445,8 +496,11 @@ duint ResolveAddress(const std::string& addressStr, std::string& errorMsg) {
         return 0;
     }
 
+    // Normalize symbol format (convert module.func or module::func to module!func)
+    std::string normalizedAddr = NormalizeSymbolFormat(addressStr);
+
     // Try to resolve the address/symbol
-    duint address = DbgValFromString(addressStr.c_str());
+    duint address = DbgValFromString(normalizedAddr.c_str());
 
     // If resolution failed (returned 0) and input wasn't "0"
     if (address == 0 && addressStr != "0" && addressStr != "0x0") {
@@ -668,33 +722,91 @@ std::string HandleStepOut(const std::string& request) {
 
 // Handler: SET_BREAKPOINT - Set software breakpoint at address
 std::string HandleSetBreakpoint(const std::string& request) {
+    // Pre-flight checks with clear error messages
     if (!DbgIsDebugging()) {
-        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+        return BuildJsonResponse(false,
+            "\"error\":\"Not debugging - use x64dbg_load_executable first to start debugging a binary\"");
     }
 
-    // Parse and resolve address
+    if (DbgIsRunning()) {
+        return BuildJsonResponse(false,
+            "\"error\":\"Debugger is running - use x64dbg_pause first, then set breakpoints while paused\"");
+    }
+
+    // Parse address input
     std::string addressStr = ExtractStringField(request, "address");
+    if (addressStr.empty()) {
+        return BuildJsonResponse(false,
+            "\"error\":\"Missing address parameter. Provide a hex address (e.g., 0x401000) or symbol (e.g., kernel32!CreateFileW)\"");
+    }
+
+    // Normalize symbol format and resolve address
+    std::string normalizedAddr = NormalizeSymbolFormat(addressStr);
     std::string errorMsg;
     duint address = ResolveAddress(addressStr, errorMsg);
 
+    // Check if this looks like a symbol (for fallback logic)
+    bool isSymbol = addressStr.find_first_not_of("0123456789abcdefABCDEFxX") != std::string::npos;
+
+    // If direct resolution failed and it looks like a symbol, try bpx command
+    // bpx is designed for setting breakpoints on exported symbols
+    if (address == 0 && isSymbol) {
+        char bpxCmd[512];
+        snprintf(bpxCmd, sizeof(bpxCmd), "bpx %s", normalizedAddr.c_str());
+
+        if (DbgCmdExec(bpxCmd)) {
+            LogInfo("Breakpoint set on symbol: %s (using bpx)", normalizedAddr.c_str());
+
+            std::stringstream data;
+            data << "\"symbol\":\"" << JsonEscape(normalizedAddr) << "\","
+                 << "\"method\":\"bpx\","
+                 << "\"note\":\"Breakpoint set on exported symbol\"";
+            return BuildJsonResponse(true, data.str());
+        }
+
+        // bpx also failed - provide helpful error
+        std::stringstream errData;
+        errData << "\"error\":\"Symbol not found: " << JsonEscape(addressStr) << "\","
+                << "\"normalized\":\"" << JsonEscape(normalizedAddr) << "\","
+                << "\"suggestions\":["
+                << "\"Verify the module is loaded (check with x64dbg_get_modules)\","
+                << "\"Use module!function format (e.g., kernel32!CreateFileW)\","
+                << "\"Ensure spelling matches exactly (case-sensitive)\","
+                << "\"For non-exported functions, use the hex address instead\""
+                << "]";
+        return BuildJsonResponse(false, errData.str());
+    }
+
+    // Direct resolution failed with other error
     if (address == 0 && !errorMsg.empty()) {
         return BuildAddressError(errorMsg, addressStr);
     }
 
-    // Set breakpoint using command
+    // Set breakpoint using resolved address
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "bp %llx", address);
+
     if (!DbgCmdExec(cmd)) {
-        return BuildJsonResponse(false, "\"error\":\"Failed to set breakpoint\"");
+        // Try to determine why it failed
+        std::stringstream errData;
+        errData << "\"error\":\"Failed to set breakpoint at 0x" << std::hex << address << std::dec << "\","
+                << "\"possible_causes\":["
+                << "\"Breakpoint may already exist at this address\","
+                << "\"Address may be in non-executable memory\","
+                << "\"Address may be outside mapped memory regions\""
+                << "]";
+        return BuildJsonResponse(false, errData.str());
     }
 
     LogInfo("Breakpoint set at 0x%llx", address);
 
     std::stringstream data;
     data << "\"address\":\"" << std::hex << address << std::dec << "\"";
-    if (!addressStr.empty() && addressStr.find_first_not_of("0123456789abcdefABCDEFxX") != std::string::npos) {
-        // Include resolved symbol name in response
+    if (isSymbol) {
         data << ",\"symbol\":\"" << JsonEscape(addressStr) << "\"";
+        if (normalizedAddr != addressStr) {
+            data << ",\"normalized\":\"" << JsonEscape(normalizedAddr) << "\"";
+        }
     }
 
     return BuildJsonResponse(true, data.str());
@@ -702,11 +814,23 @@ std::string HandleSetBreakpoint(const std::string& request) {
 
 // Handler: DELETE_BREAKPOINT - Delete software breakpoint at address
 std::string HandleDeleteBreakpoint(const std::string& request) {
+    // Pre-flight checks
     if (!DbgIsDebugging()) {
-        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+        return BuildJsonResponse(false,
+            "\"error\":\"Not debugging - no breakpoints to delete\"");
+    }
+
+    if (DbgIsRunning()) {
+        return BuildJsonResponse(false,
+            "\"error\":\"Debugger is running - use x64dbg_pause first to manage breakpoints\"");
     }
 
     std::string addressStr = ExtractStringField(request, "address");
+    if (addressStr.empty()) {
+        return BuildJsonResponse(false,
+            "\"error\":\"Missing address parameter\"");
+    }
+
     std::string errorMsg;
     duint address = ResolveAddress(addressStr, errorMsg);
 
@@ -719,7 +843,11 @@ std::string HandleDeleteBreakpoint(const std::string& request) {
     DbgCmdExec(cmd);
 
     LogInfo("Breakpoint deleted at 0x%llx", address);
-    return BuildJsonResponse(true, "\"message\":\"Breakpoint deleted\"");
+
+    std::stringstream data;
+    data << "\"message\":\"Breakpoint deleted\","
+         << "\"address\":\"" << std::hex << address << std::dec << "\"";
+    return BuildJsonResponse(true, data.str());
 }
 
 // Handler: LIST_BREAKPOINTS - List all breakpoints

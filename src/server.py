@@ -1543,7 +1543,6 @@ def list_sessions(
         for session in sessions:
             session_id = session.get('session_id', 'Unknown')
             name = session.get('name', 'Unknown')
-            created = time.strftime('%Y-%m-%d %H:%M', time.localtime(session.get('created_at', 0)))
             updated = time.strftime('%Y-%m-%d %H:%M', time.localtime(session.get('updated_at', 0)))
             binary_name = session.get('binary_name', 'Unknown')
             tags = session.get('tags', [])

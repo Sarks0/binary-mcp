@@ -12,7 +12,6 @@ import gzip
 import hashlib
 import json
 import logging
-import os
 import time
 import uuid
 from enum import Enum

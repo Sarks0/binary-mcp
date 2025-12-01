@@ -1,9 +1,10 @@
 """
 Dynamic analysis MCP tools using x64dbg.
 
-Provides debugger-based analysis capabilities.
+Provides debugger-based analysis capabilities with session logging.
 """
 
+import functools
 import logging
 import os
 
@@ -11,12 +12,43 @@ from fastmcp import FastMCP
 
 from src.engines.dynamic.x64dbg.bridge import X64DbgBridge
 from src.engines.dynamic.x64dbg.commands import X64DbgCommands
+from src.engines.session import AnalysisType, UnifiedSessionManager
 
 logger = logging.getLogger(__name__)
+
+# Session manager reference (set during registration)
+_session_manager: UnifiedSessionManager | None = None
 
 # Global x64dbg instances (initialized on first use)
 _x64dbg_bridge: X64DbgBridge | None = None
 _x64dbg_commands: X64DbgCommands | None = None
+
+# Track the binary being debugged (for session correlation)
+_current_debug_binary: str | None = None
+
+
+def log_dynamic_tool(func):
+    """
+    Decorator to log dynamic tool calls to the active session.
+
+    Automatically logs tool name, arguments, and output for dynamic analysis tools.
+    """
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        result = func(*args, **kwargs)
+
+        # Log to session if available
+        if _session_manager and _session_manager.active_session_id:
+            _session_manager.log_tool_call(
+                tool_name=func.__name__,
+                arguments=kwargs,
+                output=result,
+                analysis_type=AnalysisType.DYNAMIC
+            )
+
+        return result
+
+    return wrapper
 
 
 def get_x64dbg_bridge() -> X64DbgBridge:
@@ -42,15 +74,19 @@ def get_x64dbg_commands() -> X64DbgCommands:
     return _x64dbg_commands
 
 
-def register_dynamic_tools(app: FastMCP) -> None:
+def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager | None = None) -> None:
     """
     Register all dynamic analysis tools with the MCP server.
 
     Args:
         app: FastMCP Server instance
+        session_manager: Optional session manager for logging tool calls
     """
+    global _session_manager
+    _session_manager = session_manager
 
     @app.tool()
+    @log_dynamic_tool
     def x64dbg_status() -> str:
         """
         Get x64dbg debugger status.
@@ -72,6 +108,7 @@ def register_dynamic_tools(app: FastMCP) -> None:
             return f"Error: {e}\n\nNote: Ensure x64dbg is running with the MCP plugin loaded."
 
     @app.tool()
+    @log_dynamic_tool
     def x64dbg_connect(host: str = "127.0.0.1", port: int = 8765) -> str:
         """
         Connect to x64dbg debugger.
@@ -104,6 +141,7 @@ def register_dynamic_tools(app: FastMCP) -> None:
                    f"4. Verify port {port} is not blocked"
 
     @app.tool()
+    @log_dynamic_tool
     def x64dbg_run() -> str:
         """
         Start or resume execution in x64dbg.
@@ -123,6 +161,7 @@ def register_dynamic_tools(app: FastMCP) -> None:
             return f"Error: {e}"
 
     @app.tool()
+    @log_dynamic_tool
     def x64dbg_wait_paused(timeout_seconds: int = 30) -> str:
         """
         Wait until debugger is paused (breakpoint hit, exception, etc.).
@@ -169,6 +208,7 @@ def register_dynamic_tools(app: FastMCP) -> None:
             return f"Error: {e}"
 
     @app.tool()
+    @log_dynamic_tool
     def x64dbg_wait_running(timeout_seconds: int = 10) -> str:
         """
         Wait until debugger is running.
@@ -202,6 +242,7 @@ def register_dynamic_tools(app: FastMCP) -> None:
             return f"Error: {e}"
 
     @app.tool()
+    @log_dynamic_tool
     def x64dbg_wait_debugging(timeout_seconds: int = 30) -> str:
         """
         Wait until debugging has started (binary is loaded).
@@ -237,6 +278,7 @@ def register_dynamic_tools(app: FastMCP) -> None:
             return f"Error: {e}"
 
     @app.tool()
+    @log_dynamic_tool
     def x64dbg_run_and_wait(timeout_seconds: int = 30) -> str:
         """
         Run execution and wait until it pauses (breakpoint, exception, etc.).
@@ -286,6 +328,7 @@ def register_dynamic_tools(app: FastMCP) -> None:
             return f"Error: {e}"
 
     @app.tool()
+    @log_dynamic_tool
     def x64dbg_pause() -> str:
         """
         Pause execution in x64dbg.
@@ -305,6 +348,7 @@ def register_dynamic_tools(app: FastMCP) -> None:
             return f"Error: {e}"
 
     @app.tool()
+    @log_dynamic_tool
     def x64dbg_step_into(steps: int = 1) -> str:
         """
         Step into next instruction(s).
@@ -338,6 +382,7 @@ def register_dynamic_tools(app: FastMCP) -> None:
             return f"Error: {e}"
 
     @app.tool()
+    @log_dynamic_tool
     def x64dbg_step_over(steps: int = 1) -> str:
         """
         Step over next instruction(s).
@@ -364,6 +409,7 @@ def register_dynamic_tools(app: FastMCP) -> None:
             return f"Error: {e}"
 
     @app.tool()
+    @log_dynamic_tool
     def x64dbg_get_registers() -> str:
         """
         Get current CPU register values.
@@ -387,6 +433,7 @@ def register_dynamic_tools(app: FastMCP) -> None:
             return f"Error: {e}"
 
     @app.tool()
+    @log_dynamic_tool
     def x64dbg_set_breakpoint(address: str) -> str:
         """
         Set breakpoint at address.
@@ -410,6 +457,7 @@ def register_dynamic_tools(app: FastMCP) -> None:
             return f"Error: {e}"
 
     @app.tool()
+    @log_dynamic_tool
     def x64dbg_delete_breakpoint(address: str) -> str:
         """
         Delete breakpoint at address.
@@ -430,6 +478,7 @@ def register_dynamic_tools(app: FastMCP) -> None:
             return f"Error: {e}"
 
     @app.tool()
+    @log_dynamic_tool
     def x64dbg_list_breakpoints() -> str:
         """
         List all breakpoints.
@@ -455,6 +504,7 @@ def register_dynamic_tools(app: FastMCP) -> None:
             return f"Error: {e}"
 
     @app.tool()
+    @log_dynamic_tool
     def x64dbg_read_memory(address: str, size: int = 256) -> str:
         """
         Read memory from debugged process.
@@ -489,6 +539,7 @@ def register_dynamic_tools(app: FastMCP) -> None:
             return f"Error: {e}"
 
     @app.tool()
+    @log_dynamic_tool
     def x64dbg_disassemble(address: str, count: int = 20) -> str:
         """
         Disassemble instructions at address.
@@ -524,6 +575,7 @@ def register_dynamic_tools(app: FastMCP) -> None:
             return f"Error: {e}"
 
     @app.tool()
+    @log_dynamic_tool
     def x64dbg_trace_execution(steps: int = 10) -> str:
         """
         Trace execution for N steps.
@@ -560,6 +612,7 @@ def register_dynamic_tools(app: FastMCP) -> None:
             return f"Error: {e}"
 
     @app.tool()
+    @log_dynamic_tool
     def x64dbg_run_to_address(address: str) -> str:
         """
         Run until reaching specified address.
@@ -583,6 +636,7 @@ def register_dynamic_tools(app: FastMCP) -> None:
             return f"Error: {e}"
 
     @app.tool()
+    @log_dynamic_tool
     def x64dbg_step_out() -> str:
         """
         Step out of current function.
@@ -606,6 +660,7 @@ def register_dynamic_tools(app: FastMCP) -> None:
             return f"Error: {e}"
 
     @app.tool()
+    @log_dynamic_tool
     def x64dbg_get_stack(depth: int = 20) -> str:
         """
         Get call stack trace.
@@ -649,6 +704,7 @@ def register_dynamic_tools(app: FastMCP) -> None:
             return f"Error: {e}"
 
     @app.tool()
+    @log_dynamic_tool
     def x64dbg_get_modules() -> str:
         r"""
         Get list of loaded modules/DLLs.
@@ -699,6 +755,7 @@ def register_dynamic_tools(app: FastMCP) -> None:
             return f"Error: {e}"
 
     @app.tool()
+    @log_dynamic_tool
     def x64dbg_get_threads() -> str:
         """
         Get list of process threads.
@@ -746,6 +803,7 @@ def register_dynamic_tools(app: FastMCP) -> None:
             return f"Error: {e}"
 
     @app.tool()
+    @log_dynamic_tool
     def x64dbg_write_memory(address: str, data: str) -> str:
         """
         Write bytes to process memory.
@@ -784,6 +842,7 @@ def register_dynamic_tools(app: FastMCP) -> None:
             return f"Error: {e}"
 
     @app.tool()
+    @log_dynamic_tool
     def x64dbg_dump_memory(address: str, size: int, output_file: str) -> str:
         """
         Dump memory region to file.
@@ -828,6 +887,7 @@ def register_dynamic_tools(app: FastMCP) -> None:
             return f"Error: {e}"
 
     @app.tool()
+    @log_dynamic_tool
     def x64dbg_search_memory(pattern: str, region: str = "all") -> str:
         """
         Search memory for byte pattern.
@@ -888,6 +948,7 @@ def register_dynamic_tools(app: FastMCP) -> None:
             return f"Error: {e}"
 
     @app.tool()
+    @log_dynamic_tool
     def x64dbg_get_memory_map() -> str:
         """
         Get memory map showing all regions.
@@ -947,6 +1008,7 @@ def register_dynamic_tools(app: FastMCP) -> None:
             return f"Error: {e}"
 
     @app.tool()
+    @log_dynamic_tool
     def x64dbg_get_memory_info(address: str) -> str:
         """
         Get information about memory at specific address.
@@ -996,6 +1058,7 @@ def register_dynamic_tools(app: FastMCP) -> None:
             return f"Error: {e}"
 
     @app.tool()
+    @log_dynamic_tool
     def x64dbg_get_instruction(address: str = "") -> str:
         """
         Get current or specific instruction details.
@@ -1050,6 +1113,7 @@ def register_dynamic_tools(app: FastMCP) -> None:
             return f"Error: {e}"
 
     @app.tool()
+    @log_dynamic_tool
     def x64dbg_evaluate_expression(expression: str) -> str:
         """
         Evaluate expression to get value.
@@ -1100,6 +1164,7 @@ def register_dynamic_tools(app: FastMCP) -> None:
             return f"Error: {e}"
 
     @app.tool()
+    @log_dynamic_tool
     def x64dbg_set_comment(address: str, comment: str) -> str:
         """
         Set comment at address.
@@ -1140,6 +1205,7 @@ def register_dynamic_tools(app: FastMCP) -> None:
             return f"Error: {e}"
 
     @app.tool()
+    @log_dynamic_tool
     def x64dbg_get_comment(address: str) -> str:
         """
         Get comment at address.
@@ -1172,6 +1238,7 @@ def register_dynamic_tools(app: FastMCP) -> None:
             return f"Error: {e}"
 
     @app.tool()
+    @log_dynamic_tool
     def x64dbg_get_module_imports(module_name: str) -> str:
         """
         Get import address table (IAT) for module.
@@ -1238,6 +1305,7 @@ def register_dynamic_tools(app: FastMCP) -> None:
             return f"Error: {e}"
 
     @app.tool()
+    @log_dynamic_tool
     def x64dbg_get_module_exports(module_name: str) -> str:
         """
         Get export address table (EAT) for module.
@@ -1287,6 +1355,7 @@ def register_dynamic_tools(app: FastMCP) -> None:
             return f"Error: {e}"
 
     @app.tool()
+    @log_dynamic_tool
     def x64dbg_set_hardware_bp(address: str, bp_type: str = "execute", size: int = 1) -> str:
         """
         Set hardware breakpoint using debug registers.
@@ -1332,6 +1401,7 @@ def register_dynamic_tools(app: FastMCP) -> None:
             return f"Error: {e}"
 
     @app.tool()
+    @log_dynamic_tool
     def x64dbg_set_register(register: str, value: str) -> str:
         """
         Set register value.
@@ -1373,6 +1443,7 @@ def register_dynamic_tools(app: FastMCP) -> None:
             return f"Error: {e}"
 
     @app.tool()
+    @log_dynamic_tool
     def x64dbg_skip(count: int = 1) -> str:
         """
         Skip N instructions without executing them.
@@ -1413,6 +1484,7 @@ def register_dynamic_tools(app: FastMCP) -> None:
             return f"Error: {e}"
 
     @app.tool()
+    @log_dynamic_tool
     def x64dbg_run_until_return() -> str:
         """
         Run until current function returns.
@@ -1444,6 +1516,7 @@ def register_dynamic_tools(app: FastMCP) -> None:
             return f"Error: {e}"
 
     @app.tool()
+    @log_dynamic_tool
     def x64dbg_set_memory_bp(address: str, bp_type: str = "access", size: int = 1) -> str:
         """
         Set memory breakpoint.
@@ -1489,6 +1562,7 @@ def register_dynamic_tools(app: FastMCP) -> None:
             return f"Error: {e}"
 
     @app.tool()
+    @log_dynamic_tool
     def x64dbg_delete_memory_bp(address: str) -> str:
         """
         Delete memory breakpoint.
@@ -1517,6 +1591,7 @@ def register_dynamic_tools(app: FastMCP) -> None:
             return f"Error: {e}"
 
     @app.tool()
+    @log_dynamic_tool
     def x64dbg_hide_debugger() -> str:
         """
         Hide debugger presence in Process Environment Block.
@@ -1564,6 +1639,7 @@ def register_dynamic_tools(app: FastMCP) -> None:
     # =========================================================================
 
     @app.tool()
+    @log_dynamic_tool
     def x64dbg_get_events(max_events: int = 50) -> str:
         """
         Get pending debug events from the event queue.
@@ -1637,6 +1713,7 @@ def register_dynamic_tools(app: FastMCP) -> None:
             return f"Error: {e}"
 
     @app.tool()
+    @log_dynamic_tool
     def x64dbg_clear_events() -> str:
         """
         Clear all pending events from the event queue.
@@ -1656,6 +1733,7 @@ def register_dynamic_tools(app: FastMCP) -> None:
             return f"Error: {e}"
 
     @app.tool()
+    @log_dynamic_tool
     def x64dbg_event_status() -> str:
         """
         Get event system status.
@@ -1685,6 +1763,7 @@ def register_dynamic_tools(app: FastMCP) -> None:
             return f"Error: {e}"
 
     @app.tool()
+    @log_dynamic_tool
     def x64dbg_run_until_event(
         event_types: str = "breakpoint_hit,exception,paused",
         timeout_seconds: int = 30
@@ -1753,6 +1832,7 @@ def register_dynamic_tools(app: FastMCP) -> None:
     # =========================================================================
 
     @app.tool()
+    @log_dynamic_tool
     def x64dbg_alloc_memory(size: int = 4096, address: str = "") -> str:
         """
         Allocate memory in the debugee's address space.
@@ -1800,6 +1880,7 @@ def register_dynamic_tools(app: FastMCP) -> None:
             return f"Error: {e}"
 
     @app.tool()
+    @log_dynamic_tool
     def x64dbg_free_memory(address: str) -> str:
         """
         Free memory allocated in the debugee's address space.
@@ -1827,6 +1908,7 @@ def register_dynamic_tools(app: FastMCP) -> None:
             return f"Error: {e}"
 
     @app.tool()
+    @log_dynamic_tool
     def x64dbg_protect_memory(address: str, protection: str, size: int = 4096) -> str:
         """
         Change memory protection.
@@ -1882,6 +1964,7 @@ def register_dynamic_tools(app: FastMCP) -> None:
             return f"Error: {e}"
 
     @app.tool()
+    @log_dynamic_tool
     def x64dbg_memset(address: str, value: int, size: int) -> str:
         """
         Fill memory with a byte value.
@@ -1934,6 +2017,7 @@ def register_dynamic_tools(app: FastMCP) -> None:
             return f"Error: {e}"
 
     @app.tool()
+    @log_dynamic_tool
     def x64dbg_check_memory(address: str) -> str:
         """
         Check if address is a valid readable memory address.
@@ -1969,6 +2053,7 @@ def register_dynamic_tools(app: FastMCP) -> None:
     # =========================================================================
 
     @app.tool()
+    @log_dynamic_tool
     def x64dbg_toggle_breakpoint(address: str, enable: bool = True) -> str:
         """
         Enable or disable a software breakpoint without deleting it.
@@ -2004,6 +2089,7 @@ def register_dynamic_tools(app: FastMCP) -> None:
             return f"Error: {e}"
 
     @app.tool()
+    @log_dynamic_tool
     def x64dbg_delete_hardware_bp(address: str) -> str:
         """
         Delete a hardware breakpoint.
@@ -2030,6 +2116,7 @@ def register_dynamic_tools(app: FastMCP) -> None:
             return f"Error: {e}"
 
     @app.tool()
+    @log_dynamic_tool
     def x64dbg_toggle_hardware_bp(address: str, enable: bool = True) -> str:
         """
         Enable or disable a hardware breakpoint without deleting it.
@@ -2056,6 +2143,7 @@ def register_dynamic_tools(app: FastMCP) -> None:
             return f"Error: {e}"
 
     @app.tool()
+    @log_dynamic_tool
     def x64dbg_toggle_memory_bp(address: str, enable: bool = True) -> str:
         """
         Enable or disable a memory breakpoint without deleting it.
@@ -2082,6 +2170,7 @@ def register_dynamic_tools(app: FastMCP) -> None:
             return f"Error: {e}"
 
     @app.tool()
+    @log_dynamic_tool
     def x64dbg_list_all_breakpoints() -> str:
         """
         List all breakpoints of all types (software, hardware, memory).

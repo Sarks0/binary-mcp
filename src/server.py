@@ -17,7 +17,7 @@ from pathlib import Path
 
 from fastmcp import FastMCP
 
-from src.engines.static.ghidra.analysis_session import AnalysisSession
+from src.engines.session import AnalysisType, UnifiedSessionManager
 from src.engines.static.ghidra.project_cache import ProjectCache
 from src.engines.static.ghidra.runner import GhidraRunner
 from src.tools.dotnet_tools import register_dotnet_tools
@@ -48,7 +48,7 @@ logger = logging.getLogger(__name__)
 app = FastMCP("binary-mcp")
 runner = GhidraRunner()
 cache = ProjectCache()
-session_manager = AnalysisSession()
+session_manager = UnifiedSessionManager()
 api_patterns = APIPatterns()
 crypto_patterns = CryptoPatterns()
 compatibility_checker = BinaryCompatibilityChecker()
@@ -58,33 +58,52 @@ compatibility_checker = BinaryCompatibilityChecker()
 # HELPER FUNCTIONS
 # ============================================================================
 
-def log_to_session(func):
+def log_to_session(func=None, *, analysis_type: AnalysisType = AnalysisType.STATIC):
     """
-    Decorator to automatically log tool calls to active session.
+    Decorator to automatically log tool calls to session with auto-session support.
 
-    Transparently captures tool name, arguments, and output without
-    affecting tool behavior.
+    Features:
+    - Transparently captures tool name, arguments, and output
+    - Auto-starts/resumes session if binary_path is in arguments
+    - Tracks analysis type (static/dynamic) for mixed sessions
+
+    Args:
+        analysis_type: Type of analysis (STATIC or DYNAMIC)
     """
-    @functools.wraps(func)
-    def wrapper(*args, **kwargs):
-        # Call the original function
-        result = func(*args, **kwargs)
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            # Extract binary_path for auto-session if present
+            binary_path = kwargs.get("binary_path")
 
-        # Log to active session if one exists
-        if session_manager.active_session_id:
-            # Extract function name and arguments
-            tool_name = func.__name__
+            # Auto-ensure session if we have a binary path and auto-session is enabled
+            if binary_path and session_manager.auto_session_enabled:
+                session_manager.ensure_session(
+                    binary_path=binary_path,
+                    analysis_type=analysis_type
+                )
 
-            # Only log kwargs (args are usually 'self' for methods)
-            session_manager.log_tool_call(
-                tool_name=tool_name,
-                arguments=kwargs,
-                output=result
-            )
+            # Call the original function
+            result = fn(*args, **kwargs)
 
-        return result
+            # Log to active session if one exists
+            if session_manager.active_session_id:
+                tool_name = fn.__name__
+                session_manager.log_tool_call(
+                    tool_name=tool_name,
+                    arguments=kwargs,
+                    output=result,
+                    analysis_type=analysis_type
+                )
 
-    return wrapper
+            return result
+
+        return wrapper
+
+    # Handle both @log_to_session and @log_to_session() syntax
+    if func is not None:
+        return decorator(func)
+    return decorator
 
 
 def get_analysis_context(
@@ -1357,18 +1376,20 @@ def rename_function(
 def start_analysis_session(
     binary_path: str,
     name: str,
-    tags: str | list[str] | None = None
+    tags: str | list[str] | None = None,
+    analysis_type: str = "static"
 ) -> str:
     """
     Start a new analysis session to track all tool outputs.
 
-    This should be called BEFORE running analysis tools. All subsequent tool
-    calls will be automatically logged to this session until it's saved or ended.
+    Note: Sessions are now started AUTOMATICALLY when you run analysis tools.
+    You only need this if you want to set a custom name or tags.
 
     Args:
         binary_path: Path to the binary file to analyze
         name: Human-readable name for the session (e.g., "Malware Sample XYZ Analysis")
         tags: Optional tags for categorization (e.g., ["malware", "trojan", "ransomware"])
+        analysis_type: Type of analysis: "static", "dynamic", or "mixed" (default: "static")
 
     Returns:
         Session ID and instructions
@@ -1389,9 +1410,18 @@ def start_analysis_session(
             else:
                 parsed_tags = tags
 
+        # Parse analysis type
+        type_map = {
+            "static": AnalysisType.STATIC,
+            "dynamic": AnalysisType.DYNAMIC,
+            "mixed": AnalysisType.MIXED
+        }
+        a_type = type_map.get(analysis_type.lower(), AnalysisType.STATIC)
+
         session_id = session_manager.start_session(
             binary_path=binary_path,
             name=name,
+            analysis_type=a_type,
             tags=parsed_tags
         )
 
@@ -1399,11 +1429,14 @@ def start_analysis_session(
         result += f"- **Session ID:** `{session_id}`\n"
         result += f"- **Name:** {name}\n"
         result += f"- **Binary:** {Path(binary_path).name}\n"
+        result += f"- **Type:** {analysis_type}\n"
         if parsed_tags:
             result += f"- **Tags:** {', '.join(parsed_tags)}\n"
         result += "\n**Status:** All tool calls will now be automatically logged.\n\n"
+        result += "**Note:** Sessions auto-start when you run analysis tools.\n"
+        result += "Both static (Ghidra) and dynamic (x64dbg) tools are logged to the same session.\n\n"
         result += "**Next Steps:**\n"
-        result += "1. Run analysis tools (analyze_binary, decompile_function, etc.)\n"
+        result += "1. Run analysis tools (analyze_binary, x64dbg_*, decompile_function, etc.)\n"
         result += "2. Call `save_session()` when done to persist all outputs\n"
         result += "3. Use the session ID in a new conversation to load the data\n"
 
@@ -1432,7 +1465,7 @@ def save_session(session_id: str | None = None) -> str:
         # Use active session if no ID provided
         if session_id is None:
             if not session_manager.active_session_id:
-                return "Error: No active session. Start a session first with start_analysis_session()."
+                return "Error: No active session. Start a session first with start_analysis_session() or run an analysis tool."
             session_id = session_manager.active_session_id
 
         success = session_manager.save_session(session_id)
@@ -1448,11 +1481,19 @@ def save_session(session_id: str | None = None) -> str:
         result = "**Session Saved Successfully**\n\n"
         result += f"- **Session ID:** `{session_id}`\n"
         result += f"- **Name:** {metadata.get('name')}\n"
+        result += f"- **Type:** {metadata.get('analysis_type', 'unknown')}\n"
         result += f"- **Tools Used:** {metadata.get('tool_count')}\n"
-        result += f"- **Total Output:** {metadata.get('total_output_size') / 1024:.1f} KB\n"
-        result += f"- **Compressed Size:** {metadata.get('compressed_size') / 1024:.1f} KB\n"
+
+        # Show static/dynamic breakdown if mixed
+        static_count = metadata.get('static_tool_count', 0)
+        dynamic_count = metadata.get('dynamic_tool_count', 0)
+        if static_count > 0 or dynamic_count > 0:
+            result += f"  - Static: {static_count}, Dynamic: {dynamic_count}\n"
+
+        result += f"- **Total Output:** {metadata.get('total_output_size', 0) / 1024:.1f} KB\n"
+        result += f"- **Compressed Size:** {metadata.get('compressed_size', 0) / 1024:.1f} KB\n"
         result += "\n**To retrieve this session in a new conversation:**\n"
-        result += f"```\nload_session_section('{session_id}', 'summary')\n```\n"
+        result += f"```\nget_session_summary('{session_id}')\n```\n"
         result += "\nYou can now safely end this conversation. The session data is persisted.\n"
 
         return result
@@ -1466,6 +1507,7 @@ def save_session(session_id: str | None = None) -> str:
 def list_sessions(
     tag_filter: str | None = None,
     binary_name_filter: str | None = None,
+    analysis_type_filter: str | None = None,
     limit: int = 20
 ) -> str:
     """
@@ -1474,6 +1516,7 @@ def list_sessions(
     Args:
         tag_filter: Filter by tag (optional)
         binary_name_filter: Filter by binary name pattern (optional)
+        analysis_type_filter: Filter by type: "static", "dynamic", or "mixed" (optional)
         limit: Maximum number of results (default: 20)
 
     Returns:
@@ -1483,15 +1526,16 @@ def list_sessions(
         sessions = session_manager.list_sessions(
             tag_filter=tag_filter,
             binary_name_filter=binary_name_filter,
+            analysis_type_filter=analysis_type_filter,
             limit=limit
         )
 
         if not sessions:
             result = "**No Saved Sessions Found**\n\n"
-            if tag_filter or binary_name_filter:
-                result += "Try removing filters or start a new session using start_analysis_session().\n"
+            if tag_filter or binary_name_filter or analysis_type_filter:
+                result += "Try removing filters or start a new session.\n"
             else:
-                result += "Start your first session using start_analysis_session().\n"
+                result += "Sessions are created automatically when you run analysis tools.\n"
             return result
 
         result = f"**Saved Sessions: {len(sessions)} found**\n\n"
@@ -1504,24 +1548,42 @@ def list_sessions(
             binary_name = session.get('binary_name', 'Unknown')
             tags = session.get('tags', [])
             tool_count = session.get('tool_count', 0)
+            analysis_type = session.get('analysis_type', 'static')
             size_kb = session.get('compressed_size', 0) / 1024
 
-            result += f"### {name}\n"
-            result += f"- **ID:** `{session_id[:8]}...` (full ID: `{session_id}`)\n"
+            # Analysis type indicator
+            type_icon = {"static": "[S]", "dynamic": "[D]", "mixed": "[M]"}.get(analysis_type, "[?]")
+
+            result += f"### {type_icon} {name}\n"
+            result += f"- **ID:** `{session_id[:8]}...`\n"
             result += f"- **Binary:** {binary_name}\n"
-            result += f"- **Created:** {created}\n"
+            result += f"- **Type:** {analysis_type}\n"
             result += f"- **Updated:** {updated}\n"
-            result += f"- **Tools Used:** {tool_count}\n"
-            result += f"- **Size:** {size_kb:.1f} KB (compressed)\n"
+            result += f"- **Tools:** {tool_count}"
+
+            # Show static/dynamic breakdown
+            static_count = session.get('static_tool_count', 0)
+            dynamic_count = session.get('dynamic_tool_count', 0)
+            if static_count > 0 or dynamic_count > 0:
+                result += f" (S:{static_count}, D:{dynamic_count})"
+            result += "\n"
+
+            result += f"- **Size:** {size_kb:.1f} KB\n"
             if tags:
-                result += f"- **Tags:** {', '.join(tags)}\n"
-            result += f"\n**Load:** `get_session_summary('{session_id}')`\n\n"
+                # Filter out auto-session tag for cleaner display
+                display_tags = [t for t in tags if t != "auto-session"]
+                if display_tags:
+                    result += f"- **Tags:** {', '.join(display_tags)}\n"
+            result += "\n"
 
         # Show stats
         stats = session_manager.get_stats()
-        result += "\n**Storage Stats:**\n"
-        result += f"- Total: {stats['total_sessions']} sessions\n"
-        result += f"- Size: {stats['total_size_mb']:.2f} MB\n"
+        result += "---\n**Stats:** "
+        result += f"{stats['total_sessions']} sessions, {stats['total_size_mb']:.2f} MB"
+        type_counts = stats.get('type_counts', {})
+        if type_counts:
+            result += f" | Static: {type_counts.get('static', 0)}, Dynamic: {type_counts.get('dynamic', 0)}, Mixed: {type_counts.get('mixed', 0)}"
+        result += "\n"
 
         return result
 
@@ -1551,31 +1613,55 @@ def get_session_summary(session_id: str) -> str:
 
         metadata = session_manager.get_metadata(session_id)
 
-        result = f"# {metadata.get('name', 'Unknown Session')}\n\n"
+        analysis_type = metadata.get('analysis_type', 'static')
+        type_icon = {"static": "[Static]", "dynamic": "[Dynamic]", "mixed": "[Mixed]"}.get(analysis_type, "")
+
+        result = f"# {type_icon} {metadata.get('name', 'Unknown Session')}\n\n"
         result += f"**Session ID:** `{session_id}`\n"
         result += f"**Binary:** {metadata.get('binary_name')}\n"
         result += f"**Binary Hash:** `{metadata.get('binary_hash', 'N/A')[:16]}...`\n"
+        result += f"**Analysis Type:** {analysis_type}\n"
         result += f"**Created:** {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(metadata.get('created_at', 0)))}\n"
         result += f"**Updated:** {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(metadata.get('updated_at', 0)))}\n"
         result += f"**Status:** {metadata.get('status', 'unknown')}\n"
 
         if metadata.get('tags'):
-            result += f"**Tags:** {', '.join(metadata.get('tags', []))}\n"
+            display_tags = [t for t in metadata.get('tags', []) if t != "auto-session"]
+            if display_tags:
+                result += f"**Tags:** {', '.join(display_tags)}\n"
 
         result += "\n**Analysis Summary:**\n"
         result += f"- Total Tools Used: {summary.get('tool_count')}\n"
+
+        # Show static/dynamic breakdown
+        static_count = metadata.get('static_tool_count', 0)
+        dynamic_count = metadata.get('dynamic_tool_count', 0)
+        if static_count > 0 or dynamic_count > 0:
+            result += f"  - Static Tools: {static_count}\n"
+            result += f"  - Dynamic Tools: {dynamic_count}\n"
+
         result += f"- Total Output: {metadata.get('total_output_size', 0) / 1024:.1f} KB\n"
         result += f"- Compressed Size: {metadata.get('compressed_size', 0) / 1024:.1f} KB\n"
 
-        tools_used = summary.get('tools_used', [])
-        if tools_used:
-            result += "\n**Tools Used:**\n"
-            for tool in sorted(tools_used):
+        # Show static tools
+        static_tools = summary.get('static_tools', [])
+        dynamic_tools = summary.get('dynamic_tools', [])
+
+        if static_tools:
+            result += "\n**Static Analysis Tools:**\n"
+            for tool in sorted(static_tools):
                 result += f"- {tool}\n"
 
-        result += "\n**Next Steps:**\n"
-        result += f"- Load specific tool outputs: `load_session_section('{session_id}', 'tools', 'decompile_function')`\n"
-        result += f"- Load all data (warning - may be large): `load_full_session('{session_id}')`\n"
+        if dynamic_tools:
+            result += "\n**Dynamic Analysis Tools:**\n"
+            for tool in sorted(dynamic_tools):
+                result += f"- {tool}\n"
+
+        result += "\n**Load Data:**\n"
+        result += f"- Static tools: `load_session_section('{session_id}', 'static_tools')`\n"
+        result += f"- Dynamic tools: `load_session_section('{session_id}', 'dynamic_tools')`\n"
+        result += f"- Specific tool: `load_session_section('{session_id}', 'tools', 'tool_name')`\n"
+        result += f"- All data: `load_full_session('{session_id}')`\n"
 
         return result
 
@@ -1597,8 +1683,13 @@ def load_session_section(
 
     Args:
         session_id: UUID of the session
-        section: Section to load: "metadata", "tools", or "summary"
-        tool_filter: Optional tool name filter (e.g., "decompile_function", "find_api_calls")
+        section: Section to load:
+            - "metadata": Session metadata only
+            - "summary": Session summary with tool list
+            - "tools": All tool calls (optionally filtered by tool_filter)
+            - "static_tools": Only static analysis tool calls
+            - "dynamic_tools": Only dynamic analysis tool calls
+        tool_filter: Optional tool name filter (e.g., "decompile_function", "x64dbg_get_registers")
 
     Returns:
         Requested section data
@@ -1618,6 +1709,7 @@ def load_session_section(
             result += f"- Session ID: `{section_data.get('session_id')}`\n"
             result += f"- Name: {section_data.get('name')}\n"
             result += f"- Binary: {section_data.get('binary_name')}\n"
+            result += f"- Type: {section_data.get('analysis_type', 'static')}\n"
             result += f"- Tool Count: {section_data.get('tool_count')}\n"
             result += f"- Size: {section_data.get('total_output_size', 0) / 1024:.1f} KB\n"
             return result
@@ -1625,13 +1717,26 @@ def load_session_section(
         if section == "summary":
             return get_session_summary(session_id)
 
-        if section == "tools":
+        if section in ("tools", "static_tools", "dynamic_tools"):
             tool_calls = section_data.get('tool_calls', [])
 
             if not tool_calls:
-                return f"No tool calls found{f' for tool: {tool_filter}' if tool_filter else ''}"
+                filter_desc = ""
+                if tool_filter:
+                    filter_desc = f" for tool: {tool_filter}"
+                elif section == "static_tools":
+                    filter_desc = " (static analysis)"
+                elif section == "dynamic_tools":
+                    filter_desc = " (dynamic analysis)"
+                return f"No tool calls found{filter_desc}"
 
-            result = f"**Tool Outputs** (Session: {session_id[:8]}...)\n"
+            # Section header
+            section_labels = {
+                "tools": "All Tool Outputs",
+                "static_tools": "Static Analysis Outputs",
+                "dynamic_tools": "Dynamic Analysis Outputs"
+            }
+            result = f"**{section_labels.get(section, 'Tool Outputs')}** (Session: {session_id[:8]}...)\n"
             if tool_filter:
                 result += f"**Filtered by:** {tool_filter}\n"
             result += f"\n**Total Calls:** {len(tool_calls)}\n\n"
@@ -1642,8 +1747,12 @@ def load_session_section(
                 timestamp = call.get('timestamp')
                 output = call.get('output', '')
                 args = call.get('arguments', {})
+                analysis_type = call.get('analysis_type', 'static')
 
-                result += f"## Call #{i}: {tool_name}\n\n"
+                # Type indicator
+                type_icon = "[S]" if analysis_type == "static" else "[D]"
+
+                result += f"## {type_icon} Call #{i}: {tool_name}\n\n"
                 result += f"**Time:** {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(timestamp))}\n"
 
                 if args:
@@ -1656,7 +1765,7 @@ def load_session_section(
 
             return result
 
-        return f"Error: Unknown section type: {section}"
+        return f"Error: Unknown section type: {section}. Valid sections: metadata, summary, tools, static_tools, dynamic_tools"
 
     except Exception as e:
         logger.error(f"load_session_section failed: {e}")
@@ -1752,6 +1861,123 @@ def delete_session(session_id: str) -> str:
         return f"Error: {e}"
 
 
+@app.tool()
+def find_related_sessions(binary_path: str, limit: int = 10) -> str:
+    """
+    Find all sessions related to a specific binary.
+
+    Use this to find previous analysis sessions for the same binary,
+    allowing you to continue where you left off or compare results.
+
+    The search uses the binary's SHA256 hash, so it works even if:
+    - The file was moved to a different location
+    - The file was renamed
+    - You're in a new conversation
+
+    Args:
+        binary_path: Path to the binary file
+        limit: Maximum number of sessions to return (default: 10)
+
+    Returns:
+        List of related sessions sorted by most recent first
+    """
+    try:
+        sessions = session_manager.find_sessions_for_binary(
+            binary_path=binary_path,
+            limit=limit
+        )
+
+        if not sessions:
+            return f"No previous sessions found for: {Path(binary_path).name}"
+
+        result = f"**Related Sessions for {Path(binary_path).name}**\n\n"
+        result += f"Found {len(sessions)} session(s) for this binary:\n\n"
+
+        for session in sessions:
+            session_id = session.get('session_id', 'Unknown')
+            name = session.get('name', 'Unknown')
+            updated = time.strftime('%Y-%m-%d %H:%M', time.localtime(session.get('updated_at', 0)))
+            analysis_type = session.get('analysis_type', 'static')
+            tool_count = session.get('tool_count', 0)
+
+            type_icon = {"static": "[S]", "dynamic": "[D]", "mixed": "[M]"}.get(analysis_type, "[?]")
+
+            result += f"### {type_icon} {name}\n"
+            result += f"- **ID:** `{session_id[:8]}...`\n"
+            result += f"- **Updated:** {updated}\n"
+            result += f"- **Tools:** {tool_count}\n"
+            result += f"- **Load:** `get_session_summary('{session_id}')`\n\n"
+
+        return result
+
+    except Exception as e:
+        logger.error(f"find_related_sessions failed: {e}")
+        return f"Error: {e}"
+
+
+@app.tool()
+def configure_auto_session(enabled: bool = True) -> str:
+    """
+    Enable or disable automatic session management.
+
+    When enabled (default), sessions are automatically started/resumed when:
+    - You run analysis tools with a binary_path
+    - A recent session exists for the same binary (within 1 hour)
+
+    Args:
+        enabled: True to enable auto-session, False to disable
+
+    Returns:
+        Confirmation message
+    """
+    session_manager.auto_session_enabled = enabled
+
+    if enabled:
+        result = "**Auto-Session Enabled**\n\n"
+        result += "Sessions will now be automatically created/resumed when running analysis tools.\n"
+        result += "Recent sessions (within 1 hour) for the same binary will be resumed automatically.\n"
+    else:
+        result = "**Auto-Session Disabled**\n\n"
+        result += "You must manually call `start_analysis_session()` to create sessions.\n"
+        result += "Use `configure_auto_session(True)` to re-enable.\n"
+
+    return result
+
+
+@app.tool()
+def get_active_session() -> str:
+    """
+    Get information about the currently active session.
+
+    Returns:
+        Active session details or message if none active
+    """
+    if not session_manager.active_session_id:
+        return "No active session. Sessions are created automatically when you run analysis tools, or use `start_analysis_session()` to create one manually."
+
+    session_id = session_manager.active_session_id
+    data = session_manager.active_session_data
+
+    if not data:
+        return f"Active session ID: `{session_id}` (data unavailable)"
+
+    tool_count = len(data.get('tool_calls', []))
+    analysis_type = data.get('analysis_type', 'static')
+
+    result = "**Active Session**\n\n"
+    result += f"- **ID:** `{session_id}`\n"
+    result += f"- **Name:** {data.get('name')}\n"
+    result += f"- **Binary:** {data.get('binary_name')}\n"
+    result += f"- **Type:** {analysis_type}\n"
+    result += f"- **Tools Called:** {tool_count}\n"
+    result += f"- **Status:** {data.get('status', 'active')}\n\n"
+    result += "**Actions:**\n"
+    result += "- Save: `save_session()`\n"
+    result += "- End without saving: `session_manager.end_session(save=False)`\n"
+
+    return result
+
+
 def main():
     """Run the MCP server."""
     logger.info("Starting Binary MCP Server...")
@@ -1761,10 +1987,11 @@ def main():
     # Register .NET analysis tools
     register_dotnet_tools(app)
 
-    # Register dynamic analysis tools
-    register_dynamic_tools(app)
+    # Register dynamic analysis tools (with session logging)
+    register_dynamic_tools(app, session_manager)
 
     logger.info("Registered static (Ghidra + .NET) + dynamic analysis tools")
+    logger.info(f"Session Directory: {session_manager.store_dir}")
 
     # Run the FastMCP server (handles stdio automatically)
     app.run()

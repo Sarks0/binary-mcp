@@ -1335,7 +1335,7 @@ def rename_function(
 
         logger.info(f"Renamed function '{original_name}' to '{new_name}' at {func_address}")
 
-        result = f"**Function Renamed Successfully**\n\n"
+        result = "**Function Renamed Successfully**\n\n"
         result += f"- **Address:** `{func_address}`\n"
         result += f"- **Old Name:** `{original_name}`\n"
         result += f"- **New Name:** `{new_name}`\n"

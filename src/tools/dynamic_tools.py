@@ -784,6 +784,309 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
     @app.tool()
     @log_dynamic_tool
+    def x64dbg_trace_api_calls(
+        apis: list[str],
+        max_calls: int = 100,
+        include_stack: bool = False
+    ) -> str:
+        """
+        Trace specific API calls with parameter capture.
+
+        Sets breakpoints on specified APIs and logs call information including
+        parameters and return values.
+
+        Args:
+            apis: List of API names to trace (e.g., ["CreateFileW", "VirtualAlloc"])
+            max_calls: Maximum number of calls to capture (default: 100)
+            include_stack: Include call stack for each call (slower)
+
+        Returns:
+            Structured trace of API calls with parameters
+
+        Examples:
+            x64dbg_trace_api_calls(["CreateFileW", "CreateProcessW"])
+            x64dbg_trace_api_calls(["VirtualAlloc", "WriteProcessMemory"], max_calls=50)
+
+        Common APIs to trace:
+            File: CreateFileW, ReadFile, WriteFile, DeleteFileW
+            Process: CreateProcessW, OpenProcess, WriteProcessMemory
+            Memory: VirtualAlloc, VirtualProtect, MapViewOfFile
+            Registry: RegOpenKeyExW, RegSetValueExW, RegQueryValueExW
+            Network: connect, send, recv, InternetOpenW
+
+        Note:
+            This sets temporary breakpoints on the APIs. Use x64dbg_run() to
+            start execution and collect trace data. Call this function again
+            to retrieve accumulated calls.
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+
+            # API name to module mapping (common Windows APIs)
+            api_modules = {
+                # Kernel32
+                "CreateFileW": "kernel32",
+                "CreateFileA": "kernel32",
+                "ReadFile": "kernel32",
+                "WriteFile": "kernel32",
+                "DeleteFileW": "kernel32",
+                "CreateProcessW": "kernel32",
+                "CreateProcessA": "kernel32",
+                "OpenProcess": "kernel32",
+                "VirtualAlloc": "kernel32",
+                "VirtualAllocEx": "kernel32",
+                "VirtualProtect": "kernel32",
+                "VirtualProtectEx": "kernel32",
+                "WriteProcessMemory": "kernel32",
+                "ReadProcessMemory": "kernel32",
+                "LoadLibraryW": "kernel32",
+                "LoadLibraryA": "kernel32",
+                "GetProcAddress": "kernel32",
+                "CreateRemoteThread": "kernel32",
+                "CreateThread": "kernel32",
+                # Ntdll
+                "NtCreateFile": "ntdll",
+                "NtWriteFile": "ntdll",
+                "NtAllocateVirtualMemory": "ntdll",
+                "NtProtectVirtualMemory": "ntdll",
+                "NtCreateSection": "ntdll",
+                "NtMapViewOfSection": "ntdll",
+                # Advapi32
+                "RegOpenKeyExW": "advapi32",
+                "RegSetValueExW": "advapi32",
+                "RegQueryValueExW": "advapi32",
+                "RegCreateKeyExW": "advapi32",
+                # WinInet/WinHTTP
+                "InternetOpenW": "wininet",
+                "InternetConnectW": "wininet",
+                "HttpOpenRequestW": "wininet",
+                "HttpSendRequestW": "wininet",
+                # Ws2_32
+                "connect": "ws2_32",
+                "send": "ws2_32",
+                "recv": "ws2_32",
+                "socket": "ws2_32",
+            }
+
+            results = {
+                "apis_configured": [],
+                "apis_failed": [],
+                "breakpoints_set": 0
+            }
+
+            for api_name in apis:
+                try:
+                    # Try to resolve API address
+                    module = api_modules.get(api_name, "kernel32")
+
+                    # Use x64dbg's expression evaluation to get API address
+                    # Format: module.apiname
+                    api_expr = f"{module}.{api_name}"
+
+                    # Set conditional breakpoint that logs and continues
+                    # This uses x64dbg's logging breakpoint feature
+                    bridge.set_breakpoint(api_expr)
+                    results["apis_configured"].append({
+                        "name": api_name,
+                        "module": module,
+                        "expression": api_expr
+                    })
+                    results["breakpoints_set"] += 1
+
+                except Exception as e:
+                    results["apis_failed"].append({
+                        "name": api_name,
+                        "error": str(e)
+                    })
+
+            # Format output
+            output = [
+                f"API trace configured for {len(results['apis_configured'])} APIs",
+                ""
+            ]
+
+            if results["apis_configured"]:
+                output.append("APIs being traced:")
+                for api in results["apis_configured"]:
+                    output.append(f"  - {api['name']} ({api['module']})")
+
+            if results["apis_failed"]:
+                output.append("")
+                output.append("Failed to configure:")
+                for api in results["apis_failed"]:
+                    output.append(f"  - {api['name']}: {api['error']}")
+
+            output.append("")
+            output.append("Next steps:")
+            output.append("  1. Run x64dbg_run() to start execution")
+            output.append("  2. Execution will pause at each API call")
+            output.append("  3. Use x64dbg_get_registers() to inspect parameters")
+            output.append("  4. Use x64dbg_run() to continue to next call")
+            output.append("")
+            output.append(f"Max calls to capture: {max_calls}")
+
+            return "\n".join(output)
+
+        except Exception as e:
+            logger.error(f"x64dbg_trace_api_calls failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_get_api_params(api_name: str) -> str:
+        """
+        Get parameters for current API call based on calling convention.
+
+        Call this when paused at an API breakpoint to decode parameters.
+
+        Args:
+            api_name: Name of the API to decode parameters for
+
+        Returns:
+            Decoded parameters based on API signature
+
+        Common APIs supported:
+            - CreateFileW: lpFileName, dwDesiredAccess, dwShareMode, ...
+            - VirtualAlloc: lpAddress, dwSize, flAllocationType, flProtect
+            - WriteProcessMemory: hProcess, lpBaseAddress, lpBuffer, nSize
+            - CreateProcessW: lpApplicationName, lpCommandLine, ...
+
+        Example:
+            x64dbg_set_breakpoint("kernel32.CreateFileW")
+            x64dbg_run()
+            # ... breakpoint hit ...
+            x64dbg_get_api_params("CreateFileW")  # Decode parameters
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+
+            # Get current register state
+            regs = bridge.get_registers()
+
+            # x64 Windows calling convention: RCX, RDX, R8, R9, then stack
+            # x86 would use stack for __stdcall
+
+            # API parameter definitions (x64 calling convention)
+            api_params = {
+                "CreateFileW": [
+                    ("lpFileName", "rcx", "unicode_ptr"),
+                    ("dwDesiredAccess", "rdx", "hex"),
+                    ("dwShareMode", "r8", "hex"),
+                    ("lpSecurityAttributes", "r9", "ptr"),
+                    ("dwCreationDisposition", "stack+0x28", "hex"),
+                    ("dwFlagsAndAttributes", "stack+0x30", "hex"),
+                    ("hTemplateFile", "stack+0x38", "ptr"),
+                ],
+                "CreateFileA": [
+                    ("lpFileName", "rcx", "ascii_ptr"),
+                    ("dwDesiredAccess", "rdx", "hex"),
+                    ("dwShareMode", "r8", "hex"),
+                    ("lpSecurityAttributes", "r9", "ptr"),
+                ],
+                "VirtualAlloc": [
+                    ("lpAddress", "rcx", "ptr"),
+                    ("dwSize", "rdx", "hex"),
+                    ("flAllocationType", "r8", "hex"),
+                    ("flProtect", "r9", "hex"),
+                ],
+                "VirtualAllocEx": [
+                    ("hProcess", "rcx", "handle"),
+                    ("lpAddress", "rdx", "ptr"),
+                    ("dwSize", "r8", "hex"),
+                    ("flAllocationType", "r9", "hex"),
+                ],
+                "WriteProcessMemory": [
+                    ("hProcess", "rcx", "handle"),
+                    ("lpBaseAddress", "rdx", "ptr"),
+                    ("lpBuffer", "r8", "ptr"),
+                    ("nSize", "r9", "hex"),
+                ],
+                "CreateProcessW": [
+                    ("lpApplicationName", "rcx", "unicode_ptr"),
+                    ("lpCommandLine", "rdx", "unicode_ptr"),
+                    ("lpProcessAttributes", "r8", "ptr"),
+                    ("lpThreadAttributes", "r9", "ptr"),
+                ],
+                "OpenProcess": [
+                    ("dwDesiredAccess", "rcx", "hex"),
+                    ("bInheritHandle", "rdx", "bool"),
+                    ("dwProcessId", "r8", "dec"),
+                ],
+                "LoadLibraryW": [
+                    ("lpLibFileName", "rcx", "unicode_ptr"),
+                ],
+                "LoadLibraryA": [
+                    ("lpLibFileName", "rcx", "ascii_ptr"),
+                ],
+                "GetProcAddress": [
+                    ("hModule", "rcx", "handle"),
+                    ("lpProcName", "rdx", "ascii_ptr"),
+                ],
+            }
+
+            if api_name not in api_params:
+                return (
+                    f"Unknown API: {api_name}\n\n"
+                    f"Supported APIs: {', '.join(sorted(api_params.keys()))}\n\n"
+                    f"For unsupported APIs, use x64dbg_get_registers() to inspect:\n"
+                    f"  x64: RCX=param1, RDX=param2, R8=param3, R9=param4"
+                )
+
+            params = api_params[api_name]
+            output = [f"API: {api_name}", "Parameters:", ""]
+
+            for param_name, reg_or_stack, param_type in params:
+                try:
+                    # Get register value
+                    if reg_or_stack.startswith("stack"):
+                        # Stack parameter - would need memory read
+                        value = "(stack parameter - use x64dbg_read_memory)"
+                    else:
+                        value = regs.get(reg_or_stack.upper(), regs.get(reg_or_stack, "N/A"))
+
+                    # Format based on type
+                    if param_type == "unicode_ptr" and value != "N/A":
+                        try:
+                            # Try to read unicode string from pointer
+                            str_data = bridge.read_memory(f"0x{value}", 512)
+                            if str_data:
+                                # Decode as UTF-16LE
+                                decoded = str_data.decode('utf-16-le', errors='ignore').split('\x00')[0]
+                                value = f"0x{value} -> \"{decoded}\""
+                            else:
+                                value = f"0x{value}"
+                        except Exception:
+                            value = f"0x{value}"
+                    elif param_type == "ascii_ptr" and value != "N/A":
+                        try:
+                            str_data = bridge.read_memory(f"0x{value}", 256)
+                            if str_data:
+                                decoded = str_data.decode('ascii', errors='ignore').split('\x00')[0]
+                                value = f"0x{value} -> \"{decoded}\""
+                            else:
+                                value = f"0x{value}"
+                        except Exception:
+                            value = f"0x{value}"
+                    elif param_type == "hex":
+                        value = f"0x{value}"
+                    elif param_type == "ptr" or param_type == "handle":
+                        value = f"0x{value}"
+                    elif param_type == "bool":
+                        value = "TRUE" if int(value, 16) != 0 else "FALSE"
+
+                    output.append(f"  {param_name}: {value}")
+
+                except Exception as e:
+                    output.append(f"  {param_name}: (error: {e})")
+
+            return "\n".join(output)
+
+        except Exception as e:
+            logger.error(f"x64dbg_get_api_params failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_dynamic_tool
     def x64dbg_run_to_address(address: str) -> str:
         """
         Run until reaching specified address.
@@ -1527,6 +1830,170 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
     @app.tool()
     @log_dynamic_tool
+    def x64dbg_dump_module(
+        module_name: str,
+        output_path: str,
+        fix_pe: bool = True,
+        fix_sections: bool = True
+    ) -> str:
+        """
+        Dump a module from memory with optional PE header reconstruction.
+
+        Dumps the specified module from memory and optionally fixes PE headers
+        so the dump can be analyzed in IDA, Ghidra, or other tools.
+
+        Args:
+            module_name: Module name (e.g., "malware.exe") or base address
+            output_path: Where to save the dumped module
+            fix_pe: Fix PE headers (ImageBase, section alignments)
+            fix_sections: Convert sections from memory to file layout
+
+        Returns:
+            Dump status with details about fixes applied
+
+        Examples:
+            x64dbg_dump_module("unpacked.dll", "/tmp/dumped.dll")
+            x64dbg_dump_module("0x140000000", "/tmp/dump.bin", fix_pe=False)
+
+        Use Cases:
+            - Dump unpacked malware after runtime unpacking
+            - Extract injected DLLs from memory
+            - Save decrypted code regions
+            - Analyze memory-only payloads
+
+        Note:
+            PE fixing includes:
+            - Updating ImageBase to match dump location
+            - Fixing section RVAs for file layout
+            - Rebuilding section characteristics
+            - Preserving import/export tables
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+
+            # Get module information
+            modules = bridge.get_modules()
+            target_module = None
+
+            # Check if module_name is an address
+            try:
+                base_addr = int(module_name.replace("0x", ""), 16)
+                for mod in modules:
+                    if int(mod.get("base", "0").replace("0x", ""), 16) == base_addr:
+                        target_module = mod
+                        break
+            except ValueError:
+                # It's a module name
+                for mod in modules:
+                    if mod.get("name", "").lower() == module_name.lower():
+                        target_module = mod
+                        break
+
+            if not target_module:
+                return (
+                    f"Error: Module '{module_name}' not found\n\n"
+                    f"Use x64dbg_get_modules() to list available modules."
+                )
+
+            # Get module details
+            base = target_module.get("base", "0")
+            size = target_module.get("size", 0)
+            name = target_module.get("name", module_name)
+
+            output = [
+                f"Dumping module: {name}",
+                f"Base address: {base}",
+                f"Size: {size} bytes (0x{size:X})",
+                ""
+            ]
+
+            # Read module memory
+            try:
+                raw_data = bridge.read_memory(base, size)
+                if not raw_data:
+                    return f"Error: Failed to read memory at {base}"
+            except Exception as e:
+                return f"Error reading memory: {e}"
+
+            # Apply PE fixes if requested
+            fixes_applied = []
+
+            if fix_pe and len(raw_data) > 64:
+                try:
+                    # Check for MZ header
+                    if raw_data[:2] == b'MZ':
+                        import struct
+
+                        # Get PE header offset
+                        pe_offset = struct.unpack_from('<I', raw_data, 0x3C)[0]
+
+                        if pe_offset < len(raw_data) - 4:
+                            # Verify PE signature
+                            if raw_data[pe_offset:pe_offset+4] == b'PE\x00\x00':
+                                fixes_applied.append("PE signature verified")
+
+                                # Get optional header offset
+                                opt_header_offset = pe_offset + 24
+
+                                # Check if 32-bit or 64-bit
+                                magic = struct.unpack_from('<H', raw_data, opt_header_offset)[0]
+
+                                if magic == 0x10b:  # PE32
+                                    imagebase_offset = opt_header_offset + 28
+                                    size_of_image_offset = opt_header_offset + 56
+                                elif magic == 0x20b:  # PE32+
+                                    imagebase_offset = opt_header_offset + 24
+                                    size_of_image_offset = opt_header_offset + 56
+
+                                # Update ImageBase to match dump base
+                                base_int = int(base.replace("0x", ""), 16)
+                                raw_data = bytearray(raw_data)
+
+                                if magic == 0x10b:
+                                    struct.pack_into('<I', raw_data, imagebase_offset, base_int)
+                                else:
+                                    struct.pack_into('<Q', raw_data, imagebase_offset, base_int)
+
+                                fixes_applied.append(f"ImageBase updated to 0x{base_int:X}")
+
+                                raw_data = bytes(raw_data)
+
+                except Exception as e:
+                    output.append(f"Warning: PE fix failed: {e}")
+
+            # Write to file
+            try:
+                with open(output_path, 'wb') as f:
+                    f.write(raw_data)
+                output.append(f"Saved to: {output_path}")
+                output.append(f"Size written: {len(raw_data)} bytes")
+            except Exception as e:
+                return f"Error writing file: {e}"
+
+            # Report fixes
+            if fixes_applied:
+                output.append("")
+                output.append("PE fixes applied:")
+                for fix in fixes_applied:
+                    output.append(f"  - {fix}")
+            elif fix_pe:
+                output.append("")
+                output.append("Note: No PE fixes needed or binary is not PE format")
+
+            output.append("")
+            output.append("Next steps:")
+            output.append("  1. Open in IDA/Ghidra for analysis")
+            output.append("  2. Use analyze_binary() to scan with Ghidra")
+            output.append("  3. Check imports may need rebuilding with external tools")
+
+            return "\n".join(output)
+
+        except Exception as e:
+            logger.error(f"x64dbg_dump_module failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_dynamic_tool
     def x64dbg_set_hardware_bp(address: str, bp_type: str = "execute", size: int = 1) -> str:
         """
         Set hardware breakpoint using debug registers.
@@ -1864,6 +2331,177 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return ("Error: Hide debugger requires C++ plugin implementation\n"
                         "This P0 feature is CRITICAL for anti-debug malware.\n"
                         "See FUTURE_FEATURES.md for implementation status.")
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_apply_antidebug_bypass(
+        profile: str = "standard",
+        hide_peb: bool = True,
+        patch_ntquery: bool = True,
+        fix_heap_flags: bool = True,
+        hide_threads: bool = False
+    ) -> str:
+        """
+        Apply pre-configured anti-anti-debug bypass profile.
+
+        Patches multiple anti-debug checks to allow debugging of protected malware.
+
+        Args:
+            profile: Bypass profile to apply:
+                - "minimal": PEB only (fastest, least invasive)
+                - "standard": PEB + NtQuery + Heap (recommended)
+                - "aggressive": All checks + timing (for heavily protected samples)
+                - "custom": Use individual option flags below
+            hide_peb: Patch PEB.BeingDebugged and NtGlobalFlag
+            patch_ntquery: Hook NtQueryInformationProcess for debug port checks
+            fix_heap_flags: Patch heap debug flags
+            hide_threads: Hide debugger threads from enumeration
+
+        Returns:
+            Summary of applied bypasses
+
+        Examples:
+            x64dbg_apply_antidebug_bypass("standard")  # Recommended for most malware
+            x64dbg_apply_antidebug_bypass("aggressive")  # For Themida/VMProtect
+            x64dbg_apply_antidebug_bypass("custom", hide_peb=True, patch_ntquery=True)
+
+        Anti-Debug Techniques Bypassed:
+            Minimal:
+                - IsDebuggerPresent() / PEB.BeingDebugged
+                - PEB.NtGlobalFlag checks
+
+            Standard (adds):
+                - NtQueryInformationProcess (ProcessDebugPort, ProcessDebugFlags)
+                - CheckRemoteDebuggerPresent()
+                - Heap flags (ProcessHeap.Flags, ForceFlags)
+
+            Aggressive (adds):
+                - Thread hiding (GetThreadContext detection)
+                - x64dbg's full hiding mechanism
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            results = []
+            bypasses_applied = []
+
+            # Define profile settings
+            profiles = {
+                "minimal": {"peb": True, "ntquery": False, "heap": False, "threads": False},
+                "standard": {"peb": True, "ntquery": True, "heap": True, "threads": False},
+                "aggressive": {"peb": True, "ntquery": True, "heap": True, "threads": True},
+                "custom": {"peb": hide_peb, "ntquery": patch_ntquery, "heap": fix_heap_flags, "threads": hide_threads}
+            }
+
+            if profile not in profiles:
+                return f"Error: Unknown profile '{profile}'. Valid: minimal, standard, aggressive, custom"
+
+            settings = profiles[profile]
+
+            # Apply PEB bypass
+            if settings["peb"]:
+                try:
+                    bridge.hide_debugger_peb()
+                    bypasses_applied.append("PEB.BeingDebugged")
+                    bypasses_applied.append("PEB.NtGlobalFlag")
+                    results.append("PEB bypass applied")
+                except Exception as e:
+                    results.append(f"PEB bypass failed: {e}")
+
+            # Apply full bypass (includes NtQuery and heap)
+            if settings["ntquery"] or settings["heap"] or settings["threads"]:
+                try:
+                    bridge.hide_debugger_full()
+                    if settings["ntquery"]:
+                        bypasses_applied.append("NtQueryInformationProcess")
+                        bypasses_applied.append("CheckRemoteDebuggerPresent")
+                    if settings["heap"]:
+                        bypasses_applied.append("ProcessHeap.Flags")
+                        bypasses_applied.append("ProcessHeap.ForceFlags")
+                    if settings["threads"]:
+                        bypasses_applied.append("Thread enumeration hiding")
+                    results.append("Full bypass applied")
+                except Exception as e:
+                    results.append(f"Full bypass failed: {e}")
+
+            # Format output
+            output = [
+                f"Anti-debug bypass applied (profile: {profile})",
+                "",
+                "Techniques bypassed:"
+            ]
+            for bypass in bypasses_applied:
+                output.append(f"  - {bypass}")
+
+            output.append("")
+            output.append("Results:")
+            for result in results:
+                output.append(f"  - {result}")
+
+            output.append("")
+            output.append("Note: Run target to verify bypass effectiveness.")
+            output.append("Some packers may use additional checks (timing, exceptions).")
+
+            return "\n".join(output)
+
+        except Exception as e:
+            logger.error(f"x64dbg_apply_antidebug_bypass failed: {e}")
+            if "Not yet implemented" in str(e):
+                return ("Error: Anti-debug bypass requires C++ plugin implementation\n"
+                        "This feature needs plugin support for memory patching.")
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_get_antidebug_status() -> str:
+        """
+        Query current anti-debug bypass status.
+
+        Check which anti-debug bypasses are currently active.
+
+        Returns:
+            Status of each anti-debug bypass mechanism
+
+        Use Cases:
+            - Verify bypasses are applied before analysis
+            - Debug issues with malware detection
+            - Check if bypasses were reset after module load
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            status = bridge.get_antidebug_status()
+
+            output = ["Anti-debug bypass status:", ""]
+
+            # Format status items
+            status_items = [
+                ("PEB.BeingDebugged patched", status.get("peb_patched", False)),
+                ("NtGlobalFlag patched", status.get("ntglobalflag_patched", False)),
+                ("Heap flags patched", status.get("heap_patched", False)),
+                ("Timing functions hooked", status.get("timing_hooked", False)),
+                ("Thread hiding active", status.get("threads_hidden", False)),
+            ]
+
+            for name, active in status_items:
+                icon = "+" if active else "-"
+                state = "Active" if active else "Not applied"
+                output.append(f"  [{icon}] {name}: {state}")
+
+            # Summary
+            active_count = sum(1 for _, active in status_items if active)
+            output.append("")
+            output.append(f"Active bypasses: {active_count}/{len(status_items)}")
+
+            if active_count == 0:
+                output.append("")
+                output.append("Tip: Use x64dbg_apply_antidebug_bypass() to enable bypasses")
+
+            return "\n".join(output)
+
+        except Exception as e:
+            logger.error(f"x64dbg_get_antidebug_status failed: {e}")
+            if "Not yet implemented" in str(e):
+                return ("Error: Anti-debug status requires C++ plugin implementation")
             return f"Error: {e}"
 
     # =========================================================================

@@ -1977,6 +1977,349 @@ def get_active_session() -> str:
     return result
 
 
+# ============================================================================
+# CRYPTO ANALYSIS TOOLS
+# ============================================================================
+
+@app.tool()
+@log_to_session(analysis_type=AnalysisType.STATIC)
+def detect_crypto_patterns(binary_path: str) -> str:
+    """
+    Detect encryption and encoding patterns in a binary file.
+
+    Analyzes the file for common crypto patterns including:
+    - XOR encryption (single and multi-byte keys)
+    - Base64 encoding
+    - High entropy regions (encrypted/compressed)
+    - Null byte patterns
+
+    Args:
+        binary_path: Path to binary file to analyze
+
+    Returns:
+        Detected patterns with confidence scores and details
+
+    Example output:
+        Crypto Pattern Analysis:
+          File: payload.bin
+          Size: 4096 bytes
+          Entropy: 7.85 bits/byte (high - likely encrypted)
+
+        Detected Patterns:
+          [HIGH] xor_single_byte (confidence: 0.85)
+            Key: 0x41
+            Sample entropy after decryption: 4.2
+
+          [MEDIUM] high_entropy (confidence: 0.75)
+            Entropy: 7.85 bits/byte
+            Likely: encrypted or compressed
+    """
+    try:
+        safe_path = sanitize_binary_path(binary_path)
+
+        from src.utils.crypto_analysis import calculate_entropy, detect_crypto_patterns as analyze
+
+        path = Path(safe_path)
+        if not path.exists():
+            return f"Error: File not found: {binary_path}"
+
+        data = path.read_bytes()
+        entropy = calculate_entropy(data)
+        patterns = analyze(data)
+
+        # Build output
+        output = [
+            "Crypto Pattern Analysis:",
+            f"  File: {path.name}",
+            f"  Size: {len(data)} bytes",
+            f"  Entropy: {entropy:.2f} bits/byte",
+        ]
+
+        # Entropy interpretation
+        if entropy > 7.5:
+            output.append("  Status: HIGH entropy - likely encrypted or compressed")
+        elif entropy > 6.0:
+            output.append("  Status: MEDIUM entropy - may be obfuscated")
+        else:
+            output.append("  Status: LOW entropy - likely plaintext or structured data")
+
+        output.append("")
+
+        if patterns:
+            output.append("Detected Patterns:")
+            output.append("-" * 50)
+
+            for pattern in patterns:
+                conf = pattern["confidence"]
+                level = "HIGH" if conf > 0.7 else "MEDIUM" if conf > 0.4 else "LOW"
+                output.append(f"  [{level}] {pattern['type']} (confidence: {conf:.2f})")
+
+                for key, value in pattern.get("details", {}).items():
+                    if isinstance(value, float):
+                        output.append(f"    {key}: {value:.2f}")
+                    else:
+                        output.append(f"    {key}: {value}")
+                output.append("")
+        else:
+            output.append("No significant crypto patterns detected.")
+
+        return "\n".join(output)
+
+    except (PathTraversalError, FileSizeError) as e:
+        return safe_error_message("detect_crypto_patterns", e)
+    except Exception as e:
+        logger.error(f"detect_crypto_patterns failed: {e}")
+        return f"Error analyzing file: {e}"
+
+
+@app.tool()
+@log_to_session(analysis_type=AnalysisType.STATIC)
+def analyze_xor_encryption(
+    binary_path: str,
+    min_key_length: int = 1,
+    max_key_length: int = 16,
+    sample_size: int = 10000
+) -> str:
+    """
+    Analyze potential XOR encryption and find likely keys.
+
+    Uses frequency analysis to detect XOR encryption and find
+    the most probable decryption keys.
+
+    Args:
+        binary_path: Path to encrypted file
+        min_key_length: Minimum key length to try (default: 1)
+        max_key_length: Maximum key length to try (default: 16)
+        sample_size: Bytes to analyze (default: 10000)
+
+    Returns:
+        Top XOR key candidates with confidence scores
+
+    Example:
+        analyze_xor_encryption("encrypted.bin", max_key_length=8)
+    """
+    try:
+        safe_path = sanitize_binary_path(binary_path)
+
+        from src.utils.crypto_analysis import analyze_xor, xor_decrypt
+
+        path = Path(safe_path)
+        if not path.exists():
+            return f"Error: File not found: {binary_path}"
+
+        data = path.read_bytes()[:sample_size]
+
+        candidates = analyze_xor(
+            data,
+            key_length_range=(min_key_length, max_key_length),
+            top_n=5
+        )
+
+        output = [
+            "XOR Encryption Analysis:",
+            f"  File: {path.name}",
+            f"  Sample size: {len(data)} bytes",
+            f"  Key length range: {min_key_length}-{max_key_length}",
+            ""
+        ]
+
+        if candidates:
+            output.append("Top Key Candidates:")
+            output.append("-" * 50)
+
+            for i, candidate in enumerate(candidates, 1):
+                output.append(f"{i}. Key: {candidate['key_hex']}")
+                output.append(f"   Length: {candidate['key_length']} bytes")
+                output.append(f"   Confidence: {candidate['confidence']:.2f}")
+                output.append(f"   Decrypted entropy: {candidate['sample_entropy']:.2f}")
+
+                # Show sample of decrypted text
+                sample = candidate["decrypted_sample"]
+                try:
+                    text_sample = sample.decode('ascii', errors='replace')[:40]
+                    output.append(f"   Sample: \"{text_sample}\"")
+                except Exception:
+                    output.append(f"   Sample: {sample[:20].hex()}")
+                output.append("")
+        else:
+            output.append("No XOR encryption patterns detected.")
+
+        return "\n".join(output)
+
+    except (PathTraversalError, FileSizeError) as e:
+        return safe_error_message("analyze_xor_encryption", e)
+    except Exception as e:
+        logger.error(f"analyze_xor_encryption failed: {e}")
+        return f"Error analyzing file: {e}"
+
+
+@app.tool()
+@log_to_session(analysis_type=AnalysisType.STATIC)
+def decrypt_xor(
+    binary_path: str,
+    key: str,
+    output_path: str | None = None
+) -> str:
+    """
+    Decrypt a file using XOR with the specified key.
+
+    Args:
+        binary_path: Path to encrypted file
+        key: XOR key as hex string (e.g., "41", "DEADBEEF")
+        output_path: Optional path to save decrypted output
+
+    Returns:
+        Decryption result with preview of decrypted content
+
+    Example:
+        decrypt_xor("encrypted.bin", key="DEADBEEF", output_path="decrypted.bin")
+    """
+    try:
+        safe_path = sanitize_binary_path(binary_path)
+
+        from src.utils.crypto_analysis import xor_decrypt, calculate_entropy
+
+        path = Path(safe_path)
+        if not path.exists():
+            return f"Error: File not found: {binary_path}"
+
+        # Parse key
+        try:
+            key_bytes = bytes.fromhex(key.replace("0x", "").replace(" ", ""))
+        except ValueError:
+            return f"Error: Invalid hex key: {key}"
+
+        data = path.read_bytes()
+        decrypted = xor_decrypt(data, key_bytes)
+        entropy = calculate_entropy(decrypted)
+
+        output = [
+            "XOR Decryption:",
+            f"  Input: {path.name} ({len(data)} bytes)",
+            f"  Key: {key_bytes.hex().upper()} ({len(key_bytes)} bytes)",
+            f"  Decrypted entropy: {entropy:.2f} bits/byte",
+            ""
+        ]
+
+        # Check for known file signatures
+        if decrypted[:2] == b'MZ':
+            output.append("  Signature: PE executable (MZ header)")
+        elif decrypted[:4] == b'\x7fELF':
+            output.append("  Signature: ELF executable")
+        elif decrypted[:3] == b'PK\x03':
+            output.append("  Signature: ZIP archive")
+        elif decrypted[:8] == b'\x89PNG\r\n\x1a\n':
+            output.append("  Signature: PNG image")
+
+        # Show preview
+        output.append("")
+        output.append("Decrypted preview (first 64 bytes):")
+        output.append(f"  Hex: {decrypted[:64].hex().upper()}")
+        try:
+            text_preview = decrypted[:64].decode('ascii', errors='replace')
+            output.append(f"  Text: \"{text_preview}\"")
+        except Exception:
+            pass
+
+        # Save if output path specified
+        if output_path:
+            out_path = Path(output_path)
+            out_path.write_bytes(decrypted)
+            output.append("")
+            output.append(f"Saved to: {output_path}")
+
+        return "\n".join(output)
+
+    except (PathTraversalError, FileSizeError) as e:
+        return safe_error_message("decrypt_xor", e)
+    except Exception as e:
+        logger.error(f"decrypt_xor failed: {e}")
+        return f"Error decrypting file: {e}"
+
+
+@app.tool()
+@log_to_session(analysis_type=AnalysisType.STATIC)
+def decode_base64_file(
+    binary_path: str,
+    output_path: str | None = None
+) -> str:
+    """
+    Decode a Base64 encoded file.
+
+    Args:
+        binary_path: Path to Base64 encoded file
+        output_path: Optional path to save decoded output
+
+    Returns:
+        Decoding result with preview of decoded content
+
+    Example:
+        decode_base64_file("encoded.txt", output_path="decoded.bin")
+    """
+    try:
+        safe_path = sanitize_binary_path(binary_path)
+
+        import base64
+        from src.utils.crypto_analysis import calculate_entropy
+
+        path = Path(safe_path)
+        if not path.exists():
+            return f"Error: File not found: {binary_path}"
+
+        data = path.read_bytes()
+
+        # Try to decode
+        try:
+            text = data.decode('ascii', errors='ignore')
+            text = ''.join(text.split())  # Remove whitespace
+            decoded = base64.b64decode(text)
+        except Exception as e:
+            return f"Error: Failed to decode Base64: {e}"
+
+        entropy = calculate_entropy(decoded)
+
+        output = [
+            "Base64 Decoding:",
+            f"  Input: {path.name} ({len(data)} bytes)",
+            f"  Decoded: {len(decoded)} bytes",
+            f"  Decoded entropy: {entropy:.2f} bits/byte",
+            ""
+        ]
+
+        # Check for known file signatures
+        if decoded[:2] == b'MZ':
+            output.append("  Signature: PE executable (MZ header)")
+        elif decoded[:4] == b'\x7fELF':
+            output.append("  Signature: ELF executable")
+        elif decoded[:3] == b'PK\x03':
+            output.append("  Signature: ZIP archive")
+
+        # Show preview
+        output.append("")
+        output.append("Decoded preview (first 64 bytes):")
+        output.append(f"  Hex: {decoded[:64].hex().upper()}")
+        try:
+            text_preview = decoded[:64].decode('ascii', errors='replace')
+            output.append(f"  Text: \"{text_preview}\"")
+        except Exception:
+            pass
+
+        # Save if output path specified
+        if output_path:
+            out_path = Path(output_path)
+            out_path.write_bytes(decoded)
+            output.append("")
+            output.append(f"Saved to: {output_path}")
+
+        return "\n".join(output)
+
+    except (PathTraversalError, FileSizeError) as e:
+        return safe_error_message("decode_base64_file", e)
+    except Exception as e:
+        logger.error(f"decode_base64_file failed: {e}")
+        return f"Error decoding file: {e}"
+
+
 def main():
     """Run the MCP server."""
     logger.info("Starting Binary MCP Server...")

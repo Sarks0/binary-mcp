@@ -493,6 +493,141 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
     @app.tool()
     @log_dynamic_tool
+    def x64dbg_set_breakpoints(breakpoints: list[dict]) -> str:
+        """
+        Set multiple breakpoints in a single call.
+
+        Efficient batch operation that reduces round-trips for setting up
+        analysis environments.
+
+        Args:
+            breakpoints: List of breakpoint specifications, each containing:
+                - address: Memory address (hex string, required)
+                - type: "software" (default), "hardware", or "memory"
+                - hw_type: For hardware BPs: "execute", "read", "write", "access"
+                - size: For hardware/memory BPs: 1, 2, 4, or 8 bytes
+
+        Returns:
+            Summary of breakpoints set with success/failure count
+
+        Examples:
+            x64dbg_set_breakpoints([
+                {"address": "0x401000"},
+                {"address": "0x401100"},
+                {"address": "0x7FFD12340000", "type": "hardware", "hw_type": "execute"}
+            ])
+
+        Use Cases:
+            - Set up multiple API breakpoints quickly
+            - Configure analysis environment in one call
+            - Batch set breakpoints from a list of addresses
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            results = {"success": 0, "failed": 0, "errors": []}
+
+            for i, bp in enumerate(breakpoints):
+                address = bp.get("address")
+                bp_type = bp.get("type", "software")
+
+                if not address:
+                    results["failed"] += 1
+                    results["errors"].append(f"Breakpoint {i}: Missing address")
+                    continue
+
+                try:
+                    if bp_type == "software":
+                        bridge.set_breakpoint(address)
+                    elif bp_type == "hardware":
+                        hw_type = bp.get("hw_type", "execute")
+                        size = bp.get("size", 1)
+                        bridge.set_hardware_breakpoint(address, hw_type, size)
+                    elif bp_type == "memory":
+                        mem_type = bp.get("hw_type", "access")  # reuse hw_type for memory type
+                        size = bp.get("size", 1)
+                        bridge.set_memory_breakpoint(address, mem_type, size)
+                    else:
+                        results["failed"] += 1
+                        results["errors"].append(f"Breakpoint {i}: Invalid type '{bp_type}'")
+                        continue
+
+                    results["success"] += 1
+
+                except Exception as e:
+                    results["failed"] += 1
+                    results["errors"].append(f"Breakpoint at {address}: {e}")
+
+            # Format output
+            output = [
+                f"Batch breakpoint results:",
+                f"  Success: {results['success']}",
+                f"  Failed: {results['failed']}"
+            ]
+
+            if results["errors"]:
+                output.append("")
+                output.append("Errors:")
+                for err in results["errors"][:10]:  # Limit error messages
+                    output.append(f"  - {err}")
+                if len(results["errors"]) > 10:
+                    output.append(f"  ... and {len(results['errors']) - 10} more")
+
+            return "\n".join(output)
+
+        except Exception as e:
+            logger.error(f"x64dbg_set_breakpoints failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_delete_breakpoints(addresses: list[str]) -> str:
+        """
+        Delete multiple breakpoints in a single call.
+
+        Efficient batch operation for clearing breakpoints.
+
+        Args:
+            addresses: List of memory addresses to delete breakpoints from
+
+        Returns:
+            Summary of breakpoints deleted with success/failure count
+
+        Examples:
+            x64dbg_delete_breakpoints(["0x401000", "0x401100", "0x7FFD12340000"])
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            results = {"success": 0, "failed": 0, "errors": []}
+
+            for address in addresses:
+                try:
+                    bridge.delete_breakpoint(address)
+                    results["success"] += 1
+                except Exception as e:
+                    results["failed"] += 1
+                    results["errors"].append(f"{address}: {e}")
+
+            # Format output
+            output = [
+                f"Batch delete results:",
+                f"  Success: {results['success']}",
+                f"  Failed: {results['failed']}"
+            ]
+
+            if results["errors"]:
+                output.append("")
+                output.append("Errors:")
+                for err in results["errors"][:10]:
+                    output.append(f"  - {err}")
+
+            return "\n".join(output)
+
+        except Exception as e:
+            logger.error(f"x64dbg_delete_breakpoints failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_dynamic_tool
     def x64dbg_list_breakpoints() -> str:
         """
         List all breakpoints.

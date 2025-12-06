@@ -27,6 +27,11 @@ ENV/
 env/
 .venv
 
+# Secrets and configs (use .env.example as template)
+.env
+.env.local
+.env.*.local
+
 # IDEs
 .vscode/
 .idea/

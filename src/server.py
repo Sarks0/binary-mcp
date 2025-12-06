@@ -22,6 +22,7 @@ from src.engines.static.ghidra.project_cache import ProjectCache
 from src.engines.static.ghidra.runner import GhidraRunner
 from src.tools.dotnet_tools import register_dotnet_tools
 from src.tools.dynamic_tools import register_dynamic_tools
+from src.tools.vt_tools import register_vt_tools
 from src.utils.compatibility import (
     BinaryCompatibilityChecker,
     CompatibilityLevel,
@@ -2626,7 +2627,10 @@ def main():
     # Register dynamic analysis tools (with session logging)
     register_dynamic_tools(app, session_manager)
 
-    logger.info("Registered static (Ghidra + .NET) + dynamic analysis tools")
+    # Register VirusTotal tools
+    register_vt_tools(app, session_manager)
+
+    logger.info("Registered static (Ghidra + .NET) + dynamic + VirusTotal tools")
     logger.info(f"Session Directory: {session_manager.store_dir}")
 
     # Run the FastMCP server (handles stdio automatically)

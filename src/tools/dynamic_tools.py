@@ -10,7 +10,7 @@ import os
 
 from fastmcp import FastMCP
 
-from src.engines.dynamic.x64dbg.bridge import X64DbgBridge
+from src.engines.dynamic.x64dbg.bridge import AddressValidationError, X64DbgBridge
 from src.engines.dynamic.x64dbg.commands import X64DbgCommands
 from src.engines.session import AnalysisType, UnifiedSessionManager
 
@@ -452,6 +452,13 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             bridge.set_breakpoint(address)
             return f"Breakpoint set at {address}"
 
+        except AddressValidationError as e:
+            logger.error(f"x64dbg_set_breakpoint address validation failed: {e}")
+            return (
+                f"Error: Invalid address parameter\n"
+                f"Details: {e}\n\n"
+                f"Expected format: hex address like '0x401000' or '401000'"
+            )
         except Exception as e:
             logger.error(f"x64dbg_set_breakpoint failed: {e}")
             return f"Error: {e}"
@@ -473,6 +480,13 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             bridge.delete_breakpoint(address)
             return f"Breakpoint deleted at {address}"
 
+        except AddressValidationError as e:
+            logger.error(f"x64dbg_delete_breakpoint address validation failed: {e}")
+            return (
+                f"Error: Invalid address parameter\n"
+                f"Details: {e}\n\n"
+                f"Expected format: hex address like '0x401000' or '401000'"
+            )
         except Exception as e:
             logger.error(f"x64dbg_delete_breakpoint failed: {e}")
             return f"Error: {e}"
@@ -544,8 +558,10 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
         """
         Disassemble instructions at address.
 
+        Uses x64dbg plugin API with capstone library fallback for reliability.
+
         Args:
-            address: Start address
+            address: Start address (hex, e.g., "0x401000")
             count: Number of instructions to disassemble (default: 20)
 
         Returns:
@@ -555,6 +571,10 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             00401000: push rbp
             00401001: mov rbp, rsp
             ...
+
+        Note:
+            If the x64dbg API returns empty results, the tool will automatically
+            attempt to read raw memory and disassemble using capstone library.
         """
         try:
             bridge = get_x64dbg_bridge()
@@ -566,10 +586,26 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 addr = instr.get("address", "")
                 mnemonic = instr.get("mnemonic", "")
                 operand = instr.get("operand", "")
-                result.append(f"{addr}: {mnemonic} {operand}".strip())
+                instr_bytes = instr.get("bytes", "")
+
+                line = f"{addr}: {mnemonic} {operand}".strip()
+                if instr_bytes:
+                    line = f"{addr}: {instr_bytes:20} {mnemonic} {operand}".strip()
+                result.append(line)
 
             return "\n".join(result)
 
+        except AddressValidationError as e:
+            logger.error(f"x64dbg_disassemble address validation failed: {e}")
+            return (
+                f"Error: Invalid address parameter\n"
+                f"Details: {e}\n\n"
+                f"Expected format: hex address like '0x401000' or '401000'"
+            )
+        except RuntimeError as e:
+            # This includes the detailed disassembly failure message
+            logger.error(f"x64dbg_disassemble failed: {e}")
+            return f"Error: {e}"
         except Exception as e:
             logger.error(f"x64dbg_disassemble failed: {e}")
             return f"Error: {e}"
@@ -1392,6 +1428,21 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                     f"Size: {size} bytes\n\n"
                     f"Note: Maximum 4 hardware breakpoints can be active.")
 
+        except AddressValidationError as e:
+            logger.error(f"x64dbg_set_hardware_bp address validation failed: {e}")
+            return (
+                f"Error: Invalid address parameter\n"
+                f"Details: {e}\n\n"
+                f"Expected format: hex address like '0x401000' or '401000'"
+            )
+        except ValueError as e:
+            logger.error(f"x64dbg_set_hardware_bp parameter validation failed: {e}")
+            return (
+                f"Error: Invalid parameter\n"
+                f"Details: {e}\n\n"
+                f"Valid types: execute, read, write, access\n"
+                f"Valid sizes: 1, 2, 4, 8"
+            )
         except Exception as e:
             logger.error(f"x64dbg_set_hardware_bp failed: {e}")
             if "Not yet implemented" in str(e):
@@ -1521,12 +1572,13 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
         """
         Set memory breakpoint.
 
-        Break on memory access/read/write/execute.
+        Break on memory access/read/write/execute. For large ranges (>4096 bytes),
+        automatically splits into multiple breakpoints for reliability.
 
         Args:
             address: Memory address
             bp_type: Type ("access", "read", "write", "execute")
-            size: Size in bytes (1, 2, 4, 8)
+            size: Size in bytes (positive integer)
 
         Returns:
             Confirmation message
@@ -1535,24 +1587,62 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             x64dbg_set_memory_bp("0x500000", "write", 4)    # Break on 4-byte write
             x64dbg_set_memory_bp("0x401000", "access", 1)   # Break on any access
             x64dbg_set_memory_bp("0x600000", "read", 8)     # Break on 8-byte read
+            x64dbg_set_memory_bp("0x089A9020", "write", 4096)  # Auto-splits large range
 
         Use Cases:
             - Monitor variable changes (write breakpoint)
             - Track memory access patterns
             - Find where data is used (read breakpoint)
             - Detect code execution in data regions
+            - Monitor decryption buffers (large write breakpoint)
 
-        Priority: P0 (Critical)
+        Note:
+            For ranges >4096 bytes, breakpoints are auto-split for reliability.
+            Hardware breakpoints are limited to 1/2/4/8 bytes by CPU.
         """
         try:
             bridge = get_x64dbg_bridge()
-            bridge.set_memory_breakpoint(address, bp_type, size)
+            result = bridge.set_memory_breakpoint(address, bp_type, size)
 
-            return (f"Memory breakpoint set\n"
-                    f"Address: {address}\n"
-                    f"Type: {bp_type}\n"
-                    f"Size: {size} bytes")
+            output = [
+                f"Memory breakpoint{'s' if result['breakpoints_set'] > 1 else ''} set",
+                f"Address: {address}",
+                f"Type: {bp_type}",
+                f"Size: {size} bytes",
+                f"Breakpoints created: {result['breakpoints_set']}"
+            ]
 
+            # Include warning if present
+            if result.get("warning"):
+                output.append("")
+                output.append(f"Warning: {result['warning']}")
+
+            # If split into multiple, show addresses
+            if result['breakpoints_set'] > 1:
+                output.append("")
+                output.append("Breakpoint addresses:")
+                for addr in result.get("addresses", [])[:10]:  # Limit to first 10
+                    output.append(f"  - {addr}")
+                if len(result.get("addresses", [])) > 10:
+                    output.append(f"  ... and {len(result['addresses']) - 10} more")
+
+            return "\n".join(output)
+
+        except AddressValidationError as e:
+            logger.error(f"x64dbg_set_memory_bp address validation failed: {e}")
+            return (
+                f"Error: Invalid address parameter\n"
+                f"Details: {e}\n\n"
+                f"Expected format: hex address like '0x401000' or '401000'"
+            )
+        except ValueError as e:
+            logger.error(f"x64dbg_set_memory_bp parameter validation failed: {e}")
+            return (
+                f"Error: Invalid parameter\n"
+                f"Details: {e}\n\n"
+                f"Valid types: access, read, write, execute\n"
+                f"Size must be a positive integer"
+            )
         except Exception as e:
             logger.error(f"x64dbg_set_memory_bp failed: {e}")
             if "Not yet implemented" in str(e):
@@ -1583,6 +1673,13 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
             return f"Memory breakpoint deleted at {address}"
 
+        except AddressValidationError as e:
+            logger.error(f"x64dbg_delete_memory_bp address validation failed: {e}")
+            return (
+                f"Error: Invalid address parameter\n"
+                f"Details: {e}\n\n"
+                f"Expected format: hex address like '0x401000' or '401000'"
+            )
         except Exception as e:
             logger.error(f"x64dbg_delete_memory_bp failed: {e}")
             if "Not yet implemented" in str(e):

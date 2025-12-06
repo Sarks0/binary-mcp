@@ -2320,6 +2320,300 @@ def decode_base64_file(
         return f"Error decoding file: {e}"
 
 
+# ============================================================================
+# PYTHON BYTECODE ANALYSIS TOOLS
+# ============================================================================
+
+
+@app.tool()
+@log_to_session(analysis_type=AnalysisType.STATIC)
+def detect_python_packer(binary_path: str) -> str:
+    """
+    Detect if a binary is packed with a Python packer.
+
+    Detects py2exe, PyInstaller, cx_Freeze, and Nuitka packed executables.
+    Provides confidence scores and indicators found.
+
+    Args:
+        binary_path: Path to the binary file to analyze
+
+    Returns:
+        Detection result with packer type, confidence, and indicators
+
+    Example:
+        detect_python_packer("suspicious.exe")
+        # Returns: Packer: pyinstaller, Confidence: 95%, Python: 3.11
+    """
+    try:
+        binary_path = sanitize_binary_path(binary_path)
+
+        from src.engines.static.python.analyzer import PythonPackerAnalyzer
+        analyzer = PythonPackerAnalyzer()
+        result = analyzer.detect_packer(binary_path)
+
+        output = []
+        output.append("=" * 60)
+        output.append("PYTHON PACKER DETECTION")
+        output.append("=" * 60)
+        output.append(f"File: {binary_path}")
+        output.append("")
+
+        if result["is_python_packed"]:
+            output.append(f"✓ Python packer detected: {result['packer'].upper()}")
+            output.append(f"  Confidence: {result['confidence'] * 100:.0f}%")
+
+            if result["python_version"]:
+                output.append(f"  Python Version: {result['python_version']}")
+
+            output.append("")
+            output.append("Indicators Found:")
+            for indicator in result["indicators"]:
+                output.append(f"  • {indicator}")
+
+            if result["resources"]:
+                output.append("")
+                output.append("Embedded Resources:")
+                for res in result["resources"][:10]:
+                    output.append(f"  • {res}")
+                if len(result["resources"]) > 10:
+                    output.append(f"  ... and {len(result['resources']) - 10} more")
+        else:
+            output.append("✗ No Python packer detected")
+            if result["indicators"]:
+                output.append("")
+                output.append("Notes:")
+                for indicator in result["indicators"]:
+                    output.append(f"  • {indicator}")
+
+        return "\n".join(output)
+
+    except (PathTraversalError, FileSizeError) as e:
+        return safe_error_message("detect_python_packer", e)
+    except FileNotFoundError as e:
+        return f"File not found: {e}"
+    except Exception as e:
+        logger.error(f"detect_python_packer failed: {e}")
+        return f"Error detecting packer: {e}"
+
+
+@app.tool()
+@log_to_session(analysis_type=AnalysisType.STATIC)
+def extract_python_packed(
+    binary_path: str,
+    output_dir: str,
+    packer_type: str = "auto"
+) -> str:
+    """
+    Extract files from a Python packed executable.
+
+    Automatically detects the packer type or uses the specified one.
+    Extracts embedded .pyc files, libraries, and resources.
+
+    Args:
+        binary_path: Path to the packed executable
+        output_dir: Directory to extract files to
+        packer_type: Packer type (auto, pyinstaller, py2exe) - default: auto
+
+    Returns:
+        Extraction result with list of extracted files
+
+    Example:
+        extract_python_packed("packed.exe", "/tmp/extracted/")
+        extract_python_packed("packed.exe", "/tmp/extracted/", packer_type="py2exe")
+    """
+    try:
+        binary_path = sanitize_binary_path(binary_path)
+
+        from src.engines.static.python.analyzer import PythonPackerAnalyzer
+        analyzer = PythonPackerAnalyzer()
+
+        # Auto-detect packer type if needed
+        if packer_type == "auto":
+            detection = analyzer.detect_packer(binary_path)
+            if not detection["is_python_packed"]:
+                return "No Python packer detected in this binary"
+            packer_type = detection["packer"]
+
+        output = []
+        output.append("=" * 60)
+        output.append("PYTHON PACKED EXTRACTION")
+        output.append("=" * 60)
+        output.append(f"File: {binary_path}")
+        output.append(f"Packer: {packer_type}")
+        output.append(f"Output: {output_dir}")
+        output.append("")
+
+        # Extract based on packer type
+        if packer_type == "pyinstaller":
+            result = analyzer.extract_pyinstaller(binary_path, output_dir)
+        elif packer_type == "py2exe":
+            result = analyzer.extract_py2exe(binary_path, output_dir)
+        else:
+            return f"Unsupported packer type for extraction: {packer_type}"
+
+        if result["success"]:
+            output.append(f"✓ Successfully extracted {len(result['extracted_files'])} files")
+            output.append("")
+            output.append("Extracted Files:")
+            for f in result["extracted_files"][:20]:
+                output.append(f"  • {f}")
+            if len(result["extracted_files"]) > 20:
+                output.append(f"  ... and {len(result['extracted_files']) - 20} more")
+        else:
+            output.append("✗ Extraction failed or no files extracted")
+
+        if result["errors"]:
+            output.append("")
+            output.append("Errors:")
+            for err in result["errors"][:10]:
+                output.append(f"  • {err}")
+
+        return "\n".join(output)
+
+    except (PathTraversalError, FileSizeError) as e:
+        return safe_error_message("extract_python_packed", e)
+    except FileNotFoundError as e:
+        return f"File not found: {e}"
+    except Exception as e:
+        logger.error(f"extract_python_packed failed: {e}")
+        return f"Error extracting packed binary: {e}"
+
+
+@app.tool()
+@log_to_session(analysis_type=AnalysisType.STATIC)
+def analyze_pyc_file(pyc_path: str) -> str:
+    """
+    Analyze a .pyc (compiled Python bytecode) file.
+
+    Extracts Python version, magic number, timestamp, and metadata.
+    Useful for understanding what Python version compiled the bytecode.
+
+    Args:
+        pyc_path: Path to the .pyc file
+
+    Returns:
+        Analysis result with version info and metadata
+
+    Example:
+        analyze_pyc_file("extracted/script.pyc")
+        # Returns: Python 3.11, magic 0x7B0D, compiled 2024-01-15
+    """
+    try:
+        pyc_path = sanitize_binary_path(pyc_path)
+
+        from src.engines.static.python.analyzer import PythonPackerAnalyzer
+        analyzer = PythonPackerAnalyzer()
+        result = analyzer.analyze_pyc(pyc_path)
+
+        output = []
+        output.append("=" * 60)
+        output.append("PYC FILE ANALYSIS")
+        output.append("=" * 60)
+        output.append(f"File: {result['file']}")
+        output.append(f"Size: {result['size']} bytes")
+        output.append("")
+
+        if result["is_valid"]:
+            output.append("Header Information:")
+            output.append(f"  Magic Number: {result['magic_number']}")
+            output.append(f"  Python Version: {result['python_version']}")
+
+            if result["timestamp"]:
+                output.append(f"  Compiled: {result['timestamp']}")
+
+            if result["source_size"]:
+                output.append(f"  Source Size: {result['source_size']} bytes")
+
+            output.append("")
+            output.append("✓ Valid .pyc file")
+        else:
+            output.append("✗ Invalid or unrecognized .pyc format")
+            if result.get("error"):
+                output.append(f"  Error: {result['error']}")
+
+        return "\n".join(output)
+
+    except (PathTraversalError, FileSizeError) as e:
+        return safe_error_message("analyze_pyc_file", e)
+    except FileNotFoundError as e:
+        return f"File not found: {e}"
+    except Exception as e:
+        logger.error(f"analyze_pyc_file failed: {e}")
+        return f"Error analyzing .pyc file: {e}"
+
+
+@app.tool()
+@log_to_session(analysis_type=AnalysisType.STATIC)
+def list_python_archive_contents(binary_path: str) -> str:
+    """
+    List contents of a Python packed archive.
+
+    Shows all files embedded in a py2exe or PyInstaller packed executable,
+    including .pyc files, DLLs, and other resources.
+
+    Args:
+        binary_path: Path to the packed executable
+
+    Returns:
+        List of embedded files with sizes
+
+    Example:
+        list_python_archive_contents("packed.exe")
+        # Returns: 15 files including main.pyc, library.zip, etc.
+    """
+    try:
+        binary_path = sanitize_binary_path(binary_path)
+
+        from src.engines.static.python.analyzer import PythonPackerAnalyzer
+        analyzer = PythonPackerAnalyzer()
+        result = analyzer.list_archive_contents(binary_path)
+
+        output = []
+        output.append("=" * 60)
+        output.append("PYTHON ARCHIVE CONTENTS")
+        output.append("=" * 60)
+        output.append(f"File: {binary_path}")
+
+        if result["packer"]:
+            output.append(f"Packer: {result['packer']}")
+
+        output.append(f"Total Files: {result['total_files']}")
+        output.append("")
+
+        if result["contents"]:
+            # Group by type
+            pyc_files = [f for f in result["contents"] if f["is_pyc"]]
+            other_files = [f for f in result["contents"] if not f["is_pyc"]]
+
+            if pyc_files:
+                output.append(f"Python Bytecode Files ({len(pyc_files)}):")
+                for f in pyc_files[:15]:
+                    ratio = f["compressed_size"] / f["size"] if f["size"] > 0 else 1
+                    output.append(f"  • {f['name']:<40} {f['size']:>8} bytes ({ratio:.0%} compressed)")
+                if len(pyc_files) > 15:
+                    output.append(f"  ... and {len(pyc_files) - 15} more .pyc files")
+
+            if other_files:
+                output.append("")
+                output.append(f"Other Files ({len(other_files)}):")
+                for f in other_files[:15]:
+                    output.append(f"  • {f['name']:<40} {f['size']:>8} bytes")
+                if len(other_files) > 15:
+                    output.append(f"  ... and {len(other_files) - 15} more files")
+        else:
+            output.append("No embedded archive found or archive could not be read")
+
+        return "\n".join(output)
+
+    except (PathTraversalError, FileSizeError) as e:
+        return safe_error_message("list_python_archive_contents", e)
+    except FileNotFoundError as e:
+        return f"File not found: {e}"
+    except Exception as e:
+        logger.error(f"list_python_archive_contents failed: {e}")
+        return f"Error listing archive contents: {e}"
+
+
 def main():
     """Run the MCP server."""
     logger.info("Starting Binary MCP Server...")

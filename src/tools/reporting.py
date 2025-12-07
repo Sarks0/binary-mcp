@@ -346,8 +346,7 @@ def register_reporting_tools(app, session_manager):
         app: FastMCP application instance
         session_manager: Session manager for accessing session data
     """
-    from src.utils.security import safe_error_message
-
+    
     @app.tool()
     def generate_report(
         session_id: str = "",

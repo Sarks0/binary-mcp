@@ -34,8 +34,8 @@ def calculate_entropy(data: bytes) -> float:
     if not data:
         return 0.0
 
-    from collections import Counter
     import math
+    from collections import Counter
 
     counts = Counter(data)
     length = len(data)
@@ -480,7 +480,6 @@ def register_triage_tools(app, session_manager=None):
         app: FastMCP application instance
         session_manager: Optional session manager for logging
     """
-    from src.engines.session import AnalysisType
     from src.utils.security import (
         PathTraversalError,
         FileSizeError,
@@ -642,11 +641,11 @@ def register_triage_tools(app, session_manager=None):
                         output.append(f"    • {rk[:60]}")
 
                 if strings["commands"]:
-                    output.append(f"  Command Keywords:")
+                    output.append("  Command Keywords:")
                     output.append(f"    {', '.join(strings['commands'][:10])}")
 
                 if strings["crypto_strings"]:
-                    output.append(f"  Crypto Keywords:")
+                    output.append("  Crypto Keywords:")
                     output.append(f"    {', '.join(strings['crypto_strings'][:10])}")
 
                 output.append("")

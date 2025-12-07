@@ -753,7 +753,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
             # Format output
             output = [
-                f"Batch breakpoint results:",
+                "Batch breakpoint results:",
                 f"  Success: {results['success']}",
                 f"  Failed: {results['failed']}"
             ]
@@ -803,7 +803,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
             # Format output
             output = [
-                f"Batch delete results:",
+                "Batch delete results:",
                 f"  Success: {results['success']}",
                 f"  Failed: {results['failed']}"
             ]
@@ -2134,10 +2134,8 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
                                 if magic == 0x10b:  # PE32
                                     imagebase_offset = opt_header_offset + 28
-                                    size_of_image_offset = opt_header_offset + 56
                                 elif magic == 0x20b:  # PE32+
                                     imagebase_offset = opt_header_offset + 24
-                                    size_of_image_offset = opt_header_offset + 56
 
                                 # Update ImageBase to match dump base
                                 base_int = int(base.replace("0x", ""), 16)
@@ -3747,7 +3745,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                             # Check PE signature
                             if pe_header[0:4] == b'PE\x00\x00':
                                 # Check machine type at offset 4
-                                machine = int.from_bytes(pe_header[4:6], 'little')
                                 # Optional header offset is at 0x18
                                 opt_header = pe_header[0x18:]
                                 magic = int.from_bytes(opt_header[0:2], 'little')
@@ -3773,7 +3770,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             runtime_addr = module_base + offset
 
             output = [
-                f"Address Conversion:",
+                "Address Conversion:",
                 f"  Static address:  0x{static_addr:08X}",
                 f"  Image base:      0x{img_base:08X}",
                 f"  Offset:          0x{offset:08X}",
@@ -4156,23 +4153,18 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 session_data["debug_states"][state_id] = debug_state
 
             # Build summary
-            bp_count = (
-                len(debug_state["breakpoints"]["software"]) +
-                len(debug_state["breakpoints"]["hardware"]) +
-                len(debug_state["breakpoints"]["memory"])
-            )
 
             output = [
-                f"Debug state saved:",
+                "Debug state saved:",
                 f"  State ID: {state_id}",
                 f"  Name: {state_name}",
                 f"  Binary: {binary_name}",
-                f"",
-                f"Items saved:",
+                "",
+                "Items saved:",
                 f"  Software breakpoints: {len(debug_state['breakpoints']['software'])}",
                 f"  Hardware breakpoints: {len(debug_state['breakpoints']['hardware'])}",
                 f"  Memory breakpoints: {len(debug_state['breakpoints']['memory'])}",
-                f"",
+                "",
                 f"Use x64dbg_restore_debug_state(state_id=\"{state_id}\") to restore"
             ]
 
@@ -4298,8 +4290,8 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             output = [
                 f"Debug state restored: {debug_state.get('state_name', state_id)}",
                 f"  Original binary: {debug_state.get('binary_name', 'unknown')}",
-                f"",
-                f"Restored items:",
+                "",
+                "Restored items:",
                 f"  Software breakpoints: {restored['software_bp']}",
                 f"  Hardware breakpoints: {restored['hardware_bp']}",
                 f"  Memory breakpoints: {restored['memory_bp']}",
@@ -4568,7 +4560,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
             # Build output
             output = [
-                f"Hook Detection Results:",
+                "Hook Detection Results:",
                 f"  Modules scanned: {modules_scanned}",
                 f"  Functions checked: {functions_checked}",
                 f"  Hooks found: {len(hooks_found)}",
@@ -4805,7 +4797,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 output = [
                     f"Function unhooked: {expression}",
                     f"Address: 0x{func_addr_int:X}",
-                    f"",
+                    "",
                     f"Previous bytes: {current_bytes.hex().upper()}",
                     f"Restored bytes: {orig_bytes.hex().upper()}",
                     "",
@@ -4814,7 +4806,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             else:
                 output = [
                     f"Unhook may have failed for {expression}",
-                    f"",
+                    "",
                     f"Expected: {orig_bytes.hex().upper()}",
                     f"Got:      {verify_bytes.hex().upper() if verify_bytes else 'read failed'}"
                 ]
@@ -4906,7 +4898,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 session_data["memory_watches"][watch_id] = watch_record
 
             output = [
-                f"Memory watch started:",
+                "Memory watch started:",
                 f"  Watch ID: {watch_id}",
                 f"  Name: {watch_record['name']}",
                 f"  Address: 0x{addr_int:X}",
@@ -5004,7 +4996,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
             # Build output
             output = [
-                f"Memory CHANGED:",
+                "Memory CHANGED:",
                 f"  Watch: {watch_record['name']}",
                 f"  Address: 0x{address:X}",
                 f"  Size: {size} bytes",
@@ -5042,8 +5034,8 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             def calc_entropy(data):
                 if not data:
                     return 0
-                from collections import Counter
                 import math
+                from collections import Counter
                 counts = Counter(data)
                 length = len(data)
                 entropy = 0
@@ -5056,7 +5048,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             current_entropy = calc_entropy(current)
 
             output.append("")
-            output.append(f"Entropy analysis:")
+            output.append("Entropy analysis:")
             output.append(f"  Initial: {initial_entropy:.2f} bits/byte")
             output.append(f"  Current: {current_entropy:.2f} bits/byte")
             output.append(f"  Change: {current_entropy - initial_entropy:+.2f}")
@@ -5130,7 +5122,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             watch_record["updated_at"] = time.time()
 
             output = [
-                f"Memory snapshot updated:",
+                "Memory snapshot updated:",
                 f"  Watch: {watch_record['name']}",
                 f"  Address: 0x{address:X}",
                 f"  New hash: {new_hash[:16]}...",

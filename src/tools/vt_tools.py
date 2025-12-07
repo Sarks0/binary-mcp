@@ -13,10 +13,7 @@ Requires VT_API_KEY environment variable or config.
 import hashlib
 import json
 import logging
-import os
-import time
 from pathlib import Path
-from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -260,7 +257,6 @@ def register_vt_tools(app, session_manager=None):
         app: FastMCP application instance
         session_manager: Optional session manager for logging
     """
-    from src.engines.session import AnalysisType
     from src.utils.security import (
         PathTraversalError,
         FileSizeError,

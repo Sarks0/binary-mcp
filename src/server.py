@@ -2021,7 +2021,10 @@ def detect_crypto_patterns(binary_path: str) -> str:
     try:
         safe_path = sanitize_binary_path(binary_path)
 
-        from src.utils.crypto_analysis import calculate_entropy, detect_crypto_patterns as analyze
+        from src.utils.crypto_analysis import (
+            calculate_entropy,
+            detect_crypto_patterns as analyze,
+        )
 
         path = Path(safe_path)
         if not path.exists():
@@ -2105,7 +2108,7 @@ def analyze_xor_encryption(
     try:
         safe_path = sanitize_binary_path(binary_path)
 
-        from src.utils.crypto_analysis import analyze_xor, xor_decrypt
+        from src.utils.crypto_analysis import analyze_xor
 
         path = Path(safe_path)
         if not path.exists():
@@ -2181,7 +2184,7 @@ def decrypt_xor(
     try:
         safe_path = sanitize_binary_path(binary_path)
 
-        from src.utils.crypto_analysis import xor_decrypt, calculate_entropy
+        from src.utils.crypto_analysis import calculate_entropy, xor_decrypt
 
         path = Path(safe_path)
         if not path.exists():
@@ -2264,6 +2267,7 @@ def decode_base64_file(
         safe_path = sanitize_binary_path(binary_path)
 
         import base64
+
         from src.utils.crypto_analysis import calculate_entropy
 
         path = Path(safe_path)

@@ -60,7 +60,7 @@ def _parse_env_file(env_path: Path) -> dict[str, str]:
     config = {}
 
     try:
-        with open(env_path, "r") as f:
+        with open(env_path) as f:
             for line_num, line in enumerate(f, 1):
                 line = line.strip()
 

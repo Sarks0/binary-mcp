@@ -153,7 +153,7 @@ def generate_yara_rule(
                 lines.append(f'        {key} = {"true" if value else "false"}')
     else:
         lines.append(f'        description = "Auto-generated rule for {rule_name}"')
-        lines.append(f'        author = "binary-mcp"')
+        lines.append('        author = "binary-mcp"')
         lines.append(f'        date = "{datetime.now().strftime("%Y-%m-%d")}"')
 
     # Strings section
@@ -224,7 +224,7 @@ def generate_yara_rule(
         # PE header and some matches
         if len(selected) >= 2:
             lines.append("        uint16(0) == 0x5A4D and")
-            lines.append(f"        (2 of ($s*))")
+            lines.append("        (2 of ($s*))")
         else:
             lines.append("        uint16(0) == 0x5A4D and")
             lines.append("        any of them")
@@ -403,7 +403,6 @@ def register_yara_tools(app, session_manager):
             i = 0
             while i < len(data) - 1:
                 if data[i+1] == 0 and 32 <= data[i] < 127:
-                    start = i
                     chars = []
                     while i < len(data) - 1 and data[i+1] == 0 and 32 <= data[i] < 127:
                         chars.append(chr(data[i]))

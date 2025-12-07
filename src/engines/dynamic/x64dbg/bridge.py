@@ -1200,8 +1200,8 @@ class X64DbgBridge(Debugger):
             raise ValueError(f"Invalid size {size}. Must be a positive integer.")
 
         # Constants for size limits
-        MAX_RELIABLE_SIZE = 4096  # 4KB - page size
-        CHUNK_SIZE = 4096  # Split large ranges into page-sized chunks
+        max_reliable_size = 4096  # 4KB - page size
+        chunk_size = 4096  # Split large ranges into page-sized chunks
 
         result = {
             "success": True,
@@ -1211,15 +1211,15 @@ class X64DbgBridge(Debugger):
         }
 
         # Warn about large ranges
-        if size > MAX_RELIABLE_SIZE:
+        if size > max_reliable_size:
             result["warning"] = (
                 f"Large memory breakpoint ({size} bytes) may be unreliable. "
-                f"Memory breakpoints work best on small ranges (<{MAX_RELIABLE_SIZE} bytes). "
+                f"Memory breakpoints work best on small ranges (<{max_reliable_size} bytes). "
             )
 
             if auto_split:
                 result["warning"] += (
-                    f"Auto-splitting into {(size + CHUNK_SIZE - 1) // CHUNK_SIZE} chunks."
+                    f"Auto-splitting into {(size + chunk_size - 1) // chunk_size} chunks."
                 )
                 logger.warning(result["warning"])
 
@@ -1229,13 +1229,13 @@ class X64DbgBridge(Debugger):
                 chunk_count = 0
 
                 while remaining > 0:
-                    chunk_size = min(remaining, CHUNK_SIZE)
+                    current_chunk = min(remaining, chunk_size)
                     chunk_addr = f"{addr_int:X}"
 
                     data = {
                         "address": chunk_addr,
                         "type": bp_type,
-                        "size": chunk_size
+                        "size": current_chunk
                     }
 
                     logger.debug(f"Setting memory breakpoint chunk - sending data: {data}")
@@ -1243,8 +1243,8 @@ class X64DbgBridge(Debugger):
 
                     result["addresses"].append(f"0x{chunk_addr}")
                     chunk_count += 1
-                    addr_int += chunk_size
-                    remaining -= chunk_size
+                    addr_int += current_chunk
+                    remaining -= current_chunk
 
                 result["breakpoints_set"] = chunk_count
                 logger.info(

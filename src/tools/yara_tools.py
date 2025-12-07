@@ -243,10 +243,10 @@ def register_yara_tools(app, session_manager):
         session_manager: Session manager for accessing session data
     """
     from src.utils.security import (
-        PathTraversalError,
         FileSizeError,
-        sanitize_binary_path,
+        PathTraversalError,
         safe_error_message,
+        sanitize_binary_path,
     )
 
     @app.tool()

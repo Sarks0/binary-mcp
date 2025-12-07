@@ -481,10 +481,10 @@ def register_triage_tools(app, session_manager=None):
         session_manager: Optional session manager for logging
     """
     from src.utils.security import (
-        PathTraversalError,
         FileSizeError,
-        sanitize_binary_path,
+        PathTraversalError,
         safe_error_message,
+        sanitize_binary_path,
     )
 
     @app.tool()

@@ -2021,7 +2021,8 @@ def detect_crypto_patterns(binary_path: str) -> str:
     try:
         safe_path = sanitize_binary_path(binary_path)
 
-        from src.utils.crypto_analysis import calculate_entropy, detect_crypto_patterns as analyze
+        from src.utils.crypto_analysis import calculate_entropy
+        from src.utils.crypto_analysis import detect_crypto_patterns as analyze
 
         path = Path(safe_path)
         if not path.exists():

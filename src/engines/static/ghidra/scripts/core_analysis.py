@@ -86,6 +86,19 @@ def extract_comprehensive_analysis():
     reference_manager = program.getReferenceManager()
     data_type_manager = program.getDataTypeManager()
 
+    # Configurable settings from environment variables
+    # GHIDRA_FUNCTION_TIMEOUT: Per-function decompilation timeout in seconds (default: 30)
+    # GHIDRA_MAX_FUNCTIONS: Maximum number of functions to analyze (default: unlimited)
+    # GHIDRA_SKIP_DECOMPILE: Skip decompilation entirely (faster, but no pseudocode)
+    function_timeout = int(os.environ.get("GHIDRA_FUNCTION_TIMEOUT", "30"))
+    max_functions = int(os.environ.get("GHIDRA_MAX_FUNCTIONS", "0"))  # 0 = unlimited
+    skip_decompile = os.environ.get("GHIDRA_SKIP_DECOMPILE", "").lower() in ("1", "true", "yes")
+
+    print(safe_format("[*] Analysis settings:"))
+    print(safe_format("    Function timeout: {}s", function_timeout))
+    print(safe_format("    Max functions: {}", max_functions if max_functions > 0 else "unlimited"))
+    print(safe_format("    Skip decompile: {}", skip_decompile))
+
     # Initialize decompiler
     decompiler = DecompInterface()
     decompiler.openProgram(program)
@@ -101,7 +114,15 @@ def extract_comprehensive_analysis():
         "data_types": {
             "structures": [],
             "enums": []
-        }
+        },
+        "analysis_stats": {
+            "functions_analyzed": 0,
+            "functions_skipped": 0,
+            "decompile_failures": 0,
+            "decompile_timeouts": 0,
+            "partial_results": False
+        },
+        "skipped_functions": []  # Track functions that couldn't be analyzed
     }
 
     # Extract metadata
@@ -197,13 +218,22 @@ def extract_comprehensive_analysis():
     print("[*] Extracting functions...")
     function_iterator = function_manager.getFunctions(True)
     function_count = 0
+    decompile_timeout_count = 0
+    decompile_failure_count = 0
 
     while function_iterator.hasNext():
         function = function_iterator.next()
         function_count += 1
 
+        # Check max functions limit
+        if max_functions > 0 and function_count > max_functions:
+            print(safe_format("[!] Reached max function limit ({}), stopping analysis", max_functions))
+            context["analysis_stats"]["partial_results"] = True
+            break
+
         if function_count % 100 == 0:
-            print(safe_format("    Processed {} functions...", function_count))
+            print(safe_format("    Processed {} functions ({} timeouts, {} failures)...",
+                              function_count, decompile_timeout_count, decompile_failure_count))
 
         # Get function signature
         signature = function.getSignature()
@@ -220,7 +250,8 @@ def extract_comprehensive_analysis():
             "local_variables": [],
             "called_functions": [],
             "pseudocode": None,
-            "basic_blocks": []
+            "basic_blocks": [],
+            "decompile_status": "not_attempted"  # Track decompilation status
         }
 
         # Get parameters
@@ -242,12 +273,16 @@ def extract_comprehensive_analysis():
             function_info["local_variables"].append(var_info)
 
         # Get called functions (limited to direct calls)
-        called_functions = function.getCalledFunctions(monitor)
-        for called in called_functions:
-            function_info["called_functions"].append({
-                "name": safe_unicode(called.getName()),
-                "address": safe_unicode(called.getEntryPoint())
-            })
+        try:
+            called_functions = function.getCalledFunctions(monitor)
+            for called in called_functions:
+                function_info["called_functions"].append({
+                    "name": safe_unicode(called.getName()),
+                    "address": safe_unicode(called.getEntryPoint())
+                })
+        except Exception as e:
+            print(safe_format("    Warning: Could not get called functions for {}: {}",
+                              safe_unicode(function.getName()), safe_unicode(e)))
 
         # Get basic blocks
         try:
@@ -262,20 +297,58 @@ def extract_comprehensive_analysis():
                 }
                 function_info["basic_blocks"].append(block_info)
         except Exception as e:
-            print(safe_format("    Warning: Could not extract basic blocks for {}: {}", safe_unicode(function.getName()), safe_unicode(e)))
+            print(safe_format("    Warning: Could not extract basic blocks for {}: {}",
+                              safe_unicode(function.getName()), safe_unicode(e)))
 
         # Decompile function (for non-thunk, non-external functions)
-        if not function.isThunk() and not function.isExternal():
+        if skip_decompile:
+            function_info["decompile_status"] = "skipped"
+        elif not function.isThunk() and not function.isExternal():
             try:
-                decompile_results = decompiler.decompileFunction(function, 30, monitor)
-                if decompile_results and decompile_results.decompileCompleted():
-                    pseudocode = decompile_results.getDecompiledFunction()
-                    if pseudocode:
-                        function_info["pseudocode"] = safe_unicode(pseudocode.getC())
+                # Use configurable timeout
+                decompile_results = decompiler.decompileFunction(function, function_timeout, monitor)
+                if decompile_results:
+                    if decompile_results.decompileCompleted():
+                        pseudocode = decompile_results.getDecompiledFunction()
+                        if pseudocode:
+                            function_info["pseudocode"] = safe_unicode(pseudocode.getC())
+                            function_info["decompile_status"] = "success"
+                        else:
+                            function_info["decompile_status"] = "empty_result"
+                            decompile_failure_count += 1
+                    else:
+                        # Decompilation timed out or was cancelled
+                        function_info["decompile_status"] = "timeout"
+                        decompile_timeout_count += 1
+                        context["skipped_functions"].append({
+                            "name": safe_unicode(function.getName()),
+                            "address": safe_unicode(entry_point),
+                            "reason": "decompile_timeout"
+                        })
+                        print(safe_format("    [!] Decompile timeout for {} at {}",
+                                          safe_unicode(function.getName()), safe_unicode(entry_point)))
+                else:
+                    function_info["decompile_status"] = "no_result"
+                    decompile_failure_count += 1
             except Exception as e:
-                print(safe_format("    Warning: Could not decompile {}: {}", safe_unicode(function.getName()), safe_unicode(e)))
+                function_info["decompile_status"] = "error"
+                decompile_failure_count += 1
+                context["skipped_functions"].append({
+                    "name": safe_unicode(function.getName()),
+                    "address": safe_unicode(entry_point),
+                    "reason": safe_unicode(e)
+                })
+                print(safe_format("    [!] Decompile error for {}: {}",
+                                  safe_unicode(function.getName()), safe_unicode(e)))
+        else:
+            function_info["decompile_status"] = "skipped_thunk_or_external"
 
         context["functions"].append(function_info)
+
+    # Update analysis stats
+    context["analysis_stats"]["functions_analyzed"] = function_count
+    context["analysis_stats"]["decompile_timeouts"] = decompile_timeout_count
+    context["analysis_stats"]["decompile_failures"] = decompile_failure_count
 
     # Extract data types (structures)
     print("[*] Extracting data types...")
@@ -327,6 +400,17 @@ def extract_comprehensive_analysis():
     print(safe_format("    Strings: {}", len(context["strings"])))
     print(safe_format("    Structures: {}", len(context["data_types"]["structures"])))
     print(safe_format("    Enums: {}", len(context["data_types"]["enums"])))
+
+    # Print analysis statistics
+    stats = context["analysis_stats"]
+    print("[*] Analysis statistics:")
+    print(safe_format("    Functions analyzed: {}", stats["functions_analyzed"]))
+    print(safe_format("    Decompile timeouts: {}", stats["decompile_timeouts"]))
+    print(safe_format("    Decompile failures: {}", stats["decompile_failures"]))
+    if stats["partial_results"]:
+        print("    [!] PARTIAL RESULTS: Analysis was limited by max_functions setting")
+    if context["skipped_functions"]:
+        print(safe_format("    Skipped functions: {}", len(context["skipped_functions"])))
 
     return context
 

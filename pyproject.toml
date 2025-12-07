@@ -13,6 +13,7 @@ dependencies = [
     "pefile>=2023.2.7",
     "pyelftools>=0.31",
     "requests>=2.31.0",
+    "capstone>=5.0.0",
 ]
 
 [project.optional-dependencies]

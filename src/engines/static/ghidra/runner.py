@@ -151,6 +151,9 @@ class GhidraRunner:
         timeout: int = 600,
         processor: str | None = None,
         loader: str | None = None,
+        function_timeout: int | None = None,
+        max_functions: int | None = None,
+        skip_decompile: bool = False,
     ) -> dict:
         """
         Run Ghidra headless analysis on a binary.
@@ -162,9 +165,12 @@ class GhidraRunner:
             output_path: Where to save analysis output
             project_name: Ghidra project name (default: binary basename)
             keep_project: Whether to keep the project after analysis
-            timeout: Maximum execution time in seconds
+            timeout: Maximum execution time in seconds (default: 600)
             processor: Optional processor specification (e.g., "x86:LE:64:default")
             loader: Optional loader specification (e.g., "Portable Executable (PE)")
+            function_timeout: Per-function decompilation timeout (default: 30s)
+            max_functions: Maximum functions to analyze (default: unlimited)
+            skip_decompile: Skip decompilation for faster analysis (default: False)
 
         Returns:
             dict with analysis results and metadata
@@ -173,6 +179,13 @@ class GhidraRunner:
             subprocess.TimeoutExpired: If analysis exceeds timeout
             subprocess.CalledProcessError: If Ghidra analysis fails
             FileNotFoundError: If binary or script not found
+
+        Note:
+            For binaries with anti-analysis code that causes decompiler hangs,
+            you can:
+            1. Reduce function_timeout to skip problematic functions faster
+            2. Set max_functions to limit analysis scope
+            3. Set skip_decompile=True to skip decompilation entirely
         """
         binary_path = self._normalize_binary_path(binary_path)
 
@@ -186,9 +199,20 @@ class GhidraRunner:
         project_dir = Path(output_path).parent / "ghidra_projects"
         project_dir.mkdir(parents=True, exist_ok=True)
 
-        # Set environment variable for output path
+        # Set environment variables for output path and analysis options
         env = os.environ.copy()
         env["GHIDRA_CONTEXT_JSON"] = str(output_path)
+
+        # Pass function-level timeout settings to the Ghidra script
+        if function_timeout is not None:
+            env["GHIDRA_FUNCTION_TIMEOUT"] = str(function_timeout)
+        if max_functions is not None and max_functions > 0:
+            env["GHIDRA_MAX_FUNCTIONS"] = str(max_functions)
+        if skip_decompile:
+            env["GHIDRA_SKIP_DECOMPILE"] = "1"
+
+        logger.debug(f"Analysis settings: function_timeout={function_timeout}, "
+                     f"max_functions={max_functions}, skip_decompile={skip_decompile}")
 
         # Build command - processor/loader must come immediately after binary path
         cmd = [

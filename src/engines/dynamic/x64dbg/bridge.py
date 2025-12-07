@@ -19,6 +19,11 @@ from .error_logger import ErrorContext, X64DbgErrorLogger
 logger = logging.getLogger(__name__)
 
 
+class AddressValidationError(Exception):
+    """Raised when an address parameter is invalid or missing."""
+    pass
+
+
 class X64DbgBridge(Debugger):
     """Client for x64dbg MCP plugin HTTP API."""
 
@@ -37,8 +42,117 @@ class X64DbgBridge(Debugger):
         self._auth_token = None
         self._error_logger = X64DbgErrorLogger()
 
+        self._max_retries = 3
+        self._retry_delay = 0.1  # seconds
+
         logger.info(f"Initialized x64dbg bridge: {self.base_url}")
         logger.info(f"Error logging enabled: {self._error_logger.error_dir}")
+
+    def _normalize_address(self, address: str | None, param_name: str = "address") -> str:
+        """
+        Normalize and validate an address parameter.
+
+        Args:
+            address: Address string (hex with or without 0x prefix)
+            param_name: Name of parameter for error messages
+
+        Returns:
+            Normalized address string (without 0x prefix)
+
+        Raises:
+            AddressValidationError: If address is None, empty, or invalid
+        """
+        if address is None:
+            raise AddressValidationError(f"Missing {param_name}: parameter is None")
+
+        if not isinstance(address, str):
+            raise AddressValidationError(
+                f"Invalid {param_name}: expected string, got {type(address).__name__}"
+            )
+
+        # Strip whitespace
+        address = address.strip()
+
+        if not address:
+            raise AddressValidationError(f"Missing {param_name}: empty string")
+
+        # Remove 0x prefix if present
+        if address.lower().startswith("0x"):
+            address = address[2:]
+
+        # Validate hex characters
+        if not address:
+            raise AddressValidationError(f"Invalid {param_name}: only '0x' prefix provided")
+
+        try:
+            # Verify it's valid hex
+            int(address, 16)
+        except ValueError:
+            raise AddressValidationError(
+                f"Invalid {param_name}: '{address}' is not a valid hex address"
+            )
+
+        return address
+
+    def _request_with_retry(
+        self,
+        endpoint: str,
+        data: dict[str, Any] | None = None,
+        max_retries: int | None = None
+    ) -> dict[str, Any]:
+        """
+        Make HTTP request with retry logic for transient failures.
+
+        Args:
+            endpoint: API endpoint path
+            data: Optional JSON data for POST request
+            max_retries: Override default max retries
+
+        Returns:
+            JSON response as dictionary
+
+        Raises:
+            ConnectionError: If all retries fail
+            RuntimeError: If API returns error
+        """
+        retries = max_retries if max_retries is not None else self._max_retries
+        last_error = None
+
+        for attempt in range(retries + 1):
+            try:
+                return self._request(endpoint, data)
+            except (ConnectionError, RuntimeError) as e:
+                last_error = e
+                error_msg = str(e)
+
+                # Don't retry on validation errors (Missing address, etc.)
+                # These are likely parameter issues that won't be fixed by retrying
+                if "Missing" in error_msg and attempt < retries:
+                    # Log and retry - might be a serialization race
+                    logger.warning(
+                        f"Request failed (attempt {attempt + 1}/{retries + 1}): {error_msg}. "
+                        f"Retrying with data: {data}"
+                    )
+                    time.sleep(self._retry_delay * (attempt + 1))
+                    continue
+                elif "API error" in error_msg:
+                    # API errors should include context for debugging
+                    raise RuntimeError(
+                        f"{error_msg}\n"
+                        f"Request details:\n"
+                        f"  Endpoint: {endpoint}\n"
+                        f"  Data sent: {data}"
+                    )
+                else:
+                    raise
+
+        # All retries exhausted
+        raise RuntimeError(
+            f"Request failed after {retries + 1} attempts: {last_error}\n"
+            f"Request details:\n"
+            f"  Endpoint: {endpoint}\n"
+            f"  Data sent: {data}"
+        )
 
     def _read_auth_token(self) -> str | None:
         """
@@ -278,14 +392,21 @@ class X64DbgBridge(Debugger):
 
         Returns:
             True if breakpoint set successfully
-        """
-        # Normalize address
-        if address.startswith("0x"):
-            address = address[2:]
 
-        data = {"address": address}
-        self._request("/api/breakpoint/set", data)
-        logger.info(f"Set breakpoint at {address}")
+        Raises:
+            AddressValidationError: If address is invalid
+            RuntimeError: If API call fails
+        """
+        # Validate and normalize address
+        normalized_addr = self._normalize_address(address)
+
+        data = {"address": normalized_addr}
+
+        # Log the data being sent for debugging
+        logger.debug(f"Setting breakpoint - sending data: {data}")
+
+        self._request_with_retry("/api/breakpoint/set", data)
+        logger.info(f"Set breakpoint at 0x{normalized_addr}")
         return True
 
     def delete_breakpoint(self, address: str) -> bool:
@@ -297,13 +418,18 @@ class X64DbgBridge(Debugger):
 
         Returns:
             True if deleted successfully
-        """
-        if address.startswith("0x"):
-            address = address[2:]
 
-        data = {"address": address}
-        self._request("/api/breakpoint/delete", data)
-        logger.info(f"Deleted breakpoint at {address}")
+        Raises:
+            AddressValidationError: If address is invalid
+            RuntimeError: If API call fails
+        """
+        normalized_addr = self._normalize_address(address)
+
+        data = {"address": normalized_addr}
+        logger.debug(f"Deleting breakpoint - sending data: {data}")
+
+        self._request_with_retry("/api/breakpoint/delete", data)
+        logger.info(f"Deleted breakpoint at 0x{normalized_addr}")
         return True
 
     def list_breakpoints(self) -> list[dict[str, Any]]:
@@ -488,23 +614,108 @@ class X64DbgBridge(Debugger):
         """
         Disassemble instructions at address.
 
+        Uses the x64dbg plugin API first, with capstone fallback if the API
+        returns empty results.
+
         Args:
-            address: Start address
+            address: Start address (hex string)
+            count: Number of instructions to disassemble
+
+        Returns:
+            List of instruction dictionaries with keys:
+                - address: hex address
+                - mnemonic: instruction mnemonic
+                - operand: instruction operands
+                - bytes: (optional) instruction bytes
+
+        Raises:
+            AddressValidationError: If address is invalid
+            RuntimeError: If disassembly fails
+        """
+        normalized_addr = self._normalize_address(address)
+
+        data = {
+            "address": normalized_addr,
+            "count": count
+        }
+
+        logger.debug(f"Disassembling at 0x{normalized_addr}, count={count}")
+        result = self._request_with_retry("/api/disassemble", data)
+        instructions = result.get("instructions", [])
+
+        # If API returns empty results, try capstone fallback
+        if not instructions:
+            logger.warning(
+                f"x64dbg API returned empty disassembly at 0x{normalized_addr}, "
+                "trying capstone fallback"
+            )
+            instructions = self._disassemble_with_capstone(normalized_addr, count)
+
+        if not instructions:
+            raise RuntimeError(
+                f"Disassembly failed at 0x{normalized_addr}: "
+                "Both x64dbg API and capstone fallback returned empty results. "
+                "This may indicate:\n"
+                "  - Address is not readable (use x64dbg_check_memory first)\n"
+                "  - Address contains invalid instructions\n"
+                "  - Memory is not mapped at this address"
+            )
+
+        return instructions
+
+    def _disassemble_with_capstone(self, address: str, count: int) -> list[dict[str, str]]:
+        """
+        Fallback disassembly using capstone library.
+
+        Reads raw bytes from memory and disassembles locally.
+
+        Args:
+            address: Normalized address (without 0x prefix)
             count: Number of instructions to disassemble
 
         Returns:
             List of instruction dictionaries
         """
-        if address.startswith("0x"):
-            address = address[2:]
+        try:
+            import capstone
+        except ImportError:
+            logger.warning("Capstone library not available for fallback disassembly")
+            return []
 
-        data = {
-            "address": address,
-            "count": count
-        }
+        try:
+            # Read enough bytes for disassembly (estimate ~15 bytes per instruction max)
+            byte_count = count * 15
+            addr_int = int(address, 16)
 
-        result = self._request("/api/disassemble", data)
-        return result.get("instructions", [])
+            # Read memory
+            raw_bytes = self.read_memory(f"0x{address}", byte_count)
+
+            if not raw_bytes:
+                logger.warning(f"Could not read memory at 0x{address}")
+                return []
+
+            # Determine architecture from debugger state
+            # Default to x64 mode
+            md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
+            md.detail = False
+
+            instructions = []
+            for i, instr in enumerate(md.disasm(raw_bytes, addr_int)):
+                if i >= count:
+                    break
+                instructions.append({
+                    "address": f"{instr.address:X}",
+                    "mnemonic": instr.mnemonic,
+                    "operand": instr.op_str,
+                    "bytes": instr.bytes.hex()
+                })
+
+            logger.info(f"Capstone fallback disassembled {len(instructions)} instructions")
+            return instructions
+
+        except Exception as e:
+            logger.error(f"Capstone fallback disassembly failed: {e}")
+            return []
 
     def get_state(self) -> DebuggerState:
         """
@@ -847,21 +1058,36 @@ class X64DbgBridge(Debugger):
         Returns:
             True if successful
 
+        Raises:
+            AddressValidationError: If address is invalid
+            ValueError: If hw_type or hw_size is invalid
+            RuntimeError: If API call fails
+
         Note:
             Requires C++ plugin implementation of /api/breakpoint/hardware
             Uses DR0-DR7 registers (max 4 hardware breakpoints)
         """
-        if address.startswith("0x"):
-            address = address[2:]
+        normalized_addr = self._normalize_address(address)
+
+        # Validate hw_type
+        valid_types = ("execute", "read", "write", "access")
+        if hw_type not in valid_types:
+            raise ValueError(f"Invalid hw_type '{hw_type}'. Must be one of: {valid_types}")
+
+        # Validate hw_size (hardware breakpoints are limited by CPU)
+        valid_sizes = (1, 2, 4, 8)
+        if hw_size not in valid_sizes:
+            raise ValueError(f"Invalid hw_size {hw_size}. Must be one of: {valid_sizes}")
 
         data = {
-            "address": address,
+            "address": normalized_addr,
             "type": hw_type,
             "size": hw_size
         }
 
-        self._request("/api/breakpoint/hardware", data)
-        logger.info(f"Set hardware breakpoint at {address} ({hw_type}, {hw_size} bytes)")
+        logger.debug(f"Setting hardware breakpoint - sending data: {data}")
+        self._request_with_retry("/api/breakpoint/hardware", data)
+        logger.info(f"Set hardware breakpoint at 0x{normalized_addr} ({hw_type}, {hw_size} bytes)")
         return True
 
     def set_register(self, register: str, value: str) -> bool:
@@ -926,33 +1152,125 @@ class X64DbgBridge(Debugger):
             "state": result.get("state", "paused")
         }
 
-    def set_memory_breakpoint(self, address: str, bp_type: str = "access", size: int = 1) -> bool:
+    def set_memory_breakpoint(
+        self,
+        address: str,
+        bp_type: str = "access",
+        size: int = 1,
+        auto_split: bool = True
+    ) -> dict[str, Any]:
         """
         Set memory breakpoint.
+
+        For large ranges (>4096 bytes), automatically splits into multiple
+        breakpoints for reliability, or use page guard breakpoints.
 
         Args:
             address: Address for breakpoint
             bp_type: Type ("access", "read", "write", "execute")
             size: Size in bytes
+            auto_split: Auto-split large ranges into smaller breakpoints (default: True)
 
         Returns:
-            True if successful
+            Dictionary with:
+                - success: bool
+                - breakpoints_set: number of breakpoints created
+                - warning: optional warning message for large ranges
+                - addresses: list of breakpoint addresses if split
+
+        Raises:
+            AddressValidationError: If address is invalid
+            ValueError: If bp_type is invalid
+            RuntimeError: If API call fails
 
         Note:
-            Requires C++ plugin implementation of /api/breakpoint/memory
+            - Hardware memory breakpoints are limited to 1/2/4/8 bytes by CPU
+            - Software memory breakpoints can be larger but may be unreliable
+            - For ranges >4096 bytes, consider using page guard breakpoints instead
         """
-        if address.startswith("0x"):
-            address = address[2:]
+        normalized_addr = self._normalize_address(address)
 
+        # Validate bp_type
+        valid_types = ("access", "read", "write", "execute")
+        if bp_type not in valid_types:
+            raise ValueError(f"Invalid bp_type '{bp_type}'. Must be one of: {valid_types}")
+
+        # Validate size (must be positive)
+        if size <= 0:
+            raise ValueError(f"Invalid size {size}. Must be a positive integer.")
+
+        # Constants for size limits
+        max_reliable_size = 4096  # 4KB - page size
+        chunk_size = 4096  # Split large ranges into page-sized chunks
+
+        result = {
+            "success": True,
+            "breakpoints_set": 0,
+            "warning": None,
+            "addresses": []
+        }
+
+        # Warn about large ranges
+        if size > max_reliable_size:
+            result["warning"] = (
+                f"Large memory breakpoint ({size} bytes) may be unreliable. "
+                f"Memory breakpoints work best on small ranges (<{max_reliable_size} bytes). "
+            )
+
+            if auto_split:
+                result["warning"] += (
+                    f"Auto-splitting into {(size + chunk_size - 1) // chunk_size} chunks."
+                )
+                logger.warning(result["warning"])
+
+                # Split into chunks
+                addr_int = int(normalized_addr, 16)
+                remaining = size
+                chunk_count = 0
+
+                while remaining > 0:
+                    current_chunk = min(remaining, chunk_size)
+                    chunk_addr = f"{addr_int:X}"
+
+                    data = {
+                        "address": chunk_addr,
+                        "type": bp_type,
+                        "size": current_chunk
+                    }
+
+                    logger.debug(f"Setting memory breakpoint chunk - sending data: {data}")
+                    self._request_with_retry("/api/breakpoint/memory", data)
+
+                    result["addresses"].append(f"0x{chunk_addr}")
+                    chunk_count += 1
+                    addr_int += current_chunk
+                    remaining -= current_chunk
+
+                result["breakpoints_set"] = chunk_count
+                logger.info(
+                    f"Set {chunk_count} memory breakpoints covering {size} bytes at 0x{normalized_addr}"
+                )
+                return result
+            else:
+                result["warning"] += (
+                    "Consider using auto_split=True or page guard breakpoints for better reliability."
+                )
+                logger.warning(result["warning"])
+
+        # Set single breakpoint
         data = {
-            "address": address,
+            "address": normalized_addr,
             "type": bp_type,
             "size": size
         }
 
-        self._request("/api/breakpoint/memory", data)
-        logger.info(f"Set memory breakpoint at {address} ({bp_type}, {size} bytes)")
-        return True
+        logger.debug(f"Setting memory breakpoint - sending data: {data}")
+        self._request_with_retry("/api/breakpoint/memory", data)
+
+        result["breakpoints_set"] = 1
+        result["addresses"] = [f"0x{normalized_addr}"]
+        logger.info(f"Set memory breakpoint at 0x{normalized_addr} ({bp_type}, {size} bytes)")
+        return result
 
     def delete_memory_breakpoint(self, address: str) -> bool:
         """
@@ -964,15 +1282,20 @@ class X64DbgBridge(Debugger):
         Returns:
             True if successful
 
+        Raises:
+            AddressValidationError: If address is invalid
+            RuntimeError: If API call fails
+
         Note:
             Requires C++ plugin implementation of /api/breakpoint/memory/delete
         """
-        if address.startswith("0x"):
-            address = address[2:]
+        normalized_addr = self._normalize_address(address)
 
-        data = {"address": address}
-        self._request("/api/breakpoint/memory/delete", data)
-        logger.info(f"Deleted memory breakpoint at {address}")
+        data = {"address": normalized_addr}
+        logger.debug(f"Deleting memory breakpoint - sending data: {data}")
+
+        self._request_with_retry("/api/breakpoint/memory/delete", data)
+        logger.info(f"Deleted memory breakpoint at 0x{normalized_addr}")
         return True
 
     # =========================================================================
@@ -1402,22 +1725,26 @@ class X64DbgBridge(Debugger):
         Returns:
             Dictionary with address and enabled status
 
+        Raises:
+            AddressValidationError: If address is invalid
+            RuntimeError: If API call fails
+
         Example:
             bridge.set_breakpoint("0x401000")
             bridge.toggle_breakpoint("0x401000", enable=False)  # Temporarily disable
             bridge.run()
             bridge.toggle_breakpoint("0x401000", enable=True)   # Re-enable
         """
-        if address.startswith("0x"):
-            address = address[2:]
+        normalized_addr = self._normalize_address(address)
 
         data = {
-            "address": address,
+            "address": normalized_addr,
             "enable": 1 if enable else 0
         }
 
-        result = self._request("/api/breakpoint/toggle", data)
-        logger.info(f"Breakpoint at 0x{address} {'enabled' if enable else 'disabled'}")
+        logger.debug(f"Toggling breakpoint - sending data: {data}")
+        result = self._request_with_retry("/api/breakpoint/toggle", data)
+        logger.info(f"Breakpoint at 0x{normalized_addr} {'enabled' if enable else 'disabled'}")
         return result
 
     def delete_hardware_breakpoint(self, address: str) -> dict[str, Any]:
@@ -1430,17 +1757,22 @@ class X64DbgBridge(Debugger):
         Returns:
             Dictionary with success status
 
+        Raises:
+            AddressValidationError: If address is invalid
+            RuntimeError: If API call fails
+
         Example:
             bridge.set_hardware_breakpoint("0x401000", "execute")
             # ... later ...
             bridge.delete_hardware_breakpoint("0x401000")
         """
-        if address.startswith("0x"):
-            address = address[2:]
+        normalized_addr = self._normalize_address(address)
 
-        data = {"address": address}
-        result = self._request("/api/breakpoint/hardware/delete", data)
-        logger.info(f"Deleted hardware breakpoint at 0x{address}")
+        data = {"address": normalized_addr}
+        logger.debug(f"Deleting hardware breakpoint - sending data: {data}")
+
+        result = self._request_with_retry("/api/breakpoint/hardware/delete", data)
+        logger.info(f"Deleted hardware breakpoint at 0x{normalized_addr}")
         return result
 
     def toggle_hardware_breakpoint(self, address: str, enable: bool = True) -> dict[str, Any]:
@@ -1454,20 +1786,24 @@ class X64DbgBridge(Debugger):
         Returns:
             Dictionary with address and enabled status
 
+        Raises:
+            AddressValidationError: If address is invalid
+            RuntimeError: If API call fails
+
         Example:
             bridge.set_hardware_breakpoint("0x401000", "write", 4)
             bridge.toggle_hardware_breakpoint("0x401000", enable=False)
         """
-        if address.startswith("0x"):
-            address = address[2:]
+        normalized_addr = self._normalize_address(address)
 
         data = {
-            "address": address,
+            "address": normalized_addr,
             "enable": 1 if enable else 0
         }
 
-        result = self._request("/api/breakpoint/hardware/toggle", data)
-        logger.info(f"Hardware breakpoint at 0x{address} {'enabled' if enable else 'disabled'}")
+        logger.debug(f"Toggling hardware breakpoint - sending data: {data}")
+        result = self._request_with_retry("/api/breakpoint/hardware/toggle", data)
+        logger.info(f"Hardware breakpoint at 0x{normalized_addr} {'enabled' if enable else 'disabled'}")
         return result
 
     def toggle_memory_breakpoint(self, address: str, enable: bool = True) -> dict[str, Any]:
@@ -1480,17 +1816,21 @@ class X64DbgBridge(Debugger):
 
         Returns:
             Dictionary with address and enabled status
+
+        Raises:
+            AddressValidationError: If address is invalid
+            RuntimeError: If API call fails
         """
-        if address.startswith("0x"):
-            address = address[2:]
+        normalized_addr = self._normalize_address(address)
 
         data = {
-            "address": address,
+            "address": normalized_addr,
             "enable": 1 if enable else 0
         }
 
-        result = self._request("/api/breakpoint/memory/toggle", data)
-        logger.info(f"Memory breakpoint at 0x{address} {'enabled' if enable else 'disabled'}")
+        logger.debug(f"Toggling memory breakpoint - sending data: {data}")
+        result = self._request_with_retry("/api/breakpoint/memory/toggle", data)
+        logger.info(f"Memory breakpoint at 0x{normalized_addr} {'enabled' if enable else 'disabled'}")
         return result
 
     def list_all_breakpoints(self) -> dict[str, Any]:

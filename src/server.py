@@ -22,6 +22,10 @@ from src.engines.static.ghidra.project_cache import ProjectCache
 from src.engines.static.ghidra.runner import GhidraRunner
 from src.tools.dotnet_tools import register_dotnet_tools
 from src.tools.dynamic_tools import register_dynamic_tools
+from src.tools.reporting import register_reporting_tools
+from src.tools.triage_tools import register_triage_tools
+from src.tools.vt_tools import register_vt_tools
+from src.tools.yara_tools import register_yara_tools
 from src.utils.compatibility import (
     BinaryCompatibilityChecker,
     CompatibilityLevel,
@@ -1977,6 +1981,645 @@ def get_active_session() -> str:
     return result
 
 
+# ============================================================================
+# CRYPTO ANALYSIS TOOLS
+# ============================================================================
+
+@app.tool()
+@log_to_session(analysis_type=AnalysisType.STATIC)
+def detect_crypto_patterns(binary_path: str) -> str:
+    """
+    Detect encryption and encoding patterns in a binary file.
+
+    Analyzes the file for common crypto patterns including:
+    - XOR encryption (single and multi-byte keys)
+    - Base64 encoding
+    - High entropy regions (encrypted/compressed)
+    - Null byte patterns
+
+    Args:
+        binary_path: Path to binary file to analyze
+
+    Returns:
+        Detected patterns with confidence scores and details
+
+    Example output:
+        Crypto Pattern Analysis:
+          File: payload.bin
+          Size: 4096 bytes
+          Entropy: 7.85 bits/byte (high - likely encrypted)
+
+        Detected Patterns:
+          [HIGH] xor_single_byte (confidence: 0.85)
+            Key: 0x41
+            Sample entropy after decryption: 4.2
+
+          [MEDIUM] high_entropy (confidence: 0.75)
+            Entropy: 7.85 bits/byte
+            Likely: encrypted or compressed
+    """
+    try:
+        safe_path = sanitize_binary_path(binary_path)
+
+        from src.utils.crypto_analysis import calculate_entropy
+        from src.utils.crypto_analysis import detect_crypto_patterns as analyze
+
+        path = Path(safe_path)
+        if not path.exists():
+            return f"Error: File not found: {binary_path}"
+
+        data = path.read_bytes()
+        entropy = calculate_entropy(data)
+        patterns = analyze(data)
+
+        # Build output
+        output = [
+            "Crypto Pattern Analysis:",
+            f"  File: {path.name}",
+            f"  Size: {len(data)} bytes",
+            f"  Entropy: {entropy:.2f} bits/byte",
+        ]
+
+        # Entropy interpretation
+        if entropy > 7.5:
+            output.append("  Status: HIGH entropy - likely encrypted or compressed")
+        elif entropy > 6.0:
+            output.append("  Status: MEDIUM entropy - may be obfuscated")
+        else:
+            output.append("  Status: LOW entropy - likely plaintext or structured data")
+
+        output.append("")
+
+        if patterns:
+            output.append("Detected Patterns:")
+            output.append("-" * 50)
+
+            for pattern in patterns:
+                conf = pattern["confidence"]
+                level = "HIGH" if conf > 0.7 else "MEDIUM" if conf > 0.4 else "LOW"
+                output.append(f"  [{level}] {pattern['type']} (confidence: {conf:.2f})")
+
+                for key, value in pattern.get("details", {}).items():
+                    if isinstance(value, float):
+                        output.append(f"    {key}: {value:.2f}")
+                    else:
+                        output.append(f"    {key}: {value}")
+                output.append("")
+        else:
+            output.append("No significant crypto patterns detected.")
+
+        return "\n".join(output)
+
+    except (PathTraversalError, FileSizeError) as e:
+        return safe_error_message("detect_crypto_patterns", e)
+    except Exception as e:
+        logger.error(f"detect_crypto_patterns failed: {e}")
+        return f"Error analyzing file: {e}"
+
+
+@app.tool()
+@log_to_session(analysis_type=AnalysisType.STATIC)
+def analyze_xor_encryption(
+    binary_path: str,
+    min_key_length: int = 1,
+    max_key_length: int = 16,
+    sample_size: int = 10000
+) -> str:
+    """
+    Analyze potential XOR encryption and find likely keys.
+
+    Uses frequency analysis to detect XOR encryption and find
+    the most probable decryption keys.
+
+    Args:
+        binary_path: Path to encrypted file
+        min_key_length: Minimum key length to try (default: 1)
+        max_key_length: Maximum key length to try (default: 16)
+        sample_size: Bytes to analyze (default: 10000)
+
+    Returns:
+        Top XOR key candidates with confidence scores
+
+    Example:
+        analyze_xor_encryption("encrypted.bin", max_key_length=8)
+    """
+    try:
+        safe_path = sanitize_binary_path(binary_path)
+
+        from src.utils.crypto_analysis import analyze_xor
+
+        path = Path(safe_path)
+        if not path.exists():
+            return f"Error: File not found: {binary_path}"
+
+        data = path.read_bytes()[:sample_size]
+
+        candidates = analyze_xor(
+            data,
+            key_length_range=(min_key_length, max_key_length),
+            top_n=5
+        )
+
+        output = [
+            "XOR Encryption Analysis:",
+            f"  File: {path.name}",
+            f"  Sample size: {len(data)} bytes",
+            f"  Key length range: {min_key_length}-{max_key_length}",
+            ""
+        ]
+
+        if candidates:
+            output.append("Top Key Candidates:")
+            output.append("-" * 50)
+
+            for i, candidate in enumerate(candidates, 1):
+                output.append(f"{i}. Key: {candidate['key_hex']}")
+                output.append(f"   Length: {candidate['key_length']} bytes")
+                output.append(f"   Confidence: {candidate['confidence']:.2f}")
+                output.append(f"   Decrypted entropy: {candidate['sample_entropy']:.2f}")
+
+                # Show sample of decrypted text
+                sample = candidate["decrypted_sample"]
+                try:
+                    text_sample = sample.decode('ascii', errors='replace')[:40]
+                    output.append(f"   Sample: \"{text_sample}\"")
+                except Exception:
+                    output.append(f"   Sample: {sample[:20].hex()}")
+                output.append("")
+        else:
+            output.append("No XOR encryption patterns detected.")
+
+        return "\n".join(output)
+
+    except (PathTraversalError, FileSizeError) as e:
+        return safe_error_message("analyze_xor_encryption", e)
+    except Exception as e:
+        logger.error(f"analyze_xor_encryption failed: {e}")
+        return f"Error analyzing file: {e}"
+
+
+@app.tool()
+@log_to_session(analysis_type=AnalysisType.STATIC)
+def decrypt_xor(
+    binary_path: str,
+    key: str,
+    output_path: str | None = None
+) -> str:
+    """
+    Decrypt a file using XOR with the specified key.
+
+    Args:
+        binary_path: Path to encrypted file
+        key: XOR key as hex string (e.g., "41", "DEADBEEF")
+        output_path: Optional path to save decrypted output
+
+    Returns:
+        Decryption result with preview of decrypted content
+
+    Example:
+        decrypt_xor("encrypted.bin", key="DEADBEEF", output_path="decrypted.bin")
+    """
+    try:
+        safe_path = sanitize_binary_path(binary_path)
+
+        from src.utils.crypto_analysis import calculate_entropy, xor_decrypt
+
+        path = Path(safe_path)
+        if not path.exists():
+            return f"Error: File not found: {binary_path}"
+
+        # Parse key
+        try:
+            key_bytes = bytes.fromhex(key.replace("0x", "").replace(" ", ""))
+        except ValueError:
+            return f"Error: Invalid hex key: {key}"
+
+        data = path.read_bytes()
+        decrypted = xor_decrypt(data, key_bytes)
+        entropy = calculate_entropy(decrypted)
+
+        output = [
+            "XOR Decryption:",
+            f"  Input: {path.name} ({len(data)} bytes)",
+            f"  Key: {key_bytes.hex().upper()} ({len(key_bytes)} bytes)",
+            f"  Decrypted entropy: {entropy:.2f} bits/byte",
+            ""
+        ]
+
+        # Check for known file signatures
+        if decrypted[:2] == b'MZ':
+            output.append("  Signature: PE executable (MZ header)")
+        elif decrypted[:4] == b'\x7fELF':
+            output.append("  Signature: ELF executable")
+        elif decrypted[:3] == b'PK\x03':
+            output.append("  Signature: ZIP archive")
+        elif decrypted[:8] == b'\x89PNG\r\n\x1a\n':
+            output.append("  Signature: PNG image")
+
+        # Show preview
+        output.append("")
+        output.append("Decrypted preview (first 64 bytes):")
+        output.append(f"  Hex: {decrypted[:64].hex().upper()}")
+        try:
+            text_preview = decrypted[:64].decode('ascii', errors='replace')
+            output.append(f"  Text: \"{text_preview}\"")
+        except Exception:
+            pass
+
+        # Save if output path specified
+        if output_path:
+            out_path = Path(output_path)
+            out_path.write_bytes(decrypted)
+            output.append("")
+            output.append(f"Saved to: {output_path}")
+
+        return "\n".join(output)
+
+    except (PathTraversalError, FileSizeError) as e:
+        return safe_error_message("decrypt_xor", e)
+    except Exception as e:
+        logger.error(f"decrypt_xor failed: {e}")
+        return f"Error decrypting file: {e}"
+
+
+@app.tool()
+@log_to_session(analysis_type=AnalysisType.STATIC)
+def decode_base64_file(
+    binary_path: str,
+    output_path: str | None = None
+) -> str:
+    """
+    Decode a Base64 encoded file.
+
+    Args:
+        binary_path: Path to Base64 encoded file
+        output_path: Optional path to save decoded output
+
+    Returns:
+        Decoding result with preview of decoded content
+
+    Example:
+        decode_base64_file("encoded.txt", output_path="decoded.bin")
+    """
+    try:
+        safe_path = sanitize_binary_path(binary_path)
+
+        import base64
+
+        from src.utils.crypto_analysis import calculate_entropy
+
+        path = Path(safe_path)
+        if not path.exists():
+            return f"Error: File not found: {binary_path}"
+
+        data = path.read_bytes()
+
+        # Try to decode
+        try:
+            text = data.decode('ascii', errors='ignore')
+            text = ''.join(text.split())  # Remove whitespace
+            decoded = base64.b64decode(text)
+        except Exception as e:
+            return f"Error: Failed to decode Base64: {e}"
+
+        entropy = calculate_entropy(decoded)
+
+        output = [
+            "Base64 Decoding:",
+            f"  Input: {path.name} ({len(data)} bytes)",
+            f"  Decoded: {len(decoded)} bytes",
+            f"  Decoded entropy: {entropy:.2f} bits/byte",
+            ""
+        ]
+
+        # Check for known file signatures
+        if decoded[:2] == b'MZ':
+            output.append("  Signature: PE executable (MZ header)")
+        elif decoded[:4] == b'\x7fELF':
+            output.append("  Signature: ELF executable")
+        elif decoded[:3] == b'PK\x03':
+            output.append("  Signature: ZIP archive")
+
+        # Show preview
+        output.append("")
+        output.append("Decoded preview (first 64 bytes):")
+        output.append(f"  Hex: {decoded[:64].hex().upper()}")
+        try:
+            text_preview = decoded[:64].decode('ascii', errors='replace')
+            output.append(f"  Text: \"{text_preview}\"")
+        except Exception:
+            pass
+
+        # Save if output path specified
+        if output_path:
+            out_path = Path(output_path)
+            out_path.write_bytes(decoded)
+            output.append("")
+            output.append(f"Saved to: {output_path}")
+
+        return "\n".join(output)
+
+    except (PathTraversalError, FileSizeError) as e:
+        return safe_error_message("decode_base64_file", e)
+    except Exception as e:
+        logger.error(f"decode_base64_file failed: {e}")
+        return f"Error decoding file: {e}"
+
+
+# ============================================================================
+# PYTHON BYTECODE ANALYSIS TOOLS
+# ============================================================================
+
+
+@app.tool()
+@log_to_session(analysis_type=AnalysisType.STATIC)
+def detect_python_packer(binary_path: str) -> str:
+    """
+    Detect if a binary is packed with a Python packer.
+
+    Detects py2exe, PyInstaller, cx_Freeze, and Nuitka packed executables.
+    Provides confidence scores and indicators found.
+
+    Args:
+        binary_path: Path to the binary file to analyze
+
+    Returns:
+        Detection result with packer type, confidence, and indicators
+
+    Example:
+        detect_python_packer("suspicious.exe")
+        # Returns: Packer: pyinstaller, Confidence: 95%, Python: 3.11
+    """
+    try:
+        binary_path = sanitize_binary_path(binary_path)
+
+        from src.engines.static.python.analyzer import PythonPackerAnalyzer
+        analyzer = PythonPackerAnalyzer()
+        result = analyzer.detect_packer(binary_path)
+
+        output = []
+        output.append("=" * 60)
+        output.append("PYTHON PACKER DETECTION")
+        output.append("=" * 60)
+        output.append(f"File: {binary_path}")
+        output.append("")
+
+        if result["is_python_packed"]:
+            output.append(f"✓ Python packer detected: {result['packer'].upper()}")
+            output.append(f"  Confidence: {result['confidence'] * 100:.0f}%")
+
+            if result["python_version"]:
+                output.append(f"  Python Version: {result['python_version']}")
+
+            output.append("")
+            output.append("Indicators Found:")
+            for indicator in result["indicators"]:
+                output.append(f"  • {indicator}")
+
+            if result["resources"]:
+                output.append("")
+                output.append("Embedded Resources:")
+                for res in result["resources"][:10]:
+                    output.append(f"  • {res}")
+                if len(result["resources"]) > 10:
+                    output.append(f"  ... and {len(result['resources']) - 10} more")
+        else:
+            output.append("✗ No Python packer detected")
+            if result["indicators"]:
+                output.append("")
+                output.append("Notes:")
+                for indicator in result["indicators"]:
+                    output.append(f"  • {indicator}")
+
+        return "\n".join(output)
+
+    except (PathTraversalError, FileSizeError) as e:
+        return safe_error_message("detect_python_packer", e)
+    except FileNotFoundError as e:
+        return f"File not found: {e}"
+    except Exception as e:
+        logger.error(f"detect_python_packer failed: {e}")
+        return f"Error detecting packer: {e}"
+
+
+@app.tool()
+@log_to_session(analysis_type=AnalysisType.STATIC)
+def extract_python_packed(
+    binary_path: str,
+    output_dir: str,
+    packer_type: str = "auto"
+) -> str:
+    """
+    Extract files from a Python packed executable.
+
+    Automatically detects the packer type or uses the specified one.
+    Extracts embedded .pyc files, libraries, and resources.
+
+    Args:
+        binary_path: Path to the packed executable
+        output_dir: Directory to extract files to
+        packer_type: Packer type (auto, pyinstaller, py2exe) - default: auto
+
+    Returns:
+        Extraction result with list of extracted files
+
+    Example:
+        extract_python_packed("packed.exe", "/tmp/extracted/")
+        extract_python_packed("packed.exe", "/tmp/extracted/", packer_type="py2exe")
+    """
+    try:
+        binary_path = sanitize_binary_path(binary_path)
+
+        from src.engines.static.python.analyzer import PythonPackerAnalyzer
+        analyzer = PythonPackerAnalyzer()
+
+        # Auto-detect packer type if needed
+        if packer_type == "auto":
+            detection = analyzer.detect_packer(binary_path)
+            if not detection["is_python_packed"]:
+                return "No Python packer detected in this binary"
+            packer_type = detection["packer"]
+
+        output = []
+        output.append("=" * 60)
+        output.append("PYTHON PACKED EXTRACTION")
+        output.append("=" * 60)
+        output.append(f"File: {binary_path}")
+        output.append(f"Packer: {packer_type}")
+        output.append(f"Output: {output_dir}")
+        output.append("")
+
+        # Extract based on packer type
+        if packer_type == "pyinstaller":
+            result = analyzer.extract_pyinstaller(binary_path, output_dir)
+        elif packer_type == "py2exe":
+            result = analyzer.extract_py2exe(binary_path, output_dir)
+        else:
+            return f"Unsupported packer type for extraction: {packer_type}"
+
+        if result["success"]:
+            output.append(f"✓ Successfully extracted {len(result['extracted_files'])} files")
+            output.append("")
+            output.append("Extracted Files:")
+            for f in result["extracted_files"][:20]:
+                output.append(f"  • {f}")
+            if len(result["extracted_files"]) > 20:
+                output.append(f"  ... and {len(result['extracted_files']) - 20} more")
+        else:
+            output.append("✗ Extraction failed or no files extracted")
+
+        if result["errors"]:
+            output.append("")
+            output.append("Errors:")
+            for err in result["errors"][:10]:
+                output.append(f"  • {err}")
+
+        return "\n".join(output)
+
+    except (PathTraversalError, FileSizeError) as e:
+        return safe_error_message("extract_python_packed", e)
+    except FileNotFoundError as e:
+        return f"File not found: {e}"
+    except Exception as e:
+        logger.error(f"extract_python_packed failed: {e}")
+        return f"Error extracting packed binary: {e}"
+
+
+@app.tool()
+@log_to_session(analysis_type=AnalysisType.STATIC)
+def analyze_pyc_file(pyc_path: str) -> str:
+    """
+    Analyze a .pyc (compiled Python bytecode) file.
+
+    Extracts Python version, magic number, timestamp, and metadata.
+    Useful for understanding what Python version compiled the bytecode.
+
+    Args:
+        pyc_path: Path to the .pyc file
+
+    Returns:
+        Analysis result with version info and metadata
+
+    Example:
+        analyze_pyc_file("extracted/script.pyc")
+        # Returns: Python 3.11, magic 0x7B0D, compiled 2024-01-15
+    """
+    try:
+        pyc_path = sanitize_binary_path(pyc_path)
+
+        from src.engines.static.python.analyzer import PythonPackerAnalyzer
+        analyzer = PythonPackerAnalyzer()
+        result = analyzer.analyze_pyc(pyc_path)
+
+        output = []
+        output.append("=" * 60)
+        output.append("PYC FILE ANALYSIS")
+        output.append("=" * 60)
+        output.append(f"File: {result['file']}")
+        output.append(f"Size: {result['size']} bytes")
+        output.append("")
+
+        if result["is_valid"]:
+            output.append("Header Information:")
+            output.append(f"  Magic Number: {result['magic_number']}")
+            output.append(f"  Python Version: {result['python_version']}")
+
+            if result["timestamp"]:
+                output.append(f"  Compiled: {result['timestamp']}")
+
+            if result["source_size"]:
+                output.append(f"  Source Size: {result['source_size']} bytes")
+
+            output.append("")
+            output.append("✓ Valid .pyc file")
+        else:
+            output.append("✗ Invalid or unrecognized .pyc format")
+            if result.get("error"):
+                output.append(f"  Error: {result['error']}")
+
+        return "\n".join(output)
+
+    except (PathTraversalError, FileSizeError) as e:
+        return safe_error_message("analyze_pyc_file", e)
+    except FileNotFoundError as e:
+        return f"File not found: {e}"
+    except Exception as e:
+        logger.error(f"analyze_pyc_file failed: {e}")
+        return f"Error analyzing .pyc file: {e}"
+
+
+@app.tool()
+@log_to_session(analysis_type=AnalysisType.STATIC)
+def list_python_archive_contents(binary_path: str) -> str:
+    """
+    List contents of a Python packed archive.
+
+    Shows all files embedded in a py2exe or PyInstaller packed executable,
+    including .pyc files, DLLs, and other resources.
+
+    Args:
+        binary_path: Path to the packed executable
+
+    Returns:
+        List of embedded files with sizes
+
+    Example:
+        list_python_archive_contents("packed.exe")
+        # Returns: 15 files including main.pyc, library.zip, etc.
+    """
+    try:
+        binary_path = sanitize_binary_path(binary_path)
+
+        from src.engines.static.python.analyzer import PythonPackerAnalyzer
+        analyzer = PythonPackerAnalyzer()
+        result = analyzer.list_archive_contents(binary_path)
+
+        output = []
+        output.append("=" * 60)
+        output.append("PYTHON ARCHIVE CONTENTS")
+        output.append("=" * 60)
+        output.append(f"File: {binary_path}")
+
+        if result["packer"]:
+            output.append(f"Packer: {result['packer']}")
+
+        output.append(f"Total Files: {result['total_files']}")
+        output.append("")
+
+        if result["contents"]:
+            # Group by type
+            pyc_files = [f for f in result["contents"] if f["is_pyc"]]
+            other_files = [f for f in result["contents"] if not f["is_pyc"]]
+
+            if pyc_files:
+                output.append(f"Python Bytecode Files ({len(pyc_files)}):")
+                for f in pyc_files[:15]:
+                    ratio = f["compressed_size"] / f["size"] if f["size"] > 0 else 1
+                    output.append(f"  • {f['name']:<40} {f['size']:>8} bytes ({ratio:.0%} compressed)")
+                if len(pyc_files) > 15:
+                    output.append(f"  ... and {len(pyc_files) - 15} more .pyc files")
+
+            if other_files:
+                output.append("")
+                output.append(f"Other Files ({len(other_files)}):")
+                for f in other_files[:15]:
+                    output.append(f"  • {f['name']:<40} {f['size']:>8} bytes")
+                if len(other_files) > 15:
+                    output.append(f"  ... and {len(other_files) - 15} more files")
+        else:
+            output.append("No embedded archive found or archive could not be read")
+
+        return "\n".join(output)
+
+    except (PathTraversalError, FileSizeError) as e:
+        return safe_error_message("list_python_archive_contents", e)
+    except FileNotFoundError as e:
+        return f"File not found: {e}"
+    except Exception as e:
+        logger.error(f"list_python_archive_contents failed: {e}")
+        return f"Error listing archive contents: {e}"
+
+
 def main():
     """Run the MCP server."""
     logger.info("Starting Binary MCP Server...")
@@ -1989,7 +2632,19 @@ def main():
     # Register dynamic analysis tools (with session logging)
     register_dynamic_tools(app, session_manager)
 
-    logger.info("Registered static (Ghidra + .NET) + dynamic analysis tools")
+    # Register VirusTotal tools
+    register_vt_tools(app, session_manager)
+
+    # Register triage tools
+    register_triage_tools(app, session_manager)
+
+    # Register reporting tools
+    register_reporting_tools(app, session_manager)
+
+    # Register Yara tools
+    register_yara_tools(app, session_manager)
+
+    logger.info("Registered all analysis tools (static, dynamic, VT, triage, reporting, Yara)")
     logger.info(f"Session Directory: {session_manager.store_dir}")
 
     # Run the FastMCP server (handles stdio automatically)

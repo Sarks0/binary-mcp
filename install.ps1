@@ -678,7 +678,9 @@ function Configure-ClaudeDesktop {
 
     try {
         if (Test-Path $claudeConfigFile) {
-            $config = Get-Content $claudeConfigFile -Raw | ConvertFrom-Json
+            # Read with UTF-8 encoding to properly handle any existing content
+            # Note: -Encoding UTF8 in PS 5.1 handles both with and without BOM
+            $config = Get-Content $claudeConfigFile -Raw -Encoding UTF8 | ConvertFrom-Json
             Copy-Item $claudeConfigFile "$claudeConfigFile.backup" -Force
             Write-Info "Backup saved to: $claudeConfigFile.backup"
         } else {
@@ -718,7 +720,9 @@ function Configure-ClaudeCode {
 
     try {
         if (Test-Path $claudeCodeConfigFile) {
-            $config = Get-Content $claudeCodeConfigFile -Raw | ConvertFrom-Json
+            # Read with UTF-8 encoding to properly handle any existing content
+            # Note: -Encoding UTF8 in PS 5.1 handles both with and without BOM
+            $config = Get-Content $claudeCodeConfigFile -Raw -Encoding UTF8 | ConvertFrom-Json
             Copy-Item $claudeCodeConfigFile "$claudeCodeConfigFile.backup" -Force
             Write-Info "Backup saved to: $claudeCodeConfigFile.backup"
         } else {

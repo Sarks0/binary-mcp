@@ -65,9 +65,10 @@ bool LoadAuthToken() {
 
 // Validate Authorization header
 bool ValidateAuthHeader(const std::string& request) {
-    // If no token configured, skip validation (for backwards compatibility)
+    // SECURITY: Require authentication - fail closed if no token configured
     if (g_authToken.empty()) {
-        return true;
+        Log("Authentication required but no token configured - rejecting request");
+        return false;
     }
 
     // Find Authorization header
@@ -512,10 +513,10 @@ bool StartHTTPServer(int port) {
     u_long mode = 1;
     ioctlsocket(listenSocket, FIONBIO, &mode);
 
-    // Bind to port
+    // Bind to localhost only for security (prevents network exposure)
     sockaddr_in serverAddr = {};
     serverAddr.sin_family = AF_INET;
-    serverAddr.sin_addr.s_addr = INADDR_ANY;
+    serverAddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);  // 127.0.0.1 only
     serverAddr.sin_port = htons(port);
 
     if (bind(listenSocket, (sockaddr*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR) {
@@ -629,10 +630,13 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Load authentication token
+    // Load authentication token - REQUIRED for security
     if (!LoadAuthToken()) {
-        Log("Warning: Could not load auth token - authentication disabled");
-        Log("This is insecure! Make sure the x64dbg plugin is loaded.");
+        Log("ERROR: Could not load auth token - refusing to start without authentication");
+        Log("Make sure the x64dbg plugin is loaded and has generated the token file.");
+        g_pipeClient.Disconnect();
+        WSACleanup();
+        return 1;
     }
 
     // Start HTTP server

@@ -17,7 +17,57 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from src.utils.security import safe_regex_compile
+
 logger = logging.getLogger(__name__)
+
+# Valid .NET type name pattern:
+# - Letters, digits, underscores
+# - Dots (.) for namespaces
+# - Angle brackets (<>) for generics
+# - Commas (,) for generic parameters
+# - Backticks (`) for arity indicators
+# - Square brackets ([]) for arrays
+# - Plus (+) for nested types
+# - Spaces (limited, in generic params)
+_DOTNET_TYPE_NAME_PATTERN = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_.<>\[\],`+\s]*$')
+
+
+def validate_dotnet_type_name(type_name: str) -> str:
+    """
+    Validate a .NET type name to prevent command injection.
+
+    Args:
+        type_name: Type name to validate
+
+    Returns:
+        Validated type name
+
+    Raises:
+        ValueError: If type name contains invalid characters
+    """
+    if not type_name or not isinstance(type_name, str):
+        raise ValueError("Type name must be a non-empty string")
+
+    # Limit length to prevent buffer issues
+    if len(type_name) > 500:
+        raise ValueError("Type name too long (max 500 characters)")
+
+    # Check for shell metacharacters that could be dangerous
+    dangerous_chars = ['$', '`', '|', ';', '&', '\n', '\r', '\x00']
+    for char in dangerous_chars:
+        if char in type_name:
+            raise ValueError(f"Type name contains invalid character: {repr(char)}")
+
+    # Validate against pattern
+    if not _DOTNET_TYPE_NAME_PATTERN.match(type_name):
+        raise ValueError(
+            f"Invalid .NET type name: {type_name!r}. "
+            "Type names can only contain letters, digits, underscores, dots, "
+            "angle brackets, square brackets, commas, backticks, plus signs, and spaces."
+        )
+
+    return type_name
 
 
 @dataclass
@@ -558,11 +608,14 @@ class ILSpyRunner:
                 "ILSpyCmd not found. Install with: dotnet tool install -g ilspycmd"
             )
 
-        logger.info(f"Decompiling type {type_name} from {assembly_path.name}")
+        # Validate type name to prevent injection
+        validated_type_name = validate_dotnet_type_name(type_name)
+
+        logger.info(f"Decompiling type {validated_type_name} from {assembly_path.name}")
 
         try:
             result = subprocess.run(
-                [ilspycmd, str(assembly_path), "-t", type_name],
+                [ilspycmd, str(assembly_path), "-t", validated_type_name],
                 capture_output=True,
                 text=True,
                 timeout=60
@@ -616,7 +669,9 @@ class ILSpyRunner:
             # Use -il flag for IL disassembly (single dash, not double)
             cmd = [ilspycmd, "-il", str(assembly_path)]
             if type_name:
-                cmd.extend(["-t", type_name])
+                # Validate type name to prevent injection
+                validated_type_name = validate_dotnet_type_name(type_name)
+                cmd.extend(["-t", validated_type_name])
 
             result = subprocess.run(
                 cmd,
@@ -653,10 +708,8 @@ class ILSpyRunner:
         """
         assembly_info = self.list_types(assembly_path)
 
-        try:
-            regex = re.compile(pattern, re.IGNORECASE)
-        except re.error as e:
-            raise ValueError(f"Invalid regex pattern: {e}")
+        # Use safe_regex_compile to prevent ReDoS attacks
+        regex = safe_regex_compile(pattern, max_length=200)
 
         matches = [
             t for t in assembly_info.types

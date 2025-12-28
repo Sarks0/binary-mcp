@@ -2,7 +2,15 @@
 #include <stdlib.h>
 #include <string.h>
 
-// This program demonstrates features that binary analysis can detect
+/*
+ * TEST PROGRAM FOR BINARY ANALYSIS
+ *
+ * This program contains intentionally fake/dummy strings and patterns
+ * to test binary analysis detection capabilities. All credentials,
+ * URLs, and IP addresses are fictional and for testing purposes ONLY.
+ *
+ * DO NOT use any patterns from this file in production code.
+ */
 
 void print_banner() {
     printf("=================================\n");
@@ -11,9 +19,10 @@ void print_banner() {
 }
 
 void string_operations() {
-    const char* secret = "S3cr3tP@ssw0rd";
-    const char* url = "https://example.com/api/endpoint";
-    const char* ip = "192.168.1.100";
+    // FAKE TEST DATA - intentionally detectable patterns for analysis testing
+    const char* secret = "FAKE_TEST_CREDENTIAL_DO_NOT_USE";
+    const char* url = "https://test.example.invalid/api/endpoint";
+    const char* ip = "192.0.2.1";  // TEST-NET-1 reserved for documentation
 
     printf("Processing data...\n");
     printf("Server: %s\n", ip);

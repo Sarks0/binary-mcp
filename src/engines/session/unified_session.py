@@ -17,6 +17,8 @@ import uuid
 from enum import Enum
 from pathlib import Path
 
+from src.utils.security import safe_regex_compile
+
 logger = logging.getLogger(__name__)
 
 
@@ -583,7 +585,6 @@ class UnifiedSessionManager:
         Returns:
             List of metadata dicts sorted by update time (newest first)
         """
-        import re
         sessions = []
 
         for meta_file in self.store_dir.glob("*.meta.json"):
@@ -596,8 +597,13 @@ class UnifiedSessionManager:
                     continue
 
                 if binary_name_filter:
-                    pattern = re.compile(binary_name_filter, re.IGNORECASE)
-                    if not pattern.search(metadata.get("binary_name", "")):
+                    try:
+                        pattern = safe_regex_compile(binary_name_filter, max_length=200)
+                        if not pattern.search(metadata.get("binary_name", "")):
+                            continue
+                    except ValueError:
+                        # Invalid regex pattern - skip this filter
+                        logger.warning(f"Invalid binary_name_filter pattern: {binary_name_filter}")
                         continue
 
                 if analysis_type_filter:

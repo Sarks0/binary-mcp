@@ -694,7 +694,10 @@ function Configure-ClaudeDesktop {
             args = @("--directory", $InstallDir, "run", "python", "-m", "src.server")
         } -Force
 
-        $config | ConvertTo-Json -Depth 10 | Set-Content $claudeConfigFile -Encoding UTF8
+        # Write JSON with UTF-8 encoding WITHOUT BOM (required for Claude Desktop compatibility)
+        # Note: PowerShell 5.1's -Encoding UTF8 adds BOM, so we use .NET directly
+        $jsonContent = $config | ConvertTo-Json -Depth 10
+        [System.IO.File]::WriteAllText($claudeConfigFile, $jsonContent, [System.Text.UTF8Encoding]::new($false))
         Write-Success "Claude Desktop configured"
         return $true
     } catch {
@@ -731,7 +734,10 @@ function Configure-ClaudeCode {
             args = @("--directory", $InstallDir, "run", "python", "-m", "src.server")
         } -Force
 
-        $config | ConvertTo-Json -Depth 10 | Set-Content $claudeCodeConfigFile -Encoding UTF8
+        # Write JSON with UTF-8 encoding WITHOUT BOM (required for compatibility)
+        # Note: PowerShell 5.1's -Encoding UTF8 adds BOM, so we use .NET directly
+        $jsonContent = $config | ConvertTo-Json -Depth 10
+        [System.IO.File]::WriteAllText($claudeCodeConfigFile, $jsonContent, [System.Text.UTF8Encoding]::new($false))
         Write-Success "Claude Code configured"
         return $true
     } catch {

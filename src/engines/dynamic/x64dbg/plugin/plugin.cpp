@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cctype>
 #include <wincrypt.h>  // For CryptGenRandom
+#include <sddl.h>      // For ConvertStringSecurityDescriptorToSecurityDescriptor
 
 // x64dbg SDK headers
 #include "pluginsdk/_plugins.h"
@@ -4259,24 +4260,36 @@ void pluginSetup() {
 
         // Create security descriptor that only allows current user access
         SECURITY_ATTRIBUTES sa = {};
-        SECURITY_DESCRIPTOR sd = {};
+        PSECURITY_DESCRIPTOR pSD = nullptr;
 
-        if (InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION)) {
-            // Set NULL DACL temporarily (we should use proper ACLs in production)
-            // TODO: Implement proper ACL with only current user access
-            if (SetSecurityDescriptorDacl(&sd, TRUE, nullptr, FALSE)) {
-                sa.nLength = sizeof(SECURITY_ATTRIBUTES);
-                sa.lpSecurityDescriptor = &sd;
-                sa.bInheritHandle = FALSE;
-            }
+        // Use ConvertStringSecurityDescriptorToSecurityDescriptor to create
+        // a DACL that grants full access only to the current user (CURRENT_USER)
+        // SDDL: D:P(A;;FA;;;CU) means:
+        //   D:P - DACL that is protected (no inheritance)
+        //   A - Allow ACE
+        //   FA - File All access
+        //   CU - Creator/Current User
+        const char* sddl = "D:P(A;;FA;;;CU)";
+
+        if (ConvertStringSecurityDescriptorToSecurityDescriptorA(
+                sddl,
+                SDDL_REVISION_1,
+                &pSD,
+                nullptr)) {
+            sa.nLength = sizeof(SECURITY_ATTRIBUTES);
+            sa.lpSecurityDescriptor = pSD;
+            sa.bInheritHandle = FALSE;
+        } else {
+            LogError("Failed to create security descriptor: %d", GetLastError());
+            // Fall back to default security (less secure but functional)
         }
 
-        // Create file with restrictive permissions (removed DELETE_ON_CLOSE for now)
+        // Create file with restrictive permissions
         HANDLE hFile = CreateFileA(
             tokenPath,
             GENERIC_WRITE,
             FILE_SHARE_READ,  // Allow reading while we have it open
-            &sa,
+            pSD ? &sa : nullptr,  // Use secure SA if available
             CREATE_ALWAYS,
             FILE_ATTRIBUTE_TEMPORARY,  // Windows hint for temp file
             nullptr
@@ -4292,6 +4305,11 @@ void pluginSetup() {
             CloseHandle(hFile);
         } else {
             LogError("Failed to create auth token file: %d", GetLastError());
+        }
+
+        // Clean up security descriptor
+        if (pSD) {
+            LocalFree(pSD);
         }
     }
 

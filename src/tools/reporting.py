@@ -12,7 +12,12 @@ import logging
 from datetime import datetime
 from pathlib import Path
 
+from src.utils.security import PathTraversalError, sanitize_output_path
+
 logger = logging.getLogger(__name__)
+
+# Allowed output directory for reports
+REPORTS_OUTPUT_DIR = Path.home() / ".binary_mcp_output" / "reports"
 
 # MITRE ATT&CK technique mappings for common behaviors
 MITRE_MAPPINGS = {
@@ -401,11 +406,16 @@ def register_reporting_tools(app, session_manager):
 
             # Save to file if requested
             if output_path:
-                path = Path(output_path)
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(report)
-
-                return f"Report saved to: {output_path}\n\n" + report[:500] + "\n...\n(truncated)"
+                try:
+                    # Ensure output directory exists
+                    REPORTS_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+                    # Validate output path to prevent directory traversal
+                    safe_path = sanitize_output_path(Path(output_path), REPORTS_OUTPUT_DIR)
+                    safe_path.parent.mkdir(parents=True, exist_ok=True)
+                    safe_path.write_text(report)
+                    return f"Report saved to: {safe_path}\n\n" + report[:500] + "\n...\n(truncated)"
+                except PathTraversalError:
+                    return f"Error: Output path must be within {REPORTS_OUTPUT_DIR}"
 
             return report
 
@@ -501,10 +511,16 @@ def register_reporting_tools(app, session_manager):
 
             # Save if requested
             if output_path:
-                path = Path(output_path)
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(output)
-                return f"IOCs exported to: {output_path}\n\nTotal IOCs: {len(all_iocs)}"
+                try:
+                    # Ensure output directory exists
+                    REPORTS_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+                    # Validate output path to prevent directory traversal
+                    safe_path = sanitize_output_path(Path(output_path), REPORTS_OUTPUT_DIR)
+                    safe_path.parent.mkdir(parents=True, exist_ok=True)
+                    safe_path.write_text(output)
+                    return f"IOCs exported to: {safe_path}\n\nTotal IOCs: {len(all_iocs)}"
+                except PathTraversalError:
+                    return f"Error: Output path must be within {REPORTS_OUTPUT_DIR}"
 
             return output
 

@@ -38,8 +38,12 @@ from src.utils.security import (
     safe_error_message,
     safe_regex_compile,
     sanitize_binary_path,
+    sanitize_output_path,
     validate_numeric_range,
 )
+
+# Allowed output directory for decrypted/decoded files
+CRYPTO_OUTPUT_DIR = Path.home() / ".binary_mcp_output" / "crypto"
 
 # Configure logging
 logging.basicConfig(
@@ -447,14 +451,20 @@ def get_imports(
         context = get_analysis_context(binary_path)
         imports = context.get("imports", [])
 
-        # Apply filters
+        # Apply filters (using safe_regex_compile to prevent ReDoS)
         if filter_library:
-            pattern = re.compile(filter_library, re.IGNORECASE)
-            imports = [i for i in imports if pattern.search(i.get('library', ''))]
+            try:
+                pattern = safe_regex_compile(filter_library, max_length=200)
+                imports = [i for i in imports if pattern.search(i.get('library', ''))]
+            except ValueError as e:
+                return f"Error: Invalid filter_library pattern: {e}"
 
         if filter_function:
-            pattern = re.compile(filter_function, re.IGNORECASE)
-            imports = [i for i in imports if pattern.search(i.get('name', ''))]
+            try:
+                pattern = safe_regex_compile(filter_function, max_length=200)
+                imports = [i for i in imports if pattern.search(i.get('name', ''))]
+            except ValueError as e:
+                return f"Error: Invalid filter_function pattern: {e}"
 
         # Group by library
         by_library = {}
@@ -2228,10 +2238,18 @@ def decrypt_xor(
 
         # Save if output path specified
         if output_path:
-            out_path = Path(output_path)
-            out_path.write_bytes(decrypted)
-            output.append("")
-            output.append(f"Saved to: {output_path}")
+            try:
+                # Ensure output directory exists
+                CRYPTO_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+                # Validate output path to prevent directory traversal
+                safe_out_path = sanitize_output_path(Path(output_path), CRYPTO_OUTPUT_DIR)
+                safe_out_path.parent.mkdir(parents=True, exist_ok=True)
+                safe_out_path.write_bytes(decrypted)
+                output.append("")
+                output.append(f"Saved to: {safe_out_path}")
+            except PathTraversalError:
+                output.append("")
+                output.append(f"Error: Output path must be within {CRYPTO_OUTPUT_DIR}")
 
         return "\n".join(output)
 
@@ -2312,10 +2330,18 @@ def decode_base64_file(
 
         # Save if output path specified
         if output_path:
-            out_path = Path(output_path)
-            out_path.write_bytes(decoded)
-            output.append("")
-            output.append(f"Saved to: {output_path}")
+            try:
+                # Ensure output directory exists
+                CRYPTO_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+                # Validate output path to prevent directory traversal
+                safe_out_path = sanitize_output_path(Path(output_path), CRYPTO_OUTPUT_DIR)
+                safe_out_path.parent.mkdir(parents=True, exist_ok=True)
+                safe_out_path.write_bytes(decoded)
+                output.append("")
+                output.append(f"Saved to: {safe_out_path}")
+            except PathTraversalError:
+                output.append("")
+                output.append(f"Error: Output path must be within {CRYPTO_OUTPUT_DIR}")
 
         return "\n".join(output)
 

@@ -14,7 +14,12 @@ import re
 from datetime import datetime
 from pathlib import Path
 
+from src.utils.security import PathTraversalError, sanitize_output_path
+
 logger = logging.getLogger(__name__)
+
+# Allowed output directory for Yara rules
+YARA_OUTPUT_DIR = Path.home() / ".binary_mcp_output" / "yara"
 
 
 def sanitize_rule_name(name: str) -> str:
@@ -338,10 +343,16 @@ def register_yara_tools(app, session_manager):
 
             # Save if requested
             if output_path:
-                path = Path(output_path)
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(rule)
-                return f"Yara rule saved to: {output_path}\n\n{rule}"
+                try:
+                    # Ensure output directory exists
+                    YARA_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+                    # Validate output path to prevent directory traversal
+                    safe_path = sanitize_output_path(Path(output_path), YARA_OUTPUT_DIR)
+                    safe_path.parent.mkdir(parents=True, exist_ok=True)
+                    safe_path.write_text(rule)
+                    return f"Yara rule saved to: {safe_path}\n\n{rule}"
+                except PathTraversalError:
+                    return f"Error: Output path must be within {YARA_OUTPUT_DIR}"
 
             return rule
 
@@ -435,10 +446,16 @@ def register_yara_tools(app, session_manager):
 
             # Save if requested
             if output_path:
-                out = Path(output_path)
-                out.parent.mkdir(parents=True, exist_ok=True)
-                out.write_text(rule)
-                return f"Yara rule saved to: {output_path}\n\n{rule}"
+                try:
+                    # Ensure output directory exists
+                    YARA_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+                    # Validate output path to prevent directory traversal
+                    safe_path = sanitize_output_path(Path(output_path), YARA_OUTPUT_DIR)
+                    safe_path.parent.mkdir(parents=True, exist_ok=True)
+                    safe_path.write_text(rule)
+                    return f"Yara rule saved to: {safe_path}\n\n{rule}"
+                except PathTraversalError:
+                    return f"Error: Output path must be within {YARA_OUTPUT_DIR}"
 
             return rule
 

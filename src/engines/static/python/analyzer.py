@@ -16,6 +16,56 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
+def _safe_extract_path(output_dir: Path, entry_name: str) -> Path:
+    """
+    Safely resolve archive entry path preventing directory traversal (Zip Slip).
+
+    Args:
+        output_dir: Base output directory
+        entry_name: Archive entry name/path
+
+    Returns:
+        Safe path within output_dir
+
+    Raises:
+        ValueError: If path traversal attempt detected
+    """
+    # Normalize the entry name - handle both forward and back slashes
+    # Remove any null bytes that could be used for truncation attacks
+    safe_name = entry_name.replace("\x00", "").replace("\\", "/")
+
+    # Remove leading slashes and handle .. components
+    parts = []
+    for part in safe_name.split("/"):
+        # Skip empty parts and current directory references
+        if not part or part == ".":
+            continue
+        # Skip parent directory references entirely
+        if part == "..":
+            continue
+        # Skip parts that are only dots (potential bypass attempts)
+        if part.strip(".") == "":
+            continue
+        parts.append(part)
+
+    if not parts:
+        # Entry name resolved to empty - use a safe default
+        safe_name = "extracted_file"
+    else:
+        safe_name = "/".join(parts)
+
+    # Construct and resolve the target path
+    target = (output_dir / safe_name).resolve()
+
+    # Verify target is within output directory
+    try:
+        target.relative_to(output_dir.resolve())
+    except ValueError:
+        raise ValueError(f"Path traversal attempt detected: {entry_name}")
+
+    return target
+
+
 class PythonPackerAnalyzer:
     """Analyzes and extracts Python packed executables."""
 
@@ -255,15 +305,20 @@ class PythonPackerAnalyzer:
             for i, offset in enumerate(zip_offsets[:5]):  # Limit to 5 archives
                 try:
                     import io
+                    archive_out_dir = out_path / f"archive_{i}"
+                    archive_out_dir.mkdir(parents=True, exist_ok=True)
+
                     with zipfile.ZipFile(io.BytesIO(archive_data[offset:])) as zf:
                         for name in zf.namelist():
                             try:
-                                # Sanitize filename
-                                safe_name = name.replace("..", "_").replace("/", "_")
-                                out_file = out_path / f"archive_{i}" / safe_name
+                                # Safely resolve path to prevent Zip Slip attacks
+                                out_file = _safe_extract_path(archive_out_dir, name)
                                 out_file.parent.mkdir(parents=True, exist_ok=True)
                                 out_file.write_bytes(zf.read(name))
                                 result["extracted_files"].append(str(out_file))
+                            except ValueError as e:
+                                # Path traversal attempt
+                                result["errors"].append(f"Skipped unsafe path {name}: {e}")
                             except Exception as e:
                                 result["errors"].append(f"Failed to extract {name}: {e}")
                 except zipfile.BadZipFile:
@@ -342,12 +397,14 @@ class PythonPackerAnalyzer:
                     with zipfile.ZipFile(io.BytesIO(data[offset:])) as zf:
                         for name in zf.namelist():
                             try:
-                                # Sanitize filename
-                                safe_name = name.replace("..", "_")
-                                out_file = out_path / safe_name
+                                # Safely resolve path to prevent Zip Slip attacks
+                                out_file = _safe_extract_path(out_path, name)
                                 out_file.parent.mkdir(parents=True, exist_ok=True)
                                 out_file.write_bytes(zf.read(name))
                                 result["extracted_files"].append(str(out_file))
+                            except ValueError as e:
+                                # Path traversal attempt
+                                result["errors"].append(f"Skipped unsafe path {name}: {e}")
                             except Exception as e:
                                 result["errors"].append(f"Failed to extract {name}: {e}")
                     # If we successfully extracted from one ZIP, we're done

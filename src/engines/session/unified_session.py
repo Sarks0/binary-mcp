@@ -585,7 +585,6 @@ class UnifiedSessionManager:
         Returns:
             List of metadata dicts sorted by update time (newest first)
         """
-        import re
         sessions = []
 
         for meta_file in self.store_dir.glob("*.meta.json"):

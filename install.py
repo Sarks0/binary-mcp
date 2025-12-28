@@ -777,7 +777,8 @@ def configure_claude_desktop(install_dir: Path) -> bool:
 
     try:
         if config_file.exists():
-            with open(config_file) as f:
+            # Use utf-8-sig to handle existing files that may have BOM
+            with open(config_file, encoding='utf-8-sig') as f:
                 config = json.load(f)
             # Backup
             shutil.copy(config_file, config_file.with_suffix(".json.backup"))
@@ -793,7 +794,9 @@ def configure_claude_desktop(install_dir: Path) -> bool:
             "args": ["--directory", str(install_dir), "run", "python", "-m", "src.server"]
         }
 
-        with open(config_file, 'w') as f:
+        # Write with explicit UTF-8 encoding (no BOM) to ensure Claude Desktop compatibility
+        # Note: utf-8-sig would ADD a BOM, so we must use utf-8 for writing
+        with open(config_file, 'w', encoding='utf-8') as f:
             json.dump(config, f, indent=2)
 
         print_success("Claude Desktop configured")
@@ -814,7 +817,8 @@ def configure_claude_code(install_dir: Path) -> bool:
 
     try:
         if config_file.exists():
-            with open(config_file) as f:
+            # Use utf-8-sig to handle existing files that may have BOM
+            with open(config_file, encoding='utf-8-sig') as f:
                 config = json.load(f)
             shutil.copy(config_file, config_file.with_suffix(".json.backup"))
         else:
@@ -828,7 +832,9 @@ def configure_claude_code(install_dir: Path) -> bool:
             "args": ["--directory", str(install_dir), "run", "python", "-m", "src.server"]
         }
 
-        with open(config_file, 'w') as f:
+        # Write with explicit UTF-8 encoding (no BOM) to ensure compatibility
+        # Note: utf-8-sig would ADD a BOM, so we must use utf-8 for writing
+        with open(config_file, 'w', encoding='utf-8') as f:
             json.dump(config, f, indent=2)
 
         print_success("Claude Code configured")

@@ -14,7 +14,7 @@ import re
 from datetime import datetime
 from pathlib import Path
 
-from src.utils.security import PathTraversalError, sanitize_output_path
+from src.utils.security import sanitize_output_path
 
 logger = logging.getLogger(__name__)
 

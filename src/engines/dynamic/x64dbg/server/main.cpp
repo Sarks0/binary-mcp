@@ -20,7 +20,7 @@ void Log(const char* format, ...) {
     va_start(args, format);
     vsnprintf(buffer, sizeof(buffer), format, args);
     va_end(args);
-    std::cout << "[x64dbg_mcp_server] " << buffer << std::endl;
+    std::cout << "[Obsidian] " << buffer << std::endl;
 }
 
 // Constant-time string comparison to prevent timing attacks
@@ -264,7 +264,7 @@ std::string HandleHTTPRequest(const std::string& request) {
     // Handle GET /health
     if (method == "GET" && path == "/health") {
         return BuildHTTPResponse(200, "OK", "application/json",
-                                "{\"status\":\"ok\",\"message\":\"x64dbg MCP server running\"}");
+                                "{\"status\":\"ok\",\"message\":\"Obsidian server running\"}");
     }
 
     // Extract request body for POST requests
@@ -608,7 +608,7 @@ bool StartHTTPServer(int port) {
 }
 
 int main(int argc, char* argv[]) {
-    Log("x64dbg MCP Server starting...");
+    Log("Obsidian HTTP Server starting...");
 
     // Parse command line arguments
     int port = 8765;  // Default port

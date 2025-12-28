@@ -581,28 +581,31 @@ function Install-X64Dbg {
 
         Remove-Item $x64dbgZip -ErrorAction SilentlyContinue
 
-        # Install MCP plugins
-        Write-Info "Installing x64dbg MCP plugins..."
+        # Install Obsidian plugins
+        Write-Info "Installing Obsidian x64dbg plugins..."
         try {
             $pluginRelease = Get-LatestGitHubRelease "Sarks0/binary-mcp"
-            $plugin64 = $pluginRelease.assets | Where-Object { $_.name -eq "x64dbg_mcp.dp64" } | Select-Object -First 1
-            $plugin32 = $pluginRelease.assets | Where-Object { $_.name -eq "x64dbg_mcp.dp32" } | Select-Object -First 1
+            $plugin64 = $pluginRelease.assets | Where-Object { $_.name -eq "obsidian.dp64" } | Select-Object -First 1
+            $plugin32 = $pluginRelease.assets | Where-Object { $_.name -eq "obsidian.dp32" } | Select-Object -First 1
+            $server = $pluginRelease.assets | Where-Object { $_.name -eq "obsidian_server.exe" } | Select-Object -First 1
 
-            if ($plugin64 -and $plugin32) {
+            if ($plugin64 -and $plugin32 -and $server) {
                 $plugin64Dir = "$X64DbgDir\release\x64\plugins"
                 $plugin32Dir = "$X64DbgDir\release\x32\plugins"
                 New-Item -ItemType Directory -Force -Path $plugin64Dir | Out-Null
                 New-Item -ItemType Directory -Force -Path $plugin32Dir | Out-Null
 
-                Invoke-WebRequest -Uri $plugin64.browser_download_url -OutFile "$plugin64Dir\x64dbg_mcp.dp64" -UseBasicParsing
-                Invoke-WebRequest -Uri $plugin32.browser_download_url -OutFile "$plugin32Dir\x64dbg_mcp.dp32" -UseBasicParsing
-                Write-Success "MCP plugins installed"
+                Invoke-WebRequest -Uri $plugin64.browser_download_url -OutFile "$plugin64Dir\obsidian.dp64" -UseBasicParsing
+                Invoke-WebRequest -Uri $server.browser_download_url -OutFile "$plugin64Dir\obsidian_server.exe" -UseBasicParsing
+                Invoke-WebRequest -Uri $plugin32.browser_download_url -OutFile "$plugin32Dir\obsidian.dp32" -UseBasicParsing
+                Invoke-WebRequest -Uri $server.browser_download_url -OutFile "$plugin32Dir\obsidian_server.exe" -UseBasicParsing
+                Write-Success "Obsidian plugins installed"
             } else {
-                Write-Warn "Pre-built MCP plugins not found in latest release"
+                Write-Warn "Pre-built Obsidian plugins not found in latest release"
                 Write-Info "Build manually: src/engines/dynamic/x64dbg/plugin/README.md"
             }
         } catch {
-            Write-Warn "Failed to install MCP plugins: $_"
+            Write-Warn "Failed to install Obsidian plugins: $_"
         }
 
         return $true

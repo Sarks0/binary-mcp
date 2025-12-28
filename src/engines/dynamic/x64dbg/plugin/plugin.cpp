@@ -4049,9 +4049,9 @@ static bool SpawnHTTPServer() {
 
     // Build path to server executable
     char serverPath[MAX_PATH];
-    snprintf(serverPath, MAX_PATH, "%sx64dbg_mcp_server.exe", pluginPath);
+    snprintf(serverPath, MAX_PATH, "%sobsidian_server.exe", pluginPath);
 
-    LogInfo("Spawning HTTP server: %s", serverPath);
+    LogInfo("Spawning Obsidian server: %s", serverPath);
 
     // Spawn process
     STARTUPINFOA si = {};
@@ -4070,8 +4070,8 @@ static bool SpawnHTTPServer() {
         &si,
         &pi
     )) {
-        LogError("Failed to spawn HTTP server: %d", GetLastError());
-        LogError("Make sure x64dbg_mcp_server.exe is in the same directory as the plugin");
+        LogError("Failed to spawn Obsidian server: %d", GetLastError());
+        LogError("Make sure obsidian_server.exe is in the same directory as the plugin");
         return false;
     }
 
@@ -4086,20 +4086,34 @@ static bool SpawnHTTPServer() {
 void MenuEntryCallback(CBTYPE cbType, PLUG_CB_MENUENTRY* info) {
     switch (info->hEntry) {
         case 0: {  // About
+            char aboutMsg[1024];
+            snprintf(aboutMsg, sizeof(aboutMsg),
+                "Obsidian - AI-Powered Debugging Bridge\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                "Version: %s\n"
+                "Author: %s\n\n"
+                "Obsidian provides MCP (Model Context Protocol) integration\n"
+                "for x64dbg, enabling AI assistants to control and analyze\n"
+                "debugging sessions in real-time.\n\n"
+                "Features:\n"
+                "  • Live debugging control & breakpoint management\n"
+                "  • Memory inspection & modification\n"
+                "  • Instruction tracing & API logging\n"
+                "  • Anti-debug bypass capabilities\n"
+                "  • Code coverage analysis\n\n"
+                "Architecture:\n"
+                "  • Named Pipe IPC (plugin ↔ server)\n"
+                "  • HTTP REST API on port 8765\n"
+                "  • Crash-isolated external process\n\n"
+                "Website: %s",
+                PLUGIN_VERSION_STR,
+                PLUGIN_AUTHOR,
+                PLUGIN_WEBSITE
+            );
             MessageBoxA(
                 nullptr,
-                "x64dbg MCP Bridge Plugin\n\n"
-                "Version: 1.0\n"
-                "Architecture: External Process\n\n"
-                "This plugin provides MCP (Model Context Protocol) integration\n"
-                "for x64dbg, allowing AI assistants to interact with the debugger.\n\n"
-                "Components:\n"
-                "- Named Pipe server in plugin DLL\n"
-                "- HTTP REST API server (external process)\n"
-                "- Crash-isolated architecture\n\n"
-                "Status: Server running on http://127.0.0.1:8765\n"
-                "Pipe: \\\\.\\pipe\\x64dbg_mcp",
-                "About x64dbg_mcp",
+                aboutMsg,
+                "About Obsidian",
                 MB_OK | MB_ICONINFORMATION
             );
             break;
@@ -4116,21 +4130,22 @@ void MenuEntryCallback(CBTYPE cbType, PLUG_CB_MENUENTRY* info) {
             }
 
             snprintf(statusMsg, sizeof(statusMsg),
-                "MCP Bridge Plugin Status\n\n"
-                "Plugin State: %s\n"
-                "Named Pipe: %s\n"
-                "HTTP Server: %s\n"
-                "Server PID: %lu\n"
-                "Server Port: 8765\n\n"
-                "Pipe Name: \\\\.\\pipe\\x64dbg_mcp\n"
-                "HTTP Endpoint: http://127.0.0.1:8765",
+                "Obsidian Status\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                "Plugin State:  %s\n"
+                "Named Pipe:    %s\n"
+                "HTTP Server:   %s\n"
+                "Server PID:    %lu\n\n"
+                "Endpoints:\n"
+                "  Pipe: \\\\.\\pipe\\x64dbg_mcp\n"
+                "  HTTP: http://127.0.0.1:8765",
                 g_running ? "Running" : "Stopped",
                 pipeStatus,
                 serverStatus,
                 serverPid
             );
 
-            MessageBoxA(nullptr, statusMsg, "x64dbg_mcp Status", MB_OK | MB_ICONINFORMATION);
+            MessageBoxA(nullptr, statusMsg, "Obsidian Status", MB_OK | MB_ICONINFORMATION);
             break;
         }
     }
@@ -4139,7 +4154,7 @@ void MenuEntryCallback(CBTYPE cbType, PLUG_CB_MENUENTRY* info) {
 // Plugin initialization
 bool pluginInit(PLUG_INITSTRUCT* initStruct) {
     g_pluginHandle = initStruct->pluginHandle;
-    LogInfo("Initializing MCP Bridge Plugin v%d", PLUGIN_VERSION);
+    LogInfo("Initializing Obsidian v%s", PLUGIN_VERSION_STR);
     return true;
 }
 

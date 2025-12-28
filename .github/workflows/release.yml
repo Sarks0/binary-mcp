@@ -91,22 +91,22 @@ jobs:
       shell: pwsh
       run: |
         Write-Host "Preparing release artifacts..."
-        New-Item -ItemType Directory -Force -Path release/x64dbg-plugins
+        New-Item -ItemType Directory -Force -Path release/obsidian-plugins
 
         # Copy plugin DLLs
-        Copy-Item src/engines/dynamic/x64dbg/plugin/build-x64/Release/x64dbg_mcp.dp64 release/x64dbg-plugins/
-        Copy-Item src/engines/dynamic/x64dbg/plugin/build-x32/Release/x64dbg_mcp.dp32 release/x64dbg-plugins/
+        Copy-Item src/engines/dynamic/x64dbg/plugin/build-x64/Release/obsidian.dp64 release/obsidian-plugins/
+        Copy-Item src/engines/dynamic/x64dbg/plugin/build-x32/Release/obsidian.dp32 release/obsidian-plugins/
 
         # Copy HTTP server executable (same for both architectures)
-        Copy-Item src/engines/dynamic/x64dbg/plugin/build-x64/Release/x64dbg_mcp_server.exe release/x64dbg-plugins/
+        Copy-Item src/engines/dynamic/x64dbg/plugin/build-x64/Release/obsidian_server.exe release/obsidian-plugins/
 
-        Write-Host "Artifacts prepared in release/x64dbg-plugins/"
-        Get-ChildItem release/x64dbg-plugins/
+        Write-Host "Artifacts prepared in release/obsidian-plugins/"
+        Get-ChildItem release/obsidian-plugins/
 
     - name: Upload Build Artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: x64dbg-plugins
+        name: obsidian-plugins
         path: release/*
 
   create-release:
@@ -124,7 +124,7 @@ jobs:
     - name: Download Build Artifacts
       uses: actions/download-artifact@v4
       with:
-        name: x64dbg-plugins
+        name: obsidian-plugins
         path: release/
 
     - name: Extract Version
@@ -160,15 +160,17 @@ jobs:
           --exclude='SECURITY.md' \
           . "$PACKAGE_NAME/"
 
-        # Copy x64dbg plugins to dedicated directory
-        mkdir -p "$PACKAGE_NAME/x64dbg-plugins"
-        cp release/x64dbg-plugins/x64dbg_mcp.dp64 "$PACKAGE_NAME/x64dbg-plugins/"
-        cp release/x64dbg-plugins/x64dbg_mcp.dp32 "$PACKAGE_NAME/x64dbg-plugins/"
-        cp release/x64dbg-plugins/x64dbg_mcp_server.exe "$PACKAGE_NAME/x64dbg-plugins/"
+        # Copy Obsidian plugins to dedicated directory
+        mkdir -p "$PACKAGE_NAME/obsidian-plugins"
+        cp release/obsidian-plugins/obsidian.dp64 "$PACKAGE_NAME/obsidian-plugins/"
+        cp release/obsidian-plugins/obsidian.dp32 "$PACKAGE_NAME/obsidian-plugins/"
+        cp release/obsidian-plugins/obsidian_server.exe "$PACKAGE_NAME/obsidian-plugins/"
 
         # Create installation instructions for plugins
-        cat > "$PACKAGE_NAME/x64dbg-plugins/README.md" << 'EOF'
-        # x64dbg Plugin Installation
+        cat > "$PACKAGE_NAME/obsidian-plugins/README.md" << 'EOF'
+        # Obsidian - x64dbg Plugin Installation
+
+        Obsidian is an AI-powered debugging bridge for x64dbg.
 
         ## External Process Architecture
 
@@ -179,27 +181,27 @@ jobs:
         Copy **all three files** to your x64dbg plugins directory:
 
         **For 64-bit debugger:**
-        - `x64dbg_mcp.dp64` → `x64dbg/x64/plugins/`
-        - `x64dbg_mcp_server.exe` → `x64dbg/x64/plugins/`
+        - `obsidian.dp64` → `x64dbg/x64/plugins/`
+        - `obsidian_server.exe` → `x64dbg/x64/plugins/`
 
         **For 32-bit debugger:**
-        - `x64dbg_mcp.dp32` → `x64dbg/x32/plugins/`
-        - `x64dbg_mcp_server.exe` → `x64dbg/x32/plugins/`
+        - `obsidian.dp32` → `x64dbg/x32/plugins/`
+        - `obsidian_server.exe` → `x64dbg/x32/plugins/`
 
         **IMPORTANT**: The server executable must be in the **same directory** as the plugin DLL!
 
         ## What Happens
 
-        1. x64dbg loads the plugin DLL (`.dp64` or `.dp32`)
-        2. Plugin automatically spawns `x64dbg_mcp_server.exe`
+        1. x64dbg loads the Obsidian plugin (`.dp64` or `.dp32`)
+        2. Plugin automatically spawns `obsidian_server.exe`
         3. HTTP server runs on port 8765
         4. Communication via Named Pipe IPC
 
         ## Troubleshooting
 
         Check x64dbg log for:
-        - `[MCP] HTTP server process started (PID: ...)`
-        - `[MCP] HTTP server connected to pipe`
+        - `[Obsidian] HTTP server process started (PID: ...)`
+        - `[Obsidian] HTTP server connected to pipe`
 
         See [ARCHITECTURE.md](https://github.com/Sarks0/binary-mcp/blob/main/src/engines/dynamic/x64dbg/ARCHITECTURE.md) for details.
         EOF
@@ -219,10 +221,10 @@ jobs:
 
         This release includes everything you need:
         - **MCP Server source code** - Full binary analysis server
-        - **Pre-built x64dbg plugins** - Ready-to-use debugger plugins in `x64dbg-plugins/` directory
-          - `x64dbg_mcp.dp64` - 64-bit debugger plugin
-          - `x64dbg_mcp.dp32` - 32-bit debugger plugin
-          - `x64dbg_mcp_server.exe` - HTTP server (external process architecture)
+        - **Obsidian** - Pre-built x64dbg plugins in `obsidian-plugins/` directory
+          - `obsidian.dp64` - 64-bit debugger plugin
+          - `obsidian.dp32` - 32-bit debugger plugin
+          - `obsidian_server.exe` - HTTP server (external process architecture)
 
         ### Installation
 
@@ -238,7 +240,7 @@ jobs:
         **Option 2: Manual Installation**
         1. Download and extract `binary-mcp-${{ steps.version.outputs.version }}.zip`
         2. Follow instructions in `INSTALL.md`
-        3. For x64dbg plugins, see `x64dbg-plugins/README.md`
+        3. For Obsidian x64dbg plugins, see `obsidian-plugins/README.md`
 
         ### Features
 
@@ -248,11 +250,13 @@ jobs:
         - API call detection
         - Crypto constant identification
 
-        **Dynamic Analysis (x64dbg):**
+        **Dynamic Analysis (Obsidian for x64dbg):**
         - Live debugging control
         - Breakpoint management
         - Memory inspection
-        - Execution tracing
+        - Instruction tracing & API logging
+        - Anti-debug bypass
+        - Code coverage analysis
 
         ### Requirements
 

@@ -1,4 +1,4 @@
-# x64dbg MCP Plugin - External Process Architecture
+# Obsidian - External Process Architecture
 
 ## Problem Summary
 
@@ -11,7 +11,7 @@ The in-process C++ HTTP server consistently crashed with `BEX64` (Buffer Executi
 │ x64dbg.exe Process                                       │
 │                                                           │
 │  ┌─────────────────────────────────────────────────┐   │
-│  │ x64dbg_mcp.dp64 (Plugin DLL - Minimal Stub)    │   │
+│  │ obsidian.dp64 (Plugin DLL - Minimal Stub)    │   │
 │  │                                                  │   │
 │  │  • plugsetup() spawns server process           │   │
 │  │  • Creates Named Pipe server                   │   │
@@ -28,7 +28,7 @@ The in-process C++ HTTP server consistently crashed with `BEX64` (Buffer Executi
                           │ CreateProcess() [SAFE]
                           ↓
 ┌──────────────────────────────────────────────────────────┐
-│ x64dbg_mcp_server.exe Process (Isolated)                │
+│ obsidian_server.exe Process (Isolated)                │
 │                                                           │
 │  ┌─────────────────────────────────────────────────┐   │
 │  │ HTTP Server on port 8765                        │   │
@@ -156,15 +156,15 @@ cmake --build . --config Release
 ```
 
 **Output:**
-- `x64dbg_mcp.dp64` (or `.dp32`) - Plugin DLL
-- `x64dbg_mcp_server.exe` - HTTP server executable
+- `obsidian.dp64` (or `.dp32`) - Plugin DLL
+- `obsidian_server.exe` - HTTP server executable
 
 ### Step 4: Deploy
 Copy **BOTH** files to x64dbg plugins directory:
 ```
 C:\x64dbg\x64\plugins\
-├── x64dbg_mcp.dp64
-└── x64dbg_mcp_server.exe
+├── obsidian.dp64
+└── obsidian_server.exe
 ```
 
 **IMPORTANT:** Both files must be in the same directory!
@@ -252,9 +252,9 @@ C:\x64dbg\x64\plugins\
 
 ### Server Process Won't Start
 **Check:**
-1. x64dbg_mcp_server.exe is in same directory as plugin
+1. obsidian_server.exe is in same directory as plugin
 2. Check x64dbg log for error messages
-3. Try running server manually: `x64dbg_mcp_server.exe`
+3. Try running server manually: `obsidian_server.exe`
 
 ### Pipe Connection Failed
 **Check:**

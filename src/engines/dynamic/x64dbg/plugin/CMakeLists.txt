@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(x64dbg_mcp VERSION 0.2.0 LANGUAGES CXX)
+project(obsidian VERSION 1.0.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -40,10 +40,10 @@ set(PLUGIN_HEADERS
 )
 
 # Create the plugin DLL
-add_library(x64dbg_mcp SHARED ${PLUGIN_SOURCES} ${PLUGIN_HEADERS})
+add_library(obsidian SHARED ${PLUGIN_SOURCES} ${PLUGIN_HEADERS})
 
 # Include directories for plugin
-target_include_directories(x64dbg_mcp PRIVATE
+target_include_directories(obsidian PRIVATE
     ${X64DBG_SDK_PATH}
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/..
@@ -60,7 +60,7 @@ endif()
 
 # Link x64dbg.lib (provides _plugin_* functions like _plugin_logprintf)
 if(EXISTS "${X64DBG_LIB}")
-    target_link_libraries(x64dbg_mcp PRIVATE "${X64DBG_LIB}")
+    target_link_libraries(obsidian PRIVATE "${X64DBG_LIB}")
     message(STATUS "Plugin: Linking x64dbg API library: ${X64DBG_LIB}")
 else()
     message(WARNING "x64dbg library not found: ${X64DBG_LIB}")
@@ -69,22 +69,22 @@ endif()
 
 # Link x64bridge.lib (provides Bridge_* functions)
 if(EXISTS "${BRIDGE_LIB}")
-    target_link_libraries(x64dbg_mcp PRIVATE "${BRIDGE_LIB}")
+    target_link_libraries(obsidian PRIVATE "${BRIDGE_LIB}")
     message(STATUS "Plugin: Linking bridge library: ${BRIDGE_LIB}")
 else()
     message(WARNING "Bridge library not found: ${BRIDGE_LIB}")
 endif()
 
-# Output name: x64dbg_mcp.dp64 or x64dbg_mcp.dp32
-set_target_properties(x64dbg_mcp PROPERTIES
-    OUTPUT_NAME "x64dbg_mcp"
+# Output name: obsidian.dp64 or obsidian.dp32
+set_target_properties(obsidian PROPERTIES
+    OUTPUT_NAME "obsidian"
     SUFFIX ".dp${PLUGIN_ARCH}"
     PREFIX ""
 )
 
 if(MSVC)
     # Use DYNAMIC runtime to match x64dbg
-    set_property(TARGET x64dbg_mcp PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreadedDLL$<$<CONFIG:Debug>:Debug>")
+    set_property(TARGET obsidian PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreadedDLL$<$<CONFIG:Debug>:Debug>")
     message(STATUS "Plugin: Using DYNAMIC runtime library (/MD)")
 endif()
 
@@ -101,26 +101,26 @@ set(SERVER_HEADERS
 )
 
 # Create the server executable
-add_executable(x64dbg_mcp_server ${SERVER_SOURCES} ${SERVER_HEADERS})
+add_executable(obsidian_server ${SERVER_SOURCES} ${SERVER_HEADERS})
 
 # Include directories for server
-target_include_directories(x64dbg_mcp_server PRIVATE
+target_include_directories(obsidian_server PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/..
 )
 
 # Link libraries for server
-target_link_libraries(x64dbg_mcp_server PRIVATE
+target_link_libraries(obsidian_server PRIVATE
     ws2_32  # Windows sockets
 )
 
-# Output name: x64dbg_mcp_server.exe
-set_target_properties(x64dbg_mcp_server PROPERTIES
-    OUTPUT_NAME "x64dbg_mcp_server"
+# Output name: obsidian_server.exe
+set_target_properties(obsidian_server PROPERTIES
+    OUTPUT_NAME "obsidian_server"
 )
 
 if(MSVC)
     # Use DYNAMIC runtime for server too
-    set_property(TARGET x64dbg_mcp_server PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreadedDLL$<$<CONFIG:Debug>:Debug>")
+    set_property(TARGET obsidian_server PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreadedDLL$<$<CONFIG:Debug>:Debug>")
     message(STATUS "Server: Using DYNAMIC runtime library (/MD)")
 endif()
 
@@ -129,7 +129,7 @@ endif()
 # =============================================================================
 
 # Install both plugin and server
-install(TARGETS x64dbg_mcp x64dbg_mcp_server
+install(TARGETS obsidian obsidian_server
     RUNTIME DESTINATION bin
     LIBRARY DESTINATION lib
 )
@@ -137,23 +137,23 @@ install(TARGETS x64dbg_mcp x64dbg_mcp_server
 # Copy to x64dbg plugins folder if X64DBG_DIR is set
 if(DEFINED ENV{X64DBG_DIR})
     # Copy plugin DLL
-    add_custom_command(TARGET x64dbg_mcp POST_BUILD
+    add_custom_command(TARGET obsidian POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy
-        $<TARGET_FILE:x64dbg_mcp>
+        $<TARGET_FILE:obsidian>
         "$ENV{X64DBG_DIR}/plugins/"
-        COMMENT "Installing plugin to x64dbg"
+        COMMENT "Installing Obsidian plugin to x64dbg"
     )
 
     # Copy server executable (must be in same directory as plugin)
-    add_custom_command(TARGET x64dbg_mcp_server POST_BUILD
+    add_custom_command(TARGET obsidian_server POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy
-        $<TARGET_FILE:x64dbg_mcp_server>
+        $<TARGET_FILE:obsidian_server>
         "$ENV{X64DBG_DIR}/plugins/"
-        COMMENT "Installing server executable to x64dbg"
+        COMMENT "Installing Obsidian server to x64dbg"
     )
 endif()
 
-message(STATUS "=== Build Configuration ===")
-message(STATUS "Plugin DLL: x64dbg_mcp.dp${PLUGIN_ARCH}")
-message(STATUS "Server EXE: x64dbg_mcp_server.exe")
-message(STATUS "==========================")
+message(STATUS "=== Obsidian Build Configuration ===")
+message(STATUS "Plugin DLL: obsidian.dp${PLUGIN_ARCH}")
+message(STATUS "Server EXE: obsidian_server.exe")
+message(STATUS "====================================")

@@ -1,6 +1,6 @@
-# x64dbg MCP Bridge Plugin
+# Obsidian - x64dbg Plugin
 
-Native x64dbg plugin that exposes debugger functionality via HTTP API for integration with the binary-mcp server.
+Obsidian is an AI-powered debugging bridge for x64dbg that exposes debugger functionality via HTTP API for integration with the binary-mcp server.
 
 ## Architecture
 
@@ -11,7 +11,7 @@ Native x64dbg plugin that exposes debugger functionality via HTTP API for integr
 │ x64dbg.exe Process                                       │
 │                                                           │
 │  ┌─────────────────────────────────────────────────┐   │
-│  │ x64dbg_mcp.dp64 (Plugin DLL - Minimal Stub)    │   │
+│  │ obsidian.dp64 (Plugin DLL - Minimal Stub)    │   │
 │  │                                                  │   │
 │  │  • Spawns HTTP server process                  │   │
 │  │  • Creates Named Pipe server                   │   │
@@ -23,7 +23,7 @@ Native x64dbg plugin that exposes debugger functionality via HTTP API for integr
 └──────────────────────────────────────────────────────────┘
                           ↕
 ┌──────────────────────────────────────────────────────────┐
-│ x64dbg_mcp_server.exe (Separate Process)                │
+│ obsidian_server.exe (Separate Process)                │
 │                                                           │
 │  • HTTP Server on port 8765                             │
 │  • Isolated from x64dbg crashes                         │
@@ -67,8 +67,8 @@ cp -r x64dbg/src/sdk/* extern/x64dbg_sdk/
 ### Build Plugin
 
 The build system creates **two files**:
-1. **x64dbg_mcp.dp64** (or .dp32) - Plugin DLL
-2. **x64dbg_mcp_server.exe** - HTTP server executable
+1. **obsidian.dp64** (or .dp32) - Plugin DLL
+2. **obsidian_server.exe** - HTTP server executable
 
 ```bash
 # Navigate to plugin directory
@@ -84,8 +84,8 @@ cmake .. -DX64DBG_SDK_PATH="../../../../../../extern/x64dbg_sdk"
 cmake --build . --config Release
 
 # Output files:
-#   - x64dbg_mcp.dp64 (plugin DLL)
-#   - x64dbg_mcp_server.exe (HTTP server)
+#   - obsidian.dp64 (plugin DLL)
+#   - obsidian_server.exe (HTTP server)
 ```
 
 ### Install Plugin
@@ -94,8 +94,8 @@ cmake --build . --config Release
 
 ```bash
 # Option 1: Manual install (copy BOTH files)
-cp build/Release/x64dbg_mcp.dp64 "C:/Program Files/x64dbg/x64/plugins/"
-cp build/Release/x64dbg_mcp_server.exe "C:/Program Files/x64dbg/x64/plugins/"
+cp build/Release/obsidian.dp64 "C:/Program Files/x64dbg/x64/plugins/"
+cp build/Release/obsidian_server.exe "C:/Program Files/x64dbg/x64/plugins/"
 
 # Option 2: Auto-install (set environment variable)
 set X64DBG_DIR=C:/Program Files/x64dbg/x64
@@ -106,15 +106,15 @@ cmake --build . --config Release
 **Deployment Structure:**
 ```
 C:\Program Files\x64dbg\x64\plugins\
-├── x64dbg_mcp.dp64           # Plugin (loaded by x64dbg)
-└── x64dbg_mcp_server.exe     # Server (spawned by plugin)
+├── obsidian.dp64           # Plugin (loaded by x64dbg)
+└── obsidian_server.exe     # Server (spawned by plugin)
 ```
 
 ## API Endpoints
 
 Base URL: `http://localhost:8765`
 
-**Note**: The HTTP server runs as a separate process (`x64dbg_mcp_server.exe`) spawned automatically by the plugin. Requests are forwarded to the plugin via Named Pipe IPC.
+**Note**: The HTTP server runs as a separate process (`obsidian_server.exe`) spawned automatically by the plugin. Requests are forwarded to the plugin via Named Pipe IPC.
 
 ### Debugger Control
 
@@ -531,15 +531,15 @@ Script::Module::GetMainModulePath(buffer);
 - Check x64dbg log window for errors
 - Ensure SDK version matches x64dbg version
 - Verify DLL dependencies (use Dependency Walker)
-- Make sure `x64dbg_mcp_server.exe` is in same directory
+- Make sure `obsidian_server.exe` is in same directory
 
 ### Server process won't start
 **Symptoms**: Plugin loads but no HTTP server available
 
 **Check**:
-1. Verify `x64dbg_mcp_server.exe` exists in plugins directory
+1. Verify `obsidian_server.exe` exists in plugins directory
 2. Check x64dbg log for: `[MCP] HTTP server process started (PID: ...)`
-3. Try running server manually: `x64dbg_mcp_server.exe`
+3. Try running server manually: `obsidian_server.exe`
 4. Check Windows Event Viewer for application errors
 
 ### Pipe connection failed
@@ -553,7 +553,7 @@ Script::Module::GetMainModulePath(buffer);
 
 ### HTTP server port conflict
 - Default port: 8765
-- Change by passing argument to server: `x64dbg_mcp_server.exe 9000`
+- Change by passing argument to server: `obsidian_server.exe 9000`
 - Check if port is already in use: `netstat -ano | findstr 8765`
 
 ### Commands don't work
@@ -567,7 +567,7 @@ Script::Module::GetMainModulePath(buffer);
 
 **To Debug**:
 1. Run server manually with console visible
-2. Attach debugger to `x64dbg_mcp_server.exe` process
+2. Attach debugger to `obsidian_server.exe` process
 3. Check server console output for errors
 4. Server can be restarted without restarting x64dbg
 

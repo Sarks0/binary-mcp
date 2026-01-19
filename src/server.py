@@ -30,6 +30,7 @@ from src.utils.compatibility import (
     BinaryCompatibilityChecker,
     CompatibilityLevel,
 )
+from src.utils.config import get_config_int
 from src.utils.patterns import APIPatterns, CryptoPatterns
 from src.utils.security import (
     FileSizeError,
@@ -168,13 +169,15 @@ def get_analysis_context(
     script_path = Path(__file__).parent / "engines" / "static" / "ghidra" / "scripts"
 
     try:
+        # Use configurable timeout (default 600 seconds / 10 minutes)
+        timeout = get_config_int("GHIDRA_TIMEOUT", 600)
         result = runner.analyze(
             binary_path=binary_path,
             script_path=str(script_path),
             script_name="core_analysis.py",
             output_path=str(output_path),
             keep_project=True,  # Keep project for incremental analysis
-            timeout=600,
+            timeout=timeout,
             processor=processor,
             loader=loader
         )

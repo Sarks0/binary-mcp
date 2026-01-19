@@ -21,9 +21,26 @@ class GhidraRunner:
         Initialize Ghidra runner.
 
         Args:
-            ghidra_path: Path to Ghidra installation. If None, auto-detect.
+            ghidra_path: Path to Ghidra installation. If None, checks GHIDRA_HOME
+                         environment variable, then auto-detects.
         """
-        self.ghidra_path = ghidra_path or self._detect_ghidra()
+        if ghidra_path:
+            self.ghidra_path = Path(ghidra_path)
+        else:
+            # Check GHIDRA_HOME environment variable first (fast path)
+            ghidra_home = os.environ.get("GHIDRA_HOME")
+            if ghidra_home:
+                ghidra_home_path = Path(ghidra_home)
+                if ghidra_home_path.exists():
+                    logger.info(f"Using GHIDRA_HOME: {ghidra_home}")
+                    self.ghidra_path = ghidra_home_path
+                else:
+                    logger.warning(f"GHIDRA_HOME set but path does not exist: {ghidra_home}")
+                    self.ghidra_path = self._detect_ghidra()
+            else:
+                # Fall back to auto-detection (slow path)
+                self.ghidra_path = self._detect_ghidra()
+
         self.system = platform.system()
         logger.info(f"Initialized Ghidra runner: {self.ghidra_path} on {self.system}")
 

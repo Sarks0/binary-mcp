@@ -170,7 +170,9 @@ def get_analysis_context(
 
     try:
         # Use configurable timeout (default 600 seconds / 10 minutes)
+        # Bounds: minimum 30s, maximum 3600s (1 hour)
         timeout = get_config_int("GHIDRA_TIMEOUT", 600)
+        timeout = validate_numeric_range(timeout, 30, 3600, "GHIDRA_TIMEOUT")
         result = runner.analyze(
             binary_path=binary_path,
             script_path=str(script_path),

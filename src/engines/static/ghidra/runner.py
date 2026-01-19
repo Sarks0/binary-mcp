@@ -21,9 +21,28 @@ class GhidraRunner:
         Initialize Ghidra runner.
 
         Args:
-            ghidra_path: Path to Ghidra installation. If None, auto-detect.
+            ghidra_path: Path to Ghidra installation. If None, checks GHIDRA_HOME
+                         environment variable, then auto-detects.
         """
-        self.ghidra_path = ghidra_path or self._detect_ghidra()
+        if ghidra_path:
+            self.ghidra_path = Path(ghidra_path)
+        else:
+            # Check GHIDRA_HOME environment variable first (fast path)
+            ghidra_home = os.environ.get("GHIDRA_HOME")
+            if ghidra_home:
+                ghidra_home_path = Path(ghidra_home)
+                if self._is_valid_ghidra_installation(ghidra_home_path):
+                    logger.info(f"Using GHIDRA_HOME: {ghidra_home}")
+                    self.ghidra_path = ghidra_home_path
+                else:
+                    logger.warning(
+                        f"GHIDRA_HOME set but not a valid Ghidra installation: {ghidra_home}"
+                    )
+                    self.ghidra_path = self._detect_ghidra()
+            else:
+                # Fall back to auto-detection (slow path)
+                self.ghidra_path = self._detect_ghidra()
+
         self.system = platform.system()
         logger.info(f"Initialized Ghidra runner: {self.ghidra_path} on {self.system}")
 
@@ -84,6 +103,25 @@ class GhidraRunner:
             "Ghidra installation not found. Please set GHIDRA_HOME environment variable "
             "or pass ghidra_path explicitly."
         )
+
+    def _is_valid_ghidra_installation(self, path: Path) -> bool:
+        """
+        Validate that path contains a valid Ghidra installation.
+
+        Checks that the directory exists and contains the analyzeHeadless binary.
+
+        Args:
+            path: Path to potential Ghidra installation
+
+        Returns:
+            True if path is a valid Ghidra installation, False otherwise
+        """
+        if not path.exists() or not path.is_dir():
+            return False
+        # Check for analyzeHeadless binary (Unix or Windows)
+        analyze_unix = path / "support" / "analyzeHeadless"
+        analyze_win = path / "support" / "analyzeHeadless.bat"
+        return analyze_unix.exists() or analyze_win.exists()
 
     def _get_analyze_headless_cmd(self) -> str:
         """Get the analyzeHeadless command for the current platform."""

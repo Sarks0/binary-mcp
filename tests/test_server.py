@@ -48,6 +48,59 @@ class TestGhidraRunner:
             # On Unix, should prefer no extension if it exists
             pass
 
+    def test_ghidra_home_environment_variable(self, monkeypatch, tmp_path):
+        """Test GHIDRA_HOME environment variable is respected."""
+        from src.engines.static.ghidra.runner import GhidraRunner
+
+        # Create a mock Ghidra directory structure
+        mock_ghidra = tmp_path / "ghidra_test"
+        mock_ghidra.mkdir()
+        (mock_ghidra / "support").mkdir()
+        (mock_ghidra / "support" / "analyzeHeadless").touch()
+
+        # Set GHIDRA_HOME
+        monkeypatch.setenv("GHIDRA_HOME", str(mock_ghidra))
+
+        # Runner should use GHIDRA_HOME without calling _detect_ghidra
+        runner = GhidraRunner()
+        assert runner.ghidra_path == mock_ghidra
+
+    def test_ghidra_home_invalid_path_falls_back(self, monkeypatch):
+        """Test fallback to auto-detection when GHIDRA_HOME is invalid."""
+        from src.engines.static.ghidra.runner import GhidraRunner
+
+        # Set GHIDRA_HOME to non-existent path
+        monkeypatch.setenv("GHIDRA_HOME", "/nonexistent/ghidra/path")
+
+        # Should fall back to auto-detection
+        try:
+            runner = GhidraRunner()
+            # If auto-detection succeeds, verify it's not the invalid path
+            assert str(runner.ghidra_path) != "/nonexistent/ghidra/path"
+        except FileNotFoundError:
+            # Expected if Ghidra not installed
+            pytest.skip("Ghidra not installed for fallback test")
+
+    def test_explicit_path_overrides_ghidra_home(self, monkeypatch, tmp_path):
+        """Test explicit ghidra_path parameter takes precedence over GHIDRA_HOME."""
+        from src.engines.static.ghidra.runner import GhidraRunner
+
+        # Create mock directories
+        env_ghidra = tmp_path / "env_ghidra"
+        env_ghidra.mkdir()
+
+        explicit_ghidra = tmp_path / "explicit_ghidra"
+        explicit_ghidra.mkdir()
+        (explicit_ghidra / "support").mkdir()
+        (explicit_ghidra / "support" / "analyzeHeadless").touch()
+
+        # Set GHIDRA_HOME to one path
+        monkeypatch.setenv("GHIDRA_HOME", str(env_ghidra))
+
+        # Pass explicit path - should override GHIDRA_HOME
+        runner = GhidraRunner(ghidra_path=str(explicit_ghidra))
+        assert runner.ghidra_path == explicit_ghidra
+
 
 class TestProjectCache:
     """Test project cache functionality."""

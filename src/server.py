@@ -7,6 +7,7 @@ Provides 40+ tools for static and dynamic binary analysis:
 - Dynamic analysis via x64dbg (native plugin)
 """
 
+import asyncio
 import functools
 import json
 import logging
@@ -14,6 +15,7 @@ import re
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 from fastmcp import FastMCP
 
@@ -62,6 +64,17 @@ api_patterns = APIPatterns()
 crypto_patterns = CryptoPatterns()
 compatibility_checker = BinaryCompatibilityChecker()
 
+# Clean up stale Ghidra locks on startup (prevents lock contention after crashes)
+cache.cleanup_stale_locks()
+
+# ============================================================================
+# REQUEST DEDUPLICATION
+# ============================================================================
+# Prevents multiple concurrent Ghidra analyses of the same binary
+# Key: "binary_path:processor:loader", Value: asyncio.Task
+_active_analyses: dict[str, asyncio.Task[dict[str, Any]]] = {}
+_analysis_lock = asyncio.Lock()
+
 
 # ============================================================================
 # HELPER FUNCTIONS
@@ -75,39 +88,71 @@ def log_to_session(func=None, *, analysis_type: AnalysisType = AnalysisType.STAT
     - Transparently captures tool name, arguments, and output
     - Auto-starts/resumes session if binary_path is in arguments
     - Tracks analysis type (static/dynamic) for mixed sessions
+    - Supports both sync and async functions
 
     Args:
         analysis_type: Type of analysis (STATIC or DYNAMIC)
     """
     def decorator(fn):
-        @functools.wraps(fn)
-        def wrapper(*args, **kwargs):
-            # Extract binary_path for auto-session if present
-            binary_path = kwargs.get("binary_path")
+        # Check if the function is async
+        if asyncio.iscoroutinefunction(fn):
+            @functools.wraps(fn)
+            async def async_wrapper(*args, **kwargs):
+                # Extract binary_path for auto-session if present
+                binary_path = kwargs.get("binary_path")
 
-            # Auto-ensure session if we have a binary path and auto-session is enabled
-            if binary_path and session_manager.auto_session_enabled:
-                session_manager.ensure_session(
-                    binary_path=binary_path,
-                    analysis_type=analysis_type
-                )
+                # Auto-ensure session if we have a binary path and auto-session is enabled
+                if binary_path and session_manager.auto_session_enabled:
+                    session_manager.ensure_session(
+                        binary_path=binary_path,
+                        analysis_type=analysis_type
+                    )
 
-            # Call the original function
-            result = fn(*args, **kwargs)
+                # Call the original async function
+                result = await fn(*args, **kwargs)
 
-            # Log to active session if one exists
-            if session_manager.active_session_id:
-                tool_name = fn.__name__
-                session_manager.log_tool_call(
-                    tool_name=tool_name,
-                    arguments=kwargs,
-                    output=result,
-                    analysis_type=analysis_type
-                )
+                # Log to active session if one exists
+                if session_manager.active_session_id:
+                    tool_name = fn.__name__
+                    session_manager.log_tool_call(
+                        tool_name=tool_name,
+                        arguments=kwargs,
+                        output=result,
+                        analysis_type=analysis_type
+                    )
 
-            return result
+                return result
 
-        return wrapper
+            return async_wrapper
+        else:
+            @functools.wraps(fn)
+            def sync_wrapper(*args, **kwargs):
+                # Extract binary_path for auto-session if present
+                binary_path = kwargs.get("binary_path")
+
+                # Auto-ensure session if we have a binary path and auto-session is enabled
+                if binary_path and session_manager.auto_session_enabled:
+                    session_manager.ensure_session(
+                        binary_path=binary_path,
+                        analysis_type=analysis_type
+                    )
+
+                # Call the original function
+                result = fn(*args, **kwargs)
+
+                # Log to active session if one exists
+                if session_manager.active_session_id:
+                    tool_name = fn.__name__
+                    session_manager.log_tool_call(
+                        tool_name=tool_name,
+                        arguments=kwargs,
+                        output=result,
+                        analysis_type=analysis_type
+                    )
+
+                return result
+
+            return sync_wrapper
 
     # Handle both @log_to_session and @log_to_session() syntax
     if func is not None:
@@ -232,13 +277,215 @@ def get_analysis_context(
         raise RuntimeError(f"Failed to analyze binary: {e}")
 
 
+def _calculate_timeout(binary_path: str) -> int:
+    """
+    Calculate appropriate timeout based on binary file size.
+
+    Uses formula: 60s base + 120s per MB
+    Examples:
+    - 1 MB binary: 60 + 120 = 180s (3 min)
+    - 5 MB binary: 60 + 600 = 660s (11 min)
+    - 10 MB binary: 60 + 1200 = 1260s (21 min)
+
+    Args:
+        binary_path: Path to binary file
+
+    Returns:
+        Calculated timeout in seconds, capped at configured max
+    """
+    try:
+        file_size_bytes = Path(binary_path).stat().st_size
+        file_size_mb = file_size_bytes / (1024 * 1024)
+
+        # Base 60s + 120s per MB
+        calculated_timeout = int(60 + (file_size_mb * 120))
+
+        # Get configured max timeout (default 1800s = 30 min)
+        max_timeout = get_config_int("GHIDRA_TIMEOUT", 1800)
+        max_timeout = validate_numeric_range(max_timeout, 60, 7200, "GHIDRA_TIMEOUT")
+
+        timeout = min(calculated_timeout, max_timeout)
+        logger.info(f"Binary size: {file_size_mb:.2f} MB, calculated timeout: {timeout}s ({timeout/60:.1f} min)")
+
+        return timeout
+    except Exception as e:
+        logger.warning(f"Failed to calculate timeout, using default: {e}")
+        return 600  # Default fallback
+
+
+async def _run_ghidra_analysis(
+    binary_path: str,
+    processor: str | None,
+    loader: str | None
+) -> dict:
+    """
+    Internal async function to run Ghidra analysis.
+
+    This function does the actual Ghidra invocation and should only be called
+    from get_analysis_context_async with proper deduplication.
+    """
+    output_path = cache.cache_dir / f"temp_analysis_{Path(binary_path).stem}.json"
+    script_path = Path(__file__).parent / "engines" / "static" / "ghidra" / "scripts"
+
+    # Calculate size-based timeout
+    timeout = _calculate_timeout(binary_path)
+
+    logger.info(f"Starting async Ghidra analysis for {binary_path}")
+    if processor or loader:
+        logger.info(f"Using explicit loader config - Processor: {processor}, Loader: {loader}")
+
+    result = await runner.analyze_async(
+        binary_path=binary_path,
+        script_path=str(script_path),
+        script_name="core_analysis.py",
+        output_path=str(output_path),
+        keep_project=True,
+        timeout=timeout,
+        processor=processor,
+        loader=loader
+    )
+
+    # Save Ghidra output to debug file for inspection
+    debug_file = cache.cache_dir / "ghidra_debug.log"
+    try:
+        with open(debug_file, 'w') as f:
+            f.write("=== GHIDRA ANALYSIS DEBUG LOG (ASYNC) ===\n")
+            f.write(f"Binary: {binary_path}\n")
+            f.write(f"Output Path: {output_path}\n")
+            f.write(f"Script Path: {script_path}\n")
+            f.write(f"Timeout: {timeout}s\n\n")
+            f.write("=== STDOUT ===\n")
+            f.write(result.get('stdout', 'N/A'))
+            f.write("\n\n=== STDERR ===\n")
+            f.write(result.get('stderr', 'N/A'))
+    except Exception as e:
+        logger.warning(f"Failed to write debug log: {e}")
+
+    # Check if output file was created
+    if not output_path.exists():
+        internal_details = f"Ghidra did not create output file: {output_path}\n"
+        internal_details += f"Debug log: {debug_file}\n"
+        internal_details += f"Stdout: {result.get('stdout', 'N/A')[-500:]}\n"
+        internal_details += f"Stderr: {result.get('stderr', 'N/A')[-500:]}"
+
+        raise UserFacingError(
+            "Analysis failed. This may be due to an unsupported binary format or corrupted file.",
+            internal_details=internal_details
+        )
+
+    # Load analysis results
+    with open(output_path) as f:
+        context = json.load(f)
+
+    # Cache the results
+    cache.save_cached(binary_path, context)
+
+    # Clean up temp file
+    output_path.unlink()
+
+    logger.info(f"Async analysis complete: {result['elapsed_time']:.2f}s")
+    return context
+
+
+async def get_analysis_context_async(
+    binary_path: str,
+    force_reanalyze: bool = False,
+    processor: str | None = None,
+    loader: str | None = None
+) -> dict:
+    """
+    Get or create analysis context for a binary (async, non-blocking version).
+
+    This version:
+    - Doesn't block the event loop while Ghidra runs
+    - Deduplicates concurrent requests for the same binary
+    - Uses size-based timeout scaling
+
+    Args:
+        binary_path: Path to binary file
+        force_reanalyze: Force re-analysis even if cached
+        processor: Optional processor specification
+        loader: Optional loader name
+
+    Returns:
+        Analysis context dict
+
+    Raises:
+        RuntimeError: If analysis fails
+        PathTraversalError: If path is outside allowed directories
+        FileSizeError: If file exceeds size limits
+    """
+    # Validate and sanitize binary path
+    try:
+        validated_path = sanitize_binary_path(
+            binary_path,
+            allowed_dirs=None,
+            max_size_bytes=500 * 1024 * 1024
+        )
+        binary_path = str(validated_path)
+    except (PathTraversalError, FileSizeError, FileNotFoundError, ValueError) as e:
+        logger.error(f"Path validation failed: {e}")
+        raise RuntimeError(f"Invalid binary path: {e}")
+
+    # Check cache first (skip cache if processor/loader specified)
+    if not force_reanalyze and not processor and not loader:
+        cached_context = cache.get_cached(binary_path)
+        if cached_context:
+            logger.info(f"Using cached analysis for {binary_path}")
+            return cached_context
+
+    # Create cache key for deduplication
+    cache_key = f"{binary_path}:{processor or ''}:{loader or ''}"
+
+    # Check if analysis is already running for this binary
+    async with _analysis_lock:
+        if cache_key in _active_analyses:
+            logger.info(f"Analysis already in progress for {binary_path}, waiting...")
+            existing_task = _active_analyses[cache_key]
+        else:
+            existing_task = None
+
+    # If another task is running, wait for it
+    if existing_task is not None:
+        try:
+            return await existing_task
+        except Exception:
+            # The other task failed, we'll try our own
+            pass
+
+    # Start new analysis with deduplication
+    async with _analysis_lock:
+        # Double-check in case another task completed while we were waiting
+        if not force_reanalyze and not processor and not loader:
+            cached_context = cache.get_cached(binary_path)
+            if cached_context:
+                logger.info(f"Cache populated while waiting: {binary_path}")
+                return cached_context
+
+        # Create and register the analysis task
+        task = asyncio.create_task(
+            _run_ghidra_analysis(binary_path, processor, loader)
+        )
+        _active_analyses[cache_key] = task
+
+    try:
+        return await task
+    except Exception as e:
+        logger.error(f"Async analysis failed: {e}")
+        raise RuntimeError(f"Failed to analyze binary: {e}")
+    finally:
+        # Clean up the task from active analyses
+        async with _analysis_lock:
+            _active_analyses.pop(cache_key, None)
+
+
 # ============================================================================
 # PHASE 1: CORE TOOLS (P0 - Critical)
 # ============================================================================
 
 @app.tool()
 @log_to_session
-def analyze_binary(
+async def analyze_binary(
     binary_path: str,
     force_reanalyze: bool = False,
     processor: str | None = None,
@@ -246,10 +493,13 @@ def analyze_binary(
     skip_compatibility_check: bool = False
 ) -> str:
     """
-    Analyze a binary file with Ghidra headless analyzer.
+    Analyze a binary file with Ghidra headless analyzer (async, non-blocking).
 
     This is the foundation tool that must be called before using other analysis tools.
     It loads the binary, runs Ghidra's auto-analysis, and extracts comprehensive data.
+
+    This async version doesn't block other MCP requests while Ghidra analyzes large binaries.
+    Timeout scales automatically based on file size (60s base + 120s per MB).
 
     IMPORTANT: This tool automatically checks binary compatibility before analysis.
     For .NET assemblies or packed binaries, it will return recommendations for better tools.
@@ -301,7 +551,8 @@ Format: {compat_info.format.value}
                 # Don't fail on compatibility check errors, just log and proceed
                 logger.warning(f"Compatibility check failed, proceeding with analysis: {e}")
 
-        context = get_analysis_context(binary_path, force_reanalyze, processor, loader)
+        # Use async version for non-blocking analysis
+        context = await get_analysis_context_async(binary_path, force_reanalyze, processor, loader)
 
         metadata = context.get("metadata", {})
         functions = context.get("functions", [])

@@ -3,6 +3,7 @@ Ghidra headless runner with cross-platform support.
 Handles Ghidra installation detection, project management, and script execution.
 """
 
+import asyncio
 import logging
 import os
 import platform
@@ -334,6 +335,181 @@ class GhidraRunner:
                 f"Ghidra analysis failed with exit code {e.returncode}. "
                 f"Check logs for details."
             ) from e
+
+    async def analyze_async(
+        self,
+        binary_path: str,
+        script_path: str,
+        script_name: str,
+        output_path: str,
+        project_name: str | None = None,
+        keep_project: bool = False,
+        timeout: int = 600,
+        processor: str | None = None,
+        loader: str | None = None,
+        function_timeout: int | None = None,
+        max_functions: int | None = None,
+        skip_decompile: bool = False,
+    ) -> dict:
+        """
+        Run Ghidra headless analysis on a binary asynchronously.
+
+        This is the non-blocking version of analyze() that doesn't block the
+        async event loop. Use this for MCP server operations to allow other
+        requests to be processed while Ghidra runs.
+
+        Args:
+            binary_path: Path to binary file to analyze
+            script_path: Directory containing Ghidra scripts
+            script_name: Name of the Jython script to execute
+            output_path: Where to save analysis output
+            project_name: Ghidra project name (default: binary basename)
+            keep_project: Whether to keep the project after analysis
+            timeout: Maximum execution time in seconds (default: 600)
+            processor: Optional processor specification (e.g., "x86:LE:64:default")
+            loader: Optional loader specification (e.g., "Portable Executable (PE)")
+            function_timeout: Per-function decompilation timeout (default: 30s)
+            max_functions: Maximum functions to analyze (default: unlimited)
+            skip_decompile: Skip decompilation for faster analysis (default: False)
+
+        Returns:
+            dict with analysis results and metadata
+
+        Raises:
+            RuntimeError: If analysis fails or times out
+            FileNotFoundError: If binary or script not found
+        """
+        binary_path = self._normalize_binary_path(binary_path)
+
+        if not binary_path.exists():
+            raise FileNotFoundError(f"Binary not found: {binary_path}")
+
+        if project_name is None:
+            project_name = binary_path.stem
+
+        # Create temporary project directory
+        project_dir = Path(output_path).parent / "ghidra_projects"
+        project_dir.mkdir(parents=True, exist_ok=True)
+
+        # Set environment variables for output path and analysis options
+        env = os.environ.copy()
+        env["GHIDRA_CONTEXT_JSON"] = str(output_path)
+
+        # Pass function-level timeout settings to the Ghidra script
+        if function_timeout is not None:
+            env["GHIDRA_FUNCTION_TIMEOUT"] = str(function_timeout)
+        if max_functions is not None and max_functions > 0:
+            env["GHIDRA_MAX_FUNCTIONS"] = str(max_functions)
+        if skip_decompile:
+            env["GHIDRA_SKIP_DECOMPILE"] = "1"
+
+        logger.debug(f"Analysis settings: function_timeout={function_timeout}, "
+                     f"max_functions={max_functions}, skip_decompile={skip_decompile}")
+
+        # Build command - processor/loader must come immediately after binary path
+        cmd = [
+            self._get_analyze_headless_cmd(),
+            str(project_dir),
+            project_name,
+            "-import", str(binary_path),
+        ]
+
+        # Add processor/loader if specified (must be before other flags)
+        if processor:
+            cmd.extend(["-processor", processor])
+        if loader:
+            cmd.extend(["-loader", loader])
+
+        # Add remaining flags
+        cmd.append("-overwrite")
+        cmd.extend([
+            "-scriptPath", str(script_path),
+            "-postScript", script_name,
+        ])
+
+        if not keep_project:
+            cmd.append("-deleteProject")
+
+        logger.info(f"Running async Ghidra analysis: {' '.join(cmd)}")
+        logger.debug(f"Environment: GHIDRA_CONTEXT_JSON={output_path}")
+
+        start_time = time.time()
+
+        try:
+            # Create async subprocess - this doesn't block the event loop
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                env=env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+
+            # Wait for completion with timeout - other async tasks can run during this
+            try:
+                stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                    process.communicate(),
+                    timeout=timeout
+                )
+                stdout = stdout_bytes.decode("utf-8", errors="replace")
+                stderr = stderr_bytes.decode("utf-8", errors="replace")
+            except TimeoutError:
+                # Kill the process on timeout
+                logger.warning(f"Ghidra analysis timed out after {timeout}s, killing process")
+                process.kill()
+                await process.wait()
+
+                elapsed_time = time.time() - start_time
+                logger.error(f"Analysis timeout after {elapsed_time:.2f}s")
+
+                # Clean up locked project to prevent future lock errors
+                self._cleanup_project(project_dir, project_name)
+
+                raise RuntimeError(
+                    f"Ghidra analysis timed out after {timeout}s. "
+                    f"Binary may be too large or complex. "
+                    f"Consider increasing GHIDRA_TIMEOUT or using skip_decompile=True."
+                )
+
+            elapsed_time = time.time() - start_time
+
+            # Check return code
+            if process.returncode != 0:
+                logger.error(f"Analysis failed after {elapsed_time:.2f}s")
+                logger.error(f"stdout: {stdout}")
+                logger.error(f"stderr: {stderr}")
+
+                # Clean up locked project to prevent future lock errors
+                self._cleanup_project(project_dir, project_name)
+
+                raise RuntimeError(
+                    f"Ghidra analysis failed with exit code {process.returncode}. "
+                    f"Check logs for details."
+                )
+
+            logger.info(f"Async analysis completed in {elapsed_time:.2f}s")
+            logger.debug(f"stdout: {stdout[:500]}")
+
+            return {
+                "success": True,
+                "binary": str(binary_path),
+                "project_name": project_name,
+                "output_path": output_path,
+                "elapsed_time": elapsed_time,
+                "stdout": stdout,
+                "stderr": stderr,
+            }
+
+        except RuntimeError:
+            # Re-raise RuntimeError (timeout or failure) as-is
+            raise
+        except Exception as e:
+            elapsed_time = time.time() - start_time
+            logger.error(f"Unexpected error during async analysis after {elapsed_time:.2f}s: {e}")
+
+            # Clean up locked project to prevent future lock errors
+            self._cleanup_project(project_dir, project_name)
+
+            raise RuntimeError(f"Ghidra analysis failed unexpectedly: {e}") from e
 
     def diagnose(self) -> dict:
         """

@@ -244,3 +244,59 @@ class ProjectCache:
                 logger.error(f"Error getting size of {cache_file}: {e}")
 
         return total_size
+
+    def cleanup_stale_locks(self, max_age_hours: int = 24) -> int:
+        """
+        Clean up stale Ghidra project lock files.
+
+        Lock files can persist if the server crashes during analysis.
+        This method removes lock files older than max_age_hours to prevent
+        future analyses from being blocked.
+
+        Args:
+            max_age_hours: Maximum age in hours before a lock is considered stale.
+                          Default is 24 hours.
+
+        Returns:
+            Number of stale lock files removed
+        """
+        count = 0
+        ghidra_projects_dir = self.cache_dir.parent / "ghidra_projects"
+
+        if not ghidra_projects_dir.exists():
+            logger.debug("No ghidra_projects directory found, nothing to clean")
+            return 0
+
+        cutoff_time = time.time() - (max_age_hours * 3600)
+
+        # Clean up .lock files
+        for lock_file in ghidra_projects_dir.glob("**/*.lock"):
+            try:
+                file_mtime = lock_file.stat().st_mtime
+                if file_mtime < cutoff_time:
+                    lock_file.unlink()
+                    count += 1
+                    logger.info(f"Removed stale lock file: {lock_file}")
+            except Exception as e:
+                logger.warning(f"Error removing stale lock {lock_file}: {e}")
+
+        # Also clean up orphaned .gpr files without corresponding .rep directories
+        for gpr_file in ghidra_projects_dir.glob("*.gpr"):
+            try:
+                rep_dir = gpr_file.with_suffix(".rep")
+                # If .gpr exists but .rep doesn't, and it's old, remove it
+                if not rep_dir.exists():
+                    file_mtime = gpr_file.stat().st_mtime
+                    if file_mtime < cutoff_time:
+                        gpr_file.unlink()
+                        count += 1
+                        logger.info(f"Removed orphaned project file: {gpr_file}")
+            except Exception as e:
+                logger.warning(f"Error removing orphaned project {gpr_file}: {e}")
+
+        if count > 0:
+            logger.info(f"Cleaned up {count} stale Ghidra project files")
+        else:
+            logger.debug("No stale Ghidra project files found")
+
+        return count

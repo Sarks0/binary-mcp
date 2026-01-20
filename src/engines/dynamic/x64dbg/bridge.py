@@ -11,27 +11,19 @@ import tempfile
 import time
 import traceback
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import requests
 
-from ..base import Debugger, DebuggerState
-from .error_logger import ErrorContext, X64DbgErrorLogger
 from src.utils.structured_errors import (
-    ErrorCode,
-    StructuredError,
     StructuredErrorException,
-    classify_api_error,
     create_address_invalid_error,
     create_address_missing_error,
-    create_api_error,
-    create_breakpoint_set_failed_error,
-    create_debugger_not_connected_error,
-    create_disassembly_failed_error,
     create_error_from_api_response,
-    create_memory_read_failed_error,
-    create_memory_write_failed_error,
 )
+
+from ..base import Debugger, DebuggerState
+from .error_logger import ErrorContext, X64DbgErrorLogger
 
 logger = logging.getLogger(__name__)
 
@@ -2986,7 +2978,6 @@ class X64DbgBridge(Debugger):
         Returns:
             Remapped PE data with file layout
         """
-        import pefile
 
         section_alignment = pe.OPTIONAL_HEADER.SectionAlignment
         file_alignment = pe.OPTIONAL_HEADER.FileAlignment

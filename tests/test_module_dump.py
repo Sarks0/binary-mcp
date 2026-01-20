@@ -8,8 +8,6 @@ x64dbg to be running or pefile to be installed.
 import struct
 import tempfile
 from pathlib import Path
-from typing import Any
-from unittest.mock import MagicMock, patch
 
 import pytest
 

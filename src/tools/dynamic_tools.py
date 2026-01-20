@@ -16,8 +16,6 @@ from pathlib import Path
 from fastmcp import FastMCP
 
 from src.engines.dynamic.x64dbg.bridge import (
-    AddressValidationError,
-    X64DbgAPIError,
     X64DbgBridge,
 )
 from src.engines.dynamic.x64dbg.commands import X64DbgCommands

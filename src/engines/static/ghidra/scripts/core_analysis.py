@@ -11,10 +11,10 @@ import os
 from ghidra.app.decompiler import DecompInterface
 from ghidra.program.model.symbol import SymbolType
 from ghidra.util.task import ConsoleTaskMonitor
+from java.lang import InterruptedException, Thread
 
 # Java imports for thread-based timeout handling
-from java.util.concurrent import Callable, Executors, TimeUnit, TimeoutException
-from java.lang import Thread, InterruptedException
+from java.util.concurrent import Callable, Executors, TimeoutException, TimeUnit
 
 
 def safe_unicode(value):

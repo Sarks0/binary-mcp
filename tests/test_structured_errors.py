@@ -6,6 +6,7 @@ are properly formatted for actionable user feedback.
 """
 
 import json
+
 import pytest
 
 from src.utils.structured_errors import (

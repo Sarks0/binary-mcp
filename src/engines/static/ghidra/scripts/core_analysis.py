@@ -11,6 +11,10 @@ import os
 from ghidra.app.decompiler import DecompInterface
 from ghidra.program.model.symbol import SymbolType
 from ghidra.util.task import ConsoleTaskMonitor
+from java.lang import InterruptedException, Thread
+
+# Java imports for thread-based timeout handling
+from java.util.concurrent import Callable, Executors, TimeoutException, TimeUnit
 
 
 def safe_unicode(value):
@@ -74,6 +78,93 @@ def safe_format(fmt_string, *args, **kwargs):
             return "<formatting_error>"
 
 
+class DecompileCallable(Callable):
+    """
+    Java Callable wrapper for decompilation with thread-based timeout.
+
+    This allows us to enforce a hard timeout on decompilation that works
+    even when Ghidra's internal decompiler timeout fails to trigger
+    (which can happen with anti-analysis code that causes infinite loops).
+    """
+
+    def __init__(self, decompiler, function, timeout_seconds, monitor):
+        """
+        Initialize the callable.
+
+        Args:
+            decompiler: DecompInterface instance
+            function: Ghidra Function to decompile
+            timeout_seconds: Timeout in seconds for decompilation
+            monitor: TaskMonitor instance
+        """
+        self.decompiler = decompiler
+        self.function = function
+        self.timeout_seconds = timeout_seconds
+        self.monitor = monitor
+        self.result = None
+        self.error = None
+
+    def call(self):
+        """Execute decompilation - called by executor thread."""
+        try:
+            # Use the internal timeout as a first line of defense
+            self.result = self.decompiler.decompileFunction(
+                self.function, self.timeout_seconds, self.monitor
+            )
+            return self.result
+        except Exception as e:
+            self.error = e
+            return None
+
+
+def decompile_with_timeout(decompiler, function, timeout_seconds, monitor, executor):
+    """
+    Decompile a function with a hard thread-based timeout.
+
+    This provides a robust timeout mechanism that works even when Ghidra's
+    internal decompiler timeout fails (e.g., due to anti-analysis code).
+
+    Args:
+        decompiler: DecompInterface instance
+        function: Ghidra Function to decompile
+        timeout_seconds: Timeout in seconds
+        monitor: TaskMonitor instance
+        executor: ExecutorService for running the decompilation
+
+    Returns:
+        tuple: (result, status, error_message)
+            - result: DecompileResults or None
+            - status: "success", "timeout", "error", "interrupted"
+            - error_message: Error description or None
+    """
+    callable_task = DecompileCallable(decompiler, function, timeout_seconds, monitor)
+
+    try:
+        # Submit task and wait with timeout
+        future = executor.submit(callable_task)
+
+        try:
+            # Wait for result with timeout (add 5 seconds buffer for thread overhead)
+            result = future.get(timeout_seconds + 5, TimeUnit.SECONDS)
+
+            if callable_task.error:
+                return (None, "error", safe_unicode(callable_task.error))
+
+            return (result, "success", None)
+
+        except TimeoutException:
+            # Hard timeout - cancel the future and return
+            future.cancel(True)  # True = may interrupt if running
+            return (None, "timeout", "Thread timeout exceeded")
+
+    except InterruptedException:
+        Thread.currentThread().interrupt()
+        return (None, "interrupted", "Decompilation interrupted")
+
+    except Exception as e:
+        return (None, "error", safe_unicode(e))
+
+
 def extract_comprehensive_analysis():
     """Extract comprehensive analysis data from the current program."""
 
@@ -103,6 +194,10 @@ def extract_comprehensive_analysis():
     decompiler = DecompInterface()
     decompiler.openProgram(program)
 
+    # Create a single-thread executor for timeout-controlled decompilation
+    # Using a cached thread pool allows reuse of threads for better performance
+    decompile_executor = Executors.newCachedThreadPool()
+
     context = {
         "metadata": {},
         "functions": [],
@@ -120,7 +215,11 @@ def extract_comprehensive_analysis():
             "functions_skipped": 0,
             "decompile_failures": 0,
             "decompile_timeouts": 0,
-            "partial_results": False
+            "thread_timeouts": 0,  # Hard thread timeouts (anti-analysis code)
+            "internal_timeouts": 0,  # Ghidra's internal decompiler timeouts
+            "partial_results": False,
+            "function_timeout_setting": function_timeout,
+            "max_functions_setting": max_functions if max_functions > 0 else None
         },
         "skipped_functions": []  # Track functions that couldn't be analyzed
     }
@@ -220,6 +319,8 @@ def extract_comprehensive_analysis():
     function_count = 0
     decompile_timeout_count = 0
     decompile_failure_count = 0
+    thread_timeout_count = 0  # Hard thread timeouts (likely anti-analysis)
+    internal_timeout_count = 0  # Ghidra's internal decompiler timeouts
 
     while function_iterator.hasNext():
         function = function_iterator.next()
@@ -304,42 +405,75 @@ def extract_comprehensive_analysis():
         if skip_decompile:
             function_info["decompile_status"] = "skipped"
         elif not function.isThunk() and not function.isExternal():
-            try:
-                # Use configurable timeout
-                decompile_results = decompiler.decompileFunction(function, function_timeout, monitor)
-                if decompile_results:
-                    if decompile_results.decompileCompleted():
-                        pseudocode = decompile_results.getDecompiledFunction()
-                        if pseudocode:
-                            function_info["pseudocode"] = safe_unicode(pseudocode.getC())
-                            function_info["decompile_status"] = "success"
-                        else:
-                            function_info["decompile_status"] = "empty_result"
-                            decompile_failure_count += 1
-                    else:
-                        # Decompilation timed out or was cancelled
-                        function_info["decompile_status"] = "timeout"
-                        decompile_timeout_count += 1
-                        context["skipped_functions"].append({
-                            "name": safe_unicode(function.getName()),
-                            "address": safe_unicode(entry_point),
-                            "reason": "decompile_timeout"
-                        })
-                        print(safe_format("    [!] Decompile timeout for {} at {}",
-                                          safe_unicode(function.getName()), safe_unicode(entry_point)))
-                else:
-                    function_info["decompile_status"] = "no_result"
-                    decompile_failure_count += 1
-            except Exception as e:
+            # Use thread-based timeout for robust handling of anti-analysis code
+            # This catches cases where Ghidra's internal timeout fails
+            decompile_result, status, error_msg = decompile_with_timeout(
+                decompiler, function, function_timeout, monitor, decompile_executor
+            )
+
+            if status == "timeout":
+                # Hard thread timeout - function likely has anti-analysis code
+                function_info["decompile_status"] = "thread_timeout"
+                decompile_timeout_count += 1
+                thread_timeout_count += 1
+                context["skipped_functions"].append({
+                    "name": safe_unicode(function.getName()),
+                    "address": safe_unicode(entry_point),
+                    "reason": "thread_timeout",
+                    "detail": error_msg
+                })
+                print(safe_format("    [!] TIMEOUT: {} at {} (thread timeout after {}s)",
+                                  safe_unicode(function.getName()), safe_unicode(entry_point),
+                                  function_timeout))
+
+            elif status == "error":
                 function_info["decompile_status"] = "error"
                 decompile_failure_count += 1
                 context["skipped_functions"].append({
                     "name": safe_unicode(function.getName()),
                     "address": safe_unicode(entry_point),
-                    "reason": safe_unicode(e)
+                    "reason": "decompile_error",
+                    "detail": error_msg
                 })
                 print(safe_format("    [!] Decompile error for {}: {}",
-                                  safe_unicode(function.getName()), safe_unicode(e)))
+                                  safe_unicode(function.getName()), error_msg))
+
+            elif status == "interrupted":
+                function_info["decompile_status"] = "interrupted"
+                decompile_failure_count += 1
+                context["skipped_functions"].append({
+                    "name": safe_unicode(function.getName()),
+                    "address": safe_unicode(entry_point),
+                    "reason": "interrupted"
+                })
+                print(safe_format("    [!] Decompilation interrupted for {}",
+                                  safe_unicode(function.getName())))
+
+            elif status == "success" and decompile_result:
+                # Check if decompilation actually completed
+                if decompile_result.decompileCompleted():
+                    pseudocode = decompile_result.getDecompiledFunction()
+                    if pseudocode:
+                        function_info["pseudocode"] = safe_unicode(pseudocode.getC())
+                        function_info["decompile_status"] = "success"
+                    else:
+                        function_info["decompile_status"] = "empty_result"
+                        decompile_failure_count += 1
+                else:
+                    # Ghidra's internal timeout triggered
+                    function_info["decompile_status"] = "internal_timeout"
+                    decompile_timeout_count += 1
+                    internal_timeout_count += 1
+                    context["skipped_functions"].append({
+                        "name": safe_unicode(function.getName()),
+                        "address": safe_unicode(entry_point),
+                        "reason": "ghidra_internal_timeout"
+                    })
+                    print(safe_format("    [!] Decompile timeout (internal) for {} at {}",
+                                      safe_unicode(function.getName()), safe_unicode(entry_point)))
+            else:
+                function_info["decompile_status"] = "no_result"
+                decompile_failure_count += 1
         else:
             function_info["decompile_status"] = "skipped_thunk_or_external"
 
@@ -348,6 +482,8 @@ def extract_comprehensive_analysis():
     # Update analysis stats
     context["analysis_stats"]["functions_analyzed"] = function_count
     context["analysis_stats"]["decompile_timeouts"] = decompile_timeout_count
+    context["analysis_stats"]["thread_timeouts"] = thread_timeout_count
+    context["analysis_stats"]["internal_timeouts"] = internal_timeout_count
     context["analysis_stats"]["decompile_failures"] = decompile_failure_count
 
     # Extract data types (structures)
@@ -405,12 +541,29 @@ def extract_comprehensive_analysis():
     stats = context["analysis_stats"]
     print("[*] Analysis statistics:")
     print(safe_format("    Functions analyzed: {}", stats["functions_analyzed"]))
-    print(safe_format("    Decompile timeouts: {}", stats["decompile_timeouts"]))
+    print(safe_format("    Total decompile timeouts: {}", stats["decompile_timeouts"]))
+    if stats["thread_timeouts"] > 0:
+        print(safe_format("      - Thread timeouts (anti-analysis): {}", stats["thread_timeouts"]))
+    if stats["internal_timeouts"] > 0:
+        print(safe_format("      - Internal timeouts (Ghidra): {}", stats["internal_timeouts"]))
     print(safe_format("    Decompile failures: {}", stats["decompile_failures"]))
     if stats["partial_results"]:
         print("    [!] PARTIAL RESULTS: Analysis was limited by max_functions setting")
     if context["skipped_functions"]:
         print(safe_format("    Skipped functions: {}", len(context["skipped_functions"])))
+
+    # Cleanup: shutdown the executor service
+    print("[*] Shutting down decompile executor...")
+    decompile_executor.shutdown()
+    try:
+        # Wait up to 10 seconds for tasks to complete
+        if not decompile_executor.awaitTermination(10, TimeUnit.SECONDS):
+            # Force shutdown if tasks don't complete
+            decompile_executor.shutdownNow()
+            print("    [!] Forced executor shutdown (some tasks may not have completed)")
+    except InterruptedException:
+        decompile_executor.shutdownNow()
+        Thread.currentThread().interrupt()
 
     return context
 

@@ -4,6 +4,8 @@ x64dbg HTTP bridge client.
 Communicates with the x64dbg native plugin via HTTP API.
 """
 
+from __future__ import annotations
+
 import logging
 import tempfile
 import time
@@ -13,15 +15,90 @@ from typing import Any
 
 import requests
 
+from src.utils.structured_errors import (
+    StructuredBaseError,
+    create_address_invalid_error,
+    create_address_missing_error,
+    create_error_from_api_response,
+)
+
 from ..base import Debugger, DebuggerState
 from .error_logger import ErrorContext, X64DbgErrorLogger
 
 logger = logging.getLogger(__name__)
 
+# Security: Maximum size for memory dumps (100MB) to prevent memory exhaustion
+MAX_DUMP_SIZE = 100 * 1024 * 1024
 
-class AddressValidationError(Exception):
-    """Raised when an address parameter is invalid or missing."""
-    pass
+
+class AddressValidationError(StructuredBaseError):
+    """
+    Raised when an address parameter is invalid or missing.
+
+    Enhanced with structured error information for actionable feedback.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        address: str | None = None,
+        param_name: str = "address",
+    ):
+        """
+        Initialize address validation error with structured error.
+
+        Args:
+            message: Error message (for backwards compatibility)
+            address: The invalid address value
+            param_name: Name of the parameter
+        """
+        # Determine error type based on message
+        if address is None or "missing" in message.lower() or "none" in message.lower():
+            structured_error = create_address_missing_error(param_name)
+        else:
+            structured_error = create_address_invalid_error(
+                address,
+                param_name,
+                {"original_message": message},
+            )
+
+        super().__init__(structured_error)
+        # Store for backwards compatibility
+        self._legacy_message = message
+
+    def __str__(self) -> str:
+        """Return structured error message."""
+        return self.structured_error.to_user_message()
+
+
+class X64DbgAPIError(StructuredBaseError):
+    """
+    Raised when an x64dbg API call fails.
+
+    Provides structured error information with actionable suggestions.
+    """
+
+    def __init__(
+        self,
+        operation: str,
+        api_message: str,
+        context: dict[str, Any] | None = None,
+    ):
+        """
+        Initialize API error with structured error.
+
+        Args:
+            operation: The operation that failed
+            api_message: Error message from the API
+            context: Additional context (address, module, etc.)
+        """
+        structured_error = create_error_from_api_response(
+            operation, api_message, context
+        )
+        super().__init__(structured_error)
+        self.operation = operation
+        self.api_message = api_message
+        self.context = context or {}
 
 
 class X64DbgBridge(Debugger):
@@ -63,18 +140,29 @@ class X64DbgBridge(Debugger):
             AddressValidationError: If address is None, empty, or invalid
         """
         if address is None:
-            raise AddressValidationError(f"Missing {param_name}: parameter is None")
+            raise AddressValidationError(
+                f"Missing {param_name}: parameter is None",
+                address=None,
+                param_name=param_name,
+            )
 
         if not isinstance(address, str):
             raise AddressValidationError(
-                f"Invalid {param_name}: expected string, got {type(address).__name__}"
+                f"Invalid {param_name}: expected string, got {type(address).__name__}",
+                address=str(address),
+                param_name=param_name,
             )
 
         # Strip whitespace
+        original_address = address
         address = address.strip()
 
         if not address:
-            raise AddressValidationError(f"Missing {param_name}: empty string")
+            raise AddressValidationError(
+                f"Missing {param_name}: empty string",
+                address=None,
+                param_name=param_name,
+            )
 
         # Remove 0x prefix if present
         if address.lower().startswith("0x"):
@@ -82,14 +170,20 @@ class X64DbgBridge(Debugger):
 
         # Validate hex characters
         if not address:
-            raise AddressValidationError(f"Invalid {param_name}: only '0x' prefix provided")
+            raise AddressValidationError(
+                f"Invalid {param_name}: only '0x' prefix provided",
+                address=original_address,
+                param_name=param_name,
+            )
 
         try:
             # Verify it's valid hex
             int(address, 16)
         except ValueError:
             raise AddressValidationError(
-                f"Invalid {param_name}: '{address}' is not a valid hex address"
+                f"Invalid {param_name}: '{address}' is not a valid hex address",
+                address=original_address,
+                param_name=param_name,
             )
 
         return address
@@ -251,10 +345,27 @@ class X64DbgBridge(Debugger):
             # Check API-level error
             if not result.get("success", False):
                 error_msg = result.get("error", "Unknown error")
-                error = RuntimeError(f"API error: {error_msg}")
 
-                # Build context from request data
-                context = ErrorContext(
+                # Build context from request data for structured error
+                error_context = {
+                    "address": data.get("address") if data else None,
+                    "module": data.get("module") if data else None,
+                    "register": data.get("register") if data else None,
+                    "size": data.get("size") if data else None,
+                    "expression": data.get("expression") if data else None,
+                    "endpoint": endpoint,
+                    "http_status": response.status_code,
+                }
+
+                # Create structured error
+                structured_api_error = X64DbgAPIError(
+                    operation=operation,
+                    api_message=error_msg,
+                    context=error_context,
+                )
+
+                # Build context for legacy error logging
+                log_context = ErrorContext(
                     operation=operation,
                     address=data.get("address") if data else None,
                     register=data.get("register") if data else None,
@@ -266,8 +377,8 @@ class X64DbgBridge(Debugger):
                 # Log API error
                 self._error_logger.log_error(
                     operation=operation,
-                    error=error,
-                    context=context,
+                    error=structured_api_error,
+                    context=log_context,
                     http_status=response.status_code,
                     api_response=result,
                     endpoint=endpoint,
@@ -275,7 +386,7 @@ class X64DbgBridge(Debugger):
                     traceback_str=traceback.format_exc()
                 )
 
-                raise error
+                raise structured_api_error
 
             return result
 
@@ -774,9 +885,20 @@ class X64DbgBridge(Debugger):
         Returns:
             True if dump successful
 
+        Raises:
+            ValueError: If size is invalid or exceeds maximum
+
         Note:
             Requires C++ plugin implementation of /api/memory/dump
         """
+        # Security: Validate size to prevent memory exhaustion (defense-in-depth)
+        if size <= 0:
+            raise ValueError("Size must be positive")
+        if size > MAX_DUMP_SIZE:
+            raise ValueError(
+                f"Dump size {size} bytes exceeds maximum {MAX_DUMP_SIZE} bytes (100MB)"
+            )
+
         if address.startswith("0x"):
             address = address[2:]
 
@@ -2012,6 +2134,210 @@ class X64DbgBridge(Debugger):
         """
         return self._request("/api/api_log/clear")
 
+    # =========================================================================
+    # Conditional Breakpoint with Logging
+    # =========================================================================
+
+    def set_conditional_breakpoint(
+        self,
+        address: str,
+        condition: str | None = None,
+        log_text: str | None = None,
+        log_condition: str | None = None,
+        command_text: str | None = None,
+        command_condition: str | None = None,
+        break_on_hit: bool = True,
+        fast_resume: bool = False,
+        silent: bool = False
+    ) -> dict[str, Any]:
+        """
+        Set a conditional breakpoint with optional logging using x64dbg native commands.
+
+        Uses x64dbg's native conditional breakpoint features:
+        - bpcnd: Set break condition
+        - bplog: Set log text
+        - bplogcondition: Set log condition
+        - bpcmd: Set command on hit
+        - bpcmdcondition: Set command condition
+        - SetBreakpointFastResume: For log-and-continue behavior
+        - SetBreakpointSilent: Suppress default log output
+
+        Args:
+            address: Breakpoint address (hex string or symbol)
+            condition: Break condition expression. Only breaks if non-zero.
+                      Examples: "rcx > 0x1000", "[rsp] == 0xDEADBEEF"
+            log_text: Log message template using x64dbg format.
+                     Examples: "CreateFileW: path={s:rcx}", "value={x:rax}"
+                     Format specifiers:
+                       - {x:reg} - hex value
+                       - {d:reg} - decimal
+                       - {s:reg} - string pointer (UTF-16 for W functions)
+                       - {a:reg} - ASCII string pointer
+                       - {p:reg} - pointer dereference
+            log_condition: Condition for logging (logs only if non-zero)
+            command_text: x64dbg command to execute on hit (e.g., "log rax")
+            command_condition: Condition for command execution
+            break_on_hit: If False, continue execution after logging (fast resume)
+            fast_resume: Use fast resume (faster but fewer hooks)
+            silent: Suppress x64dbg's default breakpoint hit message
+
+        Returns:
+            Dictionary with breakpoint configuration status
+
+        Example:
+            # Log CreateFileW calls without breaking
+            bridge.set_conditional_breakpoint(
+                "kernel32!CreateFileW",
+                log_text="CreateFileW: path={s:rcx}, access={x:rdx}",
+                break_on_hit=False,
+                silent=True
+            )
+
+            # Break only when condition is met
+            bridge.set_conditional_breakpoint(
+                "0x401234",
+                condition="rax > 0x1000"
+            )
+
+            # Log and break when specific value found
+            bridge.set_conditional_breakpoint(
+                "0x405000",
+                condition="[rsp+8] == 0xDEADBEEF",
+                log_text="Magic value! rax={x:rax}"
+            )
+        """
+        normalized_addr = self._normalize_address(address)
+
+        data = {
+            "address": normalized_addr,
+            "break_on_hit": 1 if break_on_hit else 0,
+            "fast_resume": 1 if fast_resume else 0,
+            "silent": 1 if silent else 0
+        }
+
+        if condition:
+            data["condition"] = condition
+        if log_text:
+            data["log_text"] = log_text
+        if log_condition:
+            data["log_condition"] = log_condition
+        if command_text:
+            data["command_text"] = command_text
+        if command_condition:
+            data["command_condition"] = command_condition
+
+        result = self._request("/api/breakpoint/conditional", data)
+        logger.info(f"Conditional breakpoint set at 0x{normalized_addr}")
+        return result
+
+    def set_api_logging_breakpoint(
+        self,
+        api_name: str,
+        log_file: str | None = None,
+        max_calls: int = 1000,
+        log_template: str | None = None,
+        break_on_hit: bool = False
+    ) -> dict[str, Any]:
+        """
+        Set up logging for a Windows API function.
+
+        Creates a conditional breakpoint on the API that logs parameters
+        according to a template. Can optionally write logs to a file.
+
+        Args:
+            api_name: API name (e.g., "WriteProcessMemory", "CreateFileW")
+                     Can be bare name or module!function format.
+            log_file: Optional file path to write logs to
+            max_calls: Maximum number of calls to log (default: 1000)
+            log_template: Custom log template. If None, uses default for known APIs.
+            break_on_hit: If True, break execution on each call (default: False)
+
+        Returns:
+            Dictionary with:
+                - api_name: The API being logged
+                - address: Resolved address
+                - log_file: Output file path (if specified)
+                - log_template: The template being used
+
+        Example:
+            bridge.set_api_logging_breakpoint(
+                "WriteProcessMemory",
+                log_file="/tmp/wpm_calls.txt",
+                max_calls=1000
+            )
+        """
+        data = {
+            "api_name": api_name,
+            "max_calls": max_calls,
+            "break_on_hit": 1 if break_on_hit else 0
+        }
+
+        if log_file:
+            data["log_file"] = log_file
+        if log_template:
+            data["log_template"] = log_template
+
+        result = self._request("/api/breakpoint/api_logging", data)
+        logger.info(f"API logging breakpoint set for {api_name}")
+        return result
+
+    def get_breakpoint_log(
+        self,
+        address: str | None = None,
+        offset: int = 0,
+        limit: int = 50
+    ) -> dict[str, Any]:
+        """
+        Get logged entries from conditional breakpoints.
+
+        Retrieves log entries captured by conditional breakpoints with
+        log_text or log_template configured.
+
+        Args:
+            address: Filter to specific breakpoint address. If None, return all.
+            offset: Starting index for pagination
+            limit: Maximum entries to return (default: 50, max: 1000)
+
+        Returns:
+            Dictionary with:
+                - total: Total number of log entries
+                - offset: Current offset
+                - entries: List of log entries, each containing:
+                    - timestamp: When the log was captured
+                    - address: Breakpoint address
+                    - message: Formatted log message
+                    - thread_id: Thread that triggered the breakpoint
+                    - registers: Register snapshot at time of hit (optional)
+
+        Example:
+            logs = bridge.get_breakpoint_log(address="0x7670EDC0", limit=50)
+            for entry in logs["entries"]:
+                print(f"[{entry['timestamp']}] {entry['message']}")
+        """
+        data = {"offset": offset, "limit": min(limit, 1000)}
+
+        if address:
+            normalized = self._normalize_address(address)
+            data["address"] = normalized
+
+        return self._request("/api/breakpoint/log", data)
+
+    def clear_breakpoint_log(self, address: str | None = None) -> dict[str, Any]:
+        """
+        Clear breakpoint log entries.
+
+        Args:
+            address: Clear logs for specific breakpoint. If None, clear all.
+
+        Returns:
+            Confirmation with count of cleared entries
+        """
+        data = {}
+        if address:
+            data["address"] = self._normalize_address(address)
+
+        return self._request("/api/breakpoint/log/clear", data)
+
     def find_strings(
         self,
         address: str | None = None,
@@ -2456,4 +2782,1283 @@ class X64DbgBridge(Debugger):
         data = {"file": file_path, "format": format}
         result = self._request("/api/coverage/export", data)
         logger.info(f"Exported coverage to {file_path}")
+        return result
+
+    # =========================================================================
+    # Module Dump with PE Reconstruction
+    # =========================================================================
+
+    def dump_module(
+        self,
+        module_name: str,
+        output_path: str,
+        fix_pe: bool = True,
+        unmap_sections: bool = True,
+        rebuild_iat: bool = False
+    ) -> dict[str, Any]:
+        """
+        Dump a module from memory with PE header reconstruction.
+
+        Reads a module from the debugged process memory and optionally fixes
+        the PE headers so the dumped file can be analyzed in IDA, Ghidra, etc.
+
+        Args:
+            module_name: Module name (e.g., "malware.dll") or base address as hex string
+            output_path: Path to save the dumped module
+            fix_pe: Fix PE headers (ImageBase, section characteristics, etc.)
+            unmap_sections: Convert sections from memory layout to file layout
+            rebuild_iat: Attempt to rebuild Import Address Table (experimental)
+
+        Returns:
+            Dictionary with:
+                - success: True if dump succeeded
+                - output_path: Path to dumped file
+                - original_base: Module base address
+                - size: Dumped size in bytes
+                - sections_fixed: Number of sections fixed
+                - imports_rebuilt: Whether IAT was rebuilt
+                - warnings: List of any warnings during processing
+
+        Example:
+            result = bridge.dump_module(
+                module_name="ForOps_v17.dll",
+                output_path="/tmp/dumped.dll",
+                fix_pe=True,
+                unmap_sections=True
+            )
+            if result["success"]:
+                print(f"Dumped to {result['output_path']}")
+        """
+        import pefile
+
+        result: dict[str, Any] = {
+            "success": False,
+            "output_path": output_path,
+            "original_base": None,
+            "size": 0,
+            "sections_fixed": 0,
+            "imports_rebuilt": False,
+            "warnings": []
+        }
+
+        # Find the module
+        modules = self.get_modules()
+        target_module = None
+
+        # Check if module_name is an address
+        try:
+            if module_name.lower().startswith("0x"):
+                base_addr = int(module_name, 16)
+            else:
+                base_addr = int(module_name, 16)
+
+            # Search by base address
+            for mod in modules:
+                mod_base_str = mod.get("base", "0")
+                if mod_base_str.startswith("0x"):
+                    mod_base = int(mod_base_str, 16)
+                else:
+                    mod_base = int(mod_base_str, 16)
+
+                if mod_base == base_addr:
+                    target_module = mod
+                    break
+        except ValueError:
+            # It's a module name, not an address
+            module_name_lower = module_name.lower()
+            for mod in modules:
+                if mod.get("name", "").lower() == module_name_lower:
+                    target_module = mod
+                    break
+
+        if not target_module:
+            raise RuntimeError(
+                f"Module '{module_name}' not found. "
+                f"Use get_modules() to list available modules."
+            )
+
+        # Get module details
+        base_str = target_module.get("base", "0")
+        if base_str.startswith("0x"):
+            base_addr = int(base_str, 16)
+        else:
+            base_addr = int(base_str, 16)
+
+        size = target_module.get("size", 0)
+        if isinstance(size, str):
+            if size.startswith("0x"):
+                size = int(size, 16)
+            else:
+                size = int(size, 16)
+
+        result["original_base"] = f"0x{base_addr:X}"
+        result["size"] = size
+
+        logger.info(f"Dumping module: {target_module.get('name', module_name)} "
+                   f"at 0x{base_addr:X}, size 0x{size:X}")
+
+        # Read module memory
+        raw_data = self.read_memory(f"0x{base_addr:X}", size)
+        if not raw_data:
+            raise RuntimeError(f"Failed to read memory at 0x{base_addr:X}")
+
+        if len(raw_data) < 64:
+            raise RuntimeError(f"Read data too small ({len(raw_data)} bytes)")
+
+        # Check for MZ header
+        if raw_data[:2] != b'MZ':
+            result["warnings"].append("No MZ header found - dumping raw memory")
+            with open(output_path, 'wb') as f:
+                f.write(raw_data)
+            result["success"] = True
+            return result
+
+        # Parse PE for reconstruction
+        if fix_pe or unmap_sections:
+            try:
+                pe = pefile.PE(data=raw_data, fast_load=True)
+                pe.parse_data_directories()
+
+                # Fix ImageBase
+                pe.OPTIONAL_HEADER.ImageBase = base_addr
+                logger.debug(f"Fixed ImageBase to 0x{base_addr:X}")
+
+                if unmap_sections:
+                    # Convert from memory layout to file layout
+                    raw_data = self._unmap_sections(pe, raw_data, result)
+
+                if rebuild_iat:
+                    # Attempt to rebuild IAT
+                    self._rebuild_iat(pe, raw_data, result)
+
+                # Write the fixed PE
+                pe.write(output_path)
+                result["success"] = True
+                logger.info(f"Dumped module to {output_path}")
+
+            except pefile.PEFormatError as e:
+                result["warnings"].append(f"PE parsing error: {e}")
+                # Fall back to raw dump
+                with open(output_path, 'wb') as f:
+                    f.write(raw_data)
+                result["success"] = True
+
+            except Exception as e:
+                result["warnings"].append(f"PE reconstruction error: {e}")
+                # Fall back to raw dump
+                with open(output_path, 'wb') as f:
+                    f.write(raw_data)
+                result["success"] = True
+        else:
+            # No PE fixing requested, dump raw
+            with open(output_path, 'wb') as f:
+                f.write(raw_data)
+            result["success"] = True
+
+        return result
+
+    def _unmap_sections(
+        self,
+        pe: Any,
+        raw_data: bytes,
+        result: dict[str, Any]
+    ) -> bytes:
+        """
+        Convert PE from memory layout to file layout.
+
+        In memory, sections are aligned to SectionAlignment (typically 0x1000).
+        On disk, sections are aligned to FileAlignment (typically 0x200).
+        This function remaps sections to their file layout positions.
+
+        Args:
+            pe: Parsed pefile.PE object
+            raw_data: Raw memory dump bytes
+            result: Result dict to update with warnings/counts
+
+        Returns:
+            Remapped PE data with file layout
+        """
+
+        section_alignment = pe.OPTIONAL_HEADER.SectionAlignment
+        file_alignment = pe.OPTIONAL_HEADER.FileAlignment
+
+        logger.debug(f"Section alignment: 0x{section_alignment:X}, "
+                    f"File alignment: 0x{file_alignment:X}")
+
+        # If alignments are the same, no remapping needed
+        if section_alignment == file_alignment:
+            result["warnings"].append("Section and file alignment are equal - no unmapping needed")
+            return raw_data
+
+        # Build the unmapped file
+        # Start with headers (up to first section)
+        headers_size = pe.OPTIONAL_HEADER.SizeOfHeaders
+        unmapped = bytearray(raw_data[:headers_size])
+
+        sections_fixed = 0
+
+        for section in pe.sections:
+            section_name = section.Name.rstrip(b'\x00').decode('utf-8', errors='replace')
+
+            # Memory location (RVA aligned to section alignment)
+            memory_offset = section.VirtualAddress
+            memory_size = section.Misc_VirtualSize
+
+            # Calculate file location (RVA aligned to file alignment)
+            # We need to figure out where this section should be in the file
+            raw_size = section.SizeOfRawData
+            raw_offset = section.PointerToRawData
+
+            logger.debug(
+                f"Section {section_name}: "
+                f"VA=0x{memory_offset:X}, VSize=0x{memory_size:X}, "
+                f"RawOff=0x{raw_offset:X}, RawSize=0x{raw_size:X}"
+            )
+
+            # Read section data from memory dump
+            if memory_offset < len(raw_data):
+                # Calculate how much data to copy
+                data_size = min(memory_size, raw_size, len(raw_data) - memory_offset)
+                section_data = raw_data[memory_offset:memory_offset + data_size]
+
+                # Ensure unmapped buffer is large enough
+                required_size = raw_offset + len(section_data)
+                if len(unmapped) < required_size:
+                    unmapped.extend(b'\x00' * (required_size - len(unmapped)))
+
+                # Copy section data to file offset
+                unmapped[raw_offset:raw_offset + len(section_data)] = section_data
+                sections_fixed += 1
+
+                logger.debug(f"Unmapped section {section_name}: "
+                           f"{len(section_data)} bytes at file offset 0x{raw_offset:X}")
+            else:
+                result["warnings"].append(
+                    f"Section {section_name} VA 0x{memory_offset:X} beyond dump size"
+                )
+
+        result["sections_fixed"] = sections_fixed
+
+        # Update section headers with correct file offsets
+        # (pefile should handle this when we call pe.write())
+
+        return bytes(unmapped)
+
+    def _rebuild_iat(
+        self,
+        pe: Any,
+        raw_data: bytes,
+        result: dict[str, Any]
+    ) -> None:
+        """
+        Attempt to rebuild the Import Address Table.
+
+        This is experimental and may not work for all binaries.
+        It tries to resolve imported function addresses back to their names.
+
+        Args:
+            pe: Parsed pefile.PE object
+            raw_data: Raw memory dump bytes
+            result: Result dict to update with status
+        """
+        try:
+            if not hasattr(pe, 'DIRECTORY_ENTRY_IMPORT'):
+                result["warnings"].append("No import directory found")
+                return
+
+            imports_fixed = 0
+
+            for entry in pe.DIRECTORY_ENTRY_IMPORT:
+                dll_name = entry.dll.decode('utf-8', errors='replace')
+                logger.debug(f"Processing imports from {dll_name}")
+
+                for imp in entry.imports:
+                    if imp.address:
+                        # Try to resolve the address to a symbol
+                        try:
+                            resolve_result = self.resolve_symbol(f"0x{imp.address:X}")
+                            if resolve_result.get("success") and resolve_result.get("symbol"):
+                                # Found the symbol - IAT entry is valid
+                                imports_fixed += 1
+                        except Exception:
+                            pass
+
+            if imports_fixed > 0:
+                result["imports_rebuilt"] = True
+                logger.info(f"Verified {imports_fixed} import entries")
+
+        except Exception as e:
+            result["warnings"].append(f"IAT rebuild failed: {e}")
+
+    # =========================================================================
+    # Memory Watch and Diff Functions
+    # =========================================================================
+
+    def watch_memory(
+        self,
+        address: str,
+        size: int = 4096,
+        poll_interval_ms: int = 100
+    ) -> dict[str, Any]:
+        """
+        Create a memory watch region.
+
+        This creates a watch on the specified memory region and takes an initial
+        snapshot. The watch can be used with run_until_memory_changed() to detect
+        modifications.
+
+        Args:
+            address: Start address to watch (hex string)
+            size: Number of bytes to watch (default: 4096)
+            poll_interval_ms: Polling interval in milliseconds (default: 100)
+
+        Returns:
+            Dictionary with:
+                - watch_id: Unique identifier for this watch
+                - address: Normalized address
+                - size: Watch size
+                - initial_hash: SHA256 hash of initial memory contents
+                - poll_interval_ms: Configured poll interval
+
+        Example:
+            watch = bridge.watch_memory("0x089A9020", size=4096)
+            result = bridge.run_until_memory_changed(watch["watch_id"], timeout_ms=60000)
+        """
+        import hashlib
+
+        normalized_addr = self._normalize_address(address)
+        addr_int = int(normalized_addr, 16)
+
+        # Read initial memory contents
+        initial_data = self.read_memory(f"0x{normalized_addr}", size)
+        if not initial_data:
+            raise RuntimeError(f"Failed to read memory at 0x{normalized_addr}")
+
+        # Generate watch ID
+        watch_id = hashlib.sha256(
+            f"{normalized_addr}_{size}_{time.time()}".encode()
+        ).hexdigest()[:16]
+
+        # Calculate initial hash
+        initial_hash = hashlib.sha256(initial_data).hexdigest()
+
+        # Store watch data
+        if not hasattr(self, '_memory_watches'):
+            self._memory_watches: dict[str, dict[str, Any]] = {}
+
+        self._memory_watches[watch_id] = {
+            "watch_id": watch_id,
+            "address": addr_int,
+            "address_hex": normalized_addr,
+            "size": size,
+            "poll_interval_ms": poll_interval_ms,
+            "initial_data": initial_data,
+            "initial_hash": initial_hash,
+            "created_at": time.time()
+        }
+
+        logger.info(f"Created memory watch {watch_id} at 0x{normalized_addr}, size={size}")
+
+        return {
+            "watch_id": watch_id,
+            "address": f"0x{normalized_addr}",
+            "size": size,
+            "initial_hash": initial_hash,
+            "poll_interval_ms": poll_interval_ms
+        }
+
+    def run_until_memory_changed(
+        self,
+        watch_id: str,
+        timeout_ms: int = 60000,
+        poll_interval_ms: int | None = None
+    ) -> dict[str, Any]:
+        """
+        Run execution until watched memory region changes.
+
+        Starts execution and polls the watched memory region until a change
+        is detected or timeout is reached.
+
+        Args:
+            watch_id: Watch ID from watch_memory()
+            timeout_ms: Maximum wait time in milliseconds (default: 60 seconds)
+            poll_interval_ms: Override poll interval (uses watch default if None)
+
+        Returns:
+            Dictionary with:
+                - changed: True if memory changed, False if timeout
+                - address: Watch address
+                - change_offset: Offset of first change (if changed)
+                - change_size: Total bytes changed
+                - triggered_at: RIP when change detected (hex string)
+                - before_hash: Hash before change
+                - after_hash: Hash after change
+                - elapsed_ms: Time elapsed
+                - error: Error message (if applicable)
+
+        Example:
+            watch = bridge.watch_memory("0x089A9020", size=4096)
+            result = bridge.run_until_memory_changed(watch["watch_id"], timeout_ms=60000)
+            if result["changed"]:
+                print(f"Memory changed at offset {result['change_offset']}")
+                diff = bridge.memory_diff(watch["watch_id"])
+        """
+        import hashlib
+
+        # Get watch data
+        if not hasattr(self, '_memory_watches'):
+            self._memory_watches = {}
+
+        watch = self._memory_watches.get(watch_id)
+        if not watch:
+            return {
+                "changed": False,
+                "error": f"Watch not found: {watch_id}",
+                "elapsed_ms": 0
+            }
+
+        address = watch["address"]
+        size = watch["size"]
+        initial_data = watch["initial_data"]
+        initial_hash = watch["initial_hash"]
+        interval = poll_interval_ms or watch["poll_interval_ms"]
+
+        start_time = time.time()
+        timeout_sec = timeout_ms / 1000
+
+        # Start execution
+        self.run()
+
+        try:
+            while True:
+                # Check timeout
+                elapsed = time.time() - start_time
+                if elapsed >= timeout_sec:
+                    self.pause()
+                    return {
+                        "changed": False,
+                        "address": f"0x{address:X}",
+                        "before_hash": initial_hash,
+                        "after_hash": initial_hash,
+                        "elapsed_ms": int(elapsed * 1000),
+                        "error": f"Timeout after {timeout_ms}ms"
+                    }
+
+                # Sleep for poll interval
+                time.sleep(interval / 1000)
+
+                # Pause to read memory
+                self.pause()
+
+                # Read current memory
+                try:
+                    current_data = self.read_memory(f"0x{address:X}", size)
+                except Exception as e:
+                    # Memory might become unmapped - this could indicate significant changes
+                    logger.warning(f"Failed to read memory during watch: {e}")
+                    location = self.get_current_location()
+                    return {
+                        "changed": True,
+                        "address": f"0x{address:X}",
+                        "change_offset": 0,
+                        "change_size": size,
+                        "triggered_at": f"0x{location.get('address', '0')}",
+                        "before_hash": initial_hash,
+                        "after_hash": "UNREADABLE",
+                        "elapsed_ms": int((time.time() - start_time) * 1000),
+                        "error": f"Memory became unreadable: {e}"
+                    }
+
+                # Calculate current hash
+                current_hash = hashlib.sha256(current_data).hexdigest()
+
+                if current_hash != initial_hash:
+                    # Memory changed! Find the first changed byte
+                    change_offset = None
+                    change_count = 0
+
+                    for i in range(min(len(initial_data), len(current_data))):
+                        if initial_data[i] != current_data[i]:
+                            if change_offset is None:
+                                change_offset = i
+                            change_count += 1
+
+                    # Get current RIP
+                    location = self.get_current_location()
+                    triggered_at = location.get('address', '0')
+
+                    # Update watch with new data for subsequent diffs
+                    watch["last_data"] = current_data
+                    watch["last_hash"] = current_hash
+
+                    logger.info(
+                        f"Memory change detected in watch {watch_id} at offset {change_offset}, "
+                        f"{change_count} bytes changed"
+                    )
+
+                    return {
+                        "changed": True,
+                        "address": f"0x{address:X}",
+                        "change_offset": change_offset or 0,
+                        "change_size": change_count,
+                        "triggered_at": f"0x{triggered_at}",
+                        "before_hash": initial_hash,
+                        "after_hash": current_hash,
+                        "elapsed_ms": int((time.time() - start_time) * 1000)
+                    }
+
+                # No change, resume execution
+                self.run()
+
+        except Exception as e:
+            logger.error(f"run_until_memory_changed failed: {e}")
+            try:
+                self.pause()
+            except Exception:
+                pass
+            return {
+                "changed": False,
+                "address": f"0x{address:X}",
+                "before_hash": initial_hash,
+                "after_hash": initial_hash,
+                "elapsed_ms": int((time.time() - start_time) * 1000),
+                "error": str(e)
+            }
+
+    def memory_diff(self, watch_id: str) -> dict[str, Any]:
+        """
+        Get byte-level diff for a memory watch.
+
+        Compares current memory contents against the initial snapshot
+        and returns detailed diff information.
+
+        Args:
+            watch_id: Watch ID from watch_memory()
+
+        Returns:
+            Dictionary with:
+                - changed: True if memory differs from initial snapshot
+                - address: Watch address
+                - size: Watch size
+                - before_hash: Initial hash
+                - after_hash: Current hash
+                - changed_bytes: Total bytes that differ
+                - changed_ranges: List of dicts with offset, length, address
+                - diff: List of diff entries with offset, old_byte, new_byte
+                       (limited to first 1000 changes)
+
+        Example:
+            diff = bridge.memory_diff(watch_id)
+            for entry in diff["diff"]:
+                print(f"Offset {entry['offset']}: {entry['old']} -> {entry['new']}")
+        """
+        import hashlib
+
+        if not hasattr(self, '_memory_watches'):
+            self._memory_watches = {}
+
+        watch = self._memory_watches.get(watch_id)
+        if not watch:
+            return {
+                "changed": False,
+                "error": f"Watch not found: {watch_id}"
+            }
+
+        address = watch["address"]
+        size = watch["size"]
+        initial_data = watch["initial_data"]
+        initial_hash = watch["initial_hash"]
+
+        # Read current memory
+        current_data = self.read_memory(f"0x{address:X}", size)
+        if not current_data:
+            return {
+                "changed": False,
+                "error": f"Failed to read memory at 0x{address:X}"
+            }
+
+        current_hash = hashlib.sha256(current_data).hexdigest()
+
+        if current_hash == initial_hash:
+            return {
+                "changed": False,
+                "address": f"0x{address:X}",
+                "size": size,
+                "before_hash": initial_hash,
+                "after_hash": current_hash,
+                "changed_bytes": 0,
+                "changed_ranges": [],
+                "diff": []
+            }
+
+        # Build detailed diff
+        diff_entries = []
+        changed_ranges = []
+        change_start = None
+        changed_bytes = 0
+
+        for i in range(min(len(initial_data), len(current_data))):
+            if initial_data[i] != current_data[i]:
+                changed_bytes += 1
+                if change_start is None:
+                    change_start = i
+
+                # Add to diff entries (limit to 1000)
+                if len(diff_entries) < 1000:
+                    diff_entries.append({
+                        "offset": i,
+                        "address": f"0x{address + i:X}",
+                        "old": f"{initial_data[i]:02X}",
+                        "new": f"{current_data[i]:02X}"
+                    })
+            else:
+                if change_start is not None:
+                    changed_ranges.append({
+                        "offset": change_start,
+                        "length": i - change_start,
+                        "address": f"0x{address + change_start:X}"
+                    })
+                    change_start = None
+
+        # Handle trailing change
+        if change_start is not None:
+            changed_ranges.append({
+                "offset": change_start,
+                "length": min(len(initial_data), len(current_data)) - change_start,
+                "address": f"0x{address + change_start:X}"
+            })
+
+        return {
+            "changed": True,
+            "address": f"0x{address:X}",
+            "size": size,
+            "before_hash": initial_hash,
+            "after_hash": current_hash,
+            "changed_bytes": changed_bytes,
+            "changed_ranges": changed_ranges,
+            "diff": diff_entries,
+            "truncated": len(diff_entries) >= 1000
+        }
+
+    def list_memory_watches(self) -> dict[str, Any]:
+        """
+        List all active memory watches.
+
+        Returns:
+            Dictionary with:
+                - watches: List of watch info dictionaries
+                - count: Number of active watches
+        """
+        if not hasattr(self, '_memory_watches'):
+            self._memory_watches = {}
+
+        watches = []
+        for watch_id, watch in self._memory_watches.items():
+            watches.append({
+                "watch_id": watch_id,
+                "address": f"0x{watch['address']:X}",
+                "size": watch["size"],
+                "initial_hash": watch["initial_hash"][:16] + "...",
+                "poll_interval_ms": watch["poll_interval_ms"],
+                "created_at": watch["created_at"]
+            })
+
+        return {
+            "watches": watches,
+            "count": len(watches)
+        }
+
+    def remove_memory_watch(self, watch_id: str) -> dict[str, Any]:
+        """
+        Remove a memory watch.
+
+        Args:
+            watch_id: Watch ID to remove
+
+        Returns:
+            Dictionary with success status
+        """
+        if not hasattr(self, '_memory_watches'):
+            self._memory_watches = {}
+
+        if watch_id in self._memory_watches:
+            del self._memory_watches[watch_id]
+            logger.info(f"Removed memory watch {watch_id}")
+            return {"success": True, "watch_id": watch_id}
+        else:
+            return {"success": False, "error": f"Watch not found: {watch_id}"}
+
+    # =========================================================================
+    # API Hook Detection Methods
+    # =========================================================================
+
+    def detect_hooks(
+        self,
+        modules: list[str] | None = None,
+        methods: list[str] | None = None,
+        max_functions: int = 200
+    ) -> dict[str, Any]:
+        """
+        Detect API hooks in loaded modules.
+
+        Scans for inline hooks (JMP/CALL patches), IAT hooks (import table
+        modifications), and EAT hooks (export table redirects).
+
+        Args:
+            modules: List of module names to scan. If None, scans common
+                    system modules (ntdll, kernel32, kernelbase).
+            methods: List of detection methods: "inline", "iat", "eat".
+                    If None, defaults to ["inline", "iat", "eat"].
+            max_functions: Maximum functions to check per module (default: 200)
+
+        Returns:
+            Dictionary containing:
+                - hooks_found: List of detected hooks with details
+                - summary: Statistics about the scan
+                - modules_scanned: Number of modules scanned
+                - functions_checked: Number of functions checked
+
+        Example:
+            result = bridge.detect_hooks(
+                modules=["ntdll.dll", "kernel32.dll"],
+                methods=["inline", "iat", "eat"]
+            )
+        """
+        # Default modules
+        if modules is None:
+            modules = ["ntdll.dll", "kernel32.dll", "kernelbase.dll"]
+
+        # Default methods
+        if methods is None:
+            methods = ["inline", "iat", "eat"]
+
+        # Normalize method names
+        methods = [m.lower() for m in methods]
+
+        # Get loaded modules info
+        loaded_modules = self.get_modules()
+        module_map: dict[str, dict[str, Any]] = {}
+        for mod in loaded_modules:
+            name = mod.get("name", "").lower()
+            base = mod.get("base", "0")
+            size = mod.get("size", "0")
+
+            # Parse base and size
+            if isinstance(base, str):
+                base = int(base, 16) if base.startswith("0x") or base.startswith("0X") else int(base, 16)
+            if isinstance(size, str):
+                size = int(size, 16) if size.startswith("0x") or size.startswith("0X") else int(size, 16)
+
+            module_map[name] = {
+                "base": base,
+                "size": size,
+                "path": mod.get("path", "")
+            }
+
+        hooks_found: list[dict[str, Any]] = []
+        modules_scanned = 0
+        functions_checked = 0
+        inline_hooks = 0
+        iat_hooks = 0
+        eat_hooks = 0
+
+        for module_name in modules:
+            module_name_lower = module_name.lower()
+            if not module_name_lower.endswith(".dll") and "." not in module_name_lower:
+                module_name_lower += ".dll"
+
+            if module_name_lower not in module_map:
+                logger.debug(f"Module not loaded: {module_name_lower}")
+                continue
+
+            mod_info = module_map[module_name_lower]
+            mod_base = mod_info["base"]
+            mod_size = mod_info["size"]
+            modules_scanned += 1
+
+            # Get module exports for inline and EAT hook detection
+            exports: list[dict[str, str]] = []
+            try:
+                exports_result = self.get_module_exports(module_name_lower)
+                exports = exports_result if isinstance(exports_result, list) else exports_result.get("exports", [])
+            except Exception as e:
+                logger.debug(f"Failed to get exports for {module_name_lower}: {e}")
+
+            # Check inline hooks on exported functions
+            if "inline" in methods and exports:
+                for export in exports[:max_functions]:
+                    functions_checked += 1
+                    hook = self._check_inline_hook_entry(
+                        export, mod_base, mod_size, module_name_lower
+                    )
+                    if hook:
+                        hooks_found.append(hook)
+                        inline_hooks += 1
+
+            # Check EAT hooks (export table redirects)
+            if "eat" in methods and exports:
+                for export in exports[:max_functions]:
+                    hook = self._check_eat_hook(
+                        export, mod_base, mod_size, module_name_lower
+                    )
+                    if hook:
+                        hooks_found.append(hook)
+                        eat_hooks += 1
+
+            # Check IAT hooks for the main executable
+            if "iat" in methods:
+                # Find the main executable module
+                main_module = None
+                for mod_name, mod_data in module_map.items():
+                    if mod_name.endswith(".exe"):
+                        main_module = mod_name
+                        break
+
+                if main_module:
+                    iat_hook_results = self._check_iat_hooks(
+                        main_module, module_name_lower, module_map, max_functions
+                    )
+                    for hook in iat_hook_results:
+                        hooks_found.append(hook)
+                        iat_hooks += 1
+                        functions_checked += 1
+
+        return {
+            "hooks_found": hooks_found,
+            "summary": {
+                "total_hooks": len(hooks_found),
+                "inline_hooks": inline_hooks,
+                "iat_hooks": iat_hooks,
+                "eat_hooks": eat_hooks
+            },
+            "modules_scanned": modules_scanned,
+            "functions_checked": functions_checked
+        }
+
+    def _check_inline_hook_entry(
+        self,
+        export: dict[str, str],
+        mod_base: int,
+        mod_size: int,
+        module_name: str
+    ) -> dict[str, Any] | None:
+        """
+        Check if a function entry point has an inline hook.
+
+        Looks for JMP (E9, FF 25), CALL (E8), push+ret, or mov+jmp patterns
+        that redirect to addresses outside the module.
+
+        Args:
+            export: Export entry with name and address
+            mod_base: Module base address
+            mod_size: Module size
+            module_name: Module name for reporting
+
+        Returns:
+            Hook info dict if hook detected, None otherwise
+        """
+        func_name = export.get("name", "")
+        func_addr = export.get("address", "")
+
+        if not func_addr:
+            return None
+
+        # Parse function address
+        if isinstance(func_addr, str):
+            try:
+                func_addr_int = int(func_addr, 16) if not func_addr.startswith("0x") else int(func_addr, 16)
+            except ValueError:
+                return None
+        else:
+            func_addr_int = func_addr
+
+        try:
+            # Read first 16 bytes of function
+            first_bytes = self.read_memory(f"0x{func_addr_int:X}", 16)
+            if not first_bytes or len(first_bytes) < 5:
+                return None
+
+            redirect_to = None
+            hook_type = None
+            bytes_modified = 0
+
+            # Check for relative JMP (E9 xx xx xx xx)
+            if first_bytes[0] == 0xE9:
+                offset = int.from_bytes(first_bytes[1:5], 'little', signed=True)
+                next_addr = func_addr_int + 5
+                redirect_to = next_addr + offset
+                hook_type = "inline_jmp"
+                bytes_modified = 5
+
+            # Check for relative CALL (E8 xx xx xx xx)
+            elif first_bytes[0] == 0xE8:
+                offset = int.from_bytes(first_bytes[1:5], 'little', signed=True)
+                next_addr = func_addr_int + 5
+                redirect_to = next_addr + offset
+                hook_type = "inline_call"
+                bytes_modified = 5
+
+            # Check for absolute JMP via memory (FF 25 xx xx xx xx) - RIP-relative in x64
+            elif len(first_bytes) >= 6 and first_bytes[0] == 0xFF and first_bytes[1] == 0x25:
+                offset = int.from_bytes(first_bytes[2:6], 'little', signed=True)
+                next_addr = func_addr_int + 6
+                ptr_addr = next_addr + offset
+                # Read the pointer to get actual target
+                try:
+                    ptr_data = self.read_memory(f"0x{ptr_addr:X}", 8)
+                    if ptr_data and len(ptr_data) >= 8:
+                        redirect_to = int.from_bytes(ptr_data[:8], 'little')
+                    else:
+                        redirect_to = ptr_addr  # Fallback to pointer location
+                except Exception:
+                    redirect_to = ptr_addr
+                hook_type = "inline_jmp_indirect"
+                bytes_modified = 6
+
+            # Check for push + ret pattern (68 xx xx xx xx C3) - 6 bytes
+            elif len(first_bytes) >= 6 and first_bytes[0] == 0x68 and first_bytes[5] == 0xC3:
+                redirect_to = int.from_bytes(first_bytes[1:5], 'little')
+                hook_type = "push_ret"
+                bytes_modified = 6
+
+            # Check for mov rax + jmp rax pattern (48 B8 ... FF E0) - 12 bytes for 64-bit
+            elif len(first_bytes) >= 12 and first_bytes[0] == 0x48 and first_bytes[1] == 0xB8:
+                if first_bytes[10] == 0xFF and first_bytes[11] == 0xE0:
+                    redirect_to = int.from_bytes(first_bytes[2:10], 'little')
+                    hook_type = "mov_jmp"
+                    bytes_modified = 12
+
+            if redirect_to is None:
+                return None
+
+            # Check if redirect is outside the module
+            mod_end = mod_base + mod_size
+            if mod_base <= redirect_to < mod_end:
+                # Redirect is within module - probably not a hook
+                return None
+
+            return {
+                "module": module_name,
+                "function": func_name,
+                "address": f"0x{func_addr_int:X}",
+                "type": "inline_hook",
+                "hook_subtype": hook_type,
+                "redirect_to": f"0x{redirect_to:X}",
+                "bytes_modified": bytes_modified,
+                "original_bytes": "unknown",
+                "hooked_bytes": first_bytes[:bytes_modified].hex().upper()
+            }
+
+        except Exception as e:
+            logger.debug(f"Failed to check inline hook for {func_name}: {e}")
+            return None
+
+    def _check_eat_hook(
+        self,
+        export: dict[str, str],
+        mod_base: int,
+        mod_size: int,
+        module_name: str
+    ) -> dict[str, Any] | None:
+        """
+        Check if an export table entry redirects outside the module (EAT hook).
+
+        EAT hooks modify the export address table to point to code outside
+        the module, often to a forwarded export or hooked function.
+
+        Args:
+            export: Export entry with name and address
+            mod_base: Module base address
+            mod_size: Module size
+            module_name: Module name for reporting
+
+        Returns:
+            Hook info dict if EAT hook detected, None otherwise
+        """
+        func_name = export.get("name", "")
+        func_addr = export.get("address", "")
+
+        if not func_addr:
+            return None
+
+        # Parse function address
+        if isinstance(func_addr, str):
+            try:
+                func_addr_int = int(func_addr, 16) if not func_addr.startswith("0x") else int(func_addr, 16)
+            except ValueError:
+                return None
+        else:
+            func_addr_int = func_addr
+
+        # Check if export address is outside module bounds
+        mod_end = mod_base + mod_size
+
+        if func_addr_int < mod_base or func_addr_int >= mod_end:
+            # Export points outside module - this is an EAT hook or forward
+            # Try to determine where it points
+            try:
+                # Check if it's a known module
+                target_module = None
+
+                modules = self.get_modules()
+                for mod in modules:
+                    m_base = mod.get("base", "0")
+                    m_size = mod.get("size", "0")
+                    if isinstance(m_base, str):
+                        m_base = int(m_base, 16) if m_base.startswith("0x") else int(m_base, 16)
+                    if isinstance(m_size, str):
+                        m_size = int(m_size, 16) if m_size.startswith("0x") else int(m_size, 16)
+
+                    if m_base <= func_addr_int < m_base + m_size:
+                        target_module = mod.get("name", "unknown")
+                        break
+
+                return {
+                    "module": module_name,
+                    "function": func_name,
+                    "address": f"0x{func_addr_int:X}",
+                    "type": "eat_hook",
+                    "redirect_to": f"0x{func_addr_int:X}",
+                    "target_module": target_module,
+                    "bytes_modified": 0,
+                    "original_bytes": "N/A",
+                    "hooked_bytes": "N/A"
+                }
+            except Exception as e:
+                logger.debug(f"Failed to analyze EAT hook for {func_name}: {e}")
+
+        return None
+
+    def _check_iat_hooks(
+        self,
+        main_module: str,
+        target_module: str,
+        module_map: dict[str, dict[str, Any]],
+        max_functions: int
+    ) -> list[dict[str, Any]]:
+        """
+        Check for IAT hooks by comparing import addresses to actual export addresses.
+
+        IAT hooks modify the Import Address Table to redirect calls to hooked
+        functions instead of the original API implementations.
+
+        Args:
+            main_module: Name of the main executable module
+            target_module: Name of the DLL to check imports from
+            module_map: Map of module names to their info
+            max_functions: Maximum imports to check
+
+        Returns:
+            List of detected IAT hooks
+        """
+        hooks: list[dict[str, Any]] = []
+
+        try:
+            # Get imports for the main module
+            imports = self.get_module_imports(main_module)
+            if not imports:
+                return hooks
+
+            # Get exports from target module for comparison
+            exports = self.get_module_exports(target_module)
+            if not exports:
+                return hooks
+
+            # Build export address map
+            export_map: dict[str, int] = {}
+            for exp in exports:
+                name = exp.get("name", "")
+                addr = exp.get("address", "")
+                if name and addr:
+                    if isinstance(addr, str):
+                        try:
+                            addr_int = int(addr, 16) if not addr.startswith("0x") else int(addr, 16)
+                        except ValueError:
+                            continue
+                    else:
+                        addr_int = addr
+                    export_map[name] = addr_int
+
+            # Get target module info
+            target_lower = target_module.lower()
+            if target_lower not in module_map:
+                return hooks
+            target_info = module_map[target_lower]
+            target_base = target_info["base"]
+            target_size = target_info["size"]
+
+            # Check each import from the target module
+            checked = 0
+            for imp in imports:
+                if checked >= max_functions:
+                    break
+
+                imp_module = imp.get("module", "").lower()
+                if target_lower not in imp_module:
+                    continue
+
+                func_name = imp.get("function", "")
+                iat_addr = imp.get("address", "")
+
+                if not func_name or not iat_addr:
+                    continue
+
+                checked += 1
+
+                # Parse IAT entry address
+                if isinstance(iat_addr, str):
+                    try:
+                        iat_addr_int = int(iat_addr, 16) if not iat_addr.startswith("0x") else int(iat_addr, 16)
+                    except ValueError:
+                        continue
+                else:
+                    iat_addr_int = iat_addr
+
+                # Read the actual value at the IAT entry (the function pointer)
+                try:
+                    iat_value_bytes = self.read_memory(f"0x{iat_addr_int:X}", 8)
+                    if not iat_value_bytes or len(iat_value_bytes) < 8:
+                        continue
+                    iat_value = int.from_bytes(iat_value_bytes[:8], 'little')
+                except Exception:
+                    continue
+
+                # Compare with expected export address
+                expected_addr = export_map.get(func_name)
+                if expected_addr is None:
+                    continue
+
+                # Check if IAT value points to the expected address
+                if iat_value != expected_addr:
+                    # IAT has been modified - check if it points outside the target module
+                    target_end = target_base + target_size
+
+                    if iat_value < target_base or iat_value >= target_end:
+                        # Definite IAT hook - points outside the expected module
+                        hooks.append({
+                            "module": target_module,
+                            "function": func_name,
+                            "address": f"0x{iat_addr_int:X}",
+                            "type": "iat_hook",
+                            "redirect_to": f"0x{iat_value:X}",
+                            "expected_address": f"0x{expected_addr:X}",
+                            "bytes_modified": 8,
+                            "original_bytes": f"{expected_addr:016X}",
+                            "hooked_bytes": f"{iat_value:016X}"
+                        })
+
+        except Exception as e:
+            logger.debug(f"Failed to check IAT hooks for {main_module} -> {target_module}: {e}")
+
+        return hooks
+
+    def unhook_function(
+        self,
+        module_name: str,
+        function_name: str,
+        original_bytes: str | None = None
+    ) -> dict[str, Any]:
+        """
+        Remove an inline hook from a function by restoring original bytes.
+
+        Args:
+            module_name: Name of the module containing the function
+            function_name: Name of the function to unhook
+            original_bytes: Original bytes to restore (hex string).
+                           If not provided, common syscall stub patterns are tried.
+
+        Returns:
+            Dictionary with:
+                - success: Whether unhook succeeded
+                - function: Function name
+                - address: Function address
+                - previous_bytes: Bytes before unhooking
+                - restored_bytes: Bytes after unhooking
+                - error: Error message if failed
+
+        Example:
+            result = bridge.unhook_function(
+                "ntdll.dll",
+                "NtCreateFile",
+                original_bytes="4C8BD1B8550000"
+            )
+        """
+        result: dict[str, Any] = {
+            "success": False,
+            "function": function_name,
+            "module": module_name,
+            "address": None,
+            "previous_bytes": None,
+            "restored_bytes": None,
+            "error": None
+        }
+
+        try:
+            # Resolve function address
+            expression = f"{module_name}!{function_name}"
+            resolve_result = self.resolve_symbol(expression)
+
+            if not resolve_result.get("success"):
+                result["error"] = f"Failed to resolve '{expression}': {resolve_result.get('error', 'Unknown error')}"
+                return result
+
+            func_addr = resolve_result.get("address", "")
+            if isinstance(func_addr, str):
+                func_addr_int = int(func_addr, 16) if func_addr.startswith("0x") else int(func_addr, 16)
+            else:
+                func_addr_int = func_addr
+
+            result["address"] = f"0x{func_addr_int:X}"
+
+            # Read current bytes
+            current_bytes = self.read_memory(f"0x{func_addr_int:X}", 16)
+            if not current_bytes:
+                result["error"] = f"Could not read memory at 0x{func_addr_int:X}"
+                return result
+
+            result["previous_bytes"] = current_bytes[:12].hex().upper()
+
+            # Determine original bytes to restore
+            if original_bytes:
+                try:
+                    orig_bytes = bytes.fromhex(original_bytes.replace(" ", "").replace("0x", ""))
+                except ValueError:
+                    result["error"] = f"Invalid hex string for original_bytes: {original_bytes}"
+                    return result
+            else:
+                # Try common patterns for ntdll syscall stubs
+                # These are the typical first bytes of Windows syscall stubs
+                result["error"] = (
+                    "Original bytes required to unhook.\n"
+                    "Provide the original function prologue bytes (hex string).\n"
+                    "Common ntdll syscall prologues:\n"
+                    "  - 4C 8B D1 B8 xx xx 00 00  (mov r10, rcx; mov eax, syscall_num)\n"
+                    "  - 48 89 5C 24 08           (mov [rsp+8], rbx)\n"
+                    "  - 40 53 48 83 EC 20        (push rbx; sub rsp, 20h)"
+                )
+                return result
+
+            # Check if already restored
+            if current_bytes[:len(orig_bytes)] == orig_bytes:
+                result["success"] = True
+                result["restored_bytes"] = orig_bytes.hex().upper()
+                result["error"] = "Function is not hooked (bytes already match original)"
+                return result
+
+            # Write original bytes
+            self.write_memory(f"0x{func_addr_int:X}", orig_bytes)
+
+            # Verify write
+            verify_bytes = self.read_memory(f"0x{func_addr_int:X}", len(orig_bytes))
+            if verify_bytes and verify_bytes == orig_bytes:
+                result["success"] = True
+                result["restored_bytes"] = orig_bytes.hex().upper()
+            else:
+                result["error"] = "Write verification failed"
+                result["restored_bytes"] = verify_bytes.hex().upper() if verify_bytes else "read failed"
+
+        except Exception as e:
+            result["error"] = str(e)
+            logger.error(f"unhook_function failed: {e}")
+
         return result

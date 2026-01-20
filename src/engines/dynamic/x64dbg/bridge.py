@@ -35,6 +35,9 @@ from src.utils.structured_errors import (
 
 logger = logging.getLogger(__name__)
 
+# Security: Maximum size for memory dumps (100MB) to prevent memory exhaustion
+MAX_DUMP_SIZE = 100 * 1024 * 1024
+
 
 class AddressValidationError(StructuredErrorException):
     """
@@ -890,9 +893,20 @@ class X64DbgBridge(Debugger):
         Returns:
             True if dump successful
 
+        Raises:
+            ValueError: If size is invalid or exceeds maximum
+
         Note:
             Requires C++ plugin implementation of /api/memory/dump
         """
+        # Security: Validate size to prevent memory exhaustion (defense-in-depth)
+        if size <= 0:
+            raise ValueError("Size must be positive")
+        if size > MAX_DUMP_SIZE:
+            raise ValueError(
+                f"Dump size {size} bytes exceeds maximum {MAX_DUMP_SIZE} bytes (100MB)"
+            )
+
         if address.startswith("0x"):
             address = address[2:]
 

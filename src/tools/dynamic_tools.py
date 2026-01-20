@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import time
+from pathlib import Path
 
 from fastmcp import FastMCP
 
@@ -22,6 +23,7 @@ from src.engines.dynamic.x64dbg.bridge import (
 from src.engines.dynamic.x64dbg.commands import X64DbgCommands
 from src.engines.session import AnalysisType, UnifiedSessionManager
 from src.engines.static.ghidra.project_cache import ProjectCache
+from src.utils.security import PathTraversalError, sanitize_output_path
 from src.utils.structured_errors import StructuredErrorException
 
 logger = logging.getLogger(__name__)
@@ -41,6 +43,12 @@ _current_debug_binary: str | None = None
 
 # Cache for function mappings (binary_path -> {function_name -> static_address})
 _function_mappings: dict[str, dict[str, dict]] = {}
+
+# Security: Allowed output directory for memory/module dumps
+DUMP_OUTPUT_DIR = Path.home() / ".binary_mcp_output" / "dumps"
+
+# Security: Maximum size for memory dumps (100MB) to prevent memory exhaustion
+MAX_DUMP_SIZE = 100 * 1024 * 1024
 
 
 def _format_log_template(bridge, template: str) -> str:
@@ -1827,14 +1835,35 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
         Note:
             Requires x64dbg plugin C++ implementation
         """
+        # Security: Validate size to prevent memory exhaustion
+        if size <= 0:
+            return "Error: Size must be positive"
+        if size > MAX_DUMP_SIZE:
+            return (f"Error: Dump size {size} bytes exceeds maximum "
+                    f"{MAX_DUMP_SIZE} bytes (100MB). "
+                    "Use chunked reads for larger regions.")
+
+        # Security: Validate output path to prevent directory traversal
+        try:
+            DUMP_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+            output_path = Path(output_file)
+            # If relative path, resolve within dump directory
+            if not output_path.is_absolute():
+                output_path = DUMP_OUTPUT_DIR / output_path
+            safe_path = sanitize_output_path(output_path, DUMP_OUTPUT_DIR)
+        except PathTraversalError as e:
+            return f"Error: Invalid output path - {e}"
+        except ValueError as e:
+            return f"Error: Invalid path - {e}"
+
         try:
             bridge = get_x64dbg_bridge()
-            bridge.dump_memory(address, size, output_file)
+            bridge.dump_memory(address, size, str(safe_path))
 
             return f"Memory dumped successfully\n" \
                    f"Address: {address}\n" \
                    f"Size: {size} bytes ({size / 1024:.2f} KB)\n" \
-                   f"Output: {output_file}"
+                   f"Output: {safe_path}"
 
         except Exception as e:
             logger.error(f"x64dbg_dump_memory failed: {e}")
@@ -2368,13 +2397,26 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 "warnings": []
             }
         """
+        # Security: Validate output path to prevent directory traversal
+        try:
+            DUMP_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+            out_path = Path(output_path)
+            # If relative path, resolve within dump directory
+            if not out_path.is_absolute():
+                out_path = DUMP_OUTPUT_DIR / out_path
+            safe_path = sanitize_output_path(out_path, DUMP_OUTPUT_DIR)
+        except PathTraversalError as e:
+            return f"Error: Invalid output path - {e}"
+        except ValueError as e:
+            return f"Error: Invalid path - {e}"
+
         try:
             bridge = get_x64dbg_bridge()
 
             # Call the bridge method which handles PE reconstruction
             result = bridge.dump_module(
                 module_name=module_name,
-                output_path=output_path,
+                output_path=str(safe_path),
                 fix_pe=fix_pe,
                 unmap_sections=unmap_sections,
                 rebuild_iat=rebuild_iat

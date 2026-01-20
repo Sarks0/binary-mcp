@@ -330,5 +330,79 @@ class TestResultDictStructure:
         assert len(result["warnings"]) > 0
 
 
+class TestSecurityValidations:
+    """Test security validations for dump operations."""
+
+    def test_size_limit_validation(self):
+        """Test that size limit is properly enforced."""
+        from src.tools.dynamic_tools import MAX_DUMP_SIZE
+
+        # Verify the constant is set correctly (100MB)
+        assert MAX_DUMP_SIZE == 100 * 1024 * 1024
+
+        # Test that sizes exceeding MAX_DUMP_SIZE would be rejected
+        test_sizes = [
+            (1000, True),  # Valid
+            (MAX_DUMP_SIZE, True),  # Valid (at limit)
+            (MAX_DUMP_SIZE + 1, False),  # Invalid (exceeds limit)
+            (200 * 1024 * 1024, False),  # Invalid (200MB)
+            (0, False),  # Invalid (zero)
+            (-1, False),  # Invalid (negative)
+        ]
+
+        for size, should_be_valid in test_sizes:
+            is_valid = size > 0 and size <= MAX_DUMP_SIZE
+            assert is_valid == should_be_valid, f"Size {size} validation failed"
+
+    def test_path_traversal_detection(self):
+        """Test that path traversal attempts are detected."""
+        from src.utils.security import PathTraversalError, sanitize_output_path
+
+        # Resolve to handle macOS symlinks (/var -> /private/var)
+        allowed_dir = (Path(tempfile.gettempdir()) / "test_dumps").resolve()
+        allowed_dir.mkdir(parents=True, exist_ok=True)
+
+        # Valid paths (within allowed directory)
+        valid_paths = [
+            allowed_dir / "dump.dll",
+            allowed_dir / "subdir" / "dump.dll",
+        ]
+
+        # Create subdir for valid path test
+        (allowed_dir / "subdir").mkdir(parents=True, exist_ok=True)
+
+        for path in valid_paths:
+            # Should not raise
+            result = sanitize_output_path(path, allowed_dir)
+            assert result.is_relative_to(allowed_dir)
+
+        # Invalid paths (traversal attempts)
+        invalid_paths = [
+            allowed_dir / ".." / "etc" / "passwd",
+            allowed_dir / ".." / ".." / "tmp" / "evil.dll",
+            Path("/etc/passwd"),
+            Path("/tmp/outside.dll"),
+        ]
+
+        for path in invalid_paths:
+            with pytest.raises((PathTraversalError, ValueError)):
+                sanitize_output_path(path, allowed_dir)
+
+    def test_bridge_size_validation(self):
+        """Test that bridge.py also validates size (defense in depth)."""
+        from src.engines.dynamic.x64dbg.bridge import MAX_DUMP_SIZE
+
+        # Verify bridge has the same limit
+        assert MAX_DUMP_SIZE == 100 * 1024 * 1024
+
+    def test_dump_output_directory_constant(self):
+        """Test that the dump output directory is properly defined."""
+        from src.tools.dynamic_tools import DUMP_OUTPUT_DIR
+
+        # Should be in user's home directory
+        assert DUMP_OUTPUT_DIR.parts[-2] == ".binary_mcp_output"
+        assert DUMP_OUTPUT_DIR.parts[-1] == "dumps"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -127,9 +127,9 @@ class TestUnmapSectionsLogic:
         # If a section has VirtualSize=0x500 and is at VA=0x1000
         # it needs to be placed at the correct file offset
         virtual_address = 0x1000
-        virtual_size = 0x500
+        _virtual_size = 0x500  # noqa: F841 (documentation variable)
         raw_data_offset = 0x400  # After headers
-        raw_data_size = 0x200  # Aligned to file alignment
+        _raw_data_size = 0x200  # noqa: F841 (documentation variable)
 
         # The section data should be copied from memory VA to file offset
         assert raw_data_offset < virtual_address
@@ -251,18 +251,18 @@ class TestPEHeaderParsing:
 
     def test_pe_magic_values(self):
         """Test PE magic value identification."""
-        PE32_MAGIC = 0x10B
-        PE32PLUS_MAGIC = 0x20B
+        pe32_magic = 0x10B
+        pe32plus_magic = 0x20B
 
-        assert PE32_MAGIC == 267  # 32-bit PE
-        assert PE32PLUS_MAGIC == 523  # 64-bit PE
+        assert pe32_magic == 267  # 32-bit PE
+        assert pe32plus_magic == 523  # 64-bit PE
 
         # Determine architecture from magic
         def is_64bit(magic):
-            return magic == PE32PLUS_MAGIC
+            return magic == pe32plus_magic
 
-        assert is_64bit(PE32PLUS_MAGIC) is True
-        assert is_64bit(PE32_MAGIC) is False
+        assert is_64bit(pe32plus_magic) is True
+        assert is_64bit(pe32_magic) is False
 
     def test_imagebase_offset_calculation(self):
         """Test ImageBase offset calculation for PE32 and PE32+."""

@@ -16,7 +16,7 @@ from typing import Any
 import requests
 
 from src.utils.structured_errors import (
-    StructuredErrorException,
+    StructuredBaseError,
     create_address_invalid_error,
     create_address_missing_error,
     create_error_from_api_response,
@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 MAX_DUMP_SIZE = 100 * 1024 * 1024
 
 
-class AddressValidationError(StructuredErrorException):
+class AddressValidationError(StructuredBaseError):
     """
     Raised when an address parameter is invalid or missing.
 
@@ -71,7 +71,7 @@ class AddressValidationError(StructuredErrorException):
         return self.structured_error.to_user_message()
 
 
-class X64DbgAPIError(StructuredErrorException):
+class X64DbgAPIError(StructuredBaseError):
     """
     Raised when an x64dbg API call fails.
 

@@ -11,8 +11,8 @@ import pytest
 
 from src.utils.structured_errors import (
     ErrorCode,
+    StructuredBaseError,
     StructuredError,
-    StructuredErrorException,
     classify_api_error,
     create_address_invalid_error,
     create_address_missing_error,
@@ -124,8 +124,8 @@ class TestStructuredError:
         assert "Error [API_ERROR]" in str(error)
 
 
-class TestStructuredErrorException:
-    """Tests for StructuredErrorException."""
+class TestStructuredBaseError:
+    """Tests for StructuredBaseError."""
 
     def test_exception_wraps_error(self):
         """Test exception wraps structured error."""
@@ -134,7 +134,7 @@ class TestStructuredErrorException:
             message="Symbol 'foo' not found",
         )
 
-        exc = StructuredErrorException(structured_error)
+        exc = StructuredBaseError(structured_error)
 
         assert exc.structured_error == structured_error
         assert "SYMBOL_NOT_FOUND" in str(exc)
@@ -146,7 +146,7 @@ class TestStructuredErrorException:
             message="Operation timed out",
         )
 
-        exc = StructuredErrorException(structured_error)
+        exc = StructuredBaseError(structured_error)
         result = exc.to_dict()
 
         assert result["error"] in ["TIMEOUT_ERROR", "DEBUGGER_TIMEOUT"]
@@ -158,8 +158,8 @@ class TestStructuredErrorException:
             message="No breakpoint at address",
         )
 
-        with pytest.raises(StructuredErrorException) as exc_info:
-            raise StructuredErrorException(structured_error)
+        with pytest.raises(StructuredBaseError) as exc_info:
+            raise StructuredBaseError(structured_error)
 
         assert exc_info.value.structured_error.error == ErrorCode.BREAKPOINT_NOT_FOUND
 
@@ -475,7 +475,7 @@ class TestIntegrationWithBridge:
         """
         # Create an error using the factory (simulates what AddressValidationError does)
         error = create_address_missing_error("target")
-        exc = StructuredErrorException(error)
+        exc = StructuredBaseError(error)
 
         assert exc.structured_error.error == ErrorCode.ADDRESS_MISSING
         assert "target" in str(exc)
@@ -493,7 +493,7 @@ class TestIntegrationWithBridge:
             address="xyz",
             param_name="breakpoint_address",
         )
-        exc = StructuredErrorException(error)
+        exc = StructuredBaseError(error)
 
         assert exc.structured_error.error == ErrorCode.ADDRESS_INVALID
         assert "xyz" in str(exc)

@@ -22,7 +22,7 @@ from src.engines.dynamic.x64dbg.commands import X64DbgCommands
 from src.engines.session import AnalysisType, UnifiedSessionManager
 from src.engines.static.ghidra.project_cache import ProjectCache
 from src.utils.security import PathTraversalError, sanitize_output_path
-from src.utils.structured_errors import StructuredErrorException
+from src.utils.structured_errors import StructuredBaseError
 
 logger = logging.getLogger(__name__)
 
@@ -289,14 +289,14 @@ def _check_inline_hook(
     }
 
 
-def format_structured_error(error: StructuredErrorException) -> str:
+def format_structured_error(error: StructuredBaseError) -> str:
     """
     Format a structured error for MCP tool output.
 
     Provides rich, actionable error messages with suggestions for users.
 
     Args:
-        error: A StructuredErrorException (includes AddressValidationError, X64DbgAPIError)
+        error: A StructuredBaseError (includes AddressValidationError, X64DbgAPIError)
 
     Returns:
         Formatted error string suitable for tool output
@@ -322,7 +322,7 @@ def format_error_response(
     Returns:
         Formatted error string
     """
-    if isinstance(error, StructuredErrorException):
+    if isinstance(error, StructuredBaseError):
         message = format_structured_error(error)
         if include_json:
             message += f"\n\n--- JSON ---\n{error.to_json()}"
@@ -958,7 +958,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             bridge.set_breakpoint(address)
             return f"Breakpoint set at {address}"
 
-        except StructuredErrorException as e:
+        except StructuredBaseError as e:
             logger.error(f"x64dbg_set_breakpoint failed: {e.structured_error.error.value}")
             return format_error_response(e, "set_breakpoint")
         except Exception as e:
@@ -982,7 +982,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             bridge.delete_breakpoint(address)
             return f"Breakpoint deleted at {address}"
 
-        except StructuredErrorException as e:
+        except StructuredBaseError as e:
             logger.error(f"x64dbg_delete_breakpoint failed: {e.structured_error.error.value}")
             return format_error_response(e, "delete_breakpoint")
         except Exception as e:
@@ -1228,7 +1228,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
             return "\n".join(result)
 
-        except StructuredErrorException as e:
+        except StructuredBaseError as e:
             logger.error(f"x64dbg_disassemble failed: {e.structured_error.error.value}")
             return format_error_response(e, "disassemble")
         except Exception as e:
@@ -2510,7 +2510,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                     f"Size: {size} bytes\n\n"
                     f"Note: Maximum 4 hardware breakpoints can be active.")
 
-        except StructuredErrorException as e:
+        except StructuredBaseError as e:
             logger.error(f"x64dbg_set_hardware_bp failed: {e.structured_error.error.value}")
             return format_error_response(e, "set_hardware_breakpoint")
         except ValueError as e:
@@ -2706,7 +2706,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
             return "\n".join(output)
 
-        except StructuredErrorException as e:
+        except StructuredBaseError as e:
             logger.error(f"x64dbg_set_memory_bp failed: {e.structured_error.error.value}")
             return format_error_response(e, "set_memory_breakpoint")
         except ValueError as e:
@@ -2747,7 +2747,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
             return f"Memory breakpoint deleted at {address}"
 
-        except StructuredErrorException as e:
+        except StructuredBaseError as e:
             logger.error(f"x64dbg_delete_memory_bp failed: {e.structured_error.error.value}")
             return format_error_response(e, "delete_memory_breakpoint")
         except Exception as e:
@@ -3700,7 +3700,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
             return "\n".join(output)
 
-        except StructuredErrorException as e:
+        except StructuredBaseError as e:
             logger.error(f"x64dbg_set_conditional_breakpoint failed: {e.structured_error.error.value}")
             return format_error_response(e, "set_conditional_breakpoint")
         except Exception as e:
@@ -4075,7 +4075,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
                 return "\n".join(output)
 
-        except StructuredErrorException as e:
+        except StructuredBaseError as e:
             logger.error(f"x64dbg_set_conditional_bp failed: {e.structured_error.error.value}")
             return format_error_response(e, "set_conditional_bp")
         except Exception as e:
@@ -4282,7 +4282,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
                 return "\n".join(output)
 
-        except StructuredErrorException as e:
+        except StructuredBaseError as e:
             logger.error(f"x64dbg_log_api_params failed: {e.structured_error.error.value}")
             return format_error_response(e, "log_api_params")
         except Exception as e:
@@ -4652,7 +4652,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
             return "\n".join(output)
 
-        except StructuredErrorException as e:
+        except StructuredBaseError as e:
             logger.error(f"x64dbg_set_breakpoint_by_name failed: {e.structured_error.error.value}")
             return format_error_response(e, "set_breakpoint_by_name")
         except Exception as e:
@@ -4954,7 +4954,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 output.append(f"  Signature: {result['signature']}")
             return "\n".join(output)
 
-        except StructuredErrorException as e:
+        except StructuredBaseError as e:
             return format_error_response(e, "set_breakpoint_by_function")
         except Exception as e:
             logger.error(f"x64dbg_set_breakpoint_by_function failed: {e}")

@@ -2,8 +2,8 @@
 
 from .structured_errors import (
     ErrorCode,
+    StructuredBaseError,
     StructuredError,
-    StructuredErrorException,
     create_address_invalid_error,
     create_address_missing_error,
     create_api_error,
@@ -26,7 +26,7 @@ from .structured_errors import (
 __all__ = [
     "ErrorCode",
     "StructuredError",
-    "StructuredErrorException",
+    "StructuredBaseError",
     "create_address_invalid_error",
     "create_address_missing_error",
     "create_api_error",

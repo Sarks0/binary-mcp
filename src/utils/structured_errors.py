@@ -142,7 +142,7 @@ class StructuredError:
         return self.to_user_message()
 
 
-class StructuredErrorException(Exception):
+class StructuredBaseError(Exception):
     """
     Exception that wraps a StructuredError.
 

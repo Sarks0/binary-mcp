@@ -452,7 +452,7 @@ class GhidraRunner:
                 )
                 stdout = stdout_bytes.decode("utf-8", errors="replace")
                 stderr = stderr_bytes.decode("utf-8", errors="replace")
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 # Kill the process on timeout
                 logger.warning(f"Ghidra analysis timed out after {timeout}s, killing process")
                 process.kill()

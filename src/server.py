@@ -9,7 +9,6 @@ Provides 40+ tools for static and dynamic binary analysis:
 
 import asyncio
 import functools
-import inspect
 import json
 import logging
 import re

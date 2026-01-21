@@ -410,38 +410,18 @@ try:
             "Check Ghidra logs for details."
         )
 
-    # Open the program for analysis
+    # Set up FlatProgramAPI for script compatibility
     from ghidra.program.flatapi import FlatProgramAPI
-    from ghidra.program.util import GhidraProgramUtilities
-    from ghidra.app.plugin.core.analysis import AutoAnalysisManager
 
     flat_api = FlatProgramAPI(program)
     monitor = ConsoleTaskMonitor()
 
-    # Run auto-analysis if not already done
-    if not GhidraProgramUtilities.isAnalyzed(program):
-        print(f"Starting auto-analysis for {{binary_path}}...", file=sys.stderr)
-        analysis_mgr = AutoAnalysisManager.getAnalysisManager(program)
-
-        # Start analysis (non-blocking)
-        analysis_mgr.reAnalyzeAll(None)
-
-        # Wait for analysis to complete
-        from ghidra.program.model.listing import Program
-        from ghidra.framework.model import DomainObjectChangeRecord
-
-        # Get the transaction manager to properly wait for analysis
-        tx_mgr = program.getTransactionList()
-
-        # Wait for auto-analysis to complete using the analysis manager
-        # This blocks until all analyzers finish
-        while analysis_mgr.isAnalyzing():
-            import time
-            time.sleep(0.5)
-
-        print("Auto-analysis completed", file=sys.stderr)
-    else:
-        print(f"Program already analyzed: {{binary_path}}", file=sys.stderr)
+    # Run auto-analysis using GhidraProject.analyze()
+    # This is the recommended PyGhidra approach - it handles analysis waiting
+    # internally and is more reliable than manual AutoAnalysisManager polling
+    print(f"Starting auto-analysis for {{binary_path}}...", file=sys.stderr)
+    project.analyze(program)
+    print("Auto-analysis completed", file=sys.stderr)
 
     # Execute the analysis script
     script_path = {repr(str(full_script_path))}

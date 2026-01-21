@@ -281,11 +281,11 @@ def _calculate_timeout(binary_path: str) -> int:
     """
     Calculate appropriate timeout based on binary file size.
 
-    Uses formula: 60s base + 120s per MB
+    Uses formula: 780s base (13 min) + 120s per MB
     Examples:
-    - 1 MB binary: 60 + 120 = 180s (3 min)
-    - 5 MB binary: 60 + 600 = 660s (11 min)
-    - 10 MB binary: 60 + 1200 = 1260s (21 min)
+    - 1 MB binary: 780 + 120 = 900s (15 min)
+    - 5 MB binary: 780 + 600 = 1380s (23 min)
+    - 10 MB binary: 780 + 1200 = 1980s (33 min, capped at max)
 
     Args:
         binary_path: Path to binary file
@@ -297,8 +297,8 @@ def _calculate_timeout(binary_path: str) -> int:
         file_size_bytes = Path(binary_path).stat().st_size
         file_size_mb = file_size_bytes / (1024 * 1024)
 
-        # Base 60s + 120s per MB
-        calculated_timeout = int(60 + (file_size_mb * 120))
+        # Base 780s (13 min) + 120s per MB for larger binaries
+        calculated_timeout = int(780 + (file_size_mb * 120))
 
         # Get configured max timeout (default 1800s = 30 min)
         max_timeout = get_config_int("GHIDRA_TIMEOUT", 1800)
@@ -499,7 +499,7 @@ async def analyze_binary(
     It loads the binary, runs Ghidra's auto-analysis, and extracts comprehensive data.
 
     This async version doesn't block other MCP requests while Ghidra analyzes large binaries.
-    Timeout scales automatically based on file size (60s base + 120s per MB).
+    Timeout scales automatically based on file size (780s base + 120s per MB).
 
     IMPORTANT: This tool automatically checks binary compatibility before analysis.
     For .NET assemblies or packed binaries, it will return recommendations for better tools.

@@ -913,6 +913,11 @@ except Exception as e:
             "execution_mode": "pyhidra" if self.use_pyhidra else "analyzeHeadless",
         }
 
+        # Environment variable settings
+        diag["ghidra_maxmem"] = os.environ.get("GHIDRA_MAXMEM", "4G (default)")
+        diag["ghidra_use_legacy"] = os.environ.get("GHIDRA_USE_LEGACY", "not set")
+        diag["ghidra_timeout"] = os.environ.get("GHIDRA_TIMEOUT", "600 (default)")
+
         # Check analyzeHeadless
         analyze_cmd = self._get_analyze_headless_cmd()
         diag["analyze_headless"] = analyze_cmd
@@ -932,15 +937,15 @@ except Exception as e:
             diag["java_installed"] = False
             diag["java_version"] = None
 
-        # Check PyGhidra availability
-        if self.use_pyhidra:
-            try:
-                import pyhidra
-                diag["pyhidra_installed"] = True
-                diag["pyhidra_version"] = getattr(pyhidra, "__version__", "unknown")
-            except ImportError:
-                diag["pyhidra_installed"] = False
-                diag["pyhidra_version"] = None
+        # Check PyGhidra availability (always check, useful for diagnostics)
+        try:
+            import pyhidra
+            diag["pyhidra_installed"] = True
+            diag["pyhidra_version"] = getattr(pyhidra, "__version__", "unknown")
+        except ImportError:
+            diag["pyhidra_installed"] = False
+            diag["pyhidra_version"] = None
+            if self.use_pyhidra:
                 diag["pyhidra_warning"] = (
                     "PyGhidra required for Ghidra 11+ but not installed. "
                     "Install with: pip install 'binary-mcp[ghidra11]'"

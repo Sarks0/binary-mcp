@@ -1345,14 +1345,30 @@ def diagnose_setup() -> str:
         result += f"- Platform: {diag['platform']}\n"
         result += f"- Ghidra Path: `{diag['ghidra_path']}`\n"
         result += f"- Ghidra Exists: {'YES' if diag['ghidra_exists'] else 'NO'}\n"
-        result += f"- analyzeHeadless: `{diag['analyze_headless']}`\n"
-        result += f"- analyzeHeadless Exists: {'YES' if diag['analyze_headless_exists'] else 'NO'}\n"
-        result += f"- Java Installed: {'YES' if diag['java_installed'] else 'NO'}\n"
+        result += f"- Ghidra Version: {diag.get('ghidra_version', 'Unknown')}\n"
+        result += f"- Execution Mode: **{diag['execution_mode']}**\n\n"
 
+        result += "**Java & Ghidra Tools:**\n"
+        result += f"- Java Installed: {'YES' if diag['java_installed'] else 'NO'}\n"
         if diag['java_version']:
             result += f"- Java Version: {diag['java_version']}\n"
+        result += f"- analyzeHeadless: `{diag['analyze_headless']}`\n"
+        result += f"- analyzeHeadless Exists: {'YES' if diag['analyze_headless_exists'] else 'NO'}\n\n"
 
-        result += f"- Ghidra Version: {diag.get('ghidra_version', 'Unknown')}\n\n"
+        # PyGhidra info
+        result += "**PyGhidra (Ghidra 11+):**\n"
+        result += f"- Installed: {'YES' if diag.get('pyhidra_installed') else 'NO'}\n"
+        if diag.get('pyhidra_version'):
+            result += f"- Version: {diag['pyhidra_version']}\n"
+        if diag.get('pyhidra_warning'):
+            result += f"- ⚠️ {diag['pyhidra_warning']}\n"
+        result += "\n"
+
+        # Environment settings
+        result += "**Environment Settings:**\n"
+        result += f"- GHIDRA_MAXMEM: {diag.get('ghidra_maxmem', 'not set')}\n"
+        result += f"- GHIDRA_TIMEOUT: {diag.get('ghidra_timeout', 'not set')}\n"
+        result += f"- GHIDRA_USE_LEGACY: {diag.get('ghidra_use_legacy', 'not set')}\n\n"
 
         # Cache info
         cached_binaries = cache.list_cached()
@@ -1371,12 +1387,16 @@ def diagnose_setup() -> str:
             result += f"- Active Session: `{session_stats['active_session'][:8]}...`\n"
         result += "\n"
 
+        # Warnings and status
         if not diag['ghidra_exists']:
-            result += "\n**WARNING:** Ghidra not found! Please install Ghidra or set GHIDRA_HOME environment variable.\n"
+            result += "**⚠️ WARNING:** Ghidra not found! Please install Ghidra or set GHIDRA_HOME environment variable.\n"
         elif not diag['java_installed']:
-            result += "\n**WARNING:** Java not found! Ghidra requires Java 21+.\n"
+            result += "**⚠️ WARNING:** Java not found! Ghidra requires Java 21+.\n"
+        elif diag['execution_mode'] == 'pyhidra' and not diag.get('pyhidra_installed'):
+            result += "**⚠️ WARNING:** PyGhidra mode selected but pyhidra not installed!\n"
+            result += "Install with: `pip install 'binary-mcp[ghidra11]'`\n"
         else:
-            result += "\n**Setup looks good!** Ready to analyze binaries.\n"
+            result += "**✓ Setup looks good!** Ready to analyze binaries.\n"
 
         return result
 

@@ -354,8 +354,6 @@ class GhidraRunner:
         This prevents LockException when a previous analysis was interrupted
         (e.g., by MCP client timeout) and left lock files behind.
         """
-        import shutil
-
         project_folder = project_dir / project_name
 
         # Check for stale lock files

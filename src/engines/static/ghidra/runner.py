@@ -375,7 +375,6 @@ class GhidraRunner:
                 f"""
 import os
 import sys
-import pyhidra
 
 # Set Java heap size before initializing PyGhidra
 os.environ['MAXMEM'] = {repr(java_maxmem)}
@@ -386,64 +385,75 @@ for key, value in {repr(env)}.items():
     os.environ[key] = value
 
 try:
-    # Initialize PyGhidra
-    pyhidra.start(install_dir={repr(str(self.ghidra_path))})
+    # Try new pyghidra (Ghidra 12.0+) first, fall back to pyhidra (Ghidra 11.x)
+    try:
+        import pyghidra
+        pyghidra_module = pyghidra
+        print("Using pyghidra (Ghidra 12.0+ API)", file=sys.stderr)
+    except ImportError:
+        import pyhidra as pyghidra_module
+        print("Using pyhidra (Ghidra 11.x API)", file=sys.stderr)
 
-    # Import Ghidra modules
-    from ghidra.base.project import GhidraProject
-    from ghidra.util.task import ConsoleTaskMonitor
+    # Initialize PyGhidra - this starts the JVM
+    print("Initializing PyGhidra...", file=sys.stderr)
+    pyghidra_module.start(install_dir={repr(str(self.ghidra_path))})
+    print("PyGhidra initialized successfully", file=sys.stderr)
 
-    # Create/open project
+    # Use open_program() which handles import, project creation, and auto-analysis
+    # This is the recommended PyGhidra API - much simpler than manual GhidraProject calls
+    binary_path = {repr(str(binary_path))}
     project_location = {repr(str(project_dir))}
     project_name = {repr(project_name)}
-    project = GhidraProject.openProject(project_location, project_name, True)
 
-    # Import the binary
-    binary_path = {repr(str(binary_path))}
-    program = project.importProgram(binary_path)
+    print(f"Opening and analyzing binary: {{binary_path}}", file=sys.stderr)
+    print("This may take several minutes for complex binaries...", file=sys.stderr)
 
-    # Check if import succeeded
-    if program is None:
-        raise RuntimeError(
-            f"Failed to import binary: {{binary_path}}. "
-            "The file may be corrupted, not a supported format, or the import failed. "
-            "Check Ghidra logs for details."
-        )
+    with pyghidra_module.open_program(
+        binary_path,
+        project_location=project_location,
+        project_name=project_name,
+        analyze=True  # Auto-analysis runs during context entry
+    ) as flat_api:
+        print("Binary loaded and analyzed successfully", file=sys.stderr)
 
-    # Set up FlatProgramAPI for script compatibility
-    from ghidra.program.flatapi import FlatProgramAPI
+        # Get program and monitor from FlatProgramAPI
+        program = flat_api.getCurrentProgram()
+        monitor = flat_api.getMonitor()
 
-    flat_api = FlatProgramAPI(program)
-    monitor = ConsoleTaskMonitor()
+        if program is None:
+            raise RuntimeError(
+                f"Failed to load binary: {{binary_path}}. "
+                "The file may be corrupted or not a supported format."
+            )
 
-    # Run auto-analysis using GhidraProject.analyze()
-    # This is the recommended PyGhidra approach - it handles analysis waiting
-    # internally and is more reliable than manual AutoAnalysisManager polling
-    print(f"Starting auto-analysis for {{binary_path}}...", file=sys.stderr)
-    project.analyze(program)
-    print("Auto-analysis completed", file=sys.stderr)
+        print(f"Program loaded: {{program.getName()}}", file=sys.stderr)
+        print(f"Executable format: {{program.getExecutableFormat()}}", file=sys.stderr)
 
-    # Execute the analysis script
-    script_path = {repr(str(full_script_path))}
-    with open(script_path) as f:
-        script_code = f.read()
+        # Execute the analysis script
+        script_path = {repr(str(full_script_path))}
+        print(f"Executing analysis script: {{script_path}}", file=sys.stderr)
 
-    # Set up globals that Ghidra scripts expect
-    script_globals = {{
-        'currentProgram': program,
-        'monitor': monitor,
-    }}
+        with open(script_path) as f:
+            script_code = f.read()
 
-    # Execute the script
-    exec(compile(script_code, script_path, 'exec'), script_globals)
+        # Set up globals that Ghidra scripts expect
+        script_globals = {{
+            'currentProgram': program,
+            'monitor': monitor,
+            'flat_api': flat_api,
+        }}
 
-    # Close and save
-    project.save(program)
-    project.close()
+        # Execute the script
+        exec(compile(script_code, script_path, 'exec'), script_globals)
+        print("Analysis script completed", file=sys.stderr)
+
+    print("Analysis complete, project closed", file=sys.stderr)
 
 except ImportError as e:
     print(f"ERROR: Failed to import required module: {{e}}", file=sys.stderr)
-    print("Make sure pyhidra is installed: pip install 'binary-mcp[ghidra11]'", file=sys.stderr)
+    print("Make sure pyghidra or pyhidra is installed:", file=sys.stderr)
+    print("  For Ghidra 12.0+: pip install pyghidra", file=sys.stderr)
+    print("  For Ghidra 11.x:  pip install pyhidra", file=sys.stderr)
     sys.exit(1)
 except RuntimeError as e:
     print(f"ERROR: Runtime error during analysis: {{e}}", file=sys.stderr)

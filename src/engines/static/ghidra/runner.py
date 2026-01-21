@@ -1,6 +1,7 @@
 """
 Ghidra headless runner with cross-platform support.
 Handles Ghidra installation detection, project management, and script execution.
+Supports both legacy Jython (Ghidra ≤10.x) and PyGhidra (Ghidra 11+).
 """
 
 import asyncio
@@ -45,7 +46,15 @@ class GhidraRunner:
                 self.ghidra_path = self._detect_ghidra()
 
         self.system = platform.system()
-        logger.info(f"Initialized Ghidra runner: {self.ghidra_path} on {self.system}")
+
+        # Detect Ghidra version and determine execution mode
+        self.ghidra_version = self._get_ghidra_version()
+        self.use_pyhidra = self._should_use_pyhidra()
+
+        logger.info(
+            f"Initialized Ghidra runner: {self.ghidra_path} (v{self.ghidra_version}) "
+            f"on {self.system}, mode={'PyGhidra' if self.use_pyhidra else 'analyzeHeadless'}"
+        )
 
     def _detect_ghidra(self) -> Path:
         """
@@ -124,6 +133,56 @@ class GhidraRunner:
         analyze_win = path / "support" / "analyzeHeadless.bat"
         return analyze_unix.exists() or analyze_win.exists()
 
+    def _get_ghidra_version(self) -> str:
+        """
+        Get the Ghidra version from application.properties.
+
+        Returns:
+            Version string (e.g., "11.2.1") or "unknown" if not found
+        """
+        version_file = self.ghidra_path / "application.properties"
+        if not version_file.exists():
+            logger.warning(f"application.properties not found at {version_file}")
+            return "unknown"
+
+        try:
+            with open(version_file) as f:
+                for line in f:
+                    if line.startswith("application.version"):
+                        version = line.split("=")[1].strip()
+                        logger.debug(f"Detected Ghidra version: {version}")
+                        return version
+        except Exception as e:
+            logger.warning(f"Error reading Ghidra version: {e}")
+
+        return "unknown"
+
+    def _should_use_pyhidra(self) -> bool:
+        """
+        Determine if PyGhidra should be used based on Ghidra version.
+
+        Ghidra 11.0+ uses PyGhidra (Python 3) instead of Jython (Python 2.7).
+
+        Returns:
+            True if PyGhidra should be used (Ghidra 11+), False for legacy mode
+        """
+        if self.ghidra_version == "unknown":
+            # Default to PyGhidra for unknown versions (assume modern Ghidra)
+            logger.warning(
+                "Unknown Ghidra version, defaulting to PyGhidra mode. "
+                "Set GHIDRA_USE_LEGACY=1 to force analyzeHeadless mode."
+            )
+            return not os.environ.get("GHIDRA_USE_LEGACY", "").lower() in ("1", "true", "yes")
+
+        try:
+            # Parse major version (e.g., "11.2.1" -> 11)
+            major_version = int(self.ghidra_version.split(".")[0])
+            return major_version >= 11
+        except (ValueError, IndexError):
+            # If version parsing fails, check environment variable
+            logger.warning(f"Could not parse Ghidra version '{self.ghidra_version}'")
+            return not os.environ.get("GHIDRA_USE_LEGACY", "").lower() in ("1", "true", "yes")
+
     def _get_analyze_headless_cmd(self) -> str:
         """Get the analyzeHeadless command for the current platform."""
         if self.system == "Windows":
@@ -178,6 +237,192 @@ class GhidraRunner:
 
         except Exception as e:
             logger.warning(f"Failed to cleanup project {project_name}: {e}")
+
+    async def _analyze_with_pyhidra(
+        self,
+        binary_path: Path,
+        script_path: str,
+        script_name: str,
+        output_path: str,
+        project_name: str,
+        project_dir: Path,
+        timeout: int,
+        env: dict,
+    ) -> dict:
+        """
+        Run Ghidra analysis using PyGhidra (for Ghidra 11+).
+
+        Args:
+            binary_path: Path to the binary file
+            script_path: Directory containing Ghidra scripts
+            script_name: Name of the Python script to execute
+            output_path: Where to save analysis output
+            project_name: Ghidra project name
+            project_dir: Directory for Ghidra projects
+            timeout: Maximum execution time in seconds
+            env: Environment variables
+
+        Returns:
+            dict with analysis results
+
+        Raises:
+            RuntimeError: If analysis fails
+            ImportError: If pyhidra is not installed
+        """
+        try:
+            import pyhidra
+        except ImportError as e:
+            raise ImportError(
+                "pyhidra is required for Ghidra 11+ but is not installed. "
+                "Install with: pip install 'binary-mcp[ghidra11]' or pip install pyhidra"
+            ) from e
+
+        logger.info(f"Using PyGhidra for analysis: {binary_path}")
+        start_time = time.time()
+
+        # Build the script path
+        full_script_path = Path(script_path) / script_name
+
+        if not full_script_path.exists():
+            raise FileNotFoundError(f"Script not found: {full_script_path}")
+
+        try:
+            # Initialize PyGhidra with the Ghidra installation
+            logger.debug(f"Initializing PyGhidra with: {self.ghidra_path}")
+
+            # Run analysis in a subprocess to avoid blocking the event loop
+            # PyGhidra requires running in a separate process for proper isolation
+            cmd = [
+                "python",
+                "-c",
+                f"""
+import os
+import sys
+import pyhidra
+
+# Set environment variables
+os.environ['GHIDRA_CONTEXT_JSON'] = {repr(str(output_path))}
+for key, value in {repr(env)}.items():
+    os.environ[key] = value
+
+# Initialize PyGhidra
+pyhidra.start(install_dir={repr(str(self.ghidra_path))})
+
+# Import Ghidra modules
+from ghidra.base.project import GhidraProject
+
+# Create/open project
+project_location = {repr(str(project_dir))}
+project_name = {repr(project_name)}
+project = GhidraProject.openProject(project_location, project_name, True)
+
+# Import the binary
+binary_path = {repr(str(binary_path))}
+program = project.importProgram(binary_path)
+
+# Open the program for analysis
+from ghidra.app.script import GhidraScriptUtil
+from ghidra.program.flatapi import FlatProgramAPI
+
+# Set up the environment for the script
+import ghidra.app.script.GhidraState as GhidraState
+flat_api = FlatProgramAPI(program)
+
+# Run auto-analysis if not already done
+from ghidra.app.script import GhidraScriptUtil
+from ghidra.util.task import ConsoleTaskMonitor
+
+monitor = ConsoleTaskMonitor()
+if not program.getChanges().getCurrentChanges():
+    from ghidra.program.util import GhidraProgramUtilities
+    if not GhidraProgramUtilities.isAnalyzed(program):
+        from ghidra.app.plugin.core.analysis import AutoAnalysisManager
+        AutoAnalysisManager.getAnalysisManager(program).reAnalyzeAll(None)
+
+# Execute the analysis script
+script_path = {repr(str(full_script_path))}
+with open(script_path) as f:
+    script_code = f.read()
+
+# Set up globals that Ghidra scripts expect
+script_globals = {{
+    'currentProgram': program,
+    'monitor': monitor,
+}}
+
+# Execute the script
+exec(compile(script_code, script_path, 'exec'), script_globals)
+
+# Close and save
+project.save(program)
+project.close()
+""",
+            ]
+
+            # Run the PyGhidra script asynchronously
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                env=env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+
+            try:
+                stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                    process.communicate(), timeout=timeout
+                )
+                stdout = stdout_bytes.decode("utf-8", errors="replace")
+                stderr = stderr_bytes.decode("utf-8", errors="replace")
+            except TimeoutError:
+                logger.warning(f"PyGhidra analysis timed out after {timeout}s, killing process")
+                process.kill()
+                await process.wait()
+
+                elapsed_time = time.time() - start_time
+                logger.error(f"PyGhidra analysis timeout after {elapsed_time:.2f}s")
+
+                self._cleanup_project(project_dir, project_name)
+
+                raise RuntimeError(
+                    f"PyGhidra analysis timed out after {timeout}s. "
+                    f"Binary may be too large or complex."
+                )
+
+            elapsed_time = time.time() - start_time
+
+            if process.returncode != 0:
+                logger.error(f"PyGhidra analysis failed after {elapsed_time:.2f}s")
+                logger.error(f"stdout: {stdout}")
+                logger.error(f"stderr: {stderr}")
+
+                self._cleanup_project(project_dir, project_name)
+
+                raise RuntimeError(
+                    f"PyGhidra analysis failed with exit code {process.returncode}. "
+                    f"Check logs for details. Error: {stderr[:500]}"
+                )
+
+            logger.info(f"PyGhidra analysis completed in {elapsed_time:.2f}s")
+            logger.debug(f"stdout: {stdout[:500]}")
+
+            return {
+                "success": True,
+                "binary": str(binary_path),
+                "project_name": project_name,
+                "output_path": output_path,
+                "elapsed_time": elapsed_time,
+                "stdout": stdout,
+                "stderr": stderr,
+                "execution_mode": "pyhidra",
+            }
+
+        except ImportError:
+            raise
+        except Exception as e:
+            elapsed_time = time.time() - start_time
+            logger.error(f"PyGhidra analysis error after {elapsed_time:.2f}s: {e}")
+            self._cleanup_project(project_dir, project_name)
+            raise RuntimeError(f"PyGhidra analysis failed: {e}") from e
 
     def analyze(
         self,
@@ -253,6 +498,15 @@ class GhidraRunner:
         logger.debug(f"Analysis settings: function_timeout={function_timeout}, "
                      f"max_functions={max_functions}, skip_decompile={skip_decompile}")
 
+        # Note: Synchronous analyze() does not support PyGhidra mode
+        # For Ghidra 11+, use analyze_async() instead for proper PyGhidra support
+        if self.use_pyhidra:
+            logger.warning(
+                "PyGhidra mode detected but analyze() is synchronous. "
+                "Use analyze_async() for proper PyGhidra support, or set GHIDRA_USE_LEGACY=1. "
+                "Falling back to analyzeHeadless for this call."
+            )
+
         # Build command - processor/loader must come immediately after binary path
         cmd = [
             self._get_analyze_headless_cmd(),
@@ -308,6 +562,7 @@ class GhidraRunner:
                 "elapsed_time": elapsed_time,
                 "stdout": result.stdout,
                 "stderr": result.stderr,
+                "execution_mode": "pyhidra" if self.use_pyhidra else "analyzeHeadless",
             }
 
         except subprocess.TimeoutExpired as e:
@@ -406,6 +661,20 @@ class GhidraRunner:
         logger.debug(f"Analysis settings: function_timeout={function_timeout}, "
                      f"max_functions={max_functions}, skip_decompile={skip_decompile}")
 
+        # Use PyGhidra for Ghidra 11+, analyzeHeadless for older versions
+        if self.use_pyhidra:
+            return await self._analyze_with_pyhidra(
+                binary_path=binary_path,
+                script_path=script_path,
+                script_name=script_name,
+                output_path=output_path,
+                project_name=project_name,
+                project_dir=project_dir,
+                timeout=timeout,
+                env=env,
+            )
+
+        # Legacy analyzeHeadless execution for Ghidra ≤10.x
         # Build command - processor/loader must come immediately after binary path
         cmd = [
             self._get_analyze_headless_cmd(),
@@ -497,6 +766,7 @@ class GhidraRunner:
                 "elapsed_time": elapsed_time,
                 "stdout": stdout,
                 "stderr": stderr,
+                "execution_mode": "analyzeHeadless",
             }
 
         except RuntimeError:
@@ -516,12 +786,14 @@ class GhidraRunner:
         Run diagnostic checks on Ghidra installation.
 
         Returns:
-            dict with diagnostic information
+            dict with diagnostic information including version and execution mode
         """
         diag = {
             "platform": self.system,
             "ghidra_path": str(self.ghidra_path),
             "ghidra_exists": self.ghidra_path.exists(),
+            "ghidra_version": self.ghidra_version,
+            "execution_mode": "pyhidra" if self.use_pyhidra else "analyzeHeadless",
         }
 
         # Check analyzeHeadless
@@ -543,18 +815,18 @@ class GhidraRunner:
             diag["java_installed"] = False
             diag["java_version"] = None
 
-        # Check Ghidra version
-        version_file = self.ghidra_path / "application.properties"
-        if version_file.exists():
+        # Check PyGhidra availability
+        if self.use_pyhidra:
             try:
-                with open(version_file) as f:
-                    for line in f:
-                        if line.startswith("application.version"):
-                            diag["ghidra_version"] = line.split("=")[1].strip()
-                            break
-            except Exception as e:
-                diag["ghidra_version"] = f"Error reading version: {e}"
-        else:
-            diag["ghidra_version"] = "Unknown"
+                import pyhidra
+                diag["pyhidra_installed"] = True
+                diag["pyhidra_version"] = getattr(pyhidra, "__version__", "unknown")
+            except ImportError:
+                diag["pyhidra_installed"] = False
+                diag["pyhidra_version"] = None
+                diag["pyhidra_warning"] = (
+                    "PyGhidra required for Ghidra 11+ but not installed. "
+                    "Install with: pip install 'binary-mcp[ghidra11]'"
+                )
 
         return diag

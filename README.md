@@ -13,6 +13,7 @@ MCP server providing AI assistants with binary analysis capabilities via Ghidra,
 - **Smart Caching**: SHA256-based caching for 30-120x speed improvement
 - **Session Management**: Persistent analysis tracking across conversations
 - **Pattern Detection**: 100+ Windows API patterns and crypto constants
+- **Ghidra 11+/12.x Support**: Automatic PyGhidra integration with backward compatibility
 
 ## Quick Start
 
@@ -156,6 +157,44 @@ Connect to x64dbg and set a breakpoint at 0x401000
 | Mach-O (macOS) | Ghidra | ✅ Full |
 | Raw Binary | Ghidra | ⚠️ Limited |
 
+## Ghidra Version Compatibility
+
+Binary MCP automatically detects your Ghidra version and uses the appropriate execution mode:
+
+| Ghidra Version | Execution Mode | Python Runtime | Setup Required |
+|----------------|----------------|----------------|----------------|
+| 12.x | PyGhidra | Python 3.12+ | `pip install pyhidra` |
+| 11.x | PyGhidra | Python 3.12+ | `pip install pyhidra` |
+| 10.x | analyzeHeadless | Jython 2.7 | None (built-in) |
+| 9.x | analyzeHeadless | Jython 2.7 | None (built-in) |
+
+### Ghidra 11+ Setup
+
+Ghidra 11.0+ replaced Jython with PyGhidra (native Python 3). Install the optional dependency:
+
+```bash
+# Using pip
+pip install pyhidra
+
+# Or install binary-mcp with Ghidra 11+ support
+pip install "binary-mcp[ghidra11]"
+
+# Or using uv
+uv sync --extra ghidra11
+```
+
+The runner automatically detects your Ghidra version. To verify:
+
+```bash
+uv run python -c "from src.engines.static.ghidra.runner import GhidraRunner; print(GhidraRunner().diagnose())"
+```
+
+To force legacy mode on Ghidra 11+ (not recommended):
+
+```bash
+export GHIDRA_USE_LEGACY=1
+```
+
 ## Troubleshooting
 
 **Ghidra not found:**
@@ -165,6 +204,16 @@ export GHIDRA_HOME=/path/to/ghidra
 
 # Or use diagnostic tool
 diagnose_setup
+```
+
+**"Python is not available" error (Ghidra 11+):**
+```bash
+# This error occurs when using Ghidra 11+ without PyGhidra
+# Install PyGhidra support:
+pip install pyhidra
+
+# Verify installation:
+uv run python -c "from src.engines.static.ghidra.runner import GhidraRunner; print(GhidraRunner().diagnose())"
 ```
 
 **ILSpyCmd not found:**
@@ -205,6 +254,9 @@ make format
 | `GHIDRA_HOME` | Ghidra installation path | Auto-detected |
 | `GHIDRA_PROJECT_DIR` | Project directory | `~/.ghidra_projects` |
 | `GHIDRA_TIMEOUT` | Analysis timeout (seconds) | 600 |
+| `GHIDRA_USE_LEGACY` | Force analyzeHeadless mode on Ghidra 11+ | Not set |
+| `GHIDRA_FUNCTION_TIMEOUT` | Per-function decompilation timeout | 30 |
+| `GHIDRA_MAX_FUNCTIONS` | Maximum functions to analyze | Unlimited |
 | `X64DBG_PATH` | x64dbg executable path | Auto-detected |
 
 ## Contributing

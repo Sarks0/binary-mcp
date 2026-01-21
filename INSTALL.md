@@ -191,6 +191,27 @@ $env:GHIDRA_HOME = "C:\path\to\ghidra"
 export GHIDRA_HOME=/path/to/ghidra
 ```
 
+**For Ghidra 11+ (PyGhidra support):**
+
+Ghidra 11.0 and later use PyGhidra (Python 3) instead of Jython (Python 2.7). Install the optional dependency:
+
+```bash
+# Using uv
+uv sync --extra ghidra11
+
+# Or using pip
+pip install "binary-mcp[ghidra11]"
+```
+
+The runner automatically detects your Ghidra version and uses the appropriate execution mode:
+- **Ghidra 11+**: Uses PyGhidra (Python 3)
+- **Ghidra 10.x and older**: Uses analyzeHeadless (Jython/Python 2.7)
+
+To force legacy mode for Ghidra 11+, set:
+```bash
+export GHIDRA_USE_LEGACY=1
+```
+
 ### 6. Install x64dbg (Windows Only, Optional)
 
 **Download:** https://github.com/x64dbg/x64dbg/releases/latest
@@ -304,6 +325,17 @@ brew install python@3.12
 - Ensure Java 17+ is installed: `java -version`
 - Install from: https://adoptium.net/
 
+**"Python is not available" error with Ghidra 11+:**
+- Ghidra 11.0+ removed Jython and requires PyGhidra
+- Install PyGhidra: `pip install pyhidra`
+- Or install with extras: `pip install "binary-mcp[ghidra11]"`
+- The runner auto-detects version and switches modes automatically
+
+**PyGhidra import errors:**
+- Ensure Python 3.12+ is being used
+- Verify pyhidra installation: `python -c "import pyhidra; print(pyhidra.__version__)"`
+- Check Ghidra path: `echo $GHIDRA_HOME`
+
 ### Common Issues
 
 **"Claude Desktop config not found":**
@@ -372,6 +404,25 @@ uv sync --extra dev
 
 Or simply re-run the installer - it will update existing installations.
 
+### Upgrading Ghidra from 10.x to 11+/12.x
+
+When upgrading Ghidra from version 10.x to 11.x or 12.x, you need to install PyGhidra support:
+
+```bash
+# 1. Download and install new Ghidra version
+# 2. Update GHIDRA_HOME to point to new installation
+export GHIDRA_HOME=/path/to/ghidra-12.0.1
+
+# 3. Install PyGhidra support
+pip install pyhidra
+# Or: uv sync --extra ghidra11
+
+# 4. Verify the upgrade
+uv run python -c "from src.engines.static.ghidra.runner import GhidraRunner; r = GhidraRunner(); print(r.diagnose())"
+```
+
+You should see `execution_mode: "pyhidra"` in the output.
+
 ---
 
 ## Advanced Configuration
@@ -396,11 +447,19 @@ export GHIDRA_HOME="/custom/path/ghidra"
 The server can be configured via environment variables:
 
 ```bash
-# Custom cache directory
-export GHIDRA_MCP_CACHE="$HOME/custom-cache"
+# Ghidra settings
+export GHIDRA_HOME="/path/to/ghidra"          # Ghidra installation path
+export GHIDRA_TIMEOUT=600                      # Analysis timeout in seconds
+export GHIDRA_FUNCTION_TIMEOUT=30              # Per-function decompilation timeout
+export GHIDRA_MAX_FUNCTIONS=0                  # Max functions to analyze (0 = unlimited)
+export GHIDRA_USE_LEGACY=1                     # Force analyzeHeadless on Ghidra 11+ (not recommended)
 
-# Enable debug logging
-export MCP_LOG_LEVEL="DEBUG"
+# Cache and session settings
+export BINARY_MCP_CACHE_DIR="$HOME/.ghidra_mcp_cache"    # Analysis cache directory
+export BINARY_MCP_SESSION_DIR="$HOME/.binary_mcp_sessions"  # Session storage
+
+# Logging
+export BINARY_MCP_LOG_LEVEL="DEBUG"            # Log level (DEBUG, INFO, WARNING, ERROR)
 ```
 
 ### Running Multiple Instances

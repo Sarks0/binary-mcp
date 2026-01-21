@@ -11,6 +11,7 @@ import asyncio
 import functools
 import json
 import logging
+import logging.handlers
 import re
 import sys
 import time
@@ -20,8 +21,9 @@ from typing import Any
 from fastmcp import FastMCP
 
 from src.engines.session import AnalysisType, UnifiedSessionManager
+from src.engines.static.ghidra.error_logger import GhidraErrorContext, GhidraErrorLogger
 from src.engines.static.ghidra.project_cache import ProjectCache
-from src.engines.static.ghidra.runner import GhidraRunner
+from src.engines.static.ghidra.runner import GhidraAnalysisError, GhidraRunner
 from src.tools.dotnet_tools import register_dotnet_tools
 from src.tools.dynamic_tools import register_dynamic_tools
 from src.tools.reporting import register_reporting_tools
@@ -55,10 +57,25 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Add rotating file handler for persistent logging
+_log_dir = Path.home() / ".ghidra_mcp_cache" / "logs"
+_log_dir.mkdir(parents=True, exist_ok=True)
+_file_handler = logging.handlers.RotatingFileHandler(
+    _log_dir / "binary-mcp.log",
+    maxBytes=10 * 1024 * 1024,  # 10 MB
+    backupCount=3,
+)
+_file_handler.setFormatter(
+    logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+)
+logging.getLogger().addHandler(_file_handler)
+logger.info(f"File logging enabled: {_log_dir / 'binary-mcp.log'}")
+
 # Initialize components
 app = FastMCP("binary-mcp")
 runner = GhidraRunner()
 cache = ProjectCache()
+ghidra_error_logger = GhidraErrorLogger()
 session_manager = UnifiedSessionManager()
 api_patterns = APIPatterns()
 crypto_patterns = CryptoPatterns()
@@ -272,7 +289,39 @@ def get_analysis_context(
         logger.info(f"Analysis complete: {result['elapsed_time']:.2f}s")
         return context
 
+    except GhidraAnalysisError as e:
+        # Log structured error to GhidraErrorLogger
+        import traceback
+        context = GhidraErrorContext(
+            operation="analyze",
+            binary_path=e.binary_path,
+            execution_mode=e.execution_mode,
+            elapsed_seconds=e.elapsed_time,
+        )
+        ghidra_error_logger.log_error(
+            operation="analyze",
+            error=e,
+            context=context,
+            exit_code=e.exit_code,
+            stdout=e.stdout,
+            stderr=e.stderr,
+            traceback_str=traceback.format_exc(),
+        )
+        logger.error(f"Analysis failed: {e}")
+        raise RuntimeError(f"Failed to analyze binary: {e}")
     except Exception as e:
+        # Log generic error
+        import traceback
+        context = GhidraErrorContext(
+            operation="analyze",
+            binary_path=binary_path,
+        )
+        ghidra_error_logger.log_error(
+            operation="analyze",
+            error=e,
+            context=context,
+            traceback_str=traceback.format_exc(),
+        )
         logger.error(f"Analysis failed: {e}")
         raise RuntimeError(f"Failed to analyze binary: {e}")
 
@@ -470,7 +519,39 @@ async def get_analysis_context_async(
 
     try:
         return await task
+    except GhidraAnalysisError as e:
+        # Log structured error to GhidraErrorLogger
+        import traceback
+        context = GhidraErrorContext(
+            operation="analyze_async",
+            binary_path=e.binary_path,
+            execution_mode=e.execution_mode,
+            elapsed_seconds=e.elapsed_time,
+        )
+        ghidra_error_logger.log_error(
+            operation="analyze_async",
+            error=e,
+            context=context,
+            exit_code=e.exit_code,
+            stdout=e.stdout,
+            stderr=e.stderr,
+            traceback_str=traceback.format_exc(),
+        )
+        logger.error(f"Async analysis failed: {e}")
+        raise RuntimeError(f"Failed to analyze binary: {e}")
     except Exception as e:
+        # Log generic error
+        import traceback
+        context = GhidraErrorContext(
+            operation="analyze_async",
+            binary_path=binary_path,
+        )
+        ghidra_error_logger.log_error(
+            operation="analyze_async",
+            error=e,
+            context=context,
+            traceback_str=traceback.format_exc(),
+        )
         logger.error(f"Async analysis failed: {e}")
         raise RuntimeError(f"Failed to analyze binary: {e}")
     finally:
@@ -2920,6 +3001,93 @@ def list_python_archive_contents(binary_path: str) -> str:
     except Exception as e:
         logger.error(f"list_python_archive_contents failed: {e}")
         return f"Error listing archive contents: {e}"
+
+
+@app.tool()
+def view_ghidra_errors(count: int = 10, error_id: str | None = None) -> str:
+    """
+    View recent Ghidra analysis errors for debugging.
+
+    Displays error logs stored in ~/.ghidra_mcp_cache/ghidra_errors/.
+    Useful for diagnosing analysis failures when Ghidra errors are not visible
+    in the Claude Desktop interface.
+
+    Args:
+        count: Number of recent errors to show (default: 10)
+        error_id: Specific error ID to view in detail (optional)
+
+    Returns:
+        Formatted error summary or detailed error info
+
+    Example:
+        view_ghidra_errors()  # Show last 10 errors
+        view_ghidra_errors(count=5)  # Show last 5 errors
+        view_ghidra_errors(error_id="ghidra_abc123")  # View specific error
+    """
+    try:
+        if error_id:
+            # View specific error in detail
+            error = ghidra_error_logger.get_error(error_id)
+            if not error:
+                return f"Error not found: {error_id}"
+
+            import time as time_module
+            lines = [
+                f"=== GHIDRA ERROR DETAIL: {error_id} ===",
+                f"Timestamp: {time_module.strftime('%Y-%m-%d %H:%M:%S', time_module.localtime(error.timestamp))}",
+                f"Operation: {error.operation}",
+                f"Error Type: {error.error_type}",
+                f"Message: {error.error_message}",
+            ]
+
+            if error.exit_code is not None:
+                lines.append(f"Exit Code: {error.exit_code}")
+
+            if error.context:
+                lines.append(f"\nContext:")
+                for key, value in error.context.items():
+                    if value is not None:
+                        lines.append(f"  {key}: {value}")
+
+            if error.stdout:
+                lines.append(f"\nStdout (last 1000 chars):")
+                lines.append(error.stdout[-1000:])
+
+            if error.stderr:
+                lines.append(f"\nStderr (last 1000 chars):")
+                lines.append(error.stderr[-1000:])
+
+            if error.traceback:
+                lines.append(f"\nTraceback:")
+                lines.append(error.traceback)
+
+            return "\n".join(lines)
+        else:
+            # Show summary of recent errors
+            return ghidra_error_logger.format_error_summary(count)
+
+    except Exception as e:
+        logger.error(f"view_ghidra_errors failed: {e}")
+        return f"Error viewing Ghidra errors: {e}"
+
+
+@app.tool()
+def clear_ghidra_errors() -> str:
+    """
+    Clear all stored Ghidra error logs.
+
+    Removes all error records from ~/.ghidra_mcp_cache/ghidra_errors/.
+    Use this to clean up old errors after debugging.
+
+    Returns:
+        Confirmation message with count of cleared errors
+    """
+    try:
+        count = ghidra_error_logger.clear_all_errors()
+        return f"Cleared {count} Ghidra error records."
+    except Exception as e:
+        logger.error(f"clear_ghidra_errors failed: {e}")
+        return f"Error clearing Ghidra errors: {e}"
 
 
 def main():

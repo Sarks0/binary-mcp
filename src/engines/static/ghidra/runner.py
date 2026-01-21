@@ -15,6 +15,32 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
+class GhidraAnalysisError(Exception):
+    """
+    Exception raised when Ghidra analysis fails.
+
+    Carries structured context for error logging and debugging.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        stdout: str | None = None,
+        stderr: str | None = None,
+        exit_code: int | None = None,
+        elapsed_time: float | None = None,
+        binary_path: str | None = None,
+        execution_mode: str | None = None,
+    ):
+        super().__init__(message)
+        self.stdout = stdout
+        self.stderr = stderr
+        self.exit_code = exit_code
+        self.elapsed_time = elapsed_time
+        self.binary_path = binary_path
+        self.execution_mode = execution_mode
+
+
 class GhidraRunner:
     """Manages Ghidra headless analysis execution."""
 
@@ -386,17 +412,29 @@ for key, value in {repr(env)}.items():
 
 try:
     # Try new pyghidra (Ghidra 12.0+) first, fall back to pyhidra (Ghidra 11.x)
+    use_new_pyghidra = False
     try:
         import pyghidra
         pyghidra_module = pyghidra
+        use_new_pyghidra = True
         print("Using pyghidra (Ghidra 12.0+ API)", file=sys.stderr)
     except ImportError:
         import pyhidra as pyghidra_module
         print("Using pyhidra (Ghidra 11.x API)", file=sys.stderr)
 
     # Initialize PyGhidra - this starts the JVM
+    # IMPORTANT: The API differs between pyghidra (new) and pyhidra (old)
     print("Initializing PyGhidra...", file=sys.stderr)
-    pyghidra_module.start(install_dir={repr(str(self.ghidra_path))})
+    ghidra_install_dir = {repr(str(self.ghidra_path))}
+
+    if use_new_pyghidra:
+        # New pyghidra (Ghidra 12.0+) accepts install_dir parameter
+        pyghidra_module.start(install_dir=ghidra_install_dir)
+    else:
+        # Old pyhidra requires GHIDRA_INSTALL_DIR environment variable
+        os.environ['GHIDRA_INSTALL_DIR'] = ghidra_install_dir
+        pyghidra_module.start()
+
     print("PyGhidra initialized successfully", file=sys.stderr)
 
     # Use open_program() which handles import, project creation, and auto-analysis
@@ -490,9 +528,12 @@ except Exception as e:
 
                 self._cleanup_project(project_dir, project_name)
 
-                raise RuntimeError(
+                raise GhidraAnalysisError(
                     f"PyGhidra analysis timed out after {timeout}s. "
-                    f"Binary may be too large or complex."
+                    f"Binary may be too large or complex.",
+                    elapsed_time=elapsed_time,
+                    binary_path=str(binary_path),
+                    execution_mode="pyhidra",
                 )
 
             elapsed_time = time.time() - start_time
@@ -504,9 +545,15 @@ except Exception as e:
 
                 self._cleanup_project(project_dir, project_name)
 
-                raise RuntimeError(
+                raise GhidraAnalysisError(
                     f"PyGhidra analysis failed with exit code {process.returncode}. "
-                    f"Check logs for details. Error: {stderr[:500]}"
+                    f"Check logs for details. Error: {stderr[:500]}",
+                    stdout=stdout,
+                    stderr=stderr,
+                    exit_code=process.returncode,
+                    elapsed_time=elapsed_time,
+                    binary_path=str(binary_path),
+                    execution_mode="pyhidra",
                 )
 
             logger.info(f"PyGhidra analysis completed in {elapsed_time:.2f}s")
@@ -525,11 +572,18 @@ except Exception as e:
 
         except ImportError:
             raise
+        except GhidraAnalysisError:
+            raise
         except Exception as e:
             elapsed_time = time.time() - start_time
             logger.error(f"PyGhidra analysis error after {elapsed_time:.2f}s: {e}")
             self._cleanup_project(project_dir, project_name)
-            raise RuntimeError(f"PyGhidra analysis failed: {e}") from e
+            raise GhidraAnalysisError(
+                f"PyGhidra analysis failed: {e}",
+                elapsed_time=elapsed_time,
+                binary_path=str(binary_path),
+                execution_mode="pyhidra",
+            ) from e
 
     def analyze(
         self,
@@ -679,9 +733,12 @@ except Exception as e:
             # Clean up locked project to prevent future lock errors
             self._cleanup_project(project_dir, project_name)
 
-            raise RuntimeError(
+            raise GhidraAnalysisError(
                 f"Ghidra analysis timed out after {timeout}s. "
-                f"Binary may be too large or complex."
+                f"Binary may be too large or complex.",
+                elapsed_time=elapsed_time,
+                binary_path=str(binary_path),
+                execution_mode="analyzeHeadless",
             ) from e
 
         except subprocess.CalledProcessError as e:
@@ -693,9 +750,15 @@ except Exception as e:
             # Clean up locked project to prevent future lock errors
             self._cleanup_project(project_dir, project_name)
 
-            raise RuntimeError(
+            raise GhidraAnalysisError(
                 f"Ghidra analysis failed with exit code {e.returncode}. "
-                f"Check logs for details."
+                f"Check logs for details.",
+                stdout=e.stdout,
+                stderr=e.stderr,
+                exit_code=e.returncode,
+                elapsed_time=elapsed_time,
+                binary_path=str(binary_path),
+                execution_mode="analyzeHeadless",
             ) from e
 
     async def analyze_async(
@@ -840,10 +903,13 @@ except Exception as e:
                 # Clean up locked project to prevent future lock errors
                 self._cleanup_project(project_dir, project_name)
 
-                raise RuntimeError(
+                raise GhidraAnalysisError(
                     f"Ghidra analysis timed out after {timeout}s. "
                     f"Binary may be too large or complex. "
-                    f"Consider increasing GHIDRA_TIMEOUT or using skip_decompile=True."
+                    f"Consider increasing GHIDRA_TIMEOUT or using skip_decompile=True.",
+                    elapsed_time=elapsed_time,
+                    binary_path=str(binary_path),
+                    execution_mode="analyzeHeadless",
                 )
 
             elapsed_time = time.time() - start_time
@@ -857,9 +923,15 @@ except Exception as e:
                 # Clean up locked project to prevent future lock errors
                 self._cleanup_project(project_dir, project_name)
 
-                raise RuntimeError(
+                raise GhidraAnalysisError(
                     f"Ghidra analysis failed with exit code {process.returncode}. "
-                    f"Check logs for details."
+                    f"Check logs for details.",
+                    stdout=stdout,
+                    stderr=stderr,
+                    exit_code=process.returncode,
+                    elapsed_time=elapsed_time,
+                    binary_path=str(binary_path),
+                    execution_mode="analyzeHeadless",
                 )
 
             logger.info(f"Async analysis completed in {elapsed_time:.2f}s")
@@ -876,8 +948,8 @@ except Exception as e:
                 "execution_mode": "analyzeHeadless",
             }
 
-        except RuntimeError:
-            # Re-raise RuntimeError (timeout or failure) as-is
+        except GhidraAnalysisError:
+            # Re-raise GhidraAnalysisError (timeout or failure) as-is
             raise
         except Exception as e:
             elapsed_time = time.time() - start_time
@@ -886,7 +958,12 @@ except Exception as e:
             # Clean up locked project to prevent future lock errors
             self._cleanup_project(project_dir, project_name)
 
-            raise RuntimeError(f"Ghidra analysis failed unexpectedly: {e}") from e
+            raise GhidraAnalysisError(
+                f"Ghidra analysis failed unexpectedly: {e}",
+                elapsed_time=elapsed_time,
+                binary_path=str(binary_path),
+                execution_mode="analyzeHeadless",
+            ) from e
 
     def diagnose(self) -> dict:
         """

@@ -45,6 +45,9 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 git clone https://github.com/Sarks0/binary-mcp.git
 cd binary-mcp
 uv sync
+
+# For Ghidra 11+ / 12.x (includes PyGhidra support)
+uv sync --extra ghidra11
 ```
 
 ## Configuration
@@ -163,8 +166,8 @@ Binary MCP automatically detects your Ghidra version and uses the appropriate ex
 
 | Ghidra Version | Execution Mode | Python Runtime | Setup Required |
 |----------------|----------------|----------------|----------------|
-| 12.x | PyGhidra | Python 3.12+ | `pip install pyhidra` |
-| 11.x | PyGhidra | Python 3.12+ | `pip install pyhidra` |
+| 12.x | PyGhidra | Python 3.12+ | `uv sync --extra ghidra11` |
+| 11.x | PyGhidra | Python 3.12+ | `uv sync --extra ghidra11` |
 | 10.x | analyzeHeadless | Jython 2.7 | None (built-in) |
 | 9.x | analyzeHeadless | Jython 2.7 | None (built-in) |
 

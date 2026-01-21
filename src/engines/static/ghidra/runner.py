@@ -172,7 +172,7 @@ class GhidraRunner:
                 "Unknown Ghidra version, defaulting to PyGhidra mode. "
                 "Set GHIDRA_USE_LEGACY=1 to force analyzeHeadless mode."
             )
-            return not os.environ.get("GHIDRA_USE_LEGACY", "").lower() in ("1", "true", "yes")
+            return os.environ.get("GHIDRA_USE_LEGACY", "").lower() not in ("1", "true", "yes")
 
         try:
             # Parse major version (e.g., "11.2.1" -> 11)
@@ -181,7 +181,7 @@ class GhidraRunner:
         except (ValueError, IndexError):
             # If version parsing fails, check environment variable
             logger.warning(f"Could not parse Ghidra version '{self.ghidra_version}'")
-            return not os.environ.get("GHIDRA_USE_LEGACY", "").lower() in ("1", "true", "yes")
+            return os.environ.get("GHIDRA_USE_LEGACY", "").lower() not in ("1", "true", "yes")
 
     def _get_analyze_headless_cmd(self) -> str:
         """Get the analyzeHeadless command for the current platform."""
@@ -269,13 +269,13 @@ class GhidraRunner:
             RuntimeError: If analysis fails
             ImportError: If pyhidra is not installed
         """
-        try:
-            import pyhidra
-        except ImportError as e:
+        import importlib.util
+
+        if importlib.util.find_spec("pyhidra") is None:
             raise ImportError(
                 "pyhidra is required for Ghidra 11+ but is not installed. "
                 "Install with: pip install 'binary-mcp[ghidra11]' or pip install pyhidra"
-            ) from e
+            )
 
         logger.info(f"Using PyGhidra for analysis: {binary_path}")
         start_time = time.time()

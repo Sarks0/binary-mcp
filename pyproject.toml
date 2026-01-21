@@ -20,6 +20,9 @@ dependencies = [
 yara = [
     "yara-python>=4.5.0",
 ]
+pyghidra = [
+    "pyghidra>=3.0.0",  # For Ghidra 12.0+ with PyGhidra support
+]
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
@@ -43,8 +46,8 @@ select = ["E", "F", "I", "N", "W", "UP"]
 ignore = ["E501"]
 
 [tool.ruff.lint.per-file-ignores]
-# Ghidra scripts run in Jython (Python 2.7), so ignore Python 3 upgrade suggestions
-"src/engines/static/ghidra/scripts/*.py" = ["UP"]
+# Ghidra scripts now use Python 3 (PyGhidra), but still need F821 exemption for Ghidra globals
+"src/engines/static/ghidra/scripts/*.py" = ["F821"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

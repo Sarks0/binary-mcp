@@ -13,6 +13,7 @@ MCP server providing AI assistants with binary analysis capabilities via Ghidra,
 - **Smart Caching**: SHA256-based caching for 30-120x speed improvement
 - **Session Management**: Persistent analysis tracking across conversations
 - **Pattern Detection**: 100+ Windows API patterns and crypto constants
+- **Ghidra 12.0+ Support**: Automatic PyGhidra integration with backward compatibility for 9.x-11.x
 
 ## Quick Start
 
@@ -44,6 +45,9 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 git clone https://github.com/Sarks0/binary-mcp.git
 cd binary-mcp
 uv sync
+
+# For Ghidra 12.0+ (includes PyGhidra support)
+uv sync --extra pyghidra
 ```
 
 ## Configuration
@@ -156,6 +160,46 @@ Connect to x64dbg and set a breakpoint at 0x401000
 | Mach-O (macOS) | Ghidra | ✅ Full |
 | Raw Binary | Ghidra | ⚠️ Limited |
 
+## Ghidra Version Compatibility
+
+Binary MCP automatically detects your Ghidra version and uses the appropriate execution mode:
+
+| Ghidra Version | Execution Mode | Python Runtime | Setup Required |
+|----------------|----------------|----------------|----------------|
+| 12.0+ | PyGhidra | Python 3.12+ | `uv sync --extra pyghidra` |
+| 9.x - 11.x | analyzeHeadless | Jython 2.7 | None (built-in) |
+
+### Ghidra 12.0+ Setup
+
+Ghidra 12.0+ uses PyGhidra (native Python 3) for analysis. Install the optional dependency:
+
+```bash
+# Using uv (recommended)
+uv sync --extra pyghidra
+
+# Or using pip
+pip install pyghidra
+```
+
+> **Note (Windows):** PyGhidra requires `jpype1` which needs pre-built wheels. Use **Python 3.12 or 3.13** (not 3.14+) to avoid C++ compilation issues:
+> ```powershell
+> uv venv --python 3.12
+> uv sync --extra pyghidra
+> ```
+> If you encounter "VCRUNTIME140.dll not found" errors, install [Visual C++ Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe).
+
+The runner automatically detects your Ghidra version. To verify:
+
+```bash
+uv run python -c "from src.engines.static.ghidra.runner import GhidraRunner; print(GhidraRunner().diagnose())"
+```
+
+To force legacy mode on Ghidra 12+ (not recommended):
+
+```bash
+export GHIDRA_USE_LEGACY=1
+```
+
 ## Troubleshooting
 
 **Ghidra not found:**
@@ -165,6 +209,16 @@ export GHIDRA_HOME=/path/to/ghidra
 
 # Or use diagnostic tool
 diagnose_setup
+```
+
+**"Python is not available" error (Ghidra 12.0+):**
+```bash
+# This error occurs when using Ghidra 12.0+ without PyGhidra
+# Install PyGhidra support:
+pip install pyghidra
+
+# Verify installation:
+uv run python -c "from src.engines.static.ghidra.runner import GhidraRunner; print(GhidraRunner().diagnose())"
 ```
 
 **ILSpyCmd not found:**
@@ -205,6 +259,10 @@ make format
 | `GHIDRA_HOME` | Ghidra installation path | Auto-detected |
 | `GHIDRA_PROJECT_DIR` | Project directory | `~/.ghidra_projects` |
 | `GHIDRA_TIMEOUT` | Analysis timeout (seconds) | 600 |
+| `GHIDRA_USE_LEGACY` | Force analyzeHeadless mode on Ghidra 12+ | Not set |
+| `GHIDRA_MAXMEM` | Java heap size for PyGhidra (e.g., "4G", "8G") | 4G |
+| `GHIDRA_FUNCTION_TIMEOUT` | Per-function decompilation timeout | 30 |
+| `GHIDRA_MAX_FUNCTIONS` | Maximum functions to analyze | Unlimited |
 | `X64DBG_PATH` | x64dbg executable path | Auto-detected |
 
 ## Contributing

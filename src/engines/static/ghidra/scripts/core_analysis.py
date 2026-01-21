@@ -1,10 +1,9 @@
-# Ghidra Jython script for comprehensive malware analysis extraction
-# This script runs inside Ghidra's JVM environment
+# Ghidra Python 3 script for comprehensive malware analysis extraction
+# This script runs inside Ghidra's JVM environment with PyGhidra (Python 3)
 # @category: MalwareAnalysis
 # ruff: noqa: F821
 # Note: currentProgram and other Ghidra globals are provided at runtime
 
-import codecs
 import json
 import os
 
@@ -19,63 +18,46 @@ from java.util.concurrent import Callable, Executors, TimeoutException, TimeUnit
 
 def safe_unicode(value):
     """
-    Safely convert a value to unicode string, handling non-ASCII characters.
+    Safely convert a value to string, handling non-ASCII characters.
 
-    In Jython/Python 2, str() fails on unicode strings with non-ASCII characters.
-    This function handles both str and unicode types safely.
+    In Python 3, all strings are Unicode by default. This function ensures
+    consistent string handling across different types (Java objects, Python strings, etc).
     """
     if value is None:
-        return u""
+        return ""
 
-    # If it's already unicode, return it
-    if isinstance(value, unicode):
+    # In Python 3, str is already Unicode
+    if isinstance(value, str):
         return value
 
-    # If it's a regular string (bytes), decode it
-    if isinstance(value, str):
+    # For bytes, decode to string
+    if isinstance(value, bytes):
         try:
             return value.decode('utf-8')
-        except (UnicodeDecodeError, AttributeError):
+        except UnicodeDecodeError:
             # If UTF-8 fails, try latin-1 (which accepts all byte values)
             return value.decode('latin-1', 'replace')
 
-    # For other types (Java objects, numbers, etc), convert to unicode
+    # For other types (Java objects, numbers, etc), convert to str
     try:
-        return unicode(value)
-    except UnicodeDecodeError:
-        # Last resort: convert to str first, then decode
-        try:
-            return str(value).decode('utf-8', 'replace')
-        except (UnicodeDecodeError, AttributeError, TypeError):
-            return u"<encoding_error>"
+        return str(value)
+    except Exception:
+        return "<encoding_error>"
 
 
 def safe_format(fmt_string, *args, **kwargs):
     """
-    Safely format and encode a string for printing, handling Unicode.
+    Safely format a string for printing, handling Unicode.
 
-    In Python 2/Jython, formatting with Unicode values creates a Unicode string,
-    which print() tries to encode with ASCII, causing UnicodeEncodeError.
-    This function formats and encodes to UTF-8 in one step.
+    In Python 3, strings are Unicode by default and print() handles them correctly.
+    This function maintains the same API as the Python 2 version for compatibility.
 
-    Returns a UTF-8 encoded byte string safe for printing.
+    Returns a formatted string.
     """
     try:
-        # Format the string (may contain Unicode)
-        result = fmt_string.format(*args, **kwargs)
-        # If it's Unicode, encode to UTF-8; otherwise return as-is
-        if isinstance(result, unicode):
-            return result.encode('utf-8', 'replace')
-        return result
-    except (UnicodeEncodeError, UnicodeDecodeError):
-        # Fallback: use ASCII with replacement chars
-        try:
-            result = fmt_string.format(*args, **kwargs)
-            if isinstance(result, unicode):
-                return result.encode('ascii', 'replace')
-            return result
-        except Exception:
-            return "<formatting_error>"
+        return fmt_string.format(*args, **kwargs)
+    except Exception:
+        return "<formatting_error>"
 
 
 class DecompileCallable(Callable):
@@ -250,7 +232,7 @@ def extract_comprehensive_analysis():
             "write": block.isWrite(),
             "execute": block.isExecute(),
             "initialized": block.isInitialized(),
-            "comment": safe_unicode(block.getComment()) if block.getComment() else u""
+            "comment": safe_unicode(block.getComment()) if block.getComment() else ""
         }
         context["memory_map"].append(block_info)
 
@@ -586,7 +568,7 @@ def main():
 
         # Write to JSON file with UTF-8 encoding to handle Unicode characters
         print(safe_format("[*] Writing output to {}...", output_path))
-        with codecs.open(output_path, 'w', encoding='utf-8') as f:
+        with open(output_path, 'w', encoding='utf-8') as f:
             json.dump(context, f, indent=2, ensure_ascii=False)
 
         print(safe_format("[+] Analysis complete! Output saved to: {}", output_path))

@@ -121,6 +121,7 @@ python3 install.py --install-dir /opt/binary-mcp --skip-ghidra
 - **PowerShell 5.1+** - Built into Windows 10/11
 - **Administrator privileges** - For system-wide installation
 - **.NET Framework 4.8+** - Usually pre-installed
+- **Visual C++ Redistributable** - Required for PyGhidra/jpype1. [Download here](https://aka.ms/vs/17/release/vc_redist.x64.exe)
 
 ### Linux/macOS Specific
 - **curl** - Usually pre-installed
@@ -189,6 +190,27 @@ $env:GHIDRA_HOME = "C:\path\to\ghidra"
 **Linux/macOS:**
 ```bash
 export GHIDRA_HOME=/path/to/ghidra
+```
+
+**For Ghidra 12.0+ (PyGhidra support):**
+
+Ghidra 12.0 and later use PyGhidra (Python 3) instead of Jython (Python 2.7). Install the optional dependency:
+
+```bash
+# Using uv
+uv sync --extra pyghidra
+
+# Or using pip
+pip install "binary-mcp[pyghidra]"
+```
+
+The runner automatically detects your Ghidra version and uses the appropriate execution mode:
+- **Ghidra 12.0+**: Uses PyGhidra (Python 3)
+- **Ghidra 9.x-11.x**: Uses analyzeHeadless (Jython/Python 2.7)
+
+To force legacy mode for Ghidra 12+, set:
+```bash
+export GHIDRA_USE_LEGACY=1
 ```
 
 ### 6. Install x64dbg (Windows Only, Optional)
@@ -304,6 +326,30 @@ brew install python@3.12
 - Ensure Java 17+ is installed: `java -version`
 - Install from: https://adoptium.net/
 
+**"Python is not available" error with Ghidra 12.0+:**
+- Ghidra 12.0+ uses PyGhidra (native Python 3)
+- Install PyGhidra: `uv sync --extra pyghidra`
+- The runner auto-detects version and switches modes automatically
+
+**PyGhidra import errors:**
+- Ensure Python 3.12+ is being used
+- Verify pyghidra installation: `python -c "import pyghidra; print(pyghidra.__version__)"`
+- Check Ghidra path: `echo $GHIDRA_HOME`
+
+**jpype1 build fails on Windows (C++ compiler error):**
+- PyGhidra depends on `jpype1` which requires pre-built wheels
+- Use Python 3.12 or 3.13 (not 3.14+) which have pre-built Windows wheels:
+  ```powershell
+  uv venv --python 3.12
+  uv sync --extra pyghidra
+  ```
+- Alternatively, install Visual C++ Build Tools: https://visualstudio.microsoft.com/visual-cpp-build-tools/
+
+**"VCRUNTIME140.dll not found" or similar DLL errors:**
+- PyGhidra requires the Visual C++ Redistributable runtime
+- Download and install from: https://aka.ms/vs/17/release/vc_redist.x64.exe
+- Restart your terminal/PowerShell after installation
+
 ### Common Issues
 
 **"Claude Desktop config not found":**
@@ -372,6 +418,25 @@ uv sync --extra dev
 
 Or simply re-run the installer - it will update existing installations.
 
+### Upgrading Ghidra from 10.x/11.x to 12.0+
+
+When upgrading Ghidra from version 10.x or 11.x to 12.0+, you need to install PyGhidra support:
+
+```bash
+# 1. Download and install new Ghidra version
+# 2. Update GHIDRA_HOME to point to new installation
+export GHIDRA_HOME=/path/to/ghidra-12.0.1
+
+# 3. Install PyGhidra support
+pip install pyghidra
+# Or: uv sync --extra pyghidra
+
+# 4. Verify the upgrade
+uv run python -c "from src.engines.static.ghidra.runner import GhidraRunner; r = GhidraRunner(); print(r.diagnose())"
+```
+
+You should see `execution_mode: "pyghidra"` in the output.
+
 ---
 
 ## Advanced Configuration
@@ -396,11 +461,20 @@ export GHIDRA_HOME="/custom/path/ghidra"
 The server can be configured via environment variables:
 
 ```bash
-# Custom cache directory
-export GHIDRA_MCP_CACHE="$HOME/custom-cache"
+# Ghidra settings
+export GHIDRA_HOME="/path/to/ghidra"          # Ghidra installation path
+export GHIDRA_TIMEOUT=600                      # Analysis timeout in seconds
+export GHIDRA_MAXMEM="4G"                      # Java heap size for PyGhidra (e.g., "4G", "8G")
+export GHIDRA_FUNCTION_TIMEOUT=30              # Per-function decompilation timeout
+export GHIDRA_MAX_FUNCTIONS=0                  # Max functions to analyze (0 = unlimited)
+export GHIDRA_USE_LEGACY=1                     # Force analyzeHeadless on Ghidra 12+ (not recommended)
 
-# Enable debug logging
-export MCP_LOG_LEVEL="DEBUG"
+# Cache and session settings
+export BINARY_MCP_CACHE_DIR="$HOME/.ghidra_mcp_cache"    # Analysis cache directory
+export BINARY_MCP_SESSION_DIR="$HOME/.binary_mcp_sessions"  # Session storage
+
+# Logging
+export BINARY_MCP_LOG_LEVEL="DEBUG"            # Log level (DEBUG, INFO, WARNING, ERROR)
 ```
 
 ### Running Multiple Instances

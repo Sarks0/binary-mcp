@@ -91,3 +91,6 @@ logs/
 
 # Security reviews (internal only)
 security/
+
+# Internal development documents
+DEVELOPMENT_ROADMAP.md

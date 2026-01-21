@@ -11,6 +11,7 @@ import asyncio
 import functools
 import json
 import logging
+import logging.handlers
 import re
 import sys
 import time
@@ -20,8 +21,9 @@ from typing import Any
 from fastmcp import FastMCP
 
 from src.engines.session import AnalysisType, UnifiedSessionManager
+from src.engines.static.ghidra.error_logger import GhidraErrorContext, GhidraErrorLogger
 from src.engines.static.ghidra.project_cache import ProjectCache
-from src.engines.static.ghidra.runner import GhidraRunner
+from src.engines.static.ghidra.runner import GhidraAnalysisError, GhidraRunner
 from src.tools.dotnet_tools import register_dotnet_tools
 from src.tools.dynamic_tools import register_dynamic_tools
 from src.tools.reporting import register_reporting_tools
@@ -55,10 +57,25 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Add rotating file handler for persistent logging
+_log_dir = Path.home() / ".ghidra_mcp_cache" / "logs"
+_log_dir.mkdir(parents=True, exist_ok=True)
+_file_handler = logging.handlers.RotatingFileHandler(
+    _log_dir / "binary-mcp.log",
+    maxBytes=10 * 1024 * 1024,  # 10 MB
+    backupCount=3,
+)
+_file_handler.setFormatter(
+    logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+)
+logging.getLogger().addHandler(_file_handler)
+logger.info(f"File logging enabled: {_log_dir / 'binary-mcp.log'}")
+
 # Initialize components
 app = FastMCP("binary-mcp")
 runner = GhidraRunner()
 cache = ProjectCache()
+ghidra_error_logger = GhidraErrorLogger()
 session_manager = UnifiedSessionManager()
 api_patterns = APIPatterns()
 crypto_patterns = CryptoPatterns()
@@ -272,7 +289,39 @@ def get_analysis_context(
         logger.info(f"Analysis complete: {result['elapsed_time']:.2f}s")
         return context
 
+    except GhidraAnalysisError as e:
+        # Log structured error to GhidraErrorLogger
+        import traceback
+        context = GhidraErrorContext(
+            operation="analyze",
+            binary_path=e.binary_path,
+            execution_mode=e.execution_mode,
+            elapsed_seconds=e.elapsed_time,
+        )
+        ghidra_error_logger.log_error(
+            operation="analyze",
+            error=e,
+            context=context,
+            exit_code=e.exit_code,
+            stdout=e.stdout,
+            stderr=e.stderr,
+            traceback_str=traceback.format_exc(),
+        )
+        logger.error(f"Analysis failed: {e}")
+        raise RuntimeError(f"Failed to analyze binary: {e}")
     except Exception as e:
+        # Log generic error
+        import traceback
+        context = GhidraErrorContext(
+            operation="analyze",
+            binary_path=binary_path,
+        )
+        ghidra_error_logger.log_error(
+            operation="analyze",
+            error=e,
+            context=context,
+            traceback_str=traceback.format_exc(),
+        )
         logger.error(f"Analysis failed: {e}")
         raise RuntimeError(f"Failed to analyze binary: {e}")
 
@@ -281,11 +330,11 @@ def _calculate_timeout(binary_path: str) -> int:
     """
     Calculate appropriate timeout based on binary file size.
 
-    Uses formula: 60s base + 120s per MB
+    Uses formula: 780s base (13 min) + 120s per MB
     Examples:
-    - 1 MB binary: 60 + 120 = 180s (3 min)
-    - 5 MB binary: 60 + 600 = 660s (11 min)
-    - 10 MB binary: 60 + 1200 = 1260s (21 min)
+    - 1 MB binary: 780 + 120 = 900s (15 min)
+    - 5 MB binary: 780 + 600 = 1380s (23 min)
+    - 10 MB binary: 780 + 1200 = 1980s (33 min, capped at max)
 
     Args:
         binary_path: Path to binary file
@@ -297,8 +346,8 @@ def _calculate_timeout(binary_path: str) -> int:
         file_size_bytes = Path(binary_path).stat().st_size
         file_size_mb = file_size_bytes / (1024 * 1024)
 
-        # Base 60s + 120s per MB
-        calculated_timeout = int(60 + (file_size_mb * 120))
+        # Base 780s (13 min) + 120s per MB for larger binaries
+        calculated_timeout = int(780 + (file_size_mb * 120))
 
         # Get configured max timeout (default 1800s = 30 min)
         max_timeout = get_config_int("GHIDRA_TIMEOUT", 1800)
@@ -470,7 +519,39 @@ async def get_analysis_context_async(
 
     try:
         return await task
+    except GhidraAnalysisError as e:
+        # Log structured error to GhidraErrorLogger
+        import traceback
+        context = GhidraErrorContext(
+            operation="analyze_async",
+            binary_path=e.binary_path,
+            execution_mode=e.execution_mode,
+            elapsed_seconds=e.elapsed_time,
+        )
+        ghidra_error_logger.log_error(
+            operation="analyze_async",
+            error=e,
+            context=context,
+            exit_code=e.exit_code,
+            stdout=e.stdout,
+            stderr=e.stderr,
+            traceback_str=traceback.format_exc(),
+        )
+        logger.error(f"Async analysis failed: {e}")
+        raise RuntimeError(f"Failed to analyze binary: {e}")
     except Exception as e:
+        # Log generic error
+        import traceback
+        context = GhidraErrorContext(
+            operation="analyze_async",
+            binary_path=binary_path,
+        )
+        ghidra_error_logger.log_error(
+            operation="analyze_async",
+            error=e,
+            context=context,
+            traceback_str=traceback.format_exc(),
+        )
         logger.error(f"Async analysis failed: {e}")
         raise RuntimeError(f"Failed to analyze binary: {e}")
     finally:
@@ -499,7 +580,7 @@ async def analyze_binary(
     It loads the binary, runs Ghidra's auto-analysis, and extracts comprehensive data.
 
     This async version doesn't block other MCP requests while Ghidra analyzes large binaries.
-    Timeout scales automatically based on file size (60s base + 120s per MB).
+    Timeout scales automatically based on file size (780s base + 120s per MB).
 
     IMPORTANT: This tool automatically checks binary compatibility before analysis.
     For .NET assemblies or packed binaries, it will return recommendations for better tools.
@@ -1345,14 +1426,30 @@ def diagnose_setup() -> str:
         result += f"- Platform: {diag['platform']}\n"
         result += f"- Ghidra Path: `{diag['ghidra_path']}`\n"
         result += f"- Ghidra Exists: {'YES' if diag['ghidra_exists'] else 'NO'}\n"
-        result += f"- analyzeHeadless: `{diag['analyze_headless']}`\n"
-        result += f"- analyzeHeadless Exists: {'YES' if diag['analyze_headless_exists'] else 'NO'}\n"
-        result += f"- Java Installed: {'YES' if diag['java_installed'] else 'NO'}\n"
+        result += f"- Ghidra Version: {diag.get('ghidra_version', 'Unknown')}\n"
+        result += f"- Execution Mode: **{diag['execution_mode']}**\n\n"
 
+        result += "**Java & Ghidra Tools:**\n"
+        result += f"- Java Installed: {'YES' if diag['java_installed'] else 'NO'}\n"
         if diag['java_version']:
             result += f"- Java Version: {diag['java_version']}\n"
+        result += f"- analyzeHeadless: `{diag['analyze_headless']}`\n"
+        result += f"- analyzeHeadless Exists: {'YES' if diag['analyze_headless_exists'] else 'NO'}\n\n"
 
-        result += f"- Ghidra Version: {diag.get('ghidra_version', 'Unknown')}\n\n"
+        # PyGhidra info
+        result += "**PyGhidra (Ghidra 12.0+):**\n"
+        result += f"- Installed: {'YES' if diag.get('pyghidra_installed') else 'NO'}\n"
+        if diag.get('pyghidra_version'):
+            result += f"- Version: {diag['pyghidra_version']}\n"
+        if diag.get('pyghidra_warning'):
+            result += f"- ⚠️ {diag['pyghidra_warning']}\n"
+        result += "\n"
+
+        # Environment settings
+        result += "**Environment Settings:**\n"
+        result += f"- GHIDRA_MAXMEM: {diag.get('ghidra_maxmem', 'not set')}\n"
+        result += f"- GHIDRA_TIMEOUT: {diag.get('ghidra_timeout', 'not set')}\n"
+        result += f"- GHIDRA_USE_LEGACY: {diag.get('ghidra_use_legacy', 'not set')}\n\n"
 
         # Cache info
         cached_binaries = cache.list_cached()
@@ -1371,12 +1468,16 @@ def diagnose_setup() -> str:
             result += f"- Active Session: `{session_stats['active_session'][:8]}...`\n"
         result += "\n"
 
+        # Warnings and status
         if not diag['ghidra_exists']:
-            result += "\n**WARNING:** Ghidra not found! Please install Ghidra or set GHIDRA_HOME environment variable.\n"
+            result += "**⚠️ WARNING:** Ghidra not found! Please install Ghidra or set GHIDRA_HOME environment variable.\n"
         elif not diag['java_installed']:
-            result += "\n**WARNING:** Java not found! Ghidra requires Java 21+.\n"
+            result += "**⚠️ WARNING:** Java not found! Ghidra requires Java 21+.\n"
+        elif diag['execution_mode'] == 'pyghidra' and not diag.get('pyghidra_installed'):
+            result += "**⚠️ WARNING:** PyGhidra mode selected but pyghidra not installed!\n"
+            result += "Install with: `pip install 'binary-mcp[pyghidra]'`\n"
         else:
-            result += "\n**Setup looks good!** Ready to analyze binaries.\n"
+            result += "**✓ Setup looks good!** Ready to analyze binaries.\n"
 
         return result
 
@@ -2900,6 +3001,93 @@ def list_python_archive_contents(binary_path: str) -> str:
     except Exception as e:
         logger.error(f"list_python_archive_contents failed: {e}")
         return f"Error listing archive contents: {e}"
+
+
+@app.tool()
+def view_ghidra_errors(count: int = 10, error_id: str | None = None) -> str:
+    """
+    View recent Ghidra analysis errors for debugging.
+
+    Displays error logs stored in ~/.ghidra_mcp_cache/ghidra_errors/.
+    Useful for diagnosing analysis failures when Ghidra errors are not visible
+    in the Claude Desktop interface.
+
+    Args:
+        count: Number of recent errors to show (default: 10)
+        error_id: Specific error ID to view in detail (optional)
+
+    Returns:
+        Formatted error summary or detailed error info
+
+    Example:
+        view_ghidra_errors()  # Show last 10 errors
+        view_ghidra_errors(count=5)  # Show last 5 errors
+        view_ghidra_errors(error_id="ghidra_abc123")  # View specific error
+    """
+    try:
+        if error_id:
+            # View specific error in detail
+            error = ghidra_error_logger.get_error(error_id)
+            if not error:
+                return f"Error not found: {error_id}"
+
+            import time as time_module
+            lines = [
+                f"=== GHIDRA ERROR DETAIL: {error_id} ===",
+                f"Timestamp: {time_module.strftime('%Y-%m-%d %H:%M:%S', time_module.localtime(error.timestamp))}",
+                f"Operation: {error.operation}",
+                f"Error Type: {error.error_type}",
+                f"Message: {error.error_message}",
+            ]
+
+            if error.exit_code is not None:
+                lines.append(f"Exit Code: {error.exit_code}")
+
+            if error.context:
+                lines.append("\nContext:")
+                for key, value in error.context.items():
+                    if value is not None:
+                        lines.append(f"  {key}: {value}")
+
+            if error.stdout:
+                lines.append("\nStdout (last 1000 chars):")
+                lines.append(error.stdout[-1000:])
+
+            if error.stderr:
+                lines.append("\nStderr (last 1000 chars):")
+                lines.append(error.stderr[-1000:])
+
+            if error.traceback:
+                lines.append("\nTraceback:")
+                lines.append(error.traceback)
+
+            return "\n".join(lines)
+        else:
+            # Show summary of recent errors
+            return ghidra_error_logger.format_error_summary(count)
+
+    except Exception as e:
+        logger.error(f"view_ghidra_errors failed: {e}")
+        return f"Error viewing Ghidra errors: {e}"
+
+
+@app.tool()
+def clear_ghidra_errors() -> str:
+    """
+    Clear all stored Ghidra error logs.
+
+    Removes all error records from ~/.ghidra_mcp_cache/ghidra_errors/.
+    Use this to clean up old errors after debugging.
+
+    Returns:
+        Confirmation message with count of cleared errors
+    """
+    try:
+        count = ghidra_error_logger.clear_all_errors()
+        return f"Cleared {count} Ghidra error records."
+    except Exception as e:
+        logger.error(f"clear_ghidra_errors failed: {e}")
+        return f"Error clearing Ghidra errors: {e}"
 
 
 def main():

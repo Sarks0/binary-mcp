@@ -1282,8 +1282,9 @@ def search_bytes(
         found = 0
 
         for string in strings:
-            if clean_pattern in string.get('value', '').lower():
-                result += f"- Found in string at {string.get('address')}: {string.get('value')[:100]}\n"
+            string_value = string.get('value', '')
+            if clean_pattern in string_value.lower():
+                result += f"- Found in string at {string.get('address')}: {string_value[:100]}\n"
                 found += 1
                 if found >= max_results:
                     break
@@ -1464,8 +1465,9 @@ def diagnose_setup() -> str:
         result += f"- Stored Sessions: {session_stats['total_sessions']}\n"
         result += f"- Storage Size: {session_stats['total_size_mb']:.2f} MB\n"
         result += f"- Storage Directory: `{session_manager.store_dir}`\n"
-        if session_stats['active_session']:
-            result += f"- Active Session: `{session_stats['active_session'][:8]}...`\n"
+        active_session = session_stats.get('active_session')
+        if active_session:
+            result += f"- Active Session: `{active_session[:8]}...`\n"
         result += "\n"
 
         # Warnings and status
@@ -1585,7 +1587,7 @@ def list_data_types(
                 result += f"- **{struct.get('name')}** ({struct.get('length')} bytes)\n"
                 members = struct.get('members', [])
                 for member in members[:10]:  # Show first 10 members
-                    result += f"  - +0x{member.get('offset'):x}: {member.get('name')} ({member.get('datatype')})\n"
+                    result += f"  - +0x{member.get('offset', 0):x}: {member.get('name', '?')} ({member.get('datatype', 'unknown')})\n"
                 if len(members) > 10:
                     result += f"  - ...and {len(members) - 10} more members\n"
                 result += "\n"

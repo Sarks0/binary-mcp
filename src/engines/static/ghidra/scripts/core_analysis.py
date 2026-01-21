@@ -1,18 +1,32 @@
 # Ghidra Python 3 script for comprehensive malware analysis extraction
-# This script runs inside Ghidra's JVM environment with PyGhidra (Python 3)
-# @category: MalwareAnalysis
-# ruff: noqa: F821
+# @runtime PyGhidra
+# @category MalwareAnalysis
+# @menupath Tools.Binary MCP.Core Analysis
+#
+# REQUIRES: Ghidra 12.0+ with PyGhidra support
+#
+# The @runtime PyGhidra directive tells Ghidra to use Python 3 (PyGhidra)
+# instead of Jython 2.7, even when called via analyzeHeadless -postScript.
+# This allows us to write pure Python 3 code.
+#
+# ruff: noqa: F821, E402
 # Note: currentProgram and other Ghidra globals are provided at runtime
 
 import json
 import os
+import sys
 
+# Early diagnostic: Print Python version and execution context
+# These prints must happen before Ghidra imports to help debug import failures
+print(f"[*] Script starting - Python version: {sys.version_info[:3]}")
+print(f"[*] Python executable: {sys.executable}")
+print("[*] PyGhidra runtime active")
+
+# Ghidra imports (must be after diagnostic prints for debugging)
 from ghidra.app.decompiler import DecompInterface
 from ghidra.program.model.symbol import SymbolType
 from ghidra.util.task import ConsoleTaskMonitor
 from java.lang import InterruptedException, Thread
-
-# Java imports for thread-based timeout handling
 from java.util.concurrent import Callable, Executors, TimeoutException, TimeUnit
 
 
@@ -167,10 +181,10 @@ def extract_comprehensive_analysis():
     max_functions = int(os.environ.get("GHIDRA_MAX_FUNCTIONS", "0"))  # 0 = unlimited
     skip_decompile = os.environ.get("GHIDRA_SKIP_DECOMPILE", "").lower() in ("1", "true", "yes")
 
-    print(safe_format("[*] Analysis settings:"))
-    print(safe_format("    Function timeout: {}s", function_timeout))
-    print(safe_format("    Max functions: {}", max_functions if max_functions > 0 else "unlimited"))
-    print(safe_format("    Skip decompile: {}", skip_decompile))
+    print("[*] Analysis settings:")
+    print(f"    Function timeout: {function_timeout}s")
+    print(f"    Max functions: {max_functions if max_functions > 0 else 'unlimited'}")
+    print(f"    Skip decompile: {skip_decompile}")
 
     # Initialize decompiler
     decompiler = DecompInterface()
@@ -512,27 +526,27 @@ def extract_comprehensive_analysis():
             context["data_types"]["enums"].append(enum_info)
 
     print("[*] Extraction complete!")
-    print(safe_format("    Functions: {}", len(context["functions"])))
-    print(safe_format("    Imports: {}", len(context["imports"])))
-    print(safe_format("    Exports: {}", len(context["exports"])))
-    print(safe_format("    Strings: {}", len(context["strings"])))
-    print(safe_format("    Structures: {}", len(context["data_types"]["structures"])))
-    print(safe_format("    Enums: {}", len(context["data_types"]["enums"])))
+    print(f"    Functions: {len(context['functions'])}")
+    print(f"    Imports: {len(context['imports'])}")
+    print(f"    Exports: {len(context['exports'])}")
+    print(f"    Strings: {len(context['strings'])}")
+    print(f"    Structures: {len(context['data_types']['structures'])}")
+    print(f"    Enums: {len(context['data_types']['enums'])}")
 
     # Print analysis statistics
     stats = context["analysis_stats"]
     print("[*] Analysis statistics:")
-    print(safe_format("    Functions analyzed: {}", stats["functions_analyzed"]))
-    print(safe_format("    Total decompile timeouts: {}", stats["decompile_timeouts"]))
+    print(f"    Functions analyzed: {stats['functions_analyzed']}")
+    print(f"    Total decompile timeouts: {stats['decompile_timeouts']}")
     if stats["thread_timeouts"] > 0:
-        print(safe_format("      - Thread timeouts (anti-analysis): {}", stats["thread_timeouts"]))
+        print(f"      - Thread timeouts (anti-analysis): {stats['thread_timeouts']}")
     if stats["internal_timeouts"] > 0:
-        print(safe_format("      - Internal timeouts (Ghidra): {}", stats["internal_timeouts"]))
-    print(safe_format("    Decompile failures: {}", stats["decompile_failures"]))
+        print(f"      - Internal timeouts (Ghidra): {stats['internal_timeouts']}")
+    print(f"    Decompile failures: {stats['decompile_failures']}")
     if stats["partial_results"]:
         print("    [!] PARTIAL RESULTS: Analysis was limited by max_functions setting")
     if context["skipped_functions"]:
-        print(safe_format("    Skipped functions: {}", len(context["skipped_functions"])))
+        print(f"    Skipped functions: {len(context['skipped_functions'])}")
 
     # Cleanup: shutdown the executor service
     print("[*] Shutting down decompile executor...")
@@ -552,29 +566,37 @@ def extract_comprehensive_analysis():
 
 def main():
     """Main execution function."""
+    print("[*] core_analysis.py main() started")
+
     try:
         # Get output path from environment variable
         output_path = os.environ.get("GHIDRA_CONTEXT_JSON")
+        print(f"[*] GHIDRA_CONTEXT_JSON = {output_path if output_path else '<NOT SET>'}")
+
         if not output_path:
             print("[!] ERROR: GHIDRA_CONTEXT_JSON environment variable not set")
+            print("[!] Available environment variables:")
+            for key in sorted(os.environ.keys()):
+                if "GHIDRA" in key.upper() or "PATH" in key.upper():
+                    print(f"    {key} = {os.environ.get(key, '')}")
             return
 
         print("[*] Starting comprehensive analysis extraction...")
-        print(safe_format("[*] Program: {}", safe_unicode(currentProgram.getName())))
-        print(safe_format("[*] Output: {}", output_path))
+        print(f"[*] Program: {safe_unicode(currentProgram.getName())}")
+        print(f"[*] Output: {output_path}")
 
         # Extract all analysis data
         context = extract_comprehensive_analysis()
 
         # Write to JSON file with UTF-8 encoding to handle Unicode characters
-        print(safe_format("[*] Writing output to {}...", output_path))
+        print(f"[*] Writing output to {output_path}...")
         with open(output_path, 'w', encoding='utf-8') as f:
             json.dump(context, f, indent=2, ensure_ascii=False)
 
-        print(safe_format("[+] Analysis complete! Output saved to: {}", output_path))
+        print(f"[+] Analysis complete! Output saved to: {output_path}")
 
     except Exception as e:
-        print(safe_format("[!] ERROR during analysis: {}", safe_unicode(e)))
+        print(f"[!] ERROR during analysis: {safe_unicode(e)}")
         import traceback
         traceback.print_exc()
 

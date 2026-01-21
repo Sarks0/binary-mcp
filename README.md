@@ -176,15 +176,18 @@ Binary MCP automatically detects your Ghidra version and uses the appropriate ex
 Ghidra 11.0+ replaced Jython with PyGhidra (native Python 3). Install the optional dependency:
 
 ```bash
-# Using pip
-pip install pyhidra
-
-# Or install binary-mcp with Ghidra 11+ support
-pip install "binary-mcp[ghidra11]"
-
-# Or using uv
+# Using uv (recommended)
 uv sync --extra ghidra11
+
+# Or using pip
+pip install pyhidra
 ```
+
+> **Note (Windows):** PyGhidra requires `jpype1` which needs pre-built wheels. Use **Python 3.12 or 3.13** (not 3.14+) to avoid C++ compilation issues:
+> ```powershell
+> uv venv --python 3.12
+> uv sync --extra ghidra11
+> ```
 
 The runner automatically detects your Ghidra version. To verify:
 

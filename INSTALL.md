@@ -327,14 +327,22 @@ brew install python@3.12
 
 **"Python is not available" error with Ghidra 11+:**
 - Ghidra 11.0+ removed Jython and requires PyGhidra
-- Install PyGhidra: `pip install pyhidra`
-- Or install with extras: `pip install "binary-mcp[ghidra11]"`
+- Install PyGhidra: `uv sync --extra ghidra11`
 - The runner auto-detects version and switches modes automatically
 
 **PyGhidra import errors:**
 - Ensure Python 3.12+ is being used
 - Verify pyhidra installation: `python -c "import pyhidra; print(pyhidra.__version__)"`
 - Check Ghidra path: `echo $GHIDRA_HOME`
+
+**jpype1 build fails on Windows (C++ compiler error):**
+- PyGhidra depends on `jpype1` which requires pre-built wheels
+- Use Python 3.12 or 3.13 (not 3.14+) which have pre-built Windows wheels:
+  ```powershell
+  uv venv --python 3.12
+  uv sync --extra ghidra11
+  ```
+- Alternatively, install Visual C++ Build Tools: https://visualstudio.microsoft.com/visual-cpp-build-tools/
 
 ### Common Issues
 

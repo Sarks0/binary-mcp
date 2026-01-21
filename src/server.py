@@ -3044,21 +3044,21 @@ def view_ghidra_errors(count: int = 10, error_id: str | None = None) -> str:
                 lines.append(f"Exit Code: {error.exit_code}")
 
             if error.context:
-                lines.append(f"\nContext:")
+                lines.append("\nContext:")
                 for key, value in error.context.items():
                     if value is not None:
                         lines.append(f"  {key}: {value}")
 
             if error.stdout:
-                lines.append(f"\nStdout (last 1000 chars):")
+                lines.append("\nStdout (last 1000 chars):")
                 lines.append(error.stdout[-1000:])
 
             if error.stderr:
-                lines.append(f"\nStderr (last 1000 chars):")
+                lines.append("\nStderr (last 1000 chars):")
                 lines.append(error.stderr[-1000:])
 
             if error.traceback:
-                lines.append(f"\nTraceback:")
+                lines.append("\nTraceback:")
                 lines.append(error.traceback)
 
             return "\n".join(lines)

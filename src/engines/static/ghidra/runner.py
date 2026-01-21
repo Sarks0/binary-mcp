@@ -317,22 +317,64 @@ class GhidraRunner:
         """
         import shutil
 
-        project_path = project_dir / f"{project_name}.rep"
+        # Ghidra project structure:
+        # project_dir/project_name/          <- project folder
+        # project_dir/project_name.rep/      <- repository folder
+        # project_dir/project_name.lock      <- lock file (sometimes)
+        # project_dir/project_name/project_name.lock  <- lock inside folder
+        project_folder = project_dir / project_name
+        project_rep = project_dir / f"{project_name}.rep"
         lock_file = project_dir / f"{project_name}.lock"
+        inner_lock = project_folder / f"{project_name}.lock"
 
         try:
-            # Remove lock file
-            if lock_file.exists():
-                lock_file.unlink()
-                logger.debug(f"Removed lock file: {lock_file}")
+            # Remove all possible lock files
+            for lf in [lock_file, inner_lock]:
+                if lf.exists():
+                    lf.unlink()
+                    logger.debug(f"Removed lock file: {lf}")
 
-            # Remove project directory
-            if project_path.exists():
-                shutil.rmtree(project_path, ignore_errors=True)
-                logger.debug(f"Removed project directory: {project_path}")
+            # Remove project folder (contains .lock and other files)
+            if project_folder.exists():
+                shutil.rmtree(project_folder, ignore_errors=True)
+                logger.debug(f"Removed project folder: {project_folder}")
+
+            # Remove .rep directory
+            if project_rep.exists():
+                shutil.rmtree(project_rep, ignore_errors=True)
+                logger.debug(f"Removed project repository: {project_rep}")
 
         except Exception as e:
             logger.warning(f"Failed to cleanup project {project_name}: {e}")
+
+    def _pre_cleanup_stale_project(self, project_dir: Path, project_name: str) -> None:
+        """
+        Clean up stale project files before starting new analysis.
+
+        This prevents LockException when a previous analysis was interrupted
+        (e.g., by MCP client timeout) and left lock files behind.
+        """
+        import shutil
+
+        project_folder = project_dir / project_name
+
+        # Check for stale lock files
+        lock_files = [
+            project_dir / f"{project_name}.lock",
+            project_folder / f"{project_name}.lock",
+            project_folder / "db" / "db.lock",  # Ghidra DB lock
+        ]
+
+        has_stale_lock = any(lf.exists() for lf in lock_files)
+
+        if has_stale_lock:
+            logger.warning(
+                f"Found stale lock files for project {project_name}. "
+                f"Previous analysis may have been interrupted. Cleaning up..."
+            )
+            # Remove the entire project to ensure clean state
+            self._cleanup_project(project_dir, project_name)
+            logger.info(f"Cleaned up stale project: {project_name}")
 
     async def _analyze_with_pyghidra(
         self,
@@ -376,6 +418,9 @@ class GhidraRunner:
 
         logger.info(f"Using PyGhidra for analysis: {binary_path}")
         start_time = time.time()
+
+        # Clean up any stale project locks from interrupted previous analysis
+        self._pre_cleanup_stale_project(project_dir, project_name)
 
         # Build the script path
         full_script_path = Path(script_path) / script_name
@@ -831,6 +876,9 @@ except Exception as e:
             )
 
         # Legacy analyzeHeadless execution for Ghidra <12 (9.x-11.x)
+        # Clean up any stale project locks from interrupted previous analysis
+        self._pre_cleanup_stale_project(project_dir, project_name)
+
         # Build command - processor/loader must come immediately after binary path
         cmd = [
             self._get_analyze_headless_cmd(),

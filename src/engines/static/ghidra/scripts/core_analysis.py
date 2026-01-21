@@ -1,26 +1,32 @@
-# Ghidra Python 3 script for comprehensive malware analysis extraction
+# Ghidra Python script for comprehensive malware analysis extraction
 # @runtime PyGhidra
 # @category MalwareAnalysis
 # @menupath Tools.Binary MCP.Core Analysis
 #
-# REQUIRES: Ghidra 12.0+ with PyGhidra support
+# IMPORTANT: This script must be compatible with BOTH:
+#   - Jython 2.7 (used by analyzeHeadless -postScript)
+#   - Python 3 (used by PyGhidra direct execution)
 #
-# The @runtime PyGhidra directive tells Ghidra to use Python 3 (PyGhidra)
-# instead of Jython 2.7, even when called via analyzeHeadless -postScript.
-# This allows us to write pure Python 3 code.
+# The @runtime PyGhidra directive ONLY works in Ghidra's Script Manager (GUI mode).
+# It does NOT work with analyzeHeadless -postScript, which always uses Jython 2.7.
+# Therefore, this script avoids Python 3-only syntax (f-strings, etc.).
+#
+# For full Python 3 support, use PyGhidra's direct API (pyghidra.open_program()).
 #
 # ruff: noqa: F821, E402
 # Note: currentProgram and other Ghidra globals are provided at runtime
 
+from __future__ import print_function  # Python 2/3 compatibility
+import io  # For cross-version file encoding support
 import json
 import os
 import sys
 
 # Early diagnostic: Print Python version and execution context
 # These prints must happen before Ghidra imports to help debug import failures
-print(f"[*] Script starting - Python version: {sys.version_info[:3]}")
-print(f"[*] Python executable: {sys.executable}")
-print("[*] PyGhidra runtime active")
+print("[*] Script starting - Python version: {0}".format(sys.version_info[:3]))
+print("[*] Python executable: {0}".format(sys.executable))
+print("[*] Running in {0} mode".format("Python 3" if sys.version_info[0] >= 3 else "Jython 2.7"))
 
 # Ghidra imports (must be after diagnostic prints for debugging)
 from ghidra.app.decompiler import DecompInterface
@@ -34,27 +40,50 @@ def safe_unicode(value):
     """
     Safely convert a value to string, handling non-ASCII characters.
 
-    In Python 3, all strings are Unicode by default. This function ensures
-    consistent string handling across different types (Java objects, Python strings, etc).
+    Compatible with both Jython 2.7 and Python 3:
+    - In Python 2/Jython: str is bytes, unicode is text
+    - In Python 3: str is text (Unicode), bytes is bytes
+
+    This function ensures consistent string handling across runtimes.
     """
     if value is None:
         return ""
 
-    # In Python 3, str is already Unicode
-    if isinstance(value, str):
+    # Python 2/3 compatibility for string types
+    if sys.version_info[0] >= 3:
+        # Python 3: str is already Unicode
+        string_types = (str,)
+        text_type = str
+    else:
+        # Python 2/Jython: unicode is the text type
+        string_types = (str, unicode)  # noqa: F821
+        text_type = unicode  # noqa: F821
+
+    # Already a text string
+    if isinstance(value, string_types):
+        # In Python 2, convert str to unicode
+        if sys.version_info[0] < 3 and isinstance(value, str):
+            try:
+                return value.decode('utf-8')
+            except (UnicodeDecodeError, AttributeError):
+                try:
+                    return value.decode('latin-1')
+                except Exception:
+                    return text_type(value)
         return value
 
-    # For bytes, decode to string
+    # For bytes (Python 3 only has this as a separate type)
     if isinstance(value, bytes):
         try:
             return value.decode('utf-8')
         except UnicodeDecodeError:
             # If UTF-8 fails, try latin-1 (which accepts all byte values)
-            return value.decode('latin-1', 'replace')
+            return value.decode('latin-1')
 
-    # For other types (Java objects, numbers, etc), convert to str
+    # For other types (Java objects, numbers, etc), convert to text
     try:
-        return str(value)
+        result = text_type(value)
+        return result
     except Exception:
         return "<encoding_error>"
 
@@ -182,9 +211,9 @@ def extract_comprehensive_analysis():
     skip_decompile = os.environ.get("GHIDRA_SKIP_DECOMPILE", "").lower() in ("1", "true", "yes")
 
     print("[*] Analysis settings:")
-    print(f"    Function timeout: {function_timeout}s")
-    print(f"    Max functions: {max_functions if max_functions > 0 else 'unlimited'}")
-    print(f"    Skip decompile: {skip_decompile}")
+    print("    Function timeout: {0}s".format(function_timeout))
+    print("    Max functions: {0}".format(max_functions if max_functions > 0 else "unlimited"))
+    print("    Skip decompile: {0}".format(skip_decompile))
 
     # Initialize decompiler
     decompiler = DecompInterface()
@@ -526,27 +555,27 @@ def extract_comprehensive_analysis():
             context["data_types"]["enums"].append(enum_info)
 
     print("[*] Extraction complete!")
-    print(f"    Functions: {len(context['functions'])}")
-    print(f"    Imports: {len(context['imports'])}")
-    print(f"    Exports: {len(context['exports'])}")
-    print(f"    Strings: {len(context['strings'])}")
-    print(f"    Structures: {len(context['data_types']['structures'])}")
-    print(f"    Enums: {len(context['data_types']['enums'])}")
+    print("    Functions: {0}".format(len(context['functions'])))
+    print("    Imports: {0}".format(len(context['imports'])))
+    print("    Exports: {0}".format(len(context['exports'])))
+    print("    Strings: {0}".format(len(context['strings'])))
+    print("    Structures: {0}".format(len(context['data_types']['structures'])))
+    print("    Enums: {0}".format(len(context['data_types']['enums'])))
 
     # Print analysis statistics
     stats = context["analysis_stats"]
     print("[*] Analysis statistics:")
-    print(f"    Functions analyzed: {stats['functions_analyzed']}")
-    print(f"    Total decompile timeouts: {stats['decompile_timeouts']}")
+    print("    Functions analyzed: {0}".format(stats['functions_analyzed']))
+    print("    Total decompile timeouts: {0}".format(stats['decompile_timeouts']))
     if stats["thread_timeouts"] > 0:
-        print(f"      - Thread timeouts (anti-analysis): {stats['thread_timeouts']}")
+        print("      - Thread timeouts (anti-analysis): {0}".format(stats['thread_timeouts']))
     if stats["internal_timeouts"] > 0:
-        print(f"      - Internal timeouts (Ghidra): {stats['internal_timeouts']}")
-    print(f"    Decompile failures: {stats['decompile_failures']}")
+        print("      - Internal timeouts (Ghidra): {0}".format(stats['internal_timeouts']))
+    print("    Decompile failures: {0}".format(stats['decompile_failures']))
     if stats["partial_results"]:
         print("    [!] PARTIAL RESULTS: Analysis was limited by max_functions setting")
     if context["skipped_functions"]:
-        print(f"    Skipped functions: {len(context['skipped_functions'])}")
+        print("    Skipped functions: {0}".format(len(context['skipped_functions'])))
 
     # Cleanup: shutdown the executor service
     print("[*] Shutting down decompile executor...")
@@ -571,32 +600,33 @@ def main():
     try:
         # Get output path from environment variable
         output_path = os.environ.get("GHIDRA_CONTEXT_JSON")
-        print(f"[*] GHIDRA_CONTEXT_JSON = {output_path if output_path else '<NOT SET>'}")
+        print("[*] GHIDRA_CONTEXT_JSON = {0}".format(output_path if output_path else "<NOT SET>"))
 
         if not output_path:
             print("[!] ERROR: GHIDRA_CONTEXT_JSON environment variable not set")
             print("[!] Available environment variables:")
             for key in sorted(os.environ.keys()):
                 if "GHIDRA" in key.upper() or "PATH" in key.upper():
-                    print(f"    {key} = {os.environ.get(key, '')}")
+                    print("    {0} = {1}".format(key, os.environ.get(key, "")))
             return
 
         print("[*] Starting comprehensive analysis extraction...")
-        print(f"[*] Program: {safe_unicode(currentProgram.getName())}")
-        print(f"[*] Output: {output_path}")
+        print("[*] Program: {0}".format(safe_unicode(currentProgram.getName())))
+        print("[*] Output: {0}".format(output_path))
 
         # Extract all analysis data
         context = extract_comprehensive_analysis()
 
         # Write to JSON file with UTF-8 encoding to handle Unicode characters
-        print(f"[*] Writing output to {output_path}...")
-        with open(output_path, 'w', encoding='utf-8') as f:
+        # Use io.open() for Python 2/3 compatibility with encoding parameter
+        print("[*] Writing output to {0}...".format(output_path))
+        with io.open(output_path, 'w', encoding='utf-8') as f:
             json.dump(context, f, indent=2, ensure_ascii=False)
 
-        print(f"[+] Analysis complete! Output saved to: {output_path}")
+        print("[+] Analysis complete! Output saved to: {0}".format(output_path))
 
     except Exception as e:
-        print(f"[!] ERROR during analysis: {safe_unicode(e)}")
+        print("[!] ERROR during analysis: {0}".format(safe_unicode(e)))
         import traceback
         traceback.print_exc()
 

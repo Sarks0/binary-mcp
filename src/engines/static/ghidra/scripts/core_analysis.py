@@ -13,7 +13,7 @@
 #
 # For full Python 3 support, use PyGhidra's direct API (pyghidra.open_program()).
 #
-# ruff: noqa: F821, E402
+# ruff: noqa: F821, E402, I001, UP010, UP020, UP030, UP032, UP036
 # Note: currentProgram and other Ghidra globals are provided at runtime
 
 from __future__ import print_function  # Python 2/3 compatibility

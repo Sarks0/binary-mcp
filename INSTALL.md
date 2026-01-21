@@ -192,23 +192,23 @@ $env:GHIDRA_HOME = "C:\path\to\ghidra"
 export GHIDRA_HOME=/path/to/ghidra
 ```
 
-**For Ghidra 11+ (PyGhidra support):**
+**For Ghidra 12.0+ (PyGhidra support):**
 
-Ghidra 11.0 and later use PyGhidra (Python 3) instead of Jython (Python 2.7). Install the optional dependency:
+Ghidra 12.0 and later use PyGhidra (Python 3) instead of Jython (Python 2.7). Install the optional dependency:
 
 ```bash
 # Using uv
-uv sync --extra ghidra11
+uv sync --extra pyghidra
 
 # Or using pip
-pip install "binary-mcp[ghidra11]"
+pip install "binary-mcp[pyghidra]"
 ```
 
 The runner automatically detects your Ghidra version and uses the appropriate execution mode:
-- **Ghidra 11+**: Uses PyGhidra (Python 3)
-- **Ghidra 10.x and older**: Uses analyzeHeadless (Jython/Python 2.7)
+- **Ghidra 12.0+**: Uses PyGhidra (Python 3)
+- **Ghidra 9.x-11.x**: Uses analyzeHeadless (Jython/Python 2.7)
 
-To force legacy mode for Ghidra 11+, set:
+To force legacy mode for Ghidra 12+, set:
 ```bash
 export GHIDRA_USE_LEGACY=1
 ```
@@ -326,14 +326,14 @@ brew install python@3.12
 - Ensure Java 17+ is installed: `java -version`
 - Install from: https://adoptium.net/
 
-**"Python is not available" error with Ghidra 11+:**
-- Ghidra 11.0+ removed Jython and requires PyGhidra
-- Install PyGhidra: `uv sync --extra ghidra11`
+**"Python is not available" error with Ghidra 12.0+:**
+- Ghidra 12.0+ uses PyGhidra (native Python 3)
+- Install PyGhidra: `uv sync --extra pyghidra`
 - The runner auto-detects version and switches modes automatically
 
 **PyGhidra import errors:**
 - Ensure Python 3.12+ is being used
-- Verify pyhidra installation: `python -c "import pyhidra; print(pyhidra.__version__)"`
+- Verify pyghidra installation: `python -c "import pyghidra; print(pyghidra.__version__)"`
 - Check Ghidra path: `echo $GHIDRA_HOME`
 
 **jpype1 build fails on Windows (C++ compiler error):**
@@ -341,7 +341,7 @@ brew install python@3.12
 - Use Python 3.12 or 3.13 (not 3.14+) which have pre-built Windows wheels:
   ```powershell
   uv venv --python 3.12
-  uv sync --extra ghidra11
+  uv sync --extra pyghidra
   ```
 - Alternatively, install Visual C++ Build Tools: https://visualstudio.microsoft.com/visual-cpp-build-tools/
 
@@ -418,9 +418,9 @@ uv sync --extra dev
 
 Or simply re-run the installer - it will update existing installations.
 
-### Upgrading Ghidra from 10.x to 11+/12.x
+### Upgrading Ghidra from 10.x/11.x to 12.0+
 
-When upgrading Ghidra from version 10.x to 11.x or 12.x, you need to install PyGhidra support:
+When upgrading Ghidra from version 10.x or 11.x to 12.0+, you need to install PyGhidra support:
 
 ```bash
 # 1. Download and install new Ghidra version
@@ -428,14 +428,14 @@ When upgrading Ghidra from version 10.x to 11.x or 12.x, you need to install PyG
 export GHIDRA_HOME=/path/to/ghidra-12.0.1
 
 # 3. Install PyGhidra support
-pip install pyhidra
-# Or: uv sync --extra ghidra11
+pip install pyghidra
+# Or: uv sync --extra pyghidra
 
 # 4. Verify the upgrade
 uv run python -c "from src.engines.static.ghidra.runner import GhidraRunner; r = GhidraRunner(); print(r.diagnose())"
 ```
 
-You should see `execution_mode: "pyhidra"` in the output.
+You should see `execution_mode: "pyghidra"` in the output.
 
 ---
 
@@ -467,7 +467,7 @@ export GHIDRA_TIMEOUT=600                      # Analysis timeout in seconds
 export GHIDRA_MAXMEM="4G"                      # Java heap size for PyGhidra (e.g., "4G", "8G")
 export GHIDRA_FUNCTION_TIMEOUT=30              # Per-function decompilation timeout
 export GHIDRA_MAX_FUNCTIONS=0                  # Max functions to analyze (0 = unlimited)
-export GHIDRA_USE_LEGACY=1                     # Force analyzeHeadless on Ghidra 11+ (not recommended)
+export GHIDRA_USE_LEGACY=1                     # Force analyzeHeadless on Ghidra 12+ (not recommended)
 
 # Cache and session settings
 export BINARY_MCP_CACHE_DIR="$HOME/.ghidra_mcp_cache"    # Analysis cache directory

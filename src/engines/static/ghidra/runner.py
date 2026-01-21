@@ -1,7 +1,7 @@
 """
 Ghidra headless runner with cross-platform support.
 Handles Ghidra installation detection, project management, and script execution.
-Supports both legacy Jython (Ghidra ≤10.x) and PyGhidra (Ghidra 11+).
+Supports PyGhidra (Ghidra 12.0+) for Python 3 analysis.
 """
 
 import asyncio
@@ -75,11 +75,11 @@ class GhidraRunner:
 
         # Detect Ghidra version and determine execution mode
         self.ghidra_version = self._get_ghidra_version()
-        self.use_pyhidra = self._should_use_pyhidra()
+        self.use_pyghidra = self._should_use_pyghidra()
 
         logger.info(
             f"Initialized Ghidra runner: {self.ghidra_path} (v{self.ghidra_version}) "
-            f"on {self.system}, mode={'PyGhidra' if self.use_pyhidra else 'analyzeHeadless'}"
+            f"on {self.system}, mode={'PyGhidra' if self.use_pyghidra else 'analyzeHeadless'}"
         )
 
     def _detect_ghidra(self) -> Path:
@@ -253,14 +253,14 @@ class GhidraRunner:
 
         return None
 
-    def _should_use_pyhidra(self) -> bool:
+    def _should_use_pyghidra(self) -> bool:
         """
         Determine if PyGhidra should be used based on Ghidra version.
 
-        Ghidra 11.0+ uses PyGhidra (Python 3) instead of Jython (Python 2.7).
+        Ghidra 12.0+ uses PyGhidra (Python 3) for native Python analysis.
 
         Returns:
-            True if PyGhidra should be used (Ghidra 11+), False for legacy mode
+            True if PyGhidra should be used (Ghidra 12.0+), False for legacy mode
         """
         if self.ghidra_version == "unknown":
             # Default to PyGhidra for unknown versions (assume modern Ghidra)
@@ -271,9 +271,9 @@ class GhidraRunner:
             return os.environ.get("GHIDRA_USE_LEGACY", "").lower() not in ("1", "true", "yes")
 
         try:
-            # Parse major version (e.g., "11.2.1" -> 11)
+            # Parse major version (e.g., "12.0.1" -> 12)
             major_version = int(self.ghidra_version.split(".")[0])
-            return major_version >= 11
+            return major_version >= 12
         except (ValueError, IndexError):
             # If version parsing fails, check environment variable
             logger.warning(f"Could not parse Ghidra version '{self.ghidra_version}'")
@@ -334,7 +334,7 @@ class GhidraRunner:
         except Exception as e:
             logger.warning(f"Failed to cleanup project {project_name}: {e}")
 
-    async def _analyze_with_pyhidra(
+    async def _analyze_with_pyghidra(
         self,
         binary_path: Path,
         script_path: str,
@@ -346,7 +346,7 @@ class GhidraRunner:
         env: dict,
     ) -> dict:
         """
-        Run Ghidra analysis using PyGhidra (for Ghidra 11+).
+        Run Ghidra analysis using PyGhidra (for Ghidra 12.0+).
 
         Args:
             binary_path: Path to the binary file
@@ -363,15 +363,15 @@ class GhidraRunner:
 
         Raises:
             RuntimeError: If analysis fails
-            ImportError: If pyhidra is not installed
+            ImportError: If pyghidra is not installed
         """
         import importlib.util
         import sys
 
-        if importlib.util.find_spec("pyhidra") is None:
+        if importlib.util.find_spec("pyghidra") is None:
             raise ImportError(
-                "pyhidra is required for Ghidra 11+ but is not installed. "
-                "Install with: pip install 'binary-mcp[ghidra11]' or pip install pyhidra"
+                "pyghidra is required for Ghidra 12.0+ but is not installed. "
+                "Install with: pip install 'binary-mcp[pyghidra]' or pip install pyghidra"
             )
 
         logger.info(f"Using PyGhidra for analysis: {binary_path}")
@@ -390,7 +390,7 @@ class GhidraRunner:
             # Run analysis in a subprocess to avoid blocking the event loop
             # PyGhidra requires running in a separate process for proper isolation
             # CRITICAL: Use sys.executable to ensure subprocess uses the same Python
-            # interpreter (with access to installed packages like pyhidra)
+            # interpreter (with access to installed packages like pyghidra)
 
             # Set Java heap size for Ghidra (default 4G, or from GHIDRA_MAXMEM env)
             java_maxmem = os.environ.get("GHIDRA_MAXMEM", "4G")
@@ -411,29 +411,16 @@ for key, value in {repr(env)}.items():
     os.environ[key] = value
 
 try:
-    # Try new pyghidra (Ghidra 12.0+) first, fall back to pyhidra (Ghidra 11.x)
-    use_new_pyghidra = False
-    try:
-        import pyghidra
-        pyghidra_module = pyghidra
-        use_new_pyghidra = True
-        print("Using pyghidra (Ghidra 12.0+ API)", file=sys.stderr)
-    except ImportError:
-        import pyhidra as pyghidra_module
-        print("Using pyhidra (Ghidra 11.x API)", file=sys.stderr)
+    # Import pyghidra (Ghidra 12.0+)
+    import pyghidra
+    print("Using pyghidra (Ghidra 12.0+ API)", file=sys.stderr)
 
     # Initialize PyGhidra - this starts the JVM
-    # IMPORTANT: The API differs between pyghidra (new) and pyhidra (old)
     print("Initializing PyGhidra...", file=sys.stderr)
     ghidra_install_dir = {repr(str(self.ghidra_path))}
 
-    if use_new_pyghidra:
-        # New pyghidra (Ghidra 12.0+) accepts install_dir parameter
-        pyghidra_module.start(install_dir=ghidra_install_dir)
-    else:
-        # Old pyhidra requires GHIDRA_INSTALL_DIR environment variable
-        os.environ['GHIDRA_INSTALL_DIR'] = ghidra_install_dir
-        pyghidra_module.start()
+    # PyGhidra 12.0+ accepts install_dir parameter
+    pyghidra.start(install_dir=ghidra_install_dir)
 
     print("PyGhidra initialized successfully", file=sys.stderr)
 
@@ -446,7 +433,7 @@ try:
     print(f"Opening and analyzing binary: {{binary_path}}", file=sys.stderr)
     print("This may take several minutes for complex binaries...", file=sys.stderr)
 
-    with pyghidra_module.open_program(
+    with pyghidra.open_program(
         binary_path,
         project_location=project_location,
         project_name=project_name,
@@ -488,10 +475,9 @@ try:
     print("Analysis complete, project closed", file=sys.stderr)
 
 except ImportError as e:
-    print(f"ERROR: Failed to import required module: {{e}}", file=sys.stderr)
-    print("Make sure pyghidra or pyhidra is installed:", file=sys.stderr)
-    print("  For Ghidra 12.0+: pip install pyghidra", file=sys.stderr)
-    print("  For Ghidra 11.x:  pip install pyhidra", file=sys.stderr)
+    print(f"ERROR: Failed to import pyghidra: {{e}}", file=sys.stderr)
+    print("PyGhidra is required for Ghidra 12.0+ analysis.", file=sys.stderr)
+    print("Install with: pip install pyghidra", file=sys.stderr)
     sys.exit(1)
 except RuntimeError as e:
     print(f"ERROR: Runtime error during analysis: {{e}}", file=sys.stderr)
@@ -533,7 +519,7 @@ except Exception as e:
                     f"Binary may be too large or complex.",
                     elapsed_time=elapsed_time,
                     binary_path=str(binary_path),
-                    execution_mode="pyhidra",
+                    execution_mode="pyghidra",
                 )
 
             elapsed_time = time.time() - start_time
@@ -553,7 +539,7 @@ except Exception as e:
                     exit_code=process.returncode,
                     elapsed_time=elapsed_time,
                     binary_path=str(binary_path),
-                    execution_mode="pyhidra",
+                    execution_mode="pyghidra",
                 )
 
             logger.info(f"PyGhidra analysis completed in {elapsed_time:.2f}s")
@@ -567,7 +553,7 @@ except Exception as e:
                 "elapsed_time": elapsed_time,
                 "stdout": stdout,
                 "stderr": stderr,
-                "execution_mode": "pyhidra",
+                "execution_mode": "pyghidra",
             }
 
         except ImportError:
@@ -582,7 +568,7 @@ except Exception as e:
                 f"PyGhidra analysis failed: {e}",
                 elapsed_time=elapsed_time,
                 binary_path=str(binary_path),
-                execution_mode="pyhidra",
+                execution_mode="pyghidra",
             ) from e
 
     def analyze(
@@ -606,7 +592,7 @@ except Exception as e:
         Args:
             binary_path: Path to binary file to analyze
             script_path: Directory containing Ghidra scripts
-            script_name: Name of the Jython script to execute
+            script_name: Name of the Python script to execute
             output_path: Where to save analysis output
             project_name: Ghidra project name (default: binary basename)
             keep_project: Whether to keep the project after analysis
@@ -660,8 +646,8 @@ except Exception as e:
                      f"max_functions={max_functions}, skip_decompile={skip_decompile}")
 
         # Note: Synchronous analyze() does not support PyGhidra mode
-        # For Ghidra 11+, use analyze_async() instead for proper PyGhidra support
-        if self.use_pyhidra:
+        # For Ghidra 12.0+, use analyze_async() instead for proper PyGhidra support
+        if self.use_pyghidra:
             logger.warning(
                 "PyGhidra mode detected but analyze() is synchronous. "
                 "Use analyze_async() for proper PyGhidra support, or set GHIDRA_USE_LEGACY=1. "
@@ -723,7 +709,7 @@ except Exception as e:
                 "elapsed_time": elapsed_time,
                 "stdout": result.stdout,
                 "stderr": result.stderr,
-                "execution_mode": "pyhidra" if self.use_pyhidra else "analyzeHeadless",
+                "execution_mode": "pyghidra" if self.use_pyghidra else "analyzeHeadless",
             }
 
         except subprocess.TimeoutExpired as e:
@@ -786,7 +772,7 @@ except Exception as e:
         Args:
             binary_path: Path to binary file to analyze
             script_path: Directory containing Ghidra scripts
-            script_name: Name of the Jython script to execute
+            script_name: Name of the Python script to execute
             output_path: Where to save analysis output
             project_name: Ghidra project name (default: binary basename)
             keep_project: Whether to keep the project after analysis
@@ -831,9 +817,9 @@ except Exception as e:
         logger.debug(f"Analysis settings: function_timeout={function_timeout}, "
                      f"max_functions={max_functions}, skip_decompile={skip_decompile}")
 
-        # Use PyGhidra for Ghidra 11+, analyzeHeadless for older versions
-        if self.use_pyhidra:
-            return await self._analyze_with_pyhidra(
+        # Use PyGhidra for Ghidra 12.0+, analyzeHeadless for older versions
+        if self.use_pyghidra:
+            return await self._analyze_with_pyghidra(
                 binary_path=binary_path,
                 script_path=script_path,
                 script_name=script_name,
@@ -844,7 +830,7 @@ except Exception as e:
                 env=env,
             )
 
-        # Legacy analyzeHeadless execution for Ghidra ≤10.x
+        # Legacy analyzeHeadless execution for Ghidra <12 (9.x-11.x)
         # Build command - processor/loader must come immediately after binary path
         cmd = [
             self._get_analyze_headless_cmd(),
@@ -977,7 +963,7 @@ except Exception as e:
             "ghidra_path": str(self.ghidra_path),
             "ghidra_exists": self.ghidra_path.exists(),
             "ghidra_version": self.ghidra_version,
-            "execution_mode": "pyhidra" if self.use_pyhidra else "analyzeHeadless",
+            "execution_mode": "pyghidra" if self.use_pyghidra else "analyzeHeadless",
         }
 
         # Environment variable settings
@@ -1006,16 +992,16 @@ except Exception as e:
 
         # Check PyGhidra availability (always check, useful for diagnostics)
         try:
-            import pyhidra
-            diag["pyhidra_installed"] = True
-            diag["pyhidra_version"] = getattr(pyhidra, "__version__", "unknown")
+            import pyghidra
+            diag["pyghidra_installed"] = True
+            diag["pyghidra_version"] = getattr(pyghidra, "__version__", "unknown")
         except ImportError:
-            diag["pyhidra_installed"] = False
-            diag["pyhidra_version"] = None
-            if self.use_pyhidra:
-                diag["pyhidra_warning"] = (
-                    "PyGhidra required for Ghidra 11+ but not installed. "
-                    "Install with: pip install 'binary-mcp[ghidra11]'"
+            diag["pyghidra_installed"] = False
+            diag["pyghidra_version"] = None
+            if self.use_pyghidra:
+                diag["pyghidra_warning"] = (
+                    "PyGhidra required for Ghidra 12.0+ but not installed. "
+                    "Install with: pip install 'binary-mcp[pyghidra]'"
                 )
 
         return diag

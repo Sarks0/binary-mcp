@@ -20,8 +20,8 @@ dependencies = [
 yara = [
     "yara-python>=4.5.0",
 ]
-ghidra11 = [
-    "pyhidra>=1.1.0",
+pyghidra = [
+    "pyghidra>=3.0.0",  # For Ghidra 12.0+ with PyGhidra support
 ]
 dev = [
     "pytest>=8.0.0",

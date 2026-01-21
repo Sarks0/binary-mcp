@@ -1437,12 +1437,12 @@ def diagnose_setup() -> str:
         result += f"- analyzeHeadless Exists: {'YES' if diag['analyze_headless_exists'] else 'NO'}\n\n"
 
         # PyGhidra info
-        result += "**PyGhidra (Ghidra 11+):**\n"
-        result += f"- Installed: {'YES' if diag.get('pyhidra_installed') else 'NO'}\n"
-        if diag.get('pyhidra_version'):
-            result += f"- Version: {diag['pyhidra_version']}\n"
-        if diag.get('pyhidra_warning'):
-            result += f"- ⚠️ {diag['pyhidra_warning']}\n"
+        result += "**PyGhidra (Ghidra 12.0+):**\n"
+        result += f"- Installed: {'YES' if diag.get('pyghidra_installed') else 'NO'}\n"
+        if diag.get('pyghidra_version'):
+            result += f"- Version: {diag['pyghidra_version']}\n"
+        if diag.get('pyghidra_warning'):
+            result += f"- ⚠️ {diag['pyghidra_warning']}\n"
         result += "\n"
 
         # Environment settings
@@ -1473,9 +1473,9 @@ def diagnose_setup() -> str:
             result += "**⚠️ WARNING:** Ghidra not found! Please install Ghidra or set GHIDRA_HOME environment variable.\n"
         elif not diag['java_installed']:
             result += "**⚠️ WARNING:** Java not found! Ghidra requires Java 21+.\n"
-        elif diag['execution_mode'] == 'pyhidra' and not diag.get('pyhidra_installed'):
-            result += "**⚠️ WARNING:** PyGhidra mode selected but pyhidra not installed!\n"
-            result += "Install with: `pip install 'binary-mcp[ghidra11]'`\n"
+        elif diag['execution_mode'] == 'pyghidra' and not diag.get('pyghidra_installed'):
+            result += "**⚠️ WARNING:** PyGhidra mode selected but pyghidra not installed!\n"
+            result += "Install with: `pip install 'binary-mcp[pyghidra]'`\n"
         else:
             result += "**✓ Setup looks good!** Ready to analyze binaries.\n"
 

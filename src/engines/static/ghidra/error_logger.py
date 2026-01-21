@@ -24,7 +24,7 @@ class GhidraErrorContext:
     binary_path: str | None = None  # Path to binary being analyzed
     binary_size_mb: float | None = None  # Binary file size in MB
     ghidra_version: str | None = None  # Ghidra version
-    execution_mode: str | None = None  # "pyhidra" or "analyzeHeadless"
+    execution_mode: str | None = None  # "pyghidra" or "analyzeHeadless"
     timeout_seconds: int | None = None  # Configured timeout
     elapsed_seconds: float | None = None  # Time elapsed before error
     processor: str | None = None  # Processor specification

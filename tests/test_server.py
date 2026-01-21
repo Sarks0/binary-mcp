@@ -154,17 +154,17 @@ class TestGhidraRunner:
 
         assert runner.ghidra_version == "12.0.0"
 
-    def test_should_use_pyhidra_ghidra11(self, monkeypatch, tmp_path):
-        """Test PyGhidra mode is enabled for Ghidra 11+."""
+    def test_should_use_pyghidra_ghidra12(self, monkeypatch, tmp_path):
+        """Test PyGhidra mode is enabled for Ghidra 12+."""
         from src.engines.static.ghidra.runner import GhidraRunner
 
-        # Create mock Ghidra 11.x
-        mock_ghidra = tmp_path / "ghidra_11.2"
+        # Create mock Ghidra 12.x
+        mock_ghidra = tmp_path / "ghidra_12.0"
         mock_ghidra.mkdir()
         (mock_ghidra / "support").mkdir()
         (mock_ghidra / "support" / "analyzeHeadless").touch()
         (mock_ghidra / "application.properties").write_text(
-            "application.version=11.2.0\n"
+            "application.version=12.0.1\n"
         )
 
         monkeypatch.setenv("GHIDRA_HOME", str(mock_ghidra))
@@ -172,31 +172,13 @@ class TestGhidraRunner:
         monkeypatch.delenv("GHIDRA_USE_LEGACY", raising=False)
 
         runner = GhidraRunner()
-        assert runner.use_pyhidra is True
+        assert runner.use_pyghidra is True
 
-    def test_should_use_pyhidra_ghidra10(self, monkeypatch, tmp_path):
-        """Test legacy mode for Ghidra 10.x."""
+    def test_should_use_pyghidra_ghidra11(self, monkeypatch, tmp_path):
+        """Test legacy mode for Ghidra 11.x."""
         from src.engines.static.ghidra.runner import GhidraRunner
 
-        # Create mock Ghidra 10.x
-        mock_ghidra = tmp_path / "ghidra_10.4"
-        mock_ghidra.mkdir()
-        (mock_ghidra / "support").mkdir()
-        (mock_ghidra / "support" / "analyzeHeadless").touch()
-        (mock_ghidra / "application.properties").write_text(
-            "application.version=10.4.0\n"
-        )
-
-        monkeypatch.setenv("GHIDRA_HOME", str(mock_ghidra))
-        runner = GhidraRunner()
-
-        assert runner.use_pyhidra is False
-
-    def test_ghidra_use_legacy_forces_headless(self, monkeypatch, tmp_path):
-        """Test GHIDRA_USE_LEGACY=1 forces analyzeHeadless mode."""
-        from src.engines.static.ghidra.runner import GhidraRunner
-
-        # Create mock Ghidra 11.x (would normally use PyGhidra)
+        # Create mock Ghidra 11.x (uses legacy mode, not PyGhidra)
         mock_ghidra = tmp_path / "ghidra_11.2"
         mock_ghidra.mkdir()
         (mock_ghidra / "support").mkdir()
@@ -206,12 +188,30 @@ class TestGhidraRunner:
         )
 
         monkeypatch.setenv("GHIDRA_HOME", str(mock_ghidra))
+        runner = GhidraRunner()
+
+        assert runner.use_pyghidra is False
+
+    def test_ghidra_use_legacy_forces_headless(self, monkeypatch, tmp_path):
+        """Test GHIDRA_USE_LEGACY=1 forces analyzeHeadless mode."""
+        from src.engines.static.ghidra.runner import GhidraRunner
+
+        # Create mock Ghidra 12.x (would normally use PyGhidra)
+        mock_ghidra = tmp_path / "ghidra_12.0"
+        mock_ghidra.mkdir()
+        (mock_ghidra / "support").mkdir()
+        (mock_ghidra / "support" / "analyzeHeadless").touch()
+        (mock_ghidra / "application.properties").write_text(
+            "application.version=12.0.1\n"
+        )
+
+        monkeypatch.setenv("GHIDRA_HOME", str(mock_ghidra))
         monkeypatch.setenv("GHIDRA_USE_LEGACY", "1")
 
         runner = GhidraRunner()
-        # When version is known (11.x), GHIDRA_USE_LEGACY doesn't apply
+        # When version is known (12.x), GHIDRA_USE_LEGACY doesn't apply
         # It only applies when version is unknown
-        assert runner.ghidra_version == "11.2.0"
+        assert runner.ghidra_version == "12.0.1"
 
     def test_ghidra_use_legacy_with_unknown_version(self, monkeypatch, tmp_path):
         """Test GHIDRA_USE_LEGACY=1 forces legacy mode when version unknown."""
@@ -229,9 +229,9 @@ class TestGhidraRunner:
 
         runner = GhidraRunner()
         assert runner.ghidra_version == "unknown"
-        assert runner.use_pyhidra is False  # Legacy forced
+        assert runner.use_pyghidra is False  # Legacy forced
 
-    def test_unknown_version_defaults_to_pyhidra(self, monkeypatch, tmp_path):
+    def test_unknown_version_defaults_to_pyghidra(self, monkeypatch, tmp_path):
         """Test unknown version defaults to PyGhidra (assumes modern Ghidra)."""
         from src.engines.static.ghidra.runner import GhidraRunner
 
@@ -246,7 +246,7 @@ class TestGhidraRunner:
 
         runner = GhidraRunner()
         assert runner.ghidra_version == "unknown"
-        assert runner.use_pyhidra is True  # Defaults to PyGhidra
+        assert runner.use_pyghidra is True  # Defaults to PyGhidra
 
 
 class TestProjectCache:

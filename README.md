@@ -188,6 +188,7 @@ pip install pyhidra
 > uv venv --python 3.12
 > uv sync --extra ghidra11
 > ```
+> If you encounter "VCRUNTIME140.dll not found" errors, install [Visual C++ Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe).
 
 The runner automatically detects your Ghidra version. To verify:
 
@@ -261,6 +262,7 @@ make format
 | `GHIDRA_PROJECT_DIR` | Project directory | `~/.ghidra_projects` |
 | `GHIDRA_TIMEOUT` | Analysis timeout (seconds) | 600 |
 | `GHIDRA_USE_LEGACY` | Force analyzeHeadless mode on Ghidra 11+ | Not set |
+| `GHIDRA_MAXMEM` | Java heap size for PyGhidra (e.g., "4G", "8G") | 4G |
 | `GHIDRA_FUNCTION_TIMEOUT` | Per-function decompilation timeout | 30 |
 | `GHIDRA_MAX_FUNCTIONS` | Maximum functions to analyze | Unlimited |
 | `X64DBG_PATH` | x64dbg executable path | Auto-detected |

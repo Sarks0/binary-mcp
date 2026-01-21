@@ -135,27 +135,97 @@ class GhidraRunner:
 
     def _get_ghidra_version(self) -> str:
         """
-        Get the Ghidra version from application.properties.
+        Get the Ghidra version using multiple detection methods.
+
+        Detection methods (in order):
+        1. application.properties at Ghidra root
+        2. Ghidra/application.properties (some installations)
+        3. Parse version from directory name (e.g., ghidra_11.2.1_PUBLIC)
+        4. Check ghidraRun script for version info
 
         Returns:
             Version string (e.g., "11.2.1") or "unknown" if not found
         """
-        version_file = self.ghidra_path / "application.properties"
+        import re
+
+        # Method 1: Check application.properties at root
+        version = self._read_version_from_properties(
+            self.ghidra_path / "application.properties"
+        )
+        if version:
+            return version
+
+        # Method 2: Check Ghidra/application.properties
+        version = self._read_version_from_properties(
+            self.ghidra_path / "Ghidra" / "application.properties"
+        )
+        if version:
+            return version
+
+        # Method 3: Parse version from directory name
+        # Common patterns: ghidra_11.2.1_PUBLIC, ghidra-11.2, Ghidra_11.0
+        dir_name = self.ghidra_path.name
+        version_patterns = [
+            r"ghidra[_-](\d+\.\d+(?:\.\d+)?)",  # ghidra_11.2.1 or ghidra-11.2
+            r"Ghidra[_-](\d+\.\d+(?:\.\d+)?)",  # Ghidra_11.0
+            r"(\d+\.\d+(?:\.\d+)?)",  # Just version number
+        ]
+        for pattern in version_patterns:
+            match = re.search(pattern, dir_name, re.IGNORECASE)
+            if match:
+                version = match.group(1)
+                logger.info(f"Detected Ghidra version from directory name: {version}")
+                return version
+
+        # Method 4: Try to read version from ghidraRun script
+        ghidra_run = self.ghidra_path / "ghidraRun"
+        if not ghidra_run.exists():
+            ghidra_run = self.ghidra_path / "ghidraRun.bat"
+
+        if ghidra_run.exists():
+            try:
+                with open(ghidra_run, encoding="utf-8", errors="ignore") as f:
+                    content = f.read()
+                    # Look for version references in script
+                    match = re.search(r"Ghidra\s+(\d+\.\d+(?:\.\d+)?)", content)
+                    if match:
+                        version = match.group(1)
+                        logger.info(f"Detected Ghidra version from ghidraRun: {version}")
+                        return version
+            except Exception as e:
+                logger.debug(f"Could not read ghidraRun: {e}")
+
+        logger.warning(
+            f"Could not detect Ghidra version from {self.ghidra_path}. "
+            "Tried: application.properties, directory name, ghidraRun script."
+        )
+        return "unknown"
+
+    def _read_version_from_properties(self, version_file: Path) -> str | None:
+        """
+        Read version from an application.properties file.
+
+        Args:
+            version_file: Path to application.properties file
+
+        Returns:
+            Version string if found, None otherwise
+        """
         if not version_file.exists():
-            logger.warning(f"application.properties not found at {version_file}")
-            return "unknown"
+            logger.debug(f"application.properties not found at {version_file}")
+            return None
 
         try:
-            with open(version_file) as f:
+            with open(version_file, encoding="utf-8") as f:
                 for line in f:
                     if line.startswith("application.version"):
                         version = line.split("=")[1].strip()
-                        logger.debug(f"Detected Ghidra version: {version}")
+                        logger.info(f"Detected Ghidra version from {version_file}: {version}")
                         return version
         except Exception as e:
-            logger.warning(f"Error reading Ghidra version: {e}")
+            logger.warning(f"Error reading {version_file}: {e}")
 
-        return "unknown"
+        return None
 
     def _should_use_pyhidra(self) -> bool:
         """
@@ -295,6 +365,10 @@ class GhidraRunner:
             # PyGhidra requires running in a separate process for proper isolation
             # CRITICAL: Use sys.executable to ensure subprocess uses the same Python
             # interpreter (with access to installed packages like pyhidra)
+
+            # Set Java heap size for Ghidra (default 4G, or from GHIDRA_MAXMEM env)
+            java_maxmem = os.environ.get("GHIDRA_MAXMEM", "4G")
+
             cmd = [
                 sys.executable,
                 "-c",
@@ -303,62 +377,102 @@ import os
 import sys
 import pyhidra
 
+# Set Java heap size before initializing PyGhidra
+os.environ['MAXMEM'] = {repr(java_maxmem)}
+
 # Set environment variables
 os.environ['GHIDRA_CONTEXT_JSON'] = {repr(str(output_path))}
 for key, value in {repr(env)}.items():
     os.environ[key] = value
 
-# Initialize PyGhidra
-pyhidra.start(install_dir={repr(str(self.ghidra_path))})
+try:
+    # Initialize PyGhidra
+    pyhidra.start(install_dir={repr(str(self.ghidra_path))})
 
-# Import Ghidra modules
-from ghidra.base.project import GhidraProject
+    # Import Ghidra modules
+    from ghidra.base.project import GhidraProject
+    from ghidra.util.task import ConsoleTaskMonitor
 
-# Create/open project
-project_location = {repr(str(project_dir))}
-project_name = {repr(project_name)}
-project = GhidraProject.openProject(project_location, project_name, True)
+    # Create/open project
+    project_location = {repr(str(project_dir))}
+    project_name = {repr(project_name)}
+    project = GhidraProject.openProject(project_location, project_name, True)
 
-# Import the binary
-binary_path = {repr(str(binary_path))}
-program = project.importProgram(binary_path)
+    # Import the binary
+    binary_path = {repr(str(binary_path))}
+    program = project.importProgram(binary_path)
 
-# Open the program for analysis
-from ghidra.app.script import GhidraScriptUtil
-from ghidra.program.flatapi import FlatProgramAPI
+    # Check if import succeeded
+    if program is None:
+        raise RuntimeError(
+            f"Failed to import binary: {{binary_path}}. "
+            "The file may be corrupted, not a supported format, or the import failed. "
+            "Check Ghidra logs for details."
+        )
 
-# Set up the environment for the script
-import ghidra.app.script.GhidraState as GhidraState
-flat_api = FlatProgramAPI(program)
-
-# Run auto-analysis if not already done
-from ghidra.app.script import GhidraScriptUtil
-from ghidra.util.task import ConsoleTaskMonitor
-
-monitor = ConsoleTaskMonitor()
-if not program.getChanges().getCurrentChanges():
+    # Open the program for analysis
+    from ghidra.program.flatapi import FlatProgramAPI
     from ghidra.program.util import GhidraProgramUtilities
+    from ghidra.app.plugin.core.analysis import AutoAnalysisManager
+
+    flat_api = FlatProgramAPI(program)
+    monitor = ConsoleTaskMonitor()
+
+    # Run auto-analysis if not already done
     if not GhidraProgramUtilities.isAnalyzed(program):
-        from ghidra.app.plugin.core.analysis import AutoAnalysisManager
-        AutoAnalysisManager.getAnalysisManager(program).reAnalyzeAll(None)
+        print(f"Starting auto-analysis for {{binary_path}}...", file=sys.stderr)
+        analysis_mgr = AutoAnalysisManager.getAnalysisManager(program)
 
-# Execute the analysis script
-script_path = {repr(str(full_script_path))}
-with open(script_path) as f:
-    script_code = f.read()
+        # Start analysis (non-blocking)
+        analysis_mgr.reAnalyzeAll(None)
 
-# Set up globals that Ghidra scripts expect
-script_globals = {{
-    'currentProgram': program,
-    'monitor': monitor,
-}}
+        # Wait for analysis to complete
+        from ghidra.program.model.listing import Program
+        from ghidra.framework.model import DomainObjectChangeRecord
 
-# Execute the script
-exec(compile(script_code, script_path, 'exec'), script_globals)
+        # Get the transaction manager to properly wait for analysis
+        tx_mgr = program.getTransactionList()
 
-# Close and save
-project.save(program)
-project.close()
+        # Wait for auto-analysis to complete using the analysis manager
+        # This blocks until all analyzers finish
+        while analysis_mgr.isAnalyzing():
+            import time
+            time.sleep(0.5)
+
+        print("Auto-analysis completed", file=sys.stderr)
+    else:
+        print(f"Program already analyzed: {{binary_path}}", file=sys.stderr)
+
+    # Execute the analysis script
+    script_path = {repr(str(full_script_path))}
+    with open(script_path) as f:
+        script_code = f.read()
+
+    # Set up globals that Ghidra scripts expect
+    script_globals = {{
+        'currentProgram': program,
+        'monitor': monitor,
+    }}
+
+    # Execute the script
+    exec(compile(script_code, script_path, 'exec'), script_globals)
+
+    # Close and save
+    project.save(program)
+    project.close()
+
+except ImportError as e:
+    print(f"ERROR: Failed to import required module: {{e}}", file=sys.stderr)
+    print("Make sure pyhidra is installed: pip install 'binary-mcp[ghidra11]'", file=sys.stderr)
+    sys.exit(1)
+except RuntimeError as e:
+    print(f"ERROR: Runtime error during analysis: {{e}}", file=sys.stderr)
+    sys.exit(1)
+except Exception as e:
+    import traceback
+    print(f"ERROR: Unexpected error during PyGhidra analysis: {{e}}", file=sys.stderr)
+    traceback.print_exc(file=sys.stderr)
+    sys.exit(1)
 """,
             ]
 

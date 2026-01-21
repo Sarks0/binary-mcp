@@ -121,6 +121,7 @@ python3 install.py --install-dir /opt/binary-mcp --skip-ghidra
 - **PowerShell 5.1+** - Built into Windows 10/11
 - **Administrator privileges** - For system-wide installation
 - **.NET Framework 4.8+** - Usually pre-installed
+- **Visual C++ Redistributable** - Required for PyGhidra/jpype1. [Download here](https://aka.ms/vs/17/release/vc_redist.x64.exe)
 
 ### Linux/macOS Specific
 - **curl** - Usually pre-installed
@@ -344,6 +345,11 @@ brew install python@3.12
   ```
 - Alternatively, install Visual C++ Build Tools: https://visualstudio.microsoft.com/visual-cpp-build-tools/
 
+**"VCRUNTIME140.dll not found" or similar DLL errors:**
+- PyGhidra requires the Visual C++ Redistributable runtime
+- Download and install from: https://aka.ms/vs/17/release/vc_redist.x64.exe
+- Restart your terminal/PowerShell after installation
+
 ### Common Issues
 
 **"Claude Desktop config not found":**
@@ -458,6 +464,7 @@ The server can be configured via environment variables:
 # Ghidra settings
 export GHIDRA_HOME="/path/to/ghidra"          # Ghidra installation path
 export GHIDRA_TIMEOUT=600                      # Analysis timeout in seconds
+export GHIDRA_MAXMEM="4G"                      # Java heap size for PyGhidra (e.g., "4G", "8G")
 export GHIDRA_FUNCTION_TIMEOUT=30              # Per-function decompilation timeout
 export GHIDRA_MAX_FUNCTIONS=0                  # Max functions to analyze (0 = unlimited)
 export GHIDRA_USE_LEGACY=1                     # Force analyzeHeadless on Ghidra 11+ (not recommended)

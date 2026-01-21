@@ -270,6 +270,7 @@ class GhidraRunner:
             ImportError: If pyhidra is not installed
         """
         import importlib.util
+        import sys
 
         if importlib.util.find_spec("pyhidra") is None:
             raise ImportError(
@@ -292,8 +293,10 @@ class GhidraRunner:
 
             # Run analysis in a subprocess to avoid blocking the event loop
             # PyGhidra requires running in a separate process for proper isolation
+            # CRITICAL: Use sys.executable to ensure subprocess uses the same Python
+            # interpreter (with access to installed packages like pyhidra)
             cmd = [
-                "python",
+                sys.executable,
                 "-c",
                 f"""
 import os

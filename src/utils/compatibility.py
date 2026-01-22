@@ -413,20 +413,37 @@ class BinaryCompatibilityChecker:
                 if section_name not in ['.text', '.code']:
                     packing_indicators.append(f"RWX section: {section_name}")
 
-        # Very few imports often indicates packing
-        if info.imports_count < 5 and info.imports_count > 0:
-            packing_indicators.append(f"Very few imports ({info.imports_count}) - possible packing")
-        elif info.imports_count == 0 and not info.is_dotnet:
-            packing_indicators.append("No imports detected - likely packed or malformed")
+        # Import count heuristics - be careful not to flag export-only DLLs
+        # DLLs with many exports but few/no imports are common and legitimate
+        has_significant_exports = info.exports_count > 10
+
+        if info.imports_count == 0 and not info.is_dotnet:
+            # Only flag as suspicious if there are OTHER packing indicators
+            # or if the binary has no exports either (unusual for legitimate binaries)
+            if packing_indicators:  # Already have other indicators
+                packing_indicators.append("No imports detected")
+            elif not has_significant_exports:
+                # No imports AND no significant exports - more suspicious
+                packing_indicators.append("No imports or exports detected - may be packed or unusual binary")
+            # else: DLL with many exports but no imports is normal (export-only DLL)
+        elif info.imports_count < 5 and info.imports_count > 0:
+            # Very few imports combined with other indicators suggests packing
+            if packing_indicators:
+                packing_indicators.append(f"Very few imports ({info.imports_count})")
 
         if packing_indicators:
+            # Determine severity based on indicator strength
+            has_known_packer = any(
+                indicator for indicator in packing_indicators
+                if any(packer in indicator for packer in ['UPX', 'ASPack', 'VMProtect', 'Themida', 'Enigma'])
+            )
+
             info.is_packed = True
             info.issues.append(CompatibilityIssue(
-                severity="warning",
+                severity="warning" if has_known_packer else "info",
                 code="PACKED_BINARY",
-                message="Binary appears to be packed/protected: " + "; ".join(set(packing_indicators)),
-                recommendation="Consider unpacking first for better analysis results. "
-                              "Use x64dbg dynamic analysis to dump unpacked code."
+                message="Possible packing/protection detected: " + "; ".join(set(packing_indicators)),
+                recommendation="Analysis will proceed. If results seem incomplete, consider unpacking first."
             ))
 
     def _analyze_pe_basic(self, header: bytes, info: BinaryInfo) -> None:

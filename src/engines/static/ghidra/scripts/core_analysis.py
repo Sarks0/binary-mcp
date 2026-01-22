@@ -9,6 +9,7 @@ import json
 import os
 
 from ghidra.app.decompiler import DecompInterface
+from ghidra.program.model.block import BasicBlockModel
 from ghidra.program.model.symbol import SymbolType
 from ghidra.util.task import ConsoleTaskMonitor
 from java.lang import InterruptedException, Thread
@@ -322,6 +323,9 @@ def extract_comprehensive_analysis():
     thread_timeout_count = 0  # Hard thread timeouts (likely anti-analysis)
     internal_timeout_count = 0  # Ghidra's internal decompiler timeouts
 
+    # Initialize BasicBlockModel for extracting basic blocks
+    block_model = BasicBlockModel(program)
+
     while function_iterator.hasNext():
         function = function_iterator.next()
         function_count += 1
@@ -385,16 +389,16 @@ def extract_comprehensive_analysis():
             print(safe_format("    Warning: Could not get called functions for {}: {}",
                               safe_unicode(function.getName()), safe_unicode(e)))
 
-        # Get basic blocks
+        # Get basic blocks using BasicBlockModel
         try:
             body = function.getBody()
-            code_block_iterator = listing.getCodeBlocks(body, monitor)
+            code_block_iterator = block_model.getCodeBlocksContaining(body, monitor)
             while code_block_iterator.hasNext():
                 block = code_block_iterator.next()
                 block_info = {
                     "start": safe_unicode(block.getMinAddress()),
                     "end": safe_unicode(block.getMaxAddress()),
-                    "num_instructions": block.getNumAddresses()
+                    "num_addresses": block.getNumAddresses()
                 }
                 function_info["basic_blocks"].append(block_info)
         except Exception as e:

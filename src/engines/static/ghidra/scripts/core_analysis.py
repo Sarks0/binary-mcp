@@ -1,6 +1,7 @@
 # Ghidra Jython script for comprehensive malware analysis extraction
 # This script runs inside Ghidra's JVM environment
-# @category: MalwareAnalysis
+# @runtime Jython
+# @category MalwareAnalysis
 # ruff: noqa: F821
 # Note: currentProgram and other Ghidra globals are provided at runtime
 

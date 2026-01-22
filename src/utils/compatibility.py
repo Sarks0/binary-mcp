@@ -453,37 +453,159 @@ class BinaryCompatibilityChecker:
             logger.debug(f"Basic PE analysis failed: {e}")
 
     def _analyze_elf(self, header: bytes, info: BinaryInfo) -> None:
-        """Analyze ELF format binary."""
+        """Analyze ELF format binary with detailed compatibility checking."""
         if len(header) < 52:
+            info.issues.append(CompatibilityIssue(
+                severity="error",
+                code="ELF_HEADER_TRUNCATED",
+                message="ELF header is truncated or incomplete",
+                recommendation="File may be corrupted or incomplete"
+            ))
             return
 
         # ELF class (32/64 bit)
         ei_class = header[4]
         info.bitness = 64 if ei_class == 2 else 32
 
-        # ELF machine type
-        if info.bitness == 64 and len(header) >= 20:
-            machine = struct.unpack('<H', header[18:20])[0]
-        elif len(header) >= 20:
-            machine = struct.unpack('<H', header[18:20])[0]
-        else:
-            machine = 0
+        # ELF data encoding (endianness)
+        ei_data = header[5]
+        is_little_endian = ei_data == 1
+        endian_str = "LE" if is_little_endian else "BE"
+        unpack_fmt = '<' if is_little_endian else '>'
 
+        # ELF version
+        ei_version = header[6]
+        if ei_version != 1:
+            info.warnings.append(f"Unusual ELF version: {ei_version}")
+
+        # OS/ABI
+        ei_osabi = header[7]
+        osabi_names = {
+            0: "UNIX System V",
+            1: "HP-UX",
+            2: "NetBSD",
+            3: "Linux",
+            6: "Solaris",
+            7: "AIX",
+            8: "IRIX",
+            9: "FreeBSD",
+            10: "Tru64",
+            11: "Novell Modesto",
+            12: "OpenBSD",
+            64: "ARM EABI",
+            97: "ARM",
+            255: "Standalone",
+        }
+        info.compiler = osabi_names.get(ei_osabi, f"Unknown ABI ({ei_osabi})")
+
+        # ELF type (offset 16-18)
+        e_type = struct.unpack(f'{unpack_fmt}H', header[16:18])[0]
+        elf_types = {
+            0: "None",
+            1: "Relocatable",
+            2: "Executable",
+            3: "Shared object",
+            4: "Core dump",
+        }
+        info.subsystem = elf_types.get(e_type, f"Unknown ({e_type})")
+
+        # Check for core dumps
+        if e_type == 4:
+            info.issues.append(CompatibilityIssue(
+                severity="warning",
+                code="ELF_CORE_DUMP",
+                message="This is a core dump file, not an executable",
+                recommendation="Core dumps have limited analysis value in Ghidra"
+            ))
+
+        # ELF machine type (offset 18-20)
+        machine = struct.unpack(f'{unpack_fmt}H', header[18:20])[0]
+
+        # Extended machine type mapping with Ghidra processor specs
         machine_types = {
-            0x03: 'x86',
-            0x3E: 'x86-64',
-            0x28: 'ARM',
-            0xB7: 'ARM64',
-            0x08: 'MIPS',
-            0x14: 'PowerPC',
-            0x15: 'PowerPC64',
-            0xF3: 'RISC-V',
+            0x00: ('None', None),
+            0x02: ('SPARC', 'sparc:BE:32:default'),
+            0x03: ('x86', 'x86:LE:32:default'),
+            0x08: ('MIPS', f'MIPS:{endian_str}:32:default'),
+            0x14: ('PowerPC', 'PowerPC:BE:32:default'),
+            0x15: ('PowerPC64', 'PowerPC:BE:64:default'),
+            0x16: ('S390', None),  # Limited Ghidra support
+            0x28: ('ARM', f'ARM:{endian_str}:32:v7'),
+            0x2B: ('SPARC64', 'sparc:BE:64:default'),
+            0x32: ('IA-64', None),  # Limited Ghidra support
+            0x3E: ('x86-64', 'x86:LE:64:default'),
+            0xB7: ('ARM64', 'AARCH64:LE:64:v8A'),
+            0xF3: ('RISC-V', f'RISCV:{endian_str}:{info.bitness}:RV{info.bitness}GC'),
+            0xF7: ('BPF', None),  # eBPF - limited support
+            0x101: ('LoongArch', None),  # Very new, limited support
         }
 
-        info.architecture = machine_types.get(machine, f'unknown (0x{machine:x})')
+        arch_info = machine_types.get(machine, (f'unknown (0x{machine:x})', None))
+        info.architecture = arch_info[0]
 
-        # Check for stripped binary
-        # This would require more analysis of section headers
+        # Store suggested Ghidra processor spec
+        ghidra_processor = arch_info[1]
+        if ghidra_processor:
+            info.warnings.append(
+                f"Suggested Ghidra processor: {ghidra_processor}"
+            )
+
+        # Check for architectures with limited Ghidra support
+        limited_support_archs = {0x16, 0x32, 0xF7, 0x101}  # S390, IA-64, BPF, LoongArch
+        if machine in limited_support_archs:
+            info.issues.append(CompatibilityIssue(
+                severity="warning",
+                code="ELF_LIMITED_ARCH",
+                message=f"Architecture '{info.architecture}' has limited Ghidra support",
+                recommendation="Analysis may be incomplete or require custom processor modules"
+            ))
+
+        # Unknown architecture
+        if machine not in machine_types:
+            info.issues.append(CompatibilityIssue(
+                severity="warning",
+                code="ELF_UNKNOWN_ARCH",
+                message=f"Unknown ELF machine type: 0x{machine:x}",
+                recommendation=(
+                    "Ghidra may not auto-detect this architecture. "
+                    "Try specifying processor and loader explicitly: "
+                    "analyze_binary(..., loader='ElfLoader', processor='<spec>')"
+                )
+            ))
+
+        # Entry point (varies by bitness)
+        if info.bitness == 64 and len(header) >= 32:
+            info.entry_point = struct.unpack(f'{unpack_fmt}Q', header[24:32])[0]
+        elif len(header) >= 28:
+            info.entry_point = struct.unpack(f'{unpack_fmt}I', header[24:28])[0]
+
+        # Check for stripped binary indicators
+        # Section header info is at different offsets for 32/64-bit
+        if info.bitness == 64 and len(header) >= 64:
+            e_shoff = struct.unpack(f'{unpack_fmt}Q', header[40:48])[0]
+            e_shnum = struct.unpack(f'{unpack_fmt}H', header[60:62])[0]
+            e_shstrndx = struct.unpack(f'{unpack_fmt}H', header[62:64])[0]
+        elif len(header) >= 52:
+            e_shoff = struct.unpack(f'{unpack_fmt}I', header[32:36])[0]
+            e_shnum = struct.unpack(f'{unpack_fmt}H', header[48:50])[0]
+            e_shstrndx = struct.unpack(f'{unpack_fmt}H', header[50:52])[0]
+        else:
+            e_shoff = 0
+            e_shnum = 0
+            e_shstrndx = 0
+
+        # No section headers often indicates stripped binary
+        if e_shnum == 0 or e_shoff == 0:
+            info.warnings.append(
+                "No section headers - binary may be stripped or statically linked"
+            )
+            info.has_debug_info = False
+        elif e_shstrndx == 0 or e_shstrndx >= e_shnum:
+            info.warnings.append(
+                "Invalid section string table index - binary may be obfuscated"
+            )
+
+        # Default to full compatibility unless issues found
         info.compatibility = CompatibilityLevel.FULL
 
     def _analyze_macho(self, header: bytes, info: BinaryInfo) -> None:

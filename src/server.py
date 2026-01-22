@@ -11,6 +11,7 @@ import functools
 import json
 import logging
 import re
+import struct
 import sys
 import time
 from pathlib import Path
@@ -115,6 +116,155 @@ def log_to_session(func=None, *, analysis_type: AnalysisType = AnalysisType.STAT
     return decorator
 
 
+def _check_ghidra_import_failure(stdout: str, stderr: str) -> tuple[bool, str | None]:
+    """
+    Check Ghidra output for import failure indicators.
+
+    Ghidra often returns exit code 0 even when import fails, so we need to
+    check the output for failure messages.
+
+    Args:
+        stdout: Ghidra stdout output
+        stderr: Ghidra stderr output
+
+    Returns:
+        Tuple of (failed: bool, error_message: str | None)
+    """
+    combined = (stdout or "") + (stderr or "")
+
+    # Known import failure patterns
+    failure_patterns = [
+        (r"No load spec found", "Ghidra could not determine the binary format"),
+        (r"Unable to create loader", "Ghidra loader initialization failed"),
+        (r"Failed to import", "Ghidra import failed"),
+        (r"Import failed", "Ghidra import failed"),
+        (r"ERROR.*Unable to.*import", "Import error occurred"),
+        (r"No language.*found", "Ghidra could not determine processor architecture"),
+        (r"Language not found", "Processor/language specification not found"),
+        (r"IOException.*reading", "Error reading binary file"),
+        (r"InvalidInputException", "Invalid binary format"),
+        (r"NOT_FOUND", "Binary format not recognized"),
+    ]
+
+    for pattern, message in failure_patterns:
+        if re.search(pattern, combined, re.IGNORECASE):
+            return True, message
+
+    return False, None
+
+
+def _validate_analysis_context(
+    context: dict,
+    binary_path: str,
+    ghidra_stdout: str,
+    ghidra_stderr: str
+) -> tuple[bool, str | None]:
+    """
+    Validate that Ghidra analysis produced meaningful output.
+
+    This catches cases where Ghidra returns 0 but produces empty/minimal output
+    due to import failures.
+
+    Args:
+        context: The loaded JSON context
+        binary_path: Path to the analyzed binary
+        ghidra_stdout: Ghidra stdout for error context
+        ghidra_stderr: Ghidra stderr for error context
+
+    Returns:
+        Tuple of (is_valid: bool, error_message: str | None)
+    """
+    metadata = context.get("metadata", {})
+    functions = context.get("functions", [])
+    memory_map = context.get("memory_map", [])
+
+    # Check if metadata indicates a failed import
+    exec_format = metadata.get("executable_format", "")
+
+    # Empty or "Unknown" format often indicates import failure
+    if not exec_format or exec_format == "Unknown":
+        # Check if this is actually a valid empty binary or a failed import
+        if not memory_map and not functions:
+            return False, (
+                "Ghidra produced no analysis output. This typically means the binary "
+                "format was not recognized. Check the debug log for details."
+            )
+
+    # Check for suspiciously empty analysis
+    if not functions and not context.get("imports", []) and not context.get("strings", []):
+        # This could be a data file or failed import
+        if memory_map:
+            # Has memory map but nothing else - might be a data/resource file
+            logger.warning(
+                f"Analysis produced memory map but no functions/imports/strings for {binary_path}"
+            )
+        else:
+            return False, (
+                "Analysis produced no data. The binary may not have been imported correctly. "
+                "Try specifying a processor and loader explicitly."
+            )
+
+    # Check Ghidra output for warnings that indicate partial failure
+    combined = (ghidra_stdout or "") + (ghidra_stderr or "")
+    if "WARN" in combined and "Unable to" in combined:
+        logger.warning(f"Ghidra reported warnings during analysis of {binary_path}")
+
+    return True, None
+
+
+def _get_elf_loader_recommendation(binary_path: str) -> str | None:
+    """
+    Get ELF-specific loader recommendations based on architecture.
+
+    Args:
+        binary_path: Path to ELF binary
+
+    Returns:
+        Recommendation string or None if not an ELF
+    """
+    try:
+        with open(binary_path, 'rb') as f:
+            magic = f.read(20)
+
+        if magic[:4] != b'\x7fELF':
+            return None
+
+        # ELF class: 1 = 32-bit, 2 = 64-bit
+        ei_class = magic[4]
+        # ELF data encoding: 1 = little-endian, 2 = big-endian
+        ei_data = magic[5]
+        # Machine type at offset 18-20
+        machine = struct.unpack('<H' if ei_data == 1 else '>H', magic[18:20])[0]
+
+        # Map machine type to Ghidra processor spec
+        elf_processors = {
+            0x03: ("x86:LE:32:default", "x86 32-bit"),
+            0x3E: ("x86:LE:64:default", "x86-64"),
+            0x28: ("ARM:LE:32:v7" if ei_data == 1 else "ARM:BE:32:v7", "ARM 32-bit"),
+            0xB7: ("AARCH64:LE:64:v8A", "ARM64/AArch64"),
+            0x08: ("MIPS:BE:32:default" if ei_data == 2 else "MIPS:LE:32:default", "MIPS"),
+            0x14: ("PowerPC:BE:32:default", "PowerPC 32-bit"),
+            0x15: ("PowerPC:BE:64:default", "PowerPC 64-bit"),
+            0xF3: ("RISCV:LE:64:RV64GC" if ei_class == 2 else "RISCV:LE:32:RV32GC", "RISC-V"),
+        }
+
+        if machine in elf_processors:
+            proc_spec, arch_name = elf_processors[machine]
+            return (
+                f"ELF detected: {arch_name}\n"
+                f"Try: analyze_binary(..., processor=\"{proc_spec}\", loader=\"ElfLoader\")"
+            )
+        else:
+            return (
+                f"ELF detected with unknown machine type 0x{machine:x}\n"
+                f"Try: analyze_binary(..., loader=\"ElfLoader\") with appropriate processor spec"
+            )
+
+    except Exception as e:
+        logger.debug(f"Failed to read ELF header: {e}")
+        return None
+
+
 def get_analysis_context(
     binary_path: str,
     force_reanalyze: bool = False,
@@ -200,23 +350,75 @@ def get_analysis_context(
         except Exception as e:
             print(f"DEBUG: Failed to write debug log: {e}", file=sys.stderr)
 
+        ghidra_stdout = result.get('stdout', '')
+        ghidra_stderr = result.get('stderr', '')
+
+        # Check for import failure in Ghidra output (even with exit code 0)
+        import_failed, import_error = _check_ghidra_import_failure(ghidra_stdout, ghidra_stderr)
+        if import_failed:
+            # Get ELF-specific recommendations if applicable
+            elf_recommendation = _get_elf_loader_recommendation(binary_path)
+
+            internal_details = f"Ghidra import failure detected: {import_error}\n"
+            internal_details += f"Debug log: {debug_file}\n"
+            internal_details += f"Stdout (last 1000 chars): {ghidra_stdout[-1000:]}\n"
+            internal_details += f"Stderr (last 1000 chars): {ghidra_stderr[-1000:]}"
+
+            user_message = f"Analysis failed: {import_error}."
+            if elf_recommendation:
+                user_message += f"\n\n**Recommendation:**\n{elf_recommendation}"
+            else:
+                user_message += (
+                    "\n\nTry specifying processor and loader explicitly. "
+                    "See analyze_binary() docstring for examples."
+                )
+
+            raise UserFacingError(user_message, internal_details=internal_details)
+
         # Check if output file was created
         if not output_path.exists():
-            # Log detailed error internally
+            # Get ELF-specific recommendations if applicable
+            elf_recommendation = _get_elf_loader_recommendation(binary_path)
+
             internal_details = f"Ghidra did not create output file: {output_path}\n"
             internal_details += f"Debug log: {debug_file}\n"
-            internal_details += f"Stdout: {result.get('stdout', 'N/A')[-500:]}\n"
-            internal_details += f"Stderr: {result.get('stderr', 'N/A')[-500:]}"
+            internal_details += f"Stdout (last 1000 chars): {ghidra_stdout[-1000:]}\n"
+            internal_details += f"Stderr (last 1000 chars): {ghidra_stderr[-1000:]}"
 
-            # Return safe user-facing error
-            raise UserFacingError(
-                "Analysis failed. This may be due to an unsupported binary format or corrupted file.",
-                internal_details=internal_details
-            )
+            user_message = "Analysis failed. Ghidra did not produce output."
+            if elf_recommendation:
+                user_message += f"\n\n**Recommendation:**\n{elf_recommendation}"
+            else:
+                user_message += " This may be due to an unsupported binary format or corrupted file."
+
+            raise UserFacingError(user_message, internal_details=internal_details)
 
         # Load analysis results
         with open(output_path) as f:
             context = json.load(f)
+
+        # Validate the analysis context has meaningful data
+        is_valid, validation_error = _validate_analysis_context(
+            context, binary_path, ghidra_stdout, ghidra_stderr
+        )
+        if not is_valid:
+            # Get ELF-specific recommendations if applicable
+            elf_recommendation = _get_elf_loader_recommendation(binary_path)
+
+            internal_details = f"Validation failed: {validation_error}\n"
+            internal_details += f"Debug log: {debug_file}\n"
+            internal_details += f"Context keys: {list(context.keys())}\n"
+            internal_details += f"Metadata: {context.get('metadata', {})}\n"
+            internal_details += f"Functions count: {len(context.get('functions', []))}\n"
+            internal_details += f"Stdout (last 500 chars): {ghidra_stdout[-500:]}"
+
+            user_message = validation_error
+            if elf_recommendation:
+                user_message += f"\n\n**Recommendation:**\n{elf_recommendation}"
+
+            # Don't cache invalid results
+            output_path.unlink(missing_ok=True)
+            raise UserFacingError(user_message, internal_details=internal_details)
 
         # Cache the results
         cache.save_cached(binary_path, context)

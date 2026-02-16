@@ -88,7 +88,7 @@ requires-dist = [
     { name = "fastmcp", specifier = ">=0.2.0" },
     { name = "mcp", extras = ["cli"], specifier = ">=1.6.0" },
     { name = "pefile", specifier = ">=2023.2.7" },
-    { name = "pybag", marker = "sys_platform == 'win32' and extra == 'windbg'", specifier = ">=2.2.0" },
+    { name = "pybag", marker = "sys_platform == 'win32' and extra == 'windbg'", specifier = ">=2.2.16" },
     { name = "pyelftools", specifier = ">=0.31" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23.0" },

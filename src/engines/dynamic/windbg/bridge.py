@@ -89,6 +89,7 @@ class WinDbgBridge(Debugger):
         self._mode = WinDbgMode.USER_MODE
         self._state = DebuggerState.NOT_LOADED
         self._dbg: Any = None
+        self._is_local_kernel = False
         self._cdb_path = cdb_path or self._find_cdb()
         self._cdb_proc: subprocess.Popen[str] | None = None
         self._timeout = timeout
@@ -137,6 +138,7 @@ class WinDbgBridge(Debugger):
 
         self._state = DebuggerState.NOT_LOADED
         self._mode = WinDbgMode.USER_MODE
+        self._is_local_kernel = False
         logger.info("WinDbg bridge disconnected")
 
     def load_binary(self, binary_path: Path, args: list[str] | None = None) -> bool:
@@ -319,6 +321,7 @@ class WinDbgBridge(Debugger):
             self._dbg.attach("local")
             self._mode = WinDbgMode.KERNEL_MODE
             self._state = DebuggerState.PAUSED
+            self._is_local_kernel = True
             logger.info("Connected to local kernel (read-only)")
             return True
         except Exception as exc:
@@ -350,16 +353,26 @@ class WinDbgBridge(Debugger):
         """Execute a raw debugger command and return text output.
 
         Uses Pybag's exec_command when connected, otherwise falls back to CDB.
+        Local kernel connections always use CDB since pybag's local mode
+        does not support exec_command.
 
         Args:
             command: WinDbg command string (e.g. "lm", "!process 0 0").
         """
+        # Local kernel mode: pybag doesn't support exec_command, use CDB
+        if self._is_local_kernel:
+            return self._execute_cdb_command(command)
+
         if self._dbg is not None:
             try:
                 return str(self._dbg.exec_command(command))
             except Exception as exc:
-                self._log_error("execute_command", exc)
-                raise WinDbgBridgeError("execute_command", str(exc)) from exc
+                # Fall back to CDB if pybag exec_command fails
+                logger.warning(
+                    "Pybag exec_command failed for '%s', falling back to CDB: %s",
+                    command, exc,
+                )
+                return self._execute_cdb_command(command)
         return self._execute_cdb_command(command)
 
     def execute_extension(self, command: str) -> str:

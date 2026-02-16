@@ -74,6 +74,8 @@ class WinDbgCommands:
             f"State: {state.value}",
             f"Mode: {mode.value}",
         ]
+        if self.bridge._is_local_kernel:
+            lines.append("Connection: local kernel (read-only, commands via CDB)")
         if self.bridge._binary_path:
             lines.append(f"Target: {self.bridge._binary_path}")
 

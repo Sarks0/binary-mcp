@@ -814,7 +814,7 @@ function Install-WinDbg {
         try {
             Push-Location $InstallDir
             Write-Info "Falling back to direct pybag install..."
-            uv pip install pybag>=2.2.0
+            uv pip install "pybag>=2.2.16"
             Pop-Location
             $pybagInstalled = $true
             Write-Success "Pybag installed successfully via uv pip"

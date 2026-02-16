@@ -85,7 +85,7 @@ yara = [
 [package.metadata]
 requires-dist = [
     { name = "capstone", specifier = ">=5.0.0" },
-    { name = "fastmcp", specifier = ">=0.2.0" },
+    { name = "fastmcp", specifier = ">=2.13,<3" },
     { name = "mcp", extras = ["cli"], specifier = ">=1.6.0" },
     { name = "pefile", specifier = ">=2023.2.7" },
     { name = "pybag", marker = "sys_platform == 'win32' and extra == 'windbg'", specifier = ">=2.2.16" },

@@ -9,7 +9,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "mcp[cli]>=1.6.0",
-    "fastmcp>=0.2.0",
+    "fastmcp>=2.13,<3",
     "pefile>=2023.2.7",
     "pyelftools>=0.31",
     "requests>=2.31.0",

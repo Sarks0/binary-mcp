@@ -45,7 +45,7 @@ function Install-WithWinget {
 
     Write-Info "Installing $PackageName via winget..."
     try {
-        $result = winget install --id $PackageId --accept-source-agreements --accept-package-agreements 2>&1
+        $result = winget install --id $PackageId --source winget --accept-source-agreements --accept-package-agreements 2>&1
         if ($LASTEXITCODE -eq 0) {
             Write-Success "$PackageName installed successfully"
             # Refresh PATH

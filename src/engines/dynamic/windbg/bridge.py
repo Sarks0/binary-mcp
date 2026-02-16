@@ -170,10 +170,13 @@ class WinDbgBridge(Debugger):
         self._require_connected()
         try:
             addr_int = int(address.replace("`", ""), 16)
-            bp_id = self._breakpoint_counter
-            self._dbg.bp(addr_int)
+            # bp() returns the actual DbgEng breakpoint ID
+            bp_id = self._dbg.bp(addr_int)
+            if bp_id is None:
+                # Fallback if pybag doesn't return the ID
+                bp_id = self._breakpoint_counter
+                self._breakpoint_counter += 1
             self._breakpoints[address.replace("`", "").lower()] = bp_id
-            self._breakpoint_counter += 1
             logger.debug("Breakpoint %d set at %s", bp_id, address)
             return True
         except Exception as exc:
@@ -367,15 +370,20 @@ class WinDbgBridge(Debugger):
     def open_dump(self, dump_path: Path) -> bool:
         """Open a crash dump file for analysis.
 
+        Pybag's OpenDumpFile COM binding is not implemented (E_NOTIMPL),
+        so dump analysis is handled entirely via CDB subprocess commands.
+
         Args:
             dump_path: Path to a .dmp file.
         """
         self._require_windows()
-        self._require_pybag()
+        if self._cdb_path is None:
+            raise WinDbgBridgeError(
+                "open_dump",
+                "CDB.exe is required for dump analysis but was not found. "
+                "Install Debugging Tools for Windows.",
+            )
         try:
-            # UserDbg supports dump analysis; DbgEng is a submodule, not a class
-            self._dbg = pybag.UserDbg()
-            self._dbg.open_dump(str(dump_path))
             self._binary_path = dump_path
             self._mode = WinDbgMode.DUMP_ANALYSIS
             self._state = DebuggerState.PAUSED
@@ -606,12 +614,15 @@ class WinDbgBridge(Debugger):
         """
         # Choose the right debugger executable based on mode
         if self._mode == WinDbgMode.KERNEL_MODE and self._is_local_kernel:
-            # Local kernel: use kd.exe -kl
-            exe_path = self._kd_path or self._cdb_path
-            if exe_path is None:
-                structured = create_windbg_not_found_error()
-                raise StructuredBaseError(structured)
-            cmd_args = [str(exe_path), "-kl"]
+            # Local kernel: MUST use kd.exe -kl (CDB does NOT support -kl)
+            if self._kd_path is None:
+                raise WinDbgBridgeError(
+                    "execute_cdb_command",
+                    "kd.exe is required for local kernel commands but was not found. "
+                    "CDB does not support the -kl flag. "
+                    "Install Debugging Tools for Windows (Windows SDK).",
+                )
+            cmd_args = [str(self._kd_path), "-kl"]
         elif self._mode == WinDbgMode.DUMP_ANALYSIS and self._binary_path:
             # Dump file: use cdb.exe -z <dump>
             if self._cdb_path is None:

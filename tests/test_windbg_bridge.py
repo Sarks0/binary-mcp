@@ -165,15 +165,29 @@ class TestABCMethodsWithMockedPybag:
         bridge._dbg.bp.assert_called_once()
         assert "0x401000" in bridge._breakpoints
 
+    def test_set_breakpoint_captures_bp_id(self, bridge):
+        """bp() return value is used as the breakpoint ID."""
+        bridge._dbg.bp.return_value = 42
+        bridge.set_breakpoint("0x401000")
+        assert bridge._breakpoints["0x401000"] == 42
+
+    def test_set_breakpoint_fallback_counter(self, bridge):
+        """When bp() returns None, use an auto-incrementing counter."""
+        bridge._dbg.bp.return_value = None
+        bridge.set_breakpoint("0x401000")
+        assert bridge._breakpoints["0x401000"] == 0
+        bridge.set_breakpoint("0x402000")
+        assert bridge._breakpoints["0x402000"] == 1
+
     def test_delete_breakpoint(self, bridge):
         # Set first so we have a tracked BP ID
+        bridge._dbg.bp.return_value = 7
         bridge.set_breakpoint("0x401000")
-        bp_id = bridge._breakpoints.get("0x401000")
-        assert bp_id is not None
+        assert bridge._breakpoints["0x401000"] == 7
 
         result = bridge.delete_breakpoint("0x401000")
         assert result is True
-        bridge._dbg.bc.assert_called_once_with(bp_id)
+        bridge._dbg.bc.assert_called_once_with(7)
         assert "0x401000" not in bridge._breakpoints
 
     def test_delete_breakpoint_fallback(self, bridge):
@@ -331,6 +345,19 @@ class TestExtensionCommands:
         with pytest.raises(Exception):
             bridge.execute_extension("!analyze -v")
 
+    def test_local_kernel_without_kd_raises(self):
+        """Local kernel mode without kd.exe should raise, not fall back to CDB."""
+        bridge = WinDbgBridge()
+        bridge._kd_path = None
+        bridge._cdb_path = Path("C:\\cdb.exe")
+        bridge._mode = WinDbgMode.KERNEL_MODE
+        bridge._is_local_kernel = True
+
+        with pytest.raises(WinDbgBridgeError) as exc_info:
+            bridge._execute_cdb_command("lm")
+        assert "kd.exe is required" in exc_info.value.message
+        assert "CDB does not support" in exc_info.value.message
+
     @patch("src.engines.dynamic.windbg.bridge.subprocess.run")
     def test_execute_cdb_timeout(self, mock_run):
         import subprocess
@@ -450,19 +477,26 @@ class TestDumpAnalysis:
     """Test dump file opening and mode guards."""
 
     @patch("src.engines.dynamic.windbg.bridge.platform.system", return_value="Windows")
-    @patch("src.engines.dynamic.windbg.bridge.PYBAG_AVAILABLE", True)
-    @patch("src.engines.dynamic.windbg.bridge.pybag")
-    def test_open_dump_uses_user_dbg(self, mock_pybag, mock_sys):
-        """open_dump() should use UserDbg, not DbgEng (which is a module)."""
-        mock_dbg = MagicMock()
-        mock_pybag.UserDbg.return_value = mock_dbg
-
+    def test_open_dump_cdb_only(self, mock_sys):
+        """open_dump() uses CDB subprocess — pybag OpenDumpFile is E_NOTIMPL."""
         bridge = WinDbgBridge()
-        bridge.open_dump(Path("C:\\dump.dmp"))
+        bridge._cdb_path = Path("C:\\cdb.exe")
 
-        mock_pybag.UserDbg.assert_called_once()
-        mock_dbg.open_dump.assert_called_once_with("C:\\dump.dmp")
+        result = bridge.open_dump(Path("C:\\dump.dmp"))
+        assert result is True
         assert bridge._mode == WinDbgMode.DUMP_ANALYSIS
+        assert bridge._state == DebuggerState.PAUSED
+        assert bridge._binary_path == Path("C:\\dump.dmp")
+
+    @patch("src.engines.dynamic.windbg.bridge.platform.system", return_value="Windows")
+    def test_open_dump_requires_cdb(self, mock_sys):
+        """open_dump() raises if CDB is not found."""
+        bridge = WinDbgBridge()
+        bridge._cdb_path = None
+
+        with pytest.raises(WinDbgBridgeError) as exc_info:
+            bridge.open_dump(Path("C:\\dump.dmp"))
+        assert "CDB.exe is required" in exc_info.value.message
 
 
 class TestDisconnect:

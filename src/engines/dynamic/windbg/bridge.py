@@ -440,16 +440,18 @@ class WinDbgBridge(Debugger):
         if self._dbg is not None:
             try:
                 modules = self._dbg.module_list()
-                result = []
-                for name_tuple, params in modules:
-                    mod_name = name_tuple[0] if isinstance(name_tuple, tuple) else str(name_tuple)
-                    result.append({
-                        "name": mod_name,
-                        "base": f"{params.Base:x}",
-                        "size": f"{params.Size:x}",
-                        "end": f"{params.Base + params.Size:x}",
-                    })
-                return result
+                if modules:
+                    result = []
+                    for name_tuple, params in modules:
+                        mod_name = name_tuple[0] if isinstance(name_tuple, tuple) else str(name_tuple)
+                        result.append({
+                            "name": mod_name,
+                            "base": f"{params.Base:x}",
+                            "size": f"{params.Size:x}",
+                            "end": f"{params.Base + params.Size:x}",
+                        })
+                    return result
+                logger.info("Pybag module_list() returned empty, trying lm command")
             except Exception as exc:
                 logger.warning("Pybag module_list() failed, falling back to lm: %s", exc)
 

@@ -258,14 +258,15 @@ def register_windbg_tools(
         if not _is_windows():
             return _PLATFORM_MSG
         try:
+            from src.engines.dynamic.base import DebuggerState
+            from src.engines.dynamic.windbg.kernel_types import WinDbgMode
+
             bridge = get_windbg_bridge()
             bridge.run()
-            # Use pybag's native wait() which blocks until a debug event
+            # Live kernel targets require INFINITE timeout per MS docs
+            wait_ms = 0xFFFFFFFF if bridge._mode == WinDbgMode.KERNEL_MODE else timeout * 1000
             try:
-                bridge._dbg.wait(timeout * 1000)  # wait() takes milliseconds
-                bridge._state = bridge._dbg._control.GetExecutionStatus()
-                # Map DbgEng execution status to our state
-                from src.engines.dynamic.base import DebuggerState
+                bridge._dbg.wait(wait_ms)
                 bridge._state = DebuggerState.PAUSED
                 loc = bridge.get_current_location()
                 return f"Break at 0x{loc.get('address', '?')}"
@@ -288,11 +289,14 @@ def register_windbg_tools(
         if not _is_windows():
             return _PLATFORM_MSG
         try:
+            from src.engines.dynamic.base import DebuggerState
+            from src.engines.dynamic.windbg.kernel_types import WinDbgMode
+
             bridge = get_windbg_bridge()
-            # Use pybag's native wait() which blocks until a debug event
+            # Live kernel targets require INFINITE timeout per MS docs
+            wait_ms = 0xFFFFFFFF if bridge._mode == WinDbgMode.KERNEL_MODE else timeout * 1000
             try:
-                bridge._dbg.wait(timeout * 1000)  # wait() takes milliseconds
-                from src.engines.dynamic.base import DebuggerState
+                bridge._dbg.wait(wait_ms)
                 bridge._state = DebuggerState.PAUSED
                 loc = bridge.get_current_location()
                 return f"Paused at 0x{loc.get('address', '?')}"

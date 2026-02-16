@@ -444,20 +444,29 @@ class WinDbgBridge(Debugger):
                     result = []
                     for name_tuple, params in modules:
                         mod_name = name_tuple[0] if isinstance(name_tuple, tuple) else str(name_tuple)
+                        end_addr = params.Base + params.Size
                         result.append({
+                            "start": f"{params.Base:x}",
+                            "end": f"{end_addr:x}",
                             "name": mod_name,
-                            "base": f"{params.Base:x}",
-                            "size": f"{params.Size:x}",
-                            "end": f"{params.Base + params.Size:x}",
+                            "symbol_status": "loaded",
                         })
                     return result
                 logger.info("Pybag module_list() returned empty, trying lm command")
             except Exception as exc:
                 logger.warning("Pybag module_list() failed, falling back to lm: %s", exc)
 
-        # Fallback: parse 'lm k' command output
-        output = self.execute_command("lm k")
-        return WinDbgOutputParser.parse_modules(output)
+        # Fallback: parse 'lm' command output (try both 'lm' and 'lm k')
+        for lm_cmd in ("lm", "lm k"):
+            try:
+                output = self.execute_command(lm_cmd)
+                parsed = WinDbgOutputParser.parse_modules(output)
+                if parsed:
+                    return parsed
+                logger.info("'%s' returned no parseable modules", lm_cmd)
+            except Exception as exc:
+                logger.warning("'%s' command failed: %s", lm_cmd, exc)
+        return []
 
     def get_processes(self) -> list[dict[str, str]]:
         """List all kernel processes via '!process 0 0'."""

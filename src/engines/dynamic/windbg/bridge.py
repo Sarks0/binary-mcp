@@ -550,11 +550,13 @@ class WinDbgBridge(Debugger):
             structured = create_windbg_not_found_error()
             raise StructuredBaseError(structured)
 
-        cdb_args = [str(self._cdb_path), "-z"]
+        cdb_args = [str(self._cdb_path)]
         if self._binary_path:
-            cdb_args.append(str(self._binary_path))
+            # Dump file analysis: cdb -z <dump_path> -c "command; q"
+            cdb_args.extend(["-z", str(self._binary_path)])
         else:
-            cdb_args.append("-kl")  # local kernel
+            # Local kernel debugging: cdb -kl -c "command; q"
+            cdb_args.append("-kl")
 
         cdb_args.extend(["-c", f"{command}; q"])
 

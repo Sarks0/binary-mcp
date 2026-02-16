@@ -944,8 +944,9 @@ function Configure-ClaudeDesktop {
 function Configure-ClaudeCode {
     Write-Info "Configuring Claude Code..."
 
-    $claudeCodeConfigDir = "$env:USERPROFILE\.config\claude-code"
-    $claudeCodeConfigFile = "$claudeCodeConfigDir\mcp_settings.json"
+    # Claude Code reads settings from ~/.claude/settings.json (not ~/.config/claude-code/)
+    $claudeCodeConfigDir = "$env:USERPROFILE\.claude"
+    $claudeCodeConfigFile = "$claudeCodeConfigDir\settings.json"
 
     if (-not (Test-Path $claudeCodeConfigDir)) {
         New-Item -ItemType Directory -Path $claudeCodeConfigDir -Force | Out-Null
@@ -959,9 +960,10 @@ function Configure-ClaudeCode {
             Copy-Item $claudeCodeConfigFile "$claudeCodeConfigFile.backup" -Force
             Write-Info "Backup saved to: $claudeCodeConfigFile.backup"
         } else {
-            $config = [PSCustomObject]@{ mcpServers = @{} }
+            $config = [PSCustomObject]@{}
         }
 
+        # Add mcpServers key if it doesn't exist (settings.json has other keys too)
         if (-not $config.mcpServers) {
             $config | Add-Member -MemberType NoteProperty -Name "mcpServers" -Value @{} -Force
         }

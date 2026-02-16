@@ -7,8 +7,9 @@ param(
     [string]$InstallDir = "$env:USERPROFILE\binary-mcp",
     [string]$GhidraDir = "$env:USERPROFILE\ghidra",
     [string]$X64DbgDir = "$env:USERPROFILE\x64dbg",
-    [ValidateSet("", "full", "static", "dynamic", "custom", "repair")]
-    [string]$InstallProfile = "",  # full, static, dynamic, custom, repair
+    [string]$WinDbgDir = "",  # Auto-detected from Windows SDK
+    [ValidateSet("", "full", "static", "dynamic", "kernel", "custom", "repair")]
+    [string]$InstallProfile = "",  # full, static, dynamic, kernel, custom, repair
     [switch]$Unattended
 )
 
@@ -126,6 +127,8 @@ function Get-ComponentStatus {
         Ghidra = @{ Installed = $false; Version = ""; Path = $GhidraDir }
         ILSpyCmd = @{ Installed = $false; Version = ""; Path = "" }
         X64Dbg = @{ Installed = $false; Version = ""; Path = $X64DbgDir }
+        WinDbg = @{ Installed = $false; Version = ""; Path = "" }
+        Pybag  = @{ Installed = $false; Version = ""; Path = "" }
         BinaryMCP = @{ Installed = $false; Version = ""; Path = $InstallDir }
     }
 
@@ -217,6 +220,41 @@ function Get-ComponentStatus {
         $status.X64Dbg.Installed = $true
         $status.X64Dbg.Path = $X64DbgDir
     }
+
+    # Check WinDbg / Debugging Tools for Windows
+    $windbgSearchPaths = @(
+        "${env:ProgramFiles(x86)}\Windows Kits\10\Debuggers\x64",
+        "$env:ProgramFiles\Windows Kits\10\Debuggers\x64",
+        "${env:ProgramFiles(x86)}\Windows Kits\10\Debuggers\x86",
+        "C:\Debuggers"
+    )
+
+    if ($env:WINDBG_PATH -and (Test-Path "$env:WINDBG_PATH\cdb.exe")) {
+        $status.WinDbg.Installed = $true
+        $status.WinDbg.Path = $env:WINDBG_PATH
+    } else {
+        foreach ($searchPath in $windbgSearchPaths) {
+            if (Test-Path "$searchPath\cdb.exe") {
+                $status.WinDbg.Installed = $true
+                $status.WinDbg.Path = $searchPath
+                break
+            }
+        }
+    }
+
+    if (-not $status.WinDbg.Installed -and (Test-Command cdb)) {
+        $status.WinDbg.Installed = $true
+        $status.WinDbg.Path = (Get-Command cdb).Source | Split-Path
+    }
+
+    # Check Pybag (Python package for WinDbg COM API)
+    try {
+        $pybagCheck = uv run python -c "import pybag; print(pybag.__version__)" 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            $status.Pybag.Installed = $true
+            $status.Pybag.Version = $pybagCheck.Trim()
+        }
+    } catch {}
 
     # Check Binary MCP
     if (Test-Path "$InstallDir\pyproject.toml") {
@@ -321,6 +359,23 @@ function Show-SystemStatus {
         Write-Host "    [" -NoNewline; Write-Host "--" -ForegroundColor DarkGray -NoNewline; Write-Host "] x64dbg (not installed)"
     }
 
+    # WinDbg
+    if ($Status.WinDbg.Installed) {
+        Write-Host "    [" -NoNewline; Write-Host "OK" -ForegroundColor Green -NoNewline
+        Write-Host "] WinDbg/CDB (kernel debugging) - $($Status.WinDbg.Path)"
+    } else {
+        Write-Host "    [" -NoNewline; Write-Host "--" -ForegroundColor DarkGray -NoNewline
+        Write-Host "] WinDbg/CDB (not installed)"
+    }
+
+    if ($Status.Pybag.Installed) {
+        Write-Host "    [" -NoNewline; Write-Host "OK" -ForegroundColor Green -NoNewline
+        Write-Host "] Pybag $($Status.Pybag.Version) (WinDbg Python bridge)"
+    } elseif ($Status.WinDbg.Installed) {
+        Write-Host "    [" -NoNewline; Write-Host "!!" -ForegroundColor Yellow -NoNewline
+        Write-Host "] Pybag (not installed - required for WinDbg integration)"
+    }
+
     Write-Host ""
     Write-Host "  Binary MCP Server:" -ForegroundColor White
     if ($Status.BinaryMCP.Installed) {
@@ -337,7 +392,7 @@ function Show-InstallMenu {
     Write-Host "  --------------------" -ForegroundColor Yellow
     Write-Host ""
     Write-Host "  [1] Full Installation" -ForegroundColor White
-    Write-Host "      Everything: Ghidra + .NET Tools + x64dbg + Claude Config" -ForegroundColor DarkGray
+    Write-Host "      Everything: Ghidra + .NET Tools + x64dbg + WinDbg + Claude Config" -ForegroundColor DarkGray
     Write-Host ""
     Write-Host "  [2] Static Analysis Only" -ForegroundColor White
     Write-Host "      Ghidra (native) + ILSpyCmd (.NET) - No debugger" -ForegroundColor DarkGray
@@ -345,10 +400,13 @@ function Show-InstallMenu {
     Write-Host "  [3] Dynamic Analysis Only" -ForegroundColor White
     Write-Host "      x64dbg with MCP plugins - No static analysis tools" -ForegroundColor DarkGray
     Write-Host ""
-    Write-Host "  [4] Custom Installation" -ForegroundColor White
+    Write-Host "  [4] Kernel Debugging" -ForegroundColor White
+    Write-Host "      WinDbg/CDB for kernel driver analysis + crash dumps" -ForegroundColor DarkGray
+    Write-Host ""
+    Write-Host "  [5] Custom Installation" -ForegroundColor White
     Write-Host "      Choose individual components to install" -ForegroundColor DarkGray
     Write-Host ""
-    Write-Host "  [5] Repair/Update Existing" -ForegroundColor White
+    Write-Host "  [6] Repair/Update Existing" -ForegroundColor White
     Write-Host "      Reinstall or update specific components" -ForegroundColor DarkGray
     Write-Host ""
     Write-Host "  [Q] Quit" -ForegroundColor DarkGray
@@ -377,8 +435,11 @@ function Show-CustomMenu {
     $x64dbgStatus = if ($Status.X64Dbg.Installed) { "[Installed]" } else { "" }
     Write-Host "  [3] x64dbg - Dynamic debugging/analysis $x64dbgStatus" -ForegroundColor White
 
-    Write-Host "  [4] Configure Claude Desktop" -ForegroundColor White
-    Write-Host "  [5] Configure Claude Code" -ForegroundColor White
+    $windbgStatus = if ($Status.WinDbg.Installed) { "[Installed]" } else { "" }
+    Write-Host "  [4] WinDbg - Kernel/user-mode debugging $windbgStatus" -ForegroundColor White
+
+    Write-Host "  [5] Configure Claude Desktop" -ForegroundColor White
+    Write-Host "  [6] Configure Claude Code" -ForegroundColor White
     Write-Host ""
     Write-Host "  [A] All components" -ForegroundColor Cyan
     Write-Host "  [B] Back to main menu" -ForegroundColor DarkGray
@@ -615,6 +676,104 @@ function Install-X64Dbg {
     }
 }
 
+function Install-WinDbg {
+    Write-Info "Setting up WinDbg/Debugging Tools..."
+
+    # Check if already installed at known SDK paths
+    $existingPath = $null
+    $searchPaths = @(
+        "${env:ProgramFiles(x86)}\Windows Kits\10\Debuggers\x64",
+        "$env:ProgramFiles\Windows Kits\10\Debuggers\x64",
+        "${env:ProgramFiles(x86)}\Windows Kits\10\Debuggers\x86",
+        "C:\Debuggers"
+    )
+
+    # Check WINDBG_PATH env var first
+    if ($env:WINDBG_PATH -and (Test-Path "$env:WINDBG_PATH\cdb.exe")) {
+        $existingPath = $env:WINDBG_PATH
+    } else {
+        foreach ($sp in $searchPaths) {
+            if (Test-Path "$sp\cdb.exe") {
+                $existingPath = $sp
+                break
+            }
+        }
+    }
+
+    # Also check if cdb.exe is on PATH (e.g., from WinDbg Preview)
+    if (-not $existingPath -and (Test-Command cdb)) {
+        $existingPath = (Get-Command cdb).Source | Split-Path
+    }
+
+    if ($existingPath) {
+        Write-Success "WinDbg/CDB found at: $existingPath"
+        [System.Environment]::SetEnvironmentVariable("WINDBG_PATH", $existingPath, "User")
+        $env:WINDBG_PATH = $existingPath
+    } else {
+        $installed = $false
+
+        # Method 1: Try winget (installs WinDbg Preview - includes cdb.exe, kd.exe)
+        if (Test-WingetAvailable) {
+            Write-Info "Installing WinDbg via winget (winget install Microsoft.WinDbg)..."
+            $installed = Install-WithWinget -PackageId "Microsoft.WinDbg" -PackageName "WinDbg"
+        }
+
+        # Method 2: Download Windows SDK installer and install just the debuggers
+        if (-not $installed) {
+            Write-Info "Attempting Windows SDK Debugging Tools standalone install..."
+            try {
+                $sdkSetup = "$env:TEMP\winsdksetup.exe"
+                Write-Info "Downloading Windows SDK installer..."
+                Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/?linkid=2173743" -OutFile $sdkSetup -UseBasicParsing
+
+                Write-Info "Installing Debugging Tools for Windows (silent)..."
+                $proc = Start-Process -FilePath $sdkSetup -ArgumentList "/features OptionId.WindowsDesktopDebuggers /quiet" -Wait -PassThru
+                if ($proc.ExitCode -eq 0) {
+                    Write-Success "Debugging Tools for Windows installed"
+                    $installed = $true
+
+                    # Set path to default install location
+                    $defaultPath = "${env:ProgramFiles(x86)}\Windows Kits\10\Debuggers\x64"
+                    if (Test-Path "$defaultPath\cdb.exe") {
+                        [System.Environment]::SetEnvironmentVariable("WINDBG_PATH", $defaultPath, "User")
+                        $env:WINDBG_PATH = $defaultPath
+                    }
+                } else {
+                    Write-Warn "SDK installer exited with code: $($proc.ExitCode)"
+                }
+                Remove-Item $sdkSetup -ErrorAction SilentlyContinue
+            } catch {
+                Write-Warn "Failed to install via SDK: $_"
+            }
+        }
+
+        if (-not $installed) {
+            Write-Err "Could not install WinDbg automatically"
+            Write-Info "Manual installation options:"
+            Write-Info "  1. winget install Microsoft.WinDbg"
+            Write-Info "  2. Download Windows SDK: https://developer.microsoft.com/en-us/windows/downloads/windows-sdk/"
+            Write-Info "     Select 'Debugging Tools for Windows' during installation"
+            Write-Info "  3. Microsoft Store: search 'WinDbg Preview'"
+            return $false
+        }
+    }
+
+    # Install Pybag Python package (WinDbg COM API bridge)
+    Write-Info "Installing Pybag (WinDbg Python bridge)..."
+    try {
+        Push-Location $InstallDir
+        uv sync --extra windbg
+        Pop-Location
+        Write-Success "Pybag installed successfully"
+    } catch {
+        Pop-Location
+        Write-Warn "Failed to install Pybag: $_"
+        Write-Info "You can install it manually: uv sync --extra windbg"
+    }
+
+    return $true
+}
+
 function Install-BinaryMCP {
     Write-Info "Setting up Binary MCP Server..."
 
@@ -774,6 +933,9 @@ function Show-Summary {
     if ($Installed.X64Dbg) {
         Write-Success "x64dbg: $X64DbgDir"
     }
+    if ($Installed.WinDbg) {
+        Write-Success "WinDbg: Kernel debugging ready"
+    }
     if ($Installed.ClaudeDesktop) {
         Write-Success "Claude Desktop: Configured"
     }
@@ -798,6 +960,12 @@ function Show-Summary {
     if ($Installed.X64Dbg) {
         Write-Host "  3. For dynamic analysis: Launch x64dbg and load a binary" -ForegroundColor White
         Write-Host "     - x64dbg.exe for 64-bit, x32dbg.exe for 32-bit" -ForegroundColor DarkGray
+    }
+
+    if ($Installed.WinDbg) {
+        Write-Host "  4. For kernel debugging:" -ForegroundColor White
+        Write-Host "     - Crash dumps: 'Analyze the crash dump at C:\path\to\MEMORY.DMP'" -ForegroundColor DarkGray
+        Write-Host "     - Live kernel: 'Connect to kernel debugger on port 50000'" -ForegroundColor DarkGray
     }
 
     Write-Host ""
@@ -933,6 +1101,7 @@ $installed = @{
     Ghidra = $false
     DotNet = $false
     X64Dbg = $false
+    WinDbg = $false
     ClaudeDesktop = $false
     ClaudeCode = $false
 }
@@ -944,13 +1113,14 @@ if ($InstallProfile) {
         "full"    { "1" }
         "static"  { "2" }
         "dynamic" { "3" }
-        "custom"  { "4" }
-        "repair"  { "5" }
+        "kernel"  { "4" }
+        "custom"  { "5" }
+        "repair"  { "6" }
         default   { $InstallProfile }
     }
 } else {
     Show-InstallMenu
-    $selection = Get-UserSelection "Enter choice (1-5, Q to quit)"
+    $selection = Get-UserSelection "Enter choice (1-6, Q to quit)"
 }
 
 switch ($selection.ToLower()) {
@@ -977,6 +1147,7 @@ switch ($selection.ToLower()) {
         }
 
         $installed.X64Dbg = Install-X64Dbg
+        $installed.WinDbg = Install-WinDbg
         $installed.ClaudeDesktop = Configure-ClaudeDesktop
         $installed.ClaudeCode = Configure-ClaudeCode
     }
@@ -1015,7 +1186,18 @@ switch ($selection.ToLower()) {
         $installed.ClaudeDesktop = Configure-ClaudeDesktop
     }
 
-    { $_ -in "4", "custom" } {
+    { $_ -in "4", "kernel" } {
+        # Kernel debugging
+        Write-Host ""
+        Write-Info "Starting Kernel Debugging Installation..."
+        Write-Host ""
+
+        $installed.BinaryMCP = Install-BinaryMCP
+        $installed.WinDbg = Install-WinDbg
+        $installed.ClaudeDesktop = Configure-ClaudeDesktop
+    }
+
+    { $_ -in "5", "custom" } {
         # Custom installation
         Show-CustomMenu $status
         $customSelection = Get-UserSelection "Enter components"
@@ -1028,7 +1210,7 @@ switch ($selection.ToLower()) {
         }
 
         $components = if ($customSelection.ToLower() -eq "a") {
-            @("1", "2", "3", "4", "5")
+            @("1", "2", "3", "4", "5", "6")
         } else {
             $customSelection -split "," | ForEach-Object { $_.Trim() }
         }
@@ -1057,13 +1239,14 @@ switch ($selection.ToLower()) {
                     }
                 }
                 "3" { $installed.X64Dbg = Install-X64Dbg }
-                "4" { $installed.ClaudeDesktop = Configure-ClaudeDesktop }
-                "5" { $installed.ClaudeCode = Configure-ClaudeCode }
+                "4" { $installed.WinDbg = Install-WinDbg }
+                "5" { $installed.ClaudeDesktop = Configure-ClaudeDesktop }
+                "6" { $installed.ClaudeCode = Configure-ClaudeCode }
             }
         }
     }
 
-    { $_ -in "5", "repair" } {
+    { $_ -in "6", "repair" } {
         # Repair/Update
         Write-Host ""
         Write-Info "Repair/Update Mode"
@@ -1084,8 +1267,9 @@ switch ($selection.ToLower()) {
                 "1" { $installed.Ghidra = Install-Ghidra }
                 "2" { $installed.DotNet = Install-DotNetTools }
                 "3" { $installed.X64Dbg = Install-X64Dbg }
-                "4" { $installed.ClaudeDesktop = Configure-ClaudeDesktop }
-                "5" { $installed.ClaudeCode = Configure-ClaudeCode }
+                "4" { $installed.WinDbg = Install-WinDbg }
+                "5" { $installed.ClaudeDesktop = Configure-ClaudeDesktop }
+                "6" { $installed.ClaudeCode = Configure-ClaudeCode }
             }
         }
     }

@@ -63,7 +63,15 @@ uv sync --extra windbg
 
 ## Configuration
 
-Add to Claude Desktop (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS):
+### Claude Code
+
+Add the MCP server directly from the command line:
+
+```bash
+claude mcp add binary-analysis -- uv --directory /absolute/path/to/binary-mcp run python -m src.server
+```
+
+Or manually edit `~/.claude/settings.json` (global) or `.claude/settings.json` (per-project):
 
 ```json
 {
@@ -77,7 +85,28 @@ Add to Claude Desktop (`~/Library/Application Support/Claude/claude_desktop_conf
 }
 ```
 
-Restart Claude after configuration.
+### Claude Desktop
+
+Edit the Claude Desktop config file:
+
+| Platform | Config path |
+|----------|-------------|
+| macOS | `~/Library/Application Support/Claude/claude_desktop_config.json` |
+| Windows | `%APPDATA%\Claude\claude_desktop_config.json` |
+
+```json
+{
+  "mcpServers": {
+    "binary-analysis": {
+      "command": "uv",
+      "args": ["--directory", "/absolute/path/to/binary-mcp", "run", "python", "-m", "src.server"],
+      "env": {"GHIDRA_HOME": "/path/to/ghidra"}
+    }
+  }
+}
+```
+
+Restart Claude Desktop after saving.
 
 ## Usage
 

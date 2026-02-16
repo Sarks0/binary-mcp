@@ -745,7 +745,7 @@ def create_windbg_command_failed_error(
     return StructuredError(
         error=ErrorCode.WINDBG_COMMAND_FAILED,
         message=f"WinDbg command failed: '{command}'",
-        reason=f"Command produced an error or unexpected output",
+        reason="Command produced an error or unexpected output",
         suggestions=WINDBG_SUGGESTIONS["command_failed"],
         debug_info={
             "command": command,

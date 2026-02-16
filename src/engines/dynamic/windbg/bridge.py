@@ -92,6 +92,7 @@ class WinDbgBridge(Debugger):
         self._state = DebuggerState.NOT_LOADED
         self._dbg: Any = None
         self._is_local_kernel = False
+        self._local_kernel_limited = False
         self._kd_path = self._find_kd() if platform.system() == "Windows" else None
         self._cdb_path = cdb_path or (self._find_cdb() if platform.system() == "Windows" else None)
         self._timeout = timeout
@@ -144,6 +145,7 @@ class WinDbgBridge(Debugger):
         self._state = DebuggerState.NOT_LOADED
         self._mode = WinDbgMode.USER_MODE
         self._is_local_kernel = False
+        self._local_kernel_limited = False
         logger.info("WinDbg bridge disconnected")
 
     def load_binary(self, binary_path: Path, args: list[str] | None = None) -> bool:
@@ -353,54 +355,39 @@ class WinDbgBridge(Debugger):
     def connect_kernel_local(self) -> bool:
         """Attach to the local kernel in read-only mode.
 
-        Pybag's KernelDbg.attach("local") may silently succeed even
-        when kernel debugging is not enabled (bcdedit -debug on).  We
-        validate the session by attempting to read the module list or
-        program counter immediately after connecting.
+        Pybag's KernelDbg.attach("local") can partially succeed even
+        without ``bcdedit -debug on``.  We allow the connection and
+        log a warning if data access appears limited, rather than
+        rejecting the session outright.
         """
         self._require_windows()
         self._require_pybag()
-        enable_hint = (
-            "Local kernel debugging is not enabled or not running as Administrator.\n"
-            "To enable:\n"
-            "  1. Run elevated: bcdedit -debug on\n"
-            "  2. Reboot\n"
-            "  3. Run this tool as Administrator"
-        )
         try:
             self._dbg = pybag.KernelDbg()
             self._dbg.attach("local")
 
-            # --- Validate the session is actually usable ---
-            # Pybag may accept attach("local") without error even when
-            # kernel debugging is disabled.  Try lightweight operations
-            # to verify the connection before reporting success.
-            try:
-                modules = self._dbg.module_list()
-                if not modules:
-                    # module_list() returned empty — try the PC register
-                    self._dbg.reg.get_pc()
-            except Exception:
-                # Session is invalid — clean up and report clearly
-                try:
-                    self._dbg.detach()
-                except Exception:
-                    pass
-                self._dbg = None
-                raise WinDbgBridgeError("connect_kernel_local", enable_hint)
-
             self._mode = WinDbgMode.KERNEL_MODE
             self._state = DebuggerState.PAUSED
             self._is_local_kernel = True
+
+            # --- Soft validation: warn if data access is limited ---
+            self._local_kernel_limited = False
+            try:
+                modules = self._dbg.module_list()
+                if not modules:
+                    self._dbg.reg.get_pc()
+            except Exception:
+                self._local_kernel_limited = True
+                logger.warning(
+                    "Local kernel connected but data access is limited. "
+                    "For full access: bcdedit -debug on, reboot, run as Admin."
+                )
+
             logger.info("Connected to local kernel (read-only)")
             return True
-        except WinDbgBridgeError:
-            raise
         except Exception as exc:
             self._log_error("connect_kernel_local", exc)
-            structured = create_kernel_not_connected_error(
-                f"{exc}\n\n{enable_hint}"
-            )
+            structured = create_kernel_not_connected_error(str(exc))
             raise StructuredBaseError(structured) from exc
 
     def open_dump(self, dump_path: Path) -> bool:

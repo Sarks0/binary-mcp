@@ -137,19 +137,20 @@ class TestConnectWithMockedPybag:
     @patch("src.engines.dynamic.windbg.bridge.platform.system", return_value="Windows")
     @patch("src.engines.dynamic.windbg.bridge.PYBAG_AVAILABLE", True)
     @patch("src.engines.dynamic.windbg.bridge.pybag")
-    def test_connect_kernel_local_not_enabled(self, mock_pybag, mock_sys):
-        """connect_kernel_local() raises when kernel debugging is not enabled."""
+    def test_connect_kernel_local_limited_access(self, mock_pybag, mock_sys):
+        """connect_kernel_local() succeeds with warning when data access is limited."""
         mock_kd = MagicMock()
-        # Validation: module_list empty AND get_pc fails → not enabled
+        # Validation: module_list empty AND get_pc fails → limited
         mock_kd.module_list.return_value = []
         mock_kd.reg.get_pc.side_effect = RuntimeError("no session")
         mock_pybag.KernelDbg.return_value = mock_kd
 
         bridge = WinDbgBridge()
-        with pytest.raises(WinDbgBridgeError) as exc_info:
-            bridge.connect_kernel_local()
-        assert "bcdedit" in exc_info.value.message.lower()
-        assert bridge._dbg is None  # Cleaned up
+        result = bridge.connect_kernel_local()
+        assert result is True
+        assert bridge._mode == WinDbgMode.KERNEL_MODE
+        assert bridge._is_local_kernel is True
+        assert bridge._local_kernel_limited is True  # Warning flag set
 
 
 class TestABCMethodsWithMockedPybag:

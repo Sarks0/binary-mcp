@@ -76,6 +76,11 @@ class WinDbgCommands:
         ]
         if self.bridge._is_local_kernel:
             lines.append("Connection: local kernel (read-only)")
+            if getattr(self.bridge, "_local_kernel_limited", False):
+                lines.append(
+                    "Warning: Limited data access. For full access run "
+                    "'bcdedit -debug on', reboot, and run as Administrator."
+                )
         if self.bridge._binary_path:
             lines.append(f"Target: {self.bridge._binary_path}")
 

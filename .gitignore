@@ -92,3 +92,4 @@ logs/
 # Security reviews (internal only)
 security/
 DEVELOPMENT_ROADMAP.md
+WINDBG_INTEGRATION_PLAN.md

@@ -781,15 +781,35 @@ function Install-WinDbg {
 
     # Install Pybag Python package (WinDbg COM API bridge)
     Write-Info "Installing Pybag (WinDbg Python bridge)..."
+    $pybagInstalled = $false
+
+    # Method 1: Try uv sync --extra windbg (requires windbg extra in pyproject.toml)
     try {
         Push-Location $InstallDir
-        uv sync --extra windbg
+        $syncResult = uv sync --extra windbg 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            $pybagInstalled = $true
+            Write-Success "Pybag installed successfully via uv sync"
+        }
         Pop-Location
-        Write-Success "Pybag installed successfully"
     } catch {
         Pop-Location
-        Write-Warn "Failed to install Pybag: $_"
-        Write-Info "You can install it manually: uv sync --extra windbg"
+    }
+
+    # Method 2: Fall back to uv pip install if extra is not defined yet
+    if (-not $pybagInstalled) {
+        try {
+            Push-Location $InstallDir
+            Write-Info "Falling back to direct pybag install..."
+            uv pip install pybag>=2.2.0
+            Pop-Location
+            $pybagInstalled = $true
+            Write-Success "Pybag installed successfully via uv pip"
+        } catch {
+            Pop-Location
+            Write-Warn "Failed to install Pybag: $_"
+            Write-Info "You can install it manually: uv pip install pybag"
+        }
     }
 
     return $true
@@ -849,6 +869,38 @@ function Install-BinaryMCP {
     }
 }
 
+function Get-McpServerConfig {
+    # Build MCP server config with env vars for all detected/installed tools
+    $envVars = @{}
+
+    if ($env:GHIDRA_HOME -and (Test-Path $env:GHIDRA_HOME)) {
+        $envVars["GHIDRA_HOME"] = $env:GHIDRA_HOME
+    } elseif (Test-Path $GhidraDir) {
+        $envVars["GHIDRA_HOME"] = $GhidraDir
+    }
+
+    if ($env:X64DBG_HOME -and (Test-Path $env:X64DBG_HOME)) {
+        $envVars["X64DBG_HOME"] = $env:X64DBG_HOME
+    } elseif (Test-Path $X64DbgDir) {
+        $envVars["X64DBG_HOME"] = $X64DbgDir
+    }
+
+    if ($env:WINDBG_PATH) {
+        $envVars["WINDBG_PATH"] = $env:WINDBG_PATH
+    }
+
+    $serverConfig = @{
+        command = "uv"
+        args = @("--directory", $InstallDir, "run", "python", "-m", "src.server")
+    }
+
+    if ($envVars.Count -gt 0) {
+        $serverConfig["env"] = $envVars
+    }
+
+    return $serverConfig
+}
+
 function Configure-ClaudeDesktop {
     Write-Info "Configuring Claude Desktop..."
 
@@ -874,16 +926,14 @@ function Configure-ClaudeDesktop {
             $config | Add-Member -MemberType NoteProperty -Name "mcpServers" -Value @{} -Force
         }
 
-        $config.mcpServers | Add-Member -MemberType NoteProperty -Name "binary-mcp" -Value @{
-            command = "uv"
-            args = @("--directory", $InstallDir, "run", "python", "-m", "src.server")
-        } -Force
+        $serverConfig = Get-McpServerConfig
+        $config.mcpServers | Add-Member -MemberType NoteProperty -Name "binary-mcp" -Value $serverConfig -Force
 
         # Write JSON with UTF-8 encoding WITHOUT BOM (required for Claude Desktop compatibility)
         # Note: PowerShell 5.1's -Encoding UTF8 adds BOM, so we use .NET directly
         $jsonContent = $config | ConvertTo-Json -Depth 10
         [System.IO.File]::WriteAllText($claudeConfigFile, $jsonContent, [System.Text.UTF8Encoding]::new($false))
-        Write-Success "Claude Desktop configured"
+        Write-Success "Claude Desktop configured at: $claudeConfigFile"
         return $true
     } catch {
         Write-Err "Failed to configure Claude Desktop: $_"
@@ -916,16 +966,14 @@ function Configure-ClaudeCode {
             $config | Add-Member -MemberType NoteProperty -Name "mcpServers" -Value @{} -Force
         }
 
-        $config.mcpServers | Add-Member -MemberType NoteProperty -Name "binary-mcp" -Value @{
-            command = "uv"
-            args = @("--directory", $InstallDir, "run", "python", "-m", "src.server")
-        } -Force
+        $serverConfig = Get-McpServerConfig
+        $config.mcpServers | Add-Member -MemberType NoteProperty -Name "binary-mcp" -Value $serverConfig -Force
 
         # Write JSON with UTF-8 encoding WITHOUT BOM (required for compatibility)
         # Note: PowerShell 5.1's -Encoding UTF8 adds BOM, so we use .NET directly
         $jsonContent = $config | ConvertTo-Json -Depth 10
         [System.IO.File]::WriteAllText($claudeCodeConfigFile, $jsonContent, [System.Text.UTF8Encoding]::new($false))
-        Write-Success "Claude Code configured"
+        Write-Success "Claude Code configured at: $claudeCodeConfigFile"
         return $true
     } catch {
         Write-Err "Failed to configure Claude Code: $_"

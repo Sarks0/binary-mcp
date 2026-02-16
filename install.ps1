@@ -626,16 +626,35 @@ function Install-X64Dbg {
         Remove-Item -Recurse -Force $X64DbgDir
     }
 
-    try {
-        $x64dbgUrl = "https://github.com/x64dbg/x64dbg/releases/download/snapshot/snapshot_latest.zip"
-        $x64dbgZip = "$env:TEMP\x64dbg.zip"
+    $x64dbgZip = "$env:TEMP\x64dbg.zip"
 
-        Write-Info "Downloading x64dbg..."
-        Invoke-WebRequest -Uri $x64dbgUrl -OutFile $x64dbgZip -UseBasicParsing
+    try {
+        # Resolve actual snapshot asset name via GitHub API (no longer named snapshot_latest.zip)
+        Write-Info "Fetching latest x64dbg snapshot release..."
+        $snapshotRelease = Invoke-RestMethod "https://api.github.com/repos/x64dbg/x64dbg/releases/tags/snapshot"
+        $snapshotAsset = $snapshotRelease.assets | Where-Object {
+            $_.name -match "^snapshot_.*\.zip$" -and $_.name -notmatch "symbols"
+        } | Select-Object -First 1
+
+        if ($null -eq $snapshotAsset) {
+            Write-Err "Could not find x64dbg snapshot asset in release"
+            return $false
+        }
+
+        Write-Info "Downloading x64dbg ($($snapshotAsset.name))..."
+        Invoke-WebRequest -Uri $snapshotAsset.browser_download_url -OutFile $x64dbgZip -UseBasicParsing
         Write-Success "Downloaded x64dbg"
 
         Write-Info "Extracting x64dbg..."
         Expand-Archive -Path $x64dbgZip -DestinationPath $X64DbgDir -Force
+
+        # Verify extraction produced expected binaries
+        if (-not (Test-Path "$X64DbgDir\release\x64\x64dbg.exe")) {
+            Write-Err "Extraction succeeded but x64dbg.exe not found at expected path"
+            Write-Info "Expected: $X64DbgDir\release\x64\x64dbg.exe"
+            return $false
+        }
+
         Write-Success "x64dbg installed to: $X64DbgDir"
 
         [System.Environment]::SetEnvironmentVariable("X64DBG_HOME", $X64DbgDir, "User")
@@ -643,7 +662,7 @@ function Install-X64Dbg {
 
         Remove-Item $x64dbgZip -ErrorAction SilentlyContinue
 
-        # Install Obsidian plugins
+        # Install Obsidian MCP bridge plugins
         Write-Info "Installing Obsidian x64dbg plugins..."
         try {
             $pluginRelease = Get-LatestGitHubRelease "Sarks0/binary-mcp"
@@ -672,6 +691,7 @@ function Install-X64Dbg {
 
         return $true
     } catch {
+        Remove-Item $x64dbgZip -ErrorAction SilentlyContinue
         Write-Err "Failed to install x64dbg: $_"
         return $false
     }

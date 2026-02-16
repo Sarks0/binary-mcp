@@ -239,18 +239,13 @@ class WinDbgBridge(Debugger):
     def get_registers(self) -> dict[str, str]:
         """Return current register values as hex strings."""
         self._require_connected()
-
-        # Local kernel mode: pybag COM can't access registers, use CDB
-        if self._is_local_kernel:
-            output = self._execute_cdb_command("r")
-            return WinDbgOutputParser.parse_registers(output)
-
         try:
             regs = self._dbg.regs
             return {name: f"{val:x}" for name, val in regs.items()}
-        except Exception as exc:
-            self._log_error("get_registers", exc)
-            raise WinDbgBridgeError("get_registers", str(exc)) from exc
+        except Exception:
+            # Fall back to parsing 'r' command output (works in local kernel)
+            output = self.execute_command("r")
+            return WinDbgOutputParser.parse_registers(output)
 
     def read_memory(self, address: str, size: int) -> bytes:
         """Read raw bytes from the target address space."""
@@ -283,11 +278,6 @@ class WinDbgBridge(Debugger):
     def get_current_location(self) -> dict[str, Any]:
         """Return instruction pointer, disassembly, and module info."""
         self._require_connected()
-
-        # Local kernel mode: registers aren't accessible via pybag COM
-        if self._is_local_kernel:
-            return {"address": "N/A", "note": "local kernel mode (registers not accessible)"}
-
         try:
             rip = self._dbg.reg.rip
             location: dict[str, Any] = {"address": f"{rip:x}"}
@@ -300,9 +290,13 @@ class WinDbgBridge(Debugger):
             except Exception:
                 pass
             return location
-        except Exception as exc:
-            self._log_error("get_current_location", exc)
-            raise WinDbgBridgeError("get_current_location", str(exc)) from exc
+        except Exception:
+            # Local kernel / limited access: try pc() or return minimal info
+            try:
+                pc = self._dbg.pc()
+                return {"address": f"{pc:x}"}
+            except Exception:
+                return {"address": "unavailable", "note": "register access limited in this mode"}
 
     # ------------------------------------------------------------------
     # Kernel-specific methods
@@ -370,24 +364,19 @@ class WinDbgBridge(Debugger):
     def execute_command(self, command: str) -> str:
         """Execute a raw debugger command and return text output.
 
-        Uses Pybag's exec_command when connected, otherwise falls back to CDB.
-        Local kernel connections always use CDB since pybag's local mode
-        does not support exec_command.
+        Uses Pybag's cmd() method when connected (which wraps
+        IDebugControl::Execute), falling back to a CDB subprocess.
 
         Args:
             command: WinDbg command string (e.g. "lm", "!process 0 0").
         """
-        # Local kernel mode: pybag doesn't support exec_command, use CDB
-        if self._is_local_kernel:
-            return self._execute_cdb_command(command)
-
         if self._dbg is not None:
             try:
-                return str(self._dbg.exec_command(command))
+                # Pybag uses cmd() not exec_command() for command execution
+                return str(self._dbg.cmd(command))
             except Exception as exc:
-                # Fall back to CDB if pybag exec_command fails
                 logger.warning(
-                    "Pybag exec_command failed for '%s', falling back to CDB: %s",
+                    "Pybag cmd() failed for '%s', falling back to CDB: %s",
                     command, exc,
                 )
                 return self._execute_cdb_command(command)
@@ -444,8 +433,27 @@ class WinDbgBridge(Debugger):
         return IOCTLCode.decode(code)
 
     def get_loaded_drivers(self) -> list[dict[str, str]]:
-        """List all loaded kernel modules via 'lm k'."""
+        """List all loaded kernel modules."""
         self._require_connected()
+
+        # Try pybag's native module_list() first (works without CDB)
+        if self._dbg is not None:
+            try:
+                modules = self._dbg.module_list()
+                result = []
+                for name_tuple, params in modules:
+                    mod_name = name_tuple[0] if isinstance(name_tuple, tuple) else str(name_tuple)
+                    result.append({
+                        "name": mod_name,
+                        "base": f"{params.Base:x}",
+                        "size": f"{params.Size:x}",
+                        "end": f"{params.Base + params.Size:x}",
+                    })
+                return result
+            except Exception as exc:
+                logger.warning("Pybag module_list() failed, falling back to lm: %s", exc)
+
+        # Fallback: parse 'lm k' command output
         output = self.execute_command("lm k")
         return WinDbgOutputParser.parse_modules(output)
 

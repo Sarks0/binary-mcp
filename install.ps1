@@ -742,13 +742,29 @@ function Install-WinDbg {
     } else {
         $installed = $false
 
-        # Method 1: Try winget (installs WinDbg Preview - includes cdb.exe, kd.exe)
-        if (Test-WingetAvailable) {
-            Write-Info "Installing WinDbg via winget (winget install Microsoft.WinDbg)..."
-            $installed = Install-WithWinget -PackageId "Microsoft.WinDbg" -PackageName "WinDbg"
+        # Method 1: Windows SDK via winget (includes cdb.exe, kd.exe, windbg.exe)
+        if (-not $installed -and (Test-WingetAvailable)) {
+            Write-Info "Installing Windows SDK Debugging Tools via winget..."
+            $installed = Install-WithWinget -PackageId "Microsoft.WindowsSDK.10.0.26100" -PackageName "Windows SDK"
+
+            # Set default path for SDK debuggers
+            if ($installed) {
+                $sdkPath = "${env:ProgramFiles(x86)}\Windows Kits\10\Debuggers\x64"
+                if (Test-Path "$sdkPath\cdb.exe") {
+                    [System.Environment]::SetEnvironmentVariable("WINDBG_PATH", $sdkPath, "User")
+                    $env:WINDBG_PATH = $sdkPath
+                    Write-Success "CDB found at: $sdkPath"
+                }
+            }
         }
 
-        # Method 2: Download Windows SDK installer and install just the debuggers
+        # Method 2: WinDbg Preview via winget (modern UI, may not include standalone cdb.exe)
+        if (-not $installed -and (Test-WingetAvailable)) {
+            Write-Info "Trying WinDbg Preview via winget..."
+            $installed = Install-WithWinget -PackageId "Microsoft.WinDbg" -PackageName "WinDbg Preview"
+        }
+
+        # Method 3: Download Windows SDK installer and install just the debuggers
         if (-not $installed) {
             Write-Info "Attempting Windows SDK Debugging Tools standalone install..."
             try {
@@ -773,10 +789,10 @@ function Install-WinDbg {
         if (-not $installed) {
             Write-Err "Could not install WinDbg automatically"
             Write-Info "Manual installation options:"
-            Write-Info "  1. winget install Microsoft.WinDbg"
-            Write-Info "  2. Download Windows SDK: https://developer.microsoft.com/en-us/windows/downloads/windows-sdk/"
+            Write-Info "  1. winget install Microsoft.WindowsSDK.10.0.26100"
+            Write-Info "  2. winget install Microsoft.WinDbg"
+            Write-Info "  3. Download Windows SDK: https://developer.microsoft.com/en-us/windows/downloads/windows-sdk/"
             Write-Info "     Select 'Debugging Tools for Windows' during installation"
-            Write-Info "  3. Microsoft Store: search 'WinDbg Preview'"
             return $false
         }
 

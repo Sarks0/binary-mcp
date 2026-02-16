@@ -212,7 +212,7 @@ class TestExtensionCommands:
     def test_execute_command_via_pybag(self):
         bridge = WinDbgBridge()
         bridge._dbg = MagicMock()
-        bridge._dbg.exec_command.return_value = "test output"
+        bridge._dbg.cmd.return_value = "test output"
         bridge._state = DebuggerState.PAUSED
 
         result = bridge.execute_command("lm")
@@ -261,7 +261,7 @@ class TestKernelSpecificMethods:
         return b
 
     def test_get_driver_object(self, bridge):
-        bridge._dbg.exec_command.return_value = (
+        bridge._dbg.cmd.return_value = (
             "Driver object (fffff800`12340000) is for:\n"
             " \\Driver\\Test\n"
             "Device Object list:\n"
@@ -273,20 +273,24 @@ class TestKernelSpecificMethods:
         assert "Test" in driver.name
 
     def test_get_driver_object_not_found(self, bridge):
-        bridge._dbg.exec_command.return_value = "Could not find \\Driver\\Nonexistent"
+        bridge._dbg.cmd.return_value = "Could not find \\Driver\\Nonexistent"
         with pytest.raises(Exception):
             bridge.get_driver_object("\\Driver\\Nonexistent")
 
     def test_get_loaded_drivers(self, bridge):
-        bridge._dbg.exec_command.return_value = (
-            "fffff800`12340000 fffff800`12350000   nt (pdb symbols)\n"
-        )
+        # Mock module_list() for native pybag path
+        mock_params = MagicMock()
+        mock_params.Base = 0xFFFFF80012340000
+        mock_params.Size = 0x10000
+        bridge._dbg.module_list.return_value = [
+            (("nt",), mock_params),
+        ]
         mods = bridge.get_loaded_drivers()
         assert len(mods) == 1
         assert mods[0]["name"] == "nt"
 
     def test_get_processes(self, bridge):
-        bridge._dbg.exec_command.return_value = (
+        bridge._dbg.cmd.return_value = (
             "PROCESS fffff800`12340000\n"
             "    SessionId: 0  Cid: 0004    Peb: 00000000  ParentCid: 0000\n"
             "    Image: System\n"
@@ -296,7 +300,7 @@ class TestKernelSpecificMethods:
         assert procs[0]["image"] == "System"
 
     def test_analyze_crash(self, bridge):
-        bridge._dbg.exec_command.return_value = (
+        bridge._dbg.cmd.return_value = (
             "BugCheck 50 {0, 0, 0, 0}\n"
             "BUGCHECK_STR: PAGE_FAULT\n"
             "MODULE_NAME: test\n"

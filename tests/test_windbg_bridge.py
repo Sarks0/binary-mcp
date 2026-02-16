@@ -120,6 +120,11 @@ class TestConnectWithMockedPybag:
     @patch("src.engines.dynamic.windbg.bridge.pybag")
     def test_connect_kernel_local(self, mock_pybag, mock_sys):
         mock_kd = MagicMock()
+        # Validation: module_list returns data so validation passes
+        mock_params = MagicMock()
+        mock_params.Base = 0xFFFFF80000000000
+        mock_params.Size = 0x10000
+        mock_kd.module_list.return_value = [(("nt",), mock_params)]
         mock_pybag.KernelDbg.return_value = mock_kd
 
         bridge = WinDbgBridge()
@@ -128,6 +133,23 @@ class TestConnectWithMockedPybag:
         assert bridge._mode == WinDbgMode.KERNEL_MODE
         assert bridge._is_local_kernel is True
         mock_kd.attach.assert_called_once_with("local")
+
+    @patch("src.engines.dynamic.windbg.bridge.platform.system", return_value="Windows")
+    @patch("src.engines.dynamic.windbg.bridge.PYBAG_AVAILABLE", True)
+    @patch("src.engines.dynamic.windbg.bridge.pybag")
+    def test_connect_kernel_local_not_enabled(self, mock_pybag, mock_sys):
+        """connect_kernel_local() raises when kernel debugging is not enabled."""
+        mock_kd = MagicMock()
+        # Validation: module_list empty AND get_pc fails → not enabled
+        mock_kd.module_list.return_value = []
+        mock_kd.reg.get_pc.side_effect = RuntimeError("no session")
+        mock_pybag.KernelDbg.return_value = mock_kd
+
+        bridge = WinDbgBridge()
+        with pytest.raises(WinDbgBridgeError) as exc_info:
+            bridge.connect_kernel_local()
+        assert "bcdedit" in exc_info.value.message.lower()
+        assert bridge._dbg is None  # Cleaned up
 
 
 class TestABCMethodsWithMockedPybag:
@@ -371,6 +393,25 @@ class TestExtensionCommands:
             bridge.execute_extension("!analyze -v")
         assert "timed out" in exc_info.value.message.lower()
 
+    @patch("src.engines.dynamic.windbg.bridge.subprocess.run")
+    def test_execute_cdb_detects_kernel_not_enabled(self, mock_run):
+        """CDB output containing 'does not support local kernel debugging' raises."""
+        mock_run.return_value = MagicMock(
+            stdout=(
+                "Microsoft (R) Windows Debugger\n"
+                "The system does not support local kernel debugging.\n"
+                "Debuggee initialization failed, HRESULT 0x80004001\n"
+            ),
+            stderr="",
+            returncode=1,
+        )
+        bridge = WinDbgBridge()
+        bridge._cdb_path = Path("C:\\cdb.exe")
+
+        with pytest.raises(WinDbgBridgeError) as exc_info:
+            bridge.execute_extension("lm")
+        assert "bcdedit" in exc_info.value.message.lower()
+
 
 class TestCDBBannerFilter:
     """Test CDB/KD output banner filtering."""
@@ -395,6 +436,46 @@ class TestCDBBannerFilter:
         assert "More output" in result
         assert "quit:" not in result
 
+    def test_filters_extensions_gallery_noise(self):
+        """Modern WinDbg emits Extensions Gallery setup before the banner."""
+        output = (
+            "************* Preparing the environment for Debugger Extensions Gallery "
+            "repositories **************\n"
+            "   ExtensionRepository : Implicit\n"
+            "   UseExperimentalFeatureForNugetShare : true\n"
+            "   AllowNugetExeUpdate : true\n"
+            "   NonInteractiveNuget : true\n"
+            "   AllowParallelInitializationOfLocalRepositories : true\n"
+            "\n"
+            "   EnableRedirectToV8JsProvider : false\n"
+            "\n"
+            "   -- Configuring repositories\n"
+            "      ----> Repository : LocalInstalled, Enabled: true\n"
+            "      ----> Repository : UserExtensions, Enabled: true\n"
+            "\n"
+            ">>>>>>>>>>>>> Preparing the environment completed, duration 0.000 seconds\n"
+            "\n"
+            "************* Waiting for Debugger Extensions Gallery to Initialize **************\n"
+            "\n"
+            ">>>>>>>>>>>>> Waiting completed, duration 0.015 seconds\n"
+            "   ----> Repository : UserExtensions, Enabled: true, Packages count: 0\n"
+            "   ----> Repository : LocalInstalled, Enabled: true, Packages count: 29\n"
+            "\n"
+            "Microsoft (R) Windows Debugger Version 10.0.26100.4188 AMD64\n"
+            "Copyright (c) Microsoft Corporation. All rights reserved.\n"
+            "\n"
+            "start             end                 module name\n"
+            "fffff800`12340000 fffff800`12350000   nt\n"
+            "quit:\n"
+        )
+        result = WinDbgBridge._filter_cdb_banner(output)
+        assert "Extensions Gallery" not in result
+        assert "ExtensionRepository" not in result
+        assert "Repository" not in result
+        assert "Microsoft" not in result
+        assert "module name" in result
+        assert "nt" in result
+
     def test_empty_output(self):
         assert WinDbgBridge._filter_cdb_banner("") == ""
 
@@ -403,6 +484,29 @@ class TestCDBBannerFilter:
         result = WinDbgBridge._filter_cdb_banner(output)
         assert "Module list:" in result
         assert "nt" in result
+
+
+class TestCDBErrorDetection:
+    """Test _check_cdb_error() error pattern matching."""
+
+    def test_detects_kernel_not_enabled(self):
+        output = (
+            "The system does not support local kernel debugging.\n"
+            "Debuggee initialization failed, HRESULT 0x80004001\n"
+        )
+        msg = WinDbgBridge._check_cdb_error(output)
+        assert msg is not None
+        assert "bcdedit" in msg.lower()
+
+    def test_detects_admin_required(self):
+        output = "Local kernel debugging requires Administrative privileges.\n"
+        msg = WinDbgBridge._check_cdb_error(output)
+        assert msg is not None
+        assert "Administrator" in msg
+
+    def test_no_error_returns_none(self):
+        output = "start  end  module name\nnt  fffff800`12340000\n"
+        assert WinDbgBridge._check_cdb_error(output) is None
 
 
 class TestKernelSpecificMethods:

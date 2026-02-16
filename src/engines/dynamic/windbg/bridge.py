@@ -351,20 +351,56 @@ class WinDbgBridge(Debugger):
             raise StructuredBaseError(structured) from exc
 
     def connect_kernel_local(self) -> bool:
-        """Attach to the local kernel in read-only mode."""
+        """Attach to the local kernel in read-only mode.
+
+        Pybag's KernelDbg.attach("local") may silently succeed even
+        when kernel debugging is not enabled (bcdedit -debug on).  We
+        validate the session by attempting to read the module list or
+        program counter immediately after connecting.
+        """
         self._require_windows()
         self._require_pybag()
+        enable_hint = (
+            "Local kernel debugging is not enabled or not running as Administrator.\n"
+            "To enable:\n"
+            "  1. Run elevated: bcdedit -debug on\n"
+            "  2. Reboot\n"
+            "  3. Run this tool as Administrator"
+        )
         try:
             self._dbg = pybag.KernelDbg()
             self._dbg.attach("local")
+
+            # --- Validate the session is actually usable ---
+            # Pybag may accept attach("local") without error even when
+            # kernel debugging is disabled.  Try lightweight operations
+            # to verify the connection before reporting success.
+            try:
+                modules = self._dbg.module_list()
+                if not modules:
+                    # module_list() returned empty — try the PC register
+                    self._dbg.reg.get_pc()
+            except Exception:
+                # Session is invalid — clean up and report clearly
+                try:
+                    self._dbg.detach()
+                except Exception:
+                    pass
+                self._dbg = None
+                raise WinDbgBridgeError("connect_kernel_local", enable_hint)
+
             self._mode = WinDbgMode.KERNEL_MODE
             self._state = DebuggerState.PAUSED
             self._is_local_kernel = True
             logger.info("Connected to local kernel (read-only)")
             return True
+        except WinDbgBridgeError:
+            raise
         except Exception as exc:
             self._log_error("connect_kernel_local", exc)
-            structured = create_kernel_not_connected_error(str(exc))
+            structured = create_kernel_not_connected_error(
+                f"{exc}\n\n{enable_hint}"
+            )
             raise StructuredBaseError(structured) from exc
 
     def open_dump(self, dump_path: Path) -> bool:
@@ -652,6 +688,10 @@ class WinDbgBridge(Debugger):
                     "CDB/KD exited with code %d for: %s",
                     result.returncode, command,
                 )
+            # Check for fatal errors BEFORE filtering the banner
+            error_msg = self._check_cdb_error(result.stdout)
+            if error_msg:
+                raise WinDbgBridgeError("execute_cdb_command", error_msg)
             return self._filter_cdb_banner(result.stdout)
         except subprocess.TimeoutExpired as exc:
             self._log_error("cdb_command", exc)
@@ -665,44 +705,86 @@ class WinDbgBridge(Debugger):
 
     @staticmethod
     def _filter_cdb_banner(output: str) -> str:
-        """Strip CDB/KD startup banner lines from command output.
+        """Strip CDB/KD startup banner and Extensions Gallery noise.
 
-        The banner typically contains copyright lines and the prompt.
-        We look for the first line starting with a known command prompt
-        pattern or the actual output.
+        Modern WinDbg/KD emits a large block of Debugger Extensions Gallery
+        setup text before the actual banner.  We filter all known noise
+        patterns and also detect fatal errors (e.g. kernel debugging not
+        enabled) so they surface cleanly.
         """
         if not output:
             return output
 
         lines = output.splitlines()
         filtered: list[str] = []
-        banner_done = False
+
+        # Patterns that are always noise (anywhere in output)
+        noise_prefixes = (
+            "Microsoft (R)",
+            "Copyright",
+            "Loading",
+            "Opened log file",
+            "CommandLine:",
+            "Symbol search path",
+            "Executable search path",
+            "Windows ",
+            "Kernel Debugger",
+            # Extensions Gallery noise
+            "*",             # ******* Preparing ...
+            ">",             # >>>>>>>>> ... completed
+            "ExtensionRepository",
+            "UseExperimental",
+            "AllowNuget",
+            "NonInteractive",
+            "AllowParallel",
+            "EnableRedirect",
+            "----> Repository",
+            "-- Configuring",
+        )
 
         for line in lines:
-            if not banner_done:
-                # Skip typical banner lines
-                stripped = line.strip()
-                if (
-                    stripped.startswith("Microsoft (R)")
-                    or stripped.startswith("Copyright")
-                    or stripped.startswith("Loading")
-                    or stripped.startswith("Opened log file")
-                    or stripped == ""
-                    or stripped.startswith("CommandLine:")
-                    or stripped.startswith("Symbol search path")
-                    or stripped.startswith("Executable search path")
-                    or stripped.startswith("Windows ")
-                    or stripped.startswith("Kernel Debugger")
-                    or "dbgeng" in stripped.lower()
-                ):
-                    continue
-                banner_done = True
-            # Skip the quit command echo at the end
-            if line.strip() == "quit:" or line.strip() == "q":
+            stripped = line.strip()
+            # Skip empty lines, quit echo, and known noise
+            if (
+                stripped == ""
+                or stripped in ("quit:", "q")
+                or "dbgeng" in stripped.lower()
+                or "Debugger Extensions Gallery" in stripped
+                or any(stripped.startswith(p) for p in noise_prefixes)
+            ):
                 continue
             filtered.append(line)
 
         return "\n".join(filtered)
+
+    @staticmethod
+    def _check_cdb_error(output: str) -> str | None:
+        """Detect fatal errors in CDB/KD output and return a user-friendly message.
+
+        Returns None if no fatal error is detected, otherwise a clean error string.
+        """
+        error_patterns = {
+            "does not support local kernel debugging": (
+                "Local kernel debugging is not enabled on this system.\n"
+                "To enable:\n"
+                "  1. Run elevated: bcdedit -debug on\n"
+                "  2. Reboot\n"
+                "  3. Run as Administrator"
+            ),
+            "Debuggee initialization failed": (
+                "Debugger initialization failed. The target may not be "
+                "accessible or kernel debugging is not configured."
+            ),
+            "requires Administrative privileges": (
+                "This operation requires Administrator privileges.\n"
+                "Run the MCP server in an elevated terminal."
+            ),
+        }
+        lower = output.lower()
+        for pattern, message in error_patterns.items():
+            if pattern.lower() in lower:
+                return message
+        return None
 
     def _require_windows(self) -> None:
         """Raise if not running on Windows."""

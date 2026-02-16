@@ -60,6 +60,7 @@ name = "binary-mcp"
 version = "0.2.0"
 source = { editable = "." }
 dependencies = [
+    { name = "capstone" },
     { name = "fastmcp" },
     { name = "mcp", extra = ["cli"] },
     { name = "pefile" },
@@ -74,15 +75,20 @@ dev = [
     { name = "pytest-cov" },
     { name = "ruff" },
 ]
+windbg = [
+    { name = "pybag", marker = "sys_platform == 'win32'" },
+]
 yara = [
     { name = "yara-python" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "capstone", specifier = ">=5.0.0" },
     { name = "fastmcp", specifier = ">=0.2.0" },
     { name = "mcp", extras = ["cli"], specifier = ">=1.6.0" },
     { name = "pefile", specifier = ">=2023.2.7" },
+    { name = "pybag", marker = "sys_platform == 'win32' and extra == 'windbg'", specifier = ">=2.2.0" },
     { name = "pyelftools", specifier = ">=0.31" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23.0" },
@@ -91,7 +97,7 @@ requires-dist = [
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.3.0" },
     { name = "yara-python", marker = "extra == 'yara'", specifier = ">=4.5.0" },
 ]
-provides-extras = ["yara", "dev"]
+provides-extras = ["yara", "windbg", "dev"]
 
 [[package]]
 name = "cachetools"
@@ -100,6 +106,24 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/cc/7e/b975b5814bd36faf009faebe22c1072a1fa1168db34d285ef0ba071ad78c/cachetools-6.2.1.tar.gz", hash = "sha256:3f391e4bd8f8bf0931169baf7456cc822705f4e2a31f840d218f445b9a854201", size = 31325, upload-time = "2025-10-12T14:55:30.139Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/96/c5/1e741d26306c42e2bf6ab740b2202872727e0f606033c9dd713f8b93f5a8/cachetools-6.2.1-py3-none-any.whl", hash = "sha256:09868944b6dde876dfd44e1d47e18484541eaf12f26f29b7af91b26cc892d701", size = 11280, upload-time = "2025-10-12T14:55:28.382Z" },
+]
+
+[[package]]
+name = "capstone"
+version = "5.0.7"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/dd/9c/28b11f64e2425774efb21c206a6e952cfce6e3e2ef3e4b63cdae32ccd8a5/capstone-5.0.7.tar.gz", hash = "sha256:796bdd69b05fa124fc2aa2e74b9a0b3d4c4e7f3e02add5e583cf2f3bca282ede", size = 2945245, upload-time = "2026-02-09T22:51:56.392Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b2/91/98fdb020106469d2354920ffb989507f8c494d847eb9135202a0b20afe8d/capstone-5.0.7-py3-none-macosx_10_9_universal2.whl", hash = "sha256:388af4ddb9224d3b4f9269673ee575b3f94f77774d48b3f1a283ad13c29a106a", size = 2192836, upload-time = "2026-02-09T22:51:42.782Z" },
+    { url = "https://files.pythonhosted.org/packages/b7/6c/f02847b3385651eb00a6a27049bd12982cdd61e981b248e7f0dc8ed15756/capstone-5.0.7-py3-none-macosx_10_9_x86_64.whl", hash = "sha256:a9f64e3d75d8c4d7b3d26bba153b2992aadcf6b8d57674b4ef176b4ecdd9822f", size = 1188995, upload-time = "2026-02-09T22:51:44.653Z" },
+    { url = "https://files.pythonhosted.org/packages/8f/43/29cd1dbdb2b55bf339bca36444809503b8311dcc04898726a7e35b47ac86/capstone-5.0.7-py3-none-macosx_11_0_arm64.whl", hash = "sha256:acb89f5bf6f625745a104a3a44819d3acea173228055c1eadc60d2282ae490bb", size = 1200084, upload-time = "2026-02-09T22:51:45.668Z" },
+    { url = "https://files.pythonhosted.org/packages/7d/32/084419edcd9a3efaadf5c22166de625090fae833aad0672ddd9fa436d1e2/capstone-5.0.7-py3-none-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:c58546c814567c95e4b9a63bdb8624c960cb8508855c7c767d5f108d7bc09ce2", size = 1458867, upload-time = "2026-02-09T22:51:46.8Z" },
+    { url = "https://files.pythonhosted.org/packages/15/3e/3a4f45dd4eda6fc8051f76bf3ed50ead6040d827000371211fbaaf057625/capstone-5.0.7-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:b809a9654844ce0d35099121a851ddd2ab2689df1ff6687037babcedcaae6391", size = 1482184, upload-time = "2026-02-09T22:51:48.467Z" },
+    { url = "https://files.pythonhosted.org/packages/4b/a8/6b4df60c822aaeb42954ea6c9fdbf3410feaa6bea6dc3f18f6c363fd1ed2/capstone-5.0.7-py3-none-manylinux_2_5_i686.manylinux1_i686.manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:80b0f1b93fc703c419fda8cf84cfa017fd8909be62a4e88024273126ab16f006", size = 1481169, upload-time = "2026-02-09T22:51:49.574Z" },
+    { url = "https://files.pythonhosted.org/packages/05/24/4162bbc2591091dfa6c161b4a9ef1a6eccb739c20798e58f59f917a8a3d1/capstone-5.0.7-py3-none-musllinux_1_2_aarch64.whl", hash = "sha256:467716e6555d50cb3526b290f0dbdccb5f961839b1f1e299b484fb5d814173e6", size = 1457760, upload-time = "2026-02-09T22:51:50.863Z" },
+    { url = "https://files.pythonhosted.org/packages/e1/51/e3913f53ed03a8f7311b1efacbc1052811e129baa37b4f14e79da3cbc0c6/capstone-5.0.7-py3-none-musllinux_1_2_i686.whl", hash = "sha256:e551311d4b6dc344fe5518ef6decf4c2dfafe37bba9ad027a53a406930bc5c63", size = 1484528, upload-time = "2026-02-09T22:51:52.483Z" },
+    { url = "https://files.pythonhosted.org/packages/0b/98/a7d631f7bca9de02357637cfab1fb90a67992905f2041357ac5732c8a4cd/capstone-5.0.7-py3-none-musllinux_1_2_x86_64.whl", hash = "sha256:a13437b28b136c886600e88bee192d25adf56ba1db5597ff5a0bec758bb9c533", size = 1486041, upload-time = "2026-02-09T22:51:53.729Z" },
+    { url = "https://files.pythonhosted.org/packages/70/39/2138d890a8e827636b9de9924fbc8527fe83e38b6d26605b30ac55e30ebe/capstone-5.0.7-py3-none-win_amd64.whl", hash = "sha256:4ab8bcb7da8f221ff45926ca168ca33e76f7237d06fbf3c10780002faa2670e1", size = 1272204, upload-time = "2026-02-09T22:51:54.829Z" },
 ]
 
 [[package]]
@@ -244,6 +268,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/d8/53/6f443c9a4a8358a93a6792e2acffb9d9d5cb0a5cfd8802644b7b1c9a02e4/colorama-0.4.6.tar.gz", hash = "sha256:08695f5cb7ed6e0531a20572697297273c47b8cae5a63ffc6d6ed5c201be6e44", size = 27697, upload-time = "2022-10-25T02:36:22.414Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/d1/d6/3965ed04c63042e047cb6a3e6ed1a63a35087b6a609aa3a15ed8ac56c221/colorama-0.4.6-py2.py3-none-any.whl", hash = "sha256:4f1d9991f5acc0ca119f9d443620b77f9d6b33703e51011c16baf57afb285fc6", size = 25335, upload-time = "2022-10-25T02:36:20.889Z" },
+]
+
+[[package]]
+name = "comtypes"
+version = "1.4.15"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/08/a2/2db93b226887c9a9a354cb39269507213e171fca5be32aeef21b47f14aeb/comtypes-1.4.15.tar.gz", hash = "sha256:c72b9968a4e920087183a364c5a13b174e02b11c302cdd92690d14c95ac1b312", size = 241406, upload-time = "2026-01-19T23:45:46.035Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/03/2f/ca9029d5da14b5a3a103d6061149a4a94a54ab848f56c7d2809dbb36f48c/comtypes-1.4.15-py3-none-any.whl", hash = "sha256:cda90486de8762ec57d7ce04e68721920911f3f03415cb29afdf7609c427c7e3", size = 274650, upload-time = "2026-01-19T23:45:44.34Z" },
 ]
 
 [[package]]
@@ -802,6 +835,21 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/26/79/05a1f9280cfa0709479319cbfd2b1c5beb23d5034624f548c83fb65b0b61/py_key_value_shared-0.2.8.tar.gz", hash = "sha256:703b4d3c61af124f0d528ba85995c3c8d78f8bd3d2b217377bd3278598070cc1", size = 8216, upload-time = "2025-10-24T13:31:03.601Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/84/7a/1726ceaa3343874f322dd83c9ec376ad81f533df8422b8b1e1233a59f8ce/py_key_value_shared-0.2.8-py3-none-any.whl", hash = "sha256:aff1bbfd46d065b2d67897d298642e80e5349eae588c6d11b48452b46b8d46ba", size = 14586, upload-time = "2025-10-24T13:31:02.838Z" },
+]
+
+[[package]]
+name = "pybag"
+version = "2.2.16"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "capstone" },
+    { name = "comtypes" },
+    { name = "pywin32" },
+    { name = "win32more" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/e1/84/1053510186c0f9a37daad1287194c1b57167590fb065f33ed2d481db58e3/pybag-2.2.16.tar.gz", hash = "sha256:64066f4e5c6581fa9cf778d8e6cf5ce33d3f431961557365c465905ca79b2966", size = 152913, upload-time = "2025-06-26T02:24:59.073Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/5e/a2/52084698c0a3c7e7a94ddfff26f83df09a50781b8436f6f203f5de0a457c/pybag-2.2.16-py3-none-any.whl", hash = "sha256:cef631e87d0bb12163c8cb11ca756ddfa8924a6eacdbd746683ed58948a2bfdf", size = 158949, upload-time = "2025-06-26T02:24:58.091Z" },
 ]
 
 [[package]]
@@ -1378,6 +1426,107 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/86/eb/20b6cdf273913d0ad05a6a14aed4b9a85591c18a987a3d47f20fa13dcc47/websockets-15.0.1-cp313-cp313-win32.whl", hash = "sha256:ba9e56e8ceeeedb2e080147ba85ffcd5cd0711b89576b83784d8605a7df455fa", size = 176393, upload-time = "2025-03-05T20:02:53.814Z" },
     { url = "https://files.pythonhosted.org/packages/1b/6c/c65773d6cab416a64d191d6ee8a8b1c68a09970ea6909d16965d26bfed1e/websockets-15.0.1-cp313-cp313-win_amd64.whl", hash = "sha256:e09473f095a819042ecb2ab9465aee615bd9c2028e4ef7d933600a8401c79561", size = 176837, upload-time = "2025-03-05T20:02:55.237Z" },
     { url = "https://files.pythonhosted.org/packages/fa/a8/5b41e0da817d64113292ab1f8247140aac61cbf6cfd085d6a0fa77f4984f/websockets-15.0.1-py3-none-any.whl", hash = "sha256:f7a866fbc1e97b5c617ee4116daaa09b722101d4a3c170c787450ba409f9736f", size = 169743, upload-time = "2025-03-05T20:03:39.41Z" },
+]
+
+[[package]]
+name = "win32more"
+version = "0.8.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "win32more-appsdk" },
+    { name = "win32more-core" },
+    { name = "win32more-microsoft-graphics-win2d" },
+    { name = "win32more-microsoft-web-webview2" },
+    { name = "win32more-microsoft-windows-sdk-contracts" },
+    { name = "win32more-microsoft-windows-sdk-win32metadata" },
+    { name = "win32more-microsoft-windowsappsdk" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/75/01/428ea2da9f39b533fdb3705173b4436a83de466242989b3dbedb319beeee/win32more-0.8.0.tar.gz", hash = "sha256:793f19ba9777bdb4f5de36c16702a4f8d340539f466feca7bc247863007de9d6", size = 4837, upload-time = "2025-12-16T12:55:45.314Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/cb/13/9e835fba47b95fb14a9e7b9038f5a30cbe089d19781cbd1c3df3cf97d0f2/win32more-0.8.0-py3-none-any.whl", hash = "sha256:d5a188b5280442b813266a1346761fa880e2250bdd93532dc07751515b21ae9d", size = 3671, upload-time = "2025-12-16T12:55:44.149Z" },
+]
+
+[[package]]
+name = "win32more-appsdk"
+version = "0.8.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "win32more-core" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/ee/62/8202755151f8bd4a4597d879474f516732b0b2b6591a21ff9a1fcc1a96e1/win32more_appsdk-0.8.0.tar.gz", hash = "sha256:0bfbd698795d3add19316774e743cf2800835d6d27c6dc26471ebcc614baab45", size = 10827, upload-time = "2025-12-16T12:55:48.649Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/73/29/bbbfda259e93e8702df63fe8e4d9873ee4a4285185f57a34497cda71218a/win32more_appsdk-0.8.0-py2.py3-none-any.whl", hash = "sha256:f6fe556657bb63d9bb0a7febb30e8011c0b7aaaf408afe40751beaf8385401ef", size = 12140, upload-time = "2025-12-16T12:55:47.621Z" },
+]
+
+[[package]]
+name = "win32more-core"
+version = "0.8.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/57/33/eb613b2bab588089ac46d9ff831eecae3165d445299804a1dc9403f52d78/win32more_core-0.8.0.tar.gz", hash = "sha256:04af7281b86f8822be41bd48d4519dcc3445c1f7d0ff9cee29ad386309759585", size = 21598, upload-time = "2025-12-16T12:55:52.998Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/79/55/6433b9f416b5ab669faf3e2ec0d490b5887250a204c9d4dd26a5dc172e21/win32more_core-0.8.0-py2.py3-none-any.whl", hash = "sha256:1718a785af1ffe481771f8a23d555514e2816752ed6d1020b98f8179d8dfc0c1", size = 25849, upload-time = "2025-12-16T12:55:51.301Z" },
+]
+
+[[package]]
+name = "win32more-microsoft-graphics-win2d"
+version = "0.8.1.3.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "win32more-core" },
+    { name = "win32more-microsoft-windowsappsdk" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/b4/1f/fd8fbd8fab6f31e9745734e87abd77b1cdb1090de3d29520eb9f5f6348ff/win32more_microsoft_graphics_win2d-0.8.1.3.2.tar.gz", hash = "sha256:067fe6b8793607f3116924d115162dd7d158b4761edd304f62a4d063c9b4d115", size = 1906474, upload-time = "2025-12-16T12:56:18.945Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/5f/f0/10ec842d00e7e255ac9ae9cbcbe8f2e45e9d7edab83ccdfac4830eaa3214/win32more_microsoft_graphics_win2d-0.8.1.3.2-py2.py3-none-any.whl", hash = "sha256:6f8981ac1e002986a45f7ee1dfeceec375defc353330ca71064bcdb6b5032990", size = 1964022, upload-time = "2025-12-16T12:56:16.834Z" },
+]
+
+[[package]]
+name = "win32more-microsoft-web-webview2"
+version = "0.8.1.0.3719.77"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "win32more-core" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/f2/f3/c520671c3714de457b63bf132c889499cfbc36c44fecaacbf51ebf3a427f/win32more_microsoft_web_webview2-0.8.1.0.3719.77.tar.gz", hash = "sha256:d4e00c3f6d0db5428c1811c0b3c83b4e8d3a24a5311963b3fbecccd8cd0db366", size = 838738, upload-time = "2026-02-07T13:31:03.55Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/fa/be/9908385b79b50fe6035a174fa838d7e30b62604f0e4050d8c4026e684610/win32more_microsoft_web_webview2-0.8.1.0.3719.77-py2.py3-none-any.whl", hash = "sha256:d9d27475ad33b8f7e0cbd456b296621b3e14a914a919761f9dbe8b44f0173143", size = 860823, upload-time = "2026-02-07T13:31:01.668Z" },
+]
+
+[[package]]
+name = "win32more-microsoft-windows-sdk-contracts"
+version = "0.8.10.0.26100.7705"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "win32more-core" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/a3/95/126b9cdbc7787731f98b4c342dd1749b56157bf0abff5caec5f22708dfa4/win32more_microsoft_windows_sdk_contracts-0.8.10.0.26100.7705.tar.gz", hash = "sha256:45877a2108cadf24c7a2731478fb4077f9e3519e58d41e35bd6edf3e964bea60", size = 1637805, upload-time = "2026-02-15T04:37:30.584Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/19/0d/ecd52d6a382f1ac1130e560e84e65b7907b7e5e877debc88f489b8477525/win32more_microsoft_windows_sdk_contracts-0.8.10.0.26100.7705-py2.py3-none-any.whl", hash = "sha256:0902a4fc22e645ad4d6862bb413fe4169a793a4f10fc3beb55a0db1f38675e2e", size = 1807772, upload-time = "2026-02-15T04:37:32.534Z" },
+]
+
+[[package]]
+name = "win32more-microsoft-windows-sdk-win32metadata"
+version = "0.8.69.0.7"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "win32more-core" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/03/ba/6f878d388485279bd261ee24c7be58b1e5ada7811939959b5abda6d5ee0a/win32more_microsoft_windows_sdk_win32metadata-0.8.69.0.7.tar.gz", hash = "sha256:6bd3dc0dcac629e116d82a3f5108550dcb0280a18b76b9b1db2b5af65b1287fb", size = 3881452, upload-time = "2026-01-11T02:39:32.682Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/3f/aa/a2d087d17ff89e746ae21169583a64ec90ebec93f8091326b2430d2b6df0/win32more_microsoft_windows_sdk_win32metadata-0.8.69.0.7-py2.py3-none-any.whl", hash = "sha256:06be05e3d160828bf4b46edc14baeb8e35aacc16d27dafdea7b5179e59f3baec", size = 4026046, upload-time = "2026-01-11T02:39:37.277Z" },
+]
+
+[[package]]
+name = "win32more-microsoft-windowsappsdk"
+version = "0.8.1.8.260209005"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "win32more-core" },
+    { name = "win32more-microsoft-web-webview2" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/af/63/ca74a5617692b576be9df477ba6fb54b0c83b2374c34c8955515c36a3676/win32more_microsoft_windowsappsdk-0.8.1.8.260209005.tar.gz", hash = "sha256:2148dfe0d51ebef8ee1f139f3d5ac4af67e5a4e4a7818f5d54039bbdc23a911a", size = 1157559, upload-time = "2026-02-15T08:10:00.223Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/81/1a/e2e02f7c9f55639367976f3e406d2f2a4dbafb5b0cd3c46bbbea03e7b94d/win32more_microsoft_windowsappsdk-0.8.1.8.260209005-py2.py3-none-any.whl", hash = "sha256:a073a6c21b3e8946ac25a35c6424855aea7bff08c0356d592b235bcfe3d76d05", size = 1214540, upload-time = "2026-02-15T08:09:58.754Z" },
 ]
 
 [[package]]

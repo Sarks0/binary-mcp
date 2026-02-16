@@ -20,6 +20,9 @@ dependencies = [
 yara = [
     "yara-python>=4.5.0",
 ]
+windbg = [
+    "pybag>=2.2.0; sys_platform == 'win32'",
+]
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",

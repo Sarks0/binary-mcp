@@ -65,6 +65,7 @@ samples/a.out
 # Logs
 *.log
 logs/
+errors/
 
 # Temporary files
 *.tmp

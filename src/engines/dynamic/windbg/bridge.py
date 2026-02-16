@@ -8,7 +8,9 @@ COM interfaces, with a CDB subprocess fallback for extension (!) commands.
 from __future__ import annotations
 
 import logging
+import os
 import platform
+import shutil
 import subprocess
 import traceback
 from pathlib import Path
@@ -187,6 +189,7 @@ class WinDbgBridge(Debugger):
     def run(self) -> DebuggerState:
         """Resume execution."""
         self._require_connected()
+        self._require_not_local("run")
         try:
             self._dbg.go()
             self._state = DebuggerState.RUNNING
@@ -198,6 +201,7 @@ class WinDbgBridge(Debugger):
     def pause(self) -> bool:
         """Break into the debugger."""
         self._require_connected()
+        self._require_not_local("pause")
         try:
             self._dbg.break_in()
             self._state = DebuggerState.PAUSED
@@ -209,6 +213,7 @@ class WinDbgBridge(Debugger):
     def step_into(self) -> dict[str, Any]:
         """Single-step into the next instruction."""
         self._require_connected()
+        self._require_not_local("step_into")
         self._require_paused()
         try:
             self._dbg.step_into()
@@ -221,6 +226,7 @@ class WinDbgBridge(Debugger):
     def step_over(self) -> dict[str, Any]:
         """Step over the next instruction."""
         self._require_connected()
+        self._require_not_local("step_over")
         self._require_paused()
         try:
             self._dbg.step_over()
@@ -233,6 +239,12 @@ class WinDbgBridge(Debugger):
     def get_registers(self) -> dict[str, str]:
         """Return current register values as hex strings."""
         self._require_connected()
+
+        # Local kernel mode: pybag COM can't access registers, use CDB
+        if self._is_local_kernel:
+            output = self._execute_cdb_command("r")
+            return WinDbgOutputParser.parse_registers(output)
+
         try:
             regs = self._dbg.regs
             return {name: f"{val:x}" for name, val in regs.items()}
@@ -254,6 +266,7 @@ class WinDbgBridge(Debugger):
     def write_memory(self, address: str, data: bytes) -> bool:
         """Write raw bytes to the target address space."""
         self._require_connected()
+        self._require_not_local("write_memory")
         try:
             addr_int = int(address.replace("`", ""), 16)
             self._dbg.write(addr_int, data)
@@ -270,6 +283,11 @@ class WinDbgBridge(Debugger):
     def get_current_location(self) -> dict[str, Any]:
         """Return instruction pointer, disassembly, and module info."""
         self._require_connected()
+
+        # Local kernel mode: registers aren't accessible via pybag COM
+        if self._is_local_kernel:
+            return {"address": "N/A", "note": "local kernel mode (registers not accessible)"}
+
         try:
             rip = self._dbg.reg.rip
             location: dict[str, Any] = {"address": f"{rip:x}"}
@@ -448,12 +466,56 @@ class WinDbgBridge(Debugger):
 
     @staticmethod
     def _find_cdb() -> Path | None:
-        """Auto-detect cdb.exe from common Windows SDK paths."""
+        """Auto-detect cdb.exe from env vars, SDK paths, Store installs, and PATH."""
+        # 1. WINDBG_PATH environment variable (set by installer)
+        windbg_path = os.environ.get("WINDBG_PATH", "")
+        if windbg_path:
+            cdb = Path(windbg_path) / "cdb.exe"
+            if cdb.is_file():
+                logger.info("Found CDB via WINDBG_PATH: %s", cdb)
+                return cdb
+
+        # 2. Standard Windows SDK paths
         for sdk_dir in _SDK_SEARCH_PATHS:
             cdb = sdk_dir / "cdb.exe"
             if cdb.is_file():
-                logger.info("Found CDB: %s", cdb)
+                logger.info("Found CDB in SDK: %s", cdb)
                 return cdb
+
+        # 3. WinDbg Preview (Microsoft Store / winget) — WindowsApps location
+        try:
+            local_apps = Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "WindowsApps"
+            if local_apps.is_dir():
+                for entry in local_apps.iterdir():
+                    if entry.name.startswith("Microsoft.WinDbg") and entry.is_dir():
+                        for sub in ("amd64", "x64", ""):
+                            cdb = entry / sub / "cdb.exe" if sub else entry / "cdb.exe"
+                            if cdb.is_file():
+                                logger.info("Found CDB in WinDbg Preview: %s", cdb)
+                                return cdb
+        except (OSError, PermissionError):
+            pass
+
+        # 4. Program Files WinDbg Preview install
+        for prog_dir in (
+            os.environ.get("ProgramFiles", r"C:\Program Files"),
+            os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+        ):
+            windbg_preview = Path(prog_dir) / "WinDbg"
+            if windbg_preview.is_dir():
+                for sub in ("amd64", "x64", ""):
+                    cdb = windbg_preview / sub / "cdb.exe" if sub else windbg_preview / "cdb.exe"
+                    if cdb.is_file():
+                        logger.info("Found CDB in WinDbg Preview dir: %s", cdb)
+                        return cdb
+
+        # 5. cdb.exe on system PATH
+        cdb_on_path = shutil.which("cdb")
+        if cdb_on_path:
+            logger.info("Found CDB on PATH: %s", cdb_on_path)
+            return Path(cdb_on_path)
+
+        logger.warning("CDB not found — WinDbg commands will not be available")
         return None
 
     def _execute_cdb_command(self, command: str) -> str:
@@ -524,6 +586,15 @@ class WinDbgBridge(Debugger):
         if self._state != DebuggerState.PAUSED:
             structured = create_debugger_not_paused_error(self._state.value)
             raise StructuredBaseError(structured)
+
+    def _require_not_local(self, operation: str) -> None:
+        """Raise if connected in local kernel read-only mode."""
+        if self._is_local_kernel:
+            raise WinDbgBridgeError(
+                operation,
+                f"'{operation}' is not supported in local kernel read-only mode. "
+                "Use a remote KDNET connection for execution control.",
+            )
 
     def _log_error(
         self,

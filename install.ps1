@@ -797,32 +797,41 @@ function Install-WinDbg {
     $pybagInstalled = $false
 
     # Method 1: Try uv sync --extra windbg (requires windbg extra in pyproject.toml)
+    Push-Location $InstallDir
     try {
-        Push-Location $InstallDir
-        $syncResult = uv sync --extra windbg 2>&1
+        $syncOutput = & uv sync --extra dev --extra windbg 2>&1
         if ($LASTEXITCODE -eq 0) {
             $pybagInstalled = $true
             Write-Success "Pybag installed successfully via uv sync"
+        } else {
+            Write-Warn "uv sync --extra windbg failed (exit $LASTEXITCODE)"
         }
-        Pop-Location
     } catch {
-        Pop-Location
+        Write-Warn "uv sync --extra windbg error: $_"
     }
+    Pop-Location
 
     # Method 2: Fall back to uv pip install if extra is not defined yet
     if (-not $pybagInstalled) {
+        Push-Location $InstallDir
         try {
-            Push-Location $InstallDir
             Write-Info "Falling back to direct pybag install..."
-            uv pip install "pybag>=2.2.16"
-            Pop-Location
-            $pybagInstalled = $true
-            Write-Success "Pybag installed successfully via uv pip"
+            $pipOutput = & uv pip install "pybag>=2.2.16" 2>&1
+            if ($LASTEXITCODE -eq 0) {
+                $pybagInstalled = $true
+                Write-Success "Pybag installed successfully via uv pip"
+            } else {
+                Write-Warn "uv pip install failed (exit code $LASTEXITCODE): $pipOutput"
+            }
         } catch {
-            Pop-Location
             Write-Warn "Failed to install Pybag: $_"
-            Write-Info "You can install it manually: uv pip install pybag"
         }
+        Pop-Location
+    }
+
+    if (-not $pybagInstalled) {
+        Write-Err "Could not install Pybag automatically"
+        Write-Info "Install manually: uv pip install pybag"
     }
 
     return $true

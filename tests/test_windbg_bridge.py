@@ -35,7 +35,7 @@ class TestPlatformGuard:
 
 
 class TestAutoDetectPath:
-    """Test CDB path auto-detection."""
+    """Test CDB and KD path auto-detection."""
 
     @patch("pathlib.Path.is_file", return_value=False)
     def test_no_cdb_found(self, mock_is_file):
@@ -48,12 +48,26 @@ class TestAutoDetectPath:
         assert result is not None
         assert "cdb.exe" in str(result)
 
+    @patch("pathlib.Path.is_file", return_value=False)
+    @patch("shutil.which", return_value=None)
+    def test_no_kd_found(self, mock_which, mock_is_file):
+        result = WinDbgBridge._find_kd()
+        assert result is None
+
+    @patch("pathlib.Path.is_file", return_value=True)
+    def test_kd_found(self, mock_is_file):
+        result = WinDbgBridge._find_kd()
+        assert result is not None
+        assert "kd.exe" in str(result)
+
 
 class TestBridgeInitialization:
     def test_initial_state(self):
         bridge = WinDbgBridge()
         assert bridge.get_state() == DebuggerState.NOT_LOADED
         assert bridge._mode == WinDbgMode.USER_MODE
+        assert bridge._cdb_proc is None
+        assert bridge._breakpoints == {}
 
     def test_disconnect_safe_when_not_connected(self):
         bridge = WinDbgBridge()
@@ -112,6 +126,7 @@ class TestConnectWithMockedPybag:
         result = bridge.connect_kernel_local()
         assert result is True
         assert bridge._mode == WinDbgMode.KERNEL_MODE
+        assert bridge._is_local_kernel is True
         mock_kd.attach.assert_called_once_with("local")
 
 
@@ -148,43 +163,81 @@ class TestABCMethodsWithMockedPybag:
         result = bridge.set_breakpoint("0x401000")
         assert result is True
         bridge._dbg.bp.assert_called_once()
+        assert "0x401000" in bridge._breakpoints
 
     def test_delete_breakpoint(self, bridge):
+        # Set first so we have a tracked BP ID
+        bridge.set_breakpoint("0x401000")
+        bp_id = bridge._breakpoints.get("0x401000")
+        assert bp_id is not None
+
         result = bridge.delete_breakpoint("0x401000")
         assert result is True
-        bridge._dbg.bc.assert_called_once()
+        bridge._dbg.bc.assert_called_once_with(bp_id)
+        assert "0x401000" not in bridge._breakpoints
+
+    def test_delete_breakpoint_fallback(self, bridge):
+        """Delete a BP that wasn't tracked — falls back to command."""
+        result = bridge.delete_breakpoint("0x401000")
+        assert result is True
+        bridge._dbg.cmd.assert_called_once_with("bc 0x401000")
 
     def test_run(self, bridge):
         state = bridge.run()
         assert state == DebuggerState.RUNNING
         bridge._dbg.go.assert_called_once()
 
+    def test_run_blocked_in_dump_mode(self, bridge):
+        bridge._mode = WinDbgMode.DUMP_ANALYSIS
+        with pytest.raises(WinDbgBridgeError) as exc_info:
+            bridge.run()
+        assert "dump analysis" in exc_info.value.message.lower()
+
+    def test_run_blocked_in_local_kernel(self, bridge):
+        bridge._is_local_kernel = True
+        with pytest.raises(WinDbgBridgeError) as exc_info:
+            bridge.run()
+        assert "local kernel" in exc_info.value.message.lower()
+
     def test_pause(self, bridge):
         result = bridge.pause()
         assert result is True
-        bridge._dbg.break_in.assert_called_once()
+        bridge._dbg._control.SetInterrupt.assert_called_once_with(0)
 
     def test_step_into(self, bridge):
         bridge._dbg.reg.rip = 0x401000
-        bridge._dbg.exec_command.return_value = (
+        bridge._dbg.cmd.return_value = (
             "fffff80012340000 4883ec28  sub rsp,28h"
         )
         result = bridge.step_into()
         assert "address" in result
-        bridge._dbg.step_into.assert_called_once()
+        bridge._dbg.stepi.assert_called_once()
 
     def test_step_over(self, bridge):
         bridge._dbg.reg.rip = 0x401000
-        bridge._dbg.exec_command.return_value = ""
+        bridge._dbg.cmd.return_value = ""
         result = bridge.step_over()
         assert "address" in result
-        bridge._dbg.step_over.assert_called_once()
+        bridge._dbg.stepo.assert_called_once()
+
+    def test_step_into_blocked_in_dump(self, bridge):
+        bridge._mode = WinDbgMode.DUMP_ANALYSIS
+        with pytest.raises(WinDbgBridgeError):
+            bridge.step_into()
 
     def test_get_registers(self, bridge):
-        bridge._dbg.regs = {"rax": 1, "rbx": 255}
+        bridge._dbg.reg.register_dict.return_value = {"rax": 1, "rbx": 255}
         regs = bridge.get_registers()
         assert regs["rax"] == "1"
         assert regs["rbx"] == "ff"
+
+    def test_get_registers_fallback(self, bridge):
+        """Fall back to parsing 'r' command when register_dict() fails."""
+        bridge._dbg.reg.register_dict.side_effect = RuntimeError("no access")
+        bridge._dbg.cmd.return_value = "rax=0000000000000001 rbx=00000000000000ff"
+        regs = bridge.get_registers()
+        # Parser should extract at least rax
+        assert "rax" in regs
 
     def test_read_memory(self, bridge):
         bridge._dbg.read.return_value = b"\x90\x90"
@@ -196,14 +249,33 @@ class TestABCMethodsWithMockedPybag:
         assert result is True
         bridge._dbg.write.assert_called_once()
 
+    def test_write_memory_blocked_in_dump(self, bridge):
+        bridge._mode = WinDbgMode.DUMP_ANALYSIS
+        with pytest.raises(WinDbgBridgeError):
+            bridge.write_memory("0x401000", b"\xcc")
+
+    def test_write_memory_blocked_in_local_kernel(self, bridge):
+        bridge._is_local_kernel = True
+        with pytest.raises(WinDbgBridgeError):
+            bridge.write_memory("0x401000", b"\xcc")
+
     def test_get_state(self, bridge):
         assert bridge.get_state() == DebuggerState.PAUSED
 
     def test_get_current_location(self, bridge):
         bridge._dbg.reg.rip = 0xDEADBEEF
-        bridge._dbg.exec_command.return_value = ""
+        bridge._dbg.cmd.return_value = ""
         loc = bridge.get_current_location()
         assert loc["address"] == "deadbeef"
+
+    def test_get_current_location_fallback(self, bridge):
+        """Fall back to reg.get_pc() when reg.rip fails."""
+        type(bridge._dbg.reg).rip = property(
+            lambda self: (_ for _ in ()).throw(AttributeError("no rip"))
+        )
+        bridge._dbg.reg.get_pc.return_value = 0xCAFEBABE
+        loc = bridge.get_current_location()
+        assert loc["address"] == "cafebabe"
 
 
 class TestExtensionCommands:
@@ -220,15 +292,38 @@ class TestExtensionCommands:
 
     @patch("src.engines.dynamic.windbg.bridge.subprocess.run")
     def test_execute_extension_via_cdb(self, mock_run):
-        mock_run.return_value = MagicMock(stdout="extension output", returncode=0)
+        mock_run.return_value = MagicMock(
+            stdout="extension output", stderr="", returncode=0
+        )
 
         bridge = WinDbgBridge()
         bridge._cdb_path = Path("C:\\cdb.exe")
         bridge._binary_path = Path("C:\\dump.dmp")
+        bridge._mode = WinDbgMode.DUMP_ANALYSIS
 
         result = bridge.execute_extension("!analyze -v")
-        assert result == "extension output"
+        assert "extension output" in result
         mock_run.assert_called_once()
+
+    @patch("src.engines.dynamic.windbg.bridge.subprocess.run")
+    def test_execute_extension_local_kernel_uses_kd(self, mock_run):
+        """Local kernel CDB fallback should prefer kd.exe."""
+        mock_run.return_value = MagicMock(
+            stdout="kernel output", stderr="", returncode=0
+        )
+
+        bridge = WinDbgBridge()
+        bridge._kd_path = Path("C:\\kd.exe")
+        bridge._cdb_path = Path("C:\\cdb.exe")
+        bridge._mode = WinDbgMode.KERNEL_MODE
+        bridge._is_local_kernel = True
+
+        result = bridge.execute_extension("lm")
+        assert "kernel output" in result
+        # Should use kd.exe, not cdb.exe
+        call_args = mock_run.call_args[0][0]
+        assert "kd.exe" in call_args[0]
+        assert "-kl" in call_args
 
     def test_execute_extension_no_cdb(self):
         bridge = WinDbgBridge()
@@ -248,6 +343,39 @@ class TestExtensionCommands:
         with pytest.raises(WinDbgBridgeError) as exc_info:
             bridge.execute_extension("!analyze -v")
         assert "timed out" in exc_info.value.message.lower()
+
+
+class TestCDBBannerFilter:
+    """Test CDB/KD output banner filtering."""
+
+    def test_filters_microsoft_banner(self):
+        output = (
+            "Microsoft (R) Windows Debugger Version 10.0.26100.2454 AMD64\n"
+            "Copyright (c) Microsoft Corporation. All rights reserved.\n"
+            "\n"
+            "Loading Dump File [C:\\dump.dmp]\n"
+            "Windows 10 Version 19041 MP (4 procs) Free x64\n"
+            "\n"
+            "Actual command output here\n"
+            "More output\n"
+            "quit:\n"
+        )
+        result = WinDbgBridge._filter_cdb_banner(output)
+        assert "Microsoft" not in result
+        assert "Copyright" not in result
+        assert "Loading Dump" not in result
+        assert "Actual command output here" in result
+        assert "More output" in result
+        assert "quit:" not in result
+
+    def test_empty_output(self):
+        assert WinDbgBridge._filter_cdb_banner("") == ""
+
+    def test_no_banner(self):
+        output = "Module list:\nnt    fffff800`12340000\n"
+        result = WinDbgBridge._filter_cdb_banner(output)
+        assert "Module list:" in result
+        assert "nt" in result
 
 
 class TestKernelSpecificMethods:
@@ -288,6 +416,15 @@ class TestKernelSpecificMethods:
         mods = bridge.get_loaded_drivers()
         assert len(mods) == 1
         assert mods[0]["name"] == "nt"
+        assert mods[0]["start"] == "fffff80012340000"
+        assert mods[0]["end"] == "fffff80012350000"
+
+    def test_get_loaded_drivers_empty_fallback(self, bridge):
+        """Empty module_list() falls through to lm command."""
+        bridge._dbg.module_list.return_value = []
+        bridge._dbg.cmd.return_value = ""
+        mods = bridge.get_loaded_drivers()
+        assert mods == []
 
     def test_get_processes(self, bridge):
         bridge._dbg.cmd.return_value = (
@@ -307,6 +444,25 @@ class TestKernelSpecificMethods:
         )
         crash = bridge.analyze_crash()
         assert crash.bugcheck_code == 0x50
+
+
+class TestDumpAnalysis:
+    """Test dump file opening and mode guards."""
+
+    @patch("src.engines.dynamic.windbg.bridge.platform.system", return_value="Windows")
+    @patch("src.engines.dynamic.windbg.bridge.PYBAG_AVAILABLE", True)
+    @patch("src.engines.dynamic.windbg.bridge.pybag")
+    def test_open_dump_uses_user_dbg(self, mock_pybag, mock_sys):
+        """open_dump() should use UserDbg, not DbgEng (which is a module)."""
+        mock_dbg = MagicMock()
+        mock_pybag.UserDbg.return_value = mock_dbg
+
+        bridge = WinDbgBridge()
+        bridge.open_dump(Path("C:\\dump.dmp"))
+
+        mock_pybag.UserDbg.assert_called_once()
+        mock_dbg.open_dump.assert_called_once_with("C:\\dump.dmp")
+        assert bridge._mode == WinDbgMode.DUMP_ANALYSIS
 
 
 class TestDisconnect:
@@ -340,3 +496,11 @@ class TestDisconnect:
 
         bridge.disconnect()  # Should not raise
         assert bridge._dbg is None
+
+    def test_disconnect_resets_local_kernel_flag(self):
+        bridge = WinDbgBridge()
+        bridge._is_local_kernel = True
+        bridge._mode = WinDbgMode.KERNEL_MODE
+        bridge.disconnect()
+        assert bridge._is_local_kernel is False
+        assert bridge._mode == WinDbgMode.USER_MODE

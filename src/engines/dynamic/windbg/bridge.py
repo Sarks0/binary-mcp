@@ -92,11 +92,14 @@ class WinDbgBridge(Debugger):
         self._state = DebuggerState.NOT_LOADED
         self._dbg: Any = None
         self._is_local_kernel = False
-        self._cdb_path = cdb_path or self._find_cdb()
-        self._cdb_proc: subprocess.Popen[str] | None = None
+        self._kd_path = self._find_kd() if platform.system() == "Windows" else None
+        self._cdb_path = cdb_path or (self._find_cdb() if platform.system() == "Windows" else None)
         self._timeout = timeout
         self._error_logger = WinDbgErrorLogger()
         self._binary_path: Path | None = None
+        self._cdb_proc: subprocess.Popen | None = None
+        self._breakpoint_counter: int = 0
+        self._breakpoints: dict[str, int] = {}  # address -> bp id
 
         logger.info("WinDbgBridge initialized (pybag=%s)", PYBAG_AVAILABLE)
 
@@ -167,20 +170,34 @@ class WinDbgBridge(Debugger):
         self._require_connected()
         try:
             addr_int = int(address.replace("`", ""), 16)
+            bp_id = self._breakpoint_counter
             self._dbg.bp(addr_int)
-            logger.debug("Breakpoint set at %s", address)
+            self._breakpoints[address.replace("`", "").lower()] = bp_id
+            self._breakpoint_counter += 1
+            logger.debug("Breakpoint %d set at %s", bp_id, address)
             return True
         except Exception as exc:
             self._log_error("set_breakpoint", exc, address=address)
             raise WinDbgBridgeError("set_breakpoint", str(exc)) from exc
 
     def delete_breakpoint(self, address: str) -> bool:
-        """Delete the breakpoint at the given address."""
+        """Delete the breakpoint at the given address.
+
+        Pybag's bc() takes a breakpoint ID, not an address.
+        We track the mapping from set_breakpoint(). If the address
+        is not found in our map, we fall back to the 'bc' command.
+        """
         self._require_connected()
         try:
-            addr_int = int(address.replace("`", ""), 16)
-            self._dbg.bc(addr_int)
-            logger.debug("Breakpoint deleted at %s", address)
+            addr_key = address.replace("`", "").lower()
+            bp_id = self._breakpoints.pop(addr_key, None)
+            if bp_id is not None:
+                self._dbg.bc(bp_id)
+                logger.debug("Breakpoint %d deleted at %s", bp_id, address)
+            else:
+                # Fallback: try clearing via command
+                self.execute_command(f"bc {address}")
+                logger.debug("Breakpoint deleted via command at %s", address)
             return True
         except Exception as exc:
             self._log_error("delete_breakpoint", exc, address=address)
@@ -190,6 +207,7 @@ class WinDbgBridge(Debugger):
         """Resume execution."""
         self._require_connected()
         self._require_not_local("run")
+        self._require_not_dump("run")
         try:
             self._dbg.go()
             self._state = DebuggerState.RUNNING
@@ -202,8 +220,10 @@ class WinDbgBridge(Debugger):
         """Break into the debugger."""
         self._require_connected()
         self._require_not_local("pause")
+        self._require_not_dump("pause")
         try:
-            self._dbg.break_in()
+            # Pybag has no break_in() — use the low-level DbgEng COM interface
+            self._dbg._control.SetInterrupt(0)  # DEBUG_INTERRUPT_ACTIVE = 0
             self._state = DebuggerState.PAUSED
             return True
         except Exception as exc:
@@ -214,9 +234,10 @@ class WinDbgBridge(Debugger):
         """Single-step into the next instruction."""
         self._require_connected()
         self._require_not_local("step_into")
+        self._require_not_dump("step_into")
         self._require_paused()
         try:
-            self._dbg.step_into()
+            self._dbg.stepi()
             self._state = DebuggerState.PAUSED
             return self.get_current_location()
         except Exception as exc:
@@ -227,9 +248,10 @@ class WinDbgBridge(Debugger):
         """Step over the next instruction."""
         self._require_connected()
         self._require_not_local("step_over")
+        self._require_not_dump("step_over")
         self._require_paused()
         try:
-            self._dbg.step_over()
+            self._dbg.stepo()
             self._state = DebuggerState.PAUSED
             return self.get_current_location()
         except Exception as exc:
@@ -240,10 +262,10 @@ class WinDbgBridge(Debugger):
         """Return current register values as hex strings."""
         self._require_connected()
         try:
-            regs = self._dbg.regs
-            return {name: f"{val:x}" for name, val in regs.items()}
+            reg_dict = self._dbg.reg.register_dict()
+            return {name: f"{val:x}" for name, val in reg_dict.items()}
         except Exception:
-            # Fall back to parsing 'r' command output (works in local kernel)
+            # Fall back to parsing 'r' command output
             output = self.execute_command("r")
             return WinDbgOutputParser.parse_registers(output)
 
@@ -262,6 +284,7 @@ class WinDbgBridge(Debugger):
         """Write raw bytes to the target address space."""
         self._require_connected()
         self._require_not_local("write_memory")
+        self._require_not_dump("write_memory")
         try:
             addr_int = int(address.replace("`", ""), 16)
             self._dbg.write(addr_int, data)
@@ -291,9 +314,9 @@ class WinDbgBridge(Debugger):
                 pass
             return location
         except Exception:
-            # Local kernel / limited access: try pc() or return minimal info
+            # Local kernel / limited access: try reg.get_pc()
             try:
-                pc = self._dbg.pc()
+                pc = self._dbg.reg.get_pc()
                 return {"address": f"{pc:x}"}
             except Exception:
                 return {"address": "unavailable", "note": "register access limited in this mode"}
@@ -350,7 +373,8 @@ class WinDbgBridge(Debugger):
         self._require_windows()
         self._require_pybag()
         try:
-            self._dbg = pybag.DbgEng()
+            # UserDbg supports dump analysis; DbgEng is a submodule, not a class
+            self._dbg = pybag.UserDbg()
             self._dbg.open_dump(str(dump_path))
             self._binary_path = dump_path
             self._mode = WinDbgMode.DUMP_ANALYSIS
@@ -537,46 +561,137 @@ class WinDbgBridge(Debugger):
         logger.warning("CDB not found — WinDbg commands will not be available")
         return None
 
+    @staticmethod
+    def _find_kd() -> Path | None:
+        """Auto-detect kd.exe for kernel debugging.
+
+        KD.exe is the kernel debugger; it supports -kl (local kernel)
+        natively. It ships alongside cdb.exe in the Windows SDK.
+        """
+        # 1. WINDBG_PATH environment variable
+        windbg_path = os.environ.get("WINDBG_PATH", "")
+        if windbg_path:
+            kd = Path(windbg_path) / "kd.exe"
+            if kd.is_file():
+                logger.info("Found KD via WINDBG_PATH: %s", kd)
+                return kd
+
+        # 2. Standard Windows SDK paths
+        for sdk_dir in _SDK_SEARCH_PATHS:
+            kd = sdk_dir / "kd.exe"
+            if kd.is_file():
+                logger.info("Found KD in SDK: %s", kd)
+                return kd
+
+        # 3. System PATH
+        kd_on_path = shutil.which("kd")
+        if kd_on_path:
+            logger.info("Found KD on PATH: %s", kd_on_path)
+            return Path(kd_on_path)
+
+        logger.info("KD not found — will fall back to CDB for kernel commands")
+        return None
+
     def _execute_cdb_command(self, command: str) -> str:
-        """Run a single command through a CDB subprocess.
+        """Run a single command through a CDB/KD subprocess.
+
+        Uses kd.exe for local kernel debugging (-kl) and cdb.exe for
+        dump analysis (-z). Filters out the startup banner noise.
 
         Args:
             command: WinDbg command to execute.
 
         Returns:
-            Raw text output from CDB.
+            Filtered text output.
         """
-        if self._cdb_path is None:
-            structured = create_windbg_not_found_error()
-            raise StructuredBaseError(structured)
-
-        cdb_args = [str(self._cdb_path)]
-        if self._binary_path:
-            # Dump file analysis: cdb -z <dump_path> -c "command; q"
-            cdb_args.extend(["-z", str(self._binary_path)])
+        # Choose the right debugger executable based on mode
+        if self._mode == WinDbgMode.KERNEL_MODE and self._is_local_kernel:
+            # Local kernel: use kd.exe -kl
+            exe_path = self._kd_path or self._cdb_path
+            if exe_path is None:
+                structured = create_windbg_not_found_error()
+                raise StructuredBaseError(structured)
+            cmd_args = [str(exe_path), "-kl"]
+        elif self._mode == WinDbgMode.DUMP_ANALYSIS and self._binary_path:
+            # Dump file: use cdb.exe -z <dump>
+            if self._cdb_path is None:
+                structured = create_windbg_not_found_error()
+                raise StructuredBaseError(structured)
+            cmd_args = [str(self._cdb_path), "-z", str(self._binary_path)]
         else:
-            # Local kernel debugging: cdb -kl -c "command; q"
-            cdb_args.append("-kl")
+            # Fallback: try cdb.exe
+            if self._cdb_path is None:
+                structured = create_windbg_not_found_error()
+                raise StructuredBaseError(structured)
+            cmd_args = [str(self._cdb_path)]
 
-        cdb_args.extend(["-c", f"{command}; q"])
+        cmd_args.extend(["-c", f"{command}; q"])
 
         try:
             result = subprocess.run(
-                cdb_args,
+                cmd_args,
                 capture_output=True,
                 text=True,
                 timeout=self._timeout,
             )
-            return result.stdout
+            if result.stderr:
+                logger.warning("CDB/KD stderr: %s", result.stderr.strip())
+            if result.returncode != 0:
+                logger.warning(
+                    "CDB/KD exited with code %d for: %s",
+                    result.returncode, command,
+                )
+            return self._filter_cdb_banner(result.stdout)
         except subprocess.TimeoutExpired as exc:
             self._log_error("cdb_command", exc)
             raise WinDbgBridgeError(
                 "execute_cdb_command",
-                f"CDB timed out after {self._timeout}s for: {command}",
+                f"CDB/KD timed out after {self._timeout}s for: {command}",
             ) from exc
         except Exception as exc:
             self._log_error("cdb_command", exc)
             raise WinDbgBridgeError("execute_cdb_command", str(exc)) from exc
+
+    @staticmethod
+    def _filter_cdb_banner(output: str) -> str:
+        """Strip CDB/KD startup banner lines from command output.
+
+        The banner typically contains copyright lines and the prompt.
+        We look for the first line starting with a known command prompt
+        pattern or the actual output.
+        """
+        if not output:
+            return output
+
+        lines = output.splitlines()
+        filtered: list[str] = []
+        banner_done = False
+
+        for line in lines:
+            if not banner_done:
+                # Skip typical banner lines
+                stripped = line.strip()
+                if (
+                    stripped.startswith("Microsoft (R)")
+                    or stripped.startswith("Copyright")
+                    or stripped.startswith("Loading")
+                    or stripped.startswith("Opened log file")
+                    or stripped == ""
+                    or stripped.startswith("CommandLine:")
+                    or stripped.startswith("Symbol search path")
+                    or stripped.startswith("Executable search path")
+                    or stripped.startswith("Windows ")
+                    or stripped.startswith("Kernel Debugger")
+                    or "dbgeng" in stripped.lower()
+                ):
+                    continue
+                banner_done = True
+            # Skip the quit command echo at the end
+            if line.strip() == "quit:" or line.strip() == "q":
+                continue
+            filtered.append(line)
+
+        return "\n".join(filtered)
 
     def _require_windows(self) -> None:
         """Raise if not running on Windows."""
@@ -615,6 +730,15 @@ class WinDbgBridge(Debugger):
                 operation,
                 f"'{operation}' is not supported in local kernel read-only mode. "
                 "Use a remote KDNET connection for execution control.",
+            )
+
+    def _require_not_dump(self, operation: str) -> None:
+        """Raise if in dump analysis mode (read-only)."""
+        if self._mode == WinDbgMode.DUMP_ANALYSIS:
+            raise WinDbgBridgeError(
+                operation,
+                f"'{operation}' is not supported in dump analysis mode. "
+                "Crash dumps are read-only.",
             )
 
     def _log_error(

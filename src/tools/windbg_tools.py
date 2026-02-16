@@ -260,15 +260,17 @@ def register_windbg_tools(
         try:
             bridge = get_windbg_bridge()
             bridge.run()
-            import time
-            start = time.monotonic()
-            while time.monotonic() - start < timeout:
-                state = bridge.get_state()
-                if state.value == "paused":
-                    loc = bridge.get_current_location()
-                    return f"Break at 0x{loc.get('address', '?')}"
-                time.sleep(0.1)
-            return f"Timeout after {timeout}s — target still running"
+            # Use pybag's native wait() which blocks until a debug event
+            try:
+                bridge._dbg.wait(timeout * 1000)  # wait() takes milliseconds
+                bridge._state = bridge._dbg._control.GetExecutionStatus()
+                # Map DbgEng execution status to our state
+                from src.engines.dynamic.base import DebuggerState
+                bridge._state = DebuggerState.PAUSED
+                loc = bridge.get_current_location()
+                return f"Break at 0x{loc.get('address', '?')}"
+            except Exception:
+                return f"Timeout after {timeout}s — target still running"
         except (WinDbgBridgeError, StructuredBaseError) as e:
             return f"Error: {e}"
 
@@ -286,16 +288,16 @@ def register_windbg_tools(
         if not _is_windows():
             return _PLATFORM_MSG
         try:
-            import time
             bridge = get_windbg_bridge()
-            start = time.monotonic()
-            while time.monotonic() - start < timeout:
-                state = bridge.get_state()
-                if state.value == "paused":
-                    loc = bridge.get_current_location()
-                    return f"Paused at 0x{loc.get('address', '?')}"
-                time.sleep(0.1)
-            return f"Timeout after {timeout}s — target not paused"
+            # Use pybag's native wait() which blocks until a debug event
+            try:
+                bridge._dbg.wait(timeout * 1000)  # wait() takes milliseconds
+                from src.engines.dynamic.base import DebuggerState
+                bridge._state = DebuggerState.PAUSED
+                loc = bridge.get_current_location()
+                return f"Paused at 0x{loc.get('address', '?')}"
+            except Exception:
+                return f"Timeout after {timeout}s — target not paused"
         except (WinDbgBridgeError, StructuredBaseError) as e:
             return f"Error: {e}"
 
@@ -367,7 +369,7 @@ def register_windbg_tools(
             return _PLATFORM_MSG
         try:
             bridge = get_windbg_bridge()
-            cmd = f'bp {address} ".if ({condition}) {{}} .else {{gc}}\"'
+            cmd = f'bp {address} ".if ({condition}) {{}} .else {{gc}}"'
             bridge.execute_command(cmd)
             return f"Conditional breakpoint set at {address} when {condition}"
         except (WinDbgBridgeError, StructuredBaseError) as e:
@@ -410,7 +412,10 @@ def register_windbg_tools(
         try:
             size = min(size, 4096)
             bridge = get_windbg_bridge()
-            data = bridge.read_memory(address, size)
+            # Strip backtick separators (WinDbg uses fffff800`12340000 format)
+            clean_addr = address.replace("`", "")
+            data = bridge.read_memory(clean_addr, size)
+            base_addr = int(clean_addr, 16)
             lines = []
             for i in range(0, len(data), 16):
                 chunk = data[i:i + 16]
@@ -418,7 +423,7 @@ def register_windbg_tools(
                 ascii_part = "".join(
                     chr(b) if 32 <= b < 127 else "." for b in chunk
                 )
-                lines.append(f"{int(address, 16) + i:016x}  {hex_part:<48}  {ascii_part}")
+                lines.append(f"{base_addr + i:016x}  {hex_part:<48}  {ascii_part}")
             return "\n".join(lines)
         except (WinDbgBridgeError, StructuredBaseError) as e:
             return f"Error: {e}"

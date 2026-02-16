@@ -32,6 +32,58 @@ function Test-WingetAvailable {
     return (Test-Command winget)
 }
 
+function Find-WinDbgPath {
+    # Returns the directory containing cdb.exe, or $null if not found.
+    # Searches in priority order:
+    #   1. WINDBG_PATH env var
+    #   2. Standard Windows SDK paths
+    #   3. WinDbg Preview via Get-AppxPackage (Microsoft Store / winget)
+    #   4. cdb.exe on PATH
+
+    # 1. Env var
+    if ($env:WINDBG_PATH -and (Test-Path "$env:WINDBG_PATH\cdb.exe")) {
+        return $env:WINDBG_PATH
+    }
+
+    # 2. Windows SDK paths
+    $sdkPaths = @(
+        "${env:ProgramFiles(x86)}\Windows Kits\10\Debuggers\x64",
+        "$env:ProgramFiles\Windows Kits\10\Debuggers\x64",
+        "${env:ProgramFiles(x86)}\Windows Kits\10\Debuggers\x86",
+        "C:\Debuggers"
+    )
+    foreach ($p in $sdkPaths) {
+        if (Test-Path "$p\cdb.exe") {
+            return $p
+        }
+    }
+
+    # 3. WinDbg Preview (Microsoft Store / winget install)
+    try {
+        $appx = Get-AppxPackage -Name "Microsoft.WinDbg" -ErrorAction SilentlyContinue
+        if ($appx -and $appx.InstallLocation) {
+            $appxPath = $appx.InstallLocation
+            # cdb.exe may be in the root or in an amd64/ subfolder
+            if (Test-Path "$appxPath\amd64\cdb.exe") {
+                return "$appxPath\amd64"
+            } elseif (Test-Path "$appxPath\cdb.exe") {
+                return $appxPath
+            }
+            # Even without cdb.exe, the debugger is installed here
+            if (Test-Path "$appxPath\DbgX.Shell.exe") {
+                return $appxPath
+            }
+        }
+    } catch {}
+
+    # 4. cdb.exe on PATH
+    if (Test-Command cdb) {
+        return (Get-Command cdb).Source | Split-Path
+    }
+
+    return $null
+}
+
 function Install-WithWinget {
     param(
         [string]$PackageId,
@@ -223,29 +275,10 @@ function Get-ComponentStatus {
     }
 
     # Check WinDbg / Debugging Tools for Windows
-    $windbgSearchPaths = @(
-        "${env:ProgramFiles(x86)}\Windows Kits\10\Debuggers\x64",
-        "$env:ProgramFiles\Windows Kits\10\Debuggers\x64",
-        "${env:ProgramFiles(x86)}\Windows Kits\10\Debuggers\x86",
-        "C:\Debuggers"
-    )
-
-    if ($env:WINDBG_PATH -and (Test-Path "$env:WINDBG_PATH\cdb.exe")) {
+    $windbgPath = Find-WinDbgPath
+    if ($windbgPath) {
         $status.WinDbg.Installed = $true
-        $status.WinDbg.Path = $env:WINDBG_PATH
-    } else {
-        foreach ($searchPath in $windbgSearchPaths) {
-            if (Test-Path "$searchPath\cdb.exe") {
-                $status.WinDbg.Installed = $true
-                $status.WinDbg.Path = $searchPath
-                break
-            }
-        }
-    }
-
-    if (-not $status.WinDbg.Installed -and (Test-Command cdb)) {
-        $status.WinDbg.Installed = $true
-        $status.WinDbg.Path = (Get-Command cdb).Source | Split-Path
+        $status.WinDbg.Path = $windbgPath
     }
 
     # Check Pybag (Python package for WinDbg COM API)
@@ -700,31 +733,7 @@ function Install-X64Dbg {
 function Install-WinDbg {
     Write-Info "Setting up WinDbg/Debugging Tools..."
 
-    # Check if already installed at known SDK paths
-    $existingPath = $null
-    $searchPaths = @(
-        "${env:ProgramFiles(x86)}\Windows Kits\10\Debuggers\x64",
-        "$env:ProgramFiles\Windows Kits\10\Debuggers\x64",
-        "${env:ProgramFiles(x86)}\Windows Kits\10\Debuggers\x86",
-        "C:\Debuggers"
-    )
-
-    # Check WINDBG_PATH env var first
-    if ($env:WINDBG_PATH -and (Test-Path "$env:WINDBG_PATH\cdb.exe")) {
-        $existingPath = $env:WINDBG_PATH
-    } else {
-        foreach ($sp in $searchPaths) {
-            if (Test-Path "$sp\cdb.exe") {
-                $existingPath = $sp
-                break
-            }
-        }
-    }
-
-    # Also check if cdb.exe is on PATH (e.g., from WinDbg Preview)
-    if (-not $existingPath -and (Test-Command cdb)) {
-        $existingPath = (Get-Command cdb).Source | Split-Path
-    }
+    $existingPath = Find-WinDbgPath
 
     if ($existingPath) {
         Write-Success "WinDbg/CDB found at: $existingPath"
@@ -752,13 +761,6 @@ function Install-WinDbg {
                 if ($proc.ExitCode -eq 0) {
                     Write-Success "Debugging Tools for Windows installed"
                     $installed = $true
-
-                    # Set path to default install location
-                    $defaultPath = "${env:ProgramFiles(x86)}\Windows Kits\10\Debuggers\x64"
-                    if (Test-Path "$defaultPath\cdb.exe") {
-                        [System.Environment]::SetEnvironmentVariable("WINDBG_PATH", $defaultPath, "User")
-                        $env:WINDBG_PATH = $defaultPath
-                    }
                 } else {
                     Write-Warn "SDK installer exited with code: $($proc.ExitCode)"
                 }
@@ -776,6 +778,17 @@ function Install-WinDbg {
             Write-Info "     Select 'Debugging Tools for Windows' during installation"
             Write-Info "  3. Microsoft Store: search 'WinDbg Preview'"
             return $false
+        }
+
+        # Re-detect path after installation
+        $detectedPath = Find-WinDbgPath
+        if ($detectedPath) {
+            Write-Success "WinDbg detected at: $detectedPath"
+            [System.Environment]::SetEnvironmentVariable("WINDBG_PATH", $detectedPath, "User")
+            $env:WINDBG_PATH = $detectedPath
+        } else {
+            Write-Warn "WinDbg installed but could not auto-detect path"
+            Write-Info "Set WINDBG_PATH manually if needed"
         }
     }
 

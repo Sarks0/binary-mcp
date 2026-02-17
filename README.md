@@ -331,6 +331,7 @@ Contributions welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 ## Resources
 
 - **Documentation**: [docs/](docs/)
+- **WinDbg/Kernel Debugging Guide**: [docs/windbg-kernel-debugging.md](docs/windbg-kernel-debugging.md)
 - **Issues**: [github.com/Sarks0/binary-mcp/issues](https://github.com/Sarks0/binary-mcp/issues)
 - **MCP Protocol**: [modelcontextprotocol.io](https://modelcontextprotocol.io/)
 

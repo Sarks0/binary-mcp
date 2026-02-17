@@ -268,7 +268,7 @@ All six execution control tools require a remote KDNET connection. In local kern
 **Address formats accepted**:
 
 - Hex: `0x401000`, `fffff80579afb8c0`, `` fffff805`79afb8c0 `` (backtick separators allowed)
-- Symbol: `nt!NtCreateFile`, `Vgk!DriverEntry`, `module!*`
+- Symbol: `nt!NtCreateFile`, `MyDriver!DriverEntry`, `module!*`
 
 **Conditional breakpoint syntax**:
 
@@ -422,15 +422,15 @@ List all loaded kernel modules
 
 Tool call: `windbg_get_modules()`
 
-This returns a table of all loaded drivers with base addresses, end addresses, names, and symbol status. Look for the target driver (e.g. `Vgk`, `BEDaisy`, `EasyAntiCheat`).
+This returns a table of all loaded drivers with base addresses, end addresses, names, and symbol status. Look for the target driver by name.
 
 **Step 3: Get the driver object and dispatch table**
 
 ```
-Execute the WinDbg command: !drvobj \Driver\Vgk 3
+Execute the WinDbg command: !drvobj \Driver\MyDriver 3
 ```
 
-Tool call: `windbg_execute_command(command="!drvobj \\Driver\\Vgk 3")`
+Tool call: `windbg_execute_command(command="!drvobj \\Driver\\MyDriver 3")`
 
 The `3` verbosity flag dumps the full IRP dispatch table, showing the handler address for each of the 28 IRP_MJ functions.
 
@@ -478,7 +478,7 @@ This returns the bugcheck code, faulting module, faulting address, probable caus
 Execute the WinDbg command: lm vm <faulting_module>
 ```
 
-Tool call: `windbg_execute_command(command="lm vm Vgk")`
+Tool call: `windbg_execute_command(command="lm vm MyDriver")`
 
 This shows the module's version information, timestamp, and image path.
 
@@ -527,11 +527,11 @@ Tool call: `windbg_read_memory(address="fffff80579c12340", size=64)`
 **Step 4: Examine loaded modules for a specific driver**
 
 ```
-Execute the WinDbg command: lm vm Vgk
+Execute the WinDbg command: lm vm MyDriver
 ```
 
 ```
-Execute the WinDbg command: x Vgk!*Dispatch*
+Execute the WinDbg command: x MyDriver!*Dispatch*
 ```
 
 The `x` command resolves symbols matching the wildcard pattern, helping locate dispatch routines and other key functions.
@@ -566,7 +566,7 @@ Results longer than 200 characters are truncated in the log. When `WINDBG_DEBUG`
 14:32:02 DEBUG OK    WinDbgBridge.connect_kernel_local -> True  (847.3ms)
 14:32:02 DEBUG CALL  WinDbgBridge.get_loaded_drivers()
 14:32:03 DEBUG OK    WinDbgBridge.get_loaded_drivers -> [{'start': 'fffff80579800000', 'end'...  (312.1ms)
-14:32:05 DEBUG CALL  WinDbgBridge.execute_command('!drvobj \\Driver\\Vgk 3')
+14:32:05 DEBUG CALL  WinDbgBridge.execute_command('!drvobj \\Driver\\MyDriver 3')
 14:32:06 DEBUG OK    WinDbgBridge.execute_command -> 'Driver object (fffff80579...'  (1043.7ms)
 ```
 

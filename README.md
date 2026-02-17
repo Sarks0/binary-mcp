@@ -133,7 +133,7 @@ Step through the function and show me the registers
 **Kernel Debugging (WinDbg):**
 ```
 Connect to the kernel debugger on port 50000
-Show me the dispatch table for the Vgk driver
+Show me the dispatch table for the MyDriver driver
 Decode IOCTL code 0x9C402408
 Analyze the crash dump at C:\Windows\MEMORY.DMP
 List all loaded kernel drivers

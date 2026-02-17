@@ -517,6 +517,49 @@ class TestCDBBannerFilter:
         assert "mov" in result
 
 
+    def test_filters_banner_with_bom_and_encoding_quirks(self):
+        """Pybag/COM may return output with BOM or invisible chars."""
+        # BOM at start of output
+        output = (
+            "\ufeffConnected to Windows 10 26100 x64 target at (Tue Feb 17 09:51:25.172 2026), ptr64 TRUE\n"
+            "Product: WinNt, suite: TerminalServer SingleUserTS\n"
+            "nt!KeBugCheckEx:\n"
+            "fffff802`da4fb8c0 48894c2408      mov     qword ptr [rsp+8],rcx\n"
+        )
+        result = WinDbgBridge._filter_cdb_banner(output)
+        assert "Connected to Windows" not in result
+        assert "Product:" not in result
+        assert "nt!KeBugCheckEx:" in result
+        assert "mov" in result
+
+    def test_filters_banner_only_output_returns_empty(self):
+        """When output is only banner noise, return empty string."""
+        output = (
+            "Connected to Windows 10 26100 x64 target at (Tue Feb 17 23:12:45.832 2026 (UTC + 0:00)), ptr64 TRUE\n"
+            "Product: WinNt, suite: TerminalServer SingleUserTS\n"
+            "Edition build lab: 26100.1.amd64fre.ge_release.240331-1435\n"
+            "Kernel base = 0xfffff805`9b600000 PsLoadedModuleList = 0xfffff805`9c4f5040\n"
+            "Debug session time: Tue Feb 17 23:12:45.940 2026 (UTC + 0:00)\n"
+            "System Uptime: 0 days 13:11:31.619\n"
+            "lkd> kd: Reading initial command '# \"7A0h\" nt!PspAllocateProcess L3000; q'\n"
+            "NatVis script unloaded from 'C:\\Debuggers\\Visualizers\\stl.natvis'\n"
+        )
+        result = WinDbgBridge._filter_cdb_banner(output)
+        assert result.strip() == ""
+
+    def test_filters_with_carriage_returns(self):
+        """Windows may use \\r\\n line endings."""
+        output = (
+            "Connected to Windows 10 26100 x64 target\r\n"
+            "Product: WinNt\r\n"
+            "nt!KeBugCheckEx:\r\n"
+            "fffff802`da4fb8c0 mov qword ptr [rsp+8],rcx\r\n"
+        )
+        result = WinDbgBridge._filter_cdb_banner(output)
+        assert "Connected to Windows" not in result
+        assert "nt!KeBugCheckEx:" in result
+
+
 class TestCDBErrorDetection:
     """Test _check_cdb_error() error pattern matching."""
 

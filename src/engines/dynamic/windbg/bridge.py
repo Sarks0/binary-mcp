@@ -501,7 +501,8 @@ class WinDbgBridge(Debugger):
         if self._dbg is not None:
             try:
                 # Pybag uses cmd() not exec_command() for command execution
-                return str(self._dbg.cmd(command))
+                raw = str(self._dbg.cmd(command))
+                return self._filter_cdb_banner(raw)
             except Exception as exc:
                 logger.warning(
                     "Pybag cmd() failed for '%s', falling back to CDB: %s",

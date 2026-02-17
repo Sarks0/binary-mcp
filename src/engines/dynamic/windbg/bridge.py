@@ -418,7 +418,13 @@ class WinDbgBridge(Debugger):
 
     @_trace
     def connect_kernel_local(self) -> bool:
-        """Attach to the local kernel in read-only mode.
+        """Attach to the local kernel for inspection.
+
+        Local kernel debugging provides full read access to memory,
+        registers, modules, and symbols when ``bcdedit -debug on`` is
+        set and the session runs as Administrator.  Execution control
+        (breakpoints, stepping, halting) is not available — that
+        requires a remote KDNET connection to a separate target.
 
         Pybag's KernelDbg.attach("local") can partially succeed even
         without ``bcdedit -debug on``.  We allow the connection and
@@ -448,7 +454,7 @@ class WinDbgBridge(Debugger):
                     "For full access: bcdedit -debug on, reboot, run as Admin."
                 )
 
-            logger.info("Connected to local kernel (read-only)")
+            logger.info("Connected to local kernel (inspection mode)")
             return True
         except Exception as exc:
             self._log_error("connect_kernel_local", exc)
@@ -894,12 +900,14 @@ class WinDbgBridge(Debugger):
             raise StructuredBaseError(structured)
 
     def _require_not_local(self, operation: str) -> None:
-        """Raise if connected in local kernel read-only mode."""
+        """Raise if connected in local kernel mode (no execution control)."""
         if self._is_local_kernel:
             raise WinDbgBridgeError(
                 operation,
-                f"'{operation}' is not supported in local kernel read-only mode. "
-                "Use a remote KDNET connection for execution control.",
+                f"'{operation}' is not supported in local kernel mode. "
+                "Local kernel allows inspection (memory, registers, modules) "
+                "but not execution control. Use a remote KDNET connection "
+                "for breakpoints, stepping, and run/pause.",
             )
 
     def _require_not_dump(self, operation: str) -> None:

@@ -10,6 +10,7 @@ import functools
 import logging
 import os
 import platform
+import re
 
 from fastmcp import FastMCP
 
@@ -35,6 +36,42 @@ _PLATFORM_MSG = (
 
 def _is_windows() -> bool:
     return platform.system() == "Windows"
+
+
+# ---------------------------------------------------------------------------
+# Input validation helpers for command-injection prevention
+# ---------------------------------------------------------------------------
+
+_SAFE_ADDRESS_RE = re.compile(r'^[0-9a-fA-F`x]+$')  # Hex addresses with optional backticks and 0x prefix
+_SAFE_SYMBOL_RE = re.compile(r'^[a-zA-Z0-9_!.*+:]+$')  # Symbol names like nt!NtCreateFile or module!*
+_SAFE_CONDITION_RE = re.compile(r'^[a-zA-Z0-9_!=<>&|+\-*/()@$.\s,]+$')  # WinDbg expressions
+
+
+def _validate_address(address: str) -> str:
+    """Validate address is a hex value or symbol name, not an injection payload."""
+    addr = address.strip()
+    if not addr:
+        return "Error: Address cannot be empty."
+    if _SAFE_ADDRESS_RE.match(addr) or _SAFE_SYMBOL_RE.match(addr):
+        return ""  # Valid
+    return f"Error: Invalid address format '{addr}'. Use hex (e.g. 0x401000) or symbol (e.g. nt!NtCreateFile)."
+
+
+def _validate_condition(condition: str) -> str:
+    """Validate breakpoint condition expression."""
+    cond = condition.strip()
+    if not cond:
+        return "Error: Condition cannot be empty."
+    if len(cond) > 200:
+        return "Error: Condition too long (max 200 characters)."
+    if not _SAFE_CONDITION_RE.match(cond):
+        return "Error: Invalid condition expression. Only comparison expressions are allowed (e.g. 'rcx==0x100')."
+    # Extra check for dangerous commands that might slip through
+    cond_lower = cond.lower()
+    for blocked in ('.shell', '.create', '.script', '!runscript', '.writemem'):
+        if blocked in cond_lower:
+            return f"Error: Condition contains blocked command '{blocked}'."
+    return ""  # Valid
 
 
 def get_windbg_bridge() -> WinDbgBridge:
@@ -336,6 +373,9 @@ def register_windbg_tools(
         """
         if not _is_windows():
             return _PLATFORM_MSG
+        addr_err = _validate_address(address)
+        if addr_err:
+            return addr_err
         try:
             bridge = get_windbg_bridge()
             bridge.delete_breakpoint(address)
@@ -371,6 +411,12 @@ def register_windbg_tools(
         """
         if not _is_windows():
             return _PLATFORM_MSG
+        addr_err = _validate_address(address)
+        if addr_err:
+            return addr_err
+        cond_err = _validate_condition(condition)
+        if cond_err:
+            return cond_err
         try:
             bridge = get_windbg_bridge()
             cmd = f'bp {address} ".if ({condition}) {{}} .else {{gc}}"'
@@ -468,6 +514,9 @@ def register_windbg_tools(
         """
         if not _is_windows():
             return _PLATFORM_MSG
+        addr_err = _validate_address(address)
+        if addr_err:
+            return addr_err
         try:
             bridge = get_windbg_bridge()
             output = bridge.execute_command(f"u {address} L{count}")
@@ -518,6 +567,11 @@ def register_windbg_tools(
         """
         if not _is_windows():
             return _PLATFORM_MSG
+        # Tool-layer blocklist for dangerous WinDbg meta-commands
+        cmd_lower = command.strip().lower()
+        for blocked in ('.shell', '.create', '.script', '!runscript', '.writemem', '.dump', '.crash', '.reboot'):
+            if blocked in cmd_lower:
+                return f"Error: Command '{blocked}' is blocked for security reasons."
         try:
             bridge = get_windbg_bridge()
             return bridge.execute_command(command)

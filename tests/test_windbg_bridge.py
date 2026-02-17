@@ -673,3 +673,143 @@ class TestDisconnect:
         bridge.disconnect()
         assert bridge._is_local_kernel is False
         assert bridge._mode == WinDbgMode.USER_MODE
+
+
+class TestCommandInjectionPrevention:
+    """Security tests: verify command injection payloads are blocked."""
+
+    @pytest.fixture()
+    def bridge(self):
+        """Create a bridge instance for testing with mocked Pybag."""
+        with patch("src.engines.dynamic.windbg.bridge.pybag"), \
+             patch("src.engines.dynamic.windbg.bridge.PYBAG_AVAILABLE", True):
+            b = WinDbgBridge()
+            b._dbg = MagicMock()
+            b._state = DebuggerState.PAUSED
+            b._mode = WinDbgMode.KERNEL_MODE
+            yield b
+
+    # ------------------------------------------------------------------
+    # Bridge-layer: _validate_command_safety blocks dangerous commands
+    # ------------------------------------------------------------------
+
+    def test_blocks_shell_command(self, bridge):
+        """The .shell meta-command must be blocked (arbitrary OS command exec)."""
+        with pytest.raises(WinDbgBridgeError):
+            bridge._validate_command_safety(".shell cmd /c whoami")
+
+    def test_blocks_shell_in_semicolon_chain(self, bridge):
+        """Dangerous commands hiding after a semicolon must still be caught."""
+        with pytest.raises(WinDbgBridgeError):
+            bridge._validate_command_safety("u 0; .shell cmd /c calc")
+
+    def test_blocks_shell_case_insensitive(self, bridge):
+        """Blocklist matching must be case-insensitive."""
+        with pytest.raises(WinDbgBridgeError):
+            bridge._validate_command_safety(".SHELL cmd /c dir")
+
+    def test_blocks_writemem(self, bridge):
+        """.writemem can exfiltrate memory to disk and must be blocked."""
+        with pytest.raises(WinDbgBridgeError):
+            bridge._validate_command_safety(".writemem C:\\out.bin 0 L100")
+
+    def test_blocks_script(self, bridge):
+        """.scriptrun can execute arbitrary JavaScript and must be blocked."""
+        with pytest.raises(WinDbgBridgeError):
+            bridge._validate_command_safety(".scriptrun exploit.js")
+
+    def test_blocks_create(self, bridge):
+        """.create can spawn arbitrary processes and must be blocked."""
+        with pytest.raises(WinDbgBridgeError):
+            bridge._validate_command_safety(".create cmd.exe")
+
+    def test_blocks_crash_reboot(self, bridge):
+        """Both .crash and .reboot must be blocked (host destabilization)."""
+        with pytest.raises(WinDbgBridgeError):
+            bridge._validate_command_safety(".crash")
+        with pytest.raises(WinDbgBridgeError):
+            bridge._validate_command_safety(".reboot")
+
+    def test_allows_safe_commands(self, bridge):
+        """Common analysis commands must NOT be blocked."""
+        safe_commands = [
+            "lm",                              # list modules
+            "u nt!KeBugCheckEx L10",           # disassemble
+            "dq nt!PsInitialSystemProcess L1", # read memory
+            "!analyze -v",                     # extension command
+            "!process 0 0",                    # process list
+            "dt nt!_EPROCESS",                 # dump type
+            "x nt!Ps*",                        # search symbols
+            "r",                               # registers
+            "k",                               # stack trace
+        ]
+        for cmd in safe_commands:
+            # Should not raise -- any exception here is a test failure
+            bridge._validate_command_safety(cmd)
+
+    def test_execute_command_calls_validation(self, bridge):
+        """execute_command() must call _validate_command_safety before execution."""
+        with pytest.raises(WinDbgBridgeError):
+            bridge.execute_command(".shell whoami")
+        # Verify the pybag cmd() was never reached
+        bridge._dbg.cmd.assert_not_called()
+
+    # ------------------------------------------------------------------
+    # Tool-layer: _validate_address input sanitisation
+    # Imports require FastMCP; skip if unavailable in test environment.
+    # ------------------------------------------------------------------
+
+    @pytest.fixture
+    def validators(self):
+        """Import tool-layer validators, skip if FastMCP not installed."""
+        mod = pytest.importorskip(
+            "src.tools.windbg_tools",
+            reason="windbg_tools requires FastMCP",
+        )
+        return mod._validate_address, mod._validate_condition
+
+    def test_validate_address_rejects_semicolons(self, validators):
+        """Semicolons indicate command chaining and must be rejected."""
+        validate_address, _ = validators
+        result = validate_address("0; .shell cmd /c whoami")
+        assert result, "Expected non-empty error string for injection payload"
+
+    def test_validate_address_accepts_hex(self, validators):
+        """Plain hex addresses are valid."""
+        validate_address, _ = validators
+        result = validate_address("0x401000")
+        assert result == "", f"Expected empty string for valid hex address, got: {result!r}"
+
+    def test_validate_address_accepts_symbols(self, validators):
+        """Symbol names like nt!NtCreateFile are valid."""
+        validate_address, _ = validators
+        result = validate_address("nt!NtCreateFile")
+        assert result == "", f"Expected empty string for valid symbol, got: {result!r}"
+
+    def test_validate_address_accepts_backtick_addresses(self, validators):
+        """WinDbg-style backtick-separated 64-bit addresses are valid."""
+        validate_address, _ = validators
+        result = validate_address("fffff805`9bafb8c0")
+        assert result == "", f"Expected empty string for backtick address, got: {result!r}"
+
+    # ------------------------------------------------------------------
+    # Tool-layer: _validate_condition input sanitisation
+    # ------------------------------------------------------------------
+
+    def test_validate_condition_rejects_shell(self, validators):
+        """Conditions containing .shell injection attempts must be rejected."""
+        _, validate_condition = validators
+        result = validate_condition('1) {} .shell cmd /c whoami; .if (0')
+        assert result, "Expected non-empty error string for injection payload"
+
+    def test_validate_condition_accepts_expressions(self, validators):
+        """Simple comparison expressions are valid conditions."""
+        _, validate_condition = validators
+        result = validate_condition("rcx==0x100")
+        assert result == "", f"Expected empty string for valid condition, got: {result!r}"
+
+    def test_validate_condition_rejects_long_input(self, validators):
+        """Conditions exceeding 200 characters must be rejected."""
+        _, validate_condition = validators
+        result = validate_condition("a" * 201)
+        assert result, "Expected non-empty error string for oversized condition"

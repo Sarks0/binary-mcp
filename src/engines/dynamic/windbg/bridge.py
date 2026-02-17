@@ -66,6 +66,32 @@ _SDK_SEARCH_PATHS = [
 # CDB subprocess timeout for extension commands (seconds)
 _CDB_TIMEOUT = 30
 
+# Dangerous WinDbg meta-commands that must never be executed via the bridge.
+# Checked case-insensitively via substring match (commands can follow semicolons).
+_BLOCKED_COMMANDS = (
+    ".shell",
+    ".create",
+    ".abandon",
+    ".kill",
+    ".restart",
+    ".dump",
+    ".writemem",
+    ".writevirtmem",
+    ".logopen",
+    ".logclose",
+    ".outmask",
+    ".script",
+    ".scriptrun",
+    ".scriptload",
+    "!runscript",
+    ".formats",
+    ".tlist",
+    ".detach",
+    ".reboot",
+    ".crash",
+    ".bugcheck",
+)
+
 
 # ---------------------------------------------------------------------------
 # Debug trace — activate with WINDBG_DEBUG=1 to log all bridge calls to file
@@ -498,6 +524,7 @@ class WinDbgBridge(Debugger):
         Args:
             command: WinDbg command string (e.g. "lm", "!process 0 0").
         """
+        self._validate_command_safety(command)
         if self._dbg is not None:
             try:
                 # Pybag uses cmd() not exec_command() for command execution
@@ -718,6 +745,7 @@ class WinDbgBridge(Debugger):
         Returns:
             Filtered text output.
         """
+        self._validate_command_safety(command)
         # Choose the right debugger executable based on mode
         if self._mode == WinDbgMode.KERNEL_MODE and self._is_local_kernel:
             # Local kernel: MUST use kd.exe -kl (CDB does NOT support -kl)
@@ -919,6 +947,24 @@ class WinDbgBridge(Debugger):
                 f"'{operation}' is not supported in dump analysis mode. "
                 "Crash dumps are read-only.",
             )
+
+    def _validate_command_safety(self, command: str) -> None:
+        """Block dangerous WinDbg meta-commands for defense-in-depth.
+
+        Checks the command string (case-insensitively) against
+        ``_BLOCKED_COMMANDS`` using substring matching, since dangerous
+        commands can appear after semicolons in compound expressions.
+
+        Raises:
+            WinDbgBridgeError: If a blocked command is detected.
+        """
+        lower_cmd = command.lower()
+        for blocked in _BLOCKED_COMMANDS:
+            if blocked in lower_cmd:
+                raise WinDbgBridgeError(
+                    "command_validation",
+                    f"Command blocked: '{blocked}' is not allowed for security reasons.",
+                )
 
     def _log_error(
         self,

@@ -730,6 +730,20 @@ class TestCommandInjectionPrevention:
         with pytest.raises(WinDbgBridgeError):
             bridge._validate_command_safety(".reboot")
 
+    def test_blocks_load_dll(self, bridge):
+        """DLL loading commands achieve code execution on the host."""
+        with pytest.raises(WinDbgBridgeError):
+            bridge._validate_command_safety(".load evil.dll")
+        with pytest.raises(WinDbgBridgeError):
+            bridge._validate_command_safety(".loadby sos clr")
+        with pytest.raises(WinDbgBridgeError):
+            bridge._validate_command_safety(".cordll -ve -u -l")
+
+    def test_blocks_call(self, bridge):
+        """Target function execution must be blocked."""
+        with pytest.raises(WinDbgBridgeError):
+            bridge._validate_command_safety(".call kernel32!CreateFileW")
+
     def test_allows_safe_commands(self, bridge):
         """Common analysis commands must NOT be blocked."""
         safe_commands = [

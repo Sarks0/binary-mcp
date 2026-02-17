@@ -356,6 +356,9 @@ def register_windbg_tools(
         """
         if not _is_windows():
             return _PLATFORM_MSG
+        addr_err = _validate_address(address)
+        if addr_err:
+            return addr_err
         try:
             bridge = get_windbg_bridge()
             bridge.set_breakpoint(address)
@@ -459,6 +462,9 @@ def register_windbg_tools(
         """
         if not _is_windows():
             return _PLATFORM_MSG
+        addr_err = _validate_address(address)
+        if addr_err:
+            return addr_err
         try:
             size = min(size, 4096)
             bridge = get_windbg_bridge()
@@ -492,6 +498,9 @@ def register_windbg_tools(
         """
         if not _is_windows():
             return _PLATFORM_MSG
+        addr_err = _validate_address(address)
+        if addr_err:
+            return addr_err
         try:
             raw = bytes.fromhex(data.replace(" ", ""))
             bridge = get_windbg_bridge()
@@ -569,7 +578,8 @@ def register_windbg_tools(
             return _PLATFORM_MSG
         # Tool-layer blocklist for dangerous WinDbg meta-commands
         cmd_lower = command.strip().lower()
-        for blocked in ('.shell', '.create', '.script', '!runscript', '.writemem', '.dump', '.crash', '.reboot'):
+        from src.engines.dynamic.windbg.bridge import _BLOCKED_COMMANDS
+        for blocked in _BLOCKED_COMMANDS:
             if blocked in cmd_lower:
                 return f"Error: Command '{blocked}' is blocked for security reasons."
         try:

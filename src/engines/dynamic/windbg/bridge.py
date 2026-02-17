@@ -90,6 +90,10 @@ _BLOCKED_COMMANDS = (
     ".reboot",
     ".crash",
     ".bugcheck",
+    ".load",
+    ".loadby",
+    ".cordll",
+    ".call",
 )
 
 

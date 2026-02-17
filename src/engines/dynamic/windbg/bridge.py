@@ -7,11 +7,13 @@ COM interfaces, with a CDB subprocess fallback for extension (!) commands.
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 import platform
 import shutil
 import subprocess
+import time
 import traceback
 from pathlib import Path
 from typing import Any
@@ -65,6 +67,55 @@ _SDK_SEARCH_PATHS = [
 _CDB_TIMEOUT = 30
 
 
+# ---------------------------------------------------------------------------
+# Debug trace — activate with WINDBG_DEBUG=1 to log all bridge calls to file
+# ---------------------------------------------------------------------------
+def _setup_debug_log() -> logging.Logger:
+    """Configure file logging when WINDBG_DEBUG env var is set."""
+    debug_logger = logging.getLogger("windbg.trace")
+    if os.environ.get("WINDBG_DEBUG"):
+        log_path = Path.home() / ".ghidra_mcp_cache" / "windbg_debug.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        handler = logging.FileHandler(log_path, encoding="utf-8")
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)-5s %(message)s", datefmt="%H:%M:%S"
+        ))
+        debug_logger.addHandler(handler)
+        debug_logger.setLevel(logging.DEBUG)
+        debug_logger.debug("=== WinDbg debug trace started ===")
+    return debug_logger
+
+
+_trace_log = _setup_debug_log()
+
+
+def _trace(fn):
+    """Decorator that logs method calls, results, and exceptions to the debug log."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        if not _trace_log.handlers:
+            return fn(*args, **kwargs)
+        name = fn.__qualname__
+        call_args = ", ".join(
+            [repr(a) for a in args[1:]] + [f"{k}={v!r}" for k, v in kwargs.items()]
+        )
+        _trace_log.debug("CALL  %s(%s)", name, call_args)
+        t0 = time.perf_counter()
+        try:
+            result = fn(*args, **kwargs)
+            ms = (time.perf_counter() - t0) * 1000
+            summary = repr(result)
+            if len(summary) > 200:
+                summary = summary[:200] + "..."
+            _trace_log.debug("OK    %s -> %s  (%.1fms)", name, summary, ms)
+            return result
+        except Exception as exc:
+            ms = (time.perf_counter() - t0) * 1000
+            _trace_log.debug("FAIL  %s -> %s: %s  (%.1fms)", name, type(exc).__name__, exc, ms)
+            raise
+    return wrapper
+
+
 class WinDbgBridgeError(StructuredBaseError):
     """Raised when a WinDbg bridge operation fails."""
 
@@ -108,6 +159,7 @@ class WinDbgBridge(Debugger):
     # Debugger ABC implementation
     # ------------------------------------------------------------------
 
+    @_trace
     def connect(self, timeout: int = 10) -> bool:
         """Connect to the debugger engine.
 
@@ -124,6 +176,7 @@ class WinDbgBridge(Debugger):
             self._log_error("connect", exc)
             raise
 
+    @_trace
     def disconnect(self) -> None:
         """Disconnect and clean up Pybag and CDB resources."""
         if self._cdb_proc is not None:
@@ -148,6 +201,7 @@ class WinDbgBridge(Debugger):
         self._local_kernel_limited = False
         logger.info("WinDbg bridge disconnected")
 
+    @_trace
     def load_binary(self, binary_path: Path, args: list[str] | None = None) -> bool:
         """Load a user-mode binary for debugging."""
         self._require_windows()
@@ -167,6 +221,7 @@ class WinDbgBridge(Debugger):
             self._log_error("load_binary", exc)
             raise WinDbgBridgeError("load_binary", str(exc)) from exc
 
+    @_trace
     def set_breakpoint(self, address: str) -> bool:
         """Set a breakpoint at the given address."""
         self._require_connected()
@@ -185,6 +240,7 @@ class WinDbgBridge(Debugger):
             self._log_error("set_breakpoint", exc, address=address)
             raise WinDbgBridgeError("set_breakpoint", str(exc)) from exc
 
+    @_trace
     def delete_breakpoint(self, address: str) -> bool:
         """Delete the breakpoint at the given address.
 
@@ -208,6 +264,7 @@ class WinDbgBridge(Debugger):
             self._log_error("delete_breakpoint", exc, address=address)
             raise WinDbgBridgeError("delete_breakpoint", str(exc)) from exc
 
+    @_trace
     def run(self) -> DebuggerState:
         """Resume execution."""
         self._require_connected()
@@ -221,6 +278,7 @@ class WinDbgBridge(Debugger):
             self._log_error("run", exc)
             raise WinDbgBridgeError("run", str(exc)) from exc
 
+    @_trace
     def pause(self) -> bool:
         """Break into the debugger."""
         self._require_connected()
@@ -235,6 +293,7 @@ class WinDbgBridge(Debugger):
             self._log_error("pause", exc)
             raise WinDbgBridgeError("pause", str(exc)) from exc
 
+    @_trace
     def step_into(self) -> dict[str, Any]:
         """Single-step into the next instruction."""
         self._require_connected()
@@ -249,6 +308,7 @@ class WinDbgBridge(Debugger):
             self._log_error("step_into", exc)
             raise WinDbgBridgeError("step_into", str(exc)) from exc
 
+    @_trace
     def step_over(self) -> dict[str, Any]:
         """Step over the next instruction."""
         self._require_connected()
@@ -263,6 +323,7 @@ class WinDbgBridge(Debugger):
             self._log_error("step_over", exc)
             raise WinDbgBridgeError("step_over", str(exc)) from exc
 
+    @_trace
     def get_registers(self) -> dict[str, str]:
         """Return current register values as hex strings."""
         self._require_connected()
@@ -274,6 +335,7 @@ class WinDbgBridge(Debugger):
             output = self.execute_command("r")
             return WinDbgOutputParser.parse_registers(output)
 
+    @_trace
     def read_memory(self, address: str, size: int) -> bytes:
         """Read raw bytes from the target address space."""
         self._require_connected()
@@ -285,6 +347,7 @@ class WinDbgBridge(Debugger):
             structured = create_memory_read_failed_error(address, size)
             raise StructuredBaseError(structured) from exc
 
+    @_trace
     def write_memory(self, address: str, data: bytes) -> bool:
         """Write raw bytes to the target address space."""
         self._require_connected()
@@ -330,6 +393,7 @@ class WinDbgBridge(Debugger):
     # Kernel-specific methods
     # ------------------------------------------------------------------
 
+    @_trace
     def connect_kernel_net(self, port: int, key: str) -> bool:
         """Connect to a KDNET kernel debug target.
 
@@ -352,6 +416,7 @@ class WinDbgBridge(Debugger):
             structured = create_kernel_not_connected_error(str(exc))
             raise StructuredBaseError(structured) from exc
 
+    @_trace
     def connect_kernel_local(self) -> bool:
         """Attach to the local kernel in read-only mode.
 
@@ -390,6 +455,7 @@ class WinDbgBridge(Debugger):
             structured = create_kernel_not_connected_error(str(exc))
             raise StructuredBaseError(structured) from exc
 
+    @_trace
     def open_dump(self, dump_path: Path) -> bool:
         """Open a crash dump file for analysis.
 
@@ -416,6 +482,7 @@ class WinDbgBridge(Debugger):
             self._log_error("open_dump", exc)
             raise WinDbgBridgeError("open_dump", str(exc)) from exc
 
+    @_trace
     def execute_command(self, command: str) -> str:
         """Execute a raw debugger command and return text output.
 
@@ -437,6 +504,7 @@ class WinDbgBridge(Debugger):
                 return self._execute_cdb_command(command)
         return self._execute_cdb_command(command)
 
+    @_trace
     def execute_extension(self, command: str) -> str:
         """Execute a WinDbg extension (!) command via CDB subprocess.
 
@@ -445,6 +513,7 @@ class WinDbgBridge(Debugger):
         """
         return self._execute_cdb_command(command)
 
+    @_trace
     def get_driver_object(self, name: str) -> DriverObject:
         """Get a DRIVER_OBJECT by name (e.g. '\\Driver\\ACPI').
 
@@ -458,18 +527,21 @@ class WinDbgBridge(Debugger):
             raise StructuredBaseError(structured)
         return WinDbgOutputParser.parse_driver_object(output)
 
+    @_trace
     def get_device_object(self, address: str) -> DeviceObject:
         """Get a DEVICE_OBJECT at the given address."""
         self._require_connected()
         output = self.execute_command(f"!devobj {address}")
         return WinDbgOutputParser.parse_device_object(output)
 
+    @_trace
     def analyze_pool(self, address: str) -> PoolAllocation:
         """Analyze a kernel pool allocation at the given address."""
         self._require_connected()
         output = self.execute_command(f"!pool {address}")
         return WinDbgOutputParser.parse_pool_info(output)
 
+    @_trace
     def analyze_crash(self) -> CrashAnalysis:
         """Run !analyze -v on the current dump or bugcheck."""
         self._require_connected()
@@ -487,6 +559,7 @@ class WinDbgBridge(Debugger):
         """
         return IOCTLCode.decode(code)
 
+    @_trace
     def get_loaded_drivers(self) -> list[dict[str, str]]:
         """List all loaded kernel modules."""
         self._require_connected()
@@ -523,12 +596,14 @@ class WinDbgBridge(Debugger):
                 logger.warning("'%s' command failed: %s", lm_cmd, exc)
         return []
 
+    @_trace
     def get_processes(self) -> list[dict[str, str]]:
         """List all kernel processes via '!process 0 0'."""
         self._require_connected()
         output = self.execute_command("!process 0 0")
         return WinDbgOutputParser.parse_processes(output)
 
+    @_trace
     def get_object_directory(self, path: str = "\\") -> str:
         """Dump the object manager namespace at the given path."""
         self._require_connected()
@@ -623,6 +698,7 @@ class WinDbgBridge(Debugger):
         logger.info("KD not found — will fall back to CDB for kernel commands")
         return None
 
+    @_trace
     def _execute_cdb_command(self, command: str) -> str:
         """Run a single command through a CDB/KD subprocess.
 

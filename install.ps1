@@ -850,6 +850,39 @@ function Install-WinDbg {
         Write-Info "Install manually: uv pip install pybag"
     }
 
+    # Enable kernel debugging via bcdedit (requires reboot to take effect)
+    Write-Info "Checking kernel debug mode..."
+    try {
+        $bcdeditOutput = bcdedit /enum "{current}" 2>&1 | Out-String
+        if ($bcdeditOutput -match "debug\s+Yes") {
+            Write-Success "Kernel debug mode is already enabled"
+        } else {
+            Write-Info "Enabling kernel debug mode (bcdedit -debug on)..."
+            $debugResult = bcdedit -debug on 2>&1 | Out-String
+            if ($LASTEXITCODE -eq 0) {
+                Write-Success "Kernel debug mode enabled"
+                Write-Warn "A reboot is required for kernel debugging to take effect"
+                Write-Info "Run: shutdown /r /t 0"
+            } else {
+                if ($debugResult -match "Secure Boot|secure boot|0xc0000428") {
+                    Write-Err "Cannot enable kernel debugging: Secure Boot is enabled"
+                    Write-Info "To fix this:"
+                    Write-Info "  1. Restart your PC and enter BIOS/UEFI settings"
+                    Write-Info "  2. Navigate to Security > Secure Boot"
+                    Write-Info "  3. Set Secure Boot to Disabled"
+                    Write-Info "  4. Save and exit BIOS"
+                    Write-Info "  5. Re-run this installer or manually run: bcdedit -debug on"
+                } else {
+                    Write-Warn "bcdedit -debug on failed: $debugResult"
+                    Write-Info "Try running this installer as Administrator"
+                }
+            }
+        }
+    } catch {
+        Write-Warn "Could not check/set kernel debug mode: $_"
+        Write-Info "Manually run as Administrator: bcdedit -debug on"
+    }
+
     return $true
 }
 

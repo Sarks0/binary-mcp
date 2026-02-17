@@ -33,7 +33,7 @@ For WinDbg/kernel debugging support:
 pip install binary-mcp[windbg]
 ```
 
-Requires [Windows SDK](https://developer.microsoft.com/en-us/windows/downloads/windows-sdk/) (includes `cdb.exe` and `kd.exe`).
+Requires [Windows SDK](https://developer.microsoft.com/en-us/windows/downloads/windows-sdk/) (includes `cdb.exe` and `kd.exe`). For full local kernel access, enable debug mode as Administrator: `bcdedit -debug on` then reboot (see [Troubleshooting](#troubleshooting)).
 
 ### Linux / macOS
 
@@ -264,7 +264,23 @@ diagnose_dotnet_setup
 set WINDBG_PATH=C:\Program Files (x86)\Windows Kits\10\Debuggers\x64
 ```
 
-**Kernel debugging connection:**
+**Kernel debugging setup:**
+
+Local kernel debugging requires enabling debug mode and rebooting:
+
+```powershell
+# Run as Administrator:
+bcdedit -debug on
+shutdown /r /t 0
+```
+
+> **Secure Boot**: If `bcdedit -debug on` fails with an error, Secure Boot is likely enabled.
+> Disable it in BIOS/UEFI settings (Security → Secure Boot → Disabled), then retry.
+> After enabling debug mode and rebooting, run the MCP server as Administrator.
+
+Without `bcdedit -debug on`, local kernel access is limited — symbol lookups (`x`, `dt`, `u`, `lm`) work via KD, but registers, memory reads, `!process`, and call stacks will fail.
+
+**KDNET remote kernel debugging:**
 ```powershell
 # On target machine (enable KDNET):
 bcdedit /debug on

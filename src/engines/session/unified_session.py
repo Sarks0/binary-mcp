@@ -26,6 +26,7 @@ class AnalysisType(Enum):
     """Type of analysis being performed."""
     STATIC = "static"
     DYNAMIC = "dynamic"
+    KERNEL = "kernel"
     MIXED = "mixed"
 
 

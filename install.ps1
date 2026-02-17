@@ -1,5 +1,6 @@
 # Binary MCP Server - Windows Installer
 # Interactive installation script with component selection
+# By Rhys Downing
 
 #Requires -RunAsAdministrator
 
@@ -7,8 +8,9 @@ param(
     [string]$InstallDir = "$env:USERPROFILE\binary-mcp",
     [string]$GhidraDir = "$env:USERPROFILE\ghidra",
     [string]$X64DbgDir = "$env:USERPROFILE\x64dbg",
-    [ValidateSet("", "full", "static", "dynamic", "custom", "repair")]
-    [string]$InstallProfile = "",  # full, static, dynamic, custom, repair
+    [string]$WinDbgDir = "",  # Auto-detected from Windows SDK
+    [ValidateSet("", "full", "static", "dynamic", "kernel", "custom", "repair")]
+    [string]$InstallProfile = "",  # full, static, dynamic, kernel, custom, repair
     [switch]$Unattended
 )
 
@@ -30,6 +32,58 @@ function Test-WingetAvailable {
     return (Test-Command winget)
 }
 
+function Find-WinDbgPath {
+    # Returns the directory containing cdb.exe, or $null if not found.
+    # Searches in priority order:
+    #   1. WINDBG_PATH env var
+    #   2. Standard Windows SDK paths
+    #   3. WinDbg Preview via Get-AppxPackage (Microsoft Store / winget)
+    #   4. cdb.exe on PATH
+
+    # 1. Env var
+    if ($env:WINDBG_PATH -and (Test-Path "$env:WINDBG_PATH\cdb.exe")) {
+        return $env:WINDBG_PATH
+    }
+
+    # 2. Windows SDK paths
+    $sdkPaths = @(
+        "${env:ProgramFiles(x86)}\Windows Kits\10\Debuggers\x64",
+        "$env:ProgramFiles\Windows Kits\10\Debuggers\x64",
+        "${env:ProgramFiles(x86)}\Windows Kits\10\Debuggers\x86",
+        "C:\Debuggers"
+    )
+    foreach ($p in $sdkPaths) {
+        if (Test-Path "$p\cdb.exe") {
+            return $p
+        }
+    }
+
+    # 3. WinDbg Preview (Microsoft Store / winget install)
+    try {
+        $appx = Get-AppxPackage -Name "Microsoft.WinDbg" -ErrorAction SilentlyContinue
+        if ($appx -and $appx.InstallLocation) {
+            $appxPath = $appx.InstallLocation
+            # cdb.exe may be in the root or in an amd64/ subfolder
+            if (Test-Path "$appxPath\amd64\cdb.exe") {
+                return "$appxPath\amd64"
+            } elseif (Test-Path "$appxPath\cdb.exe") {
+                return $appxPath
+            }
+            # Even without cdb.exe, the debugger is installed here
+            if (Test-Path "$appxPath\DbgX.Shell.exe") {
+                return $appxPath
+            }
+        }
+    } catch {}
+
+    # 4. cdb.exe on PATH
+    if (Test-Command cdb) {
+        return (Get-Command cdb).Source | Split-Path
+    }
+
+    return $null
+}
+
 function Install-WithWinget {
     param(
         [string]$PackageId,
@@ -43,7 +97,7 @@ function Install-WithWinget {
 
     Write-Info "Installing $PackageName via winget..."
     try {
-        $result = winget install --id $PackageId --accept-source-agreements --accept-package-agreements 2>&1
+        $result = winget install --id $PackageId --source winget --accept-source-agreements --accept-package-agreements 2>&1
         if ($LASTEXITCODE -eq 0) {
             Write-Success "$PackageName installed successfully"
             # Refresh PATH
@@ -126,6 +180,8 @@ function Get-ComponentStatus {
         Ghidra = @{ Installed = $false; Version = ""; Path = $GhidraDir }
         ILSpyCmd = @{ Installed = $false; Version = ""; Path = "" }
         X64Dbg = @{ Installed = $false; Version = ""; Path = $X64DbgDir }
+        WinDbg = @{ Installed = $false; Version = ""; Path = "" }
+        Pybag  = @{ Installed = $false; Version = ""; Path = "" }
         BinaryMCP = @{ Installed = $false; Version = ""; Path = $InstallDir }
     }
 
@@ -217,6 +273,22 @@ function Get-ComponentStatus {
         $status.X64Dbg.Installed = $true
         $status.X64Dbg.Path = $X64DbgDir
     }
+
+    # Check WinDbg / Debugging Tools for Windows
+    $windbgPath = Find-WinDbgPath
+    if ($windbgPath) {
+        $status.WinDbg.Installed = $true
+        $status.WinDbg.Path = $windbgPath
+    }
+
+    # Check Pybag (Python package for WinDbg COM API)
+    try {
+        $pybagCheck = uv run python -c "import pybag; print(pybag.__version__)" 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            $status.Pybag.Installed = $true
+            $status.Pybag.Version = $pybagCheck.Trim()
+        }
+    } catch {}
 
     # Check Binary MCP
     if (Test-Path "$InstallDir\pyproject.toml") {
@@ -321,6 +393,23 @@ function Show-SystemStatus {
         Write-Host "    [" -NoNewline; Write-Host "--" -ForegroundColor DarkGray -NoNewline; Write-Host "] x64dbg (not installed)"
     }
 
+    # WinDbg
+    if ($Status.WinDbg.Installed) {
+        Write-Host "    [" -NoNewline; Write-Host "OK" -ForegroundColor Green -NoNewline
+        Write-Host "] WinDbg/CDB (kernel debugging) - $($Status.WinDbg.Path)"
+    } else {
+        Write-Host "    [" -NoNewline; Write-Host "--" -ForegroundColor DarkGray -NoNewline
+        Write-Host "] WinDbg/CDB (not installed)"
+    }
+
+    if ($Status.Pybag.Installed) {
+        Write-Host "    [" -NoNewline; Write-Host "OK" -ForegroundColor Green -NoNewline
+        Write-Host "] Pybag $($Status.Pybag.Version) (WinDbg Python bridge)"
+    } elseif ($Status.WinDbg.Installed) {
+        Write-Host "    [" -NoNewline; Write-Host "!!" -ForegroundColor Yellow -NoNewline
+        Write-Host "] Pybag (not installed - required for WinDbg integration)"
+    }
+
     Write-Host ""
     Write-Host "  Binary MCP Server:" -ForegroundColor White
     if ($Status.BinaryMCP.Installed) {
@@ -337,7 +426,7 @@ function Show-InstallMenu {
     Write-Host "  --------------------" -ForegroundColor Yellow
     Write-Host ""
     Write-Host "  [1] Full Installation" -ForegroundColor White
-    Write-Host "      Everything: Ghidra + .NET Tools + x64dbg + Claude Config" -ForegroundColor DarkGray
+    Write-Host "      Everything: Ghidra + .NET Tools + x64dbg + WinDbg + Claude Config" -ForegroundColor DarkGray
     Write-Host ""
     Write-Host "  [2] Static Analysis Only" -ForegroundColor White
     Write-Host "      Ghidra (native) + ILSpyCmd (.NET) - No debugger" -ForegroundColor DarkGray
@@ -345,10 +434,13 @@ function Show-InstallMenu {
     Write-Host "  [3] Dynamic Analysis Only" -ForegroundColor White
     Write-Host "      x64dbg with MCP plugins - No static analysis tools" -ForegroundColor DarkGray
     Write-Host ""
-    Write-Host "  [4] Custom Installation" -ForegroundColor White
+    Write-Host "  [4] Kernel Debugging" -ForegroundColor White
+    Write-Host "      WinDbg/CDB for kernel driver analysis + crash dumps" -ForegroundColor DarkGray
+    Write-Host ""
+    Write-Host "  [5] Custom Installation" -ForegroundColor White
     Write-Host "      Choose individual components to install" -ForegroundColor DarkGray
     Write-Host ""
-    Write-Host "  [5] Repair/Update Existing" -ForegroundColor White
+    Write-Host "  [6] Repair/Update Existing" -ForegroundColor White
     Write-Host "      Reinstall or update specific components" -ForegroundColor DarkGray
     Write-Host ""
     Write-Host "  [Q] Quit" -ForegroundColor DarkGray
@@ -377,8 +469,11 @@ function Show-CustomMenu {
     $x64dbgStatus = if ($Status.X64Dbg.Installed) { "[Installed]" } else { "" }
     Write-Host "  [3] x64dbg - Dynamic debugging/analysis $x64dbgStatus" -ForegroundColor White
 
-    Write-Host "  [4] Configure Claude Desktop" -ForegroundColor White
-    Write-Host "  [5] Configure Claude Code" -ForegroundColor White
+    $windbgStatus = if ($Status.WinDbg.Installed) { "[Installed]" } else { "" }
+    Write-Host "  [4] WinDbg - Kernel/user-mode debugging $windbgStatus" -ForegroundColor White
+
+    Write-Host "  [5] Configure Claude Desktop" -ForegroundColor White
+    Write-Host "  [6] Configure Claude Code" -ForegroundColor White
     Write-Host ""
     Write-Host "  [A] All components" -ForegroundColor Cyan
     Write-Host "  [B] Back to main menu" -ForegroundColor DarkGray
@@ -564,16 +659,35 @@ function Install-X64Dbg {
         Remove-Item -Recurse -Force $X64DbgDir
     }
 
-    try {
-        $x64dbgUrl = "https://github.com/x64dbg/x64dbg/releases/download/snapshot/snapshot_latest.zip"
-        $x64dbgZip = "$env:TEMP\x64dbg.zip"
+    $x64dbgZip = "$env:TEMP\x64dbg.zip"
 
-        Write-Info "Downloading x64dbg..."
-        Invoke-WebRequest -Uri $x64dbgUrl -OutFile $x64dbgZip -UseBasicParsing
+    try {
+        # Resolve actual snapshot asset name via GitHub API (no longer named snapshot_latest.zip)
+        Write-Info "Fetching latest x64dbg snapshot release..."
+        $snapshotRelease = Invoke-RestMethod "https://api.github.com/repos/x64dbg/x64dbg/releases/tags/snapshot"
+        $snapshotAsset = $snapshotRelease.assets | Where-Object {
+            $_.name -match "^snapshot_.*\.zip$" -and $_.name -notmatch "symbols"
+        } | Select-Object -First 1
+
+        if ($null -eq $snapshotAsset) {
+            Write-Err "Could not find x64dbg snapshot asset in release"
+            return $false
+        }
+
+        Write-Info "Downloading x64dbg ($($snapshotAsset.name))..."
+        Invoke-WebRequest -Uri $snapshotAsset.browser_download_url -OutFile $x64dbgZip -UseBasicParsing
         Write-Success "Downloaded x64dbg"
 
         Write-Info "Extracting x64dbg..."
         Expand-Archive -Path $x64dbgZip -DestinationPath $X64DbgDir -Force
+
+        # Verify extraction produced expected binaries
+        if (-not (Test-Path "$X64DbgDir\release\x64\x64dbg.exe")) {
+            Write-Err "Extraction succeeded but x64dbg.exe not found at expected path"
+            Write-Info "Expected: $X64DbgDir\release\x64\x64dbg.exe"
+            return $false
+        }
+
         Write-Success "x64dbg installed to: $X64DbgDir"
 
         [System.Environment]::SetEnvironmentVariable("X64DBG_HOME", $X64DbgDir, "User")
@@ -581,7 +695,7 @@ function Install-X64Dbg {
 
         Remove-Item $x64dbgZip -ErrorAction SilentlyContinue
 
-        # Install Obsidian plugins
+        # Install Obsidian MCP bridge plugins
         Write-Info "Installing Obsidian x64dbg plugins..."
         try {
             $pluginRelease = Get-LatestGitHubRelease "Sarks0/binary-mcp"
@@ -610,9 +724,166 @@ function Install-X64Dbg {
 
         return $true
     } catch {
+        Remove-Item $x64dbgZip -ErrorAction SilentlyContinue
         Write-Err "Failed to install x64dbg: $_"
         return $false
     }
+}
+
+function Install-WinDbg {
+    Write-Info "Setting up WinDbg/Debugging Tools..."
+
+    $existingPath = Find-WinDbgPath
+
+    if ($existingPath) {
+        Write-Success "WinDbg/CDB found at: $existingPath"
+        [System.Environment]::SetEnvironmentVariable("WINDBG_PATH", $existingPath, "User")
+        $env:WINDBG_PATH = $existingPath
+    } else {
+        $installed = $false
+
+        # Method 1: Windows SDK via winget (includes cdb.exe, kd.exe, windbg.exe)
+        if (-not $installed -and (Test-WingetAvailable)) {
+            Write-Info "Installing Windows SDK Debugging Tools via winget..."
+            $installed = Install-WithWinget -PackageId "Microsoft.WindowsSDK.10.0.26100" -PackageName "Windows SDK"
+
+            # Set default path for SDK debuggers
+            if ($installed) {
+                $sdkPath = "${env:ProgramFiles(x86)}\Windows Kits\10\Debuggers\x64"
+                if (Test-Path "$sdkPath\cdb.exe") {
+                    [System.Environment]::SetEnvironmentVariable("WINDBG_PATH", $sdkPath, "User")
+                    $env:WINDBG_PATH = $sdkPath
+                    Write-Success "CDB found at: $sdkPath"
+                }
+            }
+        }
+
+        # Method 2: WinDbg Preview via winget (modern UI, may not include standalone cdb.exe)
+        if (-not $installed -and (Test-WingetAvailable)) {
+            Write-Info "Trying WinDbg Preview via winget..."
+            $installed = Install-WithWinget -PackageId "Microsoft.WinDbg" -PackageName "WinDbg Preview"
+        }
+
+        # Method 3: Download Windows SDK installer and install just the debuggers
+        if (-not $installed) {
+            Write-Info "Attempting Windows SDK Debugging Tools standalone install..."
+            try {
+                $sdkSetup = "$env:TEMP\winsdksetup.exe"
+                Write-Info "Downloading Windows SDK installer..."
+                Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/?linkid=2173743" -OutFile $sdkSetup -UseBasicParsing
+
+                Write-Info "Installing Debugging Tools for Windows (silent)..."
+                $proc = Start-Process -FilePath $sdkSetup -ArgumentList "/features OptionId.WindowsDesktopDebuggers /quiet" -Wait -PassThru
+                if ($proc.ExitCode -eq 0) {
+                    Write-Success "Debugging Tools for Windows installed"
+                    $installed = $true
+                } else {
+                    Write-Warn "SDK installer exited with code: $($proc.ExitCode)"
+                }
+                Remove-Item $sdkSetup -ErrorAction SilentlyContinue
+            } catch {
+                Write-Warn "Failed to install via SDK: $_"
+            }
+        }
+
+        if (-not $installed) {
+            Write-Err "Could not install WinDbg automatically"
+            Write-Info "Manual installation options:"
+            Write-Info "  1. winget install Microsoft.WindowsSDK.10.0.26100"
+            Write-Info "  2. winget install Microsoft.WinDbg"
+            Write-Info "  3. Download Windows SDK: https://developer.microsoft.com/en-us/windows/downloads/windows-sdk/"
+            Write-Info "     Select 'Debugging Tools for Windows' during installation"
+            return $false
+        }
+
+        # Re-detect path after installation
+        $detectedPath = Find-WinDbgPath
+        if ($detectedPath) {
+            Write-Success "WinDbg detected at: $detectedPath"
+            [System.Environment]::SetEnvironmentVariable("WINDBG_PATH", $detectedPath, "User")
+            $env:WINDBG_PATH = $detectedPath
+        } else {
+            Write-Warn "WinDbg installed but could not auto-detect path"
+            Write-Info "Set WINDBG_PATH manually if needed"
+        }
+    }
+
+    # Install Pybag Python package (WinDbg COM API bridge)
+    Write-Info "Installing Pybag (WinDbg Python bridge)..."
+    $pybagInstalled = $false
+
+    # Method 1: Try uv sync --extra windbg (requires windbg extra in pyproject.toml)
+    Push-Location $InstallDir
+    try {
+        $syncOutput = & uv sync --extra dev --extra windbg 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            $pybagInstalled = $true
+            Write-Success "Pybag installed successfully via uv sync"
+        } else {
+            Write-Warn "uv sync --extra windbg failed (exit $LASTEXITCODE)"
+        }
+    } catch {
+        Write-Warn "uv sync --extra windbg error: $_"
+    }
+    Pop-Location
+
+    # Method 2: Fall back to uv pip install if extra is not defined yet
+    if (-not $pybagInstalled) {
+        Push-Location $InstallDir
+        try {
+            Write-Info "Falling back to direct pybag install..."
+            $pipOutput = & uv pip install "pybag>=2.2.16" 2>&1
+            if ($LASTEXITCODE -eq 0) {
+                $pybagInstalled = $true
+                Write-Success "Pybag installed successfully via uv pip"
+            } else {
+                Write-Warn "uv pip install failed (exit code $LASTEXITCODE): $pipOutput"
+            }
+        } catch {
+            Write-Warn "Failed to install Pybag: $_"
+        }
+        Pop-Location
+    }
+
+    if (-not $pybagInstalled) {
+        Write-Err "Could not install Pybag automatically"
+        Write-Info "Install manually: uv pip install pybag"
+    }
+
+    # Enable kernel debugging via bcdedit (requires reboot to take effect)
+    Write-Info "Checking kernel debug mode..."
+    try {
+        $bcdeditOutput = bcdedit /enum "{current}" 2>&1 | Out-String
+        if ($bcdeditOutput -match "debug\s+Yes") {
+            Write-Success "Kernel debug mode is already enabled"
+        } else {
+            Write-Info "Enabling kernel debug mode (bcdedit -debug on)..."
+            $debugResult = bcdedit -debug on 2>&1 | Out-String
+            if ($LASTEXITCODE -eq 0) {
+                Write-Success "Kernel debug mode enabled"
+                Write-Warn "A reboot is required for kernel debugging to take effect"
+                Write-Info "Run: shutdown /r /t 0"
+            } else {
+                if ($debugResult -match "Secure Boot|secure boot|0xc0000428") {
+                    Write-Err "Cannot enable kernel debugging: Secure Boot is enabled"
+                    Write-Info "To fix this:"
+                    Write-Info "  1. Restart your PC and enter BIOS/UEFI settings"
+                    Write-Info "  2. Navigate to Security > Secure Boot"
+                    Write-Info "  3. Set Secure Boot to Disabled"
+                    Write-Info "  4. Save and exit BIOS"
+                    Write-Info "  5. Re-run this installer or manually run: bcdedit -debug on"
+                } else {
+                    Write-Warn "bcdedit -debug on failed: $debugResult"
+                    Write-Info "Try running this installer as Administrator"
+                }
+            }
+        }
+    } catch {
+        Write-Warn "Could not check/set kernel debug mode: $_"
+        Write-Info "Manually run as Administrator: bcdedit -debug on"
+    }
+
+    return $true
 }
 
 function Install-BinaryMCP {
@@ -669,6 +940,38 @@ function Install-BinaryMCP {
     }
 }
 
+function Get-McpServerConfig {
+    # Build MCP server config with env vars for all detected/installed tools
+    $envVars = @{}
+
+    if ($env:GHIDRA_HOME -and (Test-Path $env:GHIDRA_HOME)) {
+        $envVars["GHIDRA_HOME"] = $env:GHIDRA_HOME
+    } elseif (Test-Path $GhidraDir) {
+        $envVars["GHIDRA_HOME"] = $GhidraDir
+    }
+
+    if ($env:X64DBG_HOME -and (Test-Path $env:X64DBG_HOME)) {
+        $envVars["X64DBG_HOME"] = $env:X64DBG_HOME
+    } elseif (Test-Path $X64DbgDir) {
+        $envVars["X64DBG_HOME"] = $X64DbgDir
+    }
+
+    if ($env:WINDBG_PATH) {
+        $envVars["WINDBG_PATH"] = $env:WINDBG_PATH
+    }
+
+    $serverConfig = @{
+        command = "uv"
+        args = @("--directory", $InstallDir, "run", "python", "-m", "src.server")
+    }
+
+    if ($envVars.Count -gt 0) {
+        $serverConfig["env"] = $envVars
+    }
+
+    return $serverConfig
+}
+
 function Configure-ClaudeDesktop {
     Write-Info "Configuring Claude Desktop..."
 
@@ -694,16 +997,14 @@ function Configure-ClaudeDesktop {
             $config | Add-Member -MemberType NoteProperty -Name "mcpServers" -Value @{} -Force
         }
 
-        $config.mcpServers | Add-Member -MemberType NoteProperty -Name "binary-mcp" -Value @{
-            command = "uv"
-            args = @("--directory", $InstallDir, "run", "python", "-m", "src.server")
-        } -Force
+        $serverConfig = Get-McpServerConfig
+        $config.mcpServers | Add-Member -MemberType NoteProperty -Name "binary-mcp" -Value $serverConfig -Force
 
         # Write JSON with UTF-8 encoding WITHOUT BOM (required for Claude Desktop compatibility)
         # Note: PowerShell 5.1's -Encoding UTF8 adds BOM, so we use .NET directly
         $jsonContent = $config | ConvertTo-Json -Depth 10
         [System.IO.File]::WriteAllText($claudeConfigFile, $jsonContent, [System.Text.UTF8Encoding]::new($false))
-        Write-Success "Claude Desktop configured"
+        Write-Success "Claude Desktop configured at: $claudeConfigFile"
         return $true
     } catch {
         Write-Err "Failed to configure Claude Desktop: $_"
@@ -714,8 +1015,9 @@ function Configure-ClaudeDesktop {
 function Configure-ClaudeCode {
     Write-Info "Configuring Claude Code..."
 
-    $claudeCodeConfigDir = "$env:USERPROFILE\.config\claude-code"
-    $claudeCodeConfigFile = "$claudeCodeConfigDir\mcp_settings.json"
+    # Claude Code reads settings from ~/.claude/settings.json (not ~/.config/claude-code/)
+    $claudeCodeConfigDir = "$env:USERPROFILE\.claude"
+    $claudeCodeConfigFile = "$claudeCodeConfigDir\settings.json"
 
     if (-not (Test-Path $claudeCodeConfigDir)) {
         New-Item -ItemType Directory -Path $claudeCodeConfigDir -Force | Out-Null
@@ -729,23 +1031,22 @@ function Configure-ClaudeCode {
             Copy-Item $claudeCodeConfigFile "$claudeCodeConfigFile.backup" -Force
             Write-Info "Backup saved to: $claudeCodeConfigFile.backup"
         } else {
-            $config = [PSCustomObject]@{ mcpServers = @{} }
+            $config = [PSCustomObject]@{}
         }
 
+        # Add mcpServers key if it doesn't exist (settings.json has other keys too)
         if (-not $config.mcpServers) {
             $config | Add-Member -MemberType NoteProperty -Name "mcpServers" -Value @{} -Force
         }
 
-        $config.mcpServers | Add-Member -MemberType NoteProperty -Name "binary-mcp" -Value @{
-            command = "uv"
-            args = @("--directory", $InstallDir, "run", "python", "-m", "src.server")
-        } -Force
+        $serverConfig = Get-McpServerConfig
+        $config.mcpServers | Add-Member -MemberType NoteProperty -Name "binary-mcp" -Value $serverConfig -Force
 
         # Write JSON with UTF-8 encoding WITHOUT BOM (required for compatibility)
         # Note: PowerShell 5.1's -Encoding UTF8 adds BOM, so we use .NET directly
         $jsonContent = $config | ConvertTo-Json -Depth 10
         [System.IO.File]::WriteAllText($claudeCodeConfigFile, $jsonContent, [System.Text.UTF8Encoding]::new($false))
-        Write-Success "Claude Code configured"
+        Write-Success "Claude Code configured at: $claudeCodeConfigFile"
         return $true
     } catch {
         Write-Err "Failed to configure Claude Code: $_"
@@ -774,6 +1075,9 @@ function Show-Summary {
     if ($Installed.X64Dbg) {
         Write-Success "x64dbg: $X64DbgDir"
     }
+    if ($Installed.WinDbg) {
+        Write-Success "WinDbg: Kernel debugging ready"
+    }
     if ($Installed.ClaudeDesktop) {
         Write-Success "Claude Desktop: Configured"
     }
@@ -798,6 +1102,12 @@ function Show-Summary {
     if ($Installed.X64Dbg) {
         Write-Host "  3. For dynamic analysis: Launch x64dbg and load a binary" -ForegroundColor White
         Write-Host "     - x64dbg.exe for 64-bit, x32dbg.exe for 32-bit" -ForegroundColor DarkGray
+    }
+
+    if ($Installed.WinDbg) {
+        Write-Host "  4. For kernel debugging:" -ForegroundColor White
+        Write-Host "     - Crash dumps: 'Analyze the crash dump at C:\path\to\MEMORY.DMP'" -ForegroundColor DarkGray
+        Write-Host "     - Live kernel: 'Connect to kernel debugger on port 50000'" -ForegroundColor DarkGray
     }
 
     Write-Host ""
@@ -933,6 +1243,7 @@ $installed = @{
     Ghidra = $false
     DotNet = $false
     X64Dbg = $false
+    WinDbg = $false
     ClaudeDesktop = $false
     ClaudeCode = $false
 }
@@ -944,13 +1255,14 @@ if ($InstallProfile) {
         "full"    { "1" }
         "static"  { "2" }
         "dynamic" { "3" }
-        "custom"  { "4" }
-        "repair"  { "5" }
+        "kernel"  { "4" }
+        "custom"  { "5" }
+        "repair"  { "6" }
         default   { $InstallProfile }
     }
 } else {
     Show-InstallMenu
-    $selection = Get-UserSelection "Enter choice (1-5, Q to quit)"
+    $selection = Get-UserSelection "Enter choice (1-6, Q to quit)"
 }
 
 switch ($selection.ToLower()) {
@@ -977,6 +1289,7 @@ switch ($selection.ToLower()) {
         }
 
         $installed.X64Dbg = Install-X64Dbg
+        $installed.WinDbg = Install-WinDbg
         $installed.ClaudeDesktop = Configure-ClaudeDesktop
         $installed.ClaudeCode = Configure-ClaudeCode
     }
@@ -1015,7 +1328,18 @@ switch ($selection.ToLower()) {
         $installed.ClaudeDesktop = Configure-ClaudeDesktop
     }
 
-    { $_ -in "4", "custom" } {
+    { $_ -in "4", "kernel" } {
+        # Kernel debugging
+        Write-Host ""
+        Write-Info "Starting Kernel Debugging Installation..."
+        Write-Host ""
+
+        $installed.BinaryMCP = Install-BinaryMCP
+        $installed.WinDbg = Install-WinDbg
+        $installed.ClaudeDesktop = Configure-ClaudeDesktop
+    }
+
+    { $_ -in "5", "custom" } {
         # Custom installation
         Show-CustomMenu $status
         $customSelection = Get-UserSelection "Enter components"
@@ -1028,7 +1352,7 @@ switch ($selection.ToLower()) {
         }
 
         $components = if ($customSelection.ToLower() -eq "a") {
-            @("1", "2", "3", "4", "5")
+            @("1", "2", "3", "4", "5", "6")
         } else {
             $customSelection -split "," | ForEach-Object { $_.Trim() }
         }
@@ -1057,13 +1381,14 @@ switch ($selection.ToLower()) {
                     }
                 }
                 "3" { $installed.X64Dbg = Install-X64Dbg }
-                "4" { $installed.ClaudeDesktop = Configure-ClaudeDesktop }
-                "5" { $installed.ClaudeCode = Configure-ClaudeCode }
+                "4" { $installed.WinDbg = Install-WinDbg }
+                "5" { $installed.ClaudeDesktop = Configure-ClaudeDesktop }
+                "6" { $installed.ClaudeCode = Configure-ClaudeCode }
             }
         }
     }
 
-    { $_ -in "5", "repair" } {
+    { $_ -in "6", "repair" } {
         # Repair/Update
         Write-Host ""
         Write-Info "Repair/Update Mode"
@@ -1084,8 +1409,9 @@ switch ($selection.ToLower()) {
                 "1" { $installed.Ghidra = Install-Ghidra }
                 "2" { $installed.DotNet = Install-DotNetTools }
                 "3" { $installed.X64Dbg = Install-X64Dbg }
-                "4" { $installed.ClaudeDesktop = Configure-ClaudeDesktop }
-                "5" { $installed.ClaudeCode = Configure-ClaudeCode }
+                "4" { $installed.WinDbg = Install-WinDbg }
+                "5" { $installed.ClaudeDesktop = Configure-ClaudeDesktop }
+                "6" { $installed.ClaudeCode = Configure-ClaudeCode }
             }
         }
     }

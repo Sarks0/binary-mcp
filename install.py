@@ -2,6 +2,7 @@
 """
 Binary MCP Server - Cross-Platform Installer
 Interactive installation script for Linux and macOS with full tooling support.
+by Rhys Downing
 """
 
 import argparse

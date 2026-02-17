@@ -73,6 +73,19 @@ class ErrorCode(str, Enum):
     API_ERROR = "API_ERROR"
     API_NOT_IMPLEMENTED = "API_NOT_IMPLEMENTED"
 
+    # Kernel debugging errors
+    KERNEL_NOT_CONNECTED = "KERNEL_NOT_CONNECTED"
+    KERNEL_TARGET_UNAVAILABLE = "KERNEL_TARGET_UNAVAILABLE"
+    KERNEL_DUMP_INVALID = "KERNEL_DUMP_INVALID"
+    KERNEL_DRIVER_NOT_FOUND = "KERNEL_DRIVER_NOT_FOUND"
+    KERNEL_IOCTL_INVALID = "KERNEL_IOCTL_INVALID"
+
+    # WinDbg errors
+    WINDBG_NOT_FOUND = "WINDBG_NOT_FOUND"
+    WINDBG_COMMAND_FAILED = "WINDBG_COMMAND_FAILED"
+    WINDBG_COMMAND_TIMEOUT = "WINDBG_COMMAND_TIMEOUT"
+    WINDBG_PARSE_ERROR = "WINDBG_PARSE_ERROR"
+
     # General errors
     UNKNOWN_ERROR = "UNKNOWN_ERROR"
     OPERATION_FAILED = "OPERATION_FAILED"
@@ -260,6 +273,60 @@ DISASSEMBLY_SUGGESTIONS = {
         "The bytes at this address may not be valid x86/x64 instructions",
         "You may be disassembling data or the middle of an instruction",
         "Check the function prologue to find the correct start address",
+    ],
+}
+
+KERNEL_SUGGESTIONS = {
+    "not_connected": [
+        "Ensure the kernel debugger connection is established via KDNET or serial",
+        "Verify KDNET configuration: bcdedit /dbgsettings (on target machine)",
+        "Check that the target machine is waiting for a debugger connection",
+        "Try restarting the target machine with debugging enabled",
+    ],
+    "target_unavailable": [
+        "The kernel debug target may have crashed or rebooted",
+        "Check the physical connection (network/serial/USB) to the target",
+        "Verify the target is configured for kernel debugging with bcdedit",
+    ],
+    "dump_invalid": [
+        "Verify the dump file is a valid Windows kernel dump (.dmp)",
+        "Check if the dump file is corrupted or truncated",
+        "Ensure the dump was created with a compatible Windows version",
+        "Try opening the dump with WinDbg directly to verify integrity",
+    ],
+    "driver_not_found": [
+        "Verify the driver name and check if it is loaded with 'lm' command",
+        "The driver may not be loaded yet; set a breakpoint on DriverEntry",
+        "Check driver load order and dependencies",
+    ],
+    "ioctl_invalid": [
+        "Verify the IOCTL code format (use CTL_CODE macro components)",
+        "Check the device type, function code, method, and access fields",
+        "Cross-reference with the driver's IRP_MJ_DEVICE_CONTROL handler",
+    ],
+}
+
+WINDBG_SUGGESTIONS = {
+    "not_found": [
+        "Install the Windows SDK or WinDbg Preview from the Microsoft Store",
+        "Ensure WinDbg is in your system PATH or set the WINDBG_PATH environment variable",
+        "Download WinDbg Preview: https://aka.ms/windbg/download",
+        "Check both 'C:\\Program Files (x86)\\Windows Kits\\10\\Debuggers' and Microsoft Store paths",
+    ],
+    "command_failed": [
+        "Check the command syntax using WinDbg '.help' command",
+        "Ensure the debugger is in the correct state for this command",
+        "Some commands require the target to be broken in (use 'break' first)",
+    ],
+    "command_timeout": [
+        "The command may be waiting for target interaction; try breaking in",
+        "Increase the command timeout if the operation is expected to be slow",
+        "Check if the target is hung or unresponsive",
+    ],
+    "parse_error": [
+        "The WinDbg output format may have changed; check the raw output",
+        "Verify the command produced expected output before parsing",
+        "Report this as a bug if the WinDbg version is supported",
     ],
 }
 
@@ -606,6 +673,83 @@ def create_parameter_error(
             "provided": provided_value,
             "expected": expected,
             "valid_values": valid_values,
+        },
+    )
+
+
+# =============================================================================
+# Kernel / WinDbg Error Factory Functions
+# =============================================================================
+
+
+def create_windbg_not_found_error(
+    search_paths: list[str] | None = None,
+) -> StructuredError:
+    """Create error for WinDbg not found on the system."""
+    debug_info: dict[str, Any] = {}
+    if search_paths:
+        debug_info["search_paths"] = search_paths
+
+    return StructuredError(
+        error=ErrorCode.WINDBG_NOT_FOUND,
+        message="WinDbg debugger not found",
+        reason="Could not locate a WinDbg installation on this system",
+        suggestions=WINDBG_SUGGESTIONS["not_found"],
+        debug_info=debug_info,
+    )
+
+
+def create_kernel_not_connected_error(
+    target: str | None = None,
+    connection_type: str | None = None,
+    connection_error: str | None = None,
+) -> StructuredError:
+    """Create error for kernel debugger connection failure."""
+    debug_info: dict[str, Any] = {}
+    if target:
+        debug_info["target"] = target
+    if connection_type:
+        debug_info["connection_type"] = connection_type
+    if connection_error:
+        debug_info["connection_error"] = connection_error
+
+    return StructuredError(
+        error=ErrorCode.KERNEL_NOT_CONNECTED,
+        message="Kernel debugger is not connected to a target",
+        reason=connection_error or "No active kernel debugging session",
+        suggestions=KERNEL_SUGGESTIONS["not_connected"],
+        debug_info=debug_info,
+    )
+
+
+def create_kernel_driver_not_found_error(
+    driver_name: str,
+) -> StructuredError:
+    """Create error for kernel driver not found."""
+    return StructuredError(
+        error=ErrorCode.KERNEL_DRIVER_NOT_FOUND,
+        message=f"Kernel driver not found: '{driver_name}'",
+        reason=f"The driver '{driver_name}' is not loaded in the target system",
+        suggestions=KERNEL_SUGGESTIONS["driver_not_found"],
+        debug_info={
+            "driver_name": driver_name,
+        },
+    )
+
+
+def create_windbg_command_failed_error(
+    command: str,
+    output: str,
+) -> StructuredError:
+    """Create error for a failed WinDbg command execution."""
+    return StructuredError(
+        error=ErrorCode.WINDBG_COMMAND_FAILED,
+        message=f"WinDbg command failed: '{command}'",
+        reason="Command produced an error or unexpected output",
+        suggestions=WINDBG_SUGGESTIONS["command_failed"],
+        debug_info={
+            "command": command,
+            "output": output,
         },
     )
 

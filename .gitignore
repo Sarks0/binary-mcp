@@ -65,6 +65,7 @@ samples/a.out
 # Logs
 *.log
 logs/
+errors/
 
 # Temporary files
 *.tmp
@@ -91,3 +92,5 @@ logs/
 
 # Security reviews (internal only)
 security/
+DEVELOPMENT_ROADMAP.md
+WINDBG_INTEGRATION_PLAN.md

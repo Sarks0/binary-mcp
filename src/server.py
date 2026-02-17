@@ -26,6 +26,7 @@ from src.tools.dynamic_tools import register_dynamic_tools
 from src.tools.reporting import register_reporting_tools
 from src.tools.triage_tools import register_triage_tools
 from src.tools.vt_tools import register_vt_tools
+from src.tools.windbg_tools import register_windbg_tools
 from src.tools.yara_tools import register_yara_tools
 from src.utils.compatibility import (
     BinaryCompatibilityChecker,
@@ -2864,6 +2865,9 @@ def main():
 
     # Register dynamic analysis tools (with session logging)
     register_dynamic_tools(app, session_manager)
+
+    # Register WinDbg kernel debugging tools (with session logging)
+    register_windbg_tools(app, session_manager)
 
     # Register VirusTotal tools
     register_vt_tools(app, session_manager)

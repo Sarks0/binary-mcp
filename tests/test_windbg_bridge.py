@@ -486,6 +486,36 @@ class TestCDBBannerFilter:
         assert "Module list:" in result
         assert "nt" in result
 
+    def test_filters_kd_session_banner_and_natvis(self):
+        """Real KD local kernel output has session banner + NatVis teardown."""
+        output = (
+            "Connected to Windows 10 26100 x64 target at (Tue Feb 17 09:51:25.172 2026), ptr64 TRUE\n"
+            "Product: WinNt, suite: TerminalServer SingleUserTS\n"
+            "Edition build lab: 26100.1.amd64fre.ge_release.240331-1435\n"
+            "Kernel base = 0xfffff802`da000000 PsLoadedModuleList = 0xfffff802`daef5040\n"
+            "Debug session time: Tue Feb 17 09:51:25.281 2026 (UTC + 0:00)\n"
+            "System Uptime: 0 days 0:26:28.960\n"
+            "lkd> kd: Reading initial command 'u nt!KeBugCheckEx; q'\n"
+            "nt!KeBugCheckEx:\n"
+            "fffff802`da4fb8c0 48894c2408      mov     qword ptr [rsp+8],rcx\n"
+            "fffff802`da4fb8c5 4889542410      mov     qword ptr [rsp+10h],rdx\n"
+            "NatVis script unloaded from 'C:\\Debuggers\\Visualizers\\stl.natvis'\n"
+            "NatVis script unloaded from 'C:\\Debuggers\\Visualizers\\windows.natvis'\n"
+        )
+        result = WinDbgBridge._filter_cdb_banner(output)
+        assert "Connected to Windows" not in result
+        assert "Product:" not in result
+        assert "Edition build lab" not in result
+        assert "Kernel base" not in result
+        assert "Debug session time" not in result
+        assert "System Uptime" not in result
+        assert "lkd>" not in result
+        assert "Reading initial command" not in result
+        assert "NatVis" not in result
+        # Actual command output preserved
+        assert "nt!KeBugCheckEx:" in result
+        assert "mov" in result
+
 
 class TestCDBErrorDetection:
     """Test _check_cdb_error() error pattern matching."""

@@ -803,6 +803,16 @@ class WinDbgBridge(Debugger):
             "EnableRedirect",
             "----> Repository",
             "-- Configuring",
+            # KD session banner (local kernel)
+            "Connected to ",
+            "Product:",
+            "Edition build lab:",
+            "Kernel base",
+            "Debug session time:",
+            "System Uptime:",
+            # NatVis teardown noise
+            "NatVis script unloaded from",
+            "NatVis script loaded from",
         )
 
         for line in lines:
@@ -813,6 +823,10 @@ class WinDbgBridge(Debugger):
                 or stripped in ("quit:", "q")
                 or "dbgeng" in stripped.lower()
                 or "Debugger Extensions Gallery" in stripped
+                # KD prompt + command echo: "lkd> kd: Reading initial command '...'"
+                or stripped.startswith("lkd>")
+                or stripped.startswith("kd>")
+                or "kd: Reading initial command" in stripped
                 or any(stripped.startswith(p) for p in noise_prefixes)
             ):
                 continue

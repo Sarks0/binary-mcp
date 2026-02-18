@@ -76,16 +76,17 @@ class WinDbgCommands:
         ]
         if self.bridge._is_local_kernel:
             if getattr(self.bridge, "_local_kernel_limited", False):
-                lines.append("Connection: local kernel (limited - bcdedit not enabled)")
+                lines.append("Connection: local kernel (limited - no modules returned)")
                 lines.append(
-                    "Warning: Data access limited. For full access run "
-                    "'bcdedit -debug on', reboot, and run as Administrator."
+                    "Warning: Module listing failed. Ensure 'bcdedit -debug on' "
+                    "is set, reboot, and run as Administrator."
                 )
             else:
-                lines.append("Connection: local kernel (inspection mode)")
+                lines.append("Connection: local kernel (read-only inspection)")
                 lines.append(
-                    "Note: Memory, registers, modules, and symbols are available. "
-                    "Execution control (breakpoints, stepping) requires a remote KDNET connection."
+                    "Note: Memory read, modules, and symbols are available. "
+                    "Registers and execution control (breakpoints, stepping) "
+                    "require a remote KDNET connection to a separate target."
                 )
         if self.bridge._binary_path:
             lines.append(f"Target: {self.bridge._binary_path}")

@@ -448,18 +448,16 @@ class WinDbgBridge(Debugger):
 
     @_trace
     def connect_kernel_local(self) -> bool:
-        """Attach to the local kernel for inspection.
+        """Attach to the local kernel for read-only inspection.
 
-        Local kernel debugging provides full read access to memory,
-        registers, modules, and symbols when ``bcdedit -debug on`` is
-        set and the session runs as Administrator.  Execution control
-        (breakpoints, stepping, halting) is not available — that
-        requires a remote KDNET connection to a separate target.
+        Local kernel debugging provides read access to memory, modules,
+        and symbols when ``bcdedit -debug on`` is set and the session
+        runs as Administrator.
 
-        Pybag's KernelDbg.attach("local") can partially succeed even
-        without ``bcdedit -debug on``.  We allow the connection and
-        log a warning if data access appears limited, rather than
-        rejecting the session outright.
+        Registers and execution control (breakpoints, stepping, halting)
+        are NOT available in local mode — the debugger cannot break into
+        a kernel it is running on.  Those features require a remote
+        KDNET connection to a separate target machine.
         """
         self._require_windows()
         self._require_pybag()
@@ -471,17 +469,28 @@ class WinDbgBridge(Debugger):
             self._state = DebuggerState.PAUSED
             self._is_local_kernel = True
 
-            # --- Soft validation: warn if data access is limited ---
+            # --- Soft validation: check if module listing works ---
+            # Only test module_list() — register reads (get_pc) always
+            # fail in local kernel mode because you cannot break into
+            # the kernel when debugging locally.  That is a fundamental
+            # Windows limitation, not a sign that bcdedit debug is off.
             self._local_kernel_limited = False
             try:
                 modules = self._dbg.module_list()
                 if not modules:
-                    self._dbg.reg.get_pc()
+                    # No modules returned — debug may not be enabled
+                    self._local_kernel_limited = True
+                    logger.warning(
+                        "Local kernel connected but no modules returned. "
+                        "Ensure bcdedit -debug on is set and you are "
+                        "running as Administrator."
+                    )
             except Exception:
                 self._local_kernel_limited = True
                 logger.warning(
-                    "Local kernel connected but data access is limited. "
-                    "For full access: bcdedit -debug on, reboot, run as Admin."
+                    "Local kernel connected but module listing failed. "
+                    "Ensure bcdedit -debug on is set and you are "
+                    "running as Administrator."
                 )
 
             logger.info("Connected to local kernel (inspection mode)")
@@ -533,13 +542,23 @@ class WinDbgBridge(Debugger):
             try:
                 # Pybag uses cmd() not exec_command() for command execution
                 raw = str(self._dbg.cmd(command))
-                return self._filter_cdb_banner(raw)
+                logger.debug(
+                    "Pybag cmd() returned %d chars for '%s'",
+                    len(raw), command[:60],
+                )
+                result = self._filter_cdb_banner(raw)
+                logger.debug(
+                    "After banner filter: %d -> %d chars",
+                    len(raw), len(result),
+                )
+                return result
             except Exception as exc:
                 logger.warning(
                     "Pybag cmd() failed for '%s', falling back to CDB: %s",
                     command, exc,
                 )
                 return self._execute_cdb_command(command)
+        logger.debug("No Pybag connection, using CDB subprocess for '%s'", command[:60])
         return self._execute_cdb_command(command)
 
     @_trace
@@ -813,14 +832,22 @@ class WinDbgBridge(Debugger):
         setup text before the actual banner.  We filter all known noise
         patterns and also detect fatal errors (e.g. kernel debugging not
         enabled) so they surface cleanly.
+
+        Uses both prefix matching and substring matching for robustness
+        against encoding quirks (BOM, invisible chars) from Pybag/KD.
         """
         if not output:
             return output
 
+        # Normalize encoding: strip BOM and null bytes that Pybag/COM
+        # objects may include, and normalize line endings
+        output = output.lstrip("\ufeff\ufffe\x00")
+        output = output.replace("\r\n", "\n").replace("\r", "\n")
+
         lines = output.splitlines()
         filtered: list[str] = []
 
-        # Patterns that are always noise (anywhere in output)
+        # Patterns matched via startswith on stripped lines
         noise_prefixes = (
             "Microsoft (R)",
             "Copyright",
@@ -854,22 +881,50 @@ class WinDbgBridge(Debugger):
             "NatVis script loaded from",
         )
 
+        # Substring patterns: catch lines even if prefix matching fails
+        # due to leading invisible chars, prompts, or encoding issues
+        noise_substrings = (
+            "Connected to Windows",
+            "Product: WinNt",
+            "Edition build lab:",
+            "Kernel base =",
+            "PsLoadedModuleList =",
+            "Debug session time:",
+            "System Uptime:",
+            "NatVis script unloaded",
+            "NatVis script loaded",
+            "Debugger Extensions Gallery",
+            "kd: Reading initial command",
+            "ptr64 TRUE",
+            "ptr64 FALSE",
+            "dbgeng",
+        )
+
         for line in lines:
             stripped = line.strip()
+            # Strip any remaining non-printable chars for matching
+            cleaned = "".join(c for c in stripped if c.isprintable() or c == " ")
             # Skip empty lines, quit echo, and known noise
             if (
-                stripped == ""
-                or stripped in ("quit:", "q")
-                or "dbgeng" in stripped.lower()
-                or "Debugger Extensions Gallery" in stripped
-                # KD prompt + command echo: "lkd> kd: Reading initial command '...'"
-                or stripped.startswith("lkd>")
-                or stripped.startswith("kd>")
-                or "kd: Reading initial command" in stripped
-                or any(stripped.startswith(p) for p in noise_prefixes)
+                cleaned == ""
+                or cleaned in ("quit:", "q")
+                # KD prompt + command echo
+                or cleaned.startswith("lkd>")
+                or cleaned.startswith("kd>")
+                # Prefix-based matching
+                or any(cleaned.startswith(p) for p in noise_prefixes)
+                # Substring-based fallback matching
+                or any(sub in cleaned for sub in noise_substrings)
             ):
+                logger.debug("Banner filter: dropped line: %s", stripped[:80])
                 continue
             filtered.append(line)
+
+        if not filtered and lines:
+            logger.debug(
+                "Banner filter: all %d lines filtered (command may have "
+                "returned no output beyond the banner)", len(lines),
+            )
 
         return "\n".join(filtered)
 

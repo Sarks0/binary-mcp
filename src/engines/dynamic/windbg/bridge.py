@@ -448,18 +448,16 @@ class WinDbgBridge(Debugger):
 
     @_trace
     def connect_kernel_local(self) -> bool:
-        """Attach to the local kernel for inspection.
+        """Attach to the local kernel for read-only inspection.
 
-        Local kernel debugging provides full read access to memory,
-        registers, modules, and symbols when ``bcdedit -debug on`` is
-        set and the session runs as Administrator.  Execution control
-        (breakpoints, stepping, halting) is not available — that
-        requires a remote KDNET connection to a separate target.
+        Local kernel debugging provides read access to memory, modules,
+        and symbols when ``bcdedit -debug on`` is set and the session
+        runs as Administrator.
 
-        Pybag's KernelDbg.attach("local") can partially succeed even
-        without ``bcdedit -debug on``.  We allow the connection and
-        log a warning if data access appears limited, rather than
-        rejecting the session outright.
+        Registers and execution control (breakpoints, stepping, halting)
+        are NOT available in local mode — the debugger cannot break into
+        a kernel it is running on.  Those features require a remote
+        KDNET connection to a separate target machine.
         """
         self._require_windows()
         self._require_pybag()
@@ -471,17 +469,28 @@ class WinDbgBridge(Debugger):
             self._state = DebuggerState.PAUSED
             self._is_local_kernel = True
 
-            # --- Soft validation: warn if data access is limited ---
+            # --- Soft validation: check if module listing works ---
+            # Only test module_list() — register reads (get_pc) always
+            # fail in local kernel mode because you cannot break into
+            # the kernel when debugging locally.  That is a fundamental
+            # Windows limitation, not a sign that bcdedit debug is off.
             self._local_kernel_limited = False
             try:
                 modules = self._dbg.module_list()
                 if not modules:
-                    self._dbg.reg.get_pc()
+                    # No modules returned — debug may not be enabled
+                    self._local_kernel_limited = True
+                    logger.warning(
+                        "Local kernel connected but no modules returned. "
+                        "Ensure bcdedit -debug on is set and you are "
+                        "running as Administrator."
+                    )
             except Exception:
                 self._local_kernel_limited = True
                 logger.warning(
-                    "Local kernel connected but data access is limited. "
-                    "For full access: bcdedit -debug on, reboot, run as Admin."
+                    "Local kernel connected but module listing failed. "
+                    "Ensure bcdedit -debug on is set and you are "
+                    "running as Administrator."
                 )
 
             logger.info("Connected to local kernel (inspection mode)")

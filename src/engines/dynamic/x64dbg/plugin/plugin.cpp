@@ -151,6 +151,7 @@ static HANDLE g_serverProcess = nullptr;
 static HANDLE g_pipeServer = INVALID_HANDLE_VALUE;
 static HANDLE g_pipeThread = nullptr;
 static HANDLE g_shutdownEvent = nullptr;  // Event to signal shutdown
+static HANDLE g_pipeReadyEvent = nullptr;  // Event signaled when pipe is created
 static bool g_running = false;
 
 // ============================================================================
@@ -3667,6 +3668,11 @@ static DWORD WINAPI PipeServerThread(LPVOID lpParam) {
             return 1;
         }
 
+        // Signal that pipe is ready for server to connect
+        if (g_pipeReadyEvent) {
+            SetEvent(g_pipeReadyEvent);
+        }
+
         LogInfo("Waiting for HTTP server to connect...");
 
         // Use overlapped I/O for interruptible ConnectNamedPipe
@@ -4051,7 +4057,20 @@ static bool SpawnHTTPServer() {
     char serverPath[MAX_PATH];
     snprintf(serverPath, MAX_PATH, "%sobsidian_server.exe", pluginPath);
 
+    // Verify server executable exists before attempting to spawn
+    DWORD fileAttrib = GetFileAttributesA(serverPath);
+    if (fileAttrib == INVALID_FILE_ATTRIBUTES) {
+        LogError("Server executable not found: %s", serverPath);
+        LogError("Make sure obsidian_server.exe is in the same directory as the plugin");
+        LogError("GetFileAttributes error: %d", GetLastError());
+        return false;
+    }
+
     LogInfo("Spawning Obsidian server: %s", serverPath);
+
+    // Build command line (lpCommandLine must be writable per MSDN)
+    char cmdLine[MAX_PATH + 2];
+    snprintf(cmdLine, sizeof(cmdLine), "\"%s\"", serverPath);
 
     // Spawn process
     STARTUPINFOA si = {};
@@ -4059,26 +4078,53 @@ static bool SpawnHTTPServer() {
     PROCESS_INFORMATION pi = {};
 
     if (!CreateProcessA(
-        serverPath,
-        nullptr,  // Command line
-        nullptr,  // Process attributes
-        nullptr,  // Thread attributes
-        FALSE,    // Inherit handles
-        0,        // Creation flags
-        nullptr,  // Environment
-        nullptr,  // Current directory
+        nullptr,       // lpApplicationName: NULL so lpCommandLine is used
+        cmdLine,       // Command line (writable buffer, quoted for spaces)
+        nullptr,       // Process attributes
+        nullptr,       // Thread attributes
+        FALSE,         // Inherit handles
+        CREATE_NO_WINDOW,  // Server is headless - no console window needed
+        nullptr,       // Environment
+        pluginPath,    // Current directory: plugin directory
         &si,
         &pi
     )) {
-        LogError("Failed to spawn Obsidian server: %d", GetLastError());
-        LogError("Make sure obsidian_server.exe is in the same directory as the plugin");
+        DWORD err = GetLastError();
+        LogError("Failed to spawn Obsidian server (error %d)", err);
+        if (err == 740) {
+            LogError("Error 740: Elevation required. Try running x64dbg as Administrator.");
+        } else if (err == 2) {
+            LogError("Error 2: File not found. Check that obsidian_server.exe exists.");
+        } else if (err == 5) {
+            LogError("Error 5: Access denied. Smart App Control or antivirus may be blocking the executable.");
+        } else if (err == 1260) {
+            LogError("Error 1260: Blocked by group policy or Smart App Control.");
+        }
         return false;
     }
 
     g_serverProcess = pi.hProcess;
     CloseHandle(pi.hThread);  // Don't need thread handle
 
-    LogInfo("HTTP server process started (PID: %d)", pi.dwProcessId);
+    // Verify the process is still alive after a brief moment
+    // (catches immediate crashes from missing DLLs, Smart App Control blocks, etc.)
+    Sleep(250);
+    DWORD exitCode = 0;
+    if (GetExitCodeProcess(g_serverProcess, &exitCode) && exitCode != STILL_ACTIVE) {
+        LogError("Server process exited immediately with code %d", exitCode);
+        if (exitCode == 0xC0000135) {
+            LogError("Exit code 0xC0000135: Missing DLL dependency (install Visual C++ Redistributable)");
+        } else if (exitCode == 0xC0000142) {
+            LogError("Exit code 0xC0000142: DLL initialization failed");
+        } else if (exitCode == 1) {
+            LogError("Server returned error 1 - check: pipe connection, auth token file, or port 8765 in use");
+        }
+        CloseHandle(g_serverProcess);
+        g_serverProcess = nullptr;
+        return false;
+    }
+
+    LogInfo("HTTP server process started and verified (PID: %d)", pi.dwProcessId);
     return true;
 }
 
@@ -4186,10 +4232,14 @@ void pluginStop() {
         g_pipeThread = nullptr;
     }
 
-    // Cleanup shutdown event
+    // Cleanup events
     if (g_shutdownEvent) {
         CloseHandle(g_shutdownEvent);
         g_shutdownEvent = nullptr;
+    }
+    if (g_pipeReadyEvent) {
+        CloseHandle(g_pipeReadyEvent);
+        g_pipeReadyEvent = nullptr;
     }
 
     // Gracefully terminate server process (send Ctrl+C first)
@@ -4335,6 +4385,15 @@ void pluginSetup() {
         return;
     }
 
+    // Create pipe-ready event (auto-reset, initially non-signaled)
+    g_pipeReadyEvent = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+    if (!g_pipeReadyEvent) {
+        LogError("Failed to create pipe-ready event: %d", GetLastError());
+        CloseHandle(g_shutdownEvent);
+        g_shutdownEvent = nullptr;
+        return;
+    }
+
     // Start Named Pipe server thread (safe to do here - no loader lock issues)
     g_running = true;
     DWORD threadId;
@@ -4349,13 +4408,22 @@ void pluginSetup() {
 
     if (!g_pipeThread) {
         LogError("Failed to create pipe server thread: %d", GetLastError());
+        CloseHandle(g_pipeReadyEvent);
+        g_pipeReadyEvent = nullptr;
         CloseHandle(g_shutdownEvent);
         g_shutdownEvent = nullptr;
         return;
     }
 
-    // Give pipe thread time to create the pipe
-    Sleep(100);
+    // Wait for pipe to be created (up to 5 seconds, replaces unreliable Sleep(100))
+    DWORD waitResult = WaitForSingleObject(g_pipeReadyEvent, 5000);
+    CloseHandle(g_pipeReadyEvent);
+    g_pipeReadyEvent = nullptr;
+
+    if (waitResult != WAIT_OBJECT_0) {
+        LogError("Pipe creation timed out after 5 seconds");
+        return;
+    }
 
     // Spawn HTTP server process
     if (!SpawnHTTPServer()) {

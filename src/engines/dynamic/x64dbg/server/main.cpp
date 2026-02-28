@@ -13,14 +13,40 @@
 // Global authentication token
 static std::string g_authToken;
 
-// Simple logging
+// Log file handle for diagnostics (server runs without console window)
+static FILE* g_logFile = nullptr;
+
+// Initialize file-based logging next to the executable
+static void InitLogging() {
+    // Get executable directory
+    char exePath[MAX_PATH];
+    if (GetModuleFileNameA(nullptr, exePath, MAX_PATH)) {
+        char* lastSlash = strrchr(exePath, '\\');
+        if (lastSlash) {
+            *(lastSlash + 1) = '\0';
+        }
+        std::string logPath = std::string(exePath) + "obsidian_server.log";
+        g_logFile = fopen(logPath.c_str(), "w");
+    }
+    // If log file can't be opened, logging still works via stdout (if console exists)
+}
+
+// Simple logging — writes to log file and stdout
 void Log(const char* format, ...) {
     char buffer[1024];
     va_list args;
     va_start(args, format);
     vsnprintf(buffer, sizeof(buffer), format, args);
     va_end(args);
+
+    // Always try stdout (works when console is attached)
     std::cout << "[Obsidian] " << buffer << std::endl;
+
+    // Also write to log file (works when running headless via CREATE_NO_WINDOW)
+    if (g_logFile) {
+        fprintf(g_logFile, "[Obsidian] %s\n", buffer);
+        fflush(g_logFile);  // Flush immediately so logs survive crashes
+    }
 }
 
 // Constant-time string comparison to prevent timing attacks
@@ -608,6 +634,9 @@ bool StartHTTPServer(int port) {
 }
 
 int main(int argc, char* argv[]) {
+    // Initialize file-based logging (persists even if console is unavailable)
+    InitLogging();
+
     Log("Obsidian HTTP Server starting...");
 
     // Parse command line arguments
@@ -619,7 +648,8 @@ int main(int argc, char* argv[]) {
     // Initialize Winsock
     WSADATA wsaData;
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-        Log("WSAStartup failed");
+        Log("WSAStartup failed: %d", GetLastError());
+        if (g_logFile) fclose(g_logFile);
         return 1;
     }
 
@@ -627,6 +657,7 @@ int main(int argc, char* argv[]) {
     if (!g_pipeClient.Connect()) {
         Log("Failed to connect to plugin - make sure x64dbg is running with plugin loaded");
         WSACleanup();
+        if (g_logFile) fclose(g_logFile);
         return 1;
     }
 
@@ -636,15 +667,23 @@ int main(int argc, char* argv[]) {
         Log("Make sure the x64dbg plugin is loaded and has generated the token file.");
         g_pipeClient.Disconnect();
         WSACleanup();
+        if (g_logFile) fclose(g_logFile);
         return 1;
     }
 
     // Start HTTP server
+    Log("Starting HTTP server on port %d...", port);
     bool success = StartHTTPServer(port);
 
+    if (!success) {
+        Log("HTTP server failed to start - check if port %d is already in use", port);
+    }
+
     // Cleanup
+    Log("Server shutting down (success=%d)", success);
     g_pipeClient.Disconnect();
     WSACleanup();
+    if (g_logFile) fclose(g_logFile);
 
     return success ? 0 : 1;
 }

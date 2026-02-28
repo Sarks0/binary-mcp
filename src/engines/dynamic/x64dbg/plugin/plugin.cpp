@@ -4083,7 +4083,7 @@ static bool SpawnHTTPServer() {
         nullptr,       // Process attributes
         nullptr,       // Thread attributes
         FALSE,         // Inherit handles
-        CREATE_NO_WINDOW,  // Server is headless - no console window needed
+        CREATE_NEW_CONSOLE,  // Explicitly create console window for server diagnostics
         nullptr,       // Environment
         pluginPath,    // Current directory: plugin directory
         &si,
@@ -4125,6 +4125,7 @@ static bool SpawnHTTPServer() {
     }
 
     LogInfo("HTTP server process started and verified (PID: %d)", pi.dwProcessId);
+    LogInfo("Server log file: %sobsidian_server.log", pluginPath);
     return true;
 }
 

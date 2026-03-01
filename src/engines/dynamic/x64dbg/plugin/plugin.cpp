@@ -12,7 +12,6 @@
 #include <algorithm>
 #include <cctype>
 #include <wincrypt.h>  // For CryptGenRandom
-#include <sddl.h>      // For ConvertStringSecurityDescriptorToSecurityDescriptor
 
 // x64dbg SDK headers
 #include "pluginsdk/_plugins.h"
@@ -151,6 +150,7 @@ static HANDLE g_serverProcess = nullptr;
 static HANDLE g_pipeServer = INVALID_HANDLE_VALUE;
 static HANDLE g_pipeThread = nullptr;
 static HANDLE g_shutdownEvent = nullptr;  // Event to signal shutdown
+static HANDLE g_pipeReadyEvent = nullptr;  // Event signaled when pipe is created
 static bool g_running = false;
 
 // ============================================================================
@@ -3667,6 +3667,11 @@ static DWORD WINAPI PipeServerThread(LPVOID lpParam) {
             return 1;
         }
 
+        // Signal that pipe is ready for server to connect
+        if (g_pipeReadyEvent) {
+            SetEvent(g_pipeReadyEvent);
+        }
+
         LogInfo("Waiting for HTTP server to connect...");
 
         // Use overlapped I/O for interruptible ConnectNamedPipe
@@ -4051,7 +4056,20 @@ static bool SpawnHTTPServer() {
     char serverPath[MAX_PATH];
     snprintf(serverPath, MAX_PATH, "%sobsidian_server.exe", pluginPath);
 
+    // Verify server executable exists before attempting to spawn
+    DWORD fileAttrib = GetFileAttributesA(serverPath);
+    if (fileAttrib == INVALID_FILE_ATTRIBUTES) {
+        LogError("Server executable not found: %s", serverPath);
+        LogError("Make sure obsidian_server.exe is in the same directory as the plugin");
+        LogError("GetFileAttributes error: %d", GetLastError());
+        return false;
+    }
+
     LogInfo("Spawning Obsidian server: %s", serverPath);
+
+    // Build command line (lpCommandLine must be writable per MSDN)
+    char cmdLine[MAX_PATH + 2];
+    snprintf(cmdLine, sizeof(cmdLine), "\"%s\"", serverPath);
 
     // Spawn process
     STARTUPINFOA si = {};
@@ -4059,26 +4077,57 @@ static bool SpawnHTTPServer() {
     PROCESS_INFORMATION pi = {};
 
     if (!CreateProcessA(
-        serverPath,
-        nullptr,  // Command line
-        nullptr,  // Process attributes
-        nullptr,  // Thread attributes
-        FALSE,    // Inherit handles
-        0,        // Creation flags
-        nullptr,  // Environment
-        nullptr,  // Current directory
+        nullptr,       // lpApplicationName: NULL so lpCommandLine is used
+        cmdLine,       // Command line (writable buffer, quoted for spaces)
+        nullptr,       // Process attributes
+        nullptr,       // Thread attributes
+        FALSE,         // Inherit handles
+        CREATE_NEW_CONSOLE,  // Explicitly create console window for server diagnostics
+        nullptr,       // Environment
+        pluginPath,    // Current directory: plugin directory
         &si,
         &pi
     )) {
-        LogError("Failed to spawn Obsidian server: %d", GetLastError());
-        LogError("Make sure obsidian_server.exe is in the same directory as the plugin");
+        DWORD err = GetLastError();
+        LogError("Failed to spawn Obsidian server (error %d)", err);
+        if (err == 740) {
+            LogError("Error 740: Elevation required. Try running x64dbg as Administrator.");
+        } else if (err == 2) {
+            LogError("Error 2: File not found. Check that obsidian_server.exe exists.");
+        } else if (err == 5) {
+            LogError("Error 5: Access denied. Smart App Control or antivirus may be blocking the executable.");
+        } else if (err == 1260) {
+            LogError("Error 1260: Blocked by group policy or Smart App Control.");
+        }
         return false;
     }
 
     g_serverProcess = pi.hProcess;
     CloseHandle(pi.hThread);  // Don't need thread handle
 
-    LogInfo("HTTP server process started (PID: %d)", pi.dwProcessId);
+    // Clear token from environment immediately after spawn (child already inherited it)
+    SetEnvironmentVariableA("OBSIDIAN_AUTH_TOKEN", nullptr);
+
+    // Verify the process is still alive after a brief moment
+    // (catches immediate crashes from missing DLLs, Smart App Control blocks, etc.)
+    Sleep(250);
+    DWORD exitCode = 0;
+    if (GetExitCodeProcess(g_serverProcess, &exitCode) && exitCode != STILL_ACTIVE) {
+        LogError("Server process exited immediately with code %d", exitCode);
+        if (exitCode == 0xC0000135) {
+            LogError("Exit code 0xC0000135: Missing DLL dependency (install Visual C++ Redistributable)");
+        } else if (exitCode == 0xC0000142) {
+            LogError("Exit code 0xC0000142: DLL initialization failed");
+        } else if (exitCode == 1) {
+            LogError("Server returned error 1 - check: pipe connection, auth token file, or port 8765 in use");
+        }
+        CloseHandle(g_serverProcess);
+        g_serverProcess = nullptr;
+        return false;
+    }
+
+    LogInfo("HTTP server process started and verified (PID: %d)", pi.dwProcessId);
+    LogInfo("Server log file: %sobsidian_server.log", pluginPath);
     return true;
 }
 
@@ -4186,10 +4235,14 @@ void pluginStop() {
         g_pipeThread = nullptr;
     }
 
-    // Cleanup shutdown event
+    // Cleanup events
     if (g_shutdownEvent) {
         CloseHandle(g_shutdownEvent);
         g_shutdownEvent = nullptr;
+    }
+    if (g_pipeReadyEvent) {
+        CloseHandle(g_pipeReadyEvent);
+        g_pipeReadyEvent = nullptr;
     }
 
     // Gracefully terminate server process (send Ctrl+C first)
@@ -4258,73 +4311,50 @@ static bool GenerateSecureToken(char* outToken, size_t tokenLength) {
 void pluginSetup() {
     LogInfo("Setting up plugin");
 
-    // Create authentication token file for Python bridge
+    // Generate cryptographically secure random token (256 bits)
+    char token[65];  // 64 hex chars + null terminator
+    if (!GenerateSecureToken(token, sizeof(token))) {
+        LogError("Failed to generate secure token");
+        return;
+    }
+
+    LogInfo("Generated secure authentication token (256-bit)");
+
+    // Pass token to server via environment variable (inherited by child process)
+    // This avoids file system issues (permissions, 8.3 paths, FILE_ATTRIBUTE_TEMPORARY)
+    if (!SetEnvironmentVariableA("OBSIDIAN_AUTH_TOKEN", token)) {
+        LogError("Failed to set auth token environment variable: %d", GetLastError());
+        return;
+    }
+    LogInfo("Auth token set via environment variable");
+
+    // Also write token file as fallback for the Python bridge
     char tempPath[MAX_PATH];
     if (GetTempPathA(MAX_PATH, tempPath)) {
         char tokenPath[MAX_PATH];
         snprintf(tokenPath, MAX_PATH, "%sx64dbg_mcp_token.txt", tempPath);
 
-        // Generate cryptographically secure random token (256 bits)
-        char token[65];  // 64 hex chars + null terminator
-        if (!GenerateSecureToken(token, sizeof(token))) {
-            LogError("Failed to generate secure token");
-            return;
-        }
-
-        LogInfo("Generated secure authentication token (256-bit)");
-
-        // Create security descriptor that only allows current user access
-        SECURITY_ATTRIBUTES sa = {};
-        PSECURITY_DESCRIPTOR pSD = nullptr;
-
-        // Use ConvertStringSecurityDescriptorToSecurityDescriptor to create
-        // a DACL that grants full access only to the current user (CURRENT_USER)
-        // SDDL: D:P(A;;FA;;;CU) means:
-        //   D:P - DACL that is protected (no inheritance)
-        //   A - Allow ACE
-        //   FA - File All access
-        //   CU - Creator/Current User
-        const char* sddl = "D:P(A;;FA;;;CU)";
-
-        if (ConvertStringSecurityDescriptorToSecurityDescriptorA(
-                sddl,
-                SDDL_REVISION_1,
-                &pSD,
-                nullptr)) {
-            sa.nLength = sizeof(SECURITY_ATTRIBUTES);
-            sa.lpSecurityDescriptor = pSD;
-            sa.bInheritHandle = FALSE;
-        } else {
-            LogError("Failed to create security descriptor: %d", GetLastError());
-            // Fall back to default security (less secure but functional)
-        }
-
-        // Create file with restrictive permissions
+        // Create file with default security (no custom SDDL)
         HANDLE hFile = CreateFileA(
             tokenPath,
             GENERIC_WRITE,
-            FILE_SHARE_READ,  // Allow reading while we have it open
-            pSD ? &sa : nullptr,  // Use secure SA if available
+            FILE_SHARE_READ,
+            nullptr,       // Default security - same user, same access
             CREATE_ALWAYS,
-            FILE_ATTRIBUTE_TEMPORARY,  // Windows hint for temp file
+            FILE_ATTRIBUTE_NORMAL,
             nullptr
         );
 
         if (hFile != INVALID_HANDLE_VALUE) {
             DWORD bytesWritten;
             if (WriteFile(hFile, token, (DWORD)strlen(token), &bytesWritten, nullptr)) {
-                LogInfo("Created secure auth token file: %s", tokenPath);
+                LogInfo("Created auth token file: %s", tokenPath);
             } else {
-                LogError("Failed to write token: %d", GetLastError());
+                LogError("Failed to write token file: %d", GetLastError());
             }
             CloseHandle(hFile);
         } else {
-            LogError("Failed to create auth token file: %d", GetLastError());
-        }
-
-        // Clean up security descriptor
-        if (pSD) {
-            LocalFree(pSD);
+            LogError("Failed to create auth token file: %d (non-fatal, env var is primary)", GetLastError());
         }
     }
 
@@ -4332,6 +4362,15 @@ void pluginSetup() {
     g_shutdownEvent = CreateEventA(nullptr, TRUE, FALSE, nullptr);
     if (!g_shutdownEvent) {
         LogError("Failed to create shutdown event: %d", GetLastError());
+        return;
+    }
+
+    // Create pipe-ready event (auto-reset, initially non-signaled)
+    g_pipeReadyEvent = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+    if (!g_pipeReadyEvent) {
+        LogError("Failed to create pipe-ready event: %d", GetLastError());
+        CloseHandle(g_shutdownEvent);
+        g_shutdownEvent = nullptr;
         return;
     }
 
@@ -4349,17 +4388,38 @@ void pluginSetup() {
 
     if (!g_pipeThread) {
         LogError("Failed to create pipe server thread: %d", GetLastError());
+        CloseHandle(g_pipeReadyEvent);
+        g_pipeReadyEvent = nullptr;
         CloseHandle(g_shutdownEvent);
         g_shutdownEvent = nullptr;
         return;
     }
 
-    // Give pipe thread time to create the pipe
-    Sleep(100);
+    // Wait for pipe to be created (up to 5 seconds, replaces unreliable Sleep(100))
+    DWORD waitResult = WaitForSingleObject(g_pipeReadyEvent, 5000);
+    CloseHandle(g_pipeReadyEvent);
+    g_pipeReadyEvent = nullptr;
+
+    if (waitResult != WAIT_OBJECT_0) {
+        LogError("Pipe creation timed out after 5 seconds");
+        g_running = false;
+        SetEvent(g_shutdownEvent);
+        WaitForSingleObject(g_pipeThread, 1000);
+        CloseHandle(g_pipeThread); g_pipeThread = nullptr;
+        CloseHandle(g_shutdownEvent); g_shutdownEvent = nullptr;
+        SetEnvironmentVariableA("OBSIDIAN_AUTH_TOKEN", nullptr);
+        return;
+    }
 
     // Spawn HTTP server process
     if (!SpawnHTTPServer()) {
         LogError("Failed to spawn HTTP server");
+        g_running = false;
+        SetEvent(g_shutdownEvent);
+        WaitForSingleObject(g_pipeThread, 1000);
+        CloseHandle(g_pipeThread); g_pipeThread = nullptr;
+        CloseHandle(g_shutdownEvent); g_shutdownEvent = nullptr;
+        SetEnvironmentVariableA("OBSIDIAN_AUTH_TOKEN", nullptr);
         return;
     }
 

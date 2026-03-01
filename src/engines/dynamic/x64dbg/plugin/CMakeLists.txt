@@ -119,9 +119,11 @@ set_target_properties(obsidian_server PROPERTIES
 )
 
 if(MSVC)
-    # Use DYNAMIC runtime for server too
-    set_property(TARGET obsidian_server PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreadedDLL$<$<CONFIG:Debug>:Debug>")
-    message(STATUS "Server: Using DYNAMIC runtime library (/MD)")
+    # Use STATIC runtime for server to avoid VC++ Redistributable dependency
+    # This is critical for deployment - the server must run on any Windows machine
+    # without requiring vcruntime140.dll / msvcp140.dll to be installed
+    set_property(TARGET obsidian_server PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    message(STATUS "Server: Using STATIC runtime library (/MT) - no VC++ Redist required")
 endif()
 
 # =============================================================================

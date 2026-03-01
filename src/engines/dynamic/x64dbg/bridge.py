@@ -7,6 +7,7 @@ Communicates with the x64dbg native plugin via HTTP API.
 from __future__ import annotations
 
 import logging
+import os
 import tempfile
 import time
 import traceback
@@ -250,15 +251,24 @@ class X64DbgBridge(Debugger):
 
     def _read_auth_token(self) -> str | None:
         """
-        Read authentication token from file created by x64dbg plugin.
+        Read authentication token from environment variable or file.
+
+        Tries OBSIDIAN_AUTH_TOKEN env var first, then falls back to
+        the token file created by the x64dbg plugin in %TEMP%.
 
         Returns:
             Authentication token or None if not found
 
         Raises:
-            RuntimeError: If token file cannot be read
+            RuntimeError: If token cannot be loaded from any source
         """
-        # Token file is created by x64dbg plugin in %TEMP%
+        # Try environment variable first
+        env_token = os.environ.get("OBSIDIAN_AUTH_TOKEN", "").strip()
+        if env_token:
+            logger.debug(f"Read authentication token from env var ({len(env_token)} chars)")
+            return env_token
+
+        # Fall back to token file created by x64dbg plugin in %TEMP%
         temp_dir = tempfile.gettempdir()
         token_file = Path(temp_dir) / "x64dbg_mcp_token.txt"
 
@@ -275,7 +285,7 @@ class X64DbgBridge(Debugger):
             if not token:
                 raise RuntimeError("Authentication token file is empty")
 
-            logger.debug(f"Read authentication token ({len(token)} chars)")
+            logger.debug(f"Read authentication token from file ({len(token)} chars)")
             return token
 
         except Exception as e:

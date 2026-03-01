@@ -12,7 +12,6 @@
 #include <algorithm>
 #include <cctype>
 #include <wincrypt.h>  // For CryptGenRandom
-#include <sddl.h>      // For ConvertStringSecurityDescriptorToSecurityDescriptor
 
 // x64dbg SDK headers
 #include "pluginsdk/_plugins.h"
@@ -4106,6 +4105,9 @@ static bool SpawnHTTPServer() {
     g_serverProcess = pi.hProcess;
     CloseHandle(pi.hThread);  // Don't need thread handle
 
+    // Clear token from environment immediately after spawn (child already inherited it)
+    SetEnvironmentVariableA("OBSIDIAN_AUTH_TOKEN", nullptr);
+
     // Verify the process is still alive after a brief moment
     // (catches immediate crashes from missing DLLs, Smart App Control blocks, etc.)
     Sleep(250);
@@ -4400,17 +4402,26 @@ void pluginSetup() {
 
     if (waitResult != WAIT_OBJECT_0) {
         LogError("Pipe creation timed out after 5 seconds");
+        g_running = false;
+        SetEvent(g_shutdownEvent);
+        WaitForSingleObject(g_pipeThread, 1000);
+        CloseHandle(g_pipeThread); g_pipeThread = nullptr;
+        CloseHandle(g_shutdownEvent); g_shutdownEvent = nullptr;
+        SetEnvironmentVariableA("OBSIDIAN_AUTH_TOKEN", nullptr);
         return;
     }
 
     // Spawn HTTP server process
     if (!SpawnHTTPServer()) {
         LogError("Failed to spawn HTTP server");
+        g_running = false;
+        SetEvent(g_shutdownEvent);
+        WaitForSingleObject(g_pipeThread, 1000);
+        CloseHandle(g_pipeThread); g_pipeThread = nullptr;
+        CloseHandle(g_shutdownEvent); g_shutdownEvent = nullptr;
+        SetEnvironmentVariableA("OBSIDIAN_AUTH_TOKEN", nullptr);
         return;
     }
-
-    // Clear token from x64dbg's environment now that server has inherited it
-    SetEnvironmentVariableA("OBSIDIAN_AUTH_TOKEN", nullptr);
 
     // Register menu callback
     _plugin_registercallback(g_pluginHandle, CB_MENUENTRY, (CBPLUGIN)MenuEntryCallback);

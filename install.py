@@ -499,10 +499,11 @@ def install_dotnet_sdk(pkg_manager: str) -> bool:
             os.chmod(script_path, 0o755)
             subprocess.run(["bash", script_path, "--channel", "8.0"], check=True)
 
-            # Add to PATH
+            # Add to PATH and set DOTNET_ROOT so tools can find the runtime
             dotnet_dir = Path.home() / ".dotnet"
             if str(dotnet_dir) not in os.environ.get("PATH", ""):
                 os.environ["PATH"] = f"{dotnet_dir}:{os.environ.get('PATH', '')}"
+            os.environ["DOTNET_ROOT"] = str(dotnet_dir)
 
             os.unlink(script_path)
             print_success(".NET SDK installed successfully")
@@ -669,10 +670,14 @@ def install_ilspycmd(status: SystemStatus, pkg_manager: str) -> bool:
             print_success("ILSpyCmd installed successfully")
         elif "already installed" in result.stderr.lower():
             print_info("ILSpyCmd already installed, updating...")
-            subprocess.run(["dotnet", "tool", "update", "-g", "ilspycmd"], check=True)
+            subprocess.run(
+                ["dotnet", "tool", "update", "-g", "ilspycmd"],
+                capture_output=True, text=True
+            )
             print_success("ILSpyCmd updated")
         else:
-            print_warning(f"ILSpyCmd installation: {result.stderr}")
+            print_error(f"ILSpyCmd installation failed: {result.stderr}")
+            return False
 
         # Add to PATH
         tools_path = Path.home() / ".dotnet" / "tools"

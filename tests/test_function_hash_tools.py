@@ -7,8 +7,6 @@ hashing, completeness scoring, and batch operations.
 
 from unittest.mock import MagicMock
 
-import pytest
-
 
 def _make_function(
     name="test_func",
@@ -154,7 +152,7 @@ class TestCompletenessScoring:
 
     def test_well_documented_function_scores_high(self):
         """A fully documented function should score >= 70."""
-        func = _make_function(
+        _make_function(
             name="decrypt_payload",
             signature="void decrypt_payload(char *buf, int len)",
             pseudocode="void decrypt_payload(char *buf, int len) { ... }",
@@ -248,8 +246,8 @@ class TestCapstoneMode:
 
         with patch(
             "src.utils.compatibility.BinaryCompatibilityChecker"
-        ) as MockChecker:
-            MockChecker.return_value.check_compatibility.return_value = mock_result
+        ) as mock_checker:
+            mock_checker.return_value.check_compatibility.return_value = mock_result
             from src.tools.function_hash_tools import _get_capstone_mode
             result = _get_capstone_mode("/fake/binary")
             assert result is None

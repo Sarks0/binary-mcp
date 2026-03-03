@@ -5,9 +5,7 @@ Uses mocked cache/runner data to test CFG construction,
 cyclomatic complexity, loop detection, and dead code analysis.
 """
 
-from unittest.mock import MagicMock, patch
-
-import pytest
+from unittest.mock import MagicMock
 
 
 # Sample cached analysis data for testing

@@ -54,7 +54,7 @@ def _get_or_run_analysis(binary_path: str, cache, runner) -> dict:
 
     import json
 
-    result = runner.analyze(
+    runner.analyze(
         binary_path=str(binary_path),
         script_path=str(script_path),
         script_name="core_analysis.py",
@@ -214,7 +214,7 @@ def _read_bytes_pe(path: Path, va: int, size: int) -> bytes | None:
         if rva < 0:
             # VA might already be an RVA
             rva = va
-        offset = pe.get_offset_from_rva(rva)
+        pe.get_offset_from_rva(rva)  # validates RVA is within a section
         data = pe.get_data(rva, size)
         return bytes(data)
     except Exception:
@@ -279,14 +279,12 @@ def _read_bytes_macho(path: Path, va: int, size: int) -> bytes | None:
                     seg_data = f.read(72)
                     if len(seg_data) >= 72:
                         seg_vmaddr = struct.unpack(endian + "Q", seg_data[24:32])[0]
-                        seg_vmsize = struct.unpack(endian + "Q", seg_data[32:40])[0]
                         seg_fileoff = struct.unpack(endian + "Q", seg_data[40:48])[0]
                         seg_filesize = struct.unpack(endian + "Q", seg_data[48:56])[0]
                 else:
                     seg_data = f.read(56)
                     if len(seg_data) >= 56:
                         seg_vmaddr = struct.unpack(endian + "I", seg_data[24:28])[0]
-                        seg_vmsize = struct.unpack(endian + "I", seg_data[28:32])[0]
                         seg_fileoff = struct.unpack(endian + "I", seg_data[32:36])[0]
                         seg_filesize = struct.unpack(endian + "I", seg_data[36:40])[0]
 
@@ -448,21 +446,10 @@ def _find_loops(blocks: dict, edges: list[tuple[int, int]], entry_addr: int):
         successors[src].append(dst)
 
     # DFS to find back edges
-    GRAY, BLACK = 1, 2
+    gray, black = 1, 2
     color: dict[int, int] = {}
     back_edges: list[tuple[int, int]] = []
     dfs_order: list[int] = []
-
-    def dfs(node):
-        color[node] = GRAY
-        dfs_order.append(node)
-        for succ in successors[node]:
-            if succ not in color:
-                dfs(succ)
-            elif color[succ] == GRAY:
-                # Back edge found
-                back_edges.append((node, succ))
-        color[node] = BLACK
 
     # Use iterative DFS to avoid recursion limit
     stack = [(entry_addr, 0)]
@@ -471,7 +458,7 @@ def _find_loops(blocks: dict, edges: list[tuple[int, int]], entry_addr: int):
     while stack:
         node, child_idx = stack[-1]
         if node not in color:
-            color[node] = GRAY
+            color[node] = gray
             dfs_order.append(node)
             children_map[node] = list(successors[node])
 
@@ -481,10 +468,10 @@ def _find_loops(blocks: dict, edges: list[tuple[int, int]], entry_addr: int):
             succ = children[child_idx]
             if succ not in color:
                 stack.append((succ, 0))
-            elif color[succ] == GRAY:
+            elif color[succ] == gray:
                 back_edges.append((node, succ))
         else:
-            color[node] = BLACK
+            color[node] = black
             stack.pop()
 
     # For each back edge, find the natural loop body
@@ -525,7 +512,7 @@ def _compute_nesting_depth(loops: list[dict]) -> dict[int, int]:
         return {}
 
     # Sort loops by body size descending (larger loops are outer)
-    sorted_loops = sorted(loops, key=lambda l: len(l["body"]), reverse=True)
+    sorted_loops = sorted(loops, key=lambda lp: len(lp["body"]), reverse=True)
     depths: dict[int, int] = {}
 
     for i, loop in enumerate(sorted_loops):

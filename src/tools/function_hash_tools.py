@@ -11,7 +11,6 @@ Provides tools for:
 import hashlib
 import logging
 import re
-import struct
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -432,7 +431,7 @@ def register_function_hash_tools(app, session_manager, cache, runner):
 
                 if not func:
                     output.append(f"--- {func_ref} ---")
-                    output.append(f"Error: Function not found")
+                    output.append("Error: Function not found")
                     output.append("")
                     failed += 1
                     continue

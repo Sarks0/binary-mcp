@@ -1,10 +1,13 @@
 """
 Binary MCP Server for comprehensive binary analysis.
 
-Provides 40+ tools for static and dynamic binary analysis:
+Provides 50+ tools for static and dynamic binary analysis:
 - Static analysis via Ghidra (headless mode) for native binaries
 - Static analysis via ILSpyCmd for .NET assemblies
 - Dynamic analysis via x64dbg (native plugin)
+- Control flow analysis (CFG, cyclomatic complexity, loops, dead code)
+- Malware behavior detection (10 categories, anti-analysis, API call chains)
+- Function hashing and cross-binary matching
 """
 
 import functools
@@ -21,8 +24,11 @@ from fastmcp import FastMCP
 from src.engines.session import AnalysisType, UnifiedSessionManager
 from src.engines.static.ghidra.project_cache import ProjectCache
 from src.engines.static.ghidra.runner import GhidraRunner
+from src.tools.control_flow_tools import register_control_flow_tools
 from src.tools.dotnet_tools import register_dotnet_tools
 from src.tools.dynamic_tools import register_dynamic_tools
+from src.tools.function_hash_tools import register_function_hash_tools
+from src.tools.malware_tools import register_malware_tools
 from src.tools.reporting import register_reporting_tools
 from src.tools.triage_tools import register_triage_tools
 from src.tools.vt_tools import register_vt_tools
@@ -2881,7 +2887,16 @@ def main():
     # Register Yara tools
     register_yara_tools(app, session_manager)
 
-    logger.info("Registered all analysis tools (static, dynamic, VT, triage, reporting, Yara)")
+    # Register control flow analysis tools
+    register_control_flow_tools(app, session_manager, cache, runner)
+
+    # Register malware behavior analysis tools
+    register_malware_tools(app, session_manager, cache, runner, api_patterns)
+
+    # Register function hash and cross-binary matching tools
+    register_function_hash_tools(app, session_manager, cache, runner)
+
+    logger.info("Registered all analysis tools (static, dynamic, VT, triage, reporting, Yara, control flow, malware, function hash)")
     logger.info(f"Session Directory: {session_manager.store_dir}")
 
     # Run the FastMCP server (handles stdio automatically)

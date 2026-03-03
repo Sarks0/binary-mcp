@@ -7,7 +7,6 @@ capstone disassembly.
 """
 
 import logging
-import struct
 from collections import defaultdict
 from pathlib import Path
 
@@ -168,134 +167,22 @@ def _parse_capstone_arch(metadata: dict):
     return None, None
 
 
-def _read_bytes_at_va(binary_path: str, va: int, size: int, metadata: dict) -> bytes | None:
+def _build_function_index(functions: list[dict]) -> dict:
     """
-    Read *size* bytes from the on-disk binary at virtual address *va*.
-
-    Uses pefile (PE) or pyelftools (ELF) to translate the VA into a file
-    offset, then reads directly from the file.
-
-    Args:
-        binary_path: Path to binary on disk
-        va: Virtual address to read from
-        size: Number of bytes to read
-        metadata: Ghidra analysis metadata dict
+    Build O(1) lookup indexes for a function list.
 
     Returns:
-        Raw bytes, or None on failure
+        Dict with ``by_name`` (name -> func) and ``by_addr`` (normalized_addr -> func).
     """
-    fmt = str(metadata.get("executable_format", "")).lower()
-    path_obj = Path(binary_path)
-
-    try:
-        if "pe" in fmt or "portable" in fmt:
-            return _read_bytes_pe(path_obj, va, size)
-        if "elf" in fmt:
-            return _read_bytes_elf(path_obj, va, size)
-        if "mach" in fmt:
-            return _read_bytes_macho(path_obj, va, size)
-    except Exception as e:
-        logger.debug(f"VA-to-offset translation failed for 0x{va:x}: {e}")
-
-    return None
-
-
-def _read_bytes_pe(path: Path, va: int, size: int) -> bytes | None:
-    """Read bytes from a PE file at the given virtual address."""
-    try:
-        import pefile
-    except ImportError:
-        return None
-
-    pe = pefile.PE(str(path), fast_load=True)
-    try:
-        image_base = pe.OPTIONAL_HEADER.ImageBase
-        rva = va - image_base
-        if rva < 0:
-            # VA might already be an RVA
-            rva = va
-        pe.get_offset_from_rva(rva)  # validates RVA is within a section
-        data = pe.get_data(rva, size)
-        return bytes(data)
-    except Exception:
-        return None
-    finally:
-        pe.close()
-
-
-def _read_bytes_elf(path: Path, va: int, size: int) -> bytes | None:
-    """Read bytes from an ELF file at the given virtual address."""
-    try:
-        from elftools.elf.elffile import ELFFile
-    except ImportError:
-        return None
-
-    with open(path, "rb") as f:
-        elf = ELFFile(f)
-        for segment in elf.iter_segments():
-            seg_start = segment["p_vaddr"]
-            seg_end = seg_start + segment["p_filesz"]
-            if seg_start <= va < seg_end:
-                offset = segment["p_offset"] + (va - seg_start)
-                f.seek(offset)
-                return f.read(size)
-    return None
-
-
-def _read_bytes_macho(path: Path, va: int, size: int) -> bytes | None:
-    """Read bytes from a Mach-O file at the given virtual address (basic)."""
-    # Minimal Mach-O support – iterate load commands for LC_SEGMENT/LC_SEGMENT_64
-    with open(path, "rb") as f:
-        magic = f.read(4)
-        if magic in (b"\xce\xfa\xed\xfe", b"\xcf\xfa\xed\xfe"):
-            endian = "<"
-        elif magic in (b"\xfe\xed\xfa\xce", b"\xfe\xed\xfa\xcf"):
-            endian = ">"
-        else:
-            return None
-
-        is_64 = magic in (b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf")
-        header_size = 32 if is_64 else 28
-
-        f.seek(0)
-        header = f.read(header_size)
-        if len(header) < header_size:
-            return None
-
-        ncmds = struct.unpack(endian + "I", header[16:20])[0]
-
-        offset = header_size
-        for _ in range(ncmds):
-            f.seek(offset)
-            cmd_header = f.read(8)
-            if len(cmd_header) < 8:
-                break
-            cmd, cmdsize = struct.unpack(endian + "II", cmd_header)
-
-            # LC_SEGMENT = 1, LC_SEGMENT_64 = 0x19
-            if cmd in (1, 0x19):
-                f.seek(offset)
-                if is_64:
-                    seg_data = f.read(72)
-                    if len(seg_data) >= 72:
-                        seg_vmaddr = struct.unpack(endian + "Q", seg_data[24:32])[0]
-                        seg_fileoff = struct.unpack(endian + "Q", seg_data[40:48])[0]
-                        seg_filesize = struct.unpack(endian + "Q", seg_data[48:56])[0]
-                else:
-                    seg_data = f.read(56)
-                    if len(seg_data) >= 56:
-                        seg_vmaddr = struct.unpack(endian + "I", seg_data[24:28])[0]
-                        seg_fileoff = struct.unpack(endian + "I", seg_data[32:36])[0]
-                        seg_filesize = struct.unpack(endian + "I", seg_data[36:40])[0]
-
-                if seg_vmaddr <= va < seg_vmaddr + seg_filesize:
-                    file_offset = seg_fileoff + (va - seg_vmaddr)
-                    f.seek(file_offset)
-                    return f.read(size)
-
-            offset += cmdsize
-
-    return None
+    by_name: dict[str, dict] = {}
+    by_addr: dict[str, dict] = {}
+    for f in functions:
+        name = f.get("name", "")
+        if name:
+            by_name[name] = f
+        addr = (f.get("address") or "").lower().replace("0x", "").lstrip("0") or "0"
+        by_addr[addr] = f
+    return {"by_name": by_name, "by_addr": by_addr}
 
 
 def _parse_address(addr_str: str) -> int:
@@ -303,11 +190,16 @@ def _parse_address(addr_str: str) -> int:
     return int(str(addr_str).strip(), 16)
 
 
-def _build_cfg(func: dict, binary_path: str, metadata: dict):
+def _build_cfg(func: dict, reader, metadata: dict):
     """
     Build a control flow graph from a function's basic blocks by
     disassembling the last instruction of each block with capstone to
     determine successors.
+
+    Args:
+        func: Function dict from cached analysis
+        reader: BinaryReader instance (already opened)
+        metadata: Ghidra analysis metadata dict
 
     Returns:
         Tuple of (blocks, edges, entry_addr) where:
@@ -361,7 +253,7 @@ def _build_cfg(func: dict, binary_path: str, metadata: dict):
         blk_size = blk["size"]
 
         # Read raw bytes for the block
-        raw = _read_bytes_at_va(binary_path, blk_addr, blk_size, metadata)
+        raw = reader.read_bytes_at_va(blk_addr, blk_size)
         if not raw:
             # Can't disassemble – assume fallthrough to next block
             idx = addr_to_idx[blk_addr]
@@ -589,8 +481,11 @@ def register_control_flow_tools(app, session_manager=None, cache=None, runner=No
             func_name = func.get("name", "unknown")
             func_addr = func.get("address", "?")
 
+            from src.utils.binary_reader import BinaryReader
+
             try:
-                blocks, edges, entry_addr = _build_cfg(func, binary_path, metadata)
+                with BinaryReader(binary_path) as reader:
+                    blocks, edges, entry_addr = _build_cfg(func, reader, metadata)
             except RuntimeError as e:
                 return f"Error building CFG for '{func_name}': {e}"
 
@@ -732,8 +627,11 @@ def register_control_flow_tools(app, session_manager=None, cache=None, runner=No
             func_name = func.get("name", "unknown")
             func_addr = func.get("address", "?")
 
+            from src.utils.binary_reader import BinaryReader
+
             try:
-                blocks, edges, entry_addr = _build_cfg(func, binary_path, metadata)
+                with BinaryReader(binary_path) as reader:
+                    blocks, edges, entry_addr = _build_cfg(func, reader, metadata)
             except RuntimeError as e:
                 return f"Error building CFG for '{func_name}': {e}"
 
@@ -1007,7 +905,10 @@ def register_control_flow_tools(app, session_manager=None, cache=None, runner=No
 
             if num_blocks > 0:
                 try:
-                    blocks, edges, entry_addr = _build_cfg(func, binary_path, metadata)
+                    from src.utils.binary_reader import BinaryReader
+
+                    with BinaryReader(binary_path) as reader:
+                        blocks, edges, entry_addr = _build_cfg(func, reader, metadata)
                     num_edges = len(edges)
                     cyclomatic = num_edges - len(blocks) + 2
                     loops = _find_loops(blocks, edges, entry_addr)

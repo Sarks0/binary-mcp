@@ -131,6 +131,27 @@ class TestControlFlowHelpers:
         assert depths[0x1000] == 1
         assert depths[0x2000] == 2
 
+    def test_build_function_index_by_name(self):
+        """Should build O(1) lookup by name."""
+        from src.tools.control_flow_tools import _build_function_index
+
+        funcs = [
+            _make_function(name="main", address="0x401000"),
+            _make_function(name="helper", address="0x402000"),
+        ]
+        index = _build_function_index(funcs)
+        assert "main" in index["by_name"]
+        assert "helper" in index["by_name"]
+        assert index["by_name"]["main"]["address"] == "0x401000"
+
+    def test_build_function_index_by_addr(self):
+        """Should build O(1) lookup by normalized address."""
+        from src.tools.control_flow_tools import _build_function_index
+
+        funcs = [_make_function(name="main", address="0x401000")]
+        index = _build_function_index(funcs)
+        assert "401000" in index["by_addr"]
+
 
 class TestControlFlowToolRegistration:
     """Test that tools register and handle basic inputs."""

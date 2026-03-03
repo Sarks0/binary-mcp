@@ -18,6 +18,9 @@ logger = logging.getLogger(__name__)
 # Maximum functions per batch decompile request
 MAX_BATCH_SIZE = 20
 
+# Safety valve for fuzzy matching to prevent runaway comparisons
+MAX_FUZZY_COMPARISONS = 100_000
+
 
 def _get_capstone_mode(binary_path: str):
     """
@@ -65,81 +68,6 @@ def _get_capstone_mode(binary_path: str):
     return None
 
 
-def _read_bytes_at_va(binary_path: str, va_start: int, size: int) -> bytes | None:
-    """
-    Read raw bytes from a binary at a virtual address range.
-
-    Maps virtual addresses to file offsets using pefile (PE) or pyelftools (ELF),
-    then reads the raw bytes from disk.
-
-    Args:
-        binary_path: Path to the binary file
-        va_start: Virtual address to start reading from
-        size: Number of bytes to read
-
-    Returns:
-        Raw bytes or None if the VA could not be resolved
-    """
-    path = Path(binary_path)
-    with open(path, "rb") as f:
-        magic = f.read(4)
-
-    # PE binary
-    if magic[:2] == b"MZ":
-        try:
-            import pefile
-
-            pe = pefile.PE(str(path), fast_load=True)
-            # pefile expects an RVA (relative to image base)
-            rva = va_start - pe.OPTIONAL_HEADER.ImageBase
-            offset = pe.get_offset_from_rva(rva)
-            pe.close()
-            if offset is not None:
-                with open(path, "rb") as f:
-                    f.seek(offset)
-                    return f.read(size)
-        except Exception as e:
-            logger.debug(f"PE VA resolution failed for 0x{va_start:x}: {e}")
-            return None
-
-    # ELF binary
-    elif magic[:4] == b"\x7fELF":
-        try:
-            from elftools.elf.elffile import ELFFile
-
-            with open(path, "rb") as f:
-                elf = ELFFile(f)
-                for segment in elf.iter_segments():
-                    if segment.header.p_type != "PT_LOAD":
-                        continue
-                    seg_va = segment.header.p_vaddr
-                    seg_filesz = segment.header.p_filesz
-                    seg_offset = segment.header.p_offset
-                    if seg_va <= va_start < seg_va + seg_filesz:
-                        file_offset = seg_offset + (va_start - seg_va)
-                        f.seek(file_offset)
-                        return f.read(size)
-        except Exception as e:
-            logger.debug(f"ELF VA resolution failed for 0x{va_start:x}: {e}")
-            return None
-
-    # Mach-O binary
-    elif magic[:4] in (b"\xfe\xed\xfa\xce", b"\xfe\xed\xfa\xcf",
-                        b"\xce\xfa\xed\xfe", b"\xcf\xfa\xed\xfe"):
-        try:
-            # Fall back to simple segment scanning for Mach-O
-            with open(path, "rb") as f:
-                data = f.read()
-            # Try direct offset as last resort (works for some Mach-O)
-            if va_start < len(data):
-                return data[va_start:va_start + size]
-        except Exception as e:
-            logger.debug(f"Mach-O VA resolution failed for 0x{va_start:x}: {e}")
-            return None
-
-    return None
-
-
 def _normalize_instructions(disasm_instructions) -> tuple[str, dict]:
     """
     Normalize disassembled instructions for hashing.
@@ -174,12 +102,14 @@ def _normalize_instructions(disasm_instructions) -> tuple[str, dict]:
     return normalized_string, stats
 
 
-def _compute_function_hash(binary_path: str, func: dict) -> dict | None:
+def _compute_function_hash(reader, cs_arch, cs_mode, func: dict) -> dict | None:
     """
     Compute normalized opcode hash for a single function.
 
     Args:
-        binary_path: Path to the binary file
+        reader: BinaryReader instance (already opened)
+        cs_arch: Capstone architecture constant
+        cs_mode: Capstone mode constant
         func: Function dict from cache (must have basic_blocks)
 
     Returns:
@@ -191,12 +121,6 @@ def _compute_function_hash(binary_path: str, func: dict) -> dict | None:
     if not basic_blocks:
         return None
 
-    # Determine capstone mode from binary
-    mode = _get_capstone_mode(binary_path)
-    if mode is None:
-        return None
-
-    cs_arch, cs_mode = mode
     md = capstone.Cs(cs_arch, cs_mode)
     md.detail = False
 
@@ -218,7 +142,7 @@ def _compute_function_hash(binary_path: str, func: dict) -> dict | None:
         if block_size <= 0 or block_size > 0x100000:  # 1MB sanity limit
             continue
 
-        raw_bytes = _read_bytes_at_va(binary_path, start_addr, block_size)
+        raw_bytes = reader.read_bytes_at_va(start_addr, block_size)
         if raw_bytes is None:
             continue
 
@@ -336,7 +260,19 @@ def register_function_hash_tools(app, session_manager, cache, runner):
                     f"and has no local code to hash."
                 )
 
-            result = _compute_function_hash(binary_path, func)
+            mode = _get_capstone_mode(binary_path)
+            if mode is None:
+                return (
+                    f"Error: Unsupported architecture for '{func.get('name')}'. "
+                    f"Cannot determine capstone mode for disassembly."
+                )
+
+            cs_arch, cs_mode = mode
+
+            from src.utils.binary_reader import BinaryReader
+
+            with BinaryReader(binary_path) as reader:
+                result = _compute_function_hash(reader, cs_arch, cs_mode, func)
             if result is None:
                 return (
                     f"Error: Could not compute hash for '{func.get('name')}'. "
@@ -792,33 +728,50 @@ def register_function_hash_tools(app, session_manager, cache, runner):
             if not funcs_b:
                 return f"Error: No hashable functions found in {Path(target_binary_path).name}"
 
-            # Compute hashes for source binary
-            hashes_a = {}
-            for func in funcs_a:
-                result = _compute_function_hash(binary_path, func)
-                if result:
-                    hashes_a[func.get("name")] = {
-                        "hash": result["hash"],
-                        "instruction_count": result["instruction_count"],
-                        "called_functions": [
-                            c.get("name", "") for c in func.get("called_functions", [])
-                        ],
-                        "func": func,
-                    }
+            from bisect import bisect_left, bisect_right
 
-            # Compute hashes for target binary
+            from src.utils.binary_reader import BinaryReader
+
+            # Detect capstone mode once per binary
+            mode_a = _get_capstone_mode(binary_path)
+            if mode_a is None:
+                return f"Error: Unsupported architecture for {Path(binary_path).name}"
+            mode_b = _get_capstone_mode(target_binary_path)
+            if mode_b is None:
+                return f"Error: Unsupported architecture for {Path(target_binary_path).name}"
+
+            cs_arch_a, cs_mode_a = mode_a
+            cs_arch_b, cs_mode_b = mode_b
+
+            # Compute hashes for source binary (one reader open)
+            hashes_a = {}
+            with BinaryReader(binary_path) as reader_a:
+                for func in funcs_a:
+                    result = _compute_function_hash(reader_a, cs_arch_a, cs_mode_a, func)
+                    if result:
+                        hashes_a[func.get("name")] = {
+                            "hash": result["hash"],
+                            "instruction_count": result["instruction_count"],
+                            "called_functions": frozenset(
+                                c.get("name", "") for c in func.get("called_functions", [])
+                            ),
+                            "func": func,
+                        }
+
+            # Compute hashes for target binary (one reader open)
             hashes_b = {}
-            for func in funcs_b:
-                result = _compute_function_hash(target_binary_path, func)
-                if result:
-                    hashes_b[func.get("name")] = {
-                        "hash": result["hash"],
-                        "instruction_count": result["instruction_count"],
-                        "called_functions": [
-                            c.get("name", "") for c in func.get("called_functions", [])
-                        ],
-                        "func": func,
-                    }
+            with BinaryReader(target_binary_path) as reader_b:
+                for func in funcs_b:
+                    result = _compute_function_hash(reader_b, cs_arch_b, cs_mode_b, func)
+                    if result:
+                        hashes_b[func.get("name")] = {
+                            "hash": result["hash"],
+                            "instruction_count": result["instruction_count"],
+                            "called_functions": frozenset(
+                                c.get("name", "") for c in func.get("called_functions", [])
+                            ),
+                            "func": func,
+                        }
 
             if not hashes_a:
                 return f"Error: Could not hash any functions in {Path(binary_path).name}"
@@ -843,7 +796,7 @@ def register_function_hash_tools(app, session_manager, cache, runner):
                             matched_b_names.add(name_b)
                             break
 
-            # Fuzzy matching for remaining functions
+            # Fuzzy matching for remaining functions — use bisect for size windowing
             fuzzy_matches = []
             remaining_a = {
                 n: v for n, v in hashes_a.items() if n not in matched_a_names
@@ -852,16 +805,33 @@ def register_function_hash_tools(app, session_manager, cache, runner):
                 n: v for n, v in hashes_b.items() if n not in matched_b_names
             }
 
+            # Sort remaining_b by instruction count for binary search windowing
+            sorted_b = sorted(
+                remaining_b.items(),
+                key=lambda x: x[1]["instruction_count"],
+            )
+            sorted_b_counts = [info["instruction_count"] for _, info in sorted_b]
+
+            comparison_count = 0
             for name_a, info_a in remaining_a.items():
+                ic_a = info_a["instruction_count"]
+                # Only compare with functions within 50% instruction count
+                lo = bisect_left(sorted_b_counts, int(ic_a * 0.5))
+                hi = bisect_right(sorted_b_counts, int(ic_a * 1.5))
+
                 best_score = 0.0
                 best_match = None
 
-                for name_b, info_b in remaining_b.items():
+                for idx in range(lo, hi):
+                    name_b, info_b = sorted_b[idx]
                     if name_b in matched_b_names:
                         continue
 
+                    comparison_count += 1
+                    if comparison_count > MAX_FUZZY_COMPARISONS:
+                        break
+
                     # Size similarity (instruction count)
-                    ic_a = info_a["instruction_count"]
                     ic_b = info_b["instruction_count"]
                     max_ic = max(ic_a, ic_b)
                     size_sim = 1.0 - (abs(ic_a - ic_b) / max_ic) if max_ic > 0 else 1.0
@@ -872,9 +842,9 @@ def register_function_hash_tools(app, session_manager, cache, runner):
                     max_cc = max(cc_a, cc_b)
                     call_sim = 1.0 - (abs(cc_a - cc_b) / max_cc) if max_cc > 0 else 1.0
 
-                    # Called function name overlap (import overlap)
-                    set_a = set(info_a["called_functions"])
-                    set_b = set(info_b["called_functions"])
+                    # Called function name overlap (import overlap) — pre-computed frozensets
+                    set_a = info_a["called_functions"]
+                    set_b = info_b["called_functions"]
                     if set_a and set_b:
                         overlap = len(set_a & set_b)
                         union = len(set_a | set_b)
@@ -890,6 +860,9 @@ def register_function_hash_tools(app, session_manager, cache, runner):
                     if similarity > best_score:
                         best_score = similarity
                         best_match = name_b
+
+                if comparison_count > MAX_FUZZY_COMPARISONS:
+                    break
 
                 if best_match and best_score >= threshold:
                     fuzzy_matches.append((name_a, best_match, best_score))

@@ -617,10 +617,11 @@ function Install-DotNetTools {
             Write-Success "ILSpyCmd installed successfully"
         } elseif ($result -match "already installed") {
             Write-Info "ILSpyCmd is already installed, updating..."
-            dotnet tool update -g ilspycmd
+            dotnet tool update -g ilspycmd 2>&1
             Write-Success "ILSpyCmd updated"
         } else {
-            Write-Warn "ILSpyCmd installation returned: $result"
+            Write-Err "ILSpyCmd installation failed: $result"
+            return $false
         }
 
         # Add to PATH if needed

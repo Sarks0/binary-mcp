@@ -12,7 +12,6 @@
 #include <algorithm>
 #include <cctype>
 #include <wincrypt.h>  // For CryptGenRandom
-#include <sddl.h>      // For ConvertStringSecurityDescriptorToSecurityDescriptor
 
 // x64dbg SDK headers
 #include "pluginsdk/_plugins.h"
@@ -4083,7 +4082,7 @@ static bool SpawnHTTPServer() {
         nullptr,       // Process attributes
         nullptr,       // Thread attributes
         FALSE,         // Inherit handles
-        CREATE_NO_WINDOW,  // Server is headless - no console window needed
+        CREATE_NEW_CONSOLE,  // Explicitly create console window for server diagnostics
         nullptr,       // Environment
         pluginPath,    // Current directory: plugin directory
         &si,
@@ -4106,6 +4105,9 @@ static bool SpawnHTTPServer() {
     g_serverProcess = pi.hProcess;
     CloseHandle(pi.hThread);  // Don't need thread handle
 
+    // Clear token from environment immediately after spawn (child already inherited it)
+    SetEnvironmentVariableA("OBSIDIAN_AUTH_TOKEN", nullptr);
+
     // Verify the process is still alive after a brief moment
     // (catches immediate crashes from missing DLLs, Smart App Control blocks, etc.)
     Sleep(250);
@@ -4125,6 +4127,7 @@ static bool SpawnHTTPServer() {
     }
 
     LogInfo("HTTP server process started and verified (PID: %d)", pi.dwProcessId);
+    LogInfo("Server log file: %sobsidian_server.log", pluginPath);
     return true;
 }
 
@@ -4308,73 +4311,50 @@ static bool GenerateSecureToken(char* outToken, size_t tokenLength) {
 void pluginSetup() {
     LogInfo("Setting up plugin");
 
-    // Create authentication token file for Python bridge
+    // Generate cryptographically secure random token (256 bits)
+    char token[65];  // 64 hex chars + null terminator
+    if (!GenerateSecureToken(token, sizeof(token))) {
+        LogError("Failed to generate secure token");
+        return;
+    }
+
+    LogInfo("Generated secure authentication token (256-bit)");
+
+    // Pass token to server via environment variable (inherited by child process)
+    // This avoids file system issues (permissions, 8.3 paths, FILE_ATTRIBUTE_TEMPORARY)
+    if (!SetEnvironmentVariableA("OBSIDIAN_AUTH_TOKEN", token)) {
+        LogError("Failed to set auth token environment variable: %d", GetLastError());
+        return;
+    }
+    LogInfo("Auth token set via environment variable");
+
+    // Also write token file as fallback for the Python bridge
     char tempPath[MAX_PATH];
     if (GetTempPathA(MAX_PATH, tempPath)) {
         char tokenPath[MAX_PATH];
         snprintf(tokenPath, MAX_PATH, "%sx64dbg_mcp_token.txt", tempPath);
 
-        // Generate cryptographically secure random token (256 bits)
-        char token[65];  // 64 hex chars + null terminator
-        if (!GenerateSecureToken(token, sizeof(token))) {
-            LogError("Failed to generate secure token");
-            return;
-        }
-
-        LogInfo("Generated secure authentication token (256-bit)");
-
-        // Create security descriptor that only allows current user access
-        SECURITY_ATTRIBUTES sa = {};
-        PSECURITY_DESCRIPTOR pSD = nullptr;
-
-        // Use ConvertStringSecurityDescriptorToSecurityDescriptor to create
-        // a DACL that grants full access only to the current user (CURRENT_USER)
-        // SDDL: D:P(A;;FA;;;CU) means:
-        //   D:P - DACL that is protected (no inheritance)
-        //   A - Allow ACE
-        //   FA - File All access
-        //   CU - Creator/Current User
-        const char* sddl = "D:P(A;;FA;;;CU)";
-
-        if (ConvertStringSecurityDescriptorToSecurityDescriptorA(
-                sddl,
-                SDDL_REVISION_1,
-                &pSD,
-                nullptr)) {
-            sa.nLength = sizeof(SECURITY_ATTRIBUTES);
-            sa.lpSecurityDescriptor = pSD;
-            sa.bInheritHandle = FALSE;
-        } else {
-            LogError("Failed to create security descriptor: %d", GetLastError());
-            // Fall back to default security (less secure but functional)
-        }
-
-        // Create file with restrictive permissions
+        // Create file with default security (no custom SDDL)
         HANDLE hFile = CreateFileA(
             tokenPath,
             GENERIC_WRITE,
-            FILE_SHARE_READ,  // Allow reading while we have it open
-            pSD ? &sa : nullptr,  // Use secure SA if available
+            FILE_SHARE_READ,
+            nullptr,       // Default security - same user, same access
             CREATE_ALWAYS,
-            FILE_ATTRIBUTE_TEMPORARY,  // Windows hint for temp file
+            FILE_ATTRIBUTE_NORMAL,
             nullptr
         );
 
         if (hFile != INVALID_HANDLE_VALUE) {
             DWORD bytesWritten;
             if (WriteFile(hFile, token, (DWORD)strlen(token), &bytesWritten, nullptr)) {
-                LogInfo("Created secure auth token file: %s", tokenPath);
+                LogInfo("Created auth token file: %s", tokenPath);
             } else {
-                LogError("Failed to write token: %d", GetLastError());
+                LogError("Failed to write token file: %d", GetLastError());
             }
             CloseHandle(hFile);
         } else {
-            LogError("Failed to create auth token file: %d", GetLastError());
-        }
-
-        // Clean up security descriptor
-        if (pSD) {
-            LocalFree(pSD);
+            LogError("Failed to create auth token file: %d (non-fatal, env var is primary)", GetLastError());
         }
     }
 
@@ -4422,12 +4402,24 @@ void pluginSetup() {
 
     if (waitResult != WAIT_OBJECT_0) {
         LogError("Pipe creation timed out after 5 seconds");
+        g_running = false;
+        SetEvent(g_shutdownEvent);
+        WaitForSingleObject(g_pipeThread, 1000);
+        CloseHandle(g_pipeThread); g_pipeThread = nullptr;
+        CloseHandle(g_shutdownEvent); g_shutdownEvent = nullptr;
+        SetEnvironmentVariableA("OBSIDIAN_AUTH_TOKEN", nullptr);
         return;
     }
 
     // Spawn HTTP server process
     if (!SpawnHTTPServer()) {
         LogError("Failed to spawn HTTP server");
+        g_running = false;
+        SetEvent(g_shutdownEvent);
+        WaitForSingleObject(g_pipeThread, 1000);
+        CloseHandle(g_pipeThread); g_pipeThread = nullptr;
+        CloseHandle(g_shutdownEvent); g_shutdownEvent = nullptr;
+        SetEnvironmentVariableA("OBSIDIAN_AUTH_TOKEN", nullptr);
         return;
     }
 

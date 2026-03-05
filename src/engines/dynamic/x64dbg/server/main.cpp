@@ -7,20 +7,46 @@
 #include <atomic>
 #include <thread>
 #include <cstdarg>  // for va_list, va_start, va_end
-#include <fstream>
+#include <cstdlib>  // for getenv
 #include "../pipe_protocol.h"
 
 // Global authentication token
 static std::string g_authToken;
 
-// Simple logging
+// Log file handle for diagnostics (server runs without console window)
+static FILE* g_logFile = nullptr;
+
+// Initialize file-based logging next to the executable
+static void InitLogging() {
+    // Get executable directory
+    char exePath[MAX_PATH];
+    if (GetModuleFileNameA(nullptr, exePath, MAX_PATH)) {
+        char* lastSlash = strrchr(exePath, '\\');
+        if (lastSlash) {
+            *(lastSlash + 1) = '\0';
+        }
+        std::string logPath = std::string(exePath) + "obsidian_server.log";
+        g_logFile = fopen(logPath.c_str(), "w");
+    }
+    // If log file can't be opened, logging still works via stdout (if console exists)
+}
+
+// Simple logging — writes to log file and stdout
 void Log(const char* format, ...) {
     char buffer[1024];
     va_list args;
     va_start(args, format);
     vsnprintf(buffer, sizeof(buffer), format, args);
     va_end(args);
+
+    // Always try stdout (works when console is attached)
     std::cout << "[Obsidian] " << buffer << std::endl;
+
+    // Also write to log file (works when running headless via CREATE_NO_WINDOW)
+    if (g_logFile) {
+        fprintf(g_logFile, "[Obsidian] %s\n", buffer);
+        fflush(g_logFile);  // Flush immediately so logs survive crashes
+    }
 }
 
 // Constant-time string comparison to prevent timing attacks
@@ -32,9 +58,19 @@ bool SecureCompare(const char* a, const char* b, size_t len) {
     return result == 0;
 }
 
-// Load authentication token from file
+// Load authentication token (env var first, file fallback)
 bool LoadAuthToken() {
-    // Get temp directory
+    // Try environment variable first (set by plugin, inherited by child process)
+    const char* envToken = getenv("OBSIDIAN_AUTH_TOKEN");
+    if (envToken && envToken[0] != '\0') {
+        g_authToken = envToken;
+        Log("Auth token loaded from environment variable (%zu bytes)", g_authToken.size());
+        return true;
+    }
+
+    Log("No OBSIDIAN_AUTH_TOKEN env var, trying token file...");
+
+    // Fall back to token file (for Python bridge or manual server launch)
     char tempPath[MAX_PATH];
     if (!GetTempPathA(MAX_PATH, tempPath)) {
         Log("Failed to get temp path: %d", GetLastError());
@@ -44,22 +80,44 @@ bool LoadAuthToken() {
     std::string tokenPath = std::string(tempPath) + "x64dbg_mcp_token.txt";
     Log("Loading auth token from: %s", tokenPath.c_str());
 
-    // Read token from file
-    std::ifstream file(tokenPath);
-    if (!file.is_open()) {
-        Log("Failed to open token file - plugin may not be loaded");
+    // Use Win32 API instead of std::ifstream for better compatibility
+    HANDLE hFile = CreateFileA(
+        tokenPath.c_str(),
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr
+    );
+
+    if (hFile == INVALID_HANDLE_VALUE) {
+        Log("Failed to open token file (error %d) - plugin may not be loaded", GetLastError());
         return false;
     }
 
-    std::getline(file, g_authToken);
-    file.close();
+    char tokenBuf[256] = {};
+    DWORD bytesRead = 0;
+    if (!ReadFile(hFile, tokenBuf, sizeof(tokenBuf) - 1, &bytesRead, nullptr) || bytesRead == 0) {
+        Log("Failed to read token file (error %d)", GetLastError());
+        CloseHandle(hFile);
+        return false;
+    }
+    CloseHandle(hFile);
 
-    if (g_authToken.empty()) {
+    // Trim trailing whitespace/newlines
+    while (bytesRead > 0 && (tokenBuf[bytesRead - 1] == '\r' || tokenBuf[bytesRead - 1] == '\n' || tokenBuf[bytesRead - 1] == ' ')) {
+        bytesRead--;
+    }
+    tokenBuf[bytesRead] = '\0';
+
+    if (bytesRead == 0) {
         Log("Token file is empty");
         return false;
     }
 
-    Log("Auth token loaded (%zu bytes)", g_authToken.size());
+    g_authToken = std::string(tokenBuf, bytesRead);
+    Log("Auth token loaded from file (%zu bytes)", g_authToken.size());
     return true;
 }
 
@@ -608,6 +666,9 @@ bool StartHTTPServer(int port) {
 }
 
 int main(int argc, char* argv[]) {
+    // Initialize file-based logging (persists even if console is unavailable)
+    InitLogging();
+
     Log("Obsidian HTTP Server starting...");
 
     // Parse command line arguments
@@ -619,7 +680,8 @@ int main(int argc, char* argv[]) {
     // Initialize Winsock
     WSADATA wsaData;
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-        Log("WSAStartup failed");
+        Log("WSAStartup failed: %d", GetLastError());
+        if (g_logFile) fclose(g_logFile);
         return 1;
     }
 
@@ -627,6 +689,7 @@ int main(int argc, char* argv[]) {
     if (!g_pipeClient.Connect()) {
         Log("Failed to connect to plugin - make sure x64dbg is running with plugin loaded");
         WSACleanup();
+        if (g_logFile) fclose(g_logFile);
         return 1;
     }
 
@@ -636,15 +699,23 @@ int main(int argc, char* argv[]) {
         Log("Make sure the x64dbg plugin is loaded and has generated the token file.");
         g_pipeClient.Disconnect();
         WSACleanup();
+        if (g_logFile) fclose(g_logFile);
         return 1;
     }
 
     // Start HTTP server
+    Log("Starting HTTP server on port %d...", port);
     bool success = StartHTTPServer(port);
 
+    if (!success) {
+        Log("HTTP server failed to start - check if port %d is already in use", port);
+    }
+
     // Cleanup
+    Log("Server shutting down (success=%d)", success);
     g_pipeClient.Disconnect();
     WSACleanup();
+    if (g_logFile) fclose(g_logFile);
 
     return success ? 0 : 1;
 }

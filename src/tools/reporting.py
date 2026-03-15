@@ -12,7 +12,7 @@ import logging
 from datetime import datetime
 from pathlib import Path
 
-from src.utils.security import PathTraversalError, sanitize_output_path
+from src.utils.security import PathTraversalError, safe_error_message, sanitize_output_path
 
 logger = logging.getLogger(__name__)
 
@@ -421,7 +421,7 @@ def register_reporting_tools(app, session_manager):
 
         except Exception as e:
             logger.error(f"generate_report failed: {e}")
-            return f"Error generating report: {e}"
+            return safe_error_message("Failed to generate report", e)
 
     @app.tool()
     def export_iocs(
@@ -526,6 +526,6 @@ def register_reporting_tools(app, session_manager):
 
         except Exception as e:
             logger.error(f"export_iocs failed: {e}")
-            return f"Error exporting IOCs: {e}"
+            return safe_error_message("Failed to export IOCs", e)
 
     logger.info("Registered 2 reporting tools")

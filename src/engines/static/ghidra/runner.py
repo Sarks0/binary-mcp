@@ -6,9 +6,12 @@ Handles Ghidra installation detection, project management, and script execution.
 import logging
 import os
 import platform
+import re
 import subprocess  # nosec B404 - Required for Ghidra headless execution
 import time
 from pathlib import Path
+
+from src.utils.security import validate_parameter_pattern
 
 logger = logging.getLogger(__name__)
 
@@ -232,6 +235,10 @@ class GhidraRunner:
 
         if project_name is None:
             project_name = binary_path.stem
+        # Sanitize project name to prevent parameter injection
+        project_name = re.sub(r'[^a-zA-Z0-9_.\-]', '_', project_name)
+        if project_name.startswith('-'):
+            project_name = f"proj_{project_name}"
 
         # Create temporary project directory
         project_dir = Path(output_path).parent / "ghidra_projects"
@@ -262,8 +269,24 @@ class GhidraRunner:
 
         # Add processor/loader if specified (must be before other flags)
         if processor:
+            try:
+                processor = validate_parameter_pattern(
+                    processor, "processor",
+                    pattern=r'^[a-zA-Z0-9:_.\-]+$',
+                    max_length=100
+                )
+            except ValueError as e:
+                raise ValueError(f"Invalid processor specification: {e}")
             cmd.extend(["-processor", processor])
         if loader:
+            try:
+                loader = validate_parameter_pattern(
+                    loader, "loader",
+                    pattern=r'^[a-zA-Z0-9 _.\-()]+$',
+                    max_length=200
+                )
+            except ValueError as e:
+                raise ValueError(f"Invalid loader specification: {e}")
             cmd.extend(["-loader", loader])
 
         # Add remaining flags

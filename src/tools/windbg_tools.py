@@ -44,7 +44,7 @@ def _is_windows() -> bool:
 
 _SAFE_ADDRESS_RE = re.compile(r'^[0-9a-fA-F`x]+$')  # Hex addresses with optional backticks and 0x prefix
 _SAFE_SYMBOL_RE = re.compile(r'^[a-zA-Z0-9_!.*+:]+$')  # Symbol names like nt!NtCreateFile or module!*
-_SAFE_CONDITION_RE = re.compile(r'^[a-zA-Z0-9_!=<>&|+\-*/()@$.\s,]+$')  # WinDbg expressions
+_SAFE_CONDITION_RE = re.compile(r'^[a-zA-Z0-9_!=<>&|+\-*/()\s,]+$')  # WinDbg expressions
 
 
 def _validate_address(address: str) -> str:
@@ -68,7 +68,13 @@ def _validate_condition(condition: str) -> str:
         return "Error: Invalid condition expression. Only comparison expressions are allowed (e.g. 'rcx==0x100')."
     # Extra check for dangerous commands that might slip through
     cond_lower = cond.lower()
-    for blocked in ('.shell', '.create', '.script', '!runscript', '.writemem'):
+    _BLOCKED_IN_CONDITION = (
+        '.shell', '.create', '.script', '!runscript', '.writemem',
+        '.writevirtmem', '.dump', '.kill', '.restart', '.foreach',
+        '.block', '.printf', '.remote', '.sympath', '.load', '.call',
+        '.open', '.opendump',
+    )
+    for blocked in _BLOCKED_IN_CONDITION:
         if blocked in cond_lower:
             return f"Error: Condition contains blocked command '{blocked}'."
     return ""  # Valid

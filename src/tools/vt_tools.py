@@ -162,6 +162,14 @@ def get_behavior_report(file_hash: str) -> dict:
         Behavior analysis results
     """
     file_hash = file_hash.lower().strip()
+
+    # Validate hash format (same as lookup_hash)
+    if len(file_hash) not in (32, 40, 64):
+        raise ValueError(
+            f"Invalid hash length: {len(file_hash)}. "
+            "Expected MD5 (32), SHA1 (40), or SHA256 (64)."
+        )
+
     response = _vt_request(f"/files/{file_hash}/behaviour_summary")
     return response.get("data", {})
 
@@ -368,7 +376,7 @@ def register_vt_tools(app, session_manager=None):
             return f"File not found: {e}"
         except Exception as e:
             logger.error(f"vt_lookup failed: {e}")
-            return f"Error looking up file: {e}"
+            return safe_error_message("Failed to look up file", e)
 
     @app.tool()
     def vt_behavior(file_hash: str) -> str:
@@ -494,7 +502,7 @@ def register_vt_tools(app, session_manager=None):
             return f"VirusTotal error: {e}"
         except Exception as e:
             logger.error(f"vt_behavior failed: {e}")
-            return f"Error getting behavior report: {e}"
+            return safe_error_message("Failed to get behavior report", e)
 
     @app.tool()
     def vt_search(query: str, limit: int = 10) -> str:
@@ -565,7 +573,7 @@ def register_vt_tools(app, session_manager=None):
             return f"VirusTotal error: {e}"
         except Exception as e:
             logger.error(f"vt_search failed: {e}")
-            return f"Error searching VirusTotal: {e}"
+            return safe_error_message("Failed to search VirusTotal", e)
 
     @app.tool()
     def vt_check_api() -> str:
@@ -599,7 +607,7 @@ def register_vt_tools(app, session_manager=None):
                 return "\n".join(output)
 
             # Mask the API key
-            masked_key = api_key[:8] + "..." + api_key[-4:]
+            masked_key = api_key[:4] + "..." + api_key[-4:]
             output.append(f"✓ API key configured: {masked_key}")
 
             # Test with a known hash (EICAR test file)
@@ -622,6 +630,6 @@ def register_vt_tools(app, session_manager=None):
 
         except Exception as e:
             logger.error(f"vt_check_api failed: {e}")
-            return f"Error checking API: {e}"
+            return safe_error_message("Failed to check API status", e)
 
     logger.info("Registered 4 VirusTotal tools")

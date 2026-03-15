@@ -360,6 +360,14 @@ def analyze_file(file_path: str) -> dict:
     if not path.exists():
         raise FileNotFoundError(f"File not found: {file_path}")
 
+    if not path.is_file():
+        raise ValueError(f"Path is not a file: {file_path}")
+
+    # Check file size to prevent memory exhaustion
+    file_size = path.stat().st_size
+    if file_size > 500 * 1024 * 1024:  # 500MB limit
+        raise ValueError(f"File too large for analysis: {file_size} bytes")
+
     data = path.read_bytes()
 
     return {

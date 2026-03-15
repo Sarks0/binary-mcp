@@ -11,6 +11,12 @@ from pathlib import Path
 from fastmcp import FastMCP
 
 from src.engines.static.dotnet.ilspy_runner import get_ilspy_runner
+from src.utils.security import (
+    PathTraversalError,
+    FileSizeError,
+    safe_error_message,
+    sanitize_binary_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -63,9 +69,16 @@ dotnet tool install -g ilspycmd
 After installation, restart your MCP client.
 """
 
-            path = Path(assembly_path)
-            if not path.exists():
+            # Validate and sanitize path (SECURITY)
+            try:
+                validated = sanitize_binary_path(assembly_path)
+                assembly_path = str(validated)
+            except (PathTraversalError, FileSizeError) as e:
+                return safe_error_message("Invalid assembly path", e)
+            except FileNotFoundError:
                 return f"Error: Assembly not found: {assembly_path}"
+            except ValueError as e:
+                return safe_error_message("Invalid assembly path", e)
 
             # Get assembly info
             assembly_info = ilspy.list_types(assembly_path, force_refresh)
@@ -145,7 +158,7 @@ After installation, restart your MCP client.
             return f"Error: {e}"
         except Exception as e:
             logger.error(f"analyze_dotnet failed: {e}")
-            return f"Error analyzing .NET assembly: {e}"
+            return safe_error_message("Failed to analyze .NET assembly", e)
 
     @app.tool()
     def get_dotnet_types(
@@ -169,6 +182,17 @@ After installation, restart your MCP client.
         try:
             if not ilspy.is_available():
                 return "Error: ILSpyCmd not installed. Run: dotnet tool install -g ilspycmd"
+
+            # Validate and sanitize path (SECURITY)
+            try:
+                validated = sanitize_binary_path(assembly_path)
+                assembly_path = str(validated)
+            except (PathTraversalError, FileSizeError) as e:
+                return safe_error_message("Invalid assembly path", e)
+            except FileNotFoundError:
+                return f"Error: Assembly not found: {assembly_path}"
+            except ValueError as e:
+                return safe_error_message("Invalid assembly path", e)
 
             assembly_info = ilspy.list_types(assembly_path)
 
@@ -208,7 +232,7 @@ After installation, restart your MCP client.
 
         except Exception as e:
             logger.error(f"get_dotnet_types failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("Failed to list .NET types", e)
 
     @app.tool()
     def decompile_dotnet_type(
@@ -232,6 +256,17 @@ After installation, restart your MCP client.
             if not ilspy.is_available():
                 return "Error: ILSpyCmd not installed. Run: dotnet tool install -g ilspycmd"
 
+            # Validate and sanitize path (SECURITY)
+            try:
+                validated = sanitize_binary_path(assembly_path)
+                assembly_path = str(validated)
+            except (PathTraversalError, FileSizeError) as e:
+                return safe_error_message("Invalid assembly path", e)
+            except FileNotFoundError:
+                return f"Error: Assembly not found: {assembly_path}"
+            except ValueError as e:
+                return safe_error_message("Invalid assembly path", e)
+
             source_code = ilspy.decompile_type(assembly_path, type_name)
 
             result = f"**Decompiled: {type_name}**\n\n"
@@ -253,7 +288,7 @@ After installation, restart your MCP client.
             return f"Error: {e}"
         except Exception as e:
             logger.error(f"decompile_dotnet_type failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("Failed to decompile .NET type", e)
 
     @app.tool()
     def search_dotnet_types(
@@ -280,6 +315,17 @@ After installation, restart your MCP client.
             if not ilspy.is_available():
                 return "Error: ILSpyCmd not installed. Run: dotnet tool install -g ilspycmd"
 
+            # Validate and sanitize path (SECURITY)
+            try:
+                validated = sanitize_binary_path(assembly_path)
+                assembly_path = str(validated)
+            except (PathTraversalError, FileSizeError) as e:
+                return safe_error_message("Invalid assembly path", e)
+            except FileNotFoundError:
+                return f"Error: Assembly not found: {assembly_path}"
+            except ValueError as e:
+                return safe_error_message("Invalid assembly path", e)
+
             matches = ilspy.search_types(assembly_path, pattern)
 
             total = len(matches)
@@ -303,10 +349,10 @@ After installation, restart your MCP client.
             return result
 
         except ValueError as e:
-            return f"Error: Invalid pattern - {e}"
+            return safe_error_message("Invalid search pattern", e)
         except Exception as e:
             logger.error(f"search_dotnet_types failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("Failed to search .NET types", e)
 
     @app.tool()
     def decompile_dotnet_assembly(
@@ -333,6 +379,17 @@ After installation, restart your MCP client.
         try:
             if not ilspy.is_available():
                 return "Error: ILSpyCmd not installed. Run: dotnet tool install -g ilspycmd"
+
+            # Validate and sanitize path (SECURITY)
+            try:
+                validated = sanitize_binary_path(assembly_path)
+                assembly_path = str(validated)
+            except (PathTraversalError, FileSizeError) as e:
+                return safe_error_message("Invalid assembly path", e)
+            except FileNotFoundError:
+                return f"Error: Assembly not found: {assembly_path}"
+            except ValueError as e:
+                return safe_error_message("Invalid assembly path", e)
 
             output_dir = ilspy.decompile_assembly(assembly_path, force_refresh=force_refresh)
 
@@ -363,7 +420,7 @@ After installation, restart your MCP client.
 
         except Exception as e:
             logger.error(f"decompile_dotnet_assembly failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("Failed to decompile .NET assembly", e)
 
     @app.tool()
     def get_dotnet_il(
@@ -390,6 +447,17 @@ After installation, restart your MCP client.
             if not ilspy.is_available():
                 return "Error: ILSpyCmd not installed. Run: dotnet tool install -g ilspycmd"
 
+            # Validate and sanitize path (SECURITY)
+            try:
+                validated = sanitize_binary_path(assembly_path)
+                assembly_path = str(validated)
+            except (PathTraversalError, FileSizeError) as e:
+                return safe_error_message("Invalid assembly path", e)
+            except FileNotFoundError:
+                return f"Error: Assembly not found: {assembly_path}"
+            except ValueError as e:
+                return safe_error_message("Invalid assembly path", e)
+
             il_code = ilspy.get_il_code(assembly_path, type_name)
 
             title = f"IL Disassembly: {type_name or Path(assembly_path).name}"
@@ -409,7 +477,7 @@ After installation, restart your MCP client.
 
         except Exception as e:
             logger.error(f"get_dotnet_il failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("Failed to get IL disassembly", e)
 
     @app.tool()
     def diagnose_dotnet_setup() -> str:
@@ -468,6 +536,6 @@ After installation, restart your MCP client.
 
         except Exception as e:
             logger.error(f"diagnose_dotnet_setup failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("Failed to diagnose .NET setup", e)
 
     logger.info("Registered 7 .NET analysis tools")

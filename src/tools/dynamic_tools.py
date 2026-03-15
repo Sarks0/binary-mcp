@@ -21,7 +21,12 @@ from src.engines.dynamic.x64dbg.bridge import (
 from src.engines.dynamic.x64dbg.commands import X64DbgCommands
 from src.engines.session import AnalysisType, UnifiedSessionManager
 from src.engines.static.ghidra.project_cache import ProjectCache
-from src.utils.security import PathTraversalError, sanitize_output_path, validate_state_id, safe_error_message
+from src.utils.security import (
+    PathTraversalError,
+    safe_error_message,
+    sanitize_output_path,
+    validate_state_id,
+)
 from src.utils.structured_errors import StructuredBaseError
 
 logger = logging.getLogger(__name__)

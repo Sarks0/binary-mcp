@@ -246,7 +246,7 @@ def safe_regex_compile(pattern: str, max_length: int = 100, timeout_ms: int = 10
 
     # Structural ReDoS detection: check for nested quantifiers
     # This catches patterns like (.+)+, ([a-z]+)+, (a|a)+, (\\w+\\s?)*, etc.
-    _NESTED_QUANTIFIER_RE = _re.compile(
+    nested_quantifier_re = _re.compile(
         r'(?:'
         r'\([^)]*[+*][^)]*\)[+*?]'   # Group with quantifier followed by quantifier
         r'|'
@@ -255,14 +255,14 @@ def safe_regex_compile(pattern: str, max_length: int = 100, timeout_ms: int = 10
         r'[+*]\)+[+*]'                # Quantifier, close group(s), quantifier
         r')'
     )
-    if _NESTED_QUANTIFIER_RE.search(pattern):
+    if nested_quantifier_re.search(pattern):
         raise ValueError(
             "Potentially dangerous regex: nested quantifiers detected (ReDoS risk)"
         )
 
     # Check for excessive alternation within groups (e.g., (a|a|a|a|a|...))
-    _EXCESSIVE_ALTERNATION_RE = _re.compile(r'\([^)]*(?:\|[^)]*){10,}\)')
-    if _EXCESSIVE_ALTERNATION_RE.search(pattern):
+    excessive_alternation_re = _re.compile(r'\([^)]*(?:\|[^)]*){10,}\)')
+    if excessive_alternation_re.search(pattern):
         raise ValueError(
             "Potentially dangerous regex: excessive alternation detected (ReDoS risk)"
         )
@@ -308,7 +308,7 @@ def validate_state_id(state_id: str) -> str:
     state_id = state_id.strip()
     if not re.match(r'^[a-f0-9]{1,64}$', state_id):
         raise ValueError(
-            f"Invalid state ID format: must be 1-64 hex characters"
+            "Invalid state ID format: must be 1-64 hex characters"
         )
     return state_id
 

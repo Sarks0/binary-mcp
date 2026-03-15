@@ -118,11 +118,11 @@ class X64DbgBridge(Debugger):
         self.base_url = f"http://{host}:{port}"
 
         # Security: Only allow loopback addresses
-        _ALLOWED_HOSTS = ("127.0.0.1", "::1", "localhost")
-        if host not in _ALLOWED_HOSTS:
+        allowed_hosts = ("127.0.0.1", "::1", "localhost")
+        if host not in allowed_hosts:
             raise ValueError(
                 f"x64dbg bridge only supports loopback connections. "
-                f"Got host='{host}', allowed: {_ALLOWED_HOSTS}"
+                f"Got host='{host}', allowed: {allowed_hosts}"
             )
 
         self.timeout = timeout
@@ -930,10 +930,10 @@ class X64DbgBridge(Debugger):
             )
 
         # Validate output path to prevent directory traversal
-        DUMP_OUTPUT_DIR = Path.home() / ".binary_mcp_output" / "dumps"
-        DUMP_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        dump_output_dir = Path.home() / ".binary_mcp_output" / "dumps"
+        dump_output_dir.mkdir(parents=True, exist_ok=True)
         try:
-            validated_output = sanitize_output_path(Path(output_file), DUMP_OUTPUT_DIR)
+            validated_output = sanitize_output_path(Path(output_file), dump_output_dir)
             output_file = str(validated_output)
         except (PathTraversalError, ValueError) as e:
             raise ValueError(f"Invalid output path: {e}")
@@ -2881,10 +2881,10 @@ class X64DbgBridge(Debugger):
         }
 
         # Validate output path to prevent directory traversal
-        DUMP_OUTPUT_DIR = Path.home() / ".binary_mcp_output" / "dumps"
-        DUMP_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        dump_output_dir = Path.home() / ".binary_mcp_output" / "dumps"
+        dump_output_dir.mkdir(parents=True, exist_ok=True)
         try:
-            validated_output = sanitize_output_path(Path(output_path), DUMP_OUTPUT_DIR)
+            validated_output = sanitize_output_path(Path(output_path), dump_output_dir)
             output_path = str(validated_output)
             result["output_path"] = output_path
         except (PathTraversalError, ValueError) as e:

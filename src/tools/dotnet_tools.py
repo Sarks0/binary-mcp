@@ -12,8 +12,8 @@ from fastmcp import FastMCP
 
 from src.engines.static.dotnet.ilspy_runner import get_ilspy_runner
 from src.utils.security import (
-    PathTraversalError,
     FileSizeError,
+    PathTraversalError,
     safe_error_message,
     sanitize_binary_path,
 )

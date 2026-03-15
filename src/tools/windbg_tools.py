@@ -68,13 +68,13 @@ def _validate_condition(condition: str) -> str:
         return "Error: Invalid condition expression. Only comparison expressions are allowed (e.g. 'rcx==0x100')."
     # Extra check for dangerous commands that might slip through
     cond_lower = cond.lower()
-    _BLOCKED_IN_CONDITION = (
+    blocked_in_condition = (
         '.shell', '.create', '.script', '!runscript', '.writemem',
         '.writevirtmem', '.dump', '.kill', '.restart', '.foreach',
         '.block', '.printf', '.remote', '.sympath', '.load', '.call',
         '.open', '.opendump',
     )
-    for blocked in _BLOCKED_IN_CONDITION:
+    for blocked in blocked_in_condition:
         if blocked in cond_lower:
             return f"Error: Condition contains blocked command '{blocked}'."
     return ""  # Valid

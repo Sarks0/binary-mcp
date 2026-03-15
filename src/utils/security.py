@@ -45,9 +45,28 @@ def sanitize_binary_path(
         FileNotFoundError: If file does not exist
         ValueError: If path validation fails
     """
+    # Check for symlinks BEFORE resolving (prevent TOCTOU race)
+    raw_path = Path(binary_path)
+
+    if raw_path.is_symlink() and allowed_dirs:
+        try:
+            real_target = raw_path.resolve()
+            is_symlink_allowed = False
+            for allowed_dir in allowed_dirs:
+                resolved_allowed = allowed_dir.resolve()
+                if real_target.is_relative_to(resolved_allowed):
+                    is_symlink_allowed = True
+                    break
+            if not is_symlink_allowed:
+                raise PathTraversalError(
+                    f"Symlink target outside allowed directories: {binary_path}"
+                )
+        except (OSError, RuntimeError) as e:
+            raise PathTraversalError(f"Invalid symlink: {e}")
+
     # Convert to Path object and resolve to absolute path
     try:
-        path = Path(binary_path).resolve()
+        path = raw_path.resolve()
     except (OSError, RuntimeError) as e:
         raise PathTraversalError(f"Invalid path: {e}")
 
@@ -75,25 +94,6 @@ def sanitize_binary_path(
             raise PathTraversalError(
                 f"Access denied: Path outside allowed directories: {binary_path}"
             )
-
-    # Check for symlinks pointing outside allowed directories
-    if path.is_symlink() and allowed_dirs:
-        try:
-            real_path = path.readlink().resolve()
-            is_symlink_allowed = False
-
-            for allowed_dir in allowed_dirs:
-                resolved_allowed = allowed_dir.resolve()
-                if real_path.is_relative_to(resolved_allowed):
-                    is_symlink_allowed = True
-                    break
-
-            if not is_symlink_allowed:
-                raise PathTraversalError(
-                    f"Symlink target outside allowed directories: {binary_path}"
-                )
-        except (OSError, RuntimeError) as e:
-            raise PathTraversalError(f"Invalid symlink: {e}")
 
     # Check file size to prevent DoS
     try:
@@ -223,13 +223,14 @@ def sanitize_output_path(output_path: Path, allowed_dir: Path) -> Path:
     return abs_path
 
 
-def safe_regex_compile(pattern: str, max_length: int = 100):
+def safe_regex_compile(pattern: str, max_length: int = 100, timeout_ms: int = 1000):
     """
     Safely compile regex pattern with complexity limits.
 
     Args:
         pattern: Regex pattern to compile
         max_length: Maximum pattern length
+        timeout_ms: Timeout for regex operations (informational, used by callers)
 
     Returns:
         Compiled regex pattern
@@ -237,31 +238,124 @@ def safe_regex_compile(pattern: str, max_length: int = 100):
     Raises:
         ValueError: If pattern is too complex or dangerous
     """
-    import re
+    import re as _re
 
     # Validate pattern length
     if len(pattern) > max_length:
         raise ValueError(f"Regex pattern too long (max {max_length} characters)")
 
-    # Check for potentially dangerous constructs that can cause ReDoS
-    dangerous_patterns = [
-        r'(.+)+',     # Nested quantifiers
-        r'(.*)*',     # Nested quantifiers
-        r'(.+)*',     # Nested quantifiers
-        r'(.*)+',     # Nested quantifiers
-        r'(.*)(.*)' , # Multiple greedy quantifiers
-    ]
+    # Structural ReDoS detection: check for nested quantifiers
+    # This catches patterns like (.+)+, ([a-z]+)+, (a|a)+, (\\w+\\s?)*, etc.
+    nested_quantifier_re = _re.compile(
+        r'(?:'
+        r'\([^)]*[+*][^)]*\)[+*?]'   # Group with quantifier followed by quantifier
+        r'|'
+        r'\([^)]*\)\{[0-9,]+\}'       # Group followed by {n,m} quantifier
+        r'|'
+        r'[+*]\)+[+*]'                # Quantifier, close group(s), quantifier
+        r')'
+    )
+    if nested_quantifier_re.search(pattern):
+        raise ValueError(
+            "Potentially dangerous regex: nested quantifiers detected (ReDoS risk)"
+        )
 
-    for danger in dangerous_patterns:
-        if danger in pattern:
-            raise ValueError(
-                f"Potentially dangerous regex pattern detected: {danger}"
-            )
+    # Check for excessive alternation within groups (e.g., (a|a|a|a|a|...))
+    excessive_alternation_re = _re.compile(r'\([^)]*(?:\|[^)]*){10,}\)')
+    if excessive_alternation_re.search(pattern):
+        raise ValueError(
+            "Potentially dangerous regex: excessive alternation detected (ReDoS risk)"
+        )
+
+    # Check for excessive group nesting depth
+    depth = 0
+    max_depth = 0
+    for char in pattern:
+        if char == '(':
+            depth += 1
+            max_depth = max(max_depth, depth)
+        elif char == ')':
+            depth -= 1
+    if max_depth > 5:
+        raise ValueError(
+            f"Regex nesting too deep ({max_depth} levels, max 5)"
+        )
 
     try:
-        return re.compile(pattern, re.IGNORECASE)
-    except re.error as e:
+        return _re.compile(pattern, _re.IGNORECASE)
+    except _re.error as e:
         raise ValueError(f"Invalid regex pattern: {e}")
+
+
+def validate_state_id(state_id: str) -> str:
+    """
+    Validate a debug state ID to prevent path traversal.
+
+    State IDs are generated as hex SHA256 prefixes and must match
+    that format strictly.
+
+    Args:
+        state_id: State identifier string
+
+    Returns:
+        Validated state ID
+
+    Raises:
+        ValueError: If state_id format is invalid
+    """
+    if not state_id or not isinstance(state_id, str):
+        raise ValueError("State ID cannot be empty")
+    state_id = state_id.strip()
+    if not re.match(r'^[a-f0-9]{1,64}$', state_id):
+        raise ValueError(
+            "Invalid state ID format: must be 1-64 hex characters"
+        )
+    return state_id
+
+
+def validate_parameter_pattern(value: str, param_name: str, pattern: str = r'^[a-zA-Z0-9:_.\-]+$', max_length: int = 200) -> str:
+    """
+    Validate a string parameter against an allowed pattern.
+
+    Args:
+        value: Parameter value to validate
+        param_name: Parameter name for error messages
+        pattern: Regex pattern for allowed characters
+        max_length: Maximum allowed length
+
+    Returns:
+        Validated parameter string
+
+    Raises:
+        ValueError: If parameter is invalid
+    """
+    if not value or not isinstance(value, str):
+        raise ValueError(f"{param_name} cannot be empty")
+    value = value.strip()
+    if len(value) > max_length:
+        raise ValueError(f"{param_name} too long (max {max_length} characters)")
+    if not re.match(pattern, value):
+        raise ValueError(
+            f"Invalid {param_name}: contains disallowed characters"
+        )
+    return value
+
+
+def get_allowed_dirs() -> list[Path] | None:
+    """
+    Get allowed directories from configuration.
+
+    Reads BINARY_MCP_ALLOWED_DIRS environment variable (colon-separated paths).
+    Returns None if not configured (allows any directory).
+
+    Returns:
+        List of allowed directory Paths, or None if unrestricted
+    """
+    import os
+    dirs_config = os.environ.get("BINARY_MCP_ALLOWED_DIRS", "").strip()
+    if not dirs_config:
+        return None
+    return [Path(d.strip()) for d in dirs_config.split(":") if d.strip()]
 
 
 class UserFacingError(Exception):

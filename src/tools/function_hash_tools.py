@@ -304,10 +304,11 @@ def register_function_hash_tools(app, session_manager, cache, runner):
         except (PathTraversalError, FileSizeError) as e:
             return safe_error_message("get_function_hash", e)
         except ImportError as e:
-            return f"Error: Required library not available: {e}"
+            logger.error(f"get_function_hash missing library: {e}")
+            return safe_error_message("Required library not available for function hashing", e)
         except Exception as e:
             logger.error(f"get_function_hash failed: {e}")
-            return f"Error computing function hash: {e}"
+            return safe_error_message("Failed to compute function hash", e)
 
     @app.tool()
     def batch_decompile(binary_path: str, functions: str) -> str:
@@ -407,7 +408,7 @@ def register_function_hash_tools(app, session_manager, cache, runner):
             return safe_error_message("batch_decompile", e)
         except Exception as e:
             logger.error(f"batch_decompile failed: {e}")
-            return f"Error in batch decompilation: {e}"
+            return safe_error_message("Failed to batch decompile", e)
 
     @app.tool()
     def analyze_function_completeness(
@@ -662,7 +663,7 @@ def register_function_hash_tools(app, session_manager, cache, runner):
             return safe_error_message("analyze_function_completeness", e)
         except Exception as e:
             logger.error(f"analyze_function_completeness failed: {e}")
-            return f"Error analyzing function completeness: {e}"
+            return safe_error_message("Failed to analyze function completeness", e)
 
     @app.tool()
     def find_similar_functions(
@@ -913,9 +914,10 @@ def register_function_hash_tools(app, session_manager, cache, runner):
         except (PathTraversalError, FileSizeError) as e:
             return safe_error_message("find_similar_functions", e)
         except ImportError as e:
-            return f"Error: Required library not available: {e}"
+            logger.error(f"find_similar_functions missing library: {e}")
+            return safe_error_message("Required library not available for function comparison", e)
         except Exception as e:
             logger.error(f"find_similar_functions failed: {e}")
-            return f"Error finding similar functions: {e}"
+            return safe_error_message("Failed to find similar functions", e)
 
     logger.info("Registered 4 function hash tools")

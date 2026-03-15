@@ -44,6 +44,7 @@ from src.utils.security import (
     FileSizeError,
     PathTraversalError,
     UserFacingError,
+    get_allowed_dirs,
     safe_error_message,
     safe_regex_compile,
     sanitize_binary_path,
@@ -301,7 +302,7 @@ def get_analysis_context(
     try:
         validated_path = sanitize_binary_path(
             binary_path,
-            allowed_dirs=None,  # None = allow any directory (can be restricted in production)
+            allowed_dirs=get_allowed_dirs(),
             max_size_bytes=500 * 1024 * 1024  # 500MB max
         )
         # Use string representation for consistency with rest of codebase

@@ -16,6 +16,7 @@ from typing import Any
 
 import requests
 
+from src.utils.security import PathTraversalError, sanitize_output_path
 from src.utils.structured_errors import (
     StructuredBaseError,
     create_address_invalid_error,
@@ -115,6 +116,15 @@ class X64DbgBridge(Debugger):
             timeout: Request timeout in seconds
         """
         self.base_url = f"http://{host}:{port}"
+
+        # Security: Only allow loopback addresses
+        allowed_hosts = ("127.0.0.1", "::1", "localhost")
+        if host not in allowed_hosts:
+            raise ValueError(
+                f"x64dbg bridge only supports loopback connections. "
+                f"Got host='{host}', allowed: {allowed_hosts}"
+            )
+
         self.timeout = timeout
         self.connected = False
         self._auth_token = None
@@ -281,6 +291,16 @@ class X64DbgBridge(Debugger):
         try:
             with open(token_file) as f:
                 token = f.read().strip()
+
+            # Verify file permissions (defense-in-depth)
+            import stat
+            file_stat = token_file.stat()
+            file_mode = file_stat.st_mode
+            if file_mode & (stat.S_IRGRP | stat.S_IROTH):
+                logger.warning(
+                    f"Token file {token_file} has overly permissive permissions "
+                    f"(mode: {oct(file_mode)}). Consider restricting to owner-only."
+                )
 
             if not token:
                 raise RuntimeError("Authentication token file is empty")
@@ -908,6 +928,15 @@ class X64DbgBridge(Debugger):
             raise ValueError(
                 f"Dump size {size} bytes exceeds maximum {MAX_DUMP_SIZE} bytes (100MB)"
             )
+
+        # Validate output path to prevent directory traversal
+        dump_output_dir = Path.home() / ".binary_mcp_output" / "dumps"
+        dump_output_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            validated_output = sanitize_output_path(Path(output_file), dump_output_dir)
+            output_file = str(validated_output)
+        except (PathTraversalError, ValueError) as e:
+            raise ValueError(f"Invalid output path: {e}")
 
         if address.startswith("0x"):
             address = address[2:]
@@ -2850,6 +2879,17 @@ class X64DbgBridge(Debugger):
             "imports_rebuilt": False,
             "warnings": []
         }
+
+        # Validate output path to prevent directory traversal
+        dump_output_dir = Path.home() / ".binary_mcp_output" / "dumps"
+        dump_output_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            validated_output = sanitize_output_path(Path(output_path), dump_output_dir)
+            output_path = str(validated_output)
+            result["output_path"] = output_path
+        except (PathTraversalError, ValueError) as e:
+            result["warnings"].append(f"Invalid output path: {e}")
+            return result
 
         # Find the module
         modules = self.get_modules()

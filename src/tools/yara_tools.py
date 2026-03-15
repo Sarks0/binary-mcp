@@ -358,7 +358,7 @@ def register_yara_tools(app, session_manager):
 
         except Exception as e:
             logger.error(f"generate_yara_rule_from_session failed: {e}")
-            return f"Error generating Yara rule: {e}"
+            return safe_error_message("Failed to generate Yara rule from session", e)
 
     @app.tool()
     def generate_yara_rule_from_strings(
@@ -463,6 +463,6 @@ def register_yara_tools(app, session_manager):
             return safe_error_message("generate_yara_rule_from_strings", e)
         except Exception as e:
             logger.error(f"generate_yara_rule_from_strings failed: {e}")
-            return f"Error generating Yara rule: {e}"
+            return safe_error_message("Failed to generate Yara rule from strings", e)
 
     logger.info("Registered 2 Yara tools")

@@ -69,31 +69,46 @@ _CDB_TIMEOUT = 30
 # Dangerous WinDbg meta-commands that must never be executed via the bridge.
 # Checked case-insensitively via substring match (commands can follow semicolons).
 _BLOCKED_COMMANDS = (
+    # Process/session control
     ".shell",
     ".create",
     ".abandon",
     ".kill",
     ".restart",
+    ".detach",
+    ".reboot",
+    ".crash",
+    ".bugcheck",
+    # File I/O
     ".dump",
     ".writemem",
     ".writevirtmem",
     ".logopen",
     ".logclose",
-    ".outmask",
+    ".open",
+    ".opendump",
+    # Scripting/execution
     ".script",
     ".scriptrun",
     ".scriptload",
     "!runscript",
-    ".formats",
-    ".tlist",
-    ".detach",
-    ".reboot",
-    ".crash",
-    ".bugcheck",
+    ".call",
+    ".foreach",
+    ".block",
+    ".printf",
+    # Module loading
     ".load",
     ".loadby",
     ".cordll",
-    ".call",
+    # Network/remote access
+    ".remote",
+    ".sympath",
+    ".symfix",
+    ".netsyms",
+    # Output/mask manipulation
+    ".outmask",
+    ".formats",
+    ".tlist",
 )
 
 
@@ -1013,17 +1028,27 @@ class WinDbgBridge(Debugger):
         Checks the command string (case-insensitively) against
         ``_BLOCKED_COMMANDS`` using substring matching, since dangerous
         commands can appear after semicolons in compound expressions.
+        Also checks for common bypass techniques.
 
         Raises:
             WinDbgBridgeError: If a blocked command is detected.
         """
-        lower_cmd = command.lower()
+        lower_cmd = command.lower().strip()
+
+        # Check each blocked command as substring
         for blocked in _BLOCKED_COMMANDS:
             if blocked in lower_cmd:
                 raise WinDbgBridgeError(
                     "command_validation",
                     f"Command blocked: '{blocked}' is not allowed for security reasons.",
                 )
+
+        # Block commands with excessive semicolons (compound command chains)
+        if lower_cmd.count(';') > 5:
+            raise WinDbgBridgeError(
+                "command_validation",
+                "Command blocked: too many compound commands (max 5 semicolons).",
+            )
 
     def _log_error(
         self,

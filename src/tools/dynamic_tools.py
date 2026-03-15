@@ -21,7 +21,12 @@ from src.engines.dynamic.x64dbg.bridge import (
 from src.engines.dynamic.x64dbg.commands import X64DbgCommands
 from src.engines.session import AnalysisType, UnifiedSessionManager
 from src.engines.static.ghidra.project_cache import ProjectCache
-from src.utils.security import PathTraversalError, sanitize_output_path
+from src.utils.security import (
+    PathTraversalError,
+    safe_error_message,
+    sanitize_output_path,
+    validate_state_id,
+)
 from src.utils.structured_errors import StructuredBaseError
 
 logger = logging.getLogger(__name__)
@@ -5442,7 +5447,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_save_debug_state failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("Failed to save debug state", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -5478,6 +5483,12 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
         """
         try:
             bridge = get_x64dbg_bridge()
+
+            # Validate state_id to prevent path traversal
+            try:
+                state_id = validate_state_id(state_id)
+            except ValueError as e:
+                return f"Error: Invalid state ID - {e}"
 
             # Load state from file
             import json
@@ -5668,7 +5679,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_list_debug_states failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("Failed to list debug states", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -5683,6 +5694,12 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             Deletion confirmation
         """
         try:
+            # Validate state_id to prevent path traversal
+            try:
+                state_id = validate_state_id(state_id)
+            except ValueError as e:
+                return f"Error: Invalid state ID - {e}"
+
             deleted = False
 
             if _session_manager:
@@ -5705,7 +5722,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_delete_debug_state failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("Failed to delete debug state", e)
 
     # =========================================================================
     # P2: API Hook Detection

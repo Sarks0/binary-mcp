@@ -18,14 +18,31 @@ logger = logging.getLogger(__name__)
 
 
 def calculate_file_hashes(file_path: str) -> dict:
-    """Calculate MD5, SHA1, SHA256 hashes."""
+    """Calculate MD5, SHA1, SHA256 hashes using chunked reads."""
     path = Path(file_path)
-    data = path.read_bytes()
+
+    if not path.is_file():
+        raise FileNotFoundError(f"File not found: {file_path}")
+
+    # Check file size to prevent memory exhaustion
+    file_size = path.stat().st_size
+    if file_size > 500 * 1024 * 1024:  # 500MB limit
+        raise ValueError(f"File too large for hashing: {file_size} bytes")
+
+    md5 = hashlib.md5()   # nosec B324 - MD5 used for identification, not security
+    sha1 = hashlib.sha1()  # nosec B324 - SHA1 used for identification, not security
+    sha256 = hashlib.sha256()
+
+    with open(path, "rb") as f:
+        while chunk := f.read(8192):
+            md5.update(chunk)
+            sha1.update(chunk)
+            sha256.update(chunk)
 
     return {
-        "md5": hashlib.md5(data).hexdigest(),  # nosec B324
-        "sha1": hashlib.sha1(data).hexdigest(),  # nosec B324
-        "sha256": hashlib.sha256(data).hexdigest(),
+        "md5": md5.hexdigest(),
+        "sha1": sha1.hexdigest(),
+        "sha256": sha256.hexdigest(),
     }
 
 
@@ -664,7 +681,7 @@ def register_triage_tools(app, session_manager=None):
             return safe_error_message("quick_scan", e)
         except Exception as e:
             logger.error(f"quick_scan failed: {e}")
-            return f"Error scanning file: {e}"
+            return safe_error_message("Failed to scan file", e)
 
     @app.tool()
     def detect_packers(binary_path: str) -> str:
@@ -723,7 +740,7 @@ def register_triage_tools(app, session_manager=None):
             return safe_error_message("detect_packers", e)
         except Exception as e:
             logger.error(f"detect_packers failed: {e}")
-            return f"Error detecting packers: {e}"
+            return safe_error_message("Failed to detect packers", e)
 
     @app.tool()
     def extract_iocs(binary_path: str) -> str:
@@ -812,6 +829,6 @@ def register_triage_tools(app, session_manager=None):
             return safe_error_message("extract_iocs", e)
         except Exception as e:
             logger.error(f"extract_iocs failed: {e}")
-            return f"Error extracting IOCs: {e}"
+            return safe_error_message("Failed to extract IOCs", e)
 
     logger.info("Registered 3 triage tools")

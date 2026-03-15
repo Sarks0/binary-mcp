@@ -580,7 +580,7 @@ def register_control_flow_tools(app, session_manager=None, cache=None, runner=No
             return safe_error_message("analyze_control_flow", e)
         except Exception as e:
             logger.error(f"analyze_control_flow failed: {e}")
-            return f"Error analyzing control flow: {e}"
+            return safe_error_message("Failed to analyze control flow", e)
 
     # ------------------------------------------------------------------
     # Tool 2: detect_loops
@@ -701,7 +701,7 @@ def register_control_flow_tools(app, session_manager=None, cache=None, runner=No
             return safe_error_message("detect_loops", e)
         except Exception as e:
             logger.error(f"detect_loops failed: {e}")
-            return f"Error detecting loops: {e}"
+            return safe_error_message("Failed to detect loops", e)
 
     # ------------------------------------------------------------------
     # Tool 3: find_dead_code
@@ -837,7 +837,7 @@ def register_control_flow_tools(app, session_manager=None, cache=None, runner=No
             return safe_error_message("find_dead_code", e)
         except Exception as e:
             logger.error(f"find_dead_code failed: {e}")
-            return f"Error finding dead code: {e}"
+            return safe_error_message("Failed to find dead code", e)
 
     # ------------------------------------------------------------------
     # Tool 4: get_function_complexity
@@ -999,6 +999,6 @@ def register_control_flow_tools(app, session_manager=None, cache=None, runner=No
             return safe_error_message("get_function_complexity", e)
         except Exception as e:
             logger.error(f"get_function_complexity failed: {e}")
-            return f"Error computing complexity: {e}"
+            return safe_error_message("Failed to compute complexity", e)
 
     logger.info("Registered 4 control flow analysis tools")

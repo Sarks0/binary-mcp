@@ -67,6 +67,5 @@ jobs:
 
     - name: Run security checks with bandit
       run: |
-        uv run pip install bandit
-        uv run bandit -r src/ -ll
+        uvx bandit -r src/ -ll
       continue-on-error: true

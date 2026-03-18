@@ -43,7 +43,7 @@ Obsidian is an AI-powered debugging bridge for x64dbg that exposes debugger func
 - Easy to debug independently
 - Industry-standard plugin pattern
 
-See [ARCHITECTURE.md](../ARCHITECTURE.md) for detailed technical documentation.
+See [x64dbg-architecture.md](../../../../docs/x64dbg-architecture.md) for detailed technical documentation.
 
 ## Building
 
@@ -437,7 +437,7 @@ Response:
 
 ```
 src/engines/dynamic/x64dbg/
-├── ARCHITECTURE.md        # Detailed architecture documentation
+├── (see docs/x64dbg-architecture.md)  # Detailed architecture documentation
 ├── pipe_protocol.h        # Shared IPC protocol definitions
 ├── plugin/
 │   ├── CMakeLists.txt     # Dual-target build (plugin + server)

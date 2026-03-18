@@ -203,7 +203,7 @@ jobs:
         - `[Obsidian] HTTP server process started (PID: ...)`
         - `[Obsidian] HTTP server connected to pipe`
 
-        See [ARCHITECTURE.md](https://github.com/Sarks0/binary-mcp/blob/main/src/engines/dynamic/x64dbg/ARCHITECTURE.md) for details.
+        See [x64dbg-architecture.md](https://github.com/Sarks0/binary-mcp/blob/main/docs/x64dbg-architecture.md) for details.
         EOF
 
         # Create the release zip

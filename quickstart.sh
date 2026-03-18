@@ -43,7 +43,7 @@ fi
 # Run diagnostics
 echo "[3/5] Running diagnostic checks..."
 uv run python -c "
-from src.ghidra.runner import GhidraRunner
+from src.engines.static.ghidra.runner import GhidraRunner
 try:
     runner = GhidraRunner()
     diag = runner.diagnose()
@@ -70,8 +70,8 @@ echo "Next Steps:"
 echo "=========================================="
 echo ""
 echo "1. Configure Claude Desktop or Claude Code:"
-echo "   See config/claude_desktop_config.json"
-echo "   See config/claude_code_config.json"
+echo "   See config/claude_desktop_config.example.json"
+echo "   See config/claude_code_config.example.json"
 echo ""
 echo "2. Update paths in config files:"
 echo "   - Update 'directory' to this project path"

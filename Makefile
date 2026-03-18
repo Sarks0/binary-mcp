@@ -1,7 +1,7 @@
-.PHONY: help install test run clean compile-sample diagnose
+.PHONY: help install install-dev test test-cov run compile-sample diagnose clean clean-all lint format
 
 help:
-	@echo "Ghidra MCP Server - Development Commands"
+	@echo "Binary MCP Server - Development Commands"
 	@echo ""
 	@echo "  make install        - Install dependencies with uv"
 	@echo "  make test          - Run test suite"
@@ -36,7 +36,7 @@ compile-sample:
 
 diagnose:
 	@echo "Running diagnostic checks..."
-	@uv run python -c "from src.ghidra.runner import GhidraRunner; import json; r = GhidraRunner(); print(json.dumps(r.diagnose(), indent=2))"
+	@uv run python -c "from src.engines.static.ghidra.runner import GhidraRunner; import json; r = GhidraRunner(); print(json.dumps(r.diagnose(), indent=2))"
 
 clean:
 	@echo "Cleaning cache and temporary files..."

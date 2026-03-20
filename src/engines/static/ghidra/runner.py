@@ -166,12 +166,18 @@ class GhidraRunner:
 
         project_path = project_dir / f"{project_name}.rep"
         lock_file = project_dir / f"{project_name}.lock"
+        gpr_file = project_dir / f"{project_name}.gpr"
 
         try:
             # Remove lock file
             if lock_file.exists():
                 lock_file.unlink()
                 logger.debug(f"Removed lock file: {lock_file}")
+
+            # Remove project file
+            if gpr_file.exists():
+                gpr_file.unlink()
+                logger.debug(f"Removed project file: {gpr_file}")
 
             # Remove project directory
             if project_path.exists():
@@ -255,6 +261,8 @@ class GhidraRunner:
             env["GHIDRA_MAX_FUNCTIONS"] = str(max_functions)
         if skip_decompile:
             env["GHIDRA_SKIP_DECOMPILE"] = "1"
+        # Give script a wall-clock budget with margin for JSON serialization
+        env["GHIDRA_ANALYSIS_BUDGET"] = str(max(timeout - 60, 60))
 
         logger.debug(f"Analysis settings: function_timeout={function_timeout}, "
                      f"max_functions={max_functions}, skip_decompile={skip_decompile}")
@@ -353,9 +361,10 @@ class GhidraRunner:
             # Clean up locked project to prevent future lock errors
             self._cleanup_project(project_dir, project_name)
 
+            stdout_tail = (e.stdout or "")[-2000:]
             raise RuntimeError(
                 f"Ghidra analysis failed with exit code {e.returncode}. "
-                f"Check logs for details."
+                f"stdout (last 2000 chars): {stdout_tail}"
             ) from e
 
     def diagnose(self) -> dict:

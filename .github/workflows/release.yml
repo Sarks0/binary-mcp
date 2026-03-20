@@ -279,6 +279,6 @@ jobs:
         files: |
           binary-mcp-${{ steps.version.outputs.version }}.zip
         draft: false
-        prerelease: false
+        prerelease: ${{ contains(github.ref, '-rc') }}
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

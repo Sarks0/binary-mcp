@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import tempfile
 import time
 import traceback
@@ -129,12 +130,55 @@ class X64DbgBridge(Debugger):
         self.connected = False
         self._auth_token = None
         self._error_logger = X64DbgErrorLogger()
+        self._arch: str | None = None  # "x86" or "x64", detected on first use
 
         self._max_retries = 3
         self._retry_delay = 0.1  # seconds
+        self._max_reconnects = 2  # max reconnection attempts per request sequence
 
         logger.info(f"Initialized x64dbg bridge: {self.base_url}")
         logger.info(f"Error logging enabled: {self._error_logger.error_dir}")
+
+    def _detect_architecture(self) -> str:
+        """
+        Detect whether the debugged process is 32-bit or 64-bit.
+
+        Checks register names returned by the debugger:
+        - rax/rip present → 64-bit (x64dbg)
+        - eax/eip present → 32-bit (x32dbg)
+
+        Returns:
+            "x64" or "x86". Result is cached after first detection.
+        """
+        if self._arch is not None:
+            return self._arch
+
+        try:
+            registers = self.get_registers()
+            reg_names = set(registers.keys())
+
+            if "eax" in reg_names or "eip" in reg_names:
+                self._arch = "x86"
+                logger.info("Detected 32-bit architecture (x32dbg)")
+            else:
+                self._arch = "x64"
+                logger.info("Detected 64-bit architecture (x64dbg)")
+        except Exception as e:
+            self._arch = "x64"
+            logger.warning(
+                f"Could not detect architecture ({e}), defaulting to x64"
+            )
+
+        return self._arch
+
+    def _get_pointer_size(self) -> int:
+        """
+        Get pointer size in bytes for the current architecture.
+
+        Returns:
+            4 for 32-bit, 8 for 64-bit
+        """
+        return 4 if self._detect_architecture() == "x86" else 8
 
     def _normalize_address(self, address: str | None, param_name: str = "address") -> str:
         """
@@ -222,25 +266,28 @@ class X64DbgBridge(Debugger):
         """
         retries = max_retries if max_retries is not None else self._max_retries
         last_error = None
+        reconnect_count = 0
 
         for attempt in range(retries + 1):
             try:
                 return self._request(endpoint, data)
+            except AddressValidationError:
+                # Address validation failures are deterministic — never retry
+                raise
             except (ConnectionError, RuntimeError) as e:
                 last_error = e
                 error_msg = str(e)
 
-                # Don't retry on validation errors (Missing address, etc.)
-                # These are likely parameter issues that won't be fixed by retrying
-                if "Missing" in error_msg and attempt < retries:
-                    # Log and retry - might be a serialization race
-                    logger.warning(
-                        f"Request failed (attempt {attempt + 1}/{retries + 1}): {error_msg}. "
-                        f"Retrying with data: {data}"
-                    )
-                    time.sleep(self._retry_delay * (attempt + 1))
-                    continue
-                elif "API error" in error_msg:
+                # Don't retry on address-related API errors — these are
+                # deterministic parameter validation failures, not transient
+                if isinstance(e, X64DbgAPIError):
+                    msg_lower = e.api_message.lower() if e.api_message else ""
+                    if "missing" in msg_lower and "address" in msg_lower:
+                        raise
+                    if "invalid" in msg_lower and "address" in msg_lower:
+                        raise
+
+                if "API error" in error_msg:
                     # API errors should include context for debugging
                     raise RuntimeError(
                         f"{error_msg}\n"
@@ -248,8 +295,41 @@ class X64DbgBridge(Debugger):
                         f"  Endpoint: {endpoint}\n"
                         f"  Data sent: {data}"
                     )
-                else:
-                    raise
+
+                # Attempt auto-reconnect for connection-level failures
+                is_connection_error = (
+                    isinstance(e, ConnectionError)
+                    or "ConnectionReset" in error_msg
+                    or "ConnectionAborted" in error_msg
+                )
+                if is_connection_error and reconnect_count < self._max_reconnects:
+                    reconnect_count += 1
+                    logger.warning(
+                        f"Connection lost (attempt {attempt + 1}/{retries + 1}): "
+                        f"{error_msg}. Attempting reconnect "
+                        f"({reconnect_count}/{self._max_reconnects})..."
+                    )
+                    # Reset auth token — plugin may have restarted with a new token
+                    self._auth_token = None
+                    self.connected = False
+                    try:
+                        self.connect()
+                        logger.warning("Reconnected to x64dbg successfully")
+                        time.sleep(self._retry_delay)
+                        continue
+                    except Exception as reconnect_error:
+                        logger.warning(f"Reconnect failed: {reconnect_error}")
+                        # Fall through to normal retry/raise logic
+
+                if attempt < retries:
+                    logger.warning(
+                        f"Request failed (attempt {attempt + 1}/{retries + 1}): {error_msg}. "
+                        f"Retrying..."
+                    )
+                    time.sleep(self._retry_delay * (attempt + 1))
+                    continue
+
+                raise
 
         # All retries exhausted
         raise RuntimeError(
@@ -669,19 +749,57 @@ class X64DbgBridge(Debugger):
         logger.debug(f"Got {len(registers)} register values")
         return registers
 
-    def get_stack(self, depth: int = 20) -> list[dict[str, str]]:
+    def get_stack(self, depth: int = 20) -> dict[str, Any]:
         """
-        Get stack trace.
+        Get stack trace, with fallback to raw stack memory dump.
+
+        When /api/stack returns no frames, falls back to reading raw
+        pointer-sized values from the stack pointer (ESP/RSP).
 
         Args:
             depth: Number of stack frames to retrieve
 
         Returns:
-            List of stack frame dictionaries
+            Dict with "frames" (list of frame dicts) and "raw" (bool
+            indicating whether frames are raw stack contents vs unwound
+            call frames)
         """
         data = {"depth": depth}
         result = self._request("/api/stack", data)
-        return result.get("frames", [])
+        frames = result.get("frames", [])
+
+        if frames:
+            return {"frames": frames, "raw": False}
+
+        # Fallback: read raw stack memory via ESP/RSP
+        logger.info("No stack frames from /api/stack, falling back to raw stack read")
+        try:
+            arch = self._detect_architecture()
+            ptr_size = self._get_pointer_size()
+            registers = self.get_registers()
+            sp_reg = "esp" if arch == "x86" else "rsp"
+            sp_value = registers.get(sp_reg)
+
+            if not sp_value:
+                logger.warning(f"Stack pointer register '{sp_reg}' not found")
+                return {"frames": [], "raw": False}
+
+            read_size = depth * ptr_size
+            raw_bytes = self.read_memory(sp_value, read_size)
+
+            raw_frames = []
+            for i in range(0, len(raw_bytes), ptr_size):
+                chunk = raw_bytes[i : i + ptr_size]
+                if len(chunk) < ptr_size:
+                    break
+                value = int.from_bytes(chunk, byteorder="little")
+                raw_frames.append({"address": f"{value:x}", "comment": "raw stack"})
+
+            logger.info(f"Read {len(raw_frames)} raw stack entries from {sp_reg}")
+            return {"frames": raw_frames, "raw": True}
+        except Exception as e:
+            logger.warning(f"Raw stack fallback failed: {e}")
+            return {"frames": [], "raw": False}
 
     def get_modules(self) -> list[dict[str, Any]]:
         """
@@ -714,8 +832,7 @@ class X64DbgBridge(Debugger):
         Returns:
             Raw bytes from memory
         """
-        if address.startswith("0x"):
-            address = address[2:]
+        address = self._normalize_address(address)
 
         data = {
             "address": address,
@@ -739,8 +856,7 @@ class X64DbgBridge(Debugger):
         Returns:
             True if write successful
         """
-        if address.startswith("0x"):
-            address = address[2:]
+        address = self._normalize_address(address)
 
         payload = {
             "address": address,
@@ -835,9 +951,10 @@ class X64DbgBridge(Debugger):
                 logger.warning(f"Could not read memory at 0x{address}")
                 return []
 
-            # Determine architecture from debugger state
-            # Default to x64 mode
-            md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
+            # Select capstone mode based on detected architecture
+            arch = self._detect_architecture()
+            mode = capstone.CS_MODE_32 if arch == "x86" else capstone.CS_MODE_64
+            md = capstone.Cs(capstone.CS_ARCH_X86, mode)
             md.detail = False
 
             instructions = []
@@ -938,8 +1055,7 @@ class X64DbgBridge(Debugger):
         except (PathTraversalError, ValueError) as e:
             raise ValueError(f"Invalid output path: {e}")
 
-        if address.startswith("0x"):
-            address = address[2:]
+        address = self._normalize_address(address)
 
         data = {
             "address": address,
@@ -1014,8 +1130,7 @@ class X64DbgBridge(Debugger):
         Note:
             Requires C++ plugin implementation of /api/memory/info
         """
-        if address.startswith("0x"):
-            address = address[2:]
+        address = self._normalize_address(address)
 
         data = {"address": address}
         result = self._request("/api/memory/info", data)
@@ -1032,53 +1147,200 @@ class X64DbgBridge(Debugger):
         """
         Get current or specific instruction details.
 
+        Falls back to capstone disassembly when the plugin returns empty fields.
+
         Args:
             address: Optional address (uses current RIP if None)
 
         Returns:
             Dictionary with address, bytes, mnemonic, operands, etc.
-
-        Note:
-            Requires C++ plugin implementation of /api/instruction
         """
         data = {}
         if address:
-            if address.startswith("0x"):
-                address = address[2:]
+            address = self._normalize_address(address)
             data["address"] = address
 
-        result = self._request("/api/instruction", data)
+        try:
+            result = self._request("/api/instruction", data)
+            api_result = {
+                "address": result.get("address", "unknown"),
+                "bytes": result.get("bytes", ""),
+                "mnemonic": result.get("mnemonic", ""),
+                "operands": result.get("operands", ""),
+                "size": result.get("size", 0),
+                "type": result.get("type", ""),
+            }
+            if api_result["mnemonic"]:
+                return api_result
+        except Exception as e:
+            logger.debug(f"Plugin /api/instruction failed: {e}")
 
+        # Fallback: disassemble with capstone
+        fallback = self._get_instruction_capstone(address)
+        if fallback:
+            return fallback
+
+        # Return empty result if both paths fail
         return {
-            "address": result.get("address", "unknown"),
-            "bytes": result.get("bytes", ""),
-            "mnemonic": result.get("mnemonic", ""),
-            "operands": result.get("operands", ""),
-            "size": result.get("size", 0),
-            "type": result.get("type", "")  # "call", "jmp", "ret", etc.
+            "address": address or "unknown",
+            "bytes": "",
+            "mnemonic": "",
+            "operands": "",
+            "size": 0,
+            "type": "",
         }
+
+    def _get_instruction_capstone(self, address: str | None) -> dict[str, Any] | None:
+        """
+        Disassemble a single instruction at address using capstone.
+
+        Args:
+            address: Normalized hex address (no 0x prefix), or None to use RIP/EIP.
+
+        Returns:
+            Instruction dict, or None on failure.
+        """
+        try:
+            import capstone
+        except ImportError:
+            logger.warning("Capstone not available for get_instruction fallback")
+            return None
+
+        try:
+            # Resolve address from instruction pointer if not provided
+            if not address:
+                regs = self.get_registers()
+                ip_reg = "eip" if self._detect_architecture() == "x86" else "rip"
+                ip_val = regs.get(ip_reg)
+                if not ip_val:
+                    logger.warning(f"Cannot resolve {ip_reg} from registers")
+                    return None
+                address = ip_val.lstrip("0x").lstrip("0") or "0"
+
+            addr_int = int(address, 16)
+            raw_bytes = self.read_memory(f"0x{address}", 15)
+            if not raw_bytes:
+                return None
+
+            arch = self._detect_architecture()
+            mode = capstone.CS_MODE_32 if arch == "x86" else capstone.CS_MODE_64
+            md = capstone.Cs(capstone.CS_ARCH_X86, mode)
+
+            for instr in md.disasm(raw_bytes, addr_int):
+                logger.info(f"Capstone fallback: 0x{instr.address:X} {instr.mnemonic} {instr.op_str}")
+                return {
+                    "address": f"{instr.address:X}",
+                    "bytes": instr.bytes.hex(),
+                    "mnemonic": instr.mnemonic,
+                    "operands": instr.op_str,
+                    "size": instr.size,
+                    "type": "",
+                }
+
+        except Exception as e:
+            logger.error(f"Capstone get_instruction fallback failed: {e}")
+
+        return None
 
     def evaluate_expression(self, expression: str) -> dict[str, Any]:
         """
         Evaluate expression (e.g., "[rsp+8]", "kernel32.CreateFileA").
 
+        Falls back to local resolution when the plugin endpoint fails.
+
         Args:
             expression: Expression to evaluate
 
         Returns:
-            Dictionary with value and type
-
-        Note:
-            Requires C++ plugin implementation of /api/evaluate
+            Dictionary with value, type, and valid flag
         """
-        data = {"expression": expression}
-        result = self._request("/api/evaluate", data)
+        # Try plugin first
+        try:
+            data = {"expression": expression}
+            result = self._request("/api/evaluate", data)
+            if result.get("valid", False):
+                return {
+                    "value": result.get("value", "unknown"),
+                    "type": result.get("type", "unknown"),
+                    "valid": True,
+                }
+        except Exception as e:
+            logger.debug(f"Plugin /api/evaluate failed: {e}")
 
-        return {
-            "value": result.get("value", "unknown"),
-            "type": result.get("type", "unknown"),
-            "valid": result.get("valid", False)
-        }
+        # Fallback: local expression evaluation
+        return self._evaluate_expression_local(expression)
+
+    def _evaluate_expression_local(self, expression: str) -> dict[str, Any]:
+        """
+        Evaluate an expression locally without the plugin.
+
+        Supports:
+            - Simple register names: "rax", "esp"
+            - Register+offset: "rax+0x10", "esp-8"
+            - Pointer dereference: "[rax]", "[esp+14]"
+            - Symbol resolution: "kernel32.CreateFileA", "kernel32!CreateFileW"
+
+        Returns:
+            Dictionary with value, type, and valid flag.
+        """
+        expr = expression.strip()
+        if not expr:
+            return {"value": "unknown", "type": "unknown", "valid": False, "error": "Empty expression"}
+
+        try:
+            # Pointer dereference: [expr]
+            if expr.startswith("[") and expr.endswith("]"):
+                inner = expr[1:-1].strip()
+                inner_result = self._evaluate_expression_local(inner)
+                if not inner_result.get("valid"):
+                    return {"value": "unknown", "type": "pointer", "valid": False,
+                            "error": f"Cannot resolve inner expression: {inner}"}
+                addr_int = int(inner_result["value"], 16)
+                ptr_size = self._get_pointer_size()
+                raw = self.read_memory(f"0x{addr_int:X}", ptr_size)
+                value = int.from_bytes(raw, byteorder="little")
+                return {"value": f"0x{value:X}", "type": "pointer", "valid": True}
+
+            # Register+offset: rax+0x10, esp-8
+            reg_offset = re.match(
+                r'^([a-zA-Z]\w*)\s*([+-])\s*(0x[0-9a-fA-F]+|[0-9a-fA-F]+)$', expr
+            )
+            if reg_offset:
+                reg_name = reg_offset.group(1).lower()
+                op = reg_offset.group(2)
+                offset_str = reg_offset.group(3)
+                offset = int(offset_str, 16) if offset_str.startswith("0x") else int(offset_str, 16)
+
+                regs = self.get_registers()
+                reg_val = regs.get(reg_name)
+                if reg_val is None:
+                    return {"value": "unknown", "type": "expression", "valid": False,
+                            "error": f"Unknown register: {reg_name}"}
+                base = int(reg_val, 16)
+                result = base + offset if op == "+" else base - offset
+                return {"value": f"0x{result:X}", "type": "expression", "valid": True}
+
+            # Simple register name
+            regs = self.get_registers()
+            if expr.lower() in regs:
+                val = regs[expr.lower()]
+                return {"value": f"0x{int(val, 16):X}", "type": "register", "valid": True}
+
+            # Symbol resolution: module.func or module!func
+            if "." in expr or "!" in expr:
+                sym_result = self.resolve_symbol(expr)
+                if sym_result.get("success"):
+                    addr = sym_result.get("address", "unknown")
+                    return {"value": f"0x{addr}" if not addr.startswith("0x") else addr,
+                            "type": "symbol", "valid": True}
+
+            return {"value": "unknown", "type": "unknown", "valid": False,
+                    "error": f"Cannot evaluate expression: {expr}"}
+
+        except Exception as e:
+            logger.error(f"Local expression evaluation failed for '{expression}': {e}")
+            return {"value": "unknown", "type": "unknown", "valid": False,
+                    "error": str(e)}
 
     def resolve_symbol(self, expression: str) -> dict[str, Any]:
         """
@@ -1134,8 +1396,7 @@ class X64DbgBridge(Debugger):
         Note:
             Requires C++ plugin implementation of /api/comment/set
         """
-        if address.startswith("0x"):
-            address = address[2:]
+        address = self._normalize_address(address)
 
         data = {
             "address": address,
@@ -1159,8 +1420,7 @@ class X64DbgBridge(Debugger):
         Note:
             Requires C++ plugin implementation of /api/comment/get
         """
-        if address.startswith("0x"):
-            address = address[2:]
+        address = self._normalize_address(address)
 
         data = {"address": address}
         result = self._request("/api/comment/get", data)
@@ -1749,8 +2009,7 @@ class X64DbgBridge(Debugger):
         """
         data = {"size": size}
         if address:
-            if address.startswith("0x"):
-                address = address[2:]
+            address = self._normalize_address(address)
             data["address"] = address
 
         result = self._request("/api/memory/alloc", data)
@@ -1770,8 +2029,7 @@ class X64DbgBridge(Debugger):
         Example:
             bridge.virt_free("0x12340000")
         """
-        if address.startswith("0x"):
-            address = address[2:]
+        address = self._normalize_address(address)
 
         data = {"address": address}
         result = self._request("/api/memory/free", data)
@@ -1805,8 +2063,7 @@ class X64DbgBridge(Debugger):
             bridge.write_memory("0x401000", b"\\x90\\x90")  # Write NOPs
             bridge.virt_protect("0x401000", "rx", 0x1000)   # Restore
         """
-        if address.startswith("0x"):
-            address = address[2:]
+        address = self._normalize_address(address)
 
         data = {
             "address": address,
@@ -1837,8 +2094,7 @@ class X64DbgBridge(Debugger):
             # Fill with NOPs (0x90)
             bridge.memset("0x401000", 0x90, 10)
         """
-        if address.startswith("0x"):
-            address = address[2:]
+        address = self._normalize_address(address)
 
         data = {
             "address": address,
@@ -1864,8 +2120,7 @@ class X64DbgBridge(Debugger):
             if bridge.check_valid_read_ptr("0x401000"):
                 data = bridge.read_memory("0x401000", 16)
         """
-        if address.startswith("0x"):
-            address = address[2:]
+        address = self._normalize_address(address)
 
         data = {"address": address}
         result = self._request("/api/memory/check", data)
@@ -2418,8 +2673,7 @@ class X64DbgBridge(Debugger):
             "unicode": 1 if unicode else 0
         }
         if address:
-            if address.startswith("0x"):
-                address = address[2:]
+            address = self._normalize_address(address)
             data["address"] = address
 
         result = self._request("/api/strings", data)
@@ -2461,8 +2715,7 @@ class X64DbgBridge(Debugger):
         """
         data = {"pattern": pattern, "size": size}
         if address:
-            if address.startswith("0x"):
-                address = address[2:]
+            address = self._normalize_address(address)
             data["address"] = address
 
         result = self._request("/api/pattern", data)
@@ -2508,8 +2761,7 @@ class X64DbgBridge(Debugger):
             result = bridge.xor_decrypt("0x401000", size=100, key="37")
             print(result["decrypted_ascii"])
         """
-        if address.startswith("0x"):
-            address = address[2:]
+        address = self._normalize_address(address)
 
         data = {"address": address, "size": size}
         if key:
@@ -2535,8 +2787,7 @@ class X64DbgBridge(Debugger):
             This provides limited results. For comprehensive reference
             search, use the x64dbg GUI.
         """
-        if address.startswith("0x"):
-            address = address[2:]
+        address = self._normalize_address(address)
 
         data = {"address": address}
         return self._request("/api/references", data)
@@ -2669,8 +2920,7 @@ class X64DbgBridge(Debugger):
             for addr in result["matches"]:
                 bridge.patch_debug_check(addr, "ret0")
         """
-        if address.startswith("0x"):
-            address = address[2:]
+        address = self._normalize_address(address)
 
         data = {"address": address, "type": patch_type}
         result = self._request("/api/antidebug/patch", data)

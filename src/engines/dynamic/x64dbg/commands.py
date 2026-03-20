@@ -91,18 +91,24 @@ class X64DbgCommands:
         lines.append("Registers:")
         lines.append("-" * 40)
 
-        # Group by category
-        general = ["rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp", "rip"]
-        extended = [f"r{i}" for i in range(8, 16)]
+        # Group by category based on architecture
+        arch = self.bridge._detect_architecture()
+        if arch == "x86":
+            general = ["eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp", "eip"]
+            extended = []
+        else:
+            general = ["rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp", "rip"]
+            extended = [f"r{i}" for i in range(8, 16)]
 
         for reg in general:
             if reg in registers:
                 lines.append(f"{reg.upper():4} = 0x{registers[reg]}")
 
-        lines.append("")
-        for reg in extended:
-            if reg in registers:
-                lines.append(f"{reg.upper():4} = 0x{registers[reg]}")
+        if extended:
+            lines.append("")
+            for reg in extended:
+                if reg in registers:
+                    lines.append(f"{reg.upper():4} = 0x{registers[reg]}")
 
         return "\n".join(lines)
 
@@ -123,10 +129,11 @@ class X64DbgCommands:
             state = self.bridge.step_into()
             registers = self.bridge.get_registers()
 
+            ip_reg = "eip" if self.bridge._detect_architecture() == "x86" else "rip"
             trace.append({
                 "step": i,
                 "address": state["address"],
-                "rip": registers.get("rip", "unknown")
+                ip_reg: registers.get(ip_reg, "unknown")
             })
 
         return trace

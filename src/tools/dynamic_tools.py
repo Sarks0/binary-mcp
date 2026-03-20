@@ -1651,17 +1651,24 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
         """
         try:
             bridge = get_x64dbg_bridge()
-            frames = bridge.get_stack(depth)
+            stack_result = bridge.get_stack(depth)
+            frames = stack_result.get("frames", [])
+            is_raw = stack_result.get("raw", False)
 
             if not frames:
                 return "No stack frames available"
 
-            result = [f"Call Stack ({len(frames)} frames):", "-" * 60]
+            if is_raw:
+                header = f"Stack contents (raw dump, not unwound call stack) — {len(frames)} entries:"
+            else:
+                header = f"Call Stack ({len(frames)} frames):"
+
+            result = [header, "-" * 60]
 
             for i, frame in enumerate(frames):
                 addr = frame.get("address", "unknown")
                 comment = frame.get("comment", "")
-                if comment:
+                if comment and comment != "raw stack":
                     result.append(f"{i}. 0x{addr} ({comment})")
                 else:
                     result.append(f"{i}. 0x{addr}")
@@ -4594,6 +4601,33 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
         """
         try:
             bridge = get_x64dbg_bridge()
+
+            # Pre-check: verify target module is loaded before attempting resolution
+            target_module = None
+            if module:
+                target_module = module
+            elif "!" in function_name:
+                target_module = function_name.split("!", 1)[0]
+
+            if target_module:
+                loaded_modules = bridge.get_modules()
+                loaded_names = set()
+                for mod in loaded_modules:
+                    name = mod.get("name", "").lower()
+                    loaded_names.add(name)
+                    # Also add without extension for flexible matching
+                    if "." in name:
+                        loaded_names.add(name.rsplit(".", 1)[0])
+
+                if target_module.lower() not in loaded_names:
+                    return (
+                        f"Module '{target_module}' is not currently loaded. "
+                        f"The module must be loaded before symbols can be resolved.\n\n"
+                        f"Suggestions:\n"
+                        f"  - Run to entry point first to let DLLs load\n"
+                        f"  - Use x64dbg_set_breakpoint('address') with a direct address instead\n"
+                        f"  - Use x64dbg_get_modules() to see currently loaded modules"
+                    )
 
             # Build full expression
             if "!" in function_name:

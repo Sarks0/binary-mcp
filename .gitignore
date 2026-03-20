@@ -38,7 +38,10 @@ env/
 *.swp
 *.swo
 *~
+
+# OS
 .DS_Store
+Thumbs.db
 
 # Testing
 .pytest_cache/
@@ -62,7 +65,7 @@ samples/*.elf
 samples/test_malware
 samples/a.out
 
-# Logs
+# Logs and errors
 *.log
 logs/
 errors/
@@ -73,22 +76,14 @@ errors/
 *.json.bak
 temp_analysis_*.json
 
-# uv
-.python-version
-
-# OS
-Thumbs.db
-.DS_Store
-
 # Backups
 *.md.bak
 
-# Documentation
-docs/
+# uv
+.python-version
 
-# Other
+# Claude
 .claude/
-logs/
 
 # Security reviews (internal only)
 security/

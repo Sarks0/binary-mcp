@@ -1,5 +1,5 @@
 """
-Test suite for Ghidra MCP Server.
+Test suite for Binary MCP Server.
 """
 
 # Mock the MCP imports before importing server

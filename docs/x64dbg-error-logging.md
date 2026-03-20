@@ -617,7 +617,7 @@ Potential improvements (not yet implemented):
 | `src/engines/dynamic/x64dbg/bridge.py` | Integration with x64dbg bridge |
 | `src/engines/dynamic/x64dbg/view_errors.py` | CLI tool for viewing errors |
 | `~/.ghidra_mcp_cache/x64dbg_errors/` | Error storage directory |
-| `docs/X64DBG_ERROR_LOGGING.md` | This documentation |
+| `docs/x64dbg-error-logging.md` | This documentation |
 
 ---
 
@@ -627,7 +627,7 @@ For issues or questions about error logging:
 
 1. Check error logs: `python view_errors.py --stats`
 2. Export errors: `python view_errors.py --export errors.txt`
-3. Review documentation: `docs/X64DBG_ERROR_LOGGING.md`
+3. Review documentation: `docs/x64dbg-error-logging.md`
 4. Report bugs with exported error logs
 
 ---

@@ -16,7 +16,7 @@ import sys
 import time
 from pathlib import Path
 
-from error_logger import X64DbgErrorLogger
+from .error_logger import X64DbgErrorLogger
 
 
 def format_timestamp(timestamp: float) -> str:

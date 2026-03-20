@@ -1,4 +1,4 @@
-# Contributing to Ghidra MCP Server
+# Contributing to Binary MCP Server
 
 Thank you for your interest in contributing! This document provides guidelines for contributing to the project.
 
@@ -79,8 +79,8 @@ Thank you for your interest in contributing! This document provides guidelines f
 
 ```bash
 # Clone your fork
-git clone https://github.com/YOUR_USERNAME/ghidra-mcp-headless.git
-cd ghidra-mcp-headless
+git clone https://github.com/YOUR_USERNAME/binary-mcp.git
+cd binary-mcp
 
 # Install dependencies
 make install-dev

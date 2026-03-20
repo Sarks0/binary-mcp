@@ -564,6 +564,80 @@ class X64DbgBridge(Debugger):
         self._arch = None  # Reset cached architecture
         logger.info("Disconnected from x64dbg")
 
+    def attach_process(self, pid: int) -> dict[str, Any]:
+        """
+        Attach debugger to a running process.
+
+        Args:
+            pid: Process ID to attach to
+
+        Returns:
+            API response dict with attach result
+
+        Raises:
+            ValueError: If pid is invalid
+            ConnectionError: If attach fails
+        """
+        if not isinstance(pid, int) or pid <= 0:
+            raise ValueError(f"Invalid PID: {pid}. Must be a positive integer.")
+
+        result = self._request_with_retry(
+            "/api/debug/attach",
+            data={"pid": pid},
+        )
+        self.connected = True
+        logger.info(f"Attached to process PID {pid}")
+        return result
+
+    def detach_process(self) -> dict[str, Any]:
+        """
+        Detach from the current process without terminating it.
+
+        Returns:
+            API response dict with detach result
+
+        Raises:
+            ConnectionError: If detach fails
+        """
+        result = self._request_with_retry(
+            "/api/debug/detach",
+            data={},
+        )
+        self.connected = False
+        self._arch = None  # Reset cached architecture
+        logger.info("Detached from process")
+        return result
+
+    def create_minidump(self, output_path: str | None = None) -> dict[str, Any]:
+        """
+        Create a minidump of the debuggee process.
+
+        Args:
+            output_path: Optional path for the minidump file.
+                         If provided, validated with sanitize_output_path.
+
+        Returns:
+            API response dict with minidump result
+
+        Raises:
+            PathTraversalError: If output_path is outside allowed directory
+            ConnectionError: If minidump creation fails
+        """
+        data: dict[str, Any] = {}
+
+        if output_path:
+            dump_output_dir = Path.home() / ".binary_mcp_output" / "dumps"
+            dump_output_dir.mkdir(parents=True, exist_ok=True)
+            safe_path = sanitize_output_path(Path(output_path), dump_output_dir)
+            data["output_path"] = str(safe_path)
+
+        result = self._request_with_retry(
+            "/api/debug/minidump",
+            data=data,
+        )
+        logger.info(f"Minidump created: {data.get('output_path', 'default location')}")
+        return result
+
     def load_binary(self, binary_path: Path, args: list[str] | None = None) -> bool:
         """
         Load a binary into x64dbg.
@@ -649,6 +723,107 @@ class X64DbgBridge(Debugger):
         """
         result = self._request("/api/breakpoint/list")
         return result.get("breakpoints", [])
+
+    # ── Exception handling control ──────────────────────────────────────
+
+    _VALID_CHANCE_VALUES = ("first", "second", "all")
+
+    def set_exception_breakpoint(
+        self, exception_code: str, chance: str = "first"
+    ) -> bool:
+        """
+        Set a breakpoint on an exception code.
+
+        Args:
+            exception_code: Exception code (hex string, e.g., "0xC0000005")
+            chance: When to break - "first", "second", or "all"
+
+        Returns:
+            True if exception breakpoint set successfully
+
+        Raises:
+            AddressValidationError: If exception_code is not valid hex
+            ValueError: If chance is not a valid option
+            RuntimeError: If API call fails
+        """
+        normalized_code = self._normalize_address(
+            exception_code, "exception_code"
+        )
+
+        if chance not in self._VALID_CHANCE_VALUES:
+            raise ValueError(
+                f"Invalid chance '{chance}': must be one of "
+                f"{self._VALID_CHANCE_VALUES}"
+            )
+
+        data = {"code": normalized_code, "chance": chance}
+        self._request_with_retry("/api/exception/set", data)
+        logger.info(
+            f"Set exception breakpoint on 0x{normalized_code} "
+            f"(chance={chance})"
+        )
+        return True
+
+    def delete_exception_breakpoint(self, exception_code: str) -> bool:
+        """
+        Delete an exception breakpoint.
+
+        Args:
+            exception_code: Exception code (hex string, e.g., "0xC0000005")
+
+        Returns:
+            True if deleted successfully
+
+        Raises:
+            AddressValidationError: If exception_code is not valid hex
+            RuntimeError: If API call fails
+        """
+        normalized_code = self._normalize_address(
+            exception_code, "exception_code"
+        )
+
+        data = {"code": normalized_code}
+        self._request_with_retry("/api/exception/delete", data)
+        logger.info(f"Deleted exception breakpoint on 0x{normalized_code}")
+        return True
+
+    def list_exception_breakpoints(self) -> list[dict[str, Any]]:
+        """
+        List all exception breakpoints.
+
+        Returns:
+            List of exception breakpoint dictionaries
+        """
+        result = self._request("/api/exception/list")
+        return result.get("exceptions", [])
+
+    def skip_exception(self, exception_code: str) -> bool:
+        """
+        Add exception code to the ignore list.
+
+        The debugger will pass the exception to the application instead
+        of breaking.
+
+        Args:
+            exception_code: Exception code (hex string, e.g., "0xC0000005")
+
+        Returns:
+            True if added to ignore list successfully
+
+        Raises:
+            AddressValidationError: If exception_code is not valid hex
+            RuntimeError: If API call fails
+        """
+        normalized_code = self._normalize_address(
+            exception_code, "exception_code"
+        )
+
+        data = {"code": normalized_code}
+        self._request_with_retry("/api/exception/skip", data)
+        logger.info(
+            f"Added exception 0x{normalized_code} to ignore list"
+        )
+        return True
 
     def run(self) -> DebuggerState:
         """
@@ -807,6 +982,101 @@ class X64DbgBridge(Debugger):
         """
         result = self._request("/api/threads")
         return result.get("threads", [])
+
+    def switch_thread(self, thread_id: str) -> dict[str, Any]:
+        """
+        Switch active thread context.
+
+        Args:
+            thread_id: Thread ID to switch to
+
+        Returns:
+            Thread context dictionary from API
+
+        Raises:
+            ValueError: If thread_id is empty
+            RuntimeError: If API call fails
+        """
+        if not thread_id or not str(thread_id).strip():
+            raise ValueError("thread_id must be a non-empty string")
+
+        data = {"thread_id": str(thread_id).strip()}
+        logger.debug(f"Switching to thread {thread_id}")
+        result = self._request_with_retry("/api/thread/switch", data)
+        logger.info(f"Switched to thread {thread_id}")
+        return result
+
+    def suspend_thread(self, thread_id: str) -> dict[str, Any]:
+        """
+        Suspend a thread.
+
+        Args:
+            thread_id: Thread ID to suspend
+
+        Returns:
+            API response dictionary
+
+        Raises:
+            ValueError: If thread_id is empty
+            RuntimeError: If API call fails
+        """
+        if not thread_id or not str(thread_id).strip():
+            raise ValueError("thread_id must be a non-empty string")
+
+        data = {"thread_id": str(thread_id).strip()}
+        result = self._request_with_retry("/api/thread/suspend", data)
+        logger.info(f"Suspended thread {thread_id}")
+        return result
+
+    def resume_thread(self, thread_id: str) -> dict[str, Any]:
+        """
+        Resume a suspended thread.
+
+        Args:
+            thread_id: Thread ID to resume
+
+        Returns:
+            API response dictionary
+
+        Raises:
+            ValueError: If thread_id is empty
+            RuntimeError: If API call fails
+        """
+        if not thread_id or not str(thread_id).strip():
+            raise ValueError("thread_id must be a non-empty string")
+
+        data = {"thread_id": str(thread_id).strip()}
+        result = self._request_with_retry("/api/thread/resume", data)
+        logger.info(f"Resumed thread {thread_id}")
+        return result
+
+    def suspend_all_threads(self) -> dict[str, Any]:
+        """
+        Suspend all threads in the debugged process.
+
+        Returns:
+            API response dictionary with thread count
+
+        Raises:
+            RuntimeError: If API call fails
+        """
+        result = self._request_with_retry("/api/thread/suspend_all")
+        logger.info("Suspended all threads")
+        return result
+
+    def resume_all_threads(self) -> dict[str, Any]:
+        """
+        Resume all threads in the debugged process.
+
+        Returns:
+            API response dictionary with thread count
+
+        Raises:
+            RuntimeError: If API call fails
+        """
+        result = self._request_with_retry("/api/thread/resume_all")
+        logger.info("Resumed all threads")
+        return result
 
     def read_memory(self, address: str, size: int) -> bytes:
         """
@@ -1414,6 +1684,120 @@ class X64DbgBridge(Debugger):
 
         return result.get("comment", "")
 
+    def set_bookmark(self, address: str) -> bool:
+        """
+        Set bookmark at address.
+
+        Args:
+            address: Address to bookmark
+
+        Returns:
+            True if successful
+
+        Note:
+            Requires C++ plugin implementation of /api/bookmark/set
+        """
+        address = self._normalize_address(address)
+
+        data = {"address": address}
+        self._request("/api/bookmark/set", data)
+        logger.debug(f"Set bookmark at {address}")
+        return True
+
+    def delete_bookmark(self, address: str) -> bool:
+        """
+        Delete bookmark at address.
+
+        Args:
+            address: Address of bookmark to delete
+
+        Returns:
+            True if successful
+
+        Note:
+            Requires C++ plugin implementation of /api/bookmark/delete
+        """
+        address = self._normalize_address(address)
+
+        data = {"address": address}
+        self._request("/api/bookmark/delete", data)
+        logger.debug(f"Deleted bookmark at {address}")
+        return True
+
+    def list_bookmarks(self) -> list[dict[str, str]]:
+        """
+        List all bookmarks.
+
+        Returns:
+            List of bookmark entries with address info
+
+        Note:
+            Requires C++ plugin implementation of /api/bookmark/list
+        """
+        result = self._request("/api/bookmark/list")
+
+        bookmarks = result.get("bookmarks", [])
+        logger.debug(f"Got {len(bookmarks)} bookmarks")
+        return bookmarks
+
+    def add_function(self, start: str, end: str) -> bool:
+        """
+        Add function boundary definition.
+
+        Args:
+            start: Function start address
+            end: Function end address
+
+        Returns:
+            True if successful
+
+        Note:
+            Requires C++ plugin implementation of /api/function/add
+        """
+        start = self._normalize_address(start, param_name="start")
+        end = self._normalize_address(end, param_name="end")
+
+        data = {"start": start, "end": end}
+        self._request("/api/function/add", data)
+        logger.debug(f"Added function {start}-{end}")
+        return True
+
+    def delete_function(self, address: str) -> bool:
+        """
+        Delete function boundary at address.
+
+        Args:
+            address: Address within function to delete
+
+        Returns:
+            True if successful
+
+        Note:
+            Requires C++ plugin implementation of /api/function/delete
+        """
+        address = self._normalize_address(address)
+
+        data = {"address": address}
+        self._request("/api/function/delete", data)
+        logger.debug(f"Deleted function at {address}")
+        return True
+
+    def list_functions(self) -> list[dict[str, str]]:
+        """
+        List all defined functions.
+
+        Returns:
+            List of function entries with start, end, name
+
+        Note:
+            Requires C++ plugin implementation of /api/function/list
+        """
+        result = self._request("/api/function/list")
+
+        functions = result.get("functions", [])
+        logger.debug(f"Got {len(functions)} functions")
+        return functions
+
     def get_module_imports(self, module_name: str) -> list[dict[str, str]]:
         """
         Get import table for module.
@@ -1559,6 +1943,70 @@ class X64DbgBridge(Debugger):
             "address": result.get("address", "unknown"),
             "state": result.get("state", "paused")
         }
+
+    def run_to_user_code(self, timeout: int = 30000) -> dict[str, Any]:
+        """
+        Run to user code (skip system/library code).
+
+        Executes the x64dbg 'rtu' command and waits until the debugger pauses
+        in user module code.
+
+        Args:
+            timeout: Maximum wait time in milliseconds (default: 30 seconds)
+
+        Returns:
+            Dictionary with current location after pause
+        """
+        self._request_with_retry("/api/command", {"command": "rtu"})
+        wait_result = self.wait_until_paused(timeout=timeout)
+
+        if not wait_result.get("success"):
+            return {
+                "success": False,
+                "error": wait_result.get("error", "Timeout waiting for pause"),
+                "elapsed_ms": wait_result.get("elapsed_ms", 0),
+            }
+
+        location = self.get_current_location()
+        return {
+            "success": True,
+            "address": location.get("address", "unknown"),
+            "module": location.get("module", "unknown"),
+            "state": "paused",
+            "elapsed_ms": wait_result.get("elapsed_ms", 0),
+        }
+
+    def undo_instruction(self) -> dict[str, Any]:
+        """
+        Undo the last instruction (reverse single step).
+
+        Uses x64dbg's InstrUndo command to reverse the effect of the
+        last executed instruction.
+
+        Returns:
+            Dictionary with result status
+        """
+        result = self._request_with_retry("/api/command", {"command": "InstrUndo"})
+        return {
+            "success": result.get("success", True),
+            "message": result.get("message", "Instruction undone"),
+        }
+
+    def execute_command(self, command: str) -> dict[str, Any]:
+        """
+        Execute an arbitrary x64dbg command via the command API.
+
+        This is a low-level method that sends any command string to x64dbg.
+        Security validation should be performed by the caller (MCP tool layer).
+
+        Args:
+            command: The x64dbg command string to execute
+
+        Returns:
+            Dictionary with command result from the API
+        """
+        result = self._request_with_retry("/api/command", {"command": command})
+        return result
 
     def set_memory_breakpoint(
         self,

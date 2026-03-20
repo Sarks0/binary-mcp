@@ -1706,7 +1706,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
         """
         try:
             bridge = get_x64dbg_bridge()
-            result = bridge.start_trace(
+            bridge.start_trace(
                 trace_into=trace_into,
                 max_entries=max_entries,
                 log_file=log_file if log_file else None,
@@ -3744,7 +3744,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             return f"Error: {e}"
 
     # Security: blocked commands that could disrupt the debugging session
-    _BLOCKED_COMMANDS = frozenset({
+    blocked_commands = frozenset({
         "quit", "stop", "exit", "detach", "attach", "init",
     })
 
@@ -3780,10 +3780,10 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
             # Security: block dangerous commands by checking the first word
             first_word = command.strip().split()[0].lower()
-            if first_word in _BLOCKED_COMMANDS:
+            if first_word in blocked_commands:
                 return (
                     f"Error: Command '{first_word}' is blocked for safety. "
-                    f"Blocked commands: {', '.join(sorted(_BLOCKED_COMMANDS))}"
+                    f"Blocked commands: {', '.join(sorted(blocked_commands))}"
                 )
 
             bridge = get_x64dbg_bridge()

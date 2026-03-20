@@ -2008,6 +2008,323 @@ class X64DbgBridge(Debugger):
         result = self._request_with_retry("/api/command", {"command": command})
         return result
 
+    # ── Watch expression management ──────────────────────────────────
+
+    _WATCHDOG_MODES = frozenset({
+        "changed", "disabled", "unchanged",
+        "istrue", "isfalse", "isgreater", "isless", "isnotequal",
+    })
+
+    def add_watch(self, expression: str, name: str = "") -> dict[str, Any]:
+        """
+        Add a watch expression.
+
+        Args:
+            expression: Expression to watch (e.g. "eax", "[esp+4]", "eax+ebx")
+            name: Optional display name for the watch entry
+
+        Returns:
+            Dictionary with command result
+
+        Raises:
+            ValueError: If expression is empty
+        """
+        if not expression or not expression.strip():
+            raise ValueError("Watch expression cannot be empty")
+
+        result = self._request_with_retry(
+            "/api/command", {"command": f"AddWatch {expression.strip()}"}
+        )
+        if name:
+            # AddWatch returns the index; set the name on the latest entry
+            # Use SetWatchName with index 0 as default (latest added)
+            self._request_with_retry(
+                "/api/command",
+                {"command": f'SetWatchName 0, {name}'},
+            )
+        logger.info(f"Added watch: {expression}" + (f" (name={name})" if name else ""))
+        return result
+
+    def delete_watch(self, index: int) -> dict[str, Any]:
+        """
+        Delete a watch entry by index.
+
+        Args:
+            index: Zero-based watch index
+
+        Returns:
+            Dictionary with command result
+
+        Raises:
+            ValueError: If index is negative
+        """
+        if not isinstance(index, int) or index < 0:
+            raise ValueError(f"Watch index must be a non-negative integer, got: {index}")
+
+        result = self._request_with_retry(
+            "/api/command", {"command": f"DelWatch {index}"}
+        )
+        logger.info(f"Deleted watch at index {index}")
+        return result
+
+    def set_watchdog(self, index: int, mode: str = "changed") -> dict[str, Any]:
+        """
+        Set watchdog trigger mode on a watch entry.
+
+        Args:
+            index: Zero-based watch index
+            mode: Trigger mode — one of: changed, disabled, unchanged,
+                  istrue, isfalse, isgreater, isless, isnotequal
+
+        Returns:
+            Dictionary with command result
+
+        Raises:
+            ValueError: If index is negative or mode is invalid
+        """
+        if not isinstance(index, int) or index < 0:
+            raise ValueError(f"Watch index must be a non-negative integer, got: {index}")
+        if mode not in self._WATCHDOG_MODES:
+            raise ValueError(
+                f"Invalid watchdog mode '{mode}'. "
+                f"Must be one of: {', '.join(sorted(self._WATCHDOG_MODES))}"
+            )
+
+        result = self._request_with_retry(
+            "/api/command", {"command": f"SetWatchdog {index}, {mode}"}
+        )
+        logger.info(f"Set watchdog on index {index} to mode '{mode}'")
+        return result
+
+    def set_watch_expression(self, index: int, expression: str) -> dict[str, Any]:
+        """
+        Update the expression of an existing watch entry.
+
+        Args:
+            index: Zero-based watch index
+            expression: New expression string
+
+        Returns:
+            Dictionary with command result
+
+        Raises:
+            ValueError: If index is negative or expression is empty
+        """
+        if not isinstance(index, int) or index < 0:
+            raise ValueError(f"Watch index must be a non-negative integer, got: {index}")
+        if not expression or not expression.strip():
+            raise ValueError("Watch expression cannot be empty")
+
+        result = self._request_with_retry(
+            "/api/command",
+            {"command": f"SetWatchExpression {index}, {expression.strip()}"},
+        )
+        logger.info(f"Set watch {index} expression to '{expression.strip()}'")
+        return result
+
+    def set_watch_name(self, index: int, name: str) -> dict[str, Any]:
+        """
+        Set the display name of a watch entry.
+
+        Args:
+            index: Zero-based watch index
+            name: Display name
+
+        Returns:
+            Dictionary with command result
+
+        Raises:
+            ValueError: If index is negative or name is empty
+        """
+        if not isinstance(index, int) or index < 0:
+            raise ValueError(f"Watch index must be a non-negative integer, got: {index}")
+        if not name or not name.strip():
+            raise ValueError("Watch name cannot be empty")
+
+        result = self._request_with_retry(
+            "/api/command", {"command": f"SetWatchName {index}, {name.strip()}"}
+        )
+        logger.info(f"Set watch {index} name to '{name.strip()}'")
+        return result
+
+    # ── DLL breakpoint management ────────────────────────────────────
+
+    def set_dll_breakpoint(
+        self, dll_name: str, singleshoot: bool = False
+    ) -> dict[str, Any]:
+        """
+        Set a breakpoint on DLL load.
+
+        Args:
+            dll_name: Name of the DLL (e.g. "kernel32.dll")
+            singleshoot: If True, breakpoint fires only once
+
+        Returns:
+            Dictionary with command result
+
+        Raises:
+            ValueError: If dll_name is empty
+        """
+        if not dll_name or not dll_name.strip():
+            raise ValueError("DLL name cannot be empty")
+
+        ss = 1 if singleshoot else 0
+        result = self._request_with_retry(
+            "/api/command",
+            {"command": f"bpdll {dll_name.strip()}, {ss}"},
+        )
+        logger.info(
+            f"Set DLL breakpoint on '{dll_name.strip()}'"
+            + (" (singleshoot)" if singleshoot else "")
+        )
+        return result
+
+    def delete_dll_breakpoint(self, dll_name: str) -> dict[str, Any]:
+        """
+        Delete a DLL load breakpoint.
+
+        Args:
+            dll_name: Name of the DLL
+
+        Returns:
+            Dictionary with command result
+
+        Raises:
+            ValueError: If dll_name is empty
+        """
+        if not dll_name or not dll_name.strip():
+            raise ValueError("DLL name cannot be empty")
+
+        result = self._request_with_retry(
+            "/api/command", {"command": f"bcdll {dll_name.strip()}"}
+        )
+        logger.info(f"Deleted DLL breakpoint on '{dll_name.strip()}'")
+        return result
+
+    def enable_dll_breakpoint(self, dll_name: str) -> dict[str, Any]:
+        """
+        Enable a DLL load breakpoint.
+
+        Args:
+            dll_name: Name of the DLL
+
+        Returns:
+            Dictionary with command result
+
+        Raises:
+            ValueError: If dll_name is empty
+        """
+        if not dll_name or not dll_name.strip():
+            raise ValueError("DLL name cannot be empty")
+
+        result = self._request_with_retry(
+            "/api/command", {"command": f"bpedll {dll_name.strip()}"}
+        )
+        logger.info(f"Enabled DLL breakpoint on '{dll_name.strip()}'")
+        return result
+
+    def disable_dll_breakpoint(self, dll_name: str) -> dict[str, Any]:
+        """
+        Disable a DLL load breakpoint.
+
+        Args:
+            dll_name: Name of the DLL
+
+        Returns:
+            Dictionary with command result
+
+        Raises:
+            ValueError: If dll_name is empty
+        """
+        if not dll_name or not dll_name.strip():
+            raise ValueError("DLL name cannot be empty")
+
+        result = self._request_with_retry(
+            "/api/command", {"command": f"bpddll {dll_name.strip()}"}
+        )
+        logger.info(f"Disabled DLL breakpoint on '{dll_name.strip()}'")
+        return result
+
+    def analyze_control_flow(self) -> dict[str, Any]:
+        """
+        Run control flow analysis (CFG) on the current module.
+
+        Executes the x64dbg 'cfanalyze' command to build the control flow graph.
+
+        Returns:
+            Dictionary with command result
+        """
+        result = self._request_with_retry("/api/command", {"command": "cfanalyze"})
+        logger.info("Control flow analysis executed")
+        return result
+
+    def analyze_cross_references(self) -> dict[str, Any]:
+        """
+        Run cross-reference analysis.
+
+        Executes the x64dbg 'analxrefs' command to find cross-references.
+
+        Returns:
+            Dictionary with command result
+        """
+        result = self._request_with_retry("/api/command", {"command": "analxrefs"})
+        logger.info("Cross-reference analysis executed")
+        return result
+
+    def analyze_recursive(self) -> dict[str, Any]:
+        """
+        Run recursive function analysis.
+
+        Executes the x64dbg 'analrecur' command for recursive analysis
+        starting from the current location.
+
+        Returns:
+            Dictionary with command result
+        """
+        result = self._request_with_retry("/api/command", {"command": "analrecur"})
+        logger.info("Recursive analysis executed")
+        return result
+
+    def analyze_advanced(self) -> dict[str, Any]:
+        """
+        Run advanced analysis.
+
+        Executes the x64dbg 'analadv' command for advanced analysis
+        including function discovery and code flow analysis.
+
+        Returns:
+            Dictionary with command result
+        """
+        result = self._request_with_retry("/api/command", {"command": "analadv"})
+        logger.info("Advanced analysis executed")
+        return result
+
+    def get_exception_handlers(self) -> dict[str, Any]:
+        """
+        Get SEH exception handler chain.
+
+        Executes the x64dbg 'exhandlers' command to retrieve the
+        structured exception handler chain.
+
+        Returns:
+            Dictionary with exception handler information
+        """
+        result = self._request_with_retry("/api/command", {"command": "exhandlers"})
+        return result
+
+    def get_exception_info(self) -> dict[str, Any]:
+        """
+        Get current exception details.
+
+        Executes the x64dbg 'exinfo' command to retrieve details about
+        the current exception (code, address, flags, etc.).
+
+        Returns:
+            Dictionary with exception information
+        """
+        result = self._request_with_retry("/api/command", {"command": "exinfo"})
+        return result
+
     def set_memory_breakpoint(
         self,
         address: str,
@@ -3226,6 +3543,140 @@ class X64DbgBridge(Debugger):
 
         data = {"address": address}
         return self._request("/api/references", data)
+
+    # ── Advanced search commands ─────────────────────────────────────
+
+    def find_assembly(
+        self, instruction: str, address: str = "", size: int = 0
+    ) -> dict[str, Any]:
+        """
+        Search for assembly instruction patterns in memory.
+
+        Uses x64dbg's findasm command to locate instructions matching
+        the given pattern.
+
+        Args:
+            instruction: Assembly instruction pattern (e.g., "push ebp", "call eax")
+            address: Start address (hex string). If empty, searches from current location.
+            size: Number of bytes to search (0 = default x64dbg range)
+
+        Returns:
+            Dictionary with command execution result
+
+        Example:
+            result = bridge.find_assembly("call eax")
+            result = bridge.find_assembly("push ebp", address="00401000", size=0x10000)
+        """
+        if address:
+            address = self._normalize_address(address)
+        addr_part = address if address else ""
+        if size:
+            cmd = f"findasm {addr_part}, {instruction}, {size:#x}" if addr_part else f"findasm , {instruction}, {size:#x}"
+        else:
+            cmd = f"findasm {addr_part}, {instruction}" if addr_part else f"findasm , {instruction}"
+        result = self.execute_command(cmd)
+        logger.info(f"find_assembly '{instruction}': {result.get('success', False)}")
+        return result
+
+    def find_guid(self, address: str = "", size: int = 0) -> dict[str, Any]:
+        """
+        Find GUIDs in a memory region.
+
+        Uses x64dbg's findguid command to locate GUID/UUID patterns.
+
+        Args:
+            address: Start address (hex string). If empty, searches from current location.
+            size: Number of bytes to search (0 = default x64dbg range)
+
+        Returns:
+            Dictionary with command execution result
+
+        Example:
+            result = bridge.find_guid()
+            result = bridge.find_guid(address="00401000", size=0x50000)
+        """
+        addr_part = ""
+        if address:
+            addr_part = self._normalize_address(address)
+        parts = ["findguid"]
+        if addr_part:
+            parts.append(addr_part)
+        if size:
+            parts.append(f"{size:#x}")
+        cmd = " ".join(parts)
+        result = self.execute_command(cmd)
+        logger.info(f"find_guid: {result.get('success', False)}")
+        return result
+
+    def find_module_calls(self, module: str = "") -> dict[str, Any]:
+        """
+        Find all calls to a specific module.
+
+        Uses x64dbg's modcallfind command to locate inter-module calls.
+
+        Args:
+            module: Module name (e.g., "kernel32.dll"). If empty, finds all module calls.
+
+        Returns:
+            Dictionary with command execution result
+
+        Example:
+            result = bridge.find_module_calls("kernel32.dll")
+            result = bridge.find_module_calls()  # All inter-module calls
+        """
+        cmd = f"modcallfind {module}" if module else "modcallfind"
+        result = self.execute_command(cmd)
+        logger.info(f"find_module_calls '{module}': {result.get('success', False)}")
+        return result
+
+    def find_references_range(self, address: str, size: int) -> dict[str, Any]:
+        """
+        Find references within an address range.
+
+        Uses x64dbg's reffindrange command to find all references
+        within the specified address range.
+
+        Args:
+            address: Start address (hex string, required)
+            size: Size of range in bytes
+
+        Returns:
+            Dictionary with command execution result
+
+        Example:
+            result = bridge.find_references_range("00401000", 0x1000)
+        """
+        address = self._normalize_address(address)
+        end_address = int(address, 16) + size
+        cmd = f"reffindrange {address}, {end_address:X}"
+        result = self.execute_command(cmd)
+        logger.info(f"find_references_range 0x{address}-0x{end_address:X}: {result.get('success', False)}")
+        return result
+
+    def find_string_references(self, address: str = "") -> dict[str, Any]:
+        """
+        Find string references in a module or at an address.
+
+        Uses x64dbg's refstr command to find all string references.
+
+        Args:
+            address: Address or module base (hex string). If empty, uses current module.
+
+        Returns:
+            Dictionary with command execution result
+
+        Example:
+            result = bridge.find_string_references()
+            result = bridge.find_string_references("00401000")
+        """
+        if address:
+            address = self._normalize_address(address)
+            cmd = f"refstr {address}"
+        else:
+            cmd = "refstr"
+        result = self.execute_command(cmd)
+        logger.info(f"find_string_references: {result.get('success', False)}")
+        return result
 
     def get_callstack_detailed(self) -> dict[str, Any]:
         """
@@ -4796,4 +5247,673 @@ class X64DbgBridge(Debugger):
             result["error"] = str(e)
             logger.error(f"unhook_function failed: {e}")
 
+        return result
+
+    # ── Type system methods ─────────────────────────────────────────────
+
+    @staticmethod
+    def _validate_type_name(name: str | None, param_name: str = "name") -> str:
+        """
+        Validate a type/struct/union name is a valid C identifier.
+
+        Args:
+            name: The name to validate
+            param_name: Parameter name for error messages
+
+        Returns:
+            The validated name string
+
+        Raises:
+            ValueError: If name is None, empty, or not a valid C identifier
+        """
+        if not name or not name.strip():
+            raise ValueError(f"{param_name} cannot be empty")
+        name = name.strip()
+        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", name):
+            raise ValueError(
+                f"Invalid {param_name} '{name}': must be a valid C identifier "
+                f"(letters, digits, underscores; cannot start with a digit)"
+            )
+        return name
+
+    def add_struct(self, name: str) -> dict[str, Any]:
+        """
+        Define a new struct type in x64dbg's type system.
+
+        Args:
+            name: Struct name (valid C identifier)
+
+        Returns:
+            Command result dictionary
+        """
+        name = self._validate_type_name(name, "struct name")
+        return self._request_with_retry("/api/command", {"command": f"AddStruct {name}"})
+
+    def add_union(self, name: str) -> dict[str, Any]:
+        """
+        Define a new union type in x64dbg's type system.
+
+        Args:
+            name: Union name (valid C identifier)
+
+        Returns:
+            Command result dictionary
+        """
+        name = self._validate_type_name(name, "union name")
+        return self._request_with_retry("/api/command", {"command": f"AddUnion {name}"})
+
+    def add_member(self, parent: str, type_name: str, member_name: str) -> dict[str, Any]:
+        """
+        Add a member field to an existing struct or union.
+
+        Args:
+            parent: Parent struct/union name
+            type_name: Type of the member (e.g. "DWORD", "BYTE", "PVOID")
+            member_name: Name of the member field
+
+        Returns:
+            Command result dictionary
+        """
+        parent = self._validate_type_name(parent, "parent")
+        type_name = self._validate_type_name(type_name, "type_name")
+        member_name = self._validate_type_name(member_name, "member_name")
+        return self._request_with_retry(
+            "/api/command",
+            {"command": f"AddMember {parent}, {type_name}, {member_name}"},
+        )
+
+    def add_type(self, definition: str) -> dict[str, Any]:
+        """
+        Add a primitive type or typedef definition.
+
+        Args:
+            definition: Type definition string (e.g. "typedef DWORD MyType")
+
+        Returns:
+            Command result dictionary
+        """
+        if not definition or not definition.strip():
+            raise ValueError("Type definition cannot be empty")
+        return self._request_with_retry(
+            "/api/command", {"command": f"AddType {definition.strip()}"}
+        )
+
+    def visit_type(self, type_name: str, address: str) -> dict[str, Any]:
+        """
+        Overlay a struct/type on a memory address for structured viewing.
+
+        This is the key type system command — it interprets raw memory
+        at the given address as the specified struct/type.
+
+        Args:
+            type_name: Name of the type to overlay
+            address: Memory address to interpret (hex string)
+
+        Returns:
+            Command result with structured memory interpretation
+        """
+        type_name = self._validate_type_name(type_name, "type_name")
+        normalized_addr = self._normalize_address(address)
+        return self._request_with_retry(
+            "/api/command",
+            {"command": f"VisitType {type_name}, 0x{normalized_addr}"},
+        )
+
+    def sizeof_type(self, type_name: str) -> dict[str, Any]:
+        """
+        Get the size of a type in bytes.
+
+        Args:
+            type_name: Name of the type
+
+        Returns:
+            Command result with size information
+        """
+        type_name = self._validate_type_name(type_name, "type_name")
+        return self._request_with_retry(
+            "/api/command", {"command": f"SizeofType {type_name}"}
+        )
+
+    def remove_type(self, type_name: str) -> dict[str, Any]:
+        """
+        Remove a type definition from x64dbg's type system.
+
+        Args:
+            type_name: Name of the type to remove
+
+        Returns:
+            Command result dictionary
+        """
+        type_name = self._validate_type_name(type_name, "type_name")
+        return self._request_with_retry(
+            "/api/command", {"command": f"RemoveType {type_name}"}
+        )
+
+    def enum_types(self) -> dict[str, Any]:
+        """
+        List all defined types in x64dbg's type system.
+
+        Returns:
+            Command result with type listing
+        """
+        return self._request_with_retry("/api/command", {"command": "EnumTypes"})
+
+    def load_types(self, filename: str) -> dict[str, Any]:
+        """
+        Load type definitions from a JSON or header file.
+
+        Args:
+            filename: Path to the types file
+
+        Returns:
+            Command result dictionary
+
+        Raises:
+            ValueError: If filename is empty
+        """
+        if not filename or not filename.strip():
+            raise ValueError("Filename cannot be empty")
+        return self._request_with_retry(
+            "/api/command", {"command": f"LoadTypes {filename.strip()}"}
+        )
+
+    def parse_types(self, definition: str) -> dict[str, Any]:
+        """
+        Parse C header text to define types inline.
+
+        Args:
+            definition: C header text with type definitions
+
+        Returns:
+            Command result dictionary
+
+        Raises:
+            ValueError: If definition is empty
+        """
+        if not definition or not definition.strip():
+            raise ValueError("Type definition text cannot be empty")
+        return self._request_with_retry(
+            "/api/command", {"command": f"ParseTypes {definition.strip()}"}
+        )
+
+    def clear_types(self) -> dict[str, Any]:
+        """
+        Clear all user-defined types from x64dbg's type system.
+
+        Returns:
+            Command result dictionary
+        """
+        return self._request_with_retry("/api/command", {"command": "ClearTypes"})
+
+    # ── Variable management ────────────────────────────────────────────
+
+    def set_variable(self, name: str, value: str) -> dict[str, Any]:
+        """
+        Set a debugger variable.
+
+        Args:
+            name: Variable name (alphanumeric and underscores)
+            value: Value to set (expression or numeric)
+
+        Returns:
+            Dictionary with command result
+
+        Raises:
+            ValueError: If name is empty or contains invalid characters
+        """
+        if not name or not name.strip():
+            raise ValueError("Variable name cannot be empty")
+
+        name = name.strip()
+        if not re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', name):
+            raise ValueError(
+                f"Invalid variable name '{name}': must start with letter/underscore "
+                "and contain only alphanumeric characters and underscores"
+            )
+
+        value = str(value).strip()
+        if not value:
+            raise ValueError("Variable value cannot be empty")
+
+        cmd = f"var {name}, {value}"
+        result = self._request_with_retry("/api/command", {"command": cmd})
+        logger.info(f"Set variable {name} = {value}")
+        return result
+
+    def delete_variable(self, name: str) -> dict[str, Any]:
+        """
+        Delete a debugger variable.
+
+        Args:
+            name: Variable name to delete
+
+        Returns:
+            Dictionary with command result
+
+        Raises:
+            ValueError: If name is empty or contains invalid characters
+        """
+        if not name or not name.strip():
+            raise ValueError("Variable name cannot be empty")
+
+        name = name.strip()
+        if not re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', name):
+            raise ValueError(
+                f"Invalid variable name '{name}': must start with letter/underscore "
+                "and contain only alphanumeric characters and underscores"
+            )
+
+        cmd = f"vardel {name}"
+        result = self._request_with_retry("/api/command", {"command": cmd})
+        logger.info(f"Deleted variable {name}")
+        return result
+
+    def list_variables(self) -> dict[str, Any]:
+        """
+        List all debugger variables.
+
+        Returns:
+            Dictionary with command result containing variable list
+        """
+        result = self._request_with_retry("/api/command", {"command": "varlist"})
+        logger.debug("Listed variables")
+        return result
+
+    # ── GUI navigation ─────────────────────────────────────────────────
+
+    def navigate_disasm(self, address: str) -> dict[str, Any]:
+        """
+        Navigate the disassembly view to an address.
+
+        Args:
+            address: Target address (hex string)
+
+        Returns:
+            Dictionary with command result
+
+        Raises:
+            AddressValidationError: If address is invalid
+        """
+        normalized_addr = self._normalize_address(address)
+        cmd = f"disasm {normalized_addr}"
+        result = self._request_with_retry("/api/command", {"command": cmd})
+        logger.info(f"Navigated disassembly to 0x{normalized_addr}")
+        return result
+
+    def navigate_dump(self, address: str) -> dict[str, Any]:
+        """
+        Navigate the dump view to an address.
+
+        Args:
+            address: Target address (hex string)
+
+        Returns:
+            Dictionary with command result
+
+        Raises:
+            AddressValidationError: If address is invalid
+        """
+        normalized_addr = self._normalize_address(address)
+        cmd = f"dump {normalized_addr}"
+        result = self._request_with_retry("/api/command", {"command": cmd})
+        logger.info(f"Navigated dump to 0x{normalized_addr}")
+        return result
+
+    def navigate_stack_dump(self, address: str) -> dict[str, Any]:
+        """
+        Navigate the stack dump view to an address.
+
+        Args:
+            address: Target address (hex string)
+
+        Returns:
+            Dictionary with command result
+
+        Raises:
+            AddressValidationError: If address is invalid
+        """
+        normalized_addr = self._normalize_address(address)
+        cmd = f"sdump {normalized_addr}"
+        result = self._request_with_retry("/api/command", {"command": cmd})
+        logger.info(f"Navigated stack dump to 0x{normalized_addr}")
+        return result
+
+    def show_graph(self, address: str = "") -> dict[str, Any]:
+        """
+        Show function graph at an address.
+
+        Args:
+            address: Target address (hex string), empty for current location
+
+        Returns:
+            Dictionary with command result
+
+        Raises:
+            AddressValidationError: If address is provided but invalid
+        """
+        if address and address.strip():
+            normalized_addr = self._normalize_address(address)
+            cmd = f"graph {normalized_addr}"
+            log_target = f"0x{normalized_addr}"
+        else:
+            cmd = "graph"
+            log_target = "current location"
+
+        result = self._request_with_retry("/api/command", {"command": cmd})
+        logger.info(f"Showed graph at {log_target}")
+        return result
+
+    # ── Privilege management ───────────────────────────────────────────
+
+    def enable_privilege(self, name: str) -> dict[str, Any]:
+        """
+        Enable a process privilege.
+
+        Args:
+            name: Privilege name (e.g., "SeDebugPrivilege")
+
+        Returns:
+            Dictionary with command result
+
+        Raises:
+            ValueError: If name is empty or contains invalid characters
+        """
+        if not name or not name.strip():
+            raise ValueError("Privilege name cannot be empty")
+
+        name = name.strip()
+        if not re.match(r'^[A-Za-z][A-Za-z0-9]*$', name):
+            raise ValueError(
+                f"Invalid privilege name '{name}': must contain only alphanumeric characters"
+            )
+
+        cmd = f"EnablePrivilege {name}"
+        result = self._request_with_retry("/api/command", {"command": cmd})
+        logger.info(f"Enabled privilege: {name}")
+        return result
+
+    def disable_privilege(self, name: str) -> dict[str, Any]:
+        """
+        Disable a process privilege.
+
+        Args:
+            name: Privilege name (e.g., "SeDebugPrivilege")
+
+        Returns:
+            Dictionary with command result
+
+        Raises:
+            ValueError: If name is empty or contains invalid characters
+        """
+        if not name or not name.strip():
+            raise ValueError("Privilege name cannot be empty")
+
+        name = name.strip()
+        if not re.match(r'^[A-Za-z][A-Za-z0-9]*$', name):
+            raise ValueError(
+                f"Invalid privilege name '{name}': must contain only alphanumeric characters"
+            )
+
+        cmd = f"DisablePrivilege {name}"
+        result = self._request_with_retry("/api/command", {"command": cmd})
+        logger.info(f"Disabled privilege: {name}")
+        return result
+
+    # ── Conditional Tracing ──────────────────────────────────────────
+
+    def set_trace_log(self, text: str, condition: str = "") -> dict[str, Any]:
+        """
+        Configure the trace log format string.
+
+        Sets what gets logged at each trace step. Supports x64dbg format
+        specifiers like {rax}, {[esp]}, {mem;addr;size}, etc.
+
+        Args:
+            text: Log format string (e.g. "RIP={rip} RAX={rax}")
+            condition: Optional condition — only log when true
+
+        Returns:
+            Command result dictionary
+        """
+        if not text or not text.strip():
+            raise ValueError("Trace log text cannot be empty")
+        cmd = f"TraceSetLog {text.strip()}"
+        if condition and condition.strip():
+            cmd += f", {condition.strip()}"
+        result = self.execute_command(cmd)
+        logger.info(f"Set trace log: {text.strip()}")
+        return result
+
+    def set_trace_command(self, command: str, condition: str = "") -> dict[str, Any]:
+        """
+        Configure a command to execute at each trace step.
+
+        Args:
+            command: x64dbg command to run per step
+            condition: Optional condition — only run when true
+
+        Returns:
+            Command result dictionary
+        """
+        if not command or not command.strip():
+            raise ValueError("Trace command cannot be empty")
+        cmd = f"TraceSetCommand {command.strip()}"
+        if condition and condition.strip():
+            cmd += f", {condition.strip()}"
+        result = self.execute_command(cmd)
+        logger.info(f"Set trace command: {command.strip()}")
+        return result
+
+    def set_trace_log_file(self, path: str) -> dict[str, Any]:
+        """
+        Set the output file for trace logging.
+
+        Args:
+            path: File path for trace log output
+
+        Returns:
+            Command result dictionary
+        """
+        if not path or not path.strip():
+            raise ValueError("Trace log file path cannot be empty")
+        cmd = f"TraceSetLogFile {path.strip()}"
+        result = self.execute_command(cmd)
+        logger.info(f"Set trace log file: {path.strip()}")
+        return result
+
+    def trace_into_conditional(
+        self,
+        condition: str,
+        max_steps: int = 50000,
+        log_text: str = "",
+        log_condition: str = "",
+        command_text: str = "",
+        command_condition: str = "",
+        log_file: str = "",
+    ) -> dict[str, Any]:
+        """
+        Trace into (following calls) until condition is met.
+
+        Executes the x64dbg ``ticnd`` command which single-steps into calls,
+        evaluating the condition at each step until it becomes true.
+
+        Args:
+            condition: Break condition expression (e.g. "rax==1", "eip<module.base")
+            max_steps: Maximum number of steps before aborting (default: 50000)
+            log_text: Optional log format string for each step
+            log_condition: Optional condition for logging
+            command_text: Optional command to execute at each step
+            command_condition: Optional condition for command execution
+            log_file: Optional file path for trace log output
+
+        Returns:
+            Dictionary with success, current_address, and trace details
+        """
+        if not condition or not condition.strip():
+            raise ValueError("Trace condition cannot be empty")
+
+        # Configure trace options before starting
+        if log_text:
+            self.set_trace_log(log_text, log_condition)
+        if command_text:
+            self.set_trace_command(command_text, command_condition)
+        if log_file:
+            self.set_trace_log_file(log_file)
+
+        # Execute conditional trace-into
+        cmd = f"ticnd {condition.strip()}, {max_steps}"
+        self.execute_command(cmd)
+
+        # Wait for trace to complete — use generous timeout
+        timeout_ms = max(60000, max_steps * 2)
+        wait_result = self.wait_until_paused(timeout=timeout_ms)
+
+        result = {
+            "success": wait_result.get("success", False),
+            "condition": condition.strip(),
+            "max_steps": max_steps,
+            "current_address": wait_result.get("current_address", "unknown"),
+            "elapsed_ms": wait_result.get("elapsed_ms", 0),
+            "trace_type": "trace_into",
+        }
+
+        if log_file:
+            result["log_file"] = log_file
+
+        logger.info(
+            f"Trace into conditional completed: condition={condition.strip()}, "
+            f"success={result['success']}"
+        )
+        return result
+
+    def trace_over_conditional(
+        self,
+        condition: str,
+        max_steps: int = 50000,
+        log_text: str = "",
+        log_condition: str = "",
+        command_text: str = "",
+        command_condition: str = "",
+        log_file: str = "",
+    ) -> dict[str, Any]:
+        """
+        Trace over (skipping calls) until condition is met.
+
+        Executes the x64dbg ``tocnd`` command which single-steps over calls,
+        evaluating the condition at each step until it becomes true.
+
+        Args:
+            condition: Break condition expression (e.g. "rax==1", "eip<module.base")
+            max_steps: Maximum number of steps before aborting (default: 50000)
+            log_text: Optional log format string for each step
+            log_condition: Optional condition for logging
+            command_text: Optional command to execute at each step
+            command_condition: Optional condition for command execution
+            log_file: Optional file path for trace log output
+
+        Returns:
+            Dictionary with success, current_address, and trace details
+        """
+        if not condition or not condition.strip():
+            raise ValueError("Trace condition cannot be empty")
+
+        # Configure trace options before starting
+        if log_text:
+            self.set_trace_log(log_text, log_condition)
+        if command_text:
+            self.set_trace_command(command_text, command_condition)
+        if log_file:
+            self.set_trace_log_file(log_file)
+
+        # Execute conditional trace-over
+        cmd = f"tocnd {condition.strip()}, {max_steps}"
+        self.execute_command(cmd)
+
+        # Wait for trace to complete
+        timeout_ms = max(60000, max_steps * 2)
+        wait_result = self.wait_until_paused(timeout=timeout_ms)
+
+        result = {
+            "success": wait_result.get("success", False),
+            "condition": condition.strip(),
+            "max_steps": max_steps,
+            "current_address": wait_result.get("current_address", "unknown"),
+            "elapsed_ms": wait_result.get("elapsed_ms", 0),
+            "trace_type": "trace_over",
+        }
+
+        if log_file:
+            result["log_file"] = log_file
+
+        logger.info(
+            f"Trace over conditional completed: condition={condition.strip()}, "
+            f"success={result['success']}"
+        )
+        return result
+
+    def trace_into_beyond_record(self, max_steps: int = 50000) -> dict[str, Any]:
+        """
+        Trace into beyond the last record (OEP finding).
+
+        Executes ``tibt`` — traces into calls, recording execution, and stops
+        when execution goes beyond any previously recorded address. Used
+        primarily for finding the Original Entry Point (OEP) of packed binaries.
+
+        Args:
+            max_steps: Maximum number of steps (default: 50000)
+
+        Returns:
+            Dictionary with success, current_address (likely OEP)
+        """
+        cmd = f"tibt {max_steps}"
+        self.execute_command(cmd)
+
+        timeout_ms = max(60000, max_steps * 2)
+        wait_result = self.wait_until_paused(timeout=timeout_ms)
+
+        result = {
+            "success": wait_result.get("success", False),
+            "current_address": wait_result.get("current_address", "unknown"),
+            "elapsed_ms": wait_result.get("elapsed_ms", 0),
+            "max_steps": max_steps,
+            "trace_type": "trace_into_beyond_record",
+        }
+
+        logger.info(
+            f"Trace into beyond record completed: "
+            f"address={result['current_address']}, success={result['success']}"
+        )
+        return result
+
+    def trace_over_beyond_record(self, max_steps: int = 50000) -> dict[str, Any]:
+        """
+        Trace over beyond the last record (OEP finding, skipping calls).
+
+        Executes ``tobt`` — traces over calls, recording execution, and stops
+        when execution goes beyond any previously recorded address.
+
+        Args:
+            max_steps: Maximum number of steps (default: 50000)
+
+        Returns:
+            Dictionary with success, current_address
+        """
+        cmd = f"tobt {max_steps}"
+        self.execute_command(cmd)
+
+        timeout_ms = max(60000, max_steps * 2)
+        wait_result = self.wait_until_paused(timeout=timeout_ms)
+
+        result = {
+            "success": wait_result.get("success", False),
+            "current_address": wait_result.get("current_address", "unknown"),
+            "elapsed_ms": wait_result.get("elapsed_ms", 0),
+            "max_steps": max_steps,
+            "trace_type": "trace_over_beyond_record",
+        }
+
+        logger.info(
+            f"Trace over beyond record completed: "
+            f"address={result['current_address']}, success={result['success']}"
+        )
         return result

@@ -274,27 +274,12 @@ class X64DbgBridge(Debugger):
             except AddressValidationError:
                 # Address validation failures are deterministic — never retry
                 raise
+            except X64DbgAPIError:
+                # API errors are deterministic — never retry
+                raise
             except (ConnectionError, RuntimeError) as e:
                 last_error = e
                 error_msg = str(e)
-
-                # Don't retry on address-related API errors — these are
-                # deterministic parameter validation failures, not transient
-                if isinstance(e, X64DbgAPIError):
-                    msg_lower = e.api_message.lower() if e.api_message else ""
-                    if "missing" in msg_lower and "address" in msg_lower:
-                        raise
-                    if "invalid" in msg_lower and "address" in msg_lower:
-                        raise
-
-                if "API error" in error_msg:
-                    # API errors should include context for debugging
-                    raise RuntimeError(
-                        f"{error_msg}\n"
-                        f"Request details:\n"
-                        f"  Endpoint: {endpoint}\n"
-                        f"  Data sent: {data}"
-                    )
 
                 # Attempt auto-reconnect for connection-level failures
                 is_connection_error = (
@@ -564,6 +549,7 @@ class X64DbgBridge(Debugger):
             ConnectionError: If connection fails
         """
         try:
+            self._arch = None  # Reset cached architecture on new connection
             result = self._request("/api/status")
             self.connected = True
             logger.info(f"Connected to x64dbg - state: {result.get('state')}")
@@ -575,6 +561,7 @@ class X64DbgBridge(Debugger):
     def disconnect(self) -> None:
         """Disconnect from x64dbg plugin."""
         self.connected = False
+        self._arch = None  # Reset cached architecture
         logger.info("Disconnected from x64dbg")
 
     def load_binary(self, binary_path: Path, args: list[str] | None = None) -> bool:
@@ -1215,7 +1202,7 @@ class X64DbgBridge(Debugger):
                 if not ip_val:
                     logger.warning(f"Cannot resolve {ip_reg} from registers")
                     return None
-                address = ip_val.lstrip("0x").lstrip("0") or "0"
+                address = self._normalize_address(ip_val)
 
             addr_int = int(address, 16)
             raw_bytes = self.read_memory(f"0x{address}", 15)
@@ -1309,7 +1296,7 @@ class X64DbgBridge(Debugger):
                 reg_name = reg_offset.group(1).lower()
                 op = reg_offset.group(2)
                 offset_str = reg_offset.group(3)
-                offset = int(offset_str, 16) if offset_str.startswith("0x") else int(offset_str, 16)
+                offset = int(offset_str, 16) if offset_str.startswith("0x") else int(offset_str, 10)
 
                 regs = self.get_registers()
                 reg_val = regs.get(reg_name)

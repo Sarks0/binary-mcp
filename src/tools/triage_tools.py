@@ -102,6 +102,12 @@ def detect_file_type(data: bytes) -> dict:
                     if characteristics & 0x2000:  # IMAGE_FILE_DLL
                         result["description"] = result["description"].replace("executable", "DLL")
 
+        # Check for .NET assembly (must be inside PE branch since .NET uses PE format)
+        header_bytes = data[:4096]
+        if b"_CorExeMain" in header_bytes or b"mscoree.dll" in header_bytes:
+            result["type"] = "dotnet"
+            result["description"] = ".NET assembly"
+
     # ELF (Linux executable)
     elif data[:4] == b"\x7fELF":
         result["type"] = "elf"
@@ -120,17 +126,17 @@ def detect_file_type(data: bytes) -> dict:
         result["description"] = "macOS Mach-O executable"
         result["is_executable"] = True
 
-    # .NET assembly
-    elif data[:2] == b"MZ" and b"_CorExeMain" in data[:4096]:
-        result["type"] = "dotnet"
-        result["description"] = ".NET assembly"
-        result["is_executable"] = True
-
-    # MSI installer
+    # OLE compound document (covers Office docs, MSI installers, etc.)
     elif data[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1":
-        result["type"] = "msi"
-        result["description"] = "Windows MSI installer"
-        result["is_executable"] = True
+        result["type"] = "ole"
+        result["description"] = "OLE document (Office)"
+
+        # Sub-check for MSI installer (look for UTF-16LE "MSI" marker)
+        header_bytes = data[:4096]
+        if b"\x00M\x00S\x00I" in header_bytes:
+            result["type"] = "msi"
+            result["description"] = "Windows MSI installer"
+            result["is_executable"] = True
 
     # ZIP archive
     elif data[:4] == b"PK\x03\x04":
@@ -141,11 +147,6 @@ def detect_file_type(data: bytes) -> dict:
     elif data[:5] == b"%PDF-":
         result["type"] = "pdf"
         result["description"] = "PDF document"
-
-    # Office documents
-    elif data[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1":
-        result["type"] = "ole"
-        result["description"] = "OLE document (Office)"
 
     return result
 
@@ -174,12 +175,14 @@ def detect_packer(data: bytes) -> list[dict]:
         "pecompact": [b"PEC2", b"PECompact"],
     }
 
-    data_lower = data.lower()
+    # Only scan first 64KB where packer signatures appear (headers, section names)
+    scan_data = data[:65536]
+    scan_data_lower = scan_data.lower()
 
     for packer, signatures in packer_signatures.items():
         matches = []
         for sig in signatures:
-            if sig.lower() in data_lower:
+            if sig.lower() in scan_data_lower:
                 matches.append(sig.decode("utf-8", errors="replace"))
 
         if matches:

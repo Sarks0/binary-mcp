@@ -8,14 +8,14 @@
 import codecs
 import json
 import os
+import time
 
 from ghidra.app.decompiler import DecompInterface
 from ghidra.program.model.block import BasicBlockModel
-from ghidra.program.model.symbol import SymbolType
+from ghidra.program.model.data import Enum as GhidraEnum
+from ghidra.program.model.data import Structure as GhidraStructure
 from ghidra.util.task import ConsoleTaskMonitor
 from java.lang import InterruptedException, Thread
-
-# Java imports for thread-based timeout handling
 from java.util.concurrent import Callable, Executors, TimeoutException, TimeUnit
 
 
@@ -147,7 +147,7 @@ def decompile_with_timeout(decompiler, function, timeout_seconds, monitor, execu
 
         try:
             # Wait for result with timeout (add 5 seconds buffer for thread overhead)
-            result = future.get(timeout_seconds + 5, TimeUnit.SECONDS)
+            result = future.get(timeout_seconds, TimeUnit.SECONDS)
 
             if callable_task.error:
                 return (None, "error", safe_unicode(callable_task.error))
@@ -186,19 +186,21 @@ def extract_comprehensive_analysis():
     function_timeout = int(os.environ.get("GHIDRA_FUNCTION_TIMEOUT", "30"))
     max_functions = int(os.environ.get("GHIDRA_MAX_FUNCTIONS", "0"))  # 0 = unlimited
     skip_decompile = os.environ.get("GHIDRA_SKIP_DECOMPILE", "").lower() in ("1", "true", "yes")
+    total_budget = int(os.environ.get("GHIDRA_ANALYSIS_BUDGET", "540"))
 
     print(safe_format("[*] Analysis settings:"))
     print(safe_format("    Function timeout: {}s", function_timeout))
     print(safe_format("    Max functions: {}", max_functions if max_functions > 0 else "unlimited"))
     print(safe_format("    Skip decompile: {}", skip_decompile))
+    print(safe_format("    Wall-clock budget: {}s", total_budget))
 
     # Initialize decompiler
     decompiler = DecompInterface()
     decompiler.openProgram(program)
 
     # Create a single-thread executor for timeout-controlled decompilation
-    # Using a cached thread pool allows reuse of threads for better performance
-    decompile_executor = Executors.newCachedThreadPool()
+    # Tasks are submitted one at a time, so a single thread is sufficient
+    decompile_executor = Executors.newSingleThreadExecutor()
 
     context = {
         "metadata": {},
@@ -260,15 +262,20 @@ def extract_comprehensive_analysis():
     print("[*] Extracting imports...")
     external_manager = program.getExternalManager()
     for external_name in external_manager.getExternalLibraryNames():
-        for symbol in symbol_table.getExternalSymbols(external_name):
-            if symbol.getSymbolType() == SymbolType.FUNCTION:
-                import_info = {
-                    "library": safe_unicode(external_name),
-                    "name": safe_unicode(symbol.getName()),
-                    "address": safe_unicode(symbol.getAddress()) if symbol.getAddress() else None,
-                    "ordinal": None  # Ordinals would need additional parsing
-                }
-                context["imports"].append(import_info)
+        # Skip Ghidra's internal pseudo-library
+        if external_name == "<EXTERNAL>":
+            continue
+        ext_loc_iter = external_manager.getExternalLocations(external_name)
+        while ext_loc_iter.hasNext():
+            ext_loc = ext_loc_iter.next()
+            import_info = {
+                "library": safe_unicode(external_name),
+                "name": safe_unicode(ext_loc.getLabel()),
+                "address": safe_unicode(ext_loc.getAddress()) if ext_loc.getAddress() else None,
+                "is_function": ext_loc.isFunction(),
+                "ordinal": None
+            }
+            context["imports"].append(import_info)
 
     # Extract exports
     print("[*] Extracting exports...")
@@ -327,6 +334,8 @@ def extract_comprehensive_analysis():
     # Initialize BasicBlockModel for extracting basic blocks
     block_model = BasicBlockModel(program)
 
+    analysis_start = time.time()
+
     while function_iterator.hasNext():
         function = function_iterator.next()
         function_count += 1
@@ -344,11 +353,13 @@ def extract_comprehensive_analysis():
         # Get function signature
         signature = function.getSignature()
         entry_point = function.getEntryPoint()
+        body = function.getBody()
 
         # Get basic info
         function_info = {
             "name": safe_unicode(function.getName()),
             "address": safe_unicode(entry_point),
+            "size": body.getNumAddresses() if body else 0,
             "signature": safe_unicode(signature),
             "is_thunk": function.isThunk(),
             "is_external": function.isExternal(),
@@ -392,7 +403,6 @@ def extract_comprehensive_analysis():
 
         # Get basic blocks using BasicBlockModel
         try:
-            body = function.getBody()
             code_block_iterator = block_model.getCodeBlocksContaining(body, monitor)
             while code_block_iterator.hasNext():
                 block = code_block_iterator.next()
@@ -484,19 +494,28 @@ def extract_comprehensive_analysis():
 
         context["functions"].append(function_info)
 
+        # Check wall-clock budget to prevent total data loss on process timeout
+        if time.time() - analysis_start > total_budget:
+            context["analysis_stats"]["partial_results"] = True
+            print(safe_format("[!] Wall-clock budget exceeded ({}s), stopping to preserve results", total_budget))
+            break
+
     # Update analysis stats
     context["analysis_stats"]["functions_analyzed"] = function_count
     context["analysis_stats"]["decompile_timeouts"] = decompile_timeout_count
     context["analysis_stats"]["thread_timeouts"] = thread_timeout_count
     context["analysis_stats"]["internal_timeouts"] = internal_timeout_count
     context["analysis_stats"]["decompile_failures"] = decompile_failure_count
+    context["analysis_stats"]["functions_skipped"] = len(context["skipped_functions"])
 
     # Extract data types (structures)
     print("[*] Extracting data types...")
     for data_type in data_type_manager.getAllDataTypes():
-        type_name = str(type(data_type).__name__)
+        # Skip types from other data type managers (Ghidra built-ins)
+        if data_type.getDataTypeManager() != data_type_manager:
+            continue
 
-        if "Structure" in type_name:
+        if isinstance(data_type, GhidraStructure):
             struct_info = {
                 "name": safe_unicode(data_type.getName()),
                 "length": data_type.getLength(),
@@ -517,7 +536,7 @@ def extract_comprehensive_analysis():
 
             context["data_types"]["structures"].append(struct_info)
 
-        elif "Enum" in type_name:
+        elif isinstance(data_type, GhidraEnum):
             enum_info = {
                 "name": safe_unicode(data_type.getName()),
                 "length": data_type.getLength(),

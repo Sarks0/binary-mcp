@@ -653,6 +653,124 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
     @app.tool()
     @log_dynamic_tool
+    def x64dbg_attach(pid: int) -> str:
+        """
+        Attach x64dbg to a running process.
+
+        Args:
+            pid: Process ID to attach to
+
+        Returns:
+            Connection status after attaching
+
+        Example:
+            x64dbg_attach(1234)
+
+        Use Cases:
+            - Debug a running service or malware sample
+            - Attach to a process spawned by another tool
+            - Inspect a process without restarting it
+        """
+        try:
+            if not isinstance(pid, int) or pid <= 0:
+                return f"Error: Invalid PID '{pid}'. Must be a positive integer."
+
+            bridge = get_x64dbg_bridge()
+            result = bridge.attach_process(pid)
+
+            # Update global commands instance
+            global _x64dbg_commands
+            _x64dbg_commands = X64DbgCommands(bridge)
+
+            state = result.get("state", "unknown")
+            return (
+                f"Attached to process PID {pid}\n"
+                f"State: {state}"
+            )
+
+        except Exception as e:
+            logger.error(f"x64dbg_attach failed: {e}")
+            return (
+                f"Error: {e}\n\n"
+                f"Troubleshooting:\n"
+                f"1. Verify PID {pid} exists and is accessible\n"
+                f"2. Ensure x64dbg is running with MCP plugin\n"
+                f"3. Check that no other debugger is attached to the process"
+            )
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_detach() -> str:
+        """
+        Detach from the current process without terminating it.
+
+        Returns:
+            Confirmation that debugger has detached
+
+        Use Cases:
+            - Release a process after analysis
+            - Allow a process to continue running unmonitored
+            - Switch to debugging a different process
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            bridge.detach_process()
+            return "Detached from process. Debugger is now idle."
+
+        except Exception as e:
+            logger.error(f"x64dbg_detach failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_create_minidump(output_path: str = "") -> str:
+        """
+        Create a minidump of the debuggee process.
+
+        Args:
+            output_path: Path for the minidump file (default: auto-generated in dump directory)
+
+        Returns:
+            Confirmation with minidump file path
+
+        Example:
+            x64dbg_create_minidump("crash.dmp")
+
+        Use Cases:
+            - Capture process state for offline analysis
+            - Save crash dumps for later investigation
+            - Archive malware memory state at a specific point
+        """
+        try:
+            resolved_path = None
+            if output_path:
+                # Security: Validate output path to prevent directory traversal
+                DUMP_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+                out_path = Path(output_path)
+                if not out_path.is_absolute():
+                    out_path = DUMP_OUTPUT_DIR / out_path
+                safe_path = sanitize_output_path(out_path, DUMP_OUTPUT_DIR)
+                resolved_path = str(safe_path)
+
+            bridge = get_x64dbg_bridge()
+            result = bridge.create_minidump(resolved_path)
+
+            dump_path = result.get("path", resolved_path or "default location")
+            return (
+                f"Minidump created successfully\n"
+                f"Path: {dump_path}"
+            )
+
+        except PathTraversalError as e:
+            return f"Error: Invalid output path - {e}"
+        except ValueError as e:
+            return f"Error: Invalid path - {e}"
+        except Exception as e:
+            logger.error(f"x64dbg_create_minidump failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_dynamic_tool
     def x64dbg_run() -> str:
         """
         Start or resume execution in x64dbg.
@@ -1155,6 +1273,129 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_list_breakpoints failed: {e}")
             return f"Error: {e}"
 
+    # ── Exception handling control tools ────────────────────────────────
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_set_exception_breakpoint(
+        exception_code: str, chance: str = "first"
+    ) -> str:
+        """
+        Set breakpoint on an exception code.
+
+        Args:
+            exception_code: Exception code (hex, e.g., "0xC0000005" for access violation)
+            chance: When to break - "first", "second", or "all"
+
+        Returns:
+            Confirmation message
+
+        Example:
+            x64dbg_set_exception_breakpoint("0xC0000005", "first")
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            bridge.set_exception_breakpoint(exception_code, chance)
+            return (
+                f"Exception breakpoint set on {exception_code} "
+                f"(chance={chance})"
+            )
+
+        except StructuredBaseError as e:
+            logger.error(
+                f"x64dbg_set_exception_breakpoint failed: "
+                f"{e.structured_error.error.value}"
+            )
+            return format_error_response(e, "set_exception_breakpoint")
+        except Exception as e:
+            logger.error(f"x64dbg_set_exception_breakpoint failed: {e}")
+            return format_error_response(e, "set_exception_breakpoint")
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_delete_exception_breakpoint(exception_code: str) -> str:
+        """
+        Delete an exception breakpoint.
+
+        Args:
+            exception_code: Exception code (hex, e.g., "0xC0000005")
+
+        Returns:
+            Confirmation message
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            bridge.delete_exception_breakpoint(exception_code)
+            return f"Exception breakpoint deleted for {exception_code}"
+
+        except StructuredBaseError as e:
+            logger.error(
+                f"x64dbg_delete_exception_breakpoint failed: "
+                f"{e.structured_error.error.value}"
+            )
+            return format_error_response(e, "delete_exception_breakpoint")
+        except Exception as e:
+            logger.error(f"x64dbg_delete_exception_breakpoint failed: {e}")
+            return format_error_response(e, "delete_exception_breakpoint")
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_list_exception_breakpoints() -> str:
+        """
+        List all exception breakpoints.
+
+        Returns:
+            List of exception breakpoints with codes and chance types
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            exceptions = bridge.list_exception_breakpoints()
+
+            if not exceptions:
+                return "No exception breakpoints set"
+
+            result = ["Exception Breakpoints:", "-" * 40]
+            for i, exc in enumerate(exceptions, 1):
+                code = exc.get("code", "unknown")
+                chance = exc.get("chance", "unknown")
+                result.append(f"{i}. 0x{code} (chance={chance})")
+
+            return "\n".join(result)
+
+        except Exception as e:
+            logger.error(f"x64dbg_list_exception_breakpoints failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_skip_exception(exception_code: str) -> str:
+        """
+        Add exception to ignore list so debugger passes it to the application.
+
+        Args:
+            exception_code: Exception code (hex, e.g., "0xC0000005")
+
+        Returns:
+            Confirmation message
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            bridge.skip_exception(exception_code)
+            return (
+                f"Exception {exception_code} added to ignore list "
+                f"(will be passed to application)"
+            )
+
+        except StructuredBaseError as e:
+            logger.error(
+                f"x64dbg_skip_exception failed: "
+                f"{e.structured_error.error.value}"
+            )
+            return format_error_response(e, "skip_exception")
+        except Exception as e:
+            logger.error(f"x64dbg_skip_exception failed: {e}")
+            return format_error_response(e, "skip_exception")
+
     @app.tool()
     @log_dynamic_tool
     def x64dbg_read_memory(address: str, size: int = 256) -> str:
@@ -1268,8 +1509,9 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             for entry in trace:
                 step = entry["step"]
                 addr = entry["address"]
-                rip = entry["rip"]
-                result.append(f"Step {step}: 0x{addr} RIP={rip}")
+                ip = entry.get("rip", entry.get("eip", "unknown"))
+                ip_label = "RIP" if "rip" in entry else "EIP"
+                result.append(f"Step {step}: 0x{addr} {ip_label}={ip}")
 
             return "\n".join(result)
 
@@ -1380,11 +1622,19 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
                     # Set conditional breakpoint that logs and continues
                     # This uses x64dbg's logging breakpoint feature
-                    bridge.set_breakpoint(api_expr)
+                    resolved = bridge.resolve_symbol(api_expr)
+                    if not resolved.get("success"):
+                        raise ValueError(
+                            f"Could not resolve symbol '{api_expr}': "
+                            f"{resolved.get('error', 'unknown error')}"
+                        )
+                    resolved_addr = resolved["address"]
+                    bridge.set_breakpoint(resolved_addr)
                     results["apis_configured"].append({
                         "name": api_name,
                         "module": module,
-                        "expression": api_expr
+                        "expression": api_expr,
+                        "address": resolved_addr
                     })
                     results["breakpoints_set"] += 1
 
@@ -1424,6 +1674,167 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_trace_api_calls failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_start_trace(
+        trace_into: bool = True,
+        max_entries: int = 100000,
+        log_file: str = ""
+    ) -> str:
+        """
+        Start recording an instruction execution trace.
+
+        Records each instruction executed with address, disassembly, and timing.
+        Use x64dbg_run() to begin execution, then x64dbg_stop_trace() and
+        x64dbg_get_trace() to retrieve results.
+
+        Args:
+            trace_into: If True, trace into function calls. If False, trace over.
+            max_entries: Maximum trace entries to keep in memory (default: 100000)
+            log_file: Optional file path to write trace log (for large traces)
+
+        Returns:
+            Trace configuration summary
+
+        Example workflow:
+            1. x64dbg_start_trace(trace_into=True)
+            2. x64dbg_run()
+            3. x64dbg_stop_trace()
+            4. x64dbg_get_trace(max_entries=50)
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            bridge.start_trace(
+                trace_into=trace_into,
+                max_entries=max_entries,
+                log_file=log_file if log_file else None,
+            )
+
+            mode = "trace into" if trace_into else "trace over"
+            output = (
+                f"Trace started\n"
+                f"  Mode: {mode}\n"
+                f"  Max entries: {max_entries}"
+            )
+            if log_file:
+                output += f"\n  Log file: {log_file}"
+
+            return output
+
+        except StructuredBaseError as e:
+            logger.error(f"x64dbg_start_trace failed: {e.structured_error.error.value}")
+            return format_error_response(e, "start_trace")
+        except Exception as e:
+            logger.error(f"x64dbg_start_trace failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_stop_trace() -> str:
+        """
+        Stop recording the instruction execution trace.
+
+        Returns:
+            Trace statistics including entry count and duration
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            result = bridge.stop_trace()
+
+            entry_count = result.get("entry_count", "unknown")
+            duration = result.get("duration", "unknown")
+
+            return (
+                f"Trace stopped\n"
+                f"  Entries recorded: {entry_count}\n"
+                f"  Duration: {duration}"
+            )
+
+        except StructuredBaseError as e:
+            logger.error(f"x64dbg_stop_trace failed: {e.structured_error.error.value}")
+            return format_error_response(e, "stop_trace")
+        except Exception as e:
+            logger.error(f"x64dbg_stop_trace failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_get_trace(max_entries: int = 100) -> str:
+        """
+        Get recorded trace data formatted as a listing.
+
+        Args:
+            max_entries: Maximum number of trace entries to return (default: 100)
+
+        Returns:
+            Formatted trace listing with addresses and instructions
+
+        Example output:
+            Trace: 500 total entries (showing 100)
+            ------------------------------------------------------------
+            0x00401234: mov eax, [ebp+8]  [main.exe]
+            0x00401238: call 0x00402000    [main.exe]
+            ...
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            result = bridge.get_trace_data(offset=0, limit=max_entries)
+
+            total = result.get("total", 0)
+            entries = result.get("entries", [])
+            enabled = result.get("enabled", False)
+
+            output = [
+                f"Trace: {total} total entries (showing {len(entries)})",
+                f"  Recording: {'active' if enabled else 'stopped'}",
+                "-" * 60,
+            ]
+
+            for entry in entries:
+                addr = entry.get("address", "?")
+                instr = entry.get("instruction", "?")
+                module = entry.get("module", "")
+                line = f"0x{addr}: {instr}"
+                if module:
+                    line += f"  [{module}]"
+                output.append(line)
+
+            if not entries:
+                output.append("(no trace entries)")
+
+            return "\n".join(output)
+
+        except StructuredBaseError as e:
+            logger.error(f"x64dbg_get_trace failed: {e.structured_error.error.value}")
+            return format_error_response(e, "get_trace")
+        except Exception as e:
+            logger.error(f"x64dbg_get_trace failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_clear_trace() -> str:
+        """
+        Clear trace data from memory.
+
+        Use this to free memory after retrieving trace data, or before
+        starting a new trace session.
+
+        Returns:
+            Confirmation message
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            bridge.clear_trace()
+            return "Trace data cleared"
+
+        except StructuredBaseError as e:
+            logger.error(f"x64dbg_clear_trace failed: {e.structured_error.error.value}")
+            return format_error_response(e, "clear_trace")
+        except Exception as e:
+            logger.error(f"x64dbg_clear_trace failed: {e}")
             return f"Error: {e}"
 
     @app.tool()
@@ -1651,17 +2062,24 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
         """
         try:
             bridge = get_x64dbg_bridge()
-            frames = bridge.get_stack(depth)
+            stack_result = bridge.get_stack(depth)
+            frames = stack_result.get("frames", [])
+            is_raw = stack_result.get("raw", False)
 
             if not frames:
                 return "No stack frames available"
 
-            result = [f"Call Stack ({len(frames)} frames):", "-" * 60]
+            if is_raw:
+                header = f"Stack contents (raw dump, not unwound call stack) — {len(frames)} entries:"
+            else:
+                header = f"Call Stack ({len(frames)} frames):"
+
+            result = [header, "-" * 60]
 
             for i, frame in enumerate(frames):
                 addr = frame.get("address", "unknown")
                 comment = frame.get("comment", "")
-                if comment:
+                if comment and comment != "raw stack":
                     result.append(f"{i}. 0x{addr} ({comment})")
                 else:
                     result.append(f"{i}. 0x{addr}")
@@ -1769,6 +2187,137 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_get_threads failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_switch_thread(thread_id: str) -> str:
+        """
+        Switch active thread in the debugger.
+
+        Changes the debugger's active thread context to the specified thread.
+
+        Args:
+            thread_id: Thread ID to switch to
+
+        Returns:
+            New thread context information
+
+        Example:
+            x64dbg_switch_thread("1234")  # Switch to thread 1234
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            result = bridge.switch_thread(thread_id)
+
+            lines = [f"Switched to thread {thread_id}"]
+
+            # Include thread context if returned by API
+            if "registers" in result:
+                regs = result["registers"]
+                for reg, val in regs.items():
+                    lines.append(f"  {reg}: 0x{val}")
+            if "entry" in result:
+                lines.append(f"  Entry: 0x{result['entry']}")
+            if "status" in result:
+                lines.append(f"  Status: {result['status']}")
+
+            return "\n".join(lines)
+
+        except Exception as e:
+            logger.error(f"x64dbg_switch_thread failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_suspend_thread(thread_id: str) -> str:
+        """
+        Suspend a thread in the debugged process.
+
+        Args:
+            thread_id: Thread ID to suspend
+
+        Returns:
+            Confirmation message
+
+        Example:
+            x64dbg_suspend_thread("1234")  # Suspend thread 1234
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            bridge.suspend_thread(thread_id)
+            return f"Thread {thread_id} suspended"
+
+        except Exception as e:
+            logger.error(f"x64dbg_suspend_thread failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_resume_thread(thread_id: str) -> str:
+        """
+        Resume a suspended thread in the debugged process.
+
+        Args:
+            thread_id: Thread ID to resume
+
+        Returns:
+            Confirmation message
+
+        Example:
+            x64dbg_resume_thread("1234")  # Resume thread 1234
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            bridge.resume_thread(thread_id)
+            return f"Thread {thread_id} resumed"
+
+        except Exception as e:
+            logger.error(f"x64dbg_resume_thread failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_suspend_all_threads() -> str:
+        """
+        Suspend all threads in the debugged process.
+
+        Returns:
+            Confirmation with thread count
+
+        Example:
+            x64dbg_suspend_all_threads()  # Suspend all threads
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            result = bridge.suspend_all_threads()
+            count = result.get("count", "unknown")
+            return f"All threads suspended (count: {count})"
+
+        except Exception as e:
+            logger.error(f"x64dbg_suspend_all_threads failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_resume_all_threads() -> str:
+        """
+        Resume all threads in the debugged process.
+
+        Returns:
+            Confirmation with thread count
+
+        Example:
+            x64dbg_resume_all_threads()  # Resume all threads
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            result = bridge.resume_all_threads()
+            count = result.get("count", "unknown")
+            return f"All threads resumed (count: {count})"
+
+        except Exception as e:
+            logger.error(f"x64dbg_resume_all_threads failed: {e}")
             return f"Error: {e}"
 
     @app.tool()
@@ -1935,6 +2484,255 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return ("Error: Memory search requires C++ plugin implementation\n"
                         "This feature is planned but not yet available in the plugin.\n"
                         "See FUTURE_FEATURES.md for implementation status.")
+            return f"Error: {e}"
+
+    # ── Advanced search tools ────────────────────────────────────────
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_find_assembly(instruction: str, address: str = "", size: int = 0) -> str:
+        """
+        Search for assembly instruction patterns in memory.
+
+        Find all occurrences of a specific assembly instruction in the debugged binary.
+
+        Args:
+            instruction: Assembly instruction pattern (e.g., "push ebp", "call eax", "jmp dword ptr [eax]")
+            address: Start address (hex string, optional). Empty = current location.
+            size: Number of bytes to search (0 = default x64dbg range)
+
+        Returns:
+            Command result from findasm search
+
+        Examples:
+            x64dbg_find_assembly("call eax")
+            x64dbg_find_assembly("push ebp", address="00401000", size=65536)
+
+        Use Cases:
+            - Find all indirect calls (call eax, call [eax])
+            - Locate function prologues (push ebp)
+            - Find specific instruction patterns for hooking
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            result = bridge.find_assembly(instruction, address=address, size=size)
+
+            lines = [
+                "Assembly Search Results:",
+                f"Instruction: {instruction}",
+            ]
+            if address:
+                lines.append(f"Start address: 0x{address}")
+            if size:
+                lines.append(f"Search size: {size:#x}")
+            lines.append("-" * 60)
+            lines.append(f"Success: {result.get('success', False)}")
+            if result.get("message"):
+                lines.append(f"Result: {result['message']}")
+            if result.get("result"):
+                lines.append(f"Output: {result['result']}")
+
+            return "\n".join(lines)
+
+        except Exception as e:
+            logger.error(f"x64dbg_find_assembly failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_find_guid(address: str = "", size: int = 0) -> str:
+        """
+        Find GUIDs/UUIDs in memory.
+
+        Scan a memory region for GUID patterns. Useful for identifying
+        COM interfaces, class IDs, and protocol identifiers.
+
+        Args:
+            address: Start address (hex string, optional). Empty = current location.
+            size: Number of bytes to search (0 = default x64dbg range)
+
+        Returns:
+            GUIDs found in the specified memory region
+
+        Examples:
+            x64dbg_find_guid()
+            x64dbg_find_guid(address="00401000", size=327680)
+
+        Use Cases:
+            - Identify COM interfaces used by malware
+            - Find class IDs for COM object creation
+            - Discover protocol/interface identifiers
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            result = bridge.find_guid(address=address, size=size)
+
+            lines = ["GUID Search Results:"]
+            if address:
+                lines.append(f"Start address: 0x{address}")
+            if size:
+                lines.append(f"Search size: {size:#x}")
+            lines.append("-" * 60)
+            lines.append(f"Success: {result.get('success', False)}")
+            if result.get("message"):
+                lines.append(f"Result: {result['message']}")
+            if result.get("result"):
+                lines.append(f"Output: {result['result']}")
+
+            return "\n".join(lines)
+
+        except Exception as e:
+            logger.error(f"x64dbg_find_guid failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_find_module_calls(module: str = "") -> str:
+        """
+        Find all calls to a specific module.
+
+        Locate inter-module call instructions targeting the specified module.
+        Useful for understanding API usage and dependencies.
+
+        Args:
+            module: Module name (e.g., "kernel32.dll"). Empty = find all inter-module calls.
+
+        Returns:
+            List of call instructions targeting the module
+
+        Examples:
+            x64dbg_find_module_calls("kernel32.dll")
+            x64dbg_find_module_calls("ws2_32.dll")
+            x64dbg_find_module_calls()  # All inter-module calls
+
+        Use Cases:
+            - Map all Windows API calls from a binary
+            - Find networking calls (ws2_32, wininet, winhttp)
+            - Identify crypto library usage
+            - Discover process manipulation calls
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            result = bridge.find_module_calls(module=module)
+
+            lines = [
+                "Module Call Search Results:",
+                f"Module: {module or '(all modules)'}",
+                "-" * 60,
+                f"Success: {result.get('success', False)}",
+            ]
+            if result.get("message"):
+                lines.append(f"Result: {result['message']}")
+            if result.get("result"):
+                lines.append(f"Output: {result['result']}")
+
+            return "\n".join(lines)
+
+        except Exception as e:
+            logger.error(f"x64dbg_find_module_calls failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_find_references_range(address: str, size: int) -> str:
+        """
+        Find all references within an address range.
+
+        Search for code and data references pointing to addresses within
+        the specified range.
+
+        Args:
+            address: Start address of range (hex string, required)
+            size: Size of range in bytes
+
+        Returns:
+            References found within the address range
+
+        Examples:
+            x64dbg_find_references_range("00401000", 4096)
+            x64dbg_find_references_range("0x00401000", 65536)
+
+        Use Cases:
+            - Find all references to a function's code range
+            - Identify cross-references to a data section
+            - Map references within a specific memory region
+        """
+        try:
+            if not address:
+                return "Error: address parameter is required"
+            if size <= 0:
+                return "Error: size must be a positive integer"
+
+            bridge = get_x64dbg_bridge()
+            result = bridge.find_references_range(address, size)
+
+            # Normalize for display
+            addr_display = address.strip()
+            if not addr_display.lower().startswith("0x"):
+                addr_display = f"0x{addr_display}"
+
+            lines = [
+                "Reference Range Search Results:",
+                f"Range: {addr_display} - {addr_display}+{size:#x}",
+                "-" * 60,
+                f"Success: {result.get('success', False)}",
+            ]
+            if result.get("message"):
+                lines.append(f"Result: {result['message']}")
+            if result.get("result"):
+                lines.append(f"Output: {result['result']}")
+
+            return "\n".join(lines)
+
+        except Exception as e:
+            logger.error(f"x64dbg_find_references_range failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_find_string_references(address: str = "") -> str:
+        """
+        Find string references in the current module or at an address.
+
+        Locate all references to string constants. Essential for understanding
+        program behavior through its string usage.
+
+        Args:
+            address: Address or module base (hex string, optional). Empty = current module.
+
+        Returns:
+            String references found
+
+        Examples:
+            x64dbg_find_string_references()
+            x64dbg_find_string_references("00401000")
+
+        Use Cases:
+            - Find error messages and debug strings
+            - Locate URLs, file paths, registry keys
+            - Identify command strings and configuration values
+            - Discover encrypted/encoded string references
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            result = bridge.find_string_references(address=address)
+
+            lines = ["String Reference Search Results:"]
+            if address:
+                lines.append(f"Address: 0x{address}")
+            else:
+                lines.append("Scope: current module")
+            lines.append("-" * 60)
+            lines.append(f"Success: {result.get('success', False)}")
+            if result.get("message"):
+                lines.append(f"Result: {result['message']}")
+            if result.get("result"):
+                lines.append(f"Output: {result['result']}")
+
+            return "\n".join(lines)
+
+        except Exception as e:
+            logger.error(f"x64dbg_find_string_references failed: {e}")
             return f"Error: {e}"
 
     @app.tool()
@@ -2224,6 +3022,231 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             if "Not yet implemented" in str(e):
                 return ("Error: Get comment requires C++ plugin implementation\n"
                         "This P1 feature improves documentation workflow.\n"
+                        "See FUTURE_FEATURES.md for implementation status.")
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_set_bookmark(address: str) -> str:
+        """
+        Set bookmark at address.
+
+        Mark important locations for quick navigation during analysis.
+
+        Args:
+            address: Address to bookmark
+
+        Returns:
+            Confirmation message
+
+        Example:
+            x64dbg_set_bookmark("0x401000")
+            x64dbg_set_bookmark("0x402500")
+
+        Use Cases:
+            - Mark interesting code locations
+            - Create navigation points during analysis
+            - Tag addresses for later review
+
+        Priority: P1 (High Value)
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            bridge.set_bookmark(address)
+
+            return f"Bookmark set at {address}"
+
+        except Exception as e:
+            logger.error(f"x64dbg_set_bookmark failed: {e}")
+            if "Not yet implemented" in str(e):
+                return ("Error: Set bookmark requires C++ plugin implementation\n"
+                        "See FUTURE_FEATURES.md for implementation status.")
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_delete_bookmark(address: str) -> str:
+        """
+        Delete bookmark at address.
+
+        Remove a previously set bookmark.
+
+        Args:
+            address: Address of bookmark to delete
+
+        Returns:
+            Confirmation message
+
+        Priority: P1 (High Value)
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            bridge.delete_bookmark(address)
+
+            return f"Bookmark deleted at {address}"
+
+        except Exception as e:
+            logger.error(f"x64dbg_delete_bookmark failed: {e}")
+            if "Not yet implemented" in str(e):
+                return ("Error: Delete bookmark requires C++ plugin implementation\n"
+                        "See FUTURE_FEATURES.md for implementation status.")
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_list_bookmarks() -> str:
+        """
+        List all bookmarks.
+
+        View all bookmarked addresses in the debugger.
+
+        Returns:
+            Formatted list of all bookmarks
+
+        Use Cases:
+            - Review marked locations
+            - Navigate between analysis points
+            - Export analysis markers
+
+        Priority: P1 (High Value)
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            bookmarks = bridge.list_bookmarks()
+
+            if not bookmarks:
+                return "No bookmarks set"
+
+            lines = [f"Bookmarks ({len(bookmarks)}):"]
+            lines.append("-" * 40)
+            for bm in bookmarks:
+                addr = bm.get("address", "unknown")
+                module = bm.get("module", "")
+                if module:
+                    lines.append(f"  {addr}  ({module})")
+                else:
+                    lines.append(f"  {addr}")
+
+            return "\n".join(lines)
+
+        except Exception as e:
+            logger.error(f"x64dbg_list_bookmarks failed: {e}")
+            if "Not yet implemented" in str(e):
+                return ("Error: List bookmarks requires C++ plugin implementation\n"
+                        "See FUTURE_FEATURES.md for implementation status.")
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_add_function(start: str, end: str) -> str:
+        """
+        Define function boundary.
+
+        Tell x64dbg where a function starts and ends for better analysis.
+
+        Args:
+            start: Function start address
+            end: Function end address
+
+        Returns:
+            Confirmation message
+
+        Example:
+            x64dbg_add_function("0x401000", "0x401050")
+            x64dbg_add_function("0x402000", "0x402200")
+
+        Use Cases:
+            - Define functions missed by auto-analysis
+            - Correct wrong function boundaries
+            - Mark unpacked or decrypted code as functions
+            - Improve disassembly listing
+
+        Priority: P1 (High Value)
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            bridge.add_function(start, end)
+
+            return f"Function defined: {start} - {end}"
+
+        except Exception as e:
+            logger.error(f"x64dbg_add_function failed: {e}")
+            if "Not yet implemented" in str(e):
+                return ("Error: Add function requires C++ plugin implementation\n"
+                        "See FUTURE_FEATURES.md for implementation status.")
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_delete_function(address: str) -> str:
+        """
+        Delete function boundary definition.
+
+        Remove a previously defined function boundary.
+
+        Args:
+            address: Address within the function to delete
+
+        Returns:
+            Confirmation message
+
+        Priority: P1 (High Value)
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            bridge.delete_function(address)
+
+            return f"Function deleted at {address}"
+
+        except Exception as e:
+            logger.error(f"x64dbg_delete_function failed: {e}")
+            if "Not yet implemented" in str(e):
+                return ("Error: Delete function requires C++ plugin implementation\n"
+                        "See FUTURE_FEATURES.md for implementation status.")
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_list_functions() -> str:
+        """
+        List all defined functions.
+
+        View all function boundaries defined in the debugger.
+
+        Returns:
+            Formatted list of all functions with start/end addresses
+
+        Use Cases:
+            - Review defined function boundaries
+            - Verify auto-analysis results
+            - Audit analysis coverage
+
+        Priority: P1 (High Value)
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            functions = bridge.list_functions()
+
+            if not functions:
+                return "No functions defined"
+
+            lines = [f"Functions ({len(functions)}):"]
+            lines.append("-" * 60)
+            for fn in functions:
+                start = fn.get("start", "unknown")
+                end = fn.get("end", "unknown")
+                name = fn.get("name", "")
+                if name:
+                    lines.append(f"  {start} - {end}  {name}")
+                else:
+                    lines.append(f"  {start} - {end}")
+
+            return "\n".join(lines)
+
+        except Exception as e:
+            logger.error(f"x64dbg_list_functions failed: {e}")
+            if "Not yet implemented" in str(e):
+                return ("Error: List functions requires C++ plugin implementation\n"
                         "See FUTURE_FEATURES.md for implementation status.")
             return f"Error: {e}"
 
@@ -2647,6 +3670,138 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return ("Error: Run until return requires C++ plugin implementation\n"
                         "This P1 feature speeds up function analysis.\n"
                         "See FUTURE_FEATURES.md for implementation status.")
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_run_to_user_code() -> str:
+        """
+        Run to user code (skip system/library code).
+
+        Executes until the debugger pauses in a user module, skipping past
+        system DLLs and library code. Useful after hitting a breakpoint in
+        ntdll or kernel32 to quickly return to the analysed binary's code.
+
+        Returns:
+            Current location after pausing in user code
+
+        Use Cases:
+            - Skip past system library calls
+            - Return to main module after exception handlers
+            - Navigate to user code from entry point
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            result = bridge.run_to_user_code()
+
+            if not result.get("success"):
+                return f"Error: {result.get('error', 'Timeout waiting for user code')}"
+
+            lines = [
+                "Paused in user code",
+                f"Address: 0x{result['address']}",
+                f"Module: {result.get('module', 'unknown')}",
+                f"Wait time: {result.get('elapsed_ms', 0)}ms",
+            ]
+            return "\n".join(lines)
+
+        except Exception as e:
+            logger.error(f"x64dbg_run_to_user_code failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_undo_instruction() -> str:
+        """
+        Undo the last executed instruction.
+
+        Reverses the effect of the last single-stepped instruction using
+        x64dbg's InstrUndo command. Useful for correcting accidental steps
+        or re-examining state before an instruction executed.
+
+        Returns:
+            New execution state after undo
+
+        Use Cases:
+            - Undo accidental step-into
+            - Re-examine state before instruction
+            - Reverse single-step for analysis
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            bridge.undo_instruction()
+
+            location = bridge.get_current_location()
+            lines = [
+                "Instruction undone",
+                f"Current address: 0x{location.get('address', 'unknown')}",
+                f"Module: {location.get('module', 'unknown')}",
+            ]
+            return "\n".join(lines)
+
+        except Exception as e:
+            logger.error(f"x64dbg_undo_instruction failed: {e}")
+            return f"Error: {e}"
+
+    # Security: blocked commands that could disrupt the debugging session
+    blocked_commands = frozenset({
+        "quit", "stop", "exit", "detach", "attach", "init",
+    })
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_execute_command(command: str) -> str:
+        """
+        Execute a generic x64dbg command.
+
+        Sends an arbitrary command string to x64dbg for execution.
+        Dangerous commands (quit, stop, exit, detach, attach, init)
+        are blocked for safety.
+
+        Args:
+            command: x64dbg command string (e.g. "dis.prev(rip, 5)", "findall 0, E8")
+
+        Returns:
+            Command execution result
+
+        Use Cases:
+            - Run analysis commands not covered by other tools
+            - Execute script commands
+            - Access advanced x64dbg features
+
+        Examples:
+            x64dbg_execute_command("dis.prev(rip, 5)")
+            x64dbg_execute_command("findall 0, E8")
+            x64dbg_execute_command("log \\"hello\\"")
+        """
+        try:
+            if not command or not command.strip():
+                return "Error: Command cannot be empty"
+
+            # Security: block dangerous commands by checking the first word
+            first_word = command.strip().split()[0].lower()
+            if first_word in blocked_commands:
+                return (
+                    f"Error: Command '{first_word}' is blocked for safety. "
+                    f"Blocked commands: {', '.join(sorted(blocked_commands))}"
+                )
+
+            bridge = get_x64dbg_bridge()
+            result = bridge.execute_command(command.strip())
+
+            lines = [
+                f"Command executed: {command.strip()}",
+                f"Success: {result.get('success', 'unknown')}",
+            ]
+            if result.get("message"):
+                lines.append(f"Result: {result['message']}")
+            if result.get("result"):
+                lines.append(f"Output: {result['result']}")
+
+            return "\n".join(lines)
+
+        except Exception as e:
+            logger.error(f"x64dbg_execute_command failed: {e}")
             return f"Error: {e}"
 
     @app.tool()
@@ -4595,6 +5750,33 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
         try:
             bridge = get_x64dbg_bridge()
 
+            # Pre-check: verify target module is loaded before attempting resolution
+            target_module = None
+            if module:
+                target_module = module
+            elif "!" in function_name:
+                target_module = function_name.split("!", 1)[0]
+
+            if target_module:
+                loaded_modules = bridge.get_modules()
+                loaded_names = set()
+                for mod in loaded_modules:
+                    name = mod.get("name", "").lower()
+                    loaded_names.add(name)
+                    # Also add without extension for flexible matching
+                    if "." in name:
+                        loaded_names.add(name.rsplit(".", 1)[0])
+
+                if target_module.lower() not in loaded_names:
+                    return (
+                        f"Module '{target_module}' is not currently loaded. "
+                        f"The module must be loaded before symbols can be resolved.\n\n"
+                        f"Suggestions:\n"
+                        f"  - Run to entry point first to let DLLs load\n"
+                        f"  - Use x64dbg_set_breakpoint('address') with a direct address instead\n"
+                        f"  - Use x64dbg_get_modules() to see currently loaded modules"
+                    )
+
             # Build full expression
             if "!" in function_name:
                 expression = function_name
@@ -4731,7 +5913,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             if disasm:
                 for instr in disasm[:5]:
                     addr = instr.get("address", "")
-                    mnemonic = instr.get("instruction", "")
+                    mnemonic = instr.get("mnemonic", "")
                     output.append(f"  {addr}: {mnemonic}")
             else:
                 output.append("  (Could not disassemble)")
@@ -4806,7 +5988,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                     output.append("Verification (first 3 instructions):")
                     for instr in disasm[:3]:
                         addr = instr.get("address", "")
-                        mnemonic = instr.get("instruction", "")
+                        mnemonic = instr.get("mnemonic", "")
                         output.append(f"  {addr}: {mnemonic}")
                 else:
                     output.append("Warning: Could not disassemble at runtime address")
@@ -5366,7 +6548,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             bridge = get_x64dbg_bridge()
 
             # Get current debug info
-            status = bridge.get_status()
+            status = bridge.get_current_location()
             modules = bridge.get_modules()
 
             binary_name = "unknown"
@@ -5968,7 +7150,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 output.append("Disassembly:")
                 for instr in disasm[:5]:
                     addr = instr.get("address", "")
-                    mnemonic = instr.get("instruction", "")
+                    mnemonic = instr.get("mnemonic", "")
                     output.append(f"  {addr}: {mnemonic}")
                 output.append("")
 
@@ -6704,4 +7886,1347 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_delete_memory_watch failed: {e}")
             return f"Error: {e}"
 
-    logger.info("Registered 88 dynamic analysis tools")
+    # ── Watch expression tools ───────────────────────────────────────
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_add_watch(expression: str, name: str = "") -> str:
+        """
+        Add a watch expression to the x64dbg watch view.
+
+        Watches evaluate expressions each time the debugger pauses,
+        useful for monitoring registers, memory, or computed values.
+
+        Args:
+            expression: Expression to watch (e.g. "eax", "[esp+4]", "eax+ebx*2")
+            name: Optional display name for the watch entry
+
+        Returns:
+            Confirmation message
+
+        Examples:
+            x64dbg_add_watch("eax")
+            x64dbg_add_watch("[esp+4]", name="stack_arg1")
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            bridge.add_watch(expression, name=name)
+            msg = f"Watch added: {expression}"
+            if name:
+                msg += f" (name={name})"
+            return msg
+
+        except StructuredBaseError as e:
+            logger.error(f"x64dbg_add_watch failed: {e.structured_error.error.value}")
+            return format_error_response(e, "add_watch")
+        except Exception as e:
+            logger.error(f"x64dbg_add_watch failed: {e}")
+            return format_error_response(e, "add_watch")
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_delete_watch(index: int) -> str:
+        """
+        Delete a watch expression by index.
+
+        Args:
+            index: Zero-based index of the watch entry to delete
+
+        Returns:
+            Confirmation message
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            bridge.delete_watch(index)
+            return f"Watch deleted at index {index}"
+
+        except StructuredBaseError as e:
+            logger.error(f"x64dbg_delete_watch failed: {e.structured_error.error.value}")
+            return format_error_response(e, "delete_watch")
+        except Exception as e:
+            logger.error(f"x64dbg_delete_watch failed: {e}")
+            return format_error_response(e, "delete_watch")
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_set_watchdog(index: int, mode: str = "changed") -> str:
+        """
+        Set watchdog trigger mode on a watch expression.
+
+        The watchdog monitors a watch entry and triggers when the
+        specified condition is met.
+
+        Args:
+            index: Zero-based watch index
+            mode: Trigger mode. One of:
+                  "changed" — value changed (default)
+                  "disabled" — watchdog off
+                  "unchanged" — value unchanged
+                  "istrue" — value is non-zero
+                  "isfalse" — value is zero
+                  "isgreater" — value increased
+                  "isless" — value decreased
+                  "isnotequal" — value differs from initial
+
+        Returns:
+            Confirmation message
+
+        Examples:
+            x64dbg_set_watchdog(0, "changed")
+            x64dbg_set_watchdog(1, "istrue")
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            bridge.set_watchdog(index, mode=mode)
+            return f"Watchdog set on index {index}: mode={mode}"
+
+        except StructuredBaseError as e:
+            logger.error(f"x64dbg_set_watchdog failed: {e.structured_error.error.value}")
+            return format_error_response(e, "set_watchdog")
+        except Exception as e:
+            logger.error(f"x64dbg_set_watchdog failed: {e}")
+            return format_error_response(e, "set_watchdog")
+
+    # ── DLL breakpoint tools ─────────────────────────────────────────
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_set_dll_breakpoint(
+        dll_name: str, singleshoot: bool = False
+    ) -> str:
+        """
+        Set a breakpoint that triggers when a DLL is loaded.
+
+        Useful for intercepting DLL loading during malware analysis
+        or for breaking when specific libraries are mapped.
+
+        Args:
+            dll_name: DLL name (e.g. "kernel32.dll", "ws2_32.dll")
+            singleshoot: If True, breakpoint fires only once then auto-deletes
+
+        Returns:
+            Confirmation message
+
+        Examples:
+            x64dbg_set_dll_breakpoint("ws2_32.dll")
+            x64dbg_set_dll_breakpoint("advapi32.dll", singleshoot=True)
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            bridge.set_dll_breakpoint(dll_name, singleshoot=singleshoot)
+            msg = f"DLL breakpoint set on '{dll_name}'"
+            if singleshoot:
+                msg += " (singleshoot)"
+            return msg
+
+        except StructuredBaseError as e:
+            logger.error(f"x64dbg_set_dll_breakpoint failed: {e.structured_error.error.value}")
+            return format_error_response(e, "set_dll_breakpoint")
+        except Exception as e:
+            logger.error(f"x64dbg_set_dll_breakpoint failed: {e}")
+            return format_error_response(e, "set_dll_breakpoint")
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_delete_dll_breakpoint(dll_name: str) -> str:
+        """
+        Delete a DLL load breakpoint.
+
+        Args:
+            dll_name: DLL name to remove breakpoint from
+
+        Returns:
+            Confirmation message
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            bridge.delete_dll_breakpoint(dll_name)
+            return f"DLL breakpoint deleted for '{dll_name}'"
+
+        except StructuredBaseError as e:
+            logger.error(f"x64dbg_delete_dll_breakpoint failed: {e.structured_error.error.value}")
+            return format_error_response(e, "delete_dll_breakpoint")
+        except Exception as e:
+            logger.error(f"x64dbg_delete_dll_breakpoint failed: {e}")
+            return format_error_response(e, "delete_dll_breakpoint")
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_enable_dll_breakpoint(dll_name: str) -> str:
+        """
+        Enable a previously disabled DLL load breakpoint.
+
+        Args:
+            dll_name: DLL name to enable breakpoint for
+
+        Returns:
+            Confirmation message
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            bridge.enable_dll_breakpoint(dll_name)
+            return f"DLL breakpoint enabled for '{dll_name}'"
+
+        except StructuredBaseError as e:
+            logger.error(f"x64dbg_enable_dll_breakpoint failed: {e.structured_error.error.value}")
+            return format_error_response(e, "enable_dll_breakpoint")
+        except Exception as e:
+            logger.error(f"x64dbg_enable_dll_breakpoint failed: {e}")
+            return format_error_response(e, "enable_dll_breakpoint")
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_disable_dll_breakpoint(dll_name: str) -> str:
+        """
+        Disable a DLL load breakpoint without deleting it.
+
+        Args:
+            dll_name: DLL name to disable breakpoint for
+
+        Returns:
+            Confirmation message
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            bridge.disable_dll_breakpoint(dll_name)
+            return f"DLL breakpoint disabled for '{dll_name}'"
+
+        except StructuredBaseError as e:
+            logger.error(f"x64dbg_disable_dll_breakpoint failed: {e.structured_error.error.value}")
+            return format_error_response(e, "disable_dll_breakpoint")
+        except Exception as e:
+            logger.error(f"x64dbg_disable_dll_breakpoint failed: {e}")
+            return format_error_response(e, "disable_dll_breakpoint")
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_analyze_control_flow() -> str:
+        """
+        Runs control flow analysis on the current module.
+
+        Builds the control flow graph (CFG) for the current module using
+        the x64dbg cfanalyze command. This identifies basic blocks,
+        branches, and function boundaries.
+
+        Returns:
+            Analysis execution result
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            result = bridge.analyze_control_flow()
+
+            lines = [
+                "Control flow analysis executed",
+                f"Success: {result.get('success', 'unknown')}",
+            ]
+            if result.get("result"):
+                lines.append(f"Output: {result['result']}")
+
+            return "\n".join(lines)
+
+        except Exception as e:
+            logger.error(f"x64dbg_analyze_control_flow failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_analyze_xrefs() -> str:
+        """
+        Runs cross-reference analysis.
+
+        Finds cross-references (xrefs) in the current module using
+        the x64dbg analxrefs command. This identifies where functions
+        and data are referenced from.
+
+        Returns:
+            Analysis execution result
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            result = bridge.analyze_cross_references()
+
+            lines = [
+                "Cross-reference analysis executed",
+                f"Success: {result.get('success', 'unknown')}",
+            ]
+            if result.get("result"):
+                lines.append(f"Output: {result['result']}")
+
+            return "\n".join(lines)
+
+        except Exception as e:
+            logger.error(f"x64dbg_analyze_xrefs failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_analyze_recursive() -> str:
+        """
+        Runs recursive function analysis.
+
+        Performs recursive analysis starting from the current location
+        using the x64dbg analrecur command. This discovers functions
+        by following call chains.
+
+        Returns:
+            Analysis execution result
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            result = bridge.analyze_recursive()
+
+            lines = [
+                "Recursive analysis executed",
+                f"Success: {result.get('success', 'unknown')}",
+            ]
+            if result.get("result"):
+                lines.append(f"Output: {result['result']}")
+
+            return "\n".join(lines)
+
+        except Exception as e:
+            logger.error(f"x64dbg_analyze_recursive failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_get_exception_handlers() -> str:
+        """
+        Shows SEH exception handler chain.
+
+        Retrieves the structured exception handler (SEH) chain for
+        the current thread using the x64dbg exhandlers command.
+
+        Returns:
+            Exception handler chain information
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            result = bridge.get_exception_handlers()
+
+            lines = [
+                "Exception handlers retrieved",
+                f"Success: {result.get('success', 'unknown')}",
+            ]
+            if result.get("result"):
+                lines.append(f"Handlers:\n{result['result']}")
+
+            return "\n".join(lines)
+
+        except Exception as e:
+            logger.error(f"x64dbg_get_exception_handlers failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_get_exception_info() -> str:
+        """
+        Shows current exception details.
+
+        Retrieves details about the current exception (code, address,
+        flags) using the x64dbg exinfo command.
+
+        Returns:
+            Current exception information
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            result = bridge.get_exception_info()
+
+            lines = [
+                "Exception info retrieved",
+                f"Success: {result.get('success', 'unknown')}",
+            ]
+            if result.get("result"):
+                lines.append(f"Details:\n{result['result']}")
+
+            return "\n".join(lines)
+
+        except Exception as e:
+            logger.error(f"x64dbg_get_exception_info failed: {e}")
+            return f"Error: {e}"
+
+    # ── Variable management tools ─────────────────────────────────────
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_set_variable(name: str, value: str) -> str:
+        """
+        Set a debugger variable.
+
+        Create or update a named variable in x64dbg's variable system.
+
+        Args:
+            name: Variable name (letters, digits, underscores; must start with letter/underscore)
+            value: Value to assign (numeric or expression)
+
+        Returns:
+            Confirmation message
+
+        Example:
+            x64dbg_set_variable("my_addr", "0x401000")
+            x64dbg_set_variable("counter", "5")
+
+        Use Cases:
+            - Store addresses for later reference
+            - Create counters for conditional breakpoints
+            - Save intermediate analysis values
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            result = bridge.set_variable(name, value)
+
+            lines = [f"Variable set: {name} = {value}"]
+            if result.get("result"):
+                lines.append(f"Result: {result['result']}")
+            return "\n".join(lines)
+
+        except ValueError as e:
+            return f"Error: {e}"
+        except Exception as e:
+            logger.error(f"x64dbg_set_variable failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_delete_variable(name: str) -> str:
+        """
+        Delete a debugger variable.
+
+        Remove a named variable from x64dbg's variable system.
+
+        Args:
+            name: Variable name to delete
+
+        Returns:
+            Confirmation message
+
+        Example:
+            x64dbg_delete_variable("my_addr")
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            result = bridge.delete_variable(name)
+
+            lines = [f"Variable deleted: {name}"]
+            if result.get("result"):
+                lines.append(f"Result: {result['result']}")
+            return "\n".join(lines)
+
+        except ValueError as e:
+            return f"Error: {e}"
+        except Exception as e:
+            logger.error(f"x64dbg_delete_variable failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_list_variables() -> str:
+        """
+        List all debugger variables.
+
+        Show all variables currently defined in x64dbg's variable system.
+
+        Returns:
+            Variable listing
+
+        Use Cases:
+            - Review stored analysis values
+            - Check variable state during debugging
+            - Verify variable assignments
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            result = bridge.list_variables()
+
+            lines = ["Variables:"]
+            if result.get("result"):
+                lines.append(result["result"])
+            elif result.get("message"):
+                lines.append(result["message"])
+            else:
+                lines.append("(no variables or empty result)")
+
+            return "\n".join(lines)
+
+        except Exception as e:
+            logger.error(f"x64dbg_list_variables failed: {e}")
+            return f"Error: {e}"
+
+    # ── GUI navigation tools ───────────────────────────────────────────
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_navigate_disasm(address: str) -> str:
+        """
+        Navigate disassembly view to address.
+
+        Move the disassembly window to show code at the specified address.
+
+        Args:
+            address: Target address (hex, e.g., "0x401000")
+
+        Returns:
+            Confirmation message
+
+        Example:
+            x64dbg_navigate_disasm("0x401000")
+            x64dbg_navigate_disasm("0x7FF600000000")
+
+        Use Cases:
+            - Jump to a function entry point
+            - Navigate to a suspicious code location
+            - Follow cross-references
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            bridge.navigate_disasm(address)
+            return f"Disassembly navigated to {address}"
+
+        except Exception as e:
+            logger.error(f"x64dbg_navigate_disasm failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_navigate_dump(address: str) -> str:
+        """
+        Navigate dump view to address.
+
+        Move the hex dump window to show memory at the specified address.
+
+        Args:
+            address: Target address (hex, e.g., "0x401000")
+
+        Returns:
+            Confirmation message
+
+        Example:
+            x64dbg_navigate_dump("0x401000")
+
+        Use Cases:
+            - Inspect data at a specific address
+            - View string or buffer contents
+            - Examine memory structures
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            bridge.navigate_dump(address)
+            return f"Dump navigated to {address}"
+
+        except Exception as e:
+            logger.error(f"x64dbg_navigate_dump failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_show_graph(address: str = "") -> str:
+        """
+        Show function graph.
+
+        Display the control flow graph for the function at the specified address,
+        or the current function if no address is provided.
+
+        Args:
+            address: Target address (hex), empty for current function
+
+        Returns:
+            Confirmation message
+
+        Example:
+            x64dbg_show_graph("0x401000")
+            x64dbg_show_graph()
+
+        Use Cases:
+            - Visualize function control flow
+            - Understand branching logic
+            - Analyze complex functions
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            bridge.show_graph(address)
+
+            if address and address.strip():
+                return f"Graph shown at {address}"
+            return "Graph shown at current location"
+
+        except Exception as e:
+            logger.error(f"x64dbg_show_graph failed: {e}")
+            return f"Error: {e}"
+
+    # ── Privilege management tools ─────────────────────────────────────
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_enable_privilege(name: str) -> str:
+        """
+        Enable a process privilege.
+
+        Enable a Windows privilege for the debugged process.
+
+        Args:
+            name: Privilege name (e.g., "SeDebugPrivilege", "SeShutdownPrivilege")
+
+        Returns:
+            Confirmation message
+
+        Example:
+            x64dbg_enable_privilege("SeDebugPrivilege")
+            x64dbg_enable_privilege("SeShutdownPrivilege")
+
+        Use Cases:
+            - Grant debug privileges for process manipulation
+            - Enable privileges needed by analyzed malware
+            - Escalate process capabilities for testing
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            bridge.enable_privilege(name)
+            return f"Privilege enabled: {name}"
+
+        except ValueError as e:
+            return f"Error: {e}"
+        except Exception as e:
+            logger.error(f"x64dbg_enable_privilege failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_disable_privilege(name: str) -> str:
+        """
+        Disable a process privilege.
+
+        Disable a Windows privilege for the debugged process.
+
+        Args:
+            name: Privilege name (e.g., "SeDebugPrivilege", "SeShutdownPrivilege")
+
+        Returns:
+            Confirmation message
+
+        Example:
+            x64dbg_disable_privilege("SeDebugPrivilege")
+
+        Use Cases:
+            - Restrict process capabilities
+            - Test behavior without specific privileges
+            - Harden process security posture
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            bridge.disable_privilege(name)
+            return f"Privilege disabled: {name}"
+
+        except ValueError as e:
+            return f"Error: {e}"
+        except Exception as e:
+            logger.error(f"x64dbg_disable_privilege failed: {e}")
+            return f"Error: {e}"
+
+    # ── Type System Tools ──────────────────────────────────────────────
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_add_struct(name: str) -> str:
+        """
+        Define a new struct type in x64dbg's type system.
+
+        Creates an empty struct that can have members added via x64dbg_add_member.
+
+        Args:
+            name: Struct name (valid C identifier, e.g. "IMAGE_DOS_HEADER")
+
+        Returns:
+            Confirmation or error message
+
+        Example:
+            x64dbg_add_struct("MY_STRUCT")
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            result = bridge.add_struct(name)
+            success = result.get("success", False)
+            if success:
+                return f"Struct '{name}' created successfully."
+            return f"Failed to create struct '{name}': {result.get('message', 'unknown error')}"
+        except ValueError as e:
+            return f"Error: {e}"
+        except Exception as e:
+            logger.error(f"x64dbg_add_struct failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_add_union(name: str) -> str:
+        """
+        Define a new union type in x64dbg's type system.
+
+        Creates an empty union that can have members added via x64dbg_add_member.
+        Union members share the same memory offset (overlapping layout).
+
+        Args:
+            name: Union name (valid C identifier, e.g. "MY_UNION")
+
+        Returns:
+            Confirmation or error message
+
+        Example:
+            x64dbg_add_union("VALUE_UNION")
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            result = bridge.add_union(name)
+            success = result.get("success", False)
+            if success:
+                return f"Union '{name}' created successfully."
+            return f"Failed to create union '{name}': {result.get('message', 'unknown error')}"
+        except ValueError as e:
+            return f"Error: {e}"
+        except Exception as e:
+            logger.error(f"x64dbg_add_union failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_add_member(parent: str, type_name: str, member_name: str) -> str:
+        """
+        Add a member field to an existing struct or union.
+
+        Args:
+            parent: Parent struct/union name (e.g. "MY_STRUCT")
+            type_name: Type of the member (e.g. "DWORD", "BYTE", "PVOID", "WORD")
+            member_name: Name of the member field (e.g. "dwSize", "lpBuffer")
+
+        Returns:
+            Confirmation or error message
+
+        Example:
+            x64dbg_add_member("MY_STRUCT", "DWORD", "dwSize")
+            x64dbg_add_member("MY_STRUCT", "PVOID", "lpBuffer")
+
+        Use Cases:
+            - Building struct definitions for Windows API structures
+            - Defining custom data structures found in malware
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            result = bridge.add_member(parent, type_name, member_name)
+            success = result.get("success", False)
+            if success:
+                return f"Member '{member_name}' ({type_name}) added to '{parent}'."
+            return f"Failed to add member: {result.get('message', 'unknown error')}"
+        except ValueError as e:
+            return f"Error: {e}"
+        except Exception as e:
+            logger.error(f"x64dbg_add_member failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_view_type(type_name: str, address: str) -> str:
+        """
+        Overlay a struct/type on a memory address for structured viewing.
+
+        This is the key type system tool — it interprets raw memory at the
+        given address as the specified struct type, showing field names and values.
+
+        Args:
+            type_name: Name of the type to overlay (e.g. "IMAGE_DOS_HEADER")
+            address: Memory address to interpret (hex, e.g. "0x00400000")
+
+        Returns:
+            Structured memory interpretation showing field values
+
+        Example:
+            x64dbg_view_type("IMAGE_DOS_HEADER", "0x00400000")
+            x64dbg_view_type("MY_STRUCT", "0x7FFE0000")
+
+        Use Cases:
+            - Viewing PE headers as structured data
+            - Inspecting Windows API structures in memory
+            - Examining custom data structures at known addresses
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            result = bridge.visit_type(type_name, address)
+            success = result.get("success", False)
+            lines = [f"Type: {type_name}", f"Address: {address}"]
+            if success:
+                if result.get("result"):
+                    lines.append(f"Result:\n{result['result']}")
+                if result.get("message"):
+                    lines.append(result["message"])
+            else:
+                lines.append(f"Error: {result.get('message', 'unknown error')}")
+            return "\n".join(lines)
+        except (ValueError, StructuredBaseError) as e:
+            return f"Error: {e}"
+        except Exception as e:
+            logger.error(f"x64dbg_view_type failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_sizeof_type(type_name: str) -> str:
+        """
+        Get the size of a type in bytes.
+
+        Args:
+            type_name: Name of the type (e.g. "IMAGE_DOS_HEADER", "DWORD")
+
+        Returns:
+            Size information for the type
+
+        Example:
+            x64dbg_sizeof_type("IMAGE_DOS_HEADER")
+            x64dbg_sizeof_type("DWORD")
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            result = bridge.sizeof_type(type_name)
+            success = result.get("success", False)
+            if success:
+                msg = result.get("result", result.get("message", ""))
+                return f"sizeof({type_name}) = {msg}"
+            return f"Failed to get size of '{type_name}': {result.get('message', 'unknown error')}"
+        except ValueError as e:
+            return f"Error: {e}"
+        except Exception as e:
+            logger.error(f"x64dbg_sizeof_type failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_remove_type(type_name: str) -> str:
+        """
+        Remove a type definition from x64dbg's type system.
+
+        Args:
+            type_name: Name of the type to remove
+
+        Returns:
+            Confirmation or error message
+
+        Example:
+            x64dbg_remove_type("MY_STRUCT")
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            result = bridge.remove_type(type_name)
+            success = result.get("success", False)
+            if success:
+                return f"Type '{type_name}' removed."
+            return f"Failed to remove type '{type_name}': {result.get('message', 'unknown error')}"
+        except ValueError as e:
+            return f"Error: {e}"
+        except Exception as e:
+            logger.error(f"x64dbg_remove_type failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_list_types() -> str:
+        """
+        List all defined types in x64dbg's type system.
+
+        Returns:
+            Listing of all registered types
+
+        Example:
+            x64dbg_list_types()
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            result = bridge.enum_types()
+            success = result.get("success", False)
+            lines = ["Defined Types:"]
+            if success:
+                if result.get("result"):
+                    lines.append(result["result"])
+                elif result.get("message"):
+                    lines.append(result["message"])
+                else:
+                    lines.append("(no types defined)")
+            else:
+                lines.append(f"Error: {result.get('message', 'unknown error')}")
+            return "\n".join(lines)
+        except Exception as e:
+            logger.error(f"x64dbg_list_types failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_clear_types() -> str:
+        """
+        Clear all user-defined types from x64dbg's type system.
+
+        This removes all custom structs, unions, and typedefs.
+        Built-in types are not affected.
+
+        Returns:
+            Confirmation or error message
+
+        Example:
+            x64dbg_clear_types()
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            result = bridge.clear_types()
+            success = result.get("success", False)
+            if success:
+                return "All user-defined types cleared."
+            return f"Failed to clear types: {result.get('message', 'unknown error')}"
+        except Exception as e:
+            logger.error(f"x64dbg_clear_types failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_load_types(filename: str) -> str:
+        """
+        Load type definitions from a JSON or C header file.
+
+        The file must be within the allowed output directory for security.
+
+        Args:
+            filename: Path to the types file (JSON or .h)
+
+        Returns:
+            Confirmation or error message
+
+        Example:
+            x64dbg_load_types("ntapi.h")
+            x64dbg_load_types("types.json")
+
+        Use Cases:
+            - Loading Windows SDK type definitions
+            - Importing custom type databases for malware analysis
+        """
+        try:
+            if not filename or not filename.strip():
+                return "Error: Filename cannot be empty"
+
+            # Security: validate path is within allowed directory
+            safe_path = sanitize_output_path(Path(filename.strip()), DUMP_OUTPUT_DIR)
+            resolved_path = str(safe_path)
+
+            bridge = get_x64dbg_bridge()
+            result = bridge.load_types(resolved_path)
+            success = result.get("success", False)
+            if success:
+                return f"Types loaded from: {resolved_path}"
+            return f"Failed to load types: {result.get('message', 'unknown error')}"
+        except PathTraversalError as e:
+            return f"Error: Invalid file path - {e}"
+        except ValueError as e:
+            return f"Error: {e}"
+        except Exception as e:
+            logger.error(f"x64dbg_load_types failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_parse_types(definition: str) -> str:
+        """
+        Parse C header text to define types inline.
+
+        Accepts C-style type definitions and registers them in
+        x64dbg's type system without needing a file.
+
+        Args:
+            definition: C header text with type definitions
+
+        Returns:
+            Confirmation or error message
+
+        Example:
+            x64dbg_parse_types("typedef struct { DWORD cb; LPSTR lpReserved; } STARTUPINFOA;")
+            x64dbg_parse_types("struct MyData { int x; int y; char name[32]; };")
+
+        Use Cases:
+            - Quickly defining structures from documentation
+            - Parsing struct definitions found in decompiled code
+        """
+        try:
+            if not definition or not definition.strip():
+                return "Error: Type definition text cannot be empty"
+
+            bridge = get_x64dbg_bridge()
+            result = bridge.parse_types(definition.strip())
+            success = result.get("success", False)
+            if success:
+                return "Types parsed successfully."
+            return f"Failed to parse types: {result.get('message', 'unknown error')}"
+        except ValueError as e:
+            return f"Error: {e}"
+        except Exception as e:
+            logger.error(f"x64dbg_parse_types failed: {e}")
+            return f"Error: {e}"
+
+    # ── Conditional Tracing Tools ───────────────────────────────────
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_trace_into_conditional(
+        condition: str,
+        max_steps: int = 50000,
+        log_text: str = "",
+        log_condition: str = "",
+        command_text: str = "",
+        command_condition: str = "",
+        log_file: str = "",
+    ) -> str:
+        """
+        Trace into (following calls) until a condition is met.
+
+        This is the most powerful x64dbg automation feature. It single-steps
+        into calls, evaluating an expression at each step, and stops when the
+        condition becomes true. Optionally logs register/memory state per step.
+
+        Args:
+            condition: Break condition expression (e.g. "rax==1", "rip>=0x500000")
+            max_steps: Maximum trace steps before aborting (default: 50000)
+            log_text: Format string logged per step (e.g. "RIP={rip} RAX={rax}")
+            log_condition: Only log when this condition is true
+            command_text: x64dbg command to run per step
+            command_condition: Only run command when this condition is true
+            log_file: File path to write trace log (relative paths resolve under dump dir)
+
+        Returns:
+            Trace result with address where stopped
+
+        Examples:
+            x64dbg_trace_into_conditional("rax==1")
+            x64dbg_trace_into_conditional("rip>=0x500000", log_text="RIP={rip}")
+            x64dbg_trace_into_conditional("eax!=0", max_steps=100000, log_file="trace.log")
+
+        Use Cases:
+            - Find where a register gets a specific value
+            - Trace until execution reaches a module/address range
+            - Log execution path with register values at each step
+            - Trace through unpacking stubs
+        """
+        try:
+            if not condition or not condition.strip():
+                return "Error: Condition cannot be empty"
+
+            resolved_log_file = ""
+            if log_file:
+                try:
+                    DUMP_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+                    log_path = Path(log_file)
+                    if not log_path.is_absolute():
+                        log_path = DUMP_OUTPUT_DIR / log_path
+                    safe_path = sanitize_output_path(log_path, DUMP_OUTPUT_DIR)
+                    resolved_log_file = str(safe_path)
+                except PathTraversalError as e:
+                    return f"Error: Invalid log file path - {e}"
+                except ValueError as e:
+                    return f"Error: Invalid path - {e}"
+
+            bridge = get_x64dbg_bridge()
+            result = bridge.trace_into_conditional(
+                condition=condition,
+                max_steps=max_steps,
+                log_text=log_text,
+                log_condition=log_condition,
+                command_text=command_text,
+                command_condition=command_condition,
+                log_file=resolved_log_file,
+            )
+
+            if result.get("success"):
+                lines = [
+                    "Trace into completed (condition met)",
+                    f"Condition: {result.get('condition', condition)}",
+                    f"Stopped at: {result.get('current_address', 'unknown')}",
+                    f"Elapsed: {result.get('elapsed_ms', 0)}ms",
+                ]
+                if resolved_log_file:
+                    lines.append(f"Log file: {resolved_log_file}")
+                lines.append("\nUse x64dbg_get_registers() to inspect state.")
+                return "\n".join(lines)
+            else:
+                return (
+                    f"Trace into did not complete (timeout or max steps reached)\n"
+                    f"Condition: {condition}\n"
+                    f"Max steps: {max_steps}\n"
+                    f"Elapsed: {result.get('elapsed_ms', 0)}ms\n\n"
+                    f"Try increasing max_steps or use x64dbg_pause() to stop."
+                )
+
+        except ValueError as e:
+            return f"Error: {e}"
+        except Exception as e:
+            logger.error(f"x64dbg_trace_into_conditional failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_trace_over_conditional(
+        condition: str,
+        max_steps: int = 50000,
+        log_text: str = "",
+        log_condition: str = "",
+        command_text: str = "",
+        command_condition: str = "",
+        log_file: str = "",
+    ) -> str:
+        """
+        Trace over (skipping calls) until a condition is met.
+
+        Like trace_into_conditional but steps OVER function calls instead of
+        following them. Faster for high-level tracing when you don't need to
+        enter subroutines.
+
+        Args:
+            condition: Break condition expression (e.g. "rax==1", "rip>=0x500000")
+            max_steps: Maximum trace steps before aborting (default: 50000)
+            log_text: Format string logged per step (e.g. "RIP={rip} RAX={rax}")
+            log_condition: Only log when this condition is true
+            command_text: x64dbg command to run per step
+            command_condition: Only run command when this condition is true
+            log_file: File path to write trace log (relative paths resolve under dump dir)
+
+        Returns:
+            Trace result with address where stopped
+
+        Examples:
+            x64dbg_trace_over_conditional("rax==1")
+            x64dbg_trace_over_conditional("eip<module.base", max_steps=100000)
+
+        Use Cases:
+            - High-level tracing without entering library calls
+            - Find where a value changes in the main module
+            - Faster alternative to trace_into when call depth is irrelevant
+        """
+        try:
+            if not condition or not condition.strip():
+                return "Error: Condition cannot be empty"
+
+            resolved_log_file = ""
+            if log_file:
+                try:
+                    DUMP_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+                    log_path = Path(log_file)
+                    if not log_path.is_absolute():
+                        log_path = DUMP_OUTPUT_DIR / log_path
+                    safe_path = sanitize_output_path(log_path, DUMP_OUTPUT_DIR)
+                    resolved_log_file = str(safe_path)
+                except PathTraversalError as e:
+                    return f"Error: Invalid log file path - {e}"
+                except ValueError as e:
+                    return f"Error: Invalid path - {e}"
+
+            bridge = get_x64dbg_bridge()
+            result = bridge.trace_over_conditional(
+                condition=condition,
+                max_steps=max_steps,
+                log_text=log_text,
+                log_condition=log_condition,
+                command_text=command_text,
+                command_condition=command_condition,
+                log_file=resolved_log_file,
+            )
+
+            if result.get("success"):
+                lines = [
+                    "Trace over completed (condition met)",
+                    f"Condition: {result.get('condition', condition)}",
+                    f"Stopped at: {result.get('current_address', 'unknown')}",
+                    f"Elapsed: {result.get('elapsed_ms', 0)}ms",
+                ]
+                if resolved_log_file:
+                    lines.append(f"Log file: {resolved_log_file}")
+                lines.append("\nUse x64dbg_get_registers() to inspect state.")
+                return "\n".join(lines)
+            else:
+                return (
+                    f"Trace over did not complete (timeout or max steps reached)\n"
+                    f"Condition: {condition}\n"
+                    f"Max steps: {max_steps}\n"
+                    f"Elapsed: {result.get('elapsed_ms', 0)}ms\n\n"
+                    f"Try increasing max_steps or use x64dbg_pause() to stop."
+                )
+
+        except ValueError as e:
+            return f"Error: {e}"
+        except Exception as e:
+            logger.error(f"x64dbg_trace_over_conditional failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_trace_to_oep(max_steps: int = 50000) -> str:
+        """
+        Trace execution to find the Original Entry Point (OEP) of a packed binary.
+
+        Uses x64dbg's trace-into-beyond-record (tibt) which tracks all executed
+        addresses and stops when execution reaches a never-before-seen address
+        region — typically the OEP after unpacking completes.
+
+        Args:
+            max_steps: Maximum trace steps (default: 50000, increase for complex packers)
+
+        Returns:
+            Likely OEP address where execution landed
+
+        Examples:
+            x64dbg_trace_to_oep()
+            x64dbg_trace_to_oep(max_steps=200000)
+
+        Use Cases:
+            - Unpack UPX, Themida, VMProtect, and other packers
+            - Find the real entry point of packed malware
+            - Automated unpacking workflows
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            result = bridge.trace_into_beyond_record(max_steps=max_steps)
+
+            if result.get("success"):
+                return (
+                    f"Trace to OEP completed\n"
+                    f"Likely OEP: {result.get('current_address', 'unknown')}\n"
+                    f"Elapsed: {result.get('elapsed_ms', 0)}ms\n\n"
+                    f"Use x64dbg_dump_module() to dump the unpacked binary.\n"
+                    f"Use x64dbg_get_registers() to verify execution context."
+                )
+            else:
+                return (
+                    f"Trace to OEP did not complete (max steps reached)\n"
+                    f"Max steps: {max_steps}\n"
+                    f"Elapsed: {result.get('elapsed_ms', 0)}ms\n\n"
+                    f"Try increasing max_steps for complex packers."
+                )
+
+        except Exception as e:
+            logger.error(f"x64dbg_trace_to_oep failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_set_trace_log(text: str, condition: str = "") -> str:
+        """
+        Configure what gets logged at each trace step.
+
+        Sets the log format string for subsequent trace operations
+        (trace_into_conditional, trace_over_conditional).
+
+        Args:
+            text: Log format string with x64dbg specifiers
+            condition: Optional condition — only log when this expression is true
+
+        Returns:
+            Confirmation message
+
+        Examples:
+            x64dbg_set_trace_log("RIP={rip} RAX={rax}")
+            x64dbg_set_trace_log("{rip}: {dis.sel()}", "rax!=0")
+            x64dbg_set_trace_log("ESP={esp} [ESP]={[esp]}")
+
+        Format Specifiers:
+            {rax}, {rbx}, etc. — register values
+            {[esp]}, {[rax+8]} — memory dereference
+            {dis.sel()} — disassembly at current address
+            {mem;addr;size} — memory dump
+        """
+        try:
+            if not text or not text.strip():
+                return "Error: Log text cannot be empty"
+
+            bridge = get_x64dbg_bridge()
+            bridge.set_trace_log(text, condition)
+
+            msg = f"Trace log configured: {text.strip()}"
+            if condition:
+                msg += f"\nCondition: {condition.strip()}"
+            return msg
+
+        except ValueError as e:
+            return f"Error: {e}"
+        except Exception as e:
+            logger.error(f"x64dbg_set_trace_log failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_set_trace_command(command: str, condition: str = "") -> str:
+        """
+        Configure a command to execute at each trace step.
+
+        Sets an x64dbg command that runs at every step during subsequent
+        trace operations.
+
+        Args:
+            command: x64dbg command to execute per step
+            condition: Optional condition — only run when this expression is true
+
+        Returns:
+            Confirmation message
+
+        Examples:
+            x64dbg_set_trace_command("log \\"Step at {rip}\\"")
+            x64dbg_set_trace_command("SetBreakpointCondition rip, \\"rax==0\\"", "rip>=0x500000")
+        """
+        try:
+            if not command or not command.strip():
+                return "Error: Command cannot be empty"
+
+            bridge = get_x64dbg_bridge()
+            bridge.set_trace_command(command, condition)
+
+            msg = f"Trace command configured: {command.strip()}"
+            if condition:
+                msg += f"\nCondition: {condition.strip()}"
+            return msg
+
+        except ValueError as e:
+            return f"Error: {e}"
+        except Exception as e:
+            logger.error(f"x64dbg_set_trace_command failed: {e}")
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_dynamic_tool
+    def x64dbg_set_trace_log_file(path: str) -> str:
+        """
+        Set the output file for trace logging.
+
+        Trace log output from subsequent trace operations will be written
+        to this file. Relative paths resolve under the dump output directory.
+
+        Args:
+            path: File path for trace log output
+
+        Returns:
+            Confirmation message
+
+        Examples:
+            x64dbg_set_trace_log_file("trace_output.log")
+            x64dbg_set_trace_log_file("/tmp/malware_trace.log")
+        """
+        try:
+            if not path or not path.strip():
+                return "Error: Path cannot be empty"
+
+            DUMP_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+            log_path = Path(path)
+            if not log_path.is_absolute():
+                log_path = DUMP_OUTPUT_DIR / log_path
+            safe_path = sanitize_output_path(log_path, DUMP_OUTPUT_DIR)
+
+            bridge = get_x64dbg_bridge()
+            bridge.set_trace_log_file(str(safe_path))
+
+            return f"Trace log file set: {safe_path}"
+
+        except PathTraversalError as e:
+            return f"Error: Invalid path - {e}"
+        except ValueError as e:
+            return f"Error: {e}"
+        except Exception as e:
+            logger.error(f"x64dbg_set_trace_log_file failed: {e}")
+            return f"Error: {e}"
+
+    logger.info("Registered 112 dynamic analysis tools")

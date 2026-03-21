@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import tempfile
 import time
 import traceback
@@ -129,12 +130,55 @@ class X64DbgBridge(Debugger):
         self.connected = False
         self._auth_token = None
         self._error_logger = X64DbgErrorLogger()
+        self._arch: str | None = None  # "x86" or "x64", detected on first use
 
         self._max_retries = 3
         self._retry_delay = 0.1  # seconds
+        self._max_reconnects = 2  # max reconnection attempts per request sequence
 
         logger.info(f"Initialized x64dbg bridge: {self.base_url}")
         logger.info(f"Error logging enabled: {self._error_logger.error_dir}")
+
+    def _detect_architecture(self) -> str:
+        """
+        Detect whether the debugged process is 32-bit or 64-bit.
+
+        Checks register names returned by the debugger:
+        - rax/rip present → 64-bit (x64dbg)
+        - eax/eip present → 32-bit (x32dbg)
+
+        Returns:
+            "x64" or "x86". Result is cached after first detection.
+        """
+        if self._arch is not None:
+            return self._arch
+
+        try:
+            registers = self.get_registers()
+            reg_names = set(registers.keys())
+
+            if "eax" in reg_names or "eip" in reg_names:
+                self._arch = "x86"
+                logger.info("Detected 32-bit architecture (x32dbg)")
+            else:
+                self._arch = "x64"
+                logger.info("Detected 64-bit architecture (x64dbg)")
+        except Exception as e:
+            self._arch = "x64"
+            logger.warning(
+                f"Could not detect architecture ({e}), defaulting to x64"
+            )
+
+        return self._arch
+
+    def _get_pointer_size(self) -> int:
+        """
+        Get pointer size in bytes for the current architecture.
+
+        Returns:
+            4 for 32-bit, 8 for 64-bit
+        """
+        return 4 if self._detect_architecture() == "x86" else 8
 
     def _normalize_address(self, address: str | None, param_name: str = "address") -> str:
         """
@@ -222,34 +266,55 @@ class X64DbgBridge(Debugger):
         """
         retries = max_retries if max_retries is not None else self._max_retries
         last_error = None
+        reconnect_count = 0
 
         for attempt in range(retries + 1):
             try:
                 return self._request(endpoint, data)
+            except AddressValidationError:
+                # Address validation failures are deterministic — never retry
+                raise
+            except X64DbgAPIError:
+                # API errors are deterministic — never retry
+                raise
             except (ConnectionError, RuntimeError) as e:
                 last_error = e
                 error_msg = str(e)
 
-                # Don't retry on validation errors (Missing address, etc.)
-                # These are likely parameter issues that won't be fixed by retrying
-                if "Missing" in error_msg and attempt < retries:
-                    # Log and retry - might be a serialization race
+                # Attempt auto-reconnect for connection-level failures
+                is_connection_error = (
+                    isinstance(e, ConnectionError)
+                    or "ConnectionReset" in error_msg
+                    or "ConnectionAborted" in error_msg
+                )
+                if is_connection_error and reconnect_count < self._max_reconnects:
+                    reconnect_count += 1
+                    logger.warning(
+                        f"Connection lost (attempt {attempt + 1}/{retries + 1}): "
+                        f"{error_msg}. Attempting reconnect "
+                        f"({reconnect_count}/{self._max_reconnects})..."
+                    )
+                    # Reset auth token — plugin may have restarted with a new token
+                    self._auth_token = None
+                    self.connected = False
+                    try:
+                        self.connect()
+                        logger.warning("Reconnected to x64dbg successfully")
+                        time.sleep(self._retry_delay)
+                        continue
+                    except Exception as reconnect_error:
+                        logger.warning(f"Reconnect failed: {reconnect_error}")
+                        # Fall through to normal retry/raise logic
+
+                if attempt < retries:
                     logger.warning(
                         f"Request failed (attempt {attempt + 1}/{retries + 1}): {error_msg}. "
-                        f"Retrying with data: {data}"
+                        f"Retrying..."
                     )
                     time.sleep(self._retry_delay * (attempt + 1))
                     continue
-                elif "API error" in error_msg:
-                    # API errors should include context for debugging
-                    raise RuntimeError(
-                        f"{error_msg}\n"
-                        f"Request details:\n"
-                        f"  Endpoint: {endpoint}\n"
-                        f"  Data sent: {data}"
-                    )
-                else:
-                    raise
+
+                raise
 
         # All retries exhausted
         raise RuntimeError(
@@ -484,6 +549,7 @@ class X64DbgBridge(Debugger):
             ConnectionError: If connection fails
         """
         try:
+            self._arch = None  # Reset cached architecture on new connection
             result = self._request("/api/status")
             self.connected = True
             logger.info(f"Connected to x64dbg - state: {result.get('state')}")
@@ -495,7 +561,82 @@ class X64DbgBridge(Debugger):
     def disconnect(self) -> None:
         """Disconnect from x64dbg plugin."""
         self.connected = False
+        self._arch = None  # Reset cached architecture
         logger.info("Disconnected from x64dbg")
+
+    def attach_process(self, pid: int) -> dict[str, Any]:
+        """
+        Attach debugger to a running process.
+
+        Args:
+            pid: Process ID to attach to
+
+        Returns:
+            API response dict with attach result
+
+        Raises:
+            ValueError: If pid is invalid
+            ConnectionError: If attach fails
+        """
+        if not isinstance(pid, int) or pid <= 0:
+            raise ValueError(f"Invalid PID: {pid}. Must be a positive integer.")
+
+        result = self._request_with_retry(
+            "/api/debug/attach",
+            data={"pid": pid},
+        )
+        self.connected = True
+        logger.info(f"Attached to process PID {pid}")
+        return result
+
+    def detach_process(self) -> dict[str, Any]:
+        """
+        Detach from the current process without terminating it.
+
+        Returns:
+            API response dict with detach result
+
+        Raises:
+            ConnectionError: If detach fails
+        """
+        result = self._request_with_retry(
+            "/api/debug/detach",
+            data={},
+        )
+        self.connected = False
+        self._arch = None  # Reset cached architecture
+        logger.info("Detached from process")
+        return result
+
+    def create_minidump(self, output_path: str | None = None) -> dict[str, Any]:
+        """
+        Create a minidump of the debuggee process.
+
+        Args:
+            output_path: Optional path for the minidump file.
+                         If provided, validated with sanitize_output_path.
+
+        Returns:
+            API response dict with minidump result
+
+        Raises:
+            PathTraversalError: If output_path is outside allowed directory
+            ConnectionError: If minidump creation fails
+        """
+        data: dict[str, Any] = {}
+
+        if output_path:
+            dump_output_dir = Path.home() / ".binary_mcp_output" / "dumps"
+            dump_output_dir.mkdir(parents=True, exist_ok=True)
+            safe_path = sanitize_output_path(Path(output_path), dump_output_dir)
+            data["output_path"] = str(safe_path)
+
+        result = self._request_with_retry(
+            "/api/debug/minidump",
+            data=data,
+        )
+        logger.info(f"Minidump created: {data.get('output_path', 'default location')}")
+        return result
 
     def load_binary(self, binary_path: Path, args: list[str] | None = None) -> bool:
         """
@@ -583,6 +724,107 @@ class X64DbgBridge(Debugger):
         result = self._request("/api/breakpoint/list")
         return result.get("breakpoints", [])
 
+    # ── Exception handling control ──────────────────────────────────────
+
+    _VALID_CHANCE_VALUES = ("first", "second", "all")
+
+    def set_exception_breakpoint(
+        self, exception_code: str, chance: str = "first"
+    ) -> bool:
+        """
+        Set a breakpoint on an exception code.
+
+        Args:
+            exception_code: Exception code (hex string, e.g., "0xC0000005")
+            chance: When to break - "first", "second", or "all"
+
+        Returns:
+            True if exception breakpoint set successfully
+
+        Raises:
+            AddressValidationError: If exception_code is not valid hex
+            ValueError: If chance is not a valid option
+            RuntimeError: If API call fails
+        """
+        normalized_code = self._normalize_address(
+            exception_code, "exception_code"
+        )
+
+        if chance not in self._VALID_CHANCE_VALUES:
+            raise ValueError(
+                f"Invalid chance '{chance}': must be one of "
+                f"{self._VALID_CHANCE_VALUES}"
+            )
+
+        data = {"code": normalized_code, "chance": chance}
+        self._request_with_retry("/api/exception/set", data)
+        logger.info(
+            f"Set exception breakpoint on 0x{normalized_code} "
+            f"(chance={chance})"
+        )
+        return True
+
+    def delete_exception_breakpoint(self, exception_code: str) -> bool:
+        """
+        Delete an exception breakpoint.
+
+        Args:
+            exception_code: Exception code (hex string, e.g., "0xC0000005")
+
+        Returns:
+            True if deleted successfully
+
+        Raises:
+            AddressValidationError: If exception_code is not valid hex
+            RuntimeError: If API call fails
+        """
+        normalized_code = self._normalize_address(
+            exception_code, "exception_code"
+        )
+
+        data = {"code": normalized_code}
+        self._request_with_retry("/api/exception/delete", data)
+        logger.info(f"Deleted exception breakpoint on 0x{normalized_code}")
+        return True
+
+    def list_exception_breakpoints(self) -> list[dict[str, Any]]:
+        """
+        List all exception breakpoints.
+
+        Returns:
+            List of exception breakpoint dictionaries
+        """
+        result = self._request("/api/exception/list")
+        return result.get("exceptions", [])
+
+    def skip_exception(self, exception_code: str) -> bool:
+        """
+        Add exception code to the ignore list.
+
+        The debugger will pass the exception to the application instead
+        of breaking.
+
+        Args:
+            exception_code: Exception code (hex string, e.g., "0xC0000005")
+
+        Returns:
+            True if added to ignore list successfully
+
+        Raises:
+            AddressValidationError: If exception_code is not valid hex
+            RuntimeError: If API call fails
+        """
+        normalized_code = self._normalize_address(
+            exception_code, "exception_code"
+        )
+
+        data = {"code": normalized_code}
+        self._request_with_retry("/api/exception/skip", data)
+        logger.info(
+            f"Added exception 0x{normalized_code} to ignore list"
+        )
+        return True
+
     def run(self) -> DebuggerState:
         """
         Start or resume execution.
@@ -669,19 +911,57 @@ class X64DbgBridge(Debugger):
         logger.debug(f"Got {len(registers)} register values")
         return registers
 
-    def get_stack(self, depth: int = 20) -> list[dict[str, str]]:
+    def get_stack(self, depth: int = 20) -> dict[str, Any]:
         """
-        Get stack trace.
+        Get stack trace, with fallback to raw stack memory dump.
+
+        When /api/stack returns no frames, falls back to reading raw
+        pointer-sized values from the stack pointer (ESP/RSP).
 
         Args:
             depth: Number of stack frames to retrieve
 
         Returns:
-            List of stack frame dictionaries
+            Dict with "frames" (list of frame dicts) and "raw" (bool
+            indicating whether frames are raw stack contents vs unwound
+            call frames)
         """
         data = {"depth": depth}
         result = self._request("/api/stack", data)
-        return result.get("frames", [])
+        frames = result.get("frames", [])
+
+        if frames:
+            return {"frames": frames, "raw": False}
+
+        # Fallback: read raw stack memory via ESP/RSP
+        logger.info("No stack frames from /api/stack, falling back to raw stack read")
+        try:
+            arch = self._detect_architecture()
+            ptr_size = self._get_pointer_size()
+            registers = self.get_registers()
+            sp_reg = "esp" if arch == "x86" else "rsp"
+            sp_value = registers.get(sp_reg)
+
+            if not sp_value:
+                logger.warning(f"Stack pointer register '{sp_reg}' not found")
+                return {"frames": [], "raw": False}
+
+            read_size = depth * ptr_size
+            raw_bytes = self.read_memory(sp_value, read_size)
+
+            raw_frames = []
+            for i in range(0, len(raw_bytes), ptr_size):
+                chunk = raw_bytes[i : i + ptr_size]
+                if len(chunk) < ptr_size:
+                    break
+                value = int.from_bytes(chunk, byteorder="little")
+                raw_frames.append({"address": f"{value:x}", "comment": "raw stack"})
+
+            logger.info(f"Read {len(raw_frames)} raw stack entries from {sp_reg}")
+            return {"frames": raw_frames, "raw": True}
+        except Exception as e:
+            logger.warning(f"Raw stack fallback failed: {e}")
+            return {"frames": [], "raw": False}
 
     def get_modules(self) -> list[dict[str, Any]]:
         """
@@ -703,6 +983,101 @@ class X64DbgBridge(Debugger):
         result = self._request("/api/threads")
         return result.get("threads", [])
 
+    def switch_thread(self, thread_id: str) -> dict[str, Any]:
+        """
+        Switch active thread context.
+
+        Args:
+            thread_id: Thread ID to switch to
+
+        Returns:
+            Thread context dictionary from API
+
+        Raises:
+            ValueError: If thread_id is empty
+            RuntimeError: If API call fails
+        """
+        if not thread_id or not str(thread_id).strip():
+            raise ValueError("thread_id must be a non-empty string")
+
+        data = {"thread_id": str(thread_id).strip()}
+        logger.debug(f"Switching to thread {thread_id}")
+        result = self._request_with_retry("/api/thread/switch", data)
+        logger.info(f"Switched to thread {thread_id}")
+        return result
+
+    def suspend_thread(self, thread_id: str) -> dict[str, Any]:
+        """
+        Suspend a thread.
+
+        Args:
+            thread_id: Thread ID to suspend
+
+        Returns:
+            API response dictionary
+
+        Raises:
+            ValueError: If thread_id is empty
+            RuntimeError: If API call fails
+        """
+        if not thread_id or not str(thread_id).strip():
+            raise ValueError("thread_id must be a non-empty string")
+
+        data = {"thread_id": str(thread_id).strip()}
+        result = self._request_with_retry("/api/thread/suspend", data)
+        logger.info(f"Suspended thread {thread_id}")
+        return result
+
+    def resume_thread(self, thread_id: str) -> dict[str, Any]:
+        """
+        Resume a suspended thread.
+
+        Args:
+            thread_id: Thread ID to resume
+
+        Returns:
+            API response dictionary
+
+        Raises:
+            ValueError: If thread_id is empty
+            RuntimeError: If API call fails
+        """
+        if not thread_id or not str(thread_id).strip():
+            raise ValueError("thread_id must be a non-empty string")
+
+        data = {"thread_id": str(thread_id).strip()}
+        result = self._request_with_retry("/api/thread/resume", data)
+        logger.info(f"Resumed thread {thread_id}")
+        return result
+
+    def suspend_all_threads(self) -> dict[str, Any]:
+        """
+        Suspend all threads in the debugged process.
+
+        Returns:
+            API response dictionary with thread count
+
+        Raises:
+            RuntimeError: If API call fails
+        """
+        result = self._request_with_retry("/api/thread/suspend_all")
+        logger.info("Suspended all threads")
+        return result
+
+    def resume_all_threads(self) -> dict[str, Any]:
+        """
+        Resume all threads in the debugged process.
+
+        Returns:
+            API response dictionary with thread count
+
+        Raises:
+            RuntimeError: If API call fails
+        """
+        result = self._request_with_retry("/api/thread/resume_all")
+        logger.info("Resumed all threads")
+        return result
+
     def read_memory(self, address: str, size: int) -> bytes:
         """
         Read memory from the debugged process.
@@ -714,8 +1089,7 @@ class X64DbgBridge(Debugger):
         Returns:
             Raw bytes from memory
         """
-        if address.startswith("0x"):
-            address = address[2:]
+        address = self._normalize_address(address)
 
         data = {
             "address": address,
@@ -739,8 +1113,7 @@ class X64DbgBridge(Debugger):
         Returns:
             True if write successful
         """
-        if address.startswith("0x"):
-            address = address[2:]
+        address = self._normalize_address(address)
 
         payload = {
             "address": address,
@@ -835,9 +1208,10 @@ class X64DbgBridge(Debugger):
                 logger.warning(f"Could not read memory at 0x{address}")
                 return []
 
-            # Determine architecture from debugger state
-            # Default to x64 mode
-            md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
+            # Select capstone mode based on detected architecture
+            arch = self._detect_architecture()
+            mode = capstone.CS_MODE_32 if arch == "x86" else capstone.CS_MODE_64
+            md = capstone.Cs(capstone.CS_ARCH_X86, mode)
             md.detail = False
 
             instructions = []
@@ -938,8 +1312,7 @@ class X64DbgBridge(Debugger):
         except (PathTraversalError, ValueError) as e:
             raise ValueError(f"Invalid output path: {e}")
 
-        if address.startswith("0x"):
-            address = address[2:]
+        address = self._normalize_address(address)
 
         data = {
             "address": address,
@@ -1014,8 +1387,7 @@ class X64DbgBridge(Debugger):
         Note:
             Requires C++ plugin implementation of /api/memory/info
         """
-        if address.startswith("0x"):
-            address = address[2:]
+        address = self._normalize_address(address)
 
         data = {"address": address}
         result = self._request("/api/memory/info", data)
@@ -1032,53 +1404,200 @@ class X64DbgBridge(Debugger):
         """
         Get current or specific instruction details.
 
+        Falls back to capstone disassembly when the plugin returns empty fields.
+
         Args:
             address: Optional address (uses current RIP if None)
 
         Returns:
             Dictionary with address, bytes, mnemonic, operands, etc.
-
-        Note:
-            Requires C++ plugin implementation of /api/instruction
         """
         data = {}
         if address:
-            if address.startswith("0x"):
-                address = address[2:]
+            address = self._normalize_address(address)
             data["address"] = address
 
-        result = self._request("/api/instruction", data)
+        try:
+            result = self._request("/api/instruction", data)
+            api_result = {
+                "address": result.get("address", "unknown"),
+                "bytes": result.get("bytes", ""),
+                "mnemonic": result.get("mnemonic", ""),
+                "operands": result.get("operands", ""),
+                "size": result.get("size", 0),
+                "type": result.get("type", ""),
+            }
+            if api_result["mnemonic"]:
+                return api_result
+        except Exception as e:
+            logger.debug(f"Plugin /api/instruction failed: {e}")
 
+        # Fallback: disassemble with capstone
+        fallback = self._get_instruction_capstone(address)
+        if fallback:
+            return fallback
+
+        # Return empty result if both paths fail
         return {
-            "address": result.get("address", "unknown"),
-            "bytes": result.get("bytes", ""),
-            "mnemonic": result.get("mnemonic", ""),
-            "operands": result.get("operands", ""),
-            "size": result.get("size", 0),
-            "type": result.get("type", "")  # "call", "jmp", "ret", etc.
+            "address": address or "unknown",
+            "bytes": "",
+            "mnemonic": "",
+            "operands": "",
+            "size": 0,
+            "type": "",
         }
+
+    def _get_instruction_capstone(self, address: str | None) -> dict[str, Any] | None:
+        """
+        Disassemble a single instruction at address using capstone.
+
+        Args:
+            address: Normalized hex address (no 0x prefix), or None to use RIP/EIP.
+
+        Returns:
+            Instruction dict, or None on failure.
+        """
+        try:
+            import capstone
+        except ImportError:
+            logger.warning("Capstone not available for get_instruction fallback")
+            return None
+
+        try:
+            # Resolve address from instruction pointer if not provided
+            if not address:
+                regs = self.get_registers()
+                ip_reg = "eip" if self._detect_architecture() == "x86" else "rip"
+                ip_val = regs.get(ip_reg)
+                if not ip_val:
+                    logger.warning(f"Cannot resolve {ip_reg} from registers")
+                    return None
+                address = self._normalize_address(ip_val)
+
+            addr_int = int(address, 16)
+            raw_bytes = self.read_memory(f"0x{address}", 15)
+            if not raw_bytes:
+                return None
+
+            arch = self._detect_architecture()
+            mode = capstone.CS_MODE_32 if arch == "x86" else capstone.CS_MODE_64
+            md = capstone.Cs(capstone.CS_ARCH_X86, mode)
+
+            for instr in md.disasm(raw_bytes, addr_int):
+                logger.info(f"Capstone fallback: 0x{instr.address:X} {instr.mnemonic} {instr.op_str}")
+                return {
+                    "address": f"{instr.address:X}",
+                    "bytes": instr.bytes.hex(),
+                    "mnemonic": instr.mnemonic,
+                    "operands": instr.op_str,
+                    "size": instr.size,
+                    "type": "",
+                }
+
+        except Exception as e:
+            logger.error(f"Capstone get_instruction fallback failed: {e}")
+
+        return None
 
     def evaluate_expression(self, expression: str) -> dict[str, Any]:
         """
         Evaluate expression (e.g., "[rsp+8]", "kernel32.CreateFileA").
 
+        Falls back to local resolution when the plugin endpoint fails.
+
         Args:
             expression: Expression to evaluate
 
         Returns:
-            Dictionary with value and type
-
-        Note:
-            Requires C++ plugin implementation of /api/evaluate
+            Dictionary with value, type, and valid flag
         """
-        data = {"expression": expression}
-        result = self._request("/api/evaluate", data)
+        # Try plugin first
+        try:
+            data = {"expression": expression}
+            result = self._request("/api/evaluate", data)
+            if result.get("valid", False):
+                return {
+                    "value": result.get("value", "unknown"),
+                    "type": result.get("type", "unknown"),
+                    "valid": True,
+                }
+        except Exception as e:
+            logger.debug(f"Plugin /api/evaluate failed: {e}")
 
-        return {
-            "value": result.get("value", "unknown"),
-            "type": result.get("type", "unknown"),
-            "valid": result.get("valid", False)
-        }
+        # Fallback: local expression evaluation
+        return self._evaluate_expression_local(expression)
+
+    def _evaluate_expression_local(self, expression: str) -> dict[str, Any]:
+        """
+        Evaluate an expression locally without the plugin.
+
+        Supports:
+            - Simple register names: "rax", "esp"
+            - Register+offset: "rax+0x10", "esp-8"
+            - Pointer dereference: "[rax]", "[esp+14]"
+            - Symbol resolution: "kernel32.CreateFileA", "kernel32!CreateFileW"
+
+        Returns:
+            Dictionary with value, type, and valid flag.
+        """
+        expr = expression.strip()
+        if not expr:
+            return {"value": "unknown", "type": "unknown", "valid": False, "error": "Empty expression"}
+
+        try:
+            # Pointer dereference: [expr]
+            if expr.startswith("[") and expr.endswith("]"):
+                inner = expr[1:-1].strip()
+                inner_result = self._evaluate_expression_local(inner)
+                if not inner_result.get("valid"):
+                    return {"value": "unknown", "type": "pointer", "valid": False,
+                            "error": f"Cannot resolve inner expression: {inner}"}
+                addr_int = int(inner_result["value"], 16)
+                ptr_size = self._get_pointer_size()
+                raw = self.read_memory(f"0x{addr_int:X}", ptr_size)
+                value = int.from_bytes(raw, byteorder="little")
+                return {"value": f"0x{value:X}", "type": "pointer", "valid": True}
+
+            # Register+offset: rax+0x10, esp-8
+            reg_offset = re.match(
+                r'^([a-zA-Z]\w*)\s*([+-])\s*(0x[0-9a-fA-F]+|[0-9a-fA-F]+)$', expr
+            )
+            if reg_offset:
+                reg_name = reg_offset.group(1).lower()
+                op = reg_offset.group(2)
+                offset_str = reg_offset.group(3)
+                offset = int(offset_str, 16) if offset_str.startswith("0x") else int(offset_str, 10)
+
+                regs = self.get_registers()
+                reg_val = regs.get(reg_name)
+                if reg_val is None:
+                    return {"value": "unknown", "type": "expression", "valid": False,
+                            "error": f"Unknown register: {reg_name}"}
+                base = int(reg_val, 16)
+                result = base + offset if op == "+" else base - offset
+                return {"value": f"0x{result:X}", "type": "expression", "valid": True}
+
+            # Simple register name
+            regs = self.get_registers()
+            if expr.lower() in regs:
+                val = regs[expr.lower()]
+                return {"value": f"0x{int(val, 16):X}", "type": "register", "valid": True}
+
+            # Symbol resolution: module.func or module!func
+            if "." in expr or "!" in expr:
+                sym_result = self.resolve_symbol(expr)
+                if sym_result.get("success"):
+                    addr = sym_result.get("address", "unknown")
+                    return {"value": f"0x{addr}" if not addr.startswith("0x") else addr,
+                            "type": "symbol", "valid": True}
+
+            return {"value": "unknown", "type": "unknown", "valid": False,
+                    "error": f"Cannot evaluate expression: {expr}"}
+
+        except Exception as e:
+            logger.error(f"Local expression evaluation failed for '{expression}': {e}")
+            return {"value": "unknown", "type": "unknown", "valid": False,
+                    "error": str(e)}
 
     def resolve_symbol(self, expression: str) -> dict[str, Any]:
         """
@@ -1134,8 +1653,7 @@ class X64DbgBridge(Debugger):
         Note:
             Requires C++ plugin implementation of /api/comment/set
         """
-        if address.startswith("0x"):
-            address = address[2:]
+        address = self._normalize_address(address)
 
         data = {
             "address": address,
@@ -1159,13 +1677,126 @@ class X64DbgBridge(Debugger):
         Note:
             Requires C++ plugin implementation of /api/comment/get
         """
-        if address.startswith("0x"):
-            address = address[2:]
+        address = self._normalize_address(address)
 
         data = {"address": address}
         result = self._request("/api/comment/get", data)
 
         return result.get("comment", "")
+
+    def set_bookmark(self, address: str) -> bool:
+        """
+        Set bookmark at address.
+
+        Args:
+            address: Address to bookmark
+
+        Returns:
+            True if successful
+
+        Note:
+            Requires C++ plugin implementation of /api/bookmark/set
+        """
+        address = self._normalize_address(address)
+
+        data = {"address": address}
+        self._request("/api/bookmark/set", data)
+        logger.debug(f"Set bookmark at {address}")
+        return True
+
+    def delete_bookmark(self, address: str) -> bool:
+        """
+        Delete bookmark at address.
+
+        Args:
+            address: Address of bookmark to delete
+
+        Returns:
+            True if successful
+
+        Note:
+            Requires C++ plugin implementation of /api/bookmark/delete
+        """
+        address = self._normalize_address(address)
+
+        data = {"address": address}
+        self._request("/api/bookmark/delete", data)
+        logger.debug(f"Deleted bookmark at {address}")
+        return True
+
+    def list_bookmarks(self) -> list[dict[str, str]]:
+        """
+        List all bookmarks.
+
+        Returns:
+            List of bookmark entries with address info
+
+        Note:
+            Requires C++ plugin implementation of /api/bookmark/list
+        """
+        result = self._request("/api/bookmark/list")
+
+        bookmarks = result.get("bookmarks", [])
+        logger.debug(f"Got {len(bookmarks)} bookmarks")
+        return bookmarks
+
+    def add_function(self, start: str, end: str) -> bool:
+        """
+        Add function boundary definition.
+
+        Args:
+            start: Function start address
+            end: Function end address
+
+        Returns:
+            True if successful
+
+        Note:
+            Requires C++ plugin implementation of /api/function/add
+        """
+        start = self._normalize_address(start, param_name="start")
+        end = self._normalize_address(end, param_name="end")
+
+        data = {"start": start, "end": end}
+        self._request("/api/function/add", data)
+        logger.debug(f"Added function {start}-{end}")
+        return True
+
+    def delete_function(self, address: str) -> bool:
+        """
+        Delete function boundary at address.
+
+        Args:
+            address: Address within function to delete
+
+        Returns:
+            True if successful
+
+        Note:
+            Requires C++ plugin implementation of /api/function/delete
+        """
+        address = self._normalize_address(address)
+
+        data = {"address": address}
+        self._request("/api/function/delete", data)
+        logger.debug(f"Deleted function at {address}")
+        return True
+
+    def list_functions(self) -> list[dict[str, str]]:
+        """
+        List all defined functions.
+
+        Returns:
+            List of function entries with start, end, name
+
+        Note:
+            Requires C++ plugin implementation of /api/function/list
+        """
+        result = self._request("/api/function/list")
+
+        functions = result.get("functions", [])
+        logger.debug(f"Got {len(functions)} functions")
+        return functions
 
     def get_module_imports(self, module_name: str) -> list[dict[str, str]]:
         """
@@ -1312,6 +1943,387 @@ class X64DbgBridge(Debugger):
             "address": result.get("address", "unknown"),
             "state": result.get("state", "paused")
         }
+
+    def run_to_user_code(self, timeout: int = 30000) -> dict[str, Any]:
+        """
+        Run to user code (skip system/library code).
+
+        Executes the x64dbg 'rtu' command and waits until the debugger pauses
+        in user module code.
+
+        Args:
+            timeout: Maximum wait time in milliseconds (default: 30 seconds)
+
+        Returns:
+            Dictionary with current location after pause
+        """
+        self._request_with_retry("/api/command", {"command": "rtu"})
+        wait_result = self.wait_until_paused(timeout=timeout)
+
+        if not wait_result.get("success"):
+            return {
+                "success": False,
+                "error": wait_result.get("error", "Timeout waiting for pause"),
+                "elapsed_ms": wait_result.get("elapsed_ms", 0),
+            }
+
+        location = self.get_current_location()
+        return {
+            "success": True,
+            "address": location.get("address", "unknown"),
+            "module": location.get("module", "unknown"),
+            "state": "paused",
+            "elapsed_ms": wait_result.get("elapsed_ms", 0),
+        }
+
+    def undo_instruction(self) -> dict[str, Any]:
+        """
+        Undo the last instruction (reverse single step).
+
+        Uses x64dbg's InstrUndo command to reverse the effect of the
+        last executed instruction.
+
+        Returns:
+            Dictionary with result status
+        """
+        result = self._request_with_retry("/api/command", {"command": "InstrUndo"})
+        return {
+            "success": result.get("success", True),
+            "message": result.get("message", "Instruction undone"),
+        }
+
+    def execute_command(self, command: str) -> dict[str, Any]:
+        """
+        Execute an arbitrary x64dbg command via the command API.
+
+        This is a low-level method that sends any command string to x64dbg.
+        Security validation should be performed by the caller (MCP tool layer).
+
+        Args:
+            command: The x64dbg command string to execute
+
+        Returns:
+            Dictionary with command result from the API
+        """
+        result = self._request_with_retry("/api/command", {"command": command})
+        return result
+
+    # ── Watch expression management ──────────────────────────────────
+
+    _WATCHDOG_MODES = frozenset({
+        "changed", "disabled", "unchanged",
+        "istrue", "isfalse", "isgreater", "isless", "isnotequal",
+    })
+
+    def add_watch(self, expression: str, name: str = "") -> dict[str, Any]:
+        """
+        Add a watch expression.
+
+        Args:
+            expression: Expression to watch (e.g. "eax", "[esp+4]", "eax+ebx")
+            name: Optional display name for the watch entry
+
+        Returns:
+            Dictionary with command result
+
+        Raises:
+            ValueError: If expression is empty
+        """
+        if not expression or not expression.strip():
+            raise ValueError("Watch expression cannot be empty")
+
+        result = self._request_with_retry(
+            "/api/command", {"command": f"AddWatch {expression.strip()}"}
+        )
+        if name:
+            # AddWatch returns the index; set the name on the latest entry
+            # Use SetWatchName with index 0 as default (latest added)
+            self._request_with_retry(
+                "/api/command",
+                {"command": f'SetWatchName 0, {name}'},
+            )
+        logger.info(f"Added watch: {expression}" + (f" (name={name})" if name else ""))
+        return result
+
+    def delete_watch(self, index: int) -> dict[str, Any]:
+        """
+        Delete a watch entry by index.
+
+        Args:
+            index: Zero-based watch index
+
+        Returns:
+            Dictionary with command result
+
+        Raises:
+            ValueError: If index is negative
+        """
+        if not isinstance(index, int) or index < 0:
+            raise ValueError(f"Watch index must be a non-negative integer, got: {index}")
+
+        result = self._request_with_retry(
+            "/api/command", {"command": f"DelWatch {index}"}
+        )
+        logger.info(f"Deleted watch at index {index}")
+        return result
+
+    def set_watchdog(self, index: int, mode: str = "changed") -> dict[str, Any]:
+        """
+        Set watchdog trigger mode on a watch entry.
+
+        Args:
+            index: Zero-based watch index
+            mode: Trigger mode — one of: changed, disabled, unchanged,
+                  istrue, isfalse, isgreater, isless, isnotequal
+
+        Returns:
+            Dictionary with command result
+
+        Raises:
+            ValueError: If index is negative or mode is invalid
+        """
+        if not isinstance(index, int) or index < 0:
+            raise ValueError(f"Watch index must be a non-negative integer, got: {index}")
+        if mode not in self._WATCHDOG_MODES:
+            raise ValueError(
+                f"Invalid watchdog mode '{mode}'. "
+                f"Must be one of: {', '.join(sorted(self._WATCHDOG_MODES))}"
+            )
+
+        result = self._request_with_retry(
+            "/api/command", {"command": f"SetWatchdog {index}, {mode}"}
+        )
+        logger.info(f"Set watchdog on index {index} to mode '{mode}'")
+        return result
+
+    def set_watch_expression(self, index: int, expression: str) -> dict[str, Any]:
+        """
+        Update the expression of an existing watch entry.
+
+        Args:
+            index: Zero-based watch index
+            expression: New expression string
+
+        Returns:
+            Dictionary with command result
+
+        Raises:
+            ValueError: If index is negative or expression is empty
+        """
+        if not isinstance(index, int) or index < 0:
+            raise ValueError(f"Watch index must be a non-negative integer, got: {index}")
+        if not expression or not expression.strip():
+            raise ValueError("Watch expression cannot be empty")
+
+        result = self._request_with_retry(
+            "/api/command",
+            {"command": f"SetWatchExpression {index}, {expression.strip()}"},
+        )
+        logger.info(f"Set watch {index} expression to '{expression.strip()}'")
+        return result
+
+    def set_watch_name(self, index: int, name: str) -> dict[str, Any]:
+        """
+        Set the display name of a watch entry.
+
+        Args:
+            index: Zero-based watch index
+            name: Display name
+
+        Returns:
+            Dictionary with command result
+
+        Raises:
+            ValueError: If index is negative or name is empty
+        """
+        if not isinstance(index, int) or index < 0:
+            raise ValueError(f"Watch index must be a non-negative integer, got: {index}")
+        if not name or not name.strip():
+            raise ValueError("Watch name cannot be empty")
+
+        result = self._request_with_retry(
+            "/api/command", {"command": f"SetWatchName {index}, {name.strip()}"}
+        )
+        logger.info(f"Set watch {index} name to '{name.strip()}'")
+        return result
+
+    # ── DLL breakpoint management ────────────────────────────────────
+
+    def set_dll_breakpoint(
+        self, dll_name: str, singleshoot: bool = False
+    ) -> dict[str, Any]:
+        """
+        Set a breakpoint on DLL load.
+
+        Args:
+            dll_name: Name of the DLL (e.g. "kernel32.dll")
+            singleshoot: If True, breakpoint fires only once
+
+        Returns:
+            Dictionary with command result
+
+        Raises:
+            ValueError: If dll_name is empty
+        """
+        if not dll_name or not dll_name.strip():
+            raise ValueError("DLL name cannot be empty")
+
+        ss = 1 if singleshoot else 0
+        result = self._request_with_retry(
+            "/api/command",
+            {"command": f"bpdll {dll_name.strip()}, {ss}"},
+        )
+        logger.info(
+            f"Set DLL breakpoint on '{dll_name.strip()}'"
+            + (" (singleshoot)" if singleshoot else "")
+        )
+        return result
+
+    def delete_dll_breakpoint(self, dll_name: str) -> dict[str, Any]:
+        """
+        Delete a DLL load breakpoint.
+
+        Args:
+            dll_name: Name of the DLL
+
+        Returns:
+            Dictionary with command result
+
+        Raises:
+            ValueError: If dll_name is empty
+        """
+        if not dll_name or not dll_name.strip():
+            raise ValueError("DLL name cannot be empty")
+
+        result = self._request_with_retry(
+            "/api/command", {"command": f"bcdll {dll_name.strip()}"}
+        )
+        logger.info(f"Deleted DLL breakpoint on '{dll_name.strip()}'")
+        return result
+
+    def enable_dll_breakpoint(self, dll_name: str) -> dict[str, Any]:
+        """
+        Enable a DLL load breakpoint.
+
+        Args:
+            dll_name: Name of the DLL
+
+        Returns:
+            Dictionary with command result
+
+        Raises:
+            ValueError: If dll_name is empty
+        """
+        if not dll_name or not dll_name.strip():
+            raise ValueError("DLL name cannot be empty")
+
+        result = self._request_with_retry(
+            "/api/command", {"command": f"bpedll {dll_name.strip()}"}
+        )
+        logger.info(f"Enabled DLL breakpoint on '{dll_name.strip()}'")
+        return result
+
+    def disable_dll_breakpoint(self, dll_name: str) -> dict[str, Any]:
+        """
+        Disable a DLL load breakpoint.
+
+        Args:
+            dll_name: Name of the DLL
+
+        Returns:
+            Dictionary with command result
+
+        Raises:
+            ValueError: If dll_name is empty
+        """
+        if not dll_name or not dll_name.strip():
+            raise ValueError("DLL name cannot be empty")
+
+        result = self._request_with_retry(
+            "/api/command", {"command": f"bpddll {dll_name.strip()}"}
+        )
+        logger.info(f"Disabled DLL breakpoint on '{dll_name.strip()}'")
+        return result
+
+    def analyze_control_flow(self) -> dict[str, Any]:
+        """
+        Run control flow analysis (CFG) on the current module.
+
+        Executes the x64dbg 'cfanalyze' command to build the control flow graph.
+
+        Returns:
+            Dictionary with command result
+        """
+        result = self._request_with_retry("/api/command", {"command": "cfanalyze"})
+        logger.info("Control flow analysis executed")
+        return result
+
+    def analyze_cross_references(self) -> dict[str, Any]:
+        """
+        Run cross-reference analysis.
+
+        Executes the x64dbg 'analxrefs' command to find cross-references.
+
+        Returns:
+            Dictionary with command result
+        """
+        result = self._request_with_retry("/api/command", {"command": "analxrefs"})
+        logger.info("Cross-reference analysis executed")
+        return result
+
+    def analyze_recursive(self) -> dict[str, Any]:
+        """
+        Run recursive function analysis.
+
+        Executes the x64dbg 'analrecur' command for recursive analysis
+        starting from the current location.
+
+        Returns:
+            Dictionary with command result
+        """
+        result = self._request_with_retry("/api/command", {"command": "analrecur"})
+        logger.info("Recursive analysis executed")
+        return result
+
+    def analyze_advanced(self) -> dict[str, Any]:
+        """
+        Run advanced analysis.
+
+        Executes the x64dbg 'analadv' command for advanced analysis
+        including function discovery and code flow analysis.
+
+        Returns:
+            Dictionary with command result
+        """
+        result = self._request_with_retry("/api/command", {"command": "analadv"})
+        logger.info("Advanced analysis executed")
+        return result
+
+    def get_exception_handlers(self) -> dict[str, Any]:
+        """
+        Get SEH exception handler chain.
+
+        Executes the x64dbg 'exhandlers' command to retrieve the
+        structured exception handler chain.
+
+        Returns:
+            Dictionary with exception handler information
+        """
+        result = self._request_with_retry("/api/command", {"command": "exhandlers"})
+        return result
+
+    def get_exception_info(self) -> dict[str, Any]:
+        """
+        Get current exception details.
+
+        Executes the x64dbg 'exinfo' command to retrieve details about
+        the current exception (code, address, flags, etc.).
+
+        Returns:
+            Dictionary with exception information
+        """
+        result = self._request_with_retry("/api/command", {"command": "exinfo"})
+        return result
 
     def set_memory_breakpoint(
         self,
@@ -1749,8 +2761,7 @@ class X64DbgBridge(Debugger):
         """
         data = {"size": size}
         if address:
-            if address.startswith("0x"):
-                address = address[2:]
+            address = self._normalize_address(address)
             data["address"] = address
 
         result = self._request("/api/memory/alloc", data)
@@ -1770,8 +2781,7 @@ class X64DbgBridge(Debugger):
         Example:
             bridge.virt_free("0x12340000")
         """
-        if address.startswith("0x"):
-            address = address[2:]
+        address = self._normalize_address(address)
 
         data = {"address": address}
         result = self._request("/api/memory/free", data)
@@ -1805,8 +2815,7 @@ class X64DbgBridge(Debugger):
             bridge.write_memory("0x401000", b"\\x90\\x90")  # Write NOPs
             bridge.virt_protect("0x401000", "rx", 0x1000)   # Restore
         """
-        if address.startswith("0x"):
-            address = address[2:]
+        address = self._normalize_address(address)
 
         data = {
             "address": address,
@@ -1837,8 +2846,7 @@ class X64DbgBridge(Debugger):
             # Fill with NOPs (0x90)
             bridge.memset("0x401000", 0x90, 10)
         """
-        if address.startswith("0x"):
-            address = address[2:]
+        address = self._normalize_address(address)
 
         data = {
             "address": address,
@@ -1864,8 +2872,7 @@ class X64DbgBridge(Debugger):
             if bridge.check_valid_read_ptr("0x401000"):
                 data = bridge.read_memory("0x401000", 16)
         """
-        if address.startswith("0x"):
-            address = address[2:]
+        address = self._normalize_address(address)
 
         data = {"address": address}
         result = self._request("/api/memory/check", data)
@@ -2418,8 +3425,7 @@ class X64DbgBridge(Debugger):
             "unicode": 1 if unicode else 0
         }
         if address:
-            if address.startswith("0x"):
-                address = address[2:]
+            address = self._normalize_address(address)
             data["address"] = address
 
         result = self._request("/api/strings", data)
@@ -2461,8 +3467,7 @@ class X64DbgBridge(Debugger):
         """
         data = {"pattern": pattern, "size": size}
         if address:
-            if address.startswith("0x"):
-                address = address[2:]
+            address = self._normalize_address(address)
             data["address"] = address
 
         result = self._request("/api/pattern", data)
@@ -2508,8 +3513,7 @@ class X64DbgBridge(Debugger):
             result = bridge.xor_decrypt("0x401000", size=100, key="37")
             print(result["decrypted_ascii"])
         """
-        if address.startswith("0x"):
-            address = address[2:]
+        address = self._normalize_address(address)
 
         data = {"address": address, "size": size}
         if key:
@@ -2535,11 +3539,144 @@ class X64DbgBridge(Debugger):
             This provides limited results. For comprehensive reference
             search, use the x64dbg GUI.
         """
-        if address.startswith("0x"):
-            address = address[2:]
+        address = self._normalize_address(address)
 
         data = {"address": address}
         return self._request("/api/references", data)
+
+    # ── Advanced search commands ─────────────────────────────────────
+
+    def find_assembly(
+        self, instruction: str, address: str = "", size: int = 0
+    ) -> dict[str, Any]:
+        """
+        Search for assembly instruction patterns in memory.
+
+        Uses x64dbg's findasm command to locate instructions matching
+        the given pattern.
+
+        Args:
+            instruction: Assembly instruction pattern (e.g., "push ebp", "call eax")
+            address: Start address (hex string). If empty, searches from current location.
+            size: Number of bytes to search (0 = default x64dbg range)
+
+        Returns:
+            Dictionary with command execution result
+
+        Example:
+            result = bridge.find_assembly("call eax")
+            result = bridge.find_assembly("push ebp", address="00401000", size=0x10000)
+        """
+        if address:
+            address = self._normalize_address(address)
+        addr_part = address if address else ""
+        if size:
+            cmd = f"findasm {addr_part}, {instruction}, {size:#x}" if addr_part else f"findasm , {instruction}, {size:#x}"
+        else:
+            cmd = f"findasm {addr_part}, {instruction}" if addr_part else f"findasm , {instruction}"
+        result = self.execute_command(cmd)
+        logger.info(f"find_assembly '{instruction}': {result.get('success', False)}")
+        return result
+
+    def find_guid(self, address: str = "", size: int = 0) -> dict[str, Any]:
+        """
+        Find GUIDs in a memory region.
+
+        Uses x64dbg's findguid command to locate GUID/UUID patterns.
+
+        Args:
+            address: Start address (hex string). If empty, searches from current location.
+            size: Number of bytes to search (0 = default x64dbg range)
+
+        Returns:
+            Dictionary with command execution result
+
+        Example:
+            result = bridge.find_guid()
+            result = bridge.find_guid(address="00401000", size=0x50000)
+        """
+        addr_part = ""
+        if address:
+            addr_part = self._normalize_address(address)
+        parts = ["findguid"]
+        if addr_part:
+            parts.append(addr_part)
+        if size:
+            parts.append(f"{size:#x}")
+        cmd = " ".join(parts)
+        result = self.execute_command(cmd)
+        logger.info(f"find_guid: {result.get('success', False)}")
+        return result
+
+    def find_module_calls(self, module: str = "") -> dict[str, Any]:
+        """
+        Find all calls to a specific module.
+
+        Uses x64dbg's modcallfind command to locate inter-module calls.
+
+        Args:
+            module: Module name (e.g., "kernel32.dll"). If empty, finds all module calls.
+
+        Returns:
+            Dictionary with command execution result
+
+        Example:
+            result = bridge.find_module_calls("kernel32.dll")
+            result = bridge.find_module_calls()  # All inter-module calls
+        """
+        cmd = f"modcallfind {module}" if module else "modcallfind"
+        result = self.execute_command(cmd)
+        logger.info(f"find_module_calls '{module}': {result.get('success', False)}")
+        return result
+
+    def find_references_range(self, address: str, size: int) -> dict[str, Any]:
+        """
+        Find references within an address range.
+
+        Uses x64dbg's reffindrange command to find all references
+        within the specified address range.
+
+        Args:
+            address: Start address (hex string, required)
+            size: Size of range in bytes
+
+        Returns:
+            Dictionary with command execution result
+
+        Example:
+            result = bridge.find_references_range("00401000", 0x1000)
+        """
+        address = self._normalize_address(address)
+        end_address = int(address, 16) + size
+        cmd = f"reffindrange {address}, {end_address:X}"
+        result = self.execute_command(cmd)
+        logger.info(f"find_references_range 0x{address}-0x{end_address:X}: {result.get('success', False)}")
+        return result
+
+    def find_string_references(self, address: str = "") -> dict[str, Any]:
+        """
+        Find string references in a module or at an address.
+
+        Uses x64dbg's refstr command to find all string references.
+
+        Args:
+            address: Address or module base (hex string). If empty, uses current module.
+
+        Returns:
+            Dictionary with command execution result
+
+        Example:
+            result = bridge.find_string_references()
+            result = bridge.find_string_references("00401000")
+        """
+        if address:
+            address = self._normalize_address(address)
+            cmd = f"refstr {address}"
+        else:
+            cmd = "refstr"
+        result = self.execute_command(cmd)
+        logger.info(f"find_string_references: {result.get('success', False)}")
+        return result
 
     def get_callstack_detailed(self) -> dict[str, Any]:
         """
@@ -2669,8 +3806,7 @@ class X64DbgBridge(Debugger):
             for addr in result["matches"]:
                 bridge.patch_debug_check(addr, "ret0")
         """
-        if address.startswith("0x"):
-            address = address[2:]
+        address = self._normalize_address(address)
 
         data = {"address": address, "type": patch_type}
         result = self._request("/api/antidebug/patch", data)
@@ -4111,4 +5247,673 @@ class X64DbgBridge(Debugger):
             result["error"] = str(e)
             logger.error(f"unhook_function failed: {e}")
 
+        return result
+
+    # ── Type system methods ─────────────────────────────────────────────
+
+    @staticmethod
+    def _validate_type_name(name: str | None, param_name: str = "name") -> str:
+        """
+        Validate a type/struct/union name is a valid C identifier.
+
+        Args:
+            name: The name to validate
+            param_name: Parameter name for error messages
+
+        Returns:
+            The validated name string
+
+        Raises:
+            ValueError: If name is None, empty, or not a valid C identifier
+        """
+        if not name or not name.strip():
+            raise ValueError(f"{param_name} cannot be empty")
+        name = name.strip()
+        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", name):
+            raise ValueError(
+                f"Invalid {param_name} '{name}': must be a valid C identifier "
+                f"(letters, digits, underscores; cannot start with a digit)"
+            )
+        return name
+
+    def add_struct(self, name: str) -> dict[str, Any]:
+        """
+        Define a new struct type in x64dbg's type system.
+
+        Args:
+            name: Struct name (valid C identifier)
+
+        Returns:
+            Command result dictionary
+        """
+        name = self._validate_type_name(name, "struct name")
+        return self._request_with_retry("/api/command", {"command": f"AddStruct {name}"})
+
+    def add_union(self, name: str) -> dict[str, Any]:
+        """
+        Define a new union type in x64dbg's type system.
+
+        Args:
+            name: Union name (valid C identifier)
+
+        Returns:
+            Command result dictionary
+        """
+        name = self._validate_type_name(name, "union name")
+        return self._request_with_retry("/api/command", {"command": f"AddUnion {name}"})
+
+    def add_member(self, parent: str, type_name: str, member_name: str) -> dict[str, Any]:
+        """
+        Add a member field to an existing struct or union.
+
+        Args:
+            parent: Parent struct/union name
+            type_name: Type of the member (e.g. "DWORD", "BYTE", "PVOID")
+            member_name: Name of the member field
+
+        Returns:
+            Command result dictionary
+        """
+        parent = self._validate_type_name(parent, "parent")
+        type_name = self._validate_type_name(type_name, "type_name")
+        member_name = self._validate_type_name(member_name, "member_name")
+        return self._request_with_retry(
+            "/api/command",
+            {"command": f"AddMember {parent}, {type_name}, {member_name}"},
+        )
+
+    def add_type(self, definition: str) -> dict[str, Any]:
+        """
+        Add a primitive type or typedef definition.
+
+        Args:
+            definition: Type definition string (e.g. "typedef DWORD MyType")
+
+        Returns:
+            Command result dictionary
+        """
+        if not definition or not definition.strip():
+            raise ValueError("Type definition cannot be empty")
+        return self._request_with_retry(
+            "/api/command", {"command": f"AddType {definition.strip()}"}
+        )
+
+    def visit_type(self, type_name: str, address: str) -> dict[str, Any]:
+        """
+        Overlay a struct/type on a memory address for structured viewing.
+
+        This is the key type system command — it interprets raw memory
+        at the given address as the specified struct/type.
+
+        Args:
+            type_name: Name of the type to overlay
+            address: Memory address to interpret (hex string)
+
+        Returns:
+            Command result with structured memory interpretation
+        """
+        type_name = self._validate_type_name(type_name, "type_name")
+        normalized_addr = self._normalize_address(address)
+        return self._request_with_retry(
+            "/api/command",
+            {"command": f"VisitType {type_name}, 0x{normalized_addr}"},
+        )
+
+    def sizeof_type(self, type_name: str) -> dict[str, Any]:
+        """
+        Get the size of a type in bytes.
+
+        Args:
+            type_name: Name of the type
+
+        Returns:
+            Command result with size information
+        """
+        type_name = self._validate_type_name(type_name, "type_name")
+        return self._request_with_retry(
+            "/api/command", {"command": f"SizeofType {type_name}"}
+        )
+
+    def remove_type(self, type_name: str) -> dict[str, Any]:
+        """
+        Remove a type definition from x64dbg's type system.
+
+        Args:
+            type_name: Name of the type to remove
+
+        Returns:
+            Command result dictionary
+        """
+        type_name = self._validate_type_name(type_name, "type_name")
+        return self._request_with_retry(
+            "/api/command", {"command": f"RemoveType {type_name}"}
+        )
+
+    def enum_types(self) -> dict[str, Any]:
+        """
+        List all defined types in x64dbg's type system.
+
+        Returns:
+            Command result with type listing
+        """
+        return self._request_with_retry("/api/command", {"command": "EnumTypes"})
+
+    def load_types(self, filename: str) -> dict[str, Any]:
+        """
+        Load type definitions from a JSON or header file.
+
+        Args:
+            filename: Path to the types file
+
+        Returns:
+            Command result dictionary
+
+        Raises:
+            ValueError: If filename is empty
+        """
+        if not filename or not filename.strip():
+            raise ValueError("Filename cannot be empty")
+        return self._request_with_retry(
+            "/api/command", {"command": f"LoadTypes {filename.strip()}"}
+        )
+
+    def parse_types(self, definition: str) -> dict[str, Any]:
+        """
+        Parse C header text to define types inline.
+
+        Args:
+            definition: C header text with type definitions
+
+        Returns:
+            Command result dictionary
+
+        Raises:
+            ValueError: If definition is empty
+        """
+        if not definition or not definition.strip():
+            raise ValueError("Type definition text cannot be empty")
+        return self._request_with_retry(
+            "/api/command", {"command": f"ParseTypes {definition.strip()}"}
+        )
+
+    def clear_types(self) -> dict[str, Any]:
+        """
+        Clear all user-defined types from x64dbg's type system.
+
+        Returns:
+            Command result dictionary
+        """
+        return self._request_with_retry("/api/command", {"command": "ClearTypes"})
+
+    # ── Variable management ────────────────────────────────────────────
+
+    def set_variable(self, name: str, value: str) -> dict[str, Any]:
+        """
+        Set a debugger variable.
+
+        Args:
+            name: Variable name (alphanumeric and underscores)
+            value: Value to set (expression or numeric)
+
+        Returns:
+            Dictionary with command result
+
+        Raises:
+            ValueError: If name is empty or contains invalid characters
+        """
+        if not name or not name.strip():
+            raise ValueError("Variable name cannot be empty")
+
+        name = name.strip()
+        if not re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', name):
+            raise ValueError(
+                f"Invalid variable name '{name}': must start with letter/underscore "
+                "and contain only alphanumeric characters and underscores"
+            )
+
+        value = str(value).strip()
+        if not value:
+            raise ValueError("Variable value cannot be empty")
+
+        cmd = f"var {name}, {value}"
+        result = self._request_with_retry("/api/command", {"command": cmd})
+        logger.info(f"Set variable {name} = {value}")
+        return result
+
+    def delete_variable(self, name: str) -> dict[str, Any]:
+        """
+        Delete a debugger variable.
+
+        Args:
+            name: Variable name to delete
+
+        Returns:
+            Dictionary with command result
+
+        Raises:
+            ValueError: If name is empty or contains invalid characters
+        """
+        if not name or not name.strip():
+            raise ValueError("Variable name cannot be empty")
+
+        name = name.strip()
+        if not re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', name):
+            raise ValueError(
+                f"Invalid variable name '{name}': must start with letter/underscore "
+                "and contain only alphanumeric characters and underscores"
+            )
+
+        cmd = f"vardel {name}"
+        result = self._request_with_retry("/api/command", {"command": cmd})
+        logger.info(f"Deleted variable {name}")
+        return result
+
+    def list_variables(self) -> dict[str, Any]:
+        """
+        List all debugger variables.
+
+        Returns:
+            Dictionary with command result containing variable list
+        """
+        result = self._request_with_retry("/api/command", {"command": "varlist"})
+        logger.debug("Listed variables")
+        return result
+
+    # ── GUI navigation ─────────────────────────────────────────────────
+
+    def navigate_disasm(self, address: str) -> dict[str, Any]:
+        """
+        Navigate the disassembly view to an address.
+
+        Args:
+            address: Target address (hex string)
+
+        Returns:
+            Dictionary with command result
+
+        Raises:
+            AddressValidationError: If address is invalid
+        """
+        normalized_addr = self._normalize_address(address)
+        cmd = f"disasm {normalized_addr}"
+        result = self._request_with_retry("/api/command", {"command": cmd})
+        logger.info(f"Navigated disassembly to 0x{normalized_addr}")
+        return result
+
+    def navigate_dump(self, address: str) -> dict[str, Any]:
+        """
+        Navigate the dump view to an address.
+
+        Args:
+            address: Target address (hex string)
+
+        Returns:
+            Dictionary with command result
+
+        Raises:
+            AddressValidationError: If address is invalid
+        """
+        normalized_addr = self._normalize_address(address)
+        cmd = f"dump {normalized_addr}"
+        result = self._request_with_retry("/api/command", {"command": cmd})
+        logger.info(f"Navigated dump to 0x{normalized_addr}")
+        return result
+
+    def navigate_stack_dump(self, address: str) -> dict[str, Any]:
+        """
+        Navigate the stack dump view to an address.
+
+        Args:
+            address: Target address (hex string)
+
+        Returns:
+            Dictionary with command result
+
+        Raises:
+            AddressValidationError: If address is invalid
+        """
+        normalized_addr = self._normalize_address(address)
+        cmd = f"sdump {normalized_addr}"
+        result = self._request_with_retry("/api/command", {"command": cmd})
+        logger.info(f"Navigated stack dump to 0x{normalized_addr}")
+        return result
+
+    def show_graph(self, address: str = "") -> dict[str, Any]:
+        """
+        Show function graph at an address.
+
+        Args:
+            address: Target address (hex string), empty for current location
+
+        Returns:
+            Dictionary with command result
+
+        Raises:
+            AddressValidationError: If address is provided but invalid
+        """
+        if address and address.strip():
+            normalized_addr = self._normalize_address(address)
+            cmd = f"graph {normalized_addr}"
+            log_target = f"0x{normalized_addr}"
+        else:
+            cmd = "graph"
+            log_target = "current location"
+
+        result = self._request_with_retry("/api/command", {"command": cmd})
+        logger.info(f"Showed graph at {log_target}")
+        return result
+
+    # ── Privilege management ───────────────────────────────────────────
+
+    def enable_privilege(self, name: str) -> dict[str, Any]:
+        """
+        Enable a process privilege.
+
+        Args:
+            name: Privilege name (e.g., "SeDebugPrivilege")
+
+        Returns:
+            Dictionary with command result
+
+        Raises:
+            ValueError: If name is empty or contains invalid characters
+        """
+        if not name or not name.strip():
+            raise ValueError("Privilege name cannot be empty")
+
+        name = name.strip()
+        if not re.match(r'^[A-Za-z][A-Za-z0-9]*$', name):
+            raise ValueError(
+                f"Invalid privilege name '{name}': must contain only alphanumeric characters"
+            )
+
+        cmd = f"EnablePrivilege {name}"
+        result = self._request_with_retry("/api/command", {"command": cmd})
+        logger.info(f"Enabled privilege: {name}")
+        return result
+
+    def disable_privilege(self, name: str) -> dict[str, Any]:
+        """
+        Disable a process privilege.
+
+        Args:
+            name: Privilege name (e.g., "SeDebugPrivilege")
+
+        Returns:
+            Dictionary with command result
+
+        Raises:
+            ValueError: If name is empty or contains invalid characters
+        """
+        if not name or not name.strip():
+            raise ValueError("Privilege name cannot be empty")
+
+        name = name.strip()
+        if not re.match(r'^[A-Za-z][A-Za-z0-9]*$', name):
+            raise ValueError(
+                f"Invalid privilege name '{name}': must contain only alphanumeric characters"
+            )
+
+        cmd = f"DisablePrivilege {name}"
+        result = self._request_with_retry("/api/command", {"command": cmd})
+        logger.info(f"Disabled privilege: {name}")
+        return result
+
+    # ── Conditional Tracing ──────────────────────────────────────────
+
+    def set_trace_log(self, text: str, condition: str = "") -> dict[str, Any]:
+        """
+        Configure the trace log format string.
+
+        Sets what gets logged at each trace step. Supports x64dbg format
+        specifiers like {rax}, {[esp]}, {mem;addr;size}, etc.
+
+        Args:
+            text: Log format string (e.g. "RIP={rip} RAX={rax}")
+            condition: Optional condition — only log when true
+
+        Returns:
+            Command result dictionary
+        """
+        if not text or not text.strip():
+            raise ValueError("Trace log text cannot be empty")
+        cmd = f"TraceSetLog {text.strip()}"
+        if condition and condition.strip():
+            cmd += f", {condition.strip()}"
+        result = self.execute_command(cmd)
+        logger.info(f"Set trace log: {text.strip()}")
+        return result
+
+    def set_trace_command(self, command: str, condition: str = "") -> dict[str, Any]:
+        """
+        Configure a command to execute at each trace step.
+
+        Args:
+            command: x64dbg command to run per step
+            condition: Optional condition — only run when true
+
+        Returns:
+            Command result dictionary
+        """
+        if not command or not command.strip():
+            raise ValueError("Trace command cannot be empty")
+        cmd = f"TraceSetCommand {command.strip()}"
+        if condition and condition.strip():
+            cmd += f", {condition.strip()}"
+        result = self.execute_command(cmd)
+        logger.info(f"Set trace command: {command.strip()}")
+        return result
+
+    def set_trace_log_file(self, path: str) -> dict[str, Any]:
+        """
+        Set the output file for trace logging.
+
+        Args:
+            path: File path for trace log output
+
+        Returns:
+            Command result dictionary
+        """
+        if not path or not path.strip():
+            raise ValueError("Trace log file path cannot be empty")
+        cmd = f"TraceSetLogFile {path.strip()}"
+        result = self.execute_command(cmd)
+        logger.info(f"Set trace log file: {path.strip()}")
+        return result
+
+    def trace_into_conditional(
+        self,
+        condition: str,
+        max_steps: int = 50000,
+        log_text: str = "",
+        log_condition: str = "",
+        command_text: str = "",
+        command_condition: str = "",
+        log_file: str = "",
+    ) -> dict[str, Any]:
+        """
+        Trace into (following calls) until condition is met.
+
+        Executes the x64dbg ``ticnd`` command which single-steps into calls,
+        evaluating the condition at each step until it becomes true.
+
+        Args:
+            condition: Break condition expression (e.g. "rax==1", "eip<module.base")
+            max_steps: Maximum number of steps before aborting (default: 50000)
+            log_text: Optional log format string for each step
+            log_condition: Optional condition for logging
+            command_text: Optional command to execute at each step
+            command_condition: Optional condition for command execution
+            log_file: Optional file path for trace log output
+
+        Returns:
+            Dictionary with success, current_address, and trace details
+        """
+        if not condition or not condition.strip():
+            raise ValueError("Trace condition cannot be empty")
+
+        # Configure trace options before starting
+        if log_text:
+            self.set_trace_log(log_text, log_condition)
+        if command_text:
+            self.set_trace_command(command_text, command_condition)
+        if log_file:
+            self.set_trace_log_file(log_file)
+
+        # Execute conditional trace-into
+        cmd = f"ticnd {condition.strip()}, {max_steps}"
+        self.execute_command(cmd)
+
+        # Wait for trace to complete — use generous timeout
+        timeout_ms = max(60000, max_steps * 2)
+        wait_result = self.wait_until_paused(timeout=timeout_ms)
+
+        result = {
+            "success": wait_result.get("success", False),
+            "condition": condition.strip(),
+            "max_steps": max_steps,
+            "current_address": wait_result.get("current_address", "unknown"),
+            "elapsed_ms": wait_result.get("elapsed_ms", 0),
+            "trace_type": "trace_into",
+        }
+
+        if log_file:
+            result["log_file"] = log_file
+
+        logger.info(
+            f"Trace into conditional completed: condition={condition.strip()}, "
+            f"success={result['success']}"
+        )
+        return result
+
+    def trace_over_conditional(
+        self,
+        condition: str,
+        max_steps: int = 50000,
+        log_text: str = "",
+        log_condition: str = "",
+        command_text: str = "",
+        command_condition: str = "",
+        log_file: str = "",
+    ) -> dict[str, Any]:
+        """
+        Trace over (skipping calls) until condition is met.
+
+        Executes the x64dbg ``tocnd`` command which single-steps over calls,
+        evaluating the condition at each step until it becomes true.
+
+        Args:
+            condition: Break condition expression (e.g. "rax==1", "eip<module.base")
+            max_steps: Maximum number of steps before aborting (default: 50000)
+            log_text: Optional log format string for each step
+            log_condition: Optional condition for logging
+            command_text: Optional command to execute at each step
+            command_condition: Optional condition for command execution
+            log_file: Optional file path for trace log output
+
+        Returns:
+            Dictionary with success, current_address, and trace details
+        """
+        if not condition or not condition.strip():
+            raise ValueError("Trace condition cannot be empty")
+
+        # Configure trace options before starting
+        if log_text:
+            self.set_trace_log(log_text, log_condition)
+        if command_text:
+            self.set_trace_command(command_text, command_condition)
+        if log_file:
+            self.set_trace_log_file(log_file)
+
+        # Execute conditional trace-over
+        cmd = f"tocnd {condition.strip()}, {max_steps}"
+        self.execute_command(cmd)
+
+        # Wait for trace to complete
+        timeout_ms = max(60000, max_steps * 2)
+        wait_result = self.wait_until_paused(timeout=timeout_ms)
+
+        result = {
+            "success": wait_result.get("success", False),
+            "condition": condition.strip(),
+            "max_steps": max_steps,
+            "current_address": wait_result.get("current_address", "unknown"),
+            "elapsed_ms": wait_result.get("elapsed_ms", 0),
+            "trace_type": "trace_over",
+        }
+
+        if log_file:
+            result["log_file"] = log_file
+
+        logger.info(
+            f"Trace over conditional completed: condition={condition.strip()}, "
+            f"success={result['success']}"
+        )
+        return result
+
+    def trace_into_beyond_record(self, max_steps: int = 50000) -> dict[str, Any]:
+        """
+        Trace into beyond the last record (OEP finding).
+
+        Executes ``tibt`` — traces into calls, recording execution, and stops
+        when execution goes beyond any previously recorded address. Used
+        primarily for finding the Original Entry Point (OEP) of packed binaries.
+
+        Args:
+            max_steps: Maximum number of steps (default: 50000)
+
+        Returns:
+            Dictionary with success, current_address (likely OEP)
+        """
+        cmd = f"tibt {max_steps}"
+        self.execute_command(cmd)
+
+        timeout_ms = max(60000, max_steps * 2)
+        wait_result = self.wait_until_paused(timeout=timeout_ms)
+
+        result = {
+            "success": wait_result.get("success", False),
+            "current_address": wait_result.get("current_address", "unknown"),
+            "elapsed_ms": wait_result.get("elapsed_ms", 0),
+            "max_steps": max_steps,
+            "trace_type": "trace_into_beyond_record",
+        }
+
+        logger.info(
+            f"Trace into beyond record completed: "
+            f"address={result['current_address']}, success={result['success']}"
+        )
+        return result
+
+    def trace_over_beyond_record(self, max_steps: int = 50000) -> dict[str, Any]:
+        """
+        Trace over beyond the last record (OEP finding, skipping calls).
+
+        Executes ``tobt`` — traces over calls, recording execution, and stops
+        when execution goes beyond any previously recorded address.
+
+        Args:
+            max_steps: Maximum number of steps (default: 50000)
+
+        Returns:
+            Dictionary with success, current_address
+        """
+        cmd = f"tobt {max_steps}"
+        self.execute_command(cmd)
+
+        timeout_ms = max(60000, max_steps * 2)
+        wait_result = self.wait_until_paused(timeout=timeout_ms)
+
+        result = {
+            "success": wait_result.get("success", False),
+            "current_address": wait_result.get("current_address", "unknown"),
+            "elapsed_ms": wait_result.get("elapsed_ms", 0),
+            "max_steps": max_steps,
+            "trace_type": "trace_over_beyond_record",
+        }
+
+        logger.info(
+            f"Trace over beyond record completed: "
+            f"address={result['current_address']}, success={result['success']}"
+        )
         return result

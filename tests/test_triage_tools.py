@@ -2,8 +2,6 @@
 
 import struct
 
-import pytest
-
 from src.tools.triage_tools import detect_file_type, detect_packer
 
 

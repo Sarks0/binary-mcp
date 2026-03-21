@@ -225,11 +225,13 @@ def detect_crypto_patterns(data: bytes) -> list[dict]:
     """
     patterns = []
 
-    # Overall entropy
-    entropy = calculate_entropy(data)
+    # Overall entropy (sample for large files to avoid slow calculation)
+    entropy_sample = data[:65536] if len(data) > 65536 else data
+    entropy = calculate_entropy(entropy_sample)
 
-    # Check for Base64
-    b64_result = detect_base64(data)
+    # Check for Base64 (only first 64KB — Base64 payloads are in headers/resources)
+    b64_sample = data[:65536] if len(data) > 65536 else data
+    b64_result = detect_base64(b64_sample)
     if b64_result["detected"]:
         patterns.append({
             "type": "base64",
@@ -240,8 +242,11 @@ def detect_crypto_patterns(data: bytes) -> list[dict]:
             }
         })
 
+    # XOR analysis on a sample (10KB) — full-file XOR is O(n * 256) per key length
+    xor_sample = data[:10240] if len(data) > 10240 else data
+
     # Check for single-byte XOR
-    xor_candidates = analyze_xor(data, key_length_range=(1, 1))
+    xor_candidates = analyze_xor(xor_sample, key_length_range=(1, 1))
     if xor_candidates and xor_candidates[0]["confidence"] > 0.5:
         candidate = xor_candidates[0]
         patterns.append({
@@ -254,7 +259,7 @@ def detect_crypto_patterns(data: bytes) -> list[dict]:
         })
 
     # Check for multi-byte XOR
-    xor_candidates = analyze_xor(data, key_length_range=(2, 8))
+    xor_candidates = analyze_xor(xor_sample, key_length_range=(2, 8))
     if xor_candidates and xor_candidates[0]["confidence"] > 0.5:
         candidate = xor_candidates[0]
         patterns.append({

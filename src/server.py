@@ -2253,8 +2253,11 @@ def detect_crypto_patterns(binary_path: str) -> str:
         if not path.exists():
             return f"Error: File not found: {binary_path}"
 
-        data = path.read_bytes()
-        entropy = calculate_entropy(data)
+        # Read file, cap at 500KB for crypto analysis (patterns are in headers/early data)
+        file_size = path.stat().st_size
+        with open(path, "rb") as f:
+            data = f.read(min(file_size, 512 * 1024))
+        entropy = calculate_entropy(data[:65536] if len(data) > 65536 else data)
         patterns = analyze(data)
 
         # Build output

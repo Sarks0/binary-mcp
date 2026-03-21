@@ -12,11 +12,10 @@ import time
 
 from ghidra.app.decompiler import DecompInterface
 from ghidra.program.model.block import BasicBlockModel
-from ghidra.program.model.data import Enum as GhidraEnum, Structure as GhidraStructure
+from ghidra.program.model.data import Enum as GhidraEnum
+from ghidra.program.model.data import Structure as GhidraStructure
 from ghidra.util.task import ConsoleTaskMonitor
 from java.lang import InterruptedException, Thread
-
-# Java imports for thread-based timeout handling
 from java.util.concurrent import Callable, Executors, TimeoutException, TimeUnit
 
 

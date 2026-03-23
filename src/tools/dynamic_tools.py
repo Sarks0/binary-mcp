@@ -3748,7 +3748,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
     # This prevents arbitrary code execution via ScriptDll, loadlib, savedata, etc.
     # Internal bridge methods (watches, types, trace, etc.) bypass this check since
     # they construct commands from validated parameters with known-safe prefixes.
-    _ALLOWED_COMMAND_PREFIXES = frozenset({
+    allowed_command_prefixes = frozenset({
         # Analysis & navigation
         "dis", "dis.prev", "dis.next", "dis.iscall", "dis.isbranch",
         "findall", "find", "findmem", "findallmem",
@@ -3829,7 +3829,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             cmd_stripped = command.strip()
             # Handle commands like "dis.prev(rip, 5)" -> "dis.prev"
             first_token = cmd_stripped.split()[0].split("(")[0].split(",")[0].lower()
-            if first_token not in _ALLOWED_COMMAND_PREFIXES:
+            if first_token not in allowed_command_prefixes:
                 return (
                     f"Error: Command '{first_token}' is not in the allowed command list. "
                     f"Only safe analysis and navigation commands are permitted. "

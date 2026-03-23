@@ -1992,19 +1992,50 @@ class X64DbgBridge(Debugger):
             "message": result.get("message", "Instruction undone"),
         }
 
+    # Commands that must never reach DbgCmdExec — they load external code,
+    # write arbitrary files, or compromise the debugging session.
+    _BLOCKED_COMMANDS = frozenset({
+        "scriptdll", "scriptload", "scriptrun",
+        "loadlib", "freelib",
+        "savedata", "savefile",
+        "quit", "stop", "exit",
+        "detach", "attach", "init",
+        "exec", "execute",
+        "createthread",
+    })
+
+    def _validate_command(self, command: str) -> None:
+        """
+        Validate a command against the blocked commands list.
+
+        Raises:
+            ValueError: If the command is blocked for security reasons
+        """
+        first_token = command.strip().split()[0].split("(")[0].lower()
+        if first_token in self._BLOCKED_COMMANDS:
+            raise ValueError(
+                f"Command '{first_token}' is blocked by security policy. "
+                f"This command could load external code or compromise the session."
+            )
+
     def execute_command(self, command: str) -> dict[str, Any]:
         """
-        Execute an arbitrary x64dbg command via the command API.
+        Execute an x64dbg command via the command API.
 
-        This is a low-level method that sends any command string to x64dbg.
-        Security validation should be performed by the caller (MCP tool layer).
+        Commands are validated against a blocklist of dangerous operations
+        (ScriptDll, loadlib, savedata, etc.) before being sent. The plugin
+        also enforces its own server-side blocklist as defense-in-depth.
 
         Args:
             command: The x64dbg command string to execute
 
         Returns:
             Dictionary with command result from the API
+
+        Raises:
+            ValueError: If the command is blocked for security reasons
         """
+        self._validate_command(command)
         result = self._request_with_retry("/api/command", {"command": command})
         return result
 

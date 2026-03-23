@@ -3619,7 +3619,39 @@ void OnSystemBreakpoint(CBTYPE cbType, PLUG_CB_SYSTEMBREAKPOINT* info) {
     );
 }
 
-// Handler: EXECUTE_COMMAND - Execute an arbitrary x64dbg command
+// Defense-in-depth: server-side allowlist for EXECUTE_COMMAND.
+// Blocks commands that could load external code, write arbitrary files,
+// or compromise the debugger/analyst host. The Python layer has its own
+// allowlist; this is a safety net in case it is bypassed.
+static const char* BLOCKED_COMMAND_PREFIXES[] = {
+    "scriptdll", "scriptload", "scriptrun",
+    "loadlib", "freelib",
+    "savedata", "savefile",
+    "quit", "stop", "exit",
+    "detach", "attach", "init",
+    "exec", "execute",
+    "createthread",
+    nullptr  // sentinel
+};
+
+static bool IsCommandBlocked(const std::string& command) {
+    // Extract first word, lowercased
+    std::string firstWord;
+    for (size_t i = 0; i < command.size(); i++) {
+        char c = command[i];
+        if (c == ' ' || c == '\t' || c == '(' || c == ',') break;
+        firstWord += (char)tolower((unsigned char)c);
+    }
+
+    for (int i = 0; BLOCKED_COMMAND_PREFIXES[i] != nullptr; i++) {
+        if (firstWord == BLOCKED_COMMAND_PREFIXES[i]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Handler: EXECUTE_COMMAND - Execute a validated x64dbg command
 std::string HandleExecuteCommand(const std::string& request) {
     std::string command = ExtractStringField(request, "command");
     if (command.empty()) {
@@ -3628,6 +3660,12 @@ std::string HandleExecuteCommand(const std::string& request) {
 
     if (!DbgIsDebugging()) {
         return BuildJsonResponse(false, "\"error\":\"Not debugging - load a binary first\"");
+    }
+
+    // Defense-in-depth: reject dangerous commands at the plugin level
+    if (IsCommandBlocked(command)) {
+        LogInfo("Blocked dangerous command: %s", command.c_str());
+        return BuildJsonResponse(false, "\"error\":\"Command blocked by security policy\"");
     }
 
     LogInfo("Executing command: %s", command.c_str());

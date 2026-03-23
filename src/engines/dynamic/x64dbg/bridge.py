@@ -1994,6 +1994,9 @@ class X64DbgBridge(Debugger):
 
     # Commands that must never reach DbgCmdExec — they load external code,
     # write arbitrary files, or compromise the debugging session.
+    # Trace configuration commands are also blocked here because their
+    # arguments (arbitrary commands, file paths) bypass validation — use
+    # the dedicated set_trace_command / set_trace_log_file methods instead.
     _BLOCKED_COMMANDS = frozenset({
         "scriptdll", "scriptload", "scriptrun",
         "loadlib", "freelib",
@@ -2002,6 +2005,7 @@ class X64DbgBridge(Debugger):
         "detach", "attach", "init",
         "exec", "execute",
         "createthread",
+        "tracesetcommand", "tracesetlog", "tracesetlogfile",
     })
 
     def _validate_command(self, command: str) -> None:
@@ -5719,15 +5723,25 @@ class X64DbgBridge(Debugger):
         """
         Configure a command to execute at each trace step.
 
+        The inner command is validated against the blocked commands list
+        to prevent staging dangerous commands (ScriptDll, loadlib, etc.)
+        for execution by the trace engine.
+
         Args:
             command: x64dbg command to run per step
             condition: Optional condition — only run when true
 
         Returns:
             Command result dictionary
+
+        Raises:
+            ValueError: If the inner command is blocked for security reasons
         """
         if not command or not command.strip():
             raise ValueError("Trace command cannot be empty")
+        # Validate the INNER command against the blocklist — the trace engine
+        # will execute it directly, bypassing the normal command validation path.
+        self._validate_command(command.strip())
         cmd = f"TraceSetCommand {command.strip()}"
         if condition and condition.strip():
             cmd += f", {condition.strip()}"

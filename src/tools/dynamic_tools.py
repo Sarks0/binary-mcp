@@ -3782,8 +3782,11 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
         "setwatchexpression", "setwatchname",
         # DLL breakpoints
         "bpdll", "bcdll", "bpedll", "bpddll",
-        # Trace configuration (setting trace params, not loading code)
-        "tracesetcommand", "tracesetlog", "tracesetlogfile",
+        # Trace configuration — tracesetcommand, tracesetlog, tracesetlogfile
+        # are intentionally EXCLUDED from this allowlist because their arguments
+        # (arbitrary commands, file paths) bypass security validation. Use the
+        # dedicated tools x64dbg_set_trace_command and x64dbg_set_trace_log_file
+        # which apply proper validation.
         "tracesetcondition",
         # Dump/view (read-only inspection)
         "dump", "sdump",

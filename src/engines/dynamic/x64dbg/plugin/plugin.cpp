@@ -3631,6 +3631,7 @@ static const char* BLOCKED_COMMAND_PREFIXES[] = {
     "detach", "attach", "init",
     "exec", "execute",
     "createthread",
+    "tracesetcommand", "tracesetlog", "tracesetlogfile",
     nullptr  // sentinel
 };
 

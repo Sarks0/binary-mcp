@@ -402,7 +402,7 @@ def get_analysis_context(
             raise UserFacingError(user_message, internal_details=internal_details)
 
         # Load analysis results
-        with open(output_path) as f:
+        with open(output_path, encoding="utf-8") as f:
             context = json.load(f)
 
         # Validate the analysis context has meaningful data

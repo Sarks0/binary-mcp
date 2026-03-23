@@ -1617,8 +1617,8 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                     module = api_modules.get(api_name, "kernel32")
 
                     # Use x64dbg's expression evaluation to get API address
-                    # Format: module.apiname
-                    api_expr = f"{module}.{api_name}"
+                    # Format: module!apiname (x64dbg symbol syntax)
+                    api_expr = f"{module}!{api_name}"
 
                     # Set conditional breakpoint that logs and continues
                     # This uses x64dbg's logging breakpoint feature

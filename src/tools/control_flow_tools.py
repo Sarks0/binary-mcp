@@ -67,7 +67,7 @@ def _get_or_run_analysis(binary_path: str, cache, runner) -> dict:
             "Ghidra did not produce output. The binary format may be unsupported."
         )
 
-    with open(output_path) as f:
+    with open(output_path, encoding="utf-8") as f:
         context = json.load(f)
 
     cache.save_cached(str(binary_path), context)

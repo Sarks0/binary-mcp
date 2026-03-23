@@ -320,6 +320,8 @@ class GhidraRunner:
                 env=env,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=timeout,
                 shell=False,  # Changed: shell=False to fix Windows path handling
                 check=True,
@@ -391,6 +393,8 @@ class GhidraRunner:
                 ["java", "-version"],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=5,
             )
             diag["java_installed"] = True
@@ -403,7 +407,7 @@ class GhidraRunner:
         version_file = self.ghidra_path / "application.properties"
         if version_file.exists():
             try:
-                with open(version_file) as f:
+                with open(version_file, encoding="utf-8") as f:
                     for line in f:
                         if line.startswith("application.version"):
                             diag["ghidra_version"] = line.split("=")[1].strip()

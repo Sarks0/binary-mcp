@@ -37,6 +37,7 @@ enum RequestType {
     GET_STACK = 13,
     GET_MODULES = 14,
     GET_THREADS = 15,
+    EXECUTE_COMMAND = 16,
 
     // Breakpoints
     SET_BREAKPOINT = 20,
@@ -3618,6 +3619,31 @@ void OnSystemBreakpoint(CBTYPE cbType, PLUG_CB_SYSTEMBREAKPOINT* info) {
     );
 }
 
+// Handler: EXECUTE_COMMAND - Execute an arbitrary x64dbg command
+std::string HandleExecuteCommand(const std::string& request) {
+    std::string command = ExtractStringField(request, "command");
+    if (command.empty()) {
+        return BuildJsonResponse(false, "\"error\":\"Missing command parameter\"");
+    }
+
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging - load a binary first\"");
+    }
+
+    LogInfo("Executing command: %s", command.c_str());
+
+    if (DbgCmdExec(command.c_str())) {
+        std::stringstream data;
+        data << "\"command\":\"" << JsonEscape(command) << "\","
+             << "\"executed\":true";
+        return BuildJsonResponse(true, data.str());
+    } else {
+        std::stringstream data;
+        data << "\"error\":\"Command failed: " << JsonEscape(command) << "\"";
+        return BuildJsonResponse(false, data.str());
+    }
+}
+
 // Handler: LOAD_BINARY - Load binary into debugger
 std::string HandleLoadBinary(const std::string& request) {
     std::string path = ExtractStringField(request, "path");
@@ -3757,6 +3783,9 @@ static DWORD WINAPI PipeServerThread(LPVOID lpParam) {
                         break;
                     case LOAD_BINARY:
                         response = HandleLoadBinary(request);
+                        break;
+                    case EXECUTE_COMMAND:
+                        response = HandleExecuteCommand(request);
                         break;
                     case GET_REGISTERS:
                         response = HandleGetRegisters(request);

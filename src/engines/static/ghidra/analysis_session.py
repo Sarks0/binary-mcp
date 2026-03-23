@@ -198,7 +198,7 @@ class AnalysisSession:
             }
 
             # Save metadata
-            with open(metadata_path, "w") as f:
+            with open(metadata_path, "w", encoding="utf-8") as f:
                 json.dump(metadata, f, indent=2)
 
             logger.info(f"Saved session: {session_data.get('name')} (ID: {session_id[:8]}..., {tool_count} tools, {total_output_size / 1024:.1f} KB)")
@@ -259,7 +259,7 @@ class AnalysisSession:
             if not metadata_path.exists():
                 return None
 
-            with open(metadata_path) as f:
+            with open(metadata_path, encoding="utf-8") as f:
                 return json.load(f)
 
         except Exception as e:
@@ -341,7 +341,7 @@ class AnalysisSession:
 
         for meta_file in self.store_dir.glob("*.meta.json"):
             try:
-                with open(meta_file) as f:
+                with open(meta_file, encoding="utf-8") as f:
                     metadata = json.load(f)
 
                 # Apply filters

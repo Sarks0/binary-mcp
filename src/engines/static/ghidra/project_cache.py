@@ -90,7 +90,7 @@ class ProjectCache:
                 logger.debug(f"No cache found for {binary_path}")
                 return None
 
-            with open(cache_path) as f:
+            with open(cache_path, encoding="utf-8") as f:
                 data = json.load(f)
 
             logger.info(f"Cache hit for {binary_path} (hash: {binary_hash[:8]}...)")
@@ -117,7 +117,7 @@ class ProjectCache:
             metadata_path = self._get_metadata_path(binary_hash)
 
             # Save analysis data
-            with open(cache_path, "w") as f:
+            with open(cache_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
 
             # Save metadata
@@ -129,7 +129,7 @@ class ProjectCache:
                 "cache_version": "1.0",
             }
 
-            with open(metadata_path, "w") as f:
+            with open(metadata_path, "w", encoding="utf-8") as f:
                 json.dump(metadata, f, indent=2)
 
             logger.info(f"Saved cache for {binary_path} (hash: {binary_hash[:8]}...)")
@@ -183,7 +183,7 @@ class ProjectCache:
             if not metadata_path.exists():
                 return None
 
-            with open(metadata_path) as f:
+            with open(metadata_path, encoding="utf-8") as f:
                 return json.load(f)
 
         except Exception as e:
@@ -201,7 +201,7 @@ class ProjectCache:
 
         for meta_file in self.cache_dir.glob("*.meta.json"):
             try:
-                with open(meta_file) as f:
+                with open(meta_file, encoding="utf-8") as f:
                     metadata = json.load(f)
                 cached_binaries.append(metadata)
             except Exception as e:

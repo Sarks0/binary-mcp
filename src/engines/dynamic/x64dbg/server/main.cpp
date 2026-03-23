@@ -354,6 +354,8 @@ std::string HandleHTTPRequest(const std::string& request) {
         requestType = 20;  // SET_BREAKPOINT
 
     // Core Functionality (Not Yet Implemented)
+    } else if (path == "/api/command") {
+        requestType = 16;  // EXECUTE_COMMAND
     } else if (path == "/api/load") {
         requestType = 2;  // LOAD_BINARY
     } else if (path == "/api/run") {
@@ -643,19 +645,54 @@ bool StartHTTPServer(int port) {
         int sendTimeout = 5000;
         setsockopt(clientSocket, SOL_SOCKET, SO_SNDTIMEO, (const char*)&sendTimeout, sizeof(sendTimeout));
 
-        // Read HTTP request
-        char buffer[8192];
-        int bytesRead = recv(clientSocket, buffer, sizeof(buffer) - 1, 0);
+        // Read HTTP request - loop until we have the full body
+        std::string request;
+        {
+            char buffer[8192];
+            int bytesRead = recv(clientSocket, buffer, sizeof(buffer) - 1, 0);
 
-        if (bytesRead > 0) {
-            buffer[bytesRead] = '\0';
-            std::string request(buffer, bytesRead);
+            if (bytesRead > 0) {
+                request.assign(buffer, bytesRead);
 
+                // For POST requests, ensure we receive the full body
+                // by checking Content-Length against actual body received
+                size_t headerEnd = request.find("\r\n\r\n");
+                if (headerEnd != std::string::npos) {
+                    // Extract Content-Length from headers
+                    int contentLength = 0;
+                    std::string clHeader = "Content-Length:";
+                    size_t clPos = request.find(clHeader);
+                    if (clPos == std::string::npos) {
+                        clHeader = "content-length:";
+                        clPos = request.find(clHeader);
+                    }
+                    if (clPos != std::string::npos) {
+                        size_t valStart = clPos + clHeader.length();
+                        while (valStart < request.length() && request[valStart] == ' ') valStart++;
+                        contentLength = atoi(request.c_str() + valStart);
+                    }
+
+                    // Calculate how much body we've received so far
+                    size_t bodyStart = headerEnd + 4;
+                    size_t bodyReceived = request.length() - bodyStart;
+
+                    // Keep reading until we have the full body
+                    while (contentLength > 0 && (int)bodyReceived < contentLength) {
+                        bytesRead = recv(clientSocket, buffer, sizeof(buffer) - 1, 0);
+                        if (bytesRead <= 0) break;
+                        request.append(buffer, bytesRead);
+                        bodyReceived += bytesRead;
+                    }
+                }
+            } else if (bytesRead == SOCKET_ERROR) {
+                Log("Recv failed: %d", WSAGetLastError());
+            }
+        }
+
+        if (!request.empty()) {
             // Handle request and send response
             std::string response = HandleHTTPRequest(request);
             send(clientSocket, response.c_str(), (int)response.size(), 0);
-        } else if (bytesRead == SOCKET_ERROR) {
-            Log("Recv failed: %d", WSAGetLastError());
         }
 
         closesocket(clientSocket);

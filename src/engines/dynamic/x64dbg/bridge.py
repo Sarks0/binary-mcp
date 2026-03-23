@@ -1992,19 +1992,54 @@ class X64DbgBridge(Debugger):
             "message": result.get("message", "Instruction undone"),
         }
 
+    # Commands that must never reach DbgCmdExec — they load external code,
+    # write arbitrary files, or compromise the debugging session.
+    # Trace configuration commands are also blocked here because their
+    # arguments (arbitrary commands, file paths) bypass validation — use
+    # the dedicated set_trace_command / set_trace_log_file methods instead.
+    _BLOCKED_COMMANDS = frozenset({
+        "scriptdll", "scriptload", "scriptrun",
+        "loadlib", "freelib",
+        "savedata", "savefile",
+        "quit", "stop", "exit",
+        "detach", "attach", "init",
+        "exec", "execute",
+        "createthread",
+        "tracesetcommand", "tracesetlog", "tracesetlogfile",
+    })
+
+    def _validate_command(self, command: str) -> None:
+        """
+        Validate a command against the blocked commands list.
+
+        Raises:
+            ValueError: If the command is blocked for security reasons
+        """
+        first_token = command.strip().split()[0].split("(")[0].lower()
+        if first_token in self._BLOCKED_COMMANDS:
+            raise ValueError(
+                f"Command '{first_token}' is blocked by security policy. "
+                f"This command could load external code or compromise the session."
+            )
+
     def execute_command(self, command: str) -> dict[str, Any]:
         """
-        Execute an arbitrary x64dbg command via the command API.
+        Execute an x64dbg command via the command API.
 
-        This is a low-level method that sends any command string to x64dbg.
-        Security validation should be performed by the caller (MCP tool layer).
+        Commands are validated against a blocklist of dangerous operations
+        (ScriptDll, loadlib, savedata, etc.) before being sent. The plugin
+        also enforces its own server-side blocklist as defense-in-depth.
 
         Args:
             command: The x64dbg command string to execute
 
         Returns:
             Dictionary with command result from the API
+
+        Raises:
+            ValueError: If the command is blocked for security reasons
         """
+        self._validate_command(command)
         result = self._request_with_retry("/api/command", {"command": command})
         return result
 
@@ -5688,15 +5723,25 @@ class X64DbgBridge(Debugger):
         """
         Configure a command to execute at each trace step.
 
+        The inner command is validated against the blocked commands list
+        to prevent staging dangerous commands (ScriptDll, loadlib, etc.)
+        for execution by the trace engine.
+
         Args:
             command: x64dbg command to run per step
             condition: Optional condition — only run when true
 
         Returns:
             Command result dictionary
+
+        Raises:
+            ValueError: If the inner command is blocked for security reasons
         """
         if not command or not command.strip():
             raise ValueError("Trace command cannot be empty")
+        # Validate the INNER command against the blocklist — the trace engine
+        # will execute it directly, bypassing the normal command validation path.
+        self._validate_command(command.strip())
         cmd = f"TraceSetCommand {command.strip()}"
         if condition and condition.strip():
             cmd += f", {condition.strip()}"

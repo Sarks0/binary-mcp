@@ -1617,8 +1617,8 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                     module = api_modules.get(api_name, "kernel32")
 
                     # Use x64dbg's expression evaluation to get API address
-                    # Format: module.apiname
-                    api_expr = f"{module}.{api_name}"
+                    # Format: module!apiname (x64dbg symbol syntax)
+                    api_expr = f"{module}!{api_name}"
 
                     # Set conditional breakpoint that logs and continues
                     # This uses x64dbg's logging breakpoint feature
@@ -3743,9 +3743,53 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_undo_instruction failed: {e}")
             return f"Error: {e}"
 
-    # Security: blocked commands that could disrupt the debugging session
-    blocked_commands = frozenset({
-        "quit", "stop", "exit", "detach", "attach", "init",
+    # Security: allowlist of safe x64dbg command prefixes.
+    # Only commands starting with these words are permitted through execute_command.
+    # This prevents arbitrary code execution via ScriptDll, loadlib, savedata, etc.
+    # Internal bridge methods (watches, types, trace, etc.) bypass this check since
+    # they construct commands from validated parameters with known-safe prefixes.
+    allowed_command_prefixes = frozenset({
+        # Analysis & navigation
+        "dis", "dis.prev", "dis.next", "dis.iscall", "dis.isbranch",
+        "findall", "find", "findmem", "findallmem",
+        "log", "msg",
+        "graph", "graphit",
+        # Breakpoint listing/info (setting is handled by dedicated tools)
+        "bplist", "bphitcount",
+        # Analysis commands
+        "cfanalyze", "analxrefs", "analrecur", "analadv", "analyse",
+        "exhandlers", "exinfo",
+        "rtu",
+        "instrundo",
+        # Search & reference
+        "ref", "refstr", "refsearch", "refinfo",
+        "modcallfind",
+        # Expression evaluation (read-only)
+        "eval",
+        # Labels and comments (annotation, not code exec)
+        "lbl", "lblset", "lbldel", "lbllist",
+        "cmt", "cmtset", "cmtdel", "cmtlist",
+        # Bookmarks
+        "bm", "bmset", "bmdel", "bmlist",
+        # Variable inspection (read-only)
+        "varlist", "var",
+        # Type system
+        "addstruct", "addunion", "addmember", "addtype",
+        "visittype", "sizeoftype", "removetype",
+        "enumtypes", "cleartypes", "loadtypes", "parsetypes",
+        # Watch expressions
+        "addwatch", "delwatch", "setwatchdog",
+        "setwatchexpression", "setwatchname",
+        # DLL breakpoints
+        "bpdll", "bcdll", "bpedll", "bpddll",
+        # Trace configuration — tracesetcommand, tracesetlog, tracesetlogfile
+        # are intentionally EXCLUDED from this allowlist because their arguments
+        # (arbitrary commands, file paths) bypass security validation. Use the
+        # dedicated tools x64dbg_set_trace_command and x64dbg_set_trace_log_file
+        # which apply proper validation.
+        "tracesetcondition",
+        # Dump/view (read-only inspection)
+        "dump", "sdump",
     })
 
     @app.tool()
@@ -3754,9 +3798,11 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
         """
         Execute a generic x64dbg command.
 
-        Sends an arbitrary command string to x64dbg for execution.
-        Dangerous commands (quit, stop, exit, detach, attach, init)
-        are blocked for safety.
+        Sends a command string to x64dbg for execution. Only commands from
+        a curated allowlist of safe analysis/navigation commands are permitted.
+        Commands that could load external code (ScriptDll, loadlib), write
+        arbitrary files (savedata), or disrupt the session (quit, detach)
+        are rejected.
 
         Args:
             command: x64dbg command string (e.g. "dis.prev(rip, 5)", "findall 0, E8")
@@ -3766,8 +3812,8 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         Use Cases:
             - Run analysis commands not covered by other tools
-            - Execute script commands
-            - Access advanced x64dbg features
+            - Navigate disassembly
+            - Search for patterns and references
 
         Examples:
             x64dbg_execute_command("dis.prev(rip, 5)")
@@ -3778,12 +3824,17 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             if not command or not command.strip():
                 return "Error: Command cannot be empty"
 
-            # Security: block dangerous commands by checking the first word
-            first_word = command.strip().split()[0].lower()
-            if first_word in blocked_commands:
+            # Security: only allow commands from the curated safe allowlist.
+            # Extract the command name (first word, before any space/paren/comma).
+            cmd_stripped = command.strip()
+            # Handle commands like "dis.prev(rip, 5)" -> "dis.prev"
+            first_token = cmd_stripped.split()[0].split("(")[0].split(",")[0].lower()
+            if first_token not in allowed_command_prefixes:
                 return (
-                    f"Error: Command '{first_word}' is blocked for safety. "
-                    f"Blocked commands: {', '.join(sorted(blocked_commands))}"
+                    f"Error: Command '{first_token}' is not in the allowed command list. "
+                    f"Only safe analysis and navigation commands are permitted. "
+                    f"Use dedicated tools (x64dbg_set_breakpoint, x64dbg_read_memory, etc.) "
+                    f"for other operations."
                 )
 
             bridge = get_x64dbg_bridge()

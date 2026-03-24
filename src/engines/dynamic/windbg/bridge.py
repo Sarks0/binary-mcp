@@ -112,9 +112,7 @@ _BLOCKED_COMMANDS = (
 )
 
 
-# ---------------------------------------------------------------------------
-# Debug trace — activate with WINDBG_DEBUG=1 to log all bridge calls to file
-# ---------------------------------------------------------------------------
+# --- Debug trace — activate with WINDBG_DEBUG=1 to log all bridge calls to file ---
 def _setup_debug_log() -> logging.Logger:
     """Configure file logging when WINDBG_DEBUG env var is set."""
     debug_logger = logging.getLogger("windbg.trace")
@@ -200,9 +198,7 @@ class WinDbgBridge(Debugger):
 
         logger.info("WinDbgBridge initialized (pybag=%s)", PYBAG_AVAILABLE)
 
-    # ------------------------------------------------------------------
-    # Debugger ABC implementation
-    # ------------------------------------------------------------------
+    # --- Debugger ABC implementation ---
 
     @_trace
     def connect(self, timeout: int = 10) -> bool:
@@ -434,9 +430,7 @@ class WinDbgBridge(Debugger):
             except Exception:
                 return {"address": "unavailable", "note": "register access limited in this mode"}
 
-    # ------------------------------------------------------------------
-    # Kernel-specific methods
-    # ------------------------------------------------------------------
+    # --- Kernel-specific methods ---
 
     @_trace
     def connect_kernel_net(self, port: int, key: str) -> bool:
@@ -681,9 +675,7 @@ class WinDbgBridge(Debugger):
         self._require_connected()
         return self.execute_command(f"!object {path}")
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
+    # --- Internal helpers ---
 
     @staticmethod
     def _find_cdb() -> Path | None:

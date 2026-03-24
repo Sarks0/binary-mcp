@@ -1273,7 +1273,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_list_breakpoints failed: {e}")
             return f"Error: {e}"
 
-    # ── Exception handling control tools ────────────────────────────────
+    # --- Exception handling control tools ---
 
     @app.tool()
     @log_dynamic_tool
@@ -2486,7 +2486,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                         "See FUTURE_FEATURES.md for implementation status.")
             return f"Error: {e}"
 
-    # ── Advanced search tools ────────────────────────────────────────
+    # --- Advanced search tools ---
 
     @app.tool()
     @log_dynamic_tool
@@ -4183,9 +4183,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return ("Error: Anti-debug status requires C++ plugin implementation")
             return f"Error: {e}"
 
-    # =========================================================================
-    # Event System Tools
-    # =========================================================================
+    # --- Event System Tools ---
 
     @app.tool()
     @log_dynamic_tool
@@ -4376,9 +4374,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_run_until_event failed: {e}")
             return f"Error: {e}"
 
-    # =========================================================================
-    # Memory Allocation Tools (Phase 3)
-    # =========================================================================
+    # --- Memory Allocation Tools (Phase 3) ---
 
     @app.tool()
     @log_dynamic_tool
@@ -4597,9 +4593,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_check_memory failed: {e}")
             return f"Error: {e}"
 
-    # =========================================================================
-    # Enhanced Breakpoint Tools (Phase 3)
-    # =========================================================================
+    # --- Enhanced Breakpoint Tools (Phase 3) ---
 
     @app.tool()
     @log_dynamic_tool
@@ -4802,9 +4796,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_list_all_breakpoints failed: {e}")
             return f"Error: {e}"
 
-    # =========================================================================
-    # P2: Conditional Breakpoint Logging
-    # =========================================================================
+    # --- P2: Conditional Breakpoint Logging ---
 
     @app.tool()
     @log_dynamic_tool
@@ -5140,9 +5132,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_clear_breakpoint_logs failed: {e}")
             return f"Error: {e}"
 
-    # =========================================================================
-    # P2: Native Conditional Breakpoint with Logging (Enhanced)
-    # =========================================================================
+    # --- P2: Native Conditional Breakpoint with Logging (Enhanced) ---
 
     @app.tool()
     @log_dynamic_tool
@@ -5631,9 +5621,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_get_bp_logs failed: {e}")
             return f"Error: {e}"
 
-    # =========================================================================
-    # P2: Static/Dynamic Cross-Reference
-    # =========================================================================
+    # --- P2: Static/Dynamic Cross-Reference ---
 
     @app.tool()
     @log_dynamic_tool
@@ -6056,9 +6044,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_get_runtime_function_address failed: {e}")
             return f"Error: {e}"
 
-    # =========================================================================
-    # Static/Dynamic Cross-Reference (Ghidra Cache Integration)
-    # =========================================================================
+    # --- Static/Dynamic Cross-Reference (Ghidra Cache Integration) ---
 
     @app.tool()
     @log_dynamic_tool
@@ -6557,9 +6543,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_refresh_function_cache failed: {e}")
             return f"Error: {e}"
 
-    # =========================================================================
-    # P2: Session State Persistence
-    # =========================================================================
+    # --- P2: Session State Persistence ---
 
     @app.tool()
     @log_dynamic_tool
@@ -6957,9 +6941,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_delete_debug_state failed: {e}")
             return safe_error_message("Failed to delete debug state", e)
 
-    # =========================================================================
-    # P2: API Hook Detection
-    # =========================================================================
+    # --- P2: API Hook Detection ---
 
     @app.tool()
     @log_dynamic_tool
@@ -7331,9 +7313,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_unhook_function failed: {e}")
             return f"Error: {e}"
 
-    # =========================================================================
-    # P2: Memory Watch and Diff
-    # =========================================================================
+    # --- P2: Memory Watch and Diff ---
 
     @app.tool()
     @log_dynamic_tool
@@ -7937,7 +7917,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_delete_memory_watch failed: {e}")
             return f"Error: {e}"
 
-    # ── Watch expression tools ───────────────────────────────────────
+    # --- Watch expression tools ---
 
     @app.tool()
     @log_dynamic_tool
@@ -8038,7 +8018,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_set_watchdog failed: {e}")
             return format_error_response(e, "set_watchdog")
 
-    # ── DLL breakpoint tools ─────────────────────────────────────────
+    # --- DLL breakpoint tools ---
 
     @app.tool()
     @log_dynamic_tool
@@ -8297,7 +8277,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_get_exception_info failed: {e}")
             return f"Error: {e}"
 
-    # ── Variable management tools ─────────────────────────────────────
+    # --- Variable management tools ---
 
     @app.tool()
     @log_dynamic_tool
@@ -8404,7 +8384,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_list_variables failed: {e}")
             return f"Error: {e}"
 
-    # ── GUI navigation tools ───────────────────────────────────────────
+    # --- GUI navigation tools ---
 
     @app.tool()
     @log_dynamic_tool
@@ -8505,7 +8485,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_show_graph failed: {e}")
             return f"Error: {e}"
 
-    # ── Privilege management tools ─────────────────────────────────────
+    # --- Privilege management tools ---
 
     @app.tool()
     @log_dynamic_tool
@@ -8574,7 +8554,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_disable_privilege failed: {e}")
             return f"Error: {e}"
 
-    # ── Type System Tools ──────────────────────────────────────────────
+    # --- Type System Tools ---
 
     @app.tool()
     @log_dynamic_tool
@@ -8914,7 +8894,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_parse_types failed: {e}")
             return f"Error: {e}"
 
-    # ── Conditional Tracing Tools ───────────────────────────────────
+    # --- Conditional Tracing Tools ---
 
     @app.tool()
     @log_dynamic_tool

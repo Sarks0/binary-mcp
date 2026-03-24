@@ -176,9 +176,7 @@ class StructuredBaseError(Exception):
         return self.structured_error.to_json(indent)
 
 
-# =============================================================================
-# Suggestion Mappings - Predefined suggestions for common error scenarios
-# =============================================================================
+# --- Suggestion Mappings - Predefined Suggestions For Common Error Scenarios ---
 
 BREAKPOINT_SUGGESTIONS = {
     "address_invalid": [
@@ -331,9 +329,7 @@ WINDBG_SUGGESTIONS = {
 }
 
 
-# =============================================================================
-# Error Factory Functions
-# =============================================================================
+# --- Error Factory Functions ---
 
 
 def create_address_invalid_error(
@@ -677,9 +673,7 @@ def create_parameter_error(
     )
 
 
-# =============================================================================
-# Kernel / WinDbg Error Factory Functions
-# =============================================================================
+# --- Kernel / Windbg Error Factory Functions ---
 
 
 def create_windbg_not_found_error(
@@ -754,9 +748,7 @@ def create_windbg_command_failed_error(
     )
 
 
-# =============================================================================
-# Error Classification Helpers
-# =============================================================================
+# --- Error Classification Helpers ---
 
 
 def classify_api_error(api_message: str, operation: str = "") -> ErrorCode:

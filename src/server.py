@@ -72,9 +72,7 @@ crypto_patterns = CryptoPatterns()
 compatibility_checker = BinaryCompatibilityChecker()
 
 
-# ============================================================================
-# HELPER FUNCTIONS
-# ============================================================================
+# --- Helper Functions ---
 
 def log_to_session(func=None, *, analysis_type: AnalysisType = AnalysisType.STATIC):
     """
@@ -442,9 +440,7 @@ def get_analysis_context(
         raise RuntimeError(f"Failed to analyze binary: {e}")
 
 
-# ============================================================================
-# PHASE 1: CORE TOOLS (P0 - Critical)
-# ============================================================================
+# --- Phase 1: Core Tools (P0 - Critical) ---
 
 @app.tool()
 @log_to_session
@@ -893,9 +889,7 @@ def decompile_function(
         return f"Error: {e}"
 
 
-# ============================================================================
-# PHASE 2: ENHANCED ANALYSIS TOOLS (P1 - Important)
-# ============================================================================
+# --- Phase 2: Enhanced Analysis Tools (P1 - Important) ---
 
 @app.tool()
 @log_to_session
@@ -1176,9 +1170,7 @@ def search_bytes(
         return f"Error: {e}"
 
 
-# ============================================================================
-# PHASE 3: ADVANCED TOOLS (P2 - Nice-to-have)
-# ============================================================================
+# --- Phase 3: Advanced Tools (P2 - Nice-To-Have) ---
 
 @app.tool()
 @log_to_session
@@ -1344,9 +1336,7 @@ def diagnose_setup() -> str:
         return f"Error: {e}"
 
 
-# ============================================================================
-# ADDITIONAL TOOLS
-# ============================================================================
+# --- Additional Tools ---
 
 @app.tool()
 def check_binary(binary_path: str) -> str:
@@ -1597,9 +1587,7 @@ def rename_function(
         return f"Error: {e}"
 
 
-# ============================================================================
-# ANALYSIS SESSION TOOLS
-# ============================================================================
+# --- Analysis Session Tools ---
 
 @app.tool()
 def start_analysis_session(
@@ -2206,9 +2194,7 @@ def get_active_session() -> str:
     return result
 
 
-# ============================================================================
-# CRYPTO ANALYSIS TOOLS
-# ============================================================================
+# --- Crypto Analysis Tools ---
 
 @app.tool()
 @log_to_session(analysis_type=AnalysisType.STATIC)
@@ -2570,9 +2556,7 @@ def decode_base64_file(
         return f"Error decoding file: {e}"
 
 
-# ============================================================================
-# PYTHON BYTECODE ANALYSIS TOOLS
-# ============================================================================
+# --- Python Bytecode Analysis Tools ---
 
 
 @app.tool()

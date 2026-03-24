@@ -38,9 +38,7 @@ def _is_windows() -> bool:
     return platform.system() == "Windows"
 
 
-# ---------------------------------------------------------------------------
-# Input validation helpers for command-injection prevention
-# ---------------------------------------------------------------------------
+# --- Input validation helpers for command-injection prevention ---
 
 _SAFE_ADDRESS_RE = re.compile(r'^[0-9a-fA-F`x]+$')  # Hex addresses with optional backticks and 0x prefix
 _SAFE_SYMBOL_RE = re.compile(r'^[a-zA-Z0-9_!.*+:]+$')  # Symbol names like nt!NtCreateFile or module!*
@@ -125,9 +123,7 @@ def register_windbg_tools(
     global _session_manager
     _session_manager = session_manager
 
-    # ------------------------------------------------------------------
-    # Connection tools (4)
-    # ------------------------------------------------------------------
+    # --- Connection tools (4) ---
 
     @app.tool()
     @log_windbg_tool
@@ -216,9 +212,7 @@ def register_windbg_tools(
         except Exception as e:
             return f"Error: {e}"
 
-    # ------------------------------------------------------------------
-    # Execution tools (6)
-    # ------------------------------------------------------------------
+    # --- Execution tools (6) ---
 
     @app.tool()
     @log_windbg_tool
@@ -348,9 +342,7 @@ def register_windbg_tools(
         except (WinDbgBridgeError, StructuredBaseError) as e:
             return f"Error: {e}"
 
-    # ------------------------------------------------------------------
-    # Breakpoint tools (4)
-    # ------------------------------------------------------------------
+    # --- Breakpoint tools (4) ---
 
     @app.tool()
     @log_windbg_tool
@@ -434,9 +426,7 @@ def register_windbg_tools(
         except (WinDbgBridgeError, StructuredBaseError) as e:
             return f"Error: {e}"
 
-    # ------------------------------------------------------------------
-    # Inspection tools (6)
-    # ------------------------------------------------------------------
+    # --- Inspection tools (6) ---
 
     @app.tool()
     @log_windbg_tool

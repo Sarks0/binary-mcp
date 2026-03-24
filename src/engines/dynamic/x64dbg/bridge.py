@@ -724,7 +724,7 @@ class X64DbgBridge(Debugger):
         result = self._request("/api/breakpoint/list")
         return result.get("breakpoints", [])
 
-    # ── Exception handling control ──────────────────────────────────────
+    # --- Exception handling control ---
 
     _VALID_CHANCE_VALUES = ("first", "second", "all")
 
@@ -2043,7 +2043,7 @@ class X64DbgBridge(Debugger):
         result = self._request_with_retry("/api/command", {"command": command})
         return result
 
-    # ── Watch expression management ──────────────────────────────────
+    # --- Watch expression management ---
 
     _WATCHDOG_MODES = frozenset({
         "changed", "disabled", "unchanged",
@@ -2182,7 +2182,7 @@ class X64DbgBridge(Debugger):
         logger.info(f"Set watch {index} name to '{name.strip()}'")
         return result
 
-    # ── DLL breakpoint management ────────────────────────────────────
+    # --- DLL breakpoint management ---
 
     def set_dll_breakpoint(
         self, dll_name: str, singleshoot: bool = False
@@ -2506,9 +2506,7 @@ class X64DbgBridge(Debugger):
         logger.info(f"Deleted memory breakpoint at 0x{normalized_addr}")
         return True
 
-    # =========================================================================
-    # Wait/Synchronization Functions
-    # =========================================================================
+    # --- Wait/Synchronization Functions ---
 
     def wait_until_paused(self, timeout: int = 30000) -> dict[str, Any]:
         """
@@ -2603,9 +2601,7 @@ class X64DbgBridge(Debugger):
         self.run()
         return self.wait_until_paused(timeout=timeout)
 
-    # =========================================================================
-    # Event System
-    # =========================================================================
+    # --- Event System ---
 
     def get_events(self, max_events: int = 100, peek: bool = False) -> dict[str, Any]:
         """
@@ -2768,9 +2764,7 @@ class X64DbgBridge(Debugger):
                 "error": f"Timeout waiting for events: {event_types}"
             }
 
-    # =========================================================================
-    # Memory Allocation Functions (Phase 3)
-    # =========================================================================
+    # --- Memory Allocation Functions (Phase 3) ---
 
     def virt_alloc(self, size: int = 4096, address: str | None = None) -> dict[str, Any]:
         """
@@ -2913,9 +2907,7 @@ class X64DbgBridge(Debugger):
         result = self._request("/api/memory/check", data)
         return result.get("valid", False)
 
-    # =========================================================================
-    # Enhanced Breakpoint Functions (Phase 3)
-    # =========================================================================
+    # --- Enhanced Breakpoint Functions (Phase 3) ---
 
     def toggle_breakpoint(self, address: str, enable: bool = True) -> dict[str, Any]:
         """
@@ -3064,9 +3056,7 @@ class X64DbgBridge(Debugger):
         result = self._request("/api/breakpoint/list/all")
         return result
 
-    # =========================================================================
-    # Phase 4: Tracing & Analysis Functions
-    # =========================================================================
+    # --- Phase 4: Tracing & Analysis Functions ---
 
     def start_trace(
         self,
@@ -3215,9 +3205,7 @@ class X64DbgBridge(Debugger):
         """
         return self._request("/api/api_log/clear")
 
-    # =========================================================================
-    # Conditional Breakpoint with Logging
-    # =========================================================================
+    # --- Conditional Breakpoint with Logging ---
 
     def set_conditional_breakpoint(
         self,
@@ -3579,7 +3567,7 @@ class X64DbgBridge(Debugger):
         data = {"address": address}
         return self._request("/api/references", data)
 
-    # ── Advanced search commands ─────────────────────────────────────
+    # --- Advanced search commands ---
 
     def find_assembly(
         self, instruction: str, address: str = "", size: int = 0
@@ -3739,9 +3727,7 @@ class X64DbgBridge(Debugger):
         """
         return self._request("/api/callstack/detailed")
 
-    # =========================================================================
-    # Phase 5: Anti-Debug Bypass Functions
-    # =========================================================================
+    # --- Phase 5: Anti-Debug Bypass Functions ---
 
     def hide_debugger_peb(self) -> dict[str, Any]:
         """
@@ -3848,9 +3834,7 @@ class X64DbgBridge(Debugger):
         logger.info(f"Patched debug check at 0x{address}")
         return result
 
-    # =========================================================================
-    # Phase 6: Code Coverage Functions
-    # =========================================================================
+    # --- Phase 6: Code Coverage Functions ---
 
     def start_coverage(
         self,
@@ -3994,9 +3978,7 @@ class X64DbgBridge(Debugger):
         logger.info(f"Exported coverage to {file_path}")
         return result
 
-    # =========================================================================
-    # Module Dump with PE Reconstruction
-    # =========================================================================
+    # --- Module Dump with PE Reconstruction ---
 
     def dump_module(
         self,
@@ -4311,9 +4293,7 @@ class X64DbgBridge(Debugger):
         except Exception as e:
             result["warnings"].append(f"IAT rebuild failed: {e}")
 
-    # =========================================================================
-    # Memory Watch and Diff Functions
-    # =========================================================================
+    # --- Memory Watch and Diff Functions ---
 
     def watch_memory(
         self,
@@ -4709,9 +4689,7 @@ class X64DbgBridge(Debugger):
         else:
             return {"success": False, "error": f"Watch not found: {watch_id}"}
 
-    # =========================================================================
-    # API Hook Detection Methods
-    # =========================================================================
+    # --- API Hook Detection Methods ---
 
     def detect_hooks(
         self,
@@ -5284,7 +5262,7 @@ class X64DbgBridge(Debugger):
 
         return result
 
-    # ── Type system methods ─────────────────────────────────────────────
+    # --- Type system methods ---
 
     @staticmethod
     def _validate_type_name(name: str | None, param_name: str = "name") -> str:
@@ -5480,7 +5458,7 @@ class X64DbgBridge(Debugger):
         """
         return self._request_with_retry("/api/command", {"command": "ClearTypes"})
 
-    # ── Variable management ────────────────────────────────────────────
+    # --- Variable management ---
 
     def set_variable(self, name: str, value: str) -> dict[str, Any]:
         """
@@ -5554,7 +5532,7 @@ class X64DbgBridge(Debugger):
         logger.debug("Listed variables")
         return result
 
-    # ── GUI navigation ─────────────────────────────────────────────────
+    # --- GUI navigation ---
 
     def navigate_disasm(self, address: str) -> dict[str, Any]:
         """
@@ -5638,7 +5616,7 @@ class X64DbgBridge(Debugger):
         logger.info(f"Showed graph at {log_target}")
         return result
 
-    # ── Privilege management ───────────────────────────────────────────
+    # --- Privilege management ---
 
     def enable_privilege(self, name: str) -> dict[str, Any]:
         """
@@ -5694,7 +5672,7 @@ class X64DbgBridge(Debugger):
         logger.info(f"Disabled privilege: {name}")
         return result
 
-    # ── Conditional Tracing ──────────────────────────────────────────
+    # --- Conditional Tracing ---
 
     def set_trace_log(self, text: str, condition: str = "") -> dict[str, Any]:
         """

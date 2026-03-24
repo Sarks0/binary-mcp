@@ -124,9 +124,7 @@ class WinDbgCommands:
 
         return "\n".join(lines)
 
-    # ------------------------------------------------------------------
-    # Driver analysis workflows
-    # ------------------------------------------------------------------
+    # --- Driver analysis workflows ---
 
     def analyze_driver(self, driver_name: str) -> dict[str, Any]:
         """Full driver analysis: driver object, dispatch table, devices, IOCTLs.
@@ -266,9 +264,7 @@ class WinDbgCommands:
             "dispatch_handler_count": analysis["dispatch_handler_count"],
         }
 
-    # ------------------------------------------------------------------
-    # Crash dump workflows
-    # ------------------------------------------------------------------
+    # --- Crash dump workflows ---
 
     def analyze_crash_dump(self, dump_path: str) -> dict[str, Any]:
         """Full crash dump analysis with recommendations.
@@ -319,9 +315,7 @@ class WinDbgCommands:
             "recommendations": recommendations,
         }
 
-    # ------------------------------------------------------------------
-    # Cross-reference helpers
-    # ------------------------------------------------------------------
+    # --- Cross-reference helpers ---
 
     def compare_dispatch_tables(
         self, driver1: str, driver2: str

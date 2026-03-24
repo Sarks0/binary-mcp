@@ -29,6 +29,7 @@ from src.tools.dotnet_tools import register_dotnet_tools
 from src.tools.dynamic_tools import register_dynamic_tools
 from src.tools.function_hash_tools import register_function_hash_tools
 from src.tools.malware_tools import register_malware_tools
+from src.tools.pe_tools import register_pe_tools
 from src.tools.reporting import register_reporting_tools
 from src.tools.triage_tools import register_triage_tools
 from src.tools.vt_tools import register_vt_tools
@@ -2884,7 +2885,10 @@ def main():
     # Register function hash and cross-binary matching tools
     register_function_hash_tools(app, session_manager, cache, runner)
 
-    logger.info("Registered all analysis tools (static, dynamic, VT, triage, reporting, Yara, control flow, malware, function hash)")
+    # Register PE structure analysis tools
+    register_pe_tools(app, session_manager)
+
+    logger.info("Registered all analysis tools (static, dynamic, VT, triage, reporting, Yara, control flow, malware, function hash, PE structure)")
     logger.info(f"Session Directory: {session_manager.store_dir}")
 
     # Run the FastMCP server (handles stdio automatically)

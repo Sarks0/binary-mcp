@@ -13,9 +13,7 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
+# --- Internal helpers ---
 
 
 def _get_or_run_analysis(binary_path: str, cache, runner) -> dict:
@@ -417,9 +415,7 @@ def _compute_nesting_depth(loops: list[dict]) -> dict[int, int]:
     return depths
 
 
-# ---------------------------------------------------------------------------
-# Public registration
-# ---------------------------------------------------------------------------
+# --- Public registration ---
 
 
 def register_control_flow_tools(app, session_manager=None, cache=None, runner=None):

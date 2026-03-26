@@ -1,7 +1,7 @@
 """
 Binary MCP Server for comprehensive binary analysis.
 
-Provides 50+ tools for static and dynamic binary analysis:
+Provides 245 tools for static and dynamic binary analysis:
 - Static analysis via Ghidra (headless mode) for native binaries
 - Static analysis via ILSpyCmd for .NET assemblies
 - Dynamic analysis via x64dbg (native plugin)
@@ -29,6 +29,7 @@ from src.tools.dotnet_tools import register_dotnet_tools
 from src.tools.dynamic_tools import register_dynamic_tools
 from src.tools.function_hash_tools import register_function_hash_tools
 from src.tools.malware_tools import register_malware_tools
+from src.tools.pe_tools import register_pe_tools
 from src.tools.reporting import register_reporting_tools
 from src.tools.triage_tools import register_triage_tools
 from src.tools.vt_tools import register_vt_tools
@@ -72,9 +73,7 @@ crypto_patterns = CryptoPatterns()
 compatibility_checker = BinaryCompatibilityChecker()
 
 
-# ============================================================================
-# HELPER FUNCTIONS
-# ============================================================================
+# --- Helper Functions ---
 
 def log_to_session(func=None, *, analysis_type: AnalysisType = AnalysisType.STATIC):
     """
@@ -442,9 +441,7 @@ def get_analysis_context(
         raise RuntimeError(f"Failed to analyze binary: {e}")
 
 
-# ============================================================================
-# PHASE 1: CORE TOOLS (P0 - Critical)
-# ============================================================================
+# --- Phase 1: Core Tools (P0 - Critical) ---
 
 @app.tool()
 @log_to_session
@@ -893,9 +890,7 @@ def decompile_function(
         return f"Error: {e}"
 
 
-# ============================================================================
-# PHASE 2: ENHANCED ANALYSIS TOOLS (P1 - Important)
-# ============================================================================
+# --- Phase 2: Enhanced Analysis Tools (P1 - Important) ---
 
 @app.tool()
 @log_to_session
@@ -1176,9 +1171,7 @@ def search_bytes(
         return f"Error: {e}"
 
 
-# ============================================================================
-# PHASE 3: ADVANCED TOOLS (P2 - Nice-to-have)
-# ============================================================================
+# --- Phase 3: Advanced Tools (P2 - Nice-To-Have) ---
 
 @app.tool()
 @log_to_session
@@ -1344,9 +1337,7 @@ def diagnose_setup() -> str:
         return f"Error: {e}"
 
 
-# ============================================================================
-# ADDITIONAL TOOLS
-# ============================================================================
+# --- Additional Tools ---
 
 @app.tool()
 def check_binary(binary_path: str) -> str:
@@ -1597,9 +1588,7 @@ def rename_function(
         return f"Error: {e}"
 
 
-# ============================================================================
-# ANALYSIS SESSION TOOLS
-# ============================================================================
+# --- Analysis Session Tools ---
 
 @app.tool()
 def start_analysis_session(
@@ -2206,9 +2195,7 @@ def get_active_session() -> str:
     return result
 
 
-# ============================================================================
-# CRYPTO ANALYSIS TOOLS
-# ============================================================================
+# --- Crypto Analysis Tools ---
 
 @app.tool()
 @log_to_session(analysis_type=AnalysisType.STATIC)
@@ -2570,9 +2557,7 @@ def decode_base64_file(
         return f"Error decoding file: {e}"
 
 
-# ============================================================================
-# PYTHON BYTECODE ANALYSIS TOOLS
-# ============================================================================
+# --- Python Bytecode Analysis Tools ---
 
 
 @app.tool()
@@ -2900,7 +2885,10 @@ def main():
     # Register function hash and cross-binary matching tools
     register_function_hash_tools(app, session_manager, cache, runner)
 
-    logger.info("Registered all analysis tools (static, dynamic, VT, triage, reporting, Yara, control flow, malware, function hash)")
+    # Register PE structure analysis tools
+    register_pe_tools(app, session_manager)
+
+    logger.info("Registered all analysis tools (static, dynamic, VT, triage, reporting, Yara, control flow, malware, function hash, PE structure)")
     logger.info(f"Session Directory: {session_manager.store_dir}")
 
     # Run the FastMCP server (handles stdio automatically)

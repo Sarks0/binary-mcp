@@ -70,13 +70,13 @@ Analyze the crash dump at C:\Windows\MEMORY.DMP
 Decompile the type MyNamespace.MyClass to C#
 ```
 
-## Capabilities
+## Capabilities (245 tools)
 
 ### Static Analysis (Ghidra) -- 35 tools
 
 Analysis, decompilation, cross-references, memory maps, byte pattern search, function renaming, call graphs, API pattern detection (100+ Windows APIs), crypto constant identification, IOC extraction, and binary compatibility checking.
 
-### Dynamic Analysis (x64dbg) -- 150+ tools
+### Dynamic Analysis (x64dbg) -- 159 tools
 
 | Category | What It Does |
 |----------|-------------|
@@ -103,13 +103,20 @@ Connection (KDNET, local kernel, crash dumps), execution control, breakpoints, r
 
 Type listing, C# decompilation, IL disassembly, type search, and full assembly decompilation.
 
-### Other
+### PE Structure (pefile) -- 1 tool
 
+Comprehensive PE header, section, import, export, resource, debug, TLS, and Rich header analysis in a single fast call (<500ms). Three detail levels (basic/standard/full) with decoded characteristic flags, compiler attribution, and malware indicators.
+
+### Other -- 23 tools
+
+- **Triage (3)** -- Quick file type detection, packer identification, entropy analysis
+- **Malware Analysis (4)** -- Behavior detection, threat chain identification, IOC extraction
+- **Control Flow (4)** -- CFG generation, cyclomatic complexity, loop detection, dead code
+- **Function Hashing (4)** -- Cross-binary function matching and similarity scoring
+- **VirusTotal (4)** -- Hash lookups, file submission, detection reports
 - **Session Management** -- Persistent analysis tracking across conversations
-- **Triage** -- Quick file type detection, packer identification, entropy analysis
-- **YARA** -- Rule scanning (optional `yara-python` dependency)
-- **Malware Analysis** -- Behavior detection, threat chain identification, IOC extraction
-- **Reporting** -- Generate structured analysis reports
+- **Reporting (2)** -- Generate structured analysis reports
+- **YARA (2)** -- Rule scanning (optional `yara-python` dependency)
 
 ## Supported Formats
 

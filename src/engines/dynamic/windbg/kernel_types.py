@@ -122,9 +122,7 @@ class IRP:
     status: str | None = None
 
 
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
+# --- Internal helpers ---
 
 # Transfer method constants from the Windows DDK
 _METHOD_BUFFERED = 0

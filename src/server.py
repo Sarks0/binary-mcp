@@ -2843,9 +2843,8 @@ def validate_security_configuration(
         Tuple of (is_valid, error_message)
     """
     from src.utils.auth import TokenEntropyError, TokenFormatError, TokenValidator
-    from src.utils.tls import TLSMode
-
     from src.utils.config import is_remote_host
+    from src.utils.tls import TLSMode
 
     # Check if this is a remote configuration
     is_remote = transport != "stdio" and (is_remote_host(host) or allow_remote)

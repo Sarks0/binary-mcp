@@ -2843,7 +2843,7 @@ def validate_security_configuration(
         Tuple of (is_valid, error_message)
     """
     from src.utils.auth import TokenEntropyError, TokenFormatError, TokenValidator
-    from src.utils.config import is_remote_host
+    from src.utils.config import get_config_bool, is_remote_host
     from src.utils.tls import TLSMode
 
     # Check if this is a remote configuration
@@ -2867,15 +2867,28 @@ def validate_security_configuration(
 
     # 2. TLS is strongly recommended (required by default)
     tls_enum = TLSMode(tls_mode) if tls_mode else TLSMode.DISABLED
+    require_tls_remote = get_config_bool("MCP_TLS_REQUIRED_FOR_REMOTE", True)
 
     if tls_enum == TLSMode.DISABLED:
-        return (
-            False,
-            "SECURITY ERROR: Remote access requires TLS encryption.\n"
-            "Set MCP_TLS_MODE=self_signed for auto-generated certificate,\n"
-            "or MCP_TLS_MODE=cert_file with MCP_TLS_CERT_PATH and MCP_TLS_KEY_PATH.\n"
-            "To bypass this (NOT RECOMMENDED), set MCP_TLS_REQUIRED_FOR_REMOTE=false.",
-        )
+        if not require_tls_remote:
+            # User explicitly opted out of TLS requirement
+            logger.warning("=" * 70)
+            logger.warning(
+                "TLS DISABLED FOR REMOTE ACCESS (MCP_TLS_REQUIRED_FOR_REMOTE=false)"
+            )
+            logger.warning(
+                "All traffic is UNENCRYPTED. Tokens and data can be intercepted."
+            )
+            logger.warning("Only use this on trusted networks!")
+            logger.warning("=" * 70)
+        else:
+            return (
+                False,
+                "SECURITY ERROR: Remote access requires TLS encryption.\n"
+                "Set MCP_TLS_MODE=self_signed for auto-generated certificate,\n"
+                "or MCP_TLS_MODE=cert_file with MCP_TLS_CERT_PATH and MCP_TLS_KEY_PATH.\n"
+                "To bypass this (NOT RECOMMENDED), set MCP_TLS_REQUIRED_FOR_REMOTE=false.",
+            )
 
     # 3. Warn about self-signed certificates
     if tls_enum == TLSMode.SELF_SIGNED:
@@ -2902,9 +2915,7 @@ def validate_security_configuration(
 def main():
     """Run the MCP server with transport and security configuration."""
     from src.utils.audit_log import get_audit_logger
-    from src.utils.auth import create_auth_manager_from_config
     from src.utils.config import get_config, get_config_bool, get_config_int
-    from src.utils.rate_limit import get_rate_limiter
     from src.utils.tls import TLSMode, get_tls_configuration_from_config, print_security_warning
 
     # Load configuration
@@ -2944,32 +2955,32 @@ def main():
         sys.exit(1)
 
     # Initialize security components
-    auth_manager = None
-    ssl_context = None
     tls_mode = TLSMode.DISABLED
+    tls_cert_path = None
+    tls_key_path = None
 
     try:
         # Initialize audit logging
         audit_logger = get_audit_logger()
         logger.info(f"Audit logging initialized: {audit_logger.log_dir}")
 
-        # Initialize rate limiting
-        rate_limiter = get_rate_limiter()
-
-        # Initialize authentication if configured
-        if transport != "stdio" or auth_token:
-            auth_manager = create_auth_manager_from_config()
-            if auth_manager:
-                logger.info("Authentication manager initialized")
-
-        # Initialize TLS if configured
+        # Initialize TLS if configured (get cert/key paths for uvicorn)
         if transport != "stdio":
             tls_mode, ssl_context = get_tls_configuration_from_config()
             if ssl_context:
                 logger.info(f"TLS initialized ({tls_mode.value})")
+                # Extract cert/key paths from config for uvicorn
+                tls_cert_path = get_config("MCP_TLS_CERT_PATH")
+                tls_key_path = get_config("MCP_TLS_KEY_PATH")
+                # For self-signed certs, paths are in the default location
+                if not tls_cert_path and tls_mode == TLSMode.SELF_SIGNED:
+                    from pathlib import Path
 
-        # Print security warnings for remote access
-        if transport != "stdio":
+                    cert_dir = Path.home() / ".binary_mcp_output" / "tls"
+                    tls_cert_path = str(cert_dir / "server.crt")
+                    tls_key_path = str(cert_dir / "server.key")
+
+            # Print security warnings for remote access
             print_security_warning(tls_mode, host, port)
 
     except Exception as e:
@@ -3028,7 +3039,7 @@ def main():
                 "host": host,
                 "port": port,
                 "tls_mode": tls_mode.value,
-                "auth_enabled": auth_manager is not None,
+                "auth_enabled": auth_token is not None,
             },
         )
     except Exception as e:
@@ -3040,23 +3051,43 @@ def main():
         app.run()
 
     elif transport == "sse":
-        # Import SSE server implementation
         try:
-            from src.transports.sse_server import run_sse_server
+            from src.transports.sse_server import (
+                build_uvicorn_config,
+                configure_remote_access,
+                get_ip_allowlist_middleware,
+            )
 
-            logger.info(f"Starting SSE server on {host}:{port}")
-            run_sse_server(
-                mcp_app=app,
+            # Configure auth, rate limiting, and audit middleware on the app
+            configure_remote_access(app, auth_token=auth_token)
+
+            # Build uvicorn config with TLS
+            uvicorn_config = build_uvicorn_config(
                 host=host,
                 port=port,
-                ssl_context=ssl_context,
-                auth_manager=auth_manager,
-                rate_limiter=rate_limiter,
+                tls_cert_path=tls_cert_path,
+                tls_key_path=tls_key_path,
             )
+
+            # Get IP allowlist ASGI middleware if configured
+            asgi_middleware = []
+            ip_mw = get_ip_allowlist_middleware()
+            if ip_mw:
+                asgi_middleware.append(ip_mw)
+
+            logger.info(f"Starting SSE server on {host}:{port}")
+            app.run(
+                transport="sse",
+                host=host,
+                port=port,
+                uvicorn_config=uvicorn_config,
+                middleware=asgi_middleware if asgi_middleware else None,
+            )
+
         except ImportError as e:
             logger.error(f"SSE transport not available: {e}")
             print("\nERROR: SSE transport requires additional dependencies.")
-            print("Install with: uv pip install 'fastmcp[sse]'")
+            print("Install with: uv add 'fastmcp[sse]'")
             sys.exit(1)
 
     else:

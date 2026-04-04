@@ -1,47 +1,38 @@
 """
-SSE (Server-Sent Events) transport for remote MCP access.
+Remote MCP access via FastMCP's SSE/HTTP transport.
 
-Provides HTTP-based bidirectional communication:
-- POST /message - Client sends requests
-- GET /sse - Server-sent events stream for responses
-
-Security features:
-- Bearer token authentication
-- IP allowlist filtering
-- Rate limiting per session
-- TLS encryption support
-- CORS configuration
-- Audit logging
-
-Based on MCP specification for HTTP with SSE transport.
+Integrates with FastMCP's built-in transport layer and adds:
+- Bearer token authentication (via TokenVerifier subclass)
+- Audit logging middleware (via FastMCP Middleware)
+- Rate limiting (via FastMCP RateLimitingMiddleware)
+- IP allowlist filtering (via Starlette ASGI middleware)
+- TLS encryption (via uvicorn ssl config)
 """
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import ipaddress
-import json
 import logging
-import ssl
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from socketserver import ThreadingMixIn
 from typing import Any
 
-from src.utils.audit_log import log_security_event
-from src.utils.auth import AuthContext, AuthenticationFailedError, AuthManager
+from fastmcp.server.auth.auth import AccessToken, TokenVerifier
+from fastmcp.server.middleware.middleware import CallNext, Middleware, MiddlewareContext
+from fastmcp.server.middleware.rate_limiting import RateLimitingMiddleware
+from starlette.middleware import Middleware as ASGIMiddleware
+from starlette.responses import JSONResponse
+from starlette.types import ASGIApp, Receive, Scope, Send
+
+from src.utils.audit_log import log_access, log_tool_call
+from src.utils.auth import TokenEntropyError, TokenFormatError, TokenValidator
 from src.utils.config import get_config
-from src.utils.rate_limit import RateLimiter, RateLimitExceededError, RateLimitTier
 
 logger = logging.getLogger(__name__)
 
-# Maximum allowed request body size (10 MB)
-MAX_REQUEST_BODY = 10 * 1024 * 1024
 
-
-class IPAllowlistError(Exception):
-    """Client IP not in allowlist."""
-
-    pass
+# --- IP Allowlist (pure functions, also used in tests) ---
 
 
 def check_ip_allowlist(client_ip: str, allowlist: list[str] | None) -> bool:
@@ -69,12 +60,10 @@ def check_ip_allowlist(client_ip: str, allowlist: list[str] | None) -> bool:
     for allowed in allowlist:
         try:
             if "/" in allowed:
-                # CIDR notation
                 network = ipaddress.ip_network(allowed, strict=False)
                 if client_addr in network:
                     return True
             else:
-                # Single IP
                 if client_addr == ipaddress.ip_address(allowed):
                     return True
         except ValueError:
@@ -86,27 +75,22 @@ def check_ip_allowlist(client_ip: str, allowlist: list[str] | None) -> bool:
 
 def get_client_ip(headers: dict[str, str]) -> str | None:
     """
-    Extract client IP from headers.
-
-    Checks X-Forwarded-For, X-Real-IP, then defaults to connection info.
+    Extract client IP from headers (lowercase keys expected).
 
     Args:
-        headers: HTTP headers dictionary
+        headers: HTTP headers dictionary with lowercase keys
 
     Returns:
         Client IP or None
     """
-    # Check forwarded headers (keys are lowercased by _get_headers)
     forwarded = headers.get("x-forwarded-for")
     if forwarded:
-        # Take first IP in chain (closest to original client)
         return forwarded.split(",")[0].strip()
 
     real_ip = headers.get("x-real-ip")
     if real_ip:
         return real_ip
 
-    # Will be filled in from connection info
     return None
 
 
@@ -130,412 +114,232 @@ def extract_bearer_token(auth_header: str | None) -> str | None:
     return None
 
 
-class MCPRequestHandler(BaseHTTPRequestHandler):
+# --- FastMCP Token Verifier ---
+
+
+class BinaryMCPTokenVerifier(TokenVerifier):
     """
-    HTTP request handler with security middleware.
+    Token verifier for binary-mcp that uses constant-time comparison.
 
-    Handles:
-    - Authentication on /sse and /message endpoints
-    - Rate limiting
-    - IP allowlist
-    - CORS headers
-    - Audit logging
+    Validates tokens against a pre-configured secret token using
+    HMAC-based constant-time comparison to prevent timing attacks.
     """
 
-    # Class-level security components (set by server)
-    auth_manager: AuthManager | None = None
-    rate_limiter: RateLimiter | None = None
-    ip_allowlist: list[str] | None = None
-    require_auth: bool = False
-    cors_origin: str = "*"
-    server_session_map: dict[str, Any] = {}
-    mcp_read_stream: Any = None
-    mcp_write_stream: Any = None
+    def __init__(self, token: str):
+        """
+        Initialize with the server's auth token.
 
-    def log_message(self, format: str, *args) -> None:
-        """Override to use our logger."""
-        logger.debug(f"{self.client_address[0]} - {format % args}")
+        Args:
+            token: The valid authentication token
 
-    def send_cors_headers(self) -> None:
-        """Send CORS headers for cross-origin requests."""
-        self.send_header("Access-Control-Allow-Origin", self.cors_origin)
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
+        Raises:
+            TokenFormatError: If token format is invalid
+        """
+        super().__init__()
 
-    def send_security_headers(self) -> None:
-        """Send security headers."""
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("X-Frame-Options", "DENY")
+        # Validate token on startup
+        try:
+            TokenValidator.validate(token, check_entropy=True)
+            logger.info("Authentication token validated and loaded")
+        except TokenFormatError:
+            logger.error("SECURITY WARNING: Token format invalid")
+            logger.error("Generate a secure token with: python scripts/generate_token.py")
+            raise
+        except TokenEntropyError as e:
+            logger.warning(f"Token security concern: {e}")
 
-    def do_OPTIONS(self) -> None:
-        """Handle CORS preflight."""
-        self.send_response(200)
-        self.send_cors_headers()
-        self.end_headers()
+        # Store only the hash — never keep the raw token
+        self._token_hash = hashlib.sha256(token.encode()).digest()
 
-    def _get_headers(self) -> dict[str, str]:
-        """Extract headers into dictionary."""
-        return {k.lower(): v for k, v in self.headers.items()}
+    async def verify_token(self, token: str) -> AccessToken | None:
+        """
+        Verify a bearer token using constant-time comparison.
 
-    def _check_ip_allowlist(self) -> bool:
-        """Check if client IP is in allowlist."""
-        if not self.ip_allowlist:
-            return True
+        Returns AccessToken on success, None on failure.
+        """
+        provided_hash = hashlib.sha256(token.encode()).digest()
+        if not hmac.compare_digest(provided_hash, self._token_hash):
+            return None
 
-        client_ip = get_client_ip(self._get_headers()) or self.client_address[0]
+        return AccessToken(
+            token="[redacted]",
+            client_id="binary-mcp-client",
+            scopes=["tools:*"],
+        )
 
-        if not check_ip_allowlist(client_ip, self.ip_allowlist):
+
+# --- FastMCP Audit Middleware ---
+
+
+class AuditMiddleware(Middleware):
+    """
+    MCP-level middleware that logs tool calls and access events
+    to the audit log.
+    """
+
+    async def on_call_tool(
+        self,
+        context: MiddlewareContext,
+        call_next: CallNext,
+    ) -> Any:
+        """Log tool calls to audit log."""
+        tool_name = ""
+        if hasattr(context.message, "name"):
+            tool_name = context.message.name
+
+        start = time.time()
+        try:
+            result = await call_next(context)
+            duration = time.time() - start
+            log_tool_call(
+                session_id="mcp-session",
+                tool_name=tool_name,
+                client_ip=None,
+                success=True,
+                details={"duration_ms": int(duration * 1000)},
+            )
+            return result
+        except Exception as e:
+            duration = time.time() - start
+            log_tool_call(
+                session_id="mcp-session",
+                tool_name=tool_name,
+                client_ip=None,
+                success=False,
+                details={"duration_ms": int(duration * 1000), "error": str(e)},
+            )
+            raise
+
+    async def on_message(
+        self,
+        context: MiddlewareContext,
+        call_next: CallNext,
+    ) -> Any:
+        """Log all MCP messages to audit log."""
+        log_access(
+            session_id="mcp-session",
+            resource=context.method or "unknown",
+            action="request",
+            client_ip=None,
+            allowed=True,
+        )
+        return await call_next(context)
+
+
+# --- ASGI IP Allowlist Middleware ---
+
+
+class IPAllowlistMiddleware:
+    """
+    Starlette ASGI middleware that rejects requests from IPs
+    not in the configured allowlist.
+    """
+
+    def __init__(self, app: ASGIApp, allowlist: list[str]):
+        self.app = app
+        self.allowlist = allowlist
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        # Extract client IP from ASGI scope
+        client = scope.get("client")
+        client_ip = client[0] if client else None
+
+        if not check_ip_allowlist(client_ip, self.allowlist):
             logger.warning(f"Rejected connection from non-allowed IP: {client_ip}")
-            return False
-
-        return True
-
-    def _authenticate(self) -> tuple[str | None, dict[str, Any] | None]:
-        """
-        Authenticate request and return session info.
-
-        Returns:
-            Tuple of (session_id, metadata) or (None, None) if unauthenticated
-        """
-        # If no auth manager configured, check if auth should be required
-        if not self.auth_manager:
-            # For SSE transport, auth is mandatory — fail closed
-            if self.require_auth:
-                return (None, {"error": "server_misconfigured", "message": "Authentication system not initialized"})
-            return (None, None)  # stdio transport — no auth needed
-
-        headers = self._get_headers()
-        auth_header = headers.get("authorization")
-        client_ip = get_client_ip(headers) or self.client_address[0]
-
-        # Check rate limit for auth attempts
-        try:
-            from src.utils.rate_limit import check_auth_rate_limit
-
-            check_auth_rate_limit(client_ip)
-        except RateLimitExceededError:
-            log_security_event("auth", "rate_limit_exceeded", False, client_ip, {"path": self.path})
-            return (None, {"error": "rate_limit_exceeded"})
-
-        # Extract token
-        token = extract_bearer_token(auth_header)
-
-        if not token:
-            log_security_event("auth", "missing_token", False, client_ip, {"path": self.path})
-            return (None, {"error": "missing_token"})
-
-        # Validate token and create/get session
-        try:
-            context = AuthContext(client_ip=client_ip, headers=headers, transport="sse")
-            session = self.auth_manager.authenticate(token, context)
-
-            return (
-                session.session_id,
-                {
-                    "client_ip": client_ip,
-                    "session_created": session.created_at,
-                },
+            response = JSONResponse(
+                {"error": "IP not in allowlist"},
+                status_code=403,
             )
-
-        except AuthenticationFailedError as e:
-            log_security_event(
-                "auth", "failed", False, client_ip, {"error": str(e), "path": self.path}
-            )
-            return (None, {"error": "invalid_token"})
-        except RateLimitExceededError:
-            log_security_event("auth", "rate_limit_exceeded", False, client_ip, {"path": self.path})
-            return (None, {"error": "rate_limit_exceeded"})
-
-    def do_GET(self) -> None:
-        """Handle GET requests (SSE endpoint)."""
-        # Only handle /sse path
-        if self.path not in ("/sse", "/sse/"):
-            self.send_response(404)
-            self.end_headers()
+            await response(scope, receive, send)
             return
 
-        # Check IP allowlist
-        if not self._check_ip_allowlist():
-            self.send_response(403)
-            self.send_security_headers()
-            self.end_headers()
-            self.wfile.write(b'{"error": "IP not in allowlist"}')
-            return
-
-        # Authenticate
-        session_id, auth_metadata = self._authenticate()
-
-        if not session_id and (self.auth_manager or self.require_auth):
-            # Authentication required but failed
-            error_code = (
-                auth_metadata.get("error", "authentication_required")
-                if auth_metadata
-                else "authentication_required"
-            )
-
-            # Return 429 for rate limit errors, 401 for auth errors
-            if error_code == "rate_limit_exceeded":
-                retry_after = auth_metadata.get("retry_after", 60) if auth_metadata else 60
-                self.send_response(429)
-                self.send_header("Retry-After", str(int(retry_after)))
-                self.send_security_headers()
-                self.end_headers()
-                self.wfile.write(
-                    json.dumps(
-                        {
-                            "error": "rate_limit_exceeded",
-                            "message": "Too many requests. Please retry later.",
-                        }
-                    ).encode()
-                )
-                return
-
-            self.send_response(401)
-            self.send_header("WWW-Authenticate", "Bearer")
-            self.send_security_headers()
-            self.end_headers()
-            self.wfile.write(
-                json.dumps(
-                    {
-                        "error": error_code,
-                        "message": "Authentication required. Provide Bearer token in Authorization header.",
-                    }
-                ).encode()
-            )
-            return
-
-        # Check rate limit for streaming
-        if session_id and self.rate_limiter:
-            try:
-                from src.utils.rate_limit import check_stream_rate_limit
-
-                check_stream_rate_limit(session_id)
-            except RateLimitExceededError as e:
-                self.send_response(429)
-                self.send_header("Retry-After", "60")
-                self.end_headers()
-                self.wfile.write(
-                    json.dumps({"error": "rate_limit_exceeded", "message": str(e)}).encode()
-                )
-                return
-
-        # Start SSE stream
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
-        self.send_cors_headers()
-        self.send_security_headers()
-
-        # Add session ID header for client reference
-        if session_id:
-            self.send_header("X-Session-ID", session_id)
-
-        self.end_headers()
-
-        # Store session info
-        if session_id:
-            self.server_session_map[session_id] = {
-                "client_ip": self.client_address[0],
-                "connected_at": time.time(),
-            }
-
-        # Stream SSE events from MCP
-        try:
-            # This would integrate with FastMCP's SSE transport
-            # For now, we write the connection header
-            self.wfile.write(b"event: connected\n")
-            self.wfile.write(f'data: {{"session_id": "{session_id}"}}\n\n'.encode())
-            self.wfile.flush()
-
-            # Keep connection open (simplified - real implementation
-            # would bridge between FastMCP and this HTTP response)
-            while True:
-                time.sleep(1)
-                # In real implementation, check for messages from MCP
-                # and forward them as SSE events
-
-        except (BrokenPipeError, ConnectionResetError):
-            logger.info(f"Client disconnected: {session_id[:8] if session_id else 'unknown'}...")
-        finally:
-            if session_id:
-                self.server_session_map.pop(session_id, None)
-
-    def do_POST(self) -> None:
-        """Handle POST requests (message endpoint)."""
-        # Only handle /message path
-        if not (self.path == "/message" or self.path.startswith("/message?")):
-            self.send_response(404)
-            self.end_headers()
-            return
-
-        # Check IP allowlist
-        if not self._check_ip_allowlist():
-            self.send_response(403)
-            self.end_headers()
-            self.wfile.write(b'{"error": "IP not in allowlist"}')
-            return
-
-        # Authenticate
-        session_id, auth_metadata = self._authenticate()
-
-        if not session_id and (self.auth_manager or self.require_auth):
-            error_code = (
-                auth_metadata.get("error", "authentication_required")
-                if auth_metadata
-                else "authentication_required"
-            )
-
-            # Return 429 for rate limit errors, 401 for auth errors
-            if error_code == "rate_limit_exceeded":
-                retry_after = auth_metadata.get("retry_after", 60) if auth_metadata else 60
-                self.send_response(429)
-                self.send_header("Retry-After", str(int(retry_after)))
-                self.send_security_headers()
-                self.end_headers()
-                self.wfile.write(
-                    json.dumps(
-                        {
-                            "error": "rate_limit_exceeded",
-                            "message": "Too many requests. Please retry later.",
-                        }
-                    ).encode()
-                )
-                return
-
-            self.send_response(401)
-            self.send_header("WWW-Authenticate", "Bearer")
-            self.end_headers()
-            return
-
-        # Check rate limit
-        if session_id and self.rate_limiter:
-            try:
-                self.rate_limiter.assert_rate_limit(session_id, RateLimitTier.STANDARD)
-            except RateLimitExceededError as e:
-                self.send_response(429)
-                self.send_header("Retry-After", "60")
-                self.end_headers()
-                self.wfile.write(
-                    json.dumps({"error": "rate_limit_exceeded", "message": str(e)}).encode()
-                )
-                return
-
-        # Read request body
-        try:
-            content_length = int(self.headers.get("Content-Length", 0))
-        except ValueError:
-            self.send_response(400)
-            self.end_headers()
-            self.wfile.write(b'{"error": "invalid_content_length", "message": "Invalid Content-Length header"}')
-            return
-
-        if content_length > MAX_REQUEST_BODY:
-            self.send_response(413)
-            self.send_security_headers()
-            self.end_headers()
-            self.wfile.write(b'{"error": "request_too_large", "message": "Request body too large"}')
-            return
-
-        body = self.rfile.read(content_length)
-
-        try:
-            _ = json.loads(body)  # Validate JSON format
-        except json.JSONDecodeError:
-            self.send_response(400)
-            self.end_headers()
-            self.wfile.write(b'{"error": "Invalid JSON"}')
-            return
-
-        # Process message (forward to MCP)
-        # In real implementation, this would route to the MCP server
-
-        # Send response
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_cors_headers()
-        self.send_security_headers()
-        self.end_headers()
-
-        response = {
-            "status": "accepted",
-            "session_id": session_id,
-        }
-        self.wfile.write(json.dumps(response).encode())
+        await self.app(scope, receive, send)
 
 
-class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
-    """Threaded HTTP server for concurrent connections."""
-
-    allow_reuse_address = True
-    daemon_threads = True
+# --- Server Configuration ---
 
 
-def run_sse_server(
-    mcp_app: Any,
-    host: str,
-    port: int,
-    ssl_context: ssl.SSLContext | None,
-    auth_manager: AuthManager | None,
-    rate_limiter: RateLimiter | None,
+def configure_remote_access(
+    app: Any,
+    auth_token: str | None,
+    rate_limit_rps: float = 10.0,
+    rate_limit_burst: int = 20,
 ) -> None:
     """
-    Run SSE server with security middleware.
+    Configure a FastMCP app with security middleware for remote access.
 
     Args:
-        mcp_app: FastMCP application instance
+        app: FastMCP application instance
+        auth_token: Authentication token (sets app.auth)
+        rate_limit_rps: Max requests per second
+        rate_limit_burst: Burst capacity for rate limiter
+    """
+    # Auth
+    if auth_token:
+        app.auth = BinaryMCPTokenVerifier(auth_token)
+        logger.info("Authentication: enabled (Bearer token)")
+    else:
+        logger.warning("Authentication: DISABLED — INSECURE")
+
+    # Rate limiting
+    app.add_middleware(
+        RateLimitingMiddleware(
+            max_requests_per_second=rate_limit_rps,
+            burst_capacity=rate_limit_burst,
+        )
+    )
+    logger.info(f"Rate limiting: {rate_limit_rps} req/s, burst {rate_limit_burst}")
+
+    # Audit logging
+    app.add_middleware(AuditMiddleware())
+    logger.info("Audit logging middleware: enabled")
+
+
+def build_uvicorn_config(
+    host: str,
+    port: int,
+    tls_cert_path: str | None = None,
+    tls_key_path: str | None = None,
+) -> dict[str, Any]:
+    """
+    Build uvicorn config dict for FastMCP's run() method.
+
+    Args:
         host: Bind host
         port: Listen port
-        ssl_context: SSL context for TLS (or None)
-        auth_manager: Authentication manager (or None)
-        rate_limiter: Rate limiter (or None)
+        tls_cert_path: Path to TLS certificate file
+        tls_key_path: Path to TLS private key file
+
+    Returns:
+        Dict suitable for FastMCP's uvicorn_config parameter
     """
-    # Load configuration
-    ip_allowlist_str = get_config("MCP_ALLOWED_IPS", "")
-    ip_allowlist = (
-        [ip.strip() for ip in ip_allowlist_str.split(",") if ip.strip()]
-        if ip_allowlist_str
-        else None
-    )
+    config: dict[str, Any] = {}
 
-    if ip_allowlist:
-        logger.info(f"IP allowlist configured: {ip_allowlist}")
-
-    # Set up request handler with security components
-    MCPRequestHandler.auth_manager = auth_manager
-    MCPRequestHandler.rate_limiter = rate_limiter
-    MCPRequestHandler.ip_allowlist = ip_allowlist
-    MCPRequestHandler.require_auth = True  # SSE transport always requires auth
-    MCPRequestHandler.cors_origin = get_config("MCP_CORS_ORIGIN", "*") or "*"
-
-    # Create HTTP server
-    server = ThreadedHTTPServer((host, port), MCPRequestHandler)
-
-    # Wrap with SSL if configured
-    if ssl_context:
-        server.socket = ssl_context.wrap_socket(server.socket, server_side=True)
+    if tls_cert_path and tls_key_path:
+        config["ssl_certfile"] = str(tls_cert_path)
+        config["ssl_keyfile"] = str(tls_key_path)
         logger.info(f"TLS enabled on {host}:{port}")
     else:
-        logger.warning(f"No TLS - connections to {host}:{port} are UNENCRYPTED")
+        logger.warning(f"No TLS — connections to {host}:{port} are UNENCRYPTED")
 
-    # Log startup
-    logger.info(f"SSE server listening on http{'s' if ssl_context else ''}://{host}:{port}")
-    logger.info("Endpoints:")
-    logger.info("  - GET  /sse     - Server-sent events stream")
-    logger.info("  - POST /message - Send messages to MCP")
+    return config
 
-    if auth_manager:
-        logger.info("Authentication: Required (Bearer token)")
-    else:
-        logger.warning("Authentication: DISABLED - INSECURE")
 
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        logger.info("Server shutting down...")
-        server.shutdown()
-    finally:
-        # Log shutdown
-        from src.utils.audit_log import log_session_event
+def get_ip_allowlist_middleware() -> ASGIMiddleware | None:
+    """
+    Create IP allowlist ASGI middleware from config, or None if not configured.
+    """
+    ip_allowlist_str = get_config("MCP_ALLOWED_IPS", "")
+    if not ip_allowlist_str:
+        return None
 
-        log_session_event(session_id="server", event_subtype="shutdown", client_ip=None, details={})
+    allowlist = [ip.strip() for ip in ip_allowlist_str.split(",") if ip.strip()]
+    if not allowlist:
+        return None
+
+    logger.info(f"IP allowlist configured: {allowlist}")
+    return ASGIMiddleware(IPAllowlistMiddleware, allowlist=allowlist)

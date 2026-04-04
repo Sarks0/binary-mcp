@@ -78,8 +78,9 @@ def _parse_env_file(env_path: Path) -> dict[str, str]:
                 value = value.strip()
 
                 # Remove quotes if present
-                if (value.startswith('"') and value.endswith('"')) or \
-                   (value.startswith("'") and value.endswith("'")):
+                if (value.startswith('"') and value.endswith('"')) or (
+                    value.startswith("'") and value.endswith("'")
+                ):
                     value = value[1:-1]
 
                 if key:
@@ -157,21 +158,50 @@ def get_config_int(key: str, default: int = 0) -> int:
 CONFIG_KEYS = {
     # VirusTotal
     "VT_API_KEY": "VirusTotal API key for hash lookups and file analysis",
-
     # Ghidra
     "GHIDRA_HOME": "Path to Ghidra installation directory",
     "GHIDRA_TIMEOUT": "Default timeout for Ghidra analysis (seconds)",
-
     # x64dbg
     "X64DBG_BRIDGE_URL": "URL for x64dbg HTTP bridge (default: http://localhost:27042)",
     "X64DBG_TIMEOUT": "Default timeout for x64dbg commands (seconds)",
-
     # Analysis
     "BINARY_MCP_CACHE_DIR": "Directory for caching analysis results",
     "BINARY_MCP_SESSION_DIR": "Directory for storing session data",
-
     # Logging
     "BINARY_MCP_LOG_LEVEL": "Logging level (DEBUG, INFO, WARNING, ERROR)",
+    # =============================================================================
+    # Network / Transport Configuration
+    # =============================================================================
+    "MCP_TRANSPORT": "Transport type: stdio (default), sse",
+    "MCP_HOST": "Network bind host (default: 127.0.0.1)",
+    "MCP_PORT": "Network port for SSE transport (default: 3000)",
+    "MCP_ALLOW_REMOTE": "Allow non-localhost binds (default: false)",
+    "MCP_ALLOWED_IPS": "Comma-separated CIDR allowlist for client IPs",
+    # =============================================================================
+    # Authentication & Authorization
+    # =============================================================================
+    "MCP_AUTH_TOKEN": "Bearer token for remote authentication (min 32 chars)",
+    "MCP_TOKEN_EXPIRY": "Session token expiry in seconds (default: 3600, 0=never)",
+    # =============================================================================
+    # Transport Security (TLS)
+    # =============================================================================
+    "MCP_TLS_MODE": "TLS mode: disabled, self_signed, cert_file (default: disabled)",
+    "MCP_TLS_CERT_PATH": "Path to TLS certificate file",
+    "MCP_TLS_KEY_PATH": "Path to TLS private key file",
+    "MCP_TLS_REQUIRED_FOR_REMOTE": "Require TLS for remote access (default: true)",
+    # =============================================================================
+    # Rate Limiting & DoS Protection
+    # =============================================================================
+    "MCP_RATE_LIMIT_AUTH": "Auth attempts per window (default: 5)",
+    "MCP_RATE_LIMIT_REQUESTS": "Tool calls per window (default: 100)",
+    "MCP_RATE_LIMIT_WINDOW": "Rate limit window in seconds (default: 60)",
+    "MCP_MAX_CONNECTIONS": "Maximum concurrent connections (default: 10)",
+    # =============================================================================
+    # Audit Logging
+    # =============================================================================
+    "MCP_AUDIT_LOG_PATH": "Directory for audit logs (default: ~/.binary_mcp_output/audit/)",
+    "MCP_AUDIT_LOG_RETENTION_DAYS": "Days to retain audit logs (default: 90)",
+    "MCP_AUDIT_LOG_ROTATE_SIZE_MB": "Max log size before rotation (default: 100)",
 }
 
 

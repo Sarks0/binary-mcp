@@ -167,7 +167,7 @@ def generate_self_signed_cert(
                 cert = x509.load_pem_x509_certificate(f.read())
 
             # Check if still valid
-            now = datetime.datetime.now(datetime.timezone.utc)
+            now = datetime.datetime.now(datetime.UTC)
             if cert.not_valid_after > now:
                 logger.info(
                     f"Using existing self-signed certificate (valid until {cert.not_valid_after})"
@@ -212,7 +212,7 @@ def generate_self_signed_cert(
         san = x509.SubjectAlternativeName(san_list)
 
         # Build certificate
-        now = datetime.datetime.now(datetime.timezone.utc)
+        now = datetime.datetime.now(datetime.UTC)
         cert = (
             x509.CertificateBuilder()
             .subject_name(subject)
@@ -264,7 +264,7 @@ def generate_self_signed_cert(
             f.write(cert_pem)
         os.chmod(cert_path, 0o644)  # World-readable (public cert)
 
-        logger.info(f"Generated self-signed certificate:")
+        logger.info("Generated self-signed certificate:")
         logger.info(f"  Certificate: {cert_path}")
         logger.info(f"  Private Key: {key_path}")
         logger.info(f"  Valid: {now} to {cert.not_valid_after}")
@@ -334,7 +334,7 @@ def validate_certificate(cert_path: Path, key_path: Path) -> dict[str, Any]:
                     errors.append("Private key does not match certificate public key")
 
         # Check certificate validity
-        now = datetime.datetime.now(datetime.timezone.utc)
+        now = datetime.datetime.now(datetime.UTC)
 
         if now < cert.not_valid_before:
             errors.append(f"Certificate not yet valid (valid from {cert.not_valid_before})")

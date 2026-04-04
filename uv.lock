@@ -61,6 +61,7 @@ version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "capstone" },
+    { name = "cryptography" },
     { name = "fastmcp" },
     { name = "mcp", extra = ["cli"] },
     { name = "pefile" },
@@ -85,6 +86,7 @@ yara = [
 [package.metadata]
 requires-dist = [
     { name = "capstone", specifier = ">=5.0.0" },
+    { name = "cryptography", specifier = ">=41.0.0" },
     { name = "fastmcp", specifier = ">=2.13,<3" },
     { name = "mcp", extras = ["cli"], specifier = ">=1.6.0" },
     { name = "pefile", specifier = ">=2023.2.7" },

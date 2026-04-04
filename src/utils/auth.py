@@ -25,8 +25,6 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-from src.utils.config import get_config, get_config_int
-
 logger = logging.getLogger(__name__)
 
 
@@ -387,7 +385,7 @@ class AuthManager:
         # Check rate limit first
         try:
             self._check_rate_limit(client_ip)
-        except RateLimitExceededError as e:
+        except RateLimitExceededError:
             self._log_auth_event("rate_limit", False, client_ip)
             raise
 

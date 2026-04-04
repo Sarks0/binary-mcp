@@ -21,23 +21,16 @@ from __future__ import annotations
 import ipaddress
 import json
 import logging
+import ssl
 import time
-import uuid
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
 from typing import Any
 
-# HTTP server imports
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from socketserver import ThreadingMixIn
-import ssl
-
-# MCP imports
-from mcp.server.sse import SseServerTransport
-
-# Local security imports
-from src.utils.auth import AuthManager, AuthContext, AuthenticationFailedError
-from src.utils.rate_limit import RateLimiter, RateLimitTier, RateLimitExceededError
-from src.utils.audit_log import log_security_event, log_error
-from src.utils.config import get_config, get_config_bool
+from src.utils.audit_log import log_security_event
+from src.utils.auth import AuthContext, AuthenticationFailedError, AuthManager
+from src.utils.config import get_config
+from src.utils.rate_limit import RateLimiter, RateLimitExceededError, RateLimitTier
 
 logger = logging.getLogger(__name__)
 
@@ -324,7 +317,7 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
         try:
             # This would integrate with FastMCP's SSE transport
             # For now, we write the connection header
-            self.wfile.write(f"event: connected\n".encode())
+            self.wfile.write(b"event: connected\n")
             self.wfile.write(f'data: {{"session_id": "{session_id}"}}\n\n'.encode())
             self.wfile.flush()
 
@@ -368,7 +361,7 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
         # Check rate limit
         if session_id and self.rate_limiter:
             try:
-                metadata = self.rate_limiter.assert_rate_limit(session_id, RateLimitTier.STANDARD)
+                self.rate_limiter.assert_rate_limit(session_id, RateLimitTier.STANDARD)
             except RateLimitExceededError as e:
                 self.send_response(429)
                 self.send_header("Retry-After", "60")
@@ -383,7 +376,7 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
         body = self.rfile.read(content_length)
 
         try:
-            message = json.loads(body)
+            _ = json.loads(body)  # Validate JSON format
         except json.JSONDecodeError:
             self.send_response(400)
             self.end_headers()
@@ -462,8 +455,8 @@ def run_sse_server(
     # Log startup
     logger.info(f"SSE server listening on http{'s' if ssl_context else ''}://{host}:{port}")
     logger.info("Endpoints:")
-    logger.info(f"  - GET  /sse     - Server-sent events stream")
-    logger.info(f"  - POST /message - Send messages to MCP")
+    logger.info("  - GET  /sse     - Server-sent events stream")
+    logger.info("  - POST /message - Send messages to MCP")
 
     if auth_manager:
         logger.info("Authentication: Required (Bearer token)")

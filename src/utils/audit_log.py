@@ -18,14 +18,13 @@ Security features:
 
 from __future__ import annotations
 
-import gzip
 import hashlib
 import json
 import logging
 import os
 import time
-from dataclasses import dataclass, asdict
-from datetime import datetime, timezone
+from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 from threading import Lock
@@ -182,7 +181,7 @@ class AuditLogger:
                 with gzip.open(latest, "rt") as f:
                     lines = f.readlines()
             else:
-                with open(latest, "r") as f:
+                with open(latest) as f:
                     lines = f.readlines()
 
             if lines:
@@ -198,7 +197,7 @@ class AuditLogger:
 
     def _get_current_log_path(self) -> Path:
         """Get path for current log file."""
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        today = datetime.now(UTC).strftime("%Y-%m-%d")
         return self.log_dir / f"audit-{today}.log"
 
     def _rotate_if_needed(self) -> None:
@@ -317,7 +316,7 @@ class AuditLogger:
         with self._lock:
             # Assign sequence and timestamp if not set
             if not event.timestamp:
-                event.timestamp = datetime.now(timezone.utc).isoformat()
+                event.timestamp = datetime.now(UTC).isoformat()
 
             if not event.sequence:
                 self._sequence += 1
@@ -370,7 +369,7 @@ class AuditLogger:
             }
 
             try:
-                with open(lf, "r") as f:
+                with open(lf) as f:
                     prev_seq = 0
                     prev_hash = None
 

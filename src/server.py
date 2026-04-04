@@ -2842,6 +2842,9 @@ def validate_security_configuration(
     Returns:
         Tuple of (is_valid, error_message)
     """
+    from src.utils.auth import TokenEntropyError, TokenFormatError, TokenValidator
+    from src.utils.tls import TLSMode
+
     # Check if this is a remote configuration
     is_local_host = host in ("127.0.0.1", "localhost", "::1")
     is_remote = transport != "stdio" and (not is_local_host or allow_remote)
@@ -2863,8 +2866,6 @@ def validate_security_configuration(
         )
 
     # 2. TLS is strongly recommended (required by default)
-    from src.utils.tls import TLSMode
-
     tls_enum = TLSMode(tls_mode) if tls_mode else TLSMode.DISABLED
 
     if tls_enum == TLSMode.DISABLED:
@@ -2883,8 +2884,6 @@ def validate_security_configuration(
         logger.warning("This is vulnerable to MITM if fingerprint not verified.")
 
     # 4. Validate token strength
-    from src.utils.auth import TokenValidator, TokenFormatError, TokenEntropyError
-
     try:
         TokenValidator.validate(auth_token, check_entropy=True)
     except TokenFormatError as e:
@@ -2902,11 +2901,11 @@ def validate_security_configuration(
 
 def main():
     """Run the MCP server with transport and security configuration."""
-    from src.utils.config import get_config, get_config_bool, get_config_int
-    from src.utils.tls import get_tls_configuration_from_config, TLSMode, print_security_warning
-    from src.utils.auth import create_auth_manager_from_config
     from src.utils.audit_log import get_audit_logger
+    from src.utils.auth import create_auth_manager_from_config
+    from src.utils.config import get_config, get_config_bool, get_config_int
     from src.utils.rate_limit import get_rate_limiter
+    from src.utils.tls import TLSMode, get_tls_configuration_from_config, print_security_warning
 
     # Load configuration
     transport = get_config("MCP_TRANSPORT", "stdio")
@@ -3056,8 +3055,8 @@ def main():
             )
         except ImportError as e:
             logger.error(f"SSE transport not available: {e}")
-            print(f"\nERROR: SSE transport requires additional dependencies.")
-            print(f"Install with: uv pip install 'fastmcp[sse]'")
+            print("\nERROR: SSE transport requires additional dependencies.")
+            print("Install with: uv pip install 'fastmcp[sse]'")
             sys.exit(1)
 
     else:

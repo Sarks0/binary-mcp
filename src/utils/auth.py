@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import logging
+import math
 import secrets
 import time
 from dataclasses import dataclass, field
@@ -173,15 +174,7 @@ class TokenValidator:
         for char in token:
             freq[char] = freq.get(char, 0) + 1
 
-        entropy = 0.0
-        for count in freq.values():
-            p = count / length
-            if p > 0:
-                entropy -= p * (p).bit_length()  # Approximation
-
-        # More accurate calculation
-        import math
-
+        # Shannon entropy calculation
         entropy = 0.0
         for count in freq.values():
             p = count / length
@@ -286,8 +279,12 @@ class AuthManager:
             except TokenFormatError as e:
                 logger.error(f"SECURITY WARNING: {e}")
                 logger.error("Generate a secure token with: python scripts/generate_token.py")
+                raise  # Don't start with an invalid token
             except TokenEntropyError as e:
                 logger.warning(f"Token security concern: {e}")
+
+        # Clear the raw token from memory — only the hash is needed
+        self._token = None
 
     @staticmethod
     def _hash_token(token: str) -> bytes:
@@ -570,8 +567,6 @@ def generate_secure_token(length: int = 48) -> str:
     # Each byte = 8 bits, base64url encoding expands ~4/3
     # For 256 bits entropy: 32 bytes = 43 chars base64url
     # Using 48 chars for good margin
-    import math
-
     bytes_needed = math.ceil(length * 3 / 4)
     token = secrets.token_urlsafe(bytes_needed)
     return token[:length] if len(token) > length else token

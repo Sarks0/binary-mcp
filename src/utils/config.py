@@ -202,6 +202,10 @@ CONFIG_KEYS = {
     "MCP_AUDIT_LOG_PATH": "Directory for audit logs (default: ~/.binary_mcp_output/audit/)",
     "MCP_AUDIT_LOG_RETENTION_DAYS": "Days to retain audit logs (default: 90)",
     "MCP_AUDIT_LOG_ROTATE_SIZE_MB": "Max log size before rotation (default: 100)",
+    # =============================================================================
+    # CORS Configuration
+    # =============================================================================
+    "MCP_CORS_ORIGIN": "CORS Access-Control-Allow-Origin header value (default: *)",
 }
 
 
@@ -244,6 +248,22 @@ def get_config_status() -> dict[str, dict]:
             }
 
     return status
+
+
+_LOCALHOST_ADDRESSES = ("127.0.0.1", "localhost", "::1")
+
+
+def is_remote_host(host: str) -> bool:
+    """
+    Check if a host address represents a remote (non-localhost) bind.
+
+    Args:
+        host: The host/IP address to check
+
+    Returns:
+        True if the host is not a localhost address
+    """
+    return host not in _LOCALHOST_ADDRESSES
 
 
 def _mask_value(key: str, value: str) -> str:

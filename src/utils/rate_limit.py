@@ -19,7 +19,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from threading import Lock
+from threading import Lock, RLock
 from typing import Any
 
 from src.utils.config import get_config_int
@@ -59,6 +59,11 @@ class TokenBucket:
     tokens: float = field(default=0.0)
     last_update: float = field(default_factory=time.time)
     lock: Lock = field(default_factory=Lock)
+
+    def __post_init__(self) -> None:
+        """Initialize tokens to capacity if not explicitly set."""
+        if self.tokens == 0.0:
+            self.tokens = float(self.capacity)
 
     def consume(self, tokens: int = 1) -> tuple[bool, float]:
         """
@@ -149,7 +154,7 @@ class RateLimiter:
         # Rate limit storage: (key, tier) -> TokenBucket
         self._buckets: dict[tuple[str, RateLimitTier], TokenBucket] = {}
         self._last_activity: dict[tuple[str, RateLimitTier], float] = {}
-        self._lock = Lock()
+        self._lock = RLock()
         self._last_cleanup = time.time()
 
     def _get_bucket(self, key: str, tier: RateLimitTier) -> TokenBucket:

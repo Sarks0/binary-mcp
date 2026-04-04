@@ -11,7 +11,7 @@ Provides:
 Security features:
 - JSON Lines format (one event per line, parseable even if corrupted)
 - Timestamp with timezone (ISO 8601)
-- Event integrity (sequence numbers prevent deletion)
+- Event integrity (sequence numbers detect deletions/gaps)
 - Automatic rotation by size and time
 - Read-only historical logs (current log only writable)
 """
@@ -64,7 +64,7 @@ class AuditEvent:
     """
     Audit event record.
 
-    Immutable record of security-relevant events.
+    Structured record of security-relevant events.
     """
 
     # Event identification
@@ -450,6 +450,10 @@ def reset_audit_logger() -> None:
     _global_audit_logger = None
 
 
+# Consecutive failure counter for audit logging health monitoring
+_audit_failure_count = 0
+
+
 # Convenience functions for common events
 
 
@@ -470,6 +474,7 @@ def log_security_event(
         client_ip: Client IP
         details: Additional details
     """
+    global _audit_failure_count
     try:
         event = AuditEvent(
             timestamp="",
@@ -492,10 +497,15 @@ def log_security_event(
         )
 
         get_audit_logger().log_event(event)
+        _audit_failure_count = 0
 
     except Exception as e:
         # Never fail main operation due to audit logging
-        logger.error(f"Failed to write audit log: {e}")
+        _audit_failure_count += 1
+        if _audit_failure_count >= 3:
+            logger.critical(f"Audit logging has failed {_audit_failure_count} consecutive times: {e}")
+        else:
+            logger.error(f"Failed to write audit log: {e}")
 
 
 def log_tool_call(
@@ -506,6 +516,7 @@ def log_tool_call(
     details: dict[str, Any] | None = None,
 ) -> None:
     """Log tool call event."""
+    global _audit_failure_count
     try:
         event = AuditEvent(
             timestamp="",
@@ -528,15 +539,21 @@ def log_tool_call(
         )
 
         get_audit_logger().log_event(event)
+        _audit_failure_count = 0
 
     except Exception as e:
-        logger.error(f"Failed to write audit log: {e}")
+        _audit_failure_count += 1
+        if _audit_failure_count >= 3:
+            logger.critical(f"Audit logging has failed {_audit_failure_count} consecutive times: {e}")
+        else:
+            logger.error(f"Failed to write audit log: {e}")
 
 
 def log_access(
     session_id: str, resource: str, action: str, client_ip: str | None, allowed: bool
 ) -> None:
     """Log resource access attempt."""
+    global _audit_failure_count
     try:
         outcome = AuditOutcome.SUCCESS.value if allowed else AuditOutcome.DENIED.value
 
@@ -561,9 +578,14 @@ def log_access(
         )
 
         get_audit_logger().log_event(event)
+        _audit_failure_count = 0
 
     except Exception as e:
-        logger.error(f"Failed to write audit log: {e}")
+        _audit_failure_count += 1
+        if _audit_failure_count >= 3:
+            logger.critical(f"Audit logging has failed {_audit_failure_count} consecutive times: {e}")
+        else:
+            logger.error(f"Failed to write audit log: {e}")
 
 
 def log_session_event(
@@ -573,6 +595,7 @@ def log_session_event(
     details: dict[str, Any] | None = None,
 ) -> None:
     """Log session lifecycle event (create, destroy, etc.)."""
+    global _audit_failure_count
     try:
         event = AuditEvent(
             timestamp="",
@@ -595,9 +618,14 @@ def log_session_event(
         )
 
         get_audit_logger().log_event(event)
+        _audit_failure_count = 0
 
     except Exception as e:
-        logger.error(f"Failed to write audit log: {e}")
+        _audit_failure_count += 1
+        if _audit_failure_count >= 3:
+            logger.critical(f"Audit logging has failed {_audit_failure_count} consecutive times: {e}")
+        else:
+            logger.error(f"Failed to write audit log: {e}")
 
 
 def log_error(
@@ -608,6 +636,7 @@ def log_error(
     details: dict[str, Any] | None = None,
 ) -> None:
     """Log error event."""
+    global _audit_failure_count
     try:
         event = AuditEvent(
             timestamp="",
@@ -630,6 +659,11 @@ def log_error(
         )
 
         get_audit_logger().log_event(event)
+        _audit_failure_count = 0
 
     except Exception as e:
-        logger.error(f"Failed to write audit log: {e}")
+        _audit_failure_count += 1
+        if _audit_failure_count >= 3:
+            logger.critical(f"Audit logging has failed {_audit_failure_count} consecutive times: {e}")
+        else:
+            logger.error(f"Failed to write audit log: {e}")

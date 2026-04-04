@@ -2845,9 +2845,10 @@ def validate_security_configuration(
     from src.utils.auth import TokenEntropyError, TokenFormatError, TokenValidator
     from src.utils.tls import TLSMode
 
+    from src.utils.config import is_remote_host
+
     # Check if this is a remote configuration
-    is_local_host = host in ("127.0.0.1", "localhost", "::1")
-    is_remote = transport != "stdio" and (not is_local_host or allow_remote)
+    is_remote = transport != "stdio" and (is_remote_host(host) or allow_remote)
 
     if not is_remote:
         # Local mode - all configurations acceptable
@@ -3031,8 +3032,8 @@ def main():
                 "auth_enabled": auth_manager is not None,
             },
         )
-    except Exception:
-        pass  # Don't fail startup due to audit logging
+    except Exception as e:
+        logger.warning(f"Failed to write startup audit event: {e}")
 
     # Run server based on transport type
     if transport == "stdio":

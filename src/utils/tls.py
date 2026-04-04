@@ -29,7 +29,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
-from src.utils.config import get_config, get_config_bool
+from src.utils.config import get_config, get_config_bool, is_remote_host
 
 logger = logging.getLogger(__name__)
 
@@ -406,7 +406,7 @@ def get_tls_configuration_from_config() -> tuple[TLSMode, ssl.SSLContext | None]
     allow_remote = get_config_bool("MCP_ALLOW_REMOTE", False)
     require_tls_remote = get_config_bool("MCP_TLS_REQUIRED_FOR_REMOTE", True)
 
-    is_remote = transport != "stdio" and (host != "127.0.0.1" or allow_remote)
+    is_remote = transport != "stdio" and (is_remote_host(host) or allow_remote)
 
     if is_remote and require_tls_remote and mode == TLSMode.DISABLED:
         raise TLSConfigurationError(
@@ -496,9 +496,7 @@ def print_security_warning(tls_mode: TLSMode, host: str, port: int) -> None:
         host: Listen host
         port: Listen port
     """
-    is_local = host in ("127.0.0.1", "localhost", "::1")
-
-    if not is_local:
+    if is_remote_host(host):
         print("\n" + "=" * 70)
         print("SECURITY WARNING: Remote Access Enabled")
         print("=" * 70)

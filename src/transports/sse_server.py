@@ -34,6 +34,9 @@ from src.utils.rate_limit import RateLimiter, RateLimitExceededError, RateLimitT
 
 logger = logging.getLogger(__name__)
 
+# Maximum allowed request body size (10 MB)
+MAX_REQUEST_BODY = 10 * 1024 * 1024
+
 
 class IPAllowlistError(Exception):
     """Client IP not in allowlist."""
@@ -52,8 +55,10 @@ def check_ip_allowlist(client_ip: str, allowlist: list[str] | None) -> bool:
     Returns:
         True if IP is allowed or no allowlist configured
     """
-    if not allowlist or not client_ip:
+    if not allowlist:
         return True
+    if not client_ip:
+        return False  # Can't verify IP — deny access
 
     try:
         client_addr = ipaddress.ip_address(client_ip)
@@ -91,13 +96,13 @@ def get_client_ip(headers: dict[str, str]) -> str | None:
     Returns:
         Client IP or None
     """
-    # Check forwarded headers
-    forwarded = headers.get("X-Forwarded-For")
+    # Check forwarded headers (keys are lowercased by _get_headers)
+    forwarded = headers.get("x-forwarded-for")
     if forwarded:
         # Take first IP in chain (closest to original client)
         return forwarded.split(",")[0].strip()
 
-    real_ip = headers.get("X-Real-IP")
+    real_ip = headers.get("x-real-ip")
     if real_ip:
         return real_ip
 
@@ -141,6 +146,8 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
     auth_manager: AuthManager | None = None
     rate_limiter: RateLimiter | None = None
     ip_allowlist: list[str] | None = None
+    require_auth: bool = False
+    cors_origin: str = "*"
     server_session_map: dict[str, Any] = {}
     mcp_read_stream: Any = None
     mcp_write_stream: Any = None
@@ -151,7 +158,7 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
 
     def send_cors_headers(self) -> None:
         """Send CORS headers for cross-origin requests."""
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Origin", self.cors_origin)
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
 
@@ -190,9 +197,12 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
         Returns:
             Tuple of (session_id, metadata) or (None, None) if unauthenticated
         """
-        # If no auth manager configured, skip authentication
+        # If no auth manager configured, check if auth should be required
         if not self.auth_manager:
-            return (None, None)
+            # For SSE transport, auth is mandatory — fail closed
+            if self.require_auth:
+                return (None, {"error": "server_misconfigured", "message": "Authentication system not initialized"})
+            return (None, None)  # stdio transport — no auth needed
 
         headers = self._get_headers()
         auth_header = headers.get("authorization")
@@ -255,13 +265,30 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
         # Authenticate
         session_id, auth_metadata = self._authenticate()
 
-        if self.auth_manager and not session_id:
+        if not session_id and (self.auth_manager or self.require_auth):
             # Authentication required but failed
             error_code = (
                 auth_metadata.get("error", "authentication_required")
                 if auth_metadata
                 else "authentication_required"
             )
+
+            # Return 429 for rate limit errors, 401 for auth errors
+            if error_code == "rate_limit_exceeded":
+                retry_after = auth_metadata.get("retry_after", 60) if auth_metadata else 60
+                self.send_response(429)
+                self.send_header("Retry-After", str(int(retry_after)))
+                self.send_security_headers()
+                self.end_headers()
+                self.wfile.write(
+                    json.dumps(
+                        {
+                            "error": "rate_limit_exceeded",
+                            "message": "Too many requests. Please retry later.",
+                        }
+                    ).encode()
+                )
+                return
 
             self.send_response(401)
             self.send_header("WWW-Authenticate", "Bearer")
@@ -352,7 +379,30 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
         # Authenticate
         session_id, auth_metadata = self._authenticate()
 
-        if self.auth_manager and not session_id:
+        if not session_id and (self.auth_manager or self.require_auth):
+            error_code = (
+                auth_metadata.get("error", "authentication_required")
+                if auth_metadata
+                else "authentication_required"
+            )
+
+            # Return 429 for rate limit errors, 401 for auth errors
+            if error_code == "rate_limit_exceeded":
+                retry_after = auth_metadata.get("retry_after", 60) if auth_metadata else 60
+                self.send_response(429)
+                self.send_header("Retry-After", str(int(retry_after)))
+                self.send_security_headers()
+                self.end_headers()
+                self.wfile.write(
+                    json.dumps(
+                        {
+                            "error": "rate_limit_exceeded",
+                            "message": "Too many requests. Please retry later.",
+                        }
+                    ).encode()
+                )
+                return
+
             self.send_response(401)
             self.send_header("WWW-Authenticate", "Bearer")
             self.end_headers()
@@ -372,7 +422,21 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                 return
 
         # Read request body
-        content_length = int(self.headers.get("Content-Length", 0))
+        try:
+            content_length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            self.send_response(400)
+            self.end_headers()
+            self.wfile.write(b'{"error": "invalid_content_length", "message": "Invalid Content-Length header"}')
+            return
+
+        if content_length > MAX_REQUEST_BODY:
+            self.send_response(413)
+            self.send_security_headers()
+            self.end_headers()
+            self.wfile.write(b'{"error": "request_too_large", "message": "Request body too large"}')
+            return
+
         body = self.rfile.read(content_length)
 
         try:
@@ -441,6 +505,8 @@ def run_sse_server(
     MCPRequestHandler.auth_manager = auth_manager
     MCPRequestHandler.rate_limiter = rate_limiter
     MCPRequestHandler.ip_allowlist = ip_allowlist
+    MCPRequestHandler.require_auth = True  # SSE transport always requires auth
+    MCPRequestHandler.cors_origin = get_config("MCP_CORS_ORIGIN", "*") or "*"
 
     # Create HTTP server
     server = ThreadedHTTPServer((host, port), MCPRequestHandler)

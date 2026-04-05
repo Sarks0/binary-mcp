@@ -168,9 +168,9 @@ def generate_self_signed_cert(
 
             # Check if still valid
             now = datetime.datetime.now(datetime.UTC)
-            if cert.not_valid_after > now:
+            if cert.not_valid_after_utc > now:
                 logger.info(
-                    f"Using existing self-signed certificate (valid until {cert.not_valid_after})"
+                    f"Using existing self-signed certificate (valid until {cert.not_valid_after_utc})"
                 )
                 return (cert_path, key_path)
             else:
@@ -267,7 +267,7 @@ def generate_self_signed_cert(
         logger.info("Generated self-signed certificate:")
         logger.info(f"  Certificate: {cert_path}")
         logger.info(f"  Private Key: {key_path}")
-        logger.info(f"  Valid: {now} to {cert.not_valid_after}")
+        logger.info(f"  Valid: {now} to {cert.not_valid_after_utc}")
         logger.info(f"  Hostname: {hostname}")
         logger.warning(
             "SECURITY WARNING: Self-signed certificate - verify fingerprint out-of-band!"
@@ -336,14 +336,14 @@ def validate_certificate(cert_path: Path, key_path: Path) -> dict[str, Any]:
         # Check certificate validity
         now = datetime.datetime.now(datetime.UTC)
 
-        if now < cert.not_valid_before:
-            errors.append(f"Certificate not yet valid (valid from {cert.not_valid_before})")
+        if now < cert.not_valid_before_utc:
+            errors.append(f"Certificate not yet valid (valid from {cert.not_valid_before_utc})")
 
-        if now > cert.not_valid_after:
-            errors.append(f"Certificate expired on {cert.not_valid_after}")
+        if now > cert.not_valid_after_utc:
+            errors.append(f"Certificate expired on {cert.not_valid_after_utc}")
 
         # Check expiration warning (30 days)
-        days_until_expiry = (cert.not_valid_after - now).days
+        days_until_expiry = (cert.not_valid_after_utc - now).days
         if days_until_expiry < 30:
             warnings.append(f"Certificate expires in {days_until_expiry} days")
 
@@ -351,8 +351,8 @@ def validate_certificate(cert_path: Path, key_path: Path) -> dict[str, Any]:
         info = {
             "subject": str(cert.subject),
             "issuer": str(cert.issuer),
-            "valid_from": cert.not_valid_before.isoformat(),
-            "valid_until": cert.not_valid_after.isoformat(),
+            "valid_from": cert.not_valid_before_utc.isoformat(),
+            "valid_until": cert.not_valid_after_utc.isoformat(),
             "days_until_expiry": days_until_expiry,
             "serial_number": str(cert.serial_number),
             "fingerprint_sha256": cert.fingerprint(hashes.SHA256()).hex(),

@@ -2866,7 +2866,15 @@ def validate_security_configuration(
         )
 
     # 2. TLS is strongly recommended (required by default)
-    tls_enum = TLSMode(tls_mode) if tls_mode else TLSMode.DISABLED
+    try:
+        tls_enum = TLSMode(tls_mode) if tls_mode else TLSMode.DISABLED
+    except ValueError:
+        return (
+            False,
+            f"SECURITY ERROR: Invalid TLS mode '{tls_mode}'.\n"
+            "Valid options: disabled, self_signed, cert_file\n"
+            "Set MCP_TLS_MODE in your .env file.",
+        )
     require_tls_remote = get_config_bool("MCP_TLS_REQUIRED_FOR_REMOTE", True)
 
     if tls_enum == TLSMode.DISABLED:
@@ -2956,29 +2964,18 @@ def main():
 
     # Initialize security components
     tls_mode = TLSMode.DISABLED
-    tls_cert_path = None
-    tls_key_path = None
+    ssl_context = None
 
     try:
         # Initialize audit logging
         audit_logger = get_audit_logger()
         logger.info(f"Audit logging initialized: {audit_logger.log_dir}")
 
-        # Initialize TLS if configured (get cert/key paths for uvicorn)
+        # Initialize TLS if configured
         if transport != "stdio":
             tls_mode, ssl_context = get_tls_configuration_from_config()
             if ssl_context:
                 logger.info(f"TLS initialized ({tls_mode.value})")
-                # Extract cert/key paths from config for uvicorn
-                tls_cert_path = get_config("MCP_TLS_CERT_PATH")
-                tls_key_path = get_config("MCP_TLS_KEY_PATH")
-                # For self-signed certs, paths are in the default location
-                if not tls_cert_path and tls_mode == TLSMode.SELF_SIGNED:
-                    from pathlib import Path
-
-                    cert_dir = Path.home() / ".binary_mcp_output" / "tls"
-                    tls_cert_path = str(cert_dir / "server.crt")
-                    tls_key_path = str(cert_dir / "server.key")
 
             # Print security warnings for remote access
             print_security_warning(tls_mode, host, port)
@@ -3065,8 +3062,7 @@ def main():
             uvicorn_config = build_uvicorn_config(
                 host=host,
                 port=port,
-                tls_cert_path=tls_cert_path,
-                tls_key_path=tls_key_path,
+                ssl_context=ssl_context,
             )
 
             # Get IP allowlist ASGI middleware if configured

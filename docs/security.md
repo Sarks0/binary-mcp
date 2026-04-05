@@ -370,24 +370,27 @@ print(f"Valid: {result['all_valid']}")
 
 If you suspect unauthorized access:
 
-1. **Immediately revoke the session:**
-   ```python
-   from src.utils.auth import get_auth_manager
-   get_auth_manager().revoke_session(session_id)
-   ```
+### Session Revocation
 
-2. **Rotate the authentication token:**
+To revoke all sessions and block a compromised token:
+
+1. Generate a new token:
    ```bash
    python scripts/generate_token.py
-   # Update .env and restart server
    ```
 
-3. **Review audit logs:**
+2. Update your `.env` file with the new `MCP_AUTH_TOKEN`
+
+3. Restart the server -- all existing sessions are invalidated immediately
+
+### Post-Incident Investigation
+
+1. **Review audit logs:**
    ```bash
    cat ~/.binary_mcp_output/audit/audit-*.log | grep "192.168.1.x"
    ```
 
-4. **Check for data access:**
+2. **Check for data access:**
    Review tool calls in logs for unauthorized binary analysis
 
 ---

@@ -27,7 +27,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from src.utils.audit_log import log_access, log_tool_call
 from src.utils.auth import TokenEntropyError, TokenFormatError, TokenValidator
-from src.utils.config import get_config
+from src.utils.config import get_config, get_config_int
 
 logger = logging.getLogger(__name__)
 
@@ -266,17 +266,15 @@ class IPAllowlistMiddleware:
 def configure_remote_access(
     app: Any,
     auth_token: str | None,
-    rate_limit_rps: float = 10.0,
-    rate_limit_burst: int = 20,
 ) -> None:
     """
     Configure a FastMCP app with security middleware for remote access.
 
+    Rate limit values are read from config (MCP_RATE_LIMIT_REQUESTS env var).
+
     Args:
         app: FastMCP application instance
         auth_token: Authentication token (sets app.auth)
-        rate_limit_rps: Max requests per second
-        rate_limit_burst: Burst capacity for rate limiter
     """
     # Auth
     if auth_token:
@@ -285,6 +283,11 @@ def configure_remote_access(
     else:
         logger.warning("Authentication: DISABLED — INSECURE")
 
+    # Read rate limit config (MCP_RATE_LIMIT_REQUESTS is per-minute)
+    max_requests_per_minute = get_config_int("MCP_RATE_LIMIT_REQUESTS", 100)
+    rate_limit_rps = max_requests_per_minute / 60.0
+    rate_limit_burst = max(max_requests_per_minute, 20)
+
     # Rate limiting
     app.add_middleware(
         RateLimitingMiddleware(
@@ -292,7 +295,7 @@ def configure_remote_access(
             burst_capacity=rate_limit_burst,
         )
     )
-    logger.info(f"Rate limiting: {rate_limit_rps} req/s, burst {rate_limit_burst}")
+    logger.info(f"Rate limiting: {rate_limit_rps:.2f} req/s, burst {rate_limit_burst}")
 
     # Audit logging
     app.add_middleware(AuditMiddleware())
@@ -302,8 +305,7 @@ def configure_remote_access(
 def build_uvicorn_config(
     host: str,
     port: int,
-    tls_cert_path: str | None = None,
-    tls_key_path: str | None = None,
+    ssl_context: Any = None,
 ) -> dict[str, Any]:
     """
     Build uvicorn config dict for FastMCP's run() method.
@@ -311,17 +313,15 @@ def build_uvicorn_config(
     Args:
         host: Bind host
         port: Listen port
-        tls_cert_path: Path to TLS certificate file
-        tls_key_path: Path to TLS private key file
+        ssl_context: Pre-configured ssl.SSLContext with hardened settings
 
     Returns:
         Dict suitable for FastMCP's uvicorn_config parameter
     """
     config: dict[str, Any] = {}
 
-    if tls_cert_path and tls_key_path:
-        config["ssl_certfile"] = str(tls_cert_path)
-        config["ssl_keyfile"] = str(tls_key_path)
+    if ssl_context:
+        config["ssl"] = ssl_context
         logger.info(f"TLS enabled on {host}:{port}")
     else:
         logger.warning(f"No TLS — connections to {host}:{port} are UNENCRYPTED")

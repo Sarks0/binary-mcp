@@ -205,9 +205,9 @@ class AuditLogger:
         if self._current_file is None:
             return
 
-        # Check file size
+        # Check file size using actual file on disk (not stream position)
         try:
-            current_size = self._current_file.tell()
+            current_size = self._current_log.stat().st_size
             if current_size >= self.max_size_bytes:
                 self._close_current()
                 self._cleanup_old_logs()

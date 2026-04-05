@@ -29,10 +29,7 @@ SSH into your VM or open a terminal on your second computer:
 # 1. Navigate to your binary-mcp installation
 cd binary-mcp
 
-# 2. Switch to the remote access branch
-git checkout feature/secure-remote-mcp-access
-
-# 3. Install the new security dependencies
+# 2. Install dependencies
 uv sync
 ```
 

@@ -2978,7 +2978,7 @@ def main():
                 logger.info(f"TLS initialized ({tls_mode.value})")
 
             # Print security warnings for remote access
-            print_security_warning(tls_mode, host, port)
+            print_security_warning(tls_mode, host, port, auth_enabled=(auth_token is not None))
 
     except Exception as e:
         logger.error(f"Failed to initialize security: {e}")
@@ -3054,37 +3054,41 @@ def main():
                 configure_remote_access,
                 get_ip_allowlist_middleware,
             )
-
-            # Configure auth, rate limiting, and audit middleware on the app
-            configure_remote_access(app, auth_token=auth_token)
-
-            # Build uvicorn config with TLS
-            uvicorn_config = build_uvicorn_config(
-                host=host,
-                port=port,
-                ssl_context=ssl_context,
-            )
-
-            # Get IP allowlist ASGI middleware if configured
-            asgi_middleware = []
-            ip_mw = get_ip_allowlist_middleware()
-            if ip_mw:
-                asgi_middleware.append(ip_mw)
-
-            logger.info(f"Starting SSE server on {host}:{port}")
-            app.run(
-                transport="sse",
-                host=host,
-                port=port,
-                uvicorn_config=uvicorn_config,
-                middleware=asgi_middleware if asgi_middleware else None,
-            )
-
         except ImportError as e:
             logger.error(f"SSE transport not available: {e}")
             print("\nERROR: SSE transport requires additional dependencies.")
             print("Install with: uv add 'fastmcp[sse]'")
             sys.exit(1)
+
+        try:
+            # Configure auth, rate limiting, and audit middleware on the app
+            configure_remote_access(app, auth_token=auth_token)
+        except Exception as e:
+            logger.error(f"Failed to configure remote access: {e}")
+            print(f"\nERROR: Remote access configuration failed: {e}")
+            sys.exit(1)
+
+        # Build uvicorn config with TLS
+        uvicorn_config = build_uvicorn_config(
+            host=host,
+            port=port,
+            ssl_context=ssl_context,
+        )
+
+        # Get IP allowlist ASGI middleware if configured
+        asgi_middleware = []
+        ip_mw = get_ip_allowlist_middleware()
+        if ip_mw:
+            asgi_middleware.append(ip_mw)
+
+        logger.info(f"Starting SSE server on {host}:{port}")
+        app.run(
+            transport="sse",
+            host=host,
+            port=port,
+            uvicorn_config=uvicorn_config,
+            middleware=asgi_middleware if asgi_middleware else None,
+        )
 
     else:
         logger.error(f"Unknown transport: {transport}")

@@ -288,11 +288,14 @@ def configure_remote_access(
     rate_limit_rps = max_requests_per_minute / 60.0
     rate_limit_burst = max(max_requests_per_minute, 20)
 
-    # Rate limiting
+    # Rate limiting — global_limit=True because MCP-level MiddlewareContext
+    # does not expose per-client identifiers (IP filtering is handled at the
+    # ASGI layer by IPAllowlistMiddleware).
     app.add_middleware(
         RateLimitingMiddleware(
             max_requests_per_second=rate_limit_rps,
             burst_capacity=rate_limit_burst,
+            global_limit=True,
         )
     )
     logger.info(f"Rate limiting: {rate_limit_rps:.2f} req/s, burst {rate_limit_burst}")

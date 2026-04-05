@@ -76,10 +76,7 @@ ssh user@192.168.1.100
 # Navigate to binary-mcp
 cd binary-mcp
 
-# Switch to the feature branch
-git checkout feature/secure-remote-mcp-access
-
-# Install new dependency (cryptography for TLS)
+# Install dependencies (includes cryptography for TLS)
 uv sync
 
 # Generate authentication token
@@ -577,7 +574,6 @@ MCP_ALLOWED_IPS=10.0.0.0/8,192.168.1.0/24
 
 # Authentication
 MCP_AUTH_TOKEN=<48-char-high-entropy-token>
-MCP_TOKEN_EXPIRY=3600
 
 # TLS with proper certificate
 MCP_TLS_MODE=cert_file
@@ -589,7 +585,6 @@ MCP_TLS_REQUIRED_FOR_REMOTE=true
 MCP_RATE_LIMIT_AUTH=3
 MCP_RATE_LIMIT_REQUESTS=50
 MCP_RATE_LIMIT_WINDOW=60
-MCP_MAX_CONNECTIONS=5
 
 # Audit logging
 MCP_AUDIT_LOG_PATH=/var/log/binary-mcp/audit
@@ -608,7 +603,6 @@ If you currently use stdio and want to switch to remote:
 # On VM
 git clone https://github.com/Sarks0/binary-mcp.git
 cd binary-mcp
-git checkout feature/secure-remote-mcp-access
 uv sync
 ```
 

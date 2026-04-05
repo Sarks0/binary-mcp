@@ -72,7 +72,7 @@ python -m src.server
 │  - No unencrypted fallback               │
 ├─────────────────────────────────────────┤
 │  Layer 3: Authentication                │
-│  - Bearer token (min 256-bit entropy)  │
+│  - Bearer token (min 128-bit entropy)  │
 │  - Session management                    │
 │  - Rate limiting on auth                 │
 ├─────────────────────────────────────────┤
@@ -144,10 +144,6 @@ MCP_AUTH_TOKEN=your-secure-token-here-min-32-chars
 
 # Generate with:
 python scripts/generate_token.py
-
-# Token expiration (seconds)
-MCP_TOKEN_EXPIRY=3600    # 1 hour
-MCP_TOKEN_EXPIRY=0       # Never expire (not recommended)
 ```
 
 **Token Requirements:**
@@ -185,7 +181,6 @@ MCP_TLS_REQUIRED_FOR_REMOTE=true
 MCP_RATE_LIMIT_AUTH=5          # 5 attempts per window
 MCP_RATE_LIMIT_REQUESTS=100    # 100 requests per window
 MCP_RATE_LIMIT_WINDOW=60       # 60 second window
-MCP_MAX_CONNECTIONS=10         # 10 concurrent connections
 ```
 
 ### Audit Logging

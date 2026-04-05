@@ -487,7 +487,9 @@ def get_certificate_fingerprint(cert_path: Path) -> str | None:
         return None
 
 
-def print_security_warning(tls_mode: TLSMode, host: str, port: int) -> None:
+def print_security_warning(
+    tls_mode: TLSMode, host: str, port: int, auth_enabled: bool = True
+) -> None:
     """
     Print security warnings for remote access configuration.
 
@@ -495,6 +497,7 @@ def print_security_warning(tls_mode: TLSMode, host: str, port: int) -> None:
         tls_mode: TLS configuration mode
         host: Listen host
         port: Listen port
+        auth_enabled: Whether bearer token authentication is configured
     """
     if is_remote_host(host):
         print("\n" + "=" * 70)
@@ -512,6 +515,9 @@ def print_security_warning(tls_mode: TLSMode, host: str, port: int) -> None:
 
         print(f"\n   Listening on: {host}:{port}")
         print(f"   TLS Mode: {tls_mode.value}")
-        print("\n   Authentication: Bearer token required")
-        print("   (Set MCP_AUTH_TOKEN in .env)")
+        if auth_enabled:
+            print("\n   Authentication: Bearer token required")
+        else:
+            print("\n   Authentication: DISABLED (no MCP_AUTH_TOKEN set)")
+            print("   WARNING: Any client can connect without credentials!")
         print("=" * 70 + "\n")

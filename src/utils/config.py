@@ -181,7 +181,6 @@ CONFIG_KEYS = {
     # Authentication & Authorization
     # =============================================================================
     "MCP_AUTH_TOKEN": "Bearer token for remote authentication (min 32 chars)",
-    "MCP_TOKEN_EXPIRY": "Session token expiry in seconds (default: 3600, 0=never)",
     # =============================================================================
     # Transport Security (TLS)
     # =============================================================================
@@ -195,17 +194,12 @@ CONFIG_KEYS = {
     "MCP_RATE_LIMIT_AUTH": "Auth attempts per window (default: 5)",
     "MCP_RATE_LIMIT_REQUESTS": "Tool calls per window (default: 100)",
     "MCP_RATE_LIMIT_WINDOW": "Rate limit window in seconds (default: 60)",
-    "MCP_MAX_CONNECTIONS": "Maximum concurrent connections (default: 10)",
     # =============================================================================
     # Audit Logging
     # =============================================================================
     "MCP_AUDIT_LOG_PATH": "Directory for audit logs (default: ~/.binary_mcp_output/audit/)",
     "MCP_AUDIT_LOG_RETENTION_DAYS": "Days to retain audit logs (default: 90)",
     "MCP_AUDIT_LOG_ROTATE_SIZE_MB": "Max log size before rotation (default: 100)",
-    # =============================================================================
-    # CORS Configuration
-    # =============================================================================
-    "MCP_CORS_ORIGIN": "CORS Access-Control-Allow-Origin header value (default: *)",
 }
 
 

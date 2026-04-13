@@ -143,8 +143,12 @@ def register_windbg_tools(
 
     @app.tool()
     @log_windbg_tool
-    def windbg_connect_kernel(port: int = 50000, key: str = "", timeout: int = 60) -> str:
+    def windbg_connect_kernel(port: int = 50000, key: str = "", timeout: int = 120) -> str:
         """Connect to a kernel debug target via KDNET.
+
+        Opens the KDNET listening port and waits for the target to break in.
+        Only returns success once the debug engine has an active session and
+        commands can be executed.
 
         IMPORTANT: Start this tool BEFORE rebooting the target machine.
         The host must be listening when the target sends its initial break.
@@ -152,7 +156,7 @@ def register_windbg_tools(
         Args:
             port: KDNET port number (default 50000).
             key: KDNET session key in w.x.y.z format.
-            timeout: Seconds to wait for target to connect (default 60).
+            timeout: Seconds to wait for target to break in (default 120).
                      Set higher if the target has a slow boot.
 
         Returns:

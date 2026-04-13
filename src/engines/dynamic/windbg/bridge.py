@@ -442,10 +442,14 @@ class WinDbgBridge(Debugger):
     def connect_kernel_net(self, port: int, key: str, timeout: int | None = None) -> bool:
         """Connect to a KDNET kernel debug target.
 
+        Opens the KDNET listening port via ``attach()``, then waits for the
+        target to actually break in via ``wait()``.  Only reports success
+        once the debug engine has an active session.
+
         Args:
             port: KDNET port number (e.g. 50000).
             key: KDNET session key (w.x.y.z format).
-            timeout: Seconds to wait for target to connect.
+            timeout: Seconds to wait for target to break in.
                      Defaults to ``_KDNET_TIMEOUT`` (env ``KDNET_TIMEOUT``, 60s).
         """
         self._require_windows()
@@ -455,13 +459,19 @@ class WinDbgBridge(Debugger):
             conn_str = f"net:port={port},key={key}"
             kd = pybag.KernelDbg()
 
-            # pybag's attach() blocks until the target connects — run it in a
-            # worker thread so we can enforce a timeout and return an actionable
-            # error instead of hanging the MCP tool call forever.
+            def _attach_and_wait():
+                # attach() only opens the listening port — it returns before
+                # the target has connected.  wait() blocks until the target
+                # actually breaks in, giving us a live debug session.
+                kd.attach(conn_str)
+                kd.wait(timeout * 1000)
+
+            # Run attach+wait in a worker thread so we can enforce a timeout
+            # and return an actionable error instead of hanging forever.
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                future = pool.submit(kd.attach, conn_str)
+                future = pool.submit(_attach_and_wait)
                 try:
-                    future.result(timeout=timeout)
+                    future.result(timeout=timeout + 5)
                 except concurrent.futures.TimeoutError:
                     logger.warning(
                         "KDNET attach timed out after %ds (port=%d)", timeout, port
@@ -469,7 +479,7 @@ class WinDbgBridge(Debugger):
                     raise WinDbgBridgeError(
                         "connect_kernel_net",
                         f"KDNET connection timed out after {timeout}s. "
-                        f"The target did not connect on port {port}.\n\n"
+                        f"The target did not break in on port {port}.\n\n"
                         "Troubleshooting:\n"
                         "1. Reboot the TARGET machine AFTER starting this connect call — "
                         "the host must be listening before the target sends its initial break.\n"

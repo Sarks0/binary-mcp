@@ -466,29 +466,36 @@ class WinDbgBridge(Debugger):
                 kd.attach(conn_str)
                 kd.wait(timeout * 1000)
 
-            # Run attach+wait in a worker thread so we can enforce a timeout
-            # and return an actionable error instead of hanging forever.
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                future = pool.submit(_attach_and_wait)
-                try:
-                    future.result(timeout=timeout + 5)
-                except concurrent.futures.TimeoutError:
-                    logger.warning(
-                        "KDNET attach timed out after %ds (port=%d)", timeout, port
-                    )
-                    raise WinDbgBridgeError(
-                        "connect_kernel_net",
-                        f"KDNET connection timed out after {timeout}s. "
-                        f"The target did not break in on port {port}.\n\n"
-                        "Troubleshooting:\n"
-                        "1. Reboot the TARGET machine AFTER starting this connect call — "
-                        "the host must be listening before the target sends its initial break.\n"
-                        "2. Verify the key matches exactly (bcdedit /dbgsettings on the target).\n"
-                        "3. Confirm the target's NIC supports KDNET "
-                        "(kdnet.exe on the target will tell you).\n"
-                        "4. Ensure no firewall is blocking the UDP port on BOTH machines.\n"
-                        "5. Increase timeout: set KDNET_TIMEOUT=120"
-                    )
+            # Run attach+wait in a daemon thread so we can enforce a timeout.
+            # IMPORTANT: Do NOT use the ThreadPoolExecutor as a context manager
+            # here — its __exit__ calls shutdown(wait=True) which blocks until
+            # the thread finishes.  If kd.wait() hangs (target never breaks
+            # in), that deadlocks the entire MCP tool call.  Instead, on
+            # timeout we call shutdown(wait=False) to abandon the thread.
+            pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            future = pool.submit(_attach_and_wait)
+            try:
+                future.result(timeout=timeout)
+            except concurrent.futures.TimeoutError:
+                pool.shutdown(wait=False, cancel_futures=True)
+                logger.warning(
+                    "KDNET attach timed out after %ds (port=%d)", timeout, port
+                )
+                raise WinDbgBridgeError(
+                    "connect_kernel_net",
+                    f"KDNET connection timed out after {timeout}s. "
+                    f"The target did not break in on port {port}.\n\n"
+                    "Troubleshooting:\n"
+                    "1. Reboot the TARGET machine AFTER starting this connect call — "
+                    "the host must be listening before the target sends its initial break.\n"
+                    "2. Verify the key matches exactly (bcdedit /dbgsettings on the target).\n"
+                    "3. Confirm the target's NIC supports KDNET "
+                    "(kdnet.exe on the target will tell you).\n"
+                    "4. Ensure no firewall is blocking the UDP port on BOTH machines.\n"
+                    "5. Increase timeout: set KDNET_TIMEOUT=120"
+                )
+            else:
+                pool.shutdown(wait=False)
 
             self._dbg = kd
             self._mode = WinDbgMode.KERNEL_MODE

@@ -143,12 +143,17 @@ def register_windbg_tools(
 
     @app.tool()
     @log_windbg_tool
-    def windbg_connect_kernel(port: int = 50000, key: str = "") -> str:
+    def windbg_connect_kernel(port: int = 50000, key: str = "", timeout: int = 60) -> str:
         """Connect to a kernel debug target via KDNET.
+
+        IMPORTANT: Start this tool BEFORE rebooting the target machine.
+        The host must be listening when the target sends its initial break.
 
         Args:
             port: KDNET port number (default 50000).
             key: KDNET session key in w.x.y.z format.
+            timeout: Seconds to wait for target to connect (default 60).
+                     Set higher if the target has a slow boot.
 
         Returns:
             Connection status message.
@@ -158,18 +163,13 @@ def register_windbg_tools(
         try:
             bridge = get_windbg_bridge()
             if key:
-                bridge.connect_kernel_net(port=port, key=key)
+                bridge.connect_kernel_net(port=port, key=key, timeout=timeout)
                 return f"Connected to kernel target via KDNET (port={port})"
             else:
                 bridge.connect_kernel_local()
                 return "Connected to local kernel (read-only)"
         except (WinDbgBridgeError, StructuredBaseError) as e:
-            return (
-                f"Error: {e}\n\nTroubleshooting:\n"
-                "1. Ensure target is configured for kernel debugging\n"
-                "2. Verify KDNET port and key are correct\n"
-                "3. Check network connectivity to the target"
-            )
+            return f"Error: {e}"
 
     @app.tool()
     @log_windbg_tool

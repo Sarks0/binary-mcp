@@ -58,8 +58,7 @@ CRYPTO_OUTPUT_DIR = Path.home() / ".binary_mcp_output" / "crypto"
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
@@ -75,6 +74,7 @@ compatibility_checker = BinaryCompatibilityChecker()
 
 # --- Helper Functions ---
 
+
 def log_to_session(func=None, *, analysis_type: AnalysisType = AnalysisType.STATIC):
     """
     Decorator to automatically log tool calls to session with auto-session support.
@@ -87,6 +87,7 @@ def log_to_session(func=None, *, analysis_type: AnalysisType = AnalysisType.STAT
     Args:
         analysis_type: Type of analysis (STATIC or DYNAMIC)
     """
+
     def decorator(fn):
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
@@ -95,10 +96,7 @@ def log_to_session(func=None, *, analysis_type: AnalysisType = AnalysisType.STAT
 
             # Auto-ensure session if we have a binary path and auto-session is enabled
             if binary_path and session_manager.auto_session_enabled:
-                session_manager.ensure_session(
-                    binary_path=binary_path,
-                    analysis_type=analysis_type
-                )
+                session_manager.ensure_session(binary_path=binary_path, analysis_type=analysis_type)
 
             # Call the original function
             result = fn(*args, **kwargs)
@@ -110,7 +108,7 @@ def log_to_session(func=None, *, analysis_type: AnalysisType = AnalysisType.STAT
                     tool_name=tool_name,
                     arguments=kwargs,
                     output=result,
-                    analysis_type=analysis_type
+                    analysis_type=analysis_type,
                 )
 
             return result
@@ -161,10 +159,7 @@ def _check_ghidra_import_failure(stdout: str, stderr: str) -> tuple[bool, str | 
 
 
 def _validate_analysis_context(
-    context: dict,
-    binary_path: str,
-    ghidra_stdout: str,
-    ghidra_stderr: str
+    context: dict, binary_path: str, ghidra_stdout: str, ghidra_stderr: str
 ) -> tuple[bool, str | None]:
     """
     Validate that Ghidra analysis produced meaningful output.
@@ -230,10 +225,10 @@ def _get_elf_loader_recommendation(binary_path: str) -> str | None:
         Recommendation string or None if not an ELF
     """
     try:
-        with open(binary_path, 'rb') as f:
+        with open(binary_path, "rb") as f:
             magic = f.read(20)
 
-        if magic[:4] != b'\x7fELF':
+        if magic[:4] != b"\x7fELF":
             return None
 
         # ELF class: 1 = 32-bit, 2 = 64-bit
@@ -241,7 +236,7 @@ def _get_elf_loader_recommendation(binary_path: str) -> str | None:
         # ELF data encoding: 1 = little-endian, 2 = big-endian
         ei_data = magic[5]
         # Machine type at offset 18-20
-        machine = struct.unpack('<H' if ei_data == 1 else '>H', magic[18:20])[0]
+        machine = struct.unpack("<H" if ei_data == 1 else ">H", magic[18:20])[0]
 
         # Map machine type to Ghidra processor spec
         elf_processors = {
@@ -259,12 +254,12 @@ def _get_elf_loader_recommendation(binary_path: str) -> str | None:
             proc_spec, arch_name = elf_processors[machine]
             return (
                 f"ELF detected: {arch_name}\n"
-                f"Try: analyze_binary(..., processor=\"{proc_spec}\", loader=\"ElfLoader\")"
+                f'Try: analyze_binary(..., processor="{proc_spec}", loader="ElfLoader")'
             )
         else:
             return (
                 f"ELF detected with unknown machine type 0x{machine:x}\n"
-                f"Try: analyze_binary(..., loader=\"ElfLoader\") with appropriate processor spec"
+                f'Try: analyze_binary(..., loader="ElfLoader") with appropriate processor spec'
             )
 
     except Exception as e:
@@ -276,7 +271,7 @@ def get_analysis_context(
     binary_path: str,
     force_reanalyze: bool = False,
     processor: str | None = None,
-    loader: str | None = None
+    loader: str | None = None,
 ) -> dict:
     """
     Get or create analysis context for a binary.
@@ -302,7 +297,7 @@ def get_analysis_context(
         validated_path = sanitize_binary_path(
             binary_path,
             allowed_dirs=get_allowed_dirs(),
-            max_size_bytes=500 * 1024 * 1024  # 500MB max
+            max_size_bytes=500 * 1024 * 1024,  # 500MB max
         )
         # Use string representation for consistency with rest of codebase
         binary_path = str(validated_path)
@@ -338,27 +333,27 @@ def get_analysis_context(
             keep_project=True,  # Keep project for incremental analysis
             timeout=timeout,
             processor=processor,
-            loader=loader
+            loader=loader,
         )
 
         # Save Ghidra output to debug file for inspection
         debug_file = cache.cache_dir / "ghidra_debug.log"
         try:
-            with open(debug_file, 'w') as f:
+            with open(debug_file, "w") as f:
                 f.write("=== GHIDRA ANALYSIS DEBUG LOG ===\n")
                 f.write(f"Binary: {binary_path}\n")
                 f.write(f"Output Path: {output_path}\n")
                 f.write(f"Script Path: {script_path}\n\n")
                 f.write("=== STDOUT ===\n")
-                f.write(result.get('stdout', 'N/A'))
+                f.write(result.get("stdout", "N/A"))
                 f.write("\n\n=== STDERR ===\n")
-                f.write(result.get('stderr', 'N/A'))
+                f.write(result.get("stderr", "N/A"))
             print(f"DEBUG: Ghidra output saved to {debug_file}", file=sys.stderr)
         except Exception as e:
             print(f"DEBUG: Failed to write debug log: {e}", file=sys.stderr)
 
-        ghidra_stdout = result.get('stdout', '')
-        ghidra_stderr = result.get('stderr', '')
+        ghidra_stdout = result.get("stdout", "")
+        ghidra_stderr = result.get("stderr", "")
 
         # Check for import failure in Ghidra output (even with exit code 0)
         import_failed, import_error = _check_ghidra_import_failure(ghidra_stdout, ghidra_stderr)
@@ -396,7 +391,9 @@ def get_analysis_context(
             if elf_recommendation:
                 user_message += f"\n\n**Recommendation:**\n{elf_recommendation}"
             else:
-                user_message += " This may be due to an unsupported binary format or corrupted file."
+                user_message += (
+                    " This may be due to an unsupported binary format or corrupted file."
+                )
 
             raise UserFacingError(user_message, internal_details=internal_details)
 
@@ -443,6 +440,7 @@ def get_analysis_context(
 
 # --- Phase 1: Core Tools (P0 - Critical) ---
 
+
 @app.tool()
 @log_to_session
 def analyze_binary(
@@ -450,7 +448,7 @@ def analyze_binary(
     force_reanalyze: bool = False,
     processor: str | None = None,
     loader: str | None = None,
-    skip_compatibility_check: bool = False
+    skip_compatibility_check: bool = False,
 ) -> str:
     """
     Analyze a binary file with Ghidra headless analyzer.
@@ -502,7 +500,9 @@ def analyze_binary(
 Format: {compat_info.format.value}
 {chr(10).join(issues_summary)}
 """
-                    logger.warning(f"Compatibility issues for {binary_path}: {compat_info.compatibility.value}")
+                    logger.warning(
+                        f"Compatibility issues for {binary_path}: {compat_info.compatibility.value}"
+                    )
 
             except Exception as e:
                 # Don't fail on compatibility check errors, just log and proceed
@@ -519,13 +519,17 @@ Format: {compat_info.format.value}
         warnings = []
 
         # .NET/CLR indicator: high structure count + low imports
-        structure_count = len(context.get('data_types', {}).get('structures', []))
+        structure_count = len(context.get("data_types", {}).get("structures", []))
         if structure_count > 10000 and len(imports) == 0:
-            warnings.append("⚠️ High structure count with no imports suggests .NET assembly - consider using dnSpy/ILSpy for better results")
+            warnings.append(
+                "⚠️ High structure count with no imports suggests .NET assembly - consider using dnSpy/ILSpy for better results"
+            )
 
         # Packed indicator: very few imports
         if 0 < len(imports) < 5 and len(functions) > 100:
-            warnings.append("⚠️ Very few imports detected - binary may be packed. Consider unpacking first.")
+            warnings.append(
+                "⚠️ Very few imports detected - binary may be packed. Consider unpacking first."
+            )
 
         # Build the summary output
         summary = ""
@@ -534,22 +538,22 @@ Format: {compat_info.format.value}
         if compat_warning:
             summary += compat_warning + "\n"
 
-        summary += f"""Binary Analysis Complete: {metadata.get('name', 'Unknown')}
+        summary += f"""Binary Analysis Complete: {metadata.get("name", "Unknown")}
 
 **Metadata:**
-- Format: {metadata.get('executable_format', 'Unknown')}
-- Architecture: {metadata.get('language', 'Unknown')}
-- Compiler: {metadata.get('compiler', 'Unknown')}
-- Image Base: {metadata.get('image_base', 'Unknown')}
-- Entry Point: {metadata.get('min_address', 'Unknown')}
+- Format: {metadata.get("executable_format", "Unknown")}
+- Architecture: {metadata.get("language", "Unknown")}
+- Compiler: {metadata.get("compiler", "Unknown")}
+- Image Base: {metadata.get("image_base", "Unknown")}
+- Entry Point: {metadata.get("min_address", "Unknown")}
 
 **Statistics:**
 - Functions: {len(functions)}
 - Imports: {len(imports)}
 - Strings: {len(strings)}
-- Memory Blocks: {len(context.get('memory_map', []))}
+- Memory Blocks: {len(context.get("memory_map", []))}
 - Structures: {structure_count}
-- Enums: {len(context.get('data_types', {}).get('enums', []))}
+- Enums: {len(context.get("data_types", {}).get("enums", []))}
 """
 
         if warnings:
@@ -581,7 +585,7 @@ def get_functions(
     binary_path: str,
     filter_name: str | None = None,
     exclude_external: bool = True,
-    limit: int = 100
+    limit: int = 100,
 ) -> str:
     """
     List all identified functions in the binary.
@@ -604,12 +608,12 @@ def get_functions(
 
         # Apply filters
         if exclude_external:
-            functions = [f for f in functions if not f.get('is_external', False)]
+            functions = [f for f in functions if not f.get("is_external", False)]
 
         if filter_name:
             # Use safe regex compilation to prevent ReDoS (SECURITY FIX)
             pattern = safe_regex_compile(filter_name, max_length=200)
-            functions = [f for f in functions if pattern.search(f.get('name', ''))]
+            functions = [f for f in functions if pattern.search(f.get("name", ""))]
 
         # Limit results
         total = len(functions)
@@ -619,10 +623,10 @@ def get_functions(
         result = f"**Functions: {total} total ({len(functions)} shown)**\n\n"
 
         for func in functions:
-            name = func.get('name', 'Unknown')
-            addr = func.get('address', 'Unknown')
-            sig = func.get('signature', 'Unknown')
-            is_thunk = ' [THUNK]' if func.get('is_thunk') else ''
+            name = func.get("name", "Unknown")
+            addr = func.get("address", "Unknown")
+            sig = func.get("signature", "Unknown")
+            is_thunk = " [THUNK]" if func.get("is_thunk") else ""
 
             result += f"- **{name}**{is_thunk}\n"
             result += f"  - Address: `{addr}`\n"
@@ -644,9 +648,7 @@ def get_functions(
 @app.tool()
 @log_to_session
 def get_imports(
-    binary_path: str,
-    filter_library: str | None = None,
-    filter_function: str | None = None
+    binary_path: str, filter_library: str | None = None, filter_function: str | None = None
 ) -> str:
     """
     Extract imported functions and libraries.
@@ -667,21 +669,21 @@ def get_imports(
         if filter_library:
             try:
                 pattern = safe_regex_compile(filter_library, max_length=200)
-                imports = [i for i in imports if pattern.search(i.get('library', ''))]
+                imports = [i for i in imports if pattern.search(i.get("library", ""))]
             except ValueError as e:
                 return f"Error: Invalid filter_library pattern: {e}"
 
         if filter_function:
             try:
                 pattern = safe_regex_compile(filter_function, max_length=200)
-                imports = [i for i in imports if pattern.search(i.get('name', ''))]
+                imports = [i for i in imports if pattern.search(i.get("name", ""))]
             except ValueError as e:
                 return f"Error: Invalid filter_function pattern: {e}"
 
         # Group by library
         by_library = {}
         for imp in imports:
-            lib = imp.get('library', 'Unknown')
+            lib = imp.get("library", "Unknown")
             if lib not in by_library:
                 by_library[lib] = []
             by_library[lib].append(imp)
@@ -691,9 +693,9 @@ def get_imports(
 
         for lib, funcs in sorted(by_library.items()):
             result += f"### {lib} ({len(funcs)} functions)\n\n"
-            for func in sorted(funcs, key=lambda x: x.get('name', '')):
-                name = func.get('name', 'Unknown')
-                addr = func.get('address', 'N/A')
+            for func in sorted(funcs, key=lambda x: x.get("name", "")):
+                name = func.get("name", "Unknown")
+                addr = func.get("address", "N/A")
                 result += f"- `{name}` @ {addr}\n"
             result += "\n"
 
@@ -707,10 +709,7 @@ def get_imports(
 @app.tool()
 @log_to_session
 def get_strings(
-    binary_path: str,
-    min_length: int = 4,
-    filter_pattern: str | None = None,
-    limit: int = 100
+    binary_path: str, min_length: int = 4, filter_pattern: str | None = None, limit: int = 100
 ) -> str:
     """
     Extract all strings from the binary with cross-references.
@@ -733,12 +732,12 @@ def get_strings(
         strings = context.get("strings", [])
 
         # Apply filters
-        strings = [s for s in strings if s.get('length', 0) >= min_length]
+        strings = [s for s in strings if s.get("length", 0) >= min_length]
 
         if filter_pattern:
             # Use safe regex compilation to prevent ReDoS (SECURITY FIX)
             pattern = safe_regex_compile(filter_pattern, max_length=200)
-            strings = [s for s in strings if pattern.search(s.get('value', ''))]
+            strings = [s for s in strings if pattern.search(s.get("value", ""))]
 
         # Limit results
         total = len(strings)
@@ -748,10 +747,10 @@ def get_strings(
         result = f"**Strings: {total} total ({len(strings)} shown)**\n\n"
 
         for string in strings:
-            value = string.get('value', '').replace('\n', '\\n').replace('\r', '\\r')
-            addr = string.get('address', 'Unknown')
-            length = string.get('length', 0)
-            xrefs = string.get('xrefs', [])
+            value = string.get("value", "").replace("\n", "\\n").replace("\r", "\\r")
+            addr = string.get("address", "Unknown")
+            length = string.get("length", 0)
+            xrefs = string.get("xrefs", [])
 
             result += f"**[{addr}]** `{value[:100]}`\n"
             if len(value) > 100:
@@ -781,7 +780,7 @@ def get_xrefs(
     binary_path: str,
     address: str | None = None,
     function_name: str | None = None,
-    direction: str = "to"
+    direction: str = "to",
 ) -> str:
     """
     Get cross-references for an address or function.
@@ -801,12 +800,12 @@ def get_xrefs(
         if function_name:
             # Find function by name
             functions = context.get("functions", [])
-            function = next((f for f in functions if f.get('name') == function_name), None)
+            function = next((f for f in functions if f.get("name") == function_name), None)
 
             if not function:
                 return f"Error: Function '{function_name}' not found"
 
-            address = function.get('address')
+            address = function.get("address")
 
         if not address:
             return "Error: Must provide either address or function_name"
@@ -819,9 +818,10 @@ def get_xrefs(
 
         found = False
         for string in strings:
-            for xref in string.get('xrefs', []):
-                if (direction == "to" and xref.get('from') == address) or \
-                   (direction == "from" and string.get('address') == address):
+            for xref in string.get("xrefs", []):
+                if (direction == "to" and xref.get("from") == address) or (
+                    direction == "from" and string.get("address") == address
+                ):
                     result += f"- {xref.get('from')} -> {string.get('address')}: {string.get('value', '')[:50]}\n"
                     found = True
 
@@ -837,10 +837,7 @@ def get_xrefs(
 
 @app.tool()
 @log_to_session
-def decompile_function(
-    binary_path: str,
-    function_name: str
-) -> str:
+def decompile_function(binary_path: str, function_name: str) -> str:
     """
     Decompile a function to C-like pseudocode.
 
@@ -856,22 +853,22 @@ def decompile_function(
         functions = context.get("functions", [])
 
         # Find function by name
-        function = next((f for f in functions if f.get('name') == function_name), None)
+        function = next((f for f in functions if f.get("name") == function_name), None)
 
         if not function:
             # Try fuzzy matching
-            matches = [f for f in functions if function_name.lower() in f.get('name', '').lower()]
+            matches = [f for f in functions if function_name.lower() in f.get("name", "").lower()]
             if matches:
-                suggestions = ", ".join([f.get('name', '') for f in matches[:5]])
+                suggestions = ", ".join([f.get("name", "") for f in matches[:5]])
                 return f"Error: Function '{function_name}' not found. Did you mean: {suggestions}?"
             return f"Error: Function '{function_name}' not found"
 
-        pseudocode = function.get('pseudocode')
+        pseudocode = function.get("pseudocode")
 
         if not pseudocode:
-            if function.get('is_thunk'):
+            if function.get("is_thunk"):
                 return f"Function '{function_name}' is a thunk and cannot be decompiled."
-            if function.get('is_external'):
+            if function.get("is_external"):
                 return f"Function '{function_name}' is external and cannot be decompiled."
             return f"Function '{function_name}' could not be decompiled (decompilation may have failed)."
 
@@ -892,13 +889,11 @@ def decompile_function(
 
 # --- Phase 2: Enhanced Analysis Tools (P1 - Important) ---
 
+
 @app.tool()
 @log_to_session
 def get_call_graph(
-    binary_path: str,
-    function_name: str,
-    depth: int = 2,
-    direction: str = "callees"
+    binary_path: str, function_name: str, depth: int = 2, direction: str = "callees"
 ) -> str:
     """
     Generate function call graph.
@@ -917,7 +912,7 @@ def get_call_graph(
         functions = context.get("functions", [])
 
         # Find starting function
-        start_func = next((f for f in functions if f.get('name') == function_name), None)
+        start_func = next((f for f in functions if f.get("name") == function_name), None)
         if not start_func:
             return f"Error: Function '{function_name}' not found"
 
@@ -929,7 +924,7 @@ def get_call_graph(
                 return ""
 
             visited.add(func_name)
-            func = next((f for f in functions if f.get('name') == func_name), None)
+            func = next((f for f in functions if f.get("name") == func_name), None)
             if not func:
                 return ""
 
@@ -937,9 +932,9 @@ def get_call_graph(
             result = f"{indent}- {func_name} @ {func.get('address')}\n"
 
             if direction == "callees":
-                called = func.get('called_functions', [])
+                called = func.get("called_functions", [])
                 for called_func in called:
-                    result += build_graph(called_func.get('name'), current_depth + 1, visited)
+                    result += build_graph(called_func.get("name"), current_depth + 1, visited)
 
             return result
 
@@ -956,9 +951,7 @@ def get_call_graph(
 @app.tool()
 @log_to_session
 def find_api_calls(
-    binary_path: str,
-    category: str | None = None,
-    suspicious_only: bool = False
+    binary_path: str, category: str | None = None, suspicious_only: bool = False
 ) -> str:
     """
     Find Windows API calls categorized by behavior.
@@ -980,30 +973,32 @@ def find_api_calls(
         api_calls = []
 
         for imp in imports:
-            api_name = imp.get('name', '')
+            api_name = imp.get("name", "")
             api_info = api_patterns.get_api_info(api_name)
 
             if api_info:
-                if suspicious_only and api_info['severity'] not in ['high', 'critical']:
+                if suspicious_only and api_info["severity"] not in ["high", "critical"]:
                     continue
 
-                if category and api_info['category'] != category:
+                if category and api_info["category"] != category:
                     continue
 
                 # Find where this API is called
                 call_sites = []
                 for func in functions:
-                    for called in func.get('called_functions', []):
-                        if called.get('name') == api_name:
-                            call_sites.append(func.get('name'))
+                    for called in func.get("called_functions", []):
+                        if called.get("name") == api_name:
+                            call_sites.append(func.get("name"))
 
-                api_calls.append({
-                    'name': api_name,
-                    'category': api_info['category'],
-                    'severity': api_info['severity'],
-                    'description': api_info['description'],
-                    'call_sites': call_sites
-                })
+                api_calls.append(
+                    {
+                        "name": api_name,
+                        "category": api_info["category"],
+                        "severity": api_info["severity"],
+                        "description": api_info["description"],
+                        "call_sites": call_sites,
+                    }
+                )
 
         # Format output
         result = f"**API Calls Analysis: {len(api_calls)} APIs found**\n\n"
@@ -1011,7 +1006,7 @@ def find_api_calls(
         # Group by category
         by_category = {}
         for api in api_calls:
-            cat = api['category']
+            cat = api["category"]
             if cat not in by_category:
                 by_category[cat] = []
             by_category[cat].append(api)
@@ -1019,17 +1014,17 @@ def find_api_calls(
         for cat, apis in sorted(by_category.items()):
             result += f"### {cat.upper()} ({len(apis)} APIs)\n\n"
 
-            for api in sorted(apis, key=lambda x: x['severity'], reverse=True):
+            for api in sorted(apis, key=lambda x: x["severity"], reverse=True):
                 severity_icon = {
-                    'critical': '[CRITICAL]',
-                    'high': '[HIGH]',
-                    'medium': '[MEDIUM]',
-                    'low': '[LOW]'
-                }.get(api['severity'], '[INFO]')
+                    "critical": "[CRITICAL]",
+                    "high": "[HIGH]",
+                    "medium": "[MEDIUM]",
+                    "low": "[LOW]",
+                }.get(api["severity"], "[INFO]")
 
                 result += f"- {severity_icon} **{api['name']}** [{api['severity'].upper()}]\n"
                 result += f"  {api['description']}\n"
-                if api['call_sites']:
+                if api["call_sites"]:
                     result += f"  Called from: {', '.join(api['call_sites'][:5])}\n"
                 result += "\n"
 
@@ -1042,9 +1037,7 @@ def find_api_calls(
 
 @app.tool()
 @log_to_session
-def get_memory_map(
-    binary_path: str
-) -> str:
+def get_memory_map(binary_path: str) -> str:
     """
     Extract memory layout and sections with entropy analysis.
 
@@ -1061,25 +1054,25 @@ def get_memory_map(
         result = f"**Memory Map: {len(memory_blocks)} sections**\n\n"
 
         for block in memory_blocks:
-            name = block.get('name', 'Unknown')
-            start = block.get('start', 'Unknown')
-            end = block.get('end', 'Unknown')
-            size = block.get('size', 0)
+            name = block.get("name", "Unknown")
+            start = block.get("start", "Unknown")
+            end = block.get("end", "Unknown")
+            size = block.get("size", 0)
             perms = ""
-            if block.get('read'):
+            if block.get("read"):
                 perms += "R"
-            if block.get('write'):
+            if block.get("write"):
                 perms += "W"
-            if block.get('execute'):
+            if block.get("execute"):
                 perms += "X"
 
-            initialized = "YES" if block.get('initialized') else "NO"
+            initialized = "YES" if block.get("initialized") else "NO"
 
             result += f"### {name}\n"
             result += f"- Range: `{start}` - `{end}` ({size} bytes)\n"
             result += f"- Permissions: `{perms}`\n"
             result += f"- Initialized: {initialized}\n"
-            if block.get('comment'):
+            if block.get("comment"):
                 result += f"- Comment: {block.get('comment')}\n"
             result += "\n"
 
@@ -1092,9 +1085,7 @@ def get_memory_map(
 
 @app.tool()
 @log_to_session
-def extract_metadata(
-    binary_path: str
-) -> str:
+def extract_metadata(binary_path: str) -> str:
     """
     Get binary metadata and headers (PE/ELF/Mach-O).
 
@@ -1111,7 +1102,7 @@ def extract_metadata(
         result = "**Binary Metadata**\n\n"
 
         for key, value in sorted(metadata.items()):
-            formatted_key = key.replace('_', ' ').title()
+            formatted_key = key.replace("_", " ").title()
             result += f"- **{formatted_key}:** `{value}`\n"
 
         return result
@@ -1123,11 +1114,7 @@ def extract_metadata(
 
 @app.tool()
 @log_to_session
-def search_bytes(
-    binary_path: str,
-    pattern: str,
-    max_results: int = 50
-) -> str:
+def search_bytes(binary_path: str, pattern: str, max_results: int = 50) -> str:
     """
     Search for byte patterns in the binary.
 
@@ -1145,7 +1132,7 @@ def search_bytes(
         context = get_analysis_context(binary_path)
 
         # Remove spaces and convert to lowercase
-        clean_pattern = pattern.replace(' ', '').lower()
+        clean_pattern = pattern.replace(" ", "").lower()
 
         result = f"**Byte Pattern Search: '{pattern}'**\n\n"
         result += "*Note: Full byte search requires direct binary access. Currently searching in extracted data.*\n\n"
@@ -1155,8 +1142,10 @@ def search_bytes(
         found = 0
 
         for string in strings:
-            if clean_pattern in string.get('value', '').lower():
-                result += f"- Found in string at {string.get('address')}: {string.get('value')[:100]}\n"
+            if clean_pattern in string.get("value", "").lower():
+                result += (
+                    f"- Found in string at {string.get('address')}: {string.get('value')[:100]}\n"
+                )
                 found += 1
                 if found >= max_results:
                     break
@@ -1173,11 +1162,10 @@ def search_bytes(
 
 # --- Phase 3: Advanced Tools (P2 - Nice-To-Have) ---
 
+
 @app.tool()
 @log_to_session
-def detect_crypto(
-    binary_path: str
-) -> str:
+def detect_crypto(binary_path: str) -> str:
     """
     Identify cryptographic constants and algorithms.
 
@@ -1212,9 +1200,7 @@ def detect_crypto(
 
 @app.tool()
 @log_to_session
-def generate_iocs(
-    binary_path: str
-) -> str:
+def generate_iocs(binary_path: str) -> str:
     """
     Generate indicators of compromise (IOCs) from analysis.
 
@@ -1229,28 +1215,28 @@ def generate_iocs(
         strings = context.get("strings", [])
 
         iocs = {
-            'ip_addresses': [],
-            'domains': [],
-            'urls': [],
-            'file_paths': [],
-            'registry_keys': [],
-            'emails': [],
-            'crypto_addresses': []
+            "ip_addresses": [],
+            "domains": [],
+            "urls": [],
+            "file_paths": [],
+            "registry_keys": [],
+            "emails": [],
+            "crypto_addresses": [],
         }
 
         # Regex patterns for IOC extraction
         patterns = {
-            'ip_addresses': r'\b(?:\d{1,3}\.){3}\d{1,3}\b',
-            'domains': r'\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}\b',
-            'urls': r'https?://[^\s<>"{}|\\^`\[\]]+',
-            'emails': r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b',
-            'file_paths': r'[C-Z]:\\[\\\w\s\-\.]+',
-            'registry_keys': r'HKEY_[A-Z_]+\\[\\\w\s\-]+',
+            "ip_addresses": r"\b(?:\d{1,3}\.){3}\d{1,3}\b",
+            "domains": r"\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}\b",
+            "urls": r'https?://[^\s<>"{}|\\^`\[\]]+',
+            "emails": r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b",
+            "file_paths": r"[C-Z]:\\[\\\w\s\-\.]+",
+            "registry_keys": r"HKEY_[A-Z_]+\\[\\\w\s\-]+",
         }
 
         # Extract IOCs from strings
         for string in strings:
-            value = string.get('value', '')
+            value = string.get("value", "")
 
             for ioc_type, pattern in patterns.items():
                 matches = re.findall(pattern, value, re.IGNORECASE)
@@ -1266,7 +1252,7 @@ def generate_iocs(
 
         for ioc_type, values in iocs.items():
             if values:
-                formatted_type = ioc_type.replace('_', ' ').title()
+                formatted_type = ioc_type.replace("_", " ").title()
                 result += f"### {formatted_type} ({len(values)})\n\n"
                 for value in sorted(set(values))[:20]:  # Limit to 20 per type
                     result += f"- `{value}`\n"
@@ -1298,10 +1284,12 @@ def diagnose_setup() -> str:
         result += f"- Ghidra Path: `{diag['ghidra_path']}`\n"
         result += f"- Ghidra Exists: {'YES' if diag['ghidra_exists'] else 'NO'}\n"
         result += f"- analyzeHeadless: `{diag['analyze_headless']}`\n"
-        result += f"- analyzeHeadless Exists: {'YES' if diag['analyze_headless_exists'] else 'NO'}\n"
+        result += (
+            f"- analyzeHeadless Exists: {'YES' if diag['analyze_headless_exists'] else 'NO'}\n"
+        )
         result += f"- Java Installed: {'YES' if diag['java_installed'] else 'NO'}\n"
 
-        if diag['java_version']:
+        if diag["java_version"]:
             result += f"- Java Version: {diag['java_version']}\n"
 
         result += f"- Ghidra Version: {diag.get('ghidra_version', 'Unknown')}\n\n"
@@ -1319,13 +1307,13 @@ def diagnose_setup() -> str:
         result += f"- Stored Sessions: {session_stats['total_sessions']}\n"
         result += f"- Storage Size: {session_stats['total_size_mb']:.2f} MB\n"
         result += f"- Storage Directory: `{session_manager.store_dir}`\n"
-        if session_stats['active_session']:
+        if session_stats["active_session"]:
             result += f"- Active Session: `{session_stats['active_session'][:8]}...`\n"
         result += "\n"
 
-        if not diag['ghidra_exists']:
+        if not diag["ghidra_exists"]:
             result += "\n**WARNING:** Ghidra not found! Please install Ghidra or set GHIDRA_HOME environment variable.\n"
-        elif not diag['java_installed']:
+        elif not diag["java_installed"]:
             result += "\n**WARNING:** Java not found! Ghidra requires Java 21+.\n"
         else:
             result += "\n**Setup looks good!** Ready to analyze binaries.\n"
@@ -1338,6 +1326,7 @@ def diagnose_setup() -> str:
 
 
 # --- Additional Tools ---
+
 
 @app.tool()
 def check_binary(binary_path: str) -> str:
@@ -1406,10 +1395,7 @@ def check_binary(binary_path: str) -> str:
 
 @app.tool()
 @log_to_session
-def list_data_types(
-    binary_path: str,
-    type_filter: str = "all"
-) -> str:
+def list_data_types(binary_path: str, type_filter: str = "all") -> str:
     """
     List data types (structures and enums) found in the binary.
 
@@ -1432,7 +1418,7 @@ def list_data_types(
 
             for struct in structures[:50]:  # Limit to 50
                 result += f"- **{struct.get('name')}** ({struct.get('length')} bytes)\n"
-                members = struct.get('members', [])
+                members = struct.get("members", [])
                 for member in members[:10]:  # Show first 10 members
                     result += f"  - +0x{member.get('offset'):x}: {member.get('name')} ({member.get('datatype')})\n"
                 if len(members) > 10:
@@ -1445,7 +1431,7 @@ def list_data_types(
 
             for enum in enums[:50]:  # Limit to 50
                 result += f"- **{enum.get('name')}**\n"
-                values = enum.get('values', [])
+                values = enum.get("values", [])
                 for value in values[:10]:  # Show first 10 values
                     result += f"  - {value.get('name')} = {value.get('value')}\n"
                 if len(values) > 10:
@@ -1462,10 +1448,7 @@ def list_data_types(
 @app.tool()
 @log_to_session
 def rename_function(
-    binary_path: str,
-    new_name: str,
-    address: str | None = None,
-    old_name: str | None = None
+    binary_path: str, new_name: str, address: str | None = None, old_name: str | None = None
 ) -> str:
     """
     Rename a function in the analysis cache.
@@ -1496,7 +1479,7 @@ def rename_function(
 
         # Validate new_name is a valid identifier
         new_name = new_name.strip()
-        if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', new_name):
+        if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", new_name):
             return f"Error: '{new_name}' is not a valid function name. Use only letters, numbers, and underscores, starting with a letter or underscore."
 
         # Get the analysis context (from cache)
@@ -1514,14 +1497,14 @@ def rename_function(
             # Normalize address format (handle with/without 0x prefix)
             addr_normalized = address.lower().replace("0x", "")
             for i, func in enumerate(functions):
-                func_addr = func.get('address', '').lower().replace("0x", "")
+                func_addr = func.get("address", "").lower().replace("0x", "")
                 if func_addr == addr_normalized or func_addr.endswith(addr_normalized):
                     target_function = func
                     target_index = i
                     break
         elif old_name:
             for i, func in enumerate(functions):
-                if func.get('name') == old_name:
+                if func.get("name") == old_name:
                     target_function = func
                     target_index = i
                     break
@@ -1530,44 +1513,49 @@ def rename_function(
             identifier = address if address else old_name
             # Suggest similar functions
             if old_name:
-                matches = [f.get('name', '') for f in functions
-                          if old_name.lower() in f.get('name', '').lower()][:5]
+                matches = [
+                    f.get("name", "")
+                    for f in functions
+                    if old_name.lower() in f.get("name", "").lower()
+                ][:5]
                 if matches:
                     return f"Error: Function '{old_name}' not found. Similar functions: {', '.join(matches)}"
             return f"Error: Function '{identifier}' not found"
 
         # Check if new name already exists
-        existing = next((f for f in functions if f.get('name') == new_name), None)
+        existing = next((f for f in functions if f.get("name") == new_name), None)
         if existing and existing != target_function:
-            return f"Error: A function named '{new_name}' already exists at {existing.get('address')}"
+            return (
+                f"Error: A function named '{new_name}' already exists at {existing.get('address')}"
+            )
 
         # Store old name for confirmation message
-        original_name = target_function.get('name', 'unknown')
-        func_address = target_function.get('address', 'unknown')
+        original_name = target_function.get("name", "unknown")
+        func_address = target_function.get("address", "unknown")
 
         # Update the function name
-        target_function['name'] = new_name
+        target_function["name"] = new_name
 
         # Update the signature if it contains the old name
-        old_signature = target_function.get('signature', '')
+        old_signature = target_function.get("signature", "")
         if original_name in old_signature:
-            target_function['signature'] = old_signature.replace(original_name, new_name, 1)
+            target_function["signature"] = old_signature.replace(original_name, new_name, 1)
 
         # Update the pseudocode if it contains the old name (function definition line)
-        pseudocode = target_function.get('pseudocode', '')
+        pseudocode = target_function.get("pseudocode", "")
         if pseudocode and original_name in pseudocode:
             # Only replace in the function definition, not all occurrences
             # This handles the common case of "void FUN_00401000(void)" -> "void decrypt_string(void)"
-            lines = pseudocode.split('\n')
+            lines = pseudocode.split("\n")
             for i, line in enumerate(lines):
                 # Look for function definition pattern
-                if original_name in line and ('(' in line or '{' in line):
+                if original_name in line and ("(" in line or "{" in line):
                     lines[i] = line.replace(original_name, new_name, 1)
                     break
-            target_function['pseudocode'] = '\n'.join(lines)
+            target_function["pseudocode"] = "\n".join(lines)
 
         # Update the function in the context
-        context['functions'][target_index] = target_function
+        context["functions"][target_index] = target_function
 
         # Save the updated context back to cache
         cache.save_cached(binary_path, context)
@@ -1590,12 +1578,10 @@ def rename_function(
 
 # --- Analysis Session Tools ---
 
+
 @app.tool()
 def start_analysis_session(
-    binary_path: str,
-    name: str,
-    tags: str | list[str] | None = None,
-    analysis_type: str = "static"
+    binary_path: str, name: str, tags: str | list[str] | None = None, analysis_type: str = "static"
 ) -> str:
     """
     Start a new analysis session to track all tool outputs.
@@ -1632,15 +1618,12 @@ def start_analysis_session(
         type_map = {
             "static": AnalysisType.STATIC,
             "dynamic": AnalysisType.DYNAMIC,
-            "mixed": AnalysisType.MIXED
+            "mixed": AnalysisType.MIXED,
         }
         a_type = type_map.get(analysis_type.lower(), AnalysisType.STATIC)
 
         session_id = session_manager.start_session(
-            binary_path=binary_path,
-            name=name,
-            analysis_type=a_type,
-            tags=parsed_tags
+            binary_path=binary_path, name=name, analysis_type=a_type, tags=parsed_tags
         )
 
         result = "**Analysis Session Started**\n\n"
@@ -1652,7 +1635,9 @@ def start_analysis_session(
             result += f"- **Tags:** {', '.join(parsed_tags)}\n"
         result += "\n**Status:** All tool calls will now be automatically logged.\n\n"
         result += "**Note:** Sessions auto-start when you run analysis tools.\n"
-        result += "Both static (Ghidra) and dynamic (x64dbg) tools are logged to the same session.\n\n"
+        result += (
+            "Both static (Ghidra) and dynamic (x64dbg) tools are logged to the same session.\n\n"
+        )
         result += "**Next Steps:**\n"
         result += "1. Run analysis tools (analyze_binary, x64dbg_*, decompile_function, etc.)\n"
         result += "2. Call `save_session()` when done to persist all outputs\n"
@@ -1703,8 +1688,8 @@ def save_session(session_id: str | None = None) -> str:
         result += f"- **Tools Used:** {metadata.get('tool_count')}\n"
 
         # Show static/dynamic breakdown if mixed
-        static_count = metadata.get('static_tool_count', 0)
-        dynamic_count = metadata.get('dynamic_tool_count', 0)
+        static_count = metadata.get("static_tool_count", 0)
+        dynamic_count = metadata.get("dynamic_tool_count", 0)
         if static_count > 0 or dynamic_count > 0:
             result += f"  - Static: {static_count}, Dynamic: {dynamic_count}\n"
 
@@ -1726,7 +1711,7 @@ def list_sessions(
     tag_filter: str | None = None,
     binary_name_filter: str | None = None,
     analysis_type_filter: str | None = None,
-    limit: int = 20
+    limit: int = 20,
 ) -> str:
     """
     List all saved analysis sessions.
@@ -1745,7 +1730,7 @@ def list_sessions(
             tag_filter=tag_filter,
             binary_name_filter=binary_name_filter,
             analysis_type_filter=analysis_type_filter,
-            limit=limit
+            limit=limit,
         )
 
         if not sessions:
@@ -1759,17 +1744,19 @@ def list_sessions(
         result = f"**Saved Sessions: {len(sessions)} found**\n\n"
 
         for session in sessions:
-            session_id = session.get('session_id', 'Unknown')
-            name = session.get('name', 'Unknown')
-            updated = time.strftime('%Y-%m-%d %H:%M', time.localtime(session.get('updated_at', 0)))
-            binary_name = session.get('binary_name', 'Unknown')
-            tags = session.get('tags', [])
-            tool_count = session.get('tool_count', 0)
-            analysis_type = session.get('analysis_type', 'static')
-            size_kb = session.get('compressed_size', 0) / 1024
+            session_id = session.get("session_id", "Unknown")
+            name = session.get("name", "Unknown")
+            updated = time.strftime("%Y-%m-%d %H:%M", time.localtime(session.get("updated_at", 0)))
+            binary_name = session.get("binary_name", "Unknown")
+            tags = session.get("tags", [])
+            tool_count = session.get("tool_count", 0)
+            analysis_type = session.get("analysis_type", "static")
+            size_kb = session.get("compressed_size", 0) / 1024
 
             # Analysis type indicator
-            type_icon = {"static": "[S]", "dynamic": "[D]", "mixed": "[M]"}.get(analysis_type, "[?]")
+            type_icon = {"static": "[S]", "dynamic": "[D]", "mixed": "[M]"}.get(
+                analysis_type, "[?]"
+            )
 
             result += f"### {type_icon} {name}\n"
             result += f"- **ID:** `{session_id[:8]}...`\n"
@@ -1779,8 +1766,8 @@ def list_sessions(
             result += f"- **Tools:** {tool_count}"
 
             # Show static/dynamic breakdown
-            static_count = session.get('static_tool_count', 0)
-            dynamic_count = session.get('dynamic_tool_count', 0)
+            static_count = session.get("static_tool_count", 0)
+            dynamic_count = session.get("dynamic_tool_count", 0)
             if static_count > 0 or dynamic_count > 0:
                 result += f" (S:{static_count}, D:{dynamic_count})"
             result += "\n"
@@ -1797,7 +1784,7 @@ def list_sessions(
         stats = session_manager.get_stats()
         result += "---\n**Stats:** "
         result += f"{stats['total_sessions']} sessions, {stats['total_size_mb']:.2f} MB"
-        type_counts = stats.get('type_counts', {})
+        type_counts = stats.get("type_counts", {})
         if type_counts:
             result += f" | Static: {type_counts.get('static', 0)}, Dynamic: {type_counts.get('dynamic', 0)}, Mixed: {type_counts.get('mixed', 0)}"
         result += "\n"
@@ -1830,8 +1817,10 @@ def get_session_summary(session_id: str) -> str:
 
         metadata = session_manager.get_metadata(session_id)
 
-        analysis_type = metadata.get('analysis_type', 'static')
-        type_icon = {"static": "[Static]", "dynamic": "[Dynamic]", "mixed": "[Mixed]"}.get(analysis_type, "")
+        analysis_type = metadata.get("analysis_type", "static")
+        type_icon = {"static": "[Static]", "dynamic": "[Dynamic]", "mixed": "[Mixed]"}.get(
+            analysis_type, ""
+        )
 
         result = f"# {type_icon} {metadata.get('name', 'Unknown Session')}\n\n"
         result += f"**Session ID:** `{session_id}`\n"
@@ -1842,8 +1831,8 @@ def get_session_summary(session_id: str) -> str:
         result += f"**Updated:** {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(metadata.get('updated_at', 0)))}\n"
         result += f"**Status:** {metadata.get('status', 'unknown')}\n"
 
-        if metadata.get('tags'):
-            display_tags = [t for t in metadata.get('tags', []) if t != "auto-session"]
+        if metadata.get("tags"):
+            display_tags = [t for t in metadata.get("tags", []) if t != "auto-session"]
             if display_tags:
                 result += f"**Tags:** {', '.join(display_tags)}\n"
 
@@ -1851,8 +1840,8 @@ def get_session_summary(session_id: str) -> str:
         result += f"- Total Tools Used: {summary.get('tool_count')}\n"
 
         # Show static/dynamic breakdown
-        static_count = metadata.get('static_tool_count', 0)
-        dynamic_count = metadata.get('dynamic_tool_count', 0)
+        static_count = metadata.get("static_tool_count", 0)
+        dynamic_count = metadata.get("dynamic_tool_count", 0)
         if static_count > 0 or dynamic_count > 0:
             result += f"  - Static Tools: {static_count}\n"
             result += f"  - Dynamic Tools: {dynamic_count}\n"
@@ -1861,8 +1850,8 @@ def get_session_summary(session_id: str) -> str:
         result += f"- Compressed Size: {metadata.get('compressed_size', 0) / 1024:.1f} KB\n"
 
         # Show static tools
-        static_tools = summary.get('static_tools', [])
-        dynamic_tools = summary.get('dynamic_tools', [])
+        static_tools = summary.get("static_tools", [])
+        dynamic_tools = summary.get("dynamic_tools", [])
 
         if static_tools:
             result += "\n**Static Analysis Tools:**\n"
@@ -1888,11 +1877,7 @@ def get_session_summary(session_id: str) -> str:
 
 
 @app.tool()
-def load_session_section(
-    session_id: str,
-    section: str,
-    tool_filter: str | None = None
-) -> str:
+def load_session_section(session_id: str, section: str, tool_filter: str | None = None) -> str:
     """
     Load a specific section of session data (chunked retrieval).
 
@@ -1913,9 +1898,7 @@ def load_session_section(
     """
     try:
         section_data = session_manager.get_section(
-            session_id=session_id,
-            section_type=section,
-            tool_filter=tool_filter
+            session_id=session_id, section_type=section, tool_filter=tool_filter
         )
 
         if not section_data:
@@ -1935,7 +1918,7 @@ def load_session_section(
             return get_session_summary(session_id)
 
         if section in ("tools", "static_tools", "dynamic_tools"):
-            tool_calls = section_data.get('tool_calls', [])
+            tool_calls = section_data.get("tool_calls", [])
 
             if not tool_calls:
                 filter_desc = ""
@@ -1951,7 +1934,7 @@ def load_session_section(
             section_labels = {
                 "tools": "All Tool Outputs",
                 "static_tools": "Static Analysis Outputs",
-                "dynamic_tools": "Dynamic Analysis Outputs"
+                "dynamic_tools": "Dynamic Analysis Outputs",
             }
             result = f"**{section_labels.get(section, 'Tool Outputs')}** (Session: {session_id[:8]}...)\n"
             if tool_filter:
@@ -1960,17 +1943,19 @@ def load_session_section(
             result += "---\n\n"
 
             for i, call in enumerate(tool_calls, 1):
-                tool_name = call.get('tool_name')
-                timestamp = call.get('timestamp')
-                output = call.get('output', '')
-                args = call.get('arguments', {})
-                analysis_type = call.get('analysis_type', 'static')
+                tool_name = call.get("tool_name")
+                timestamp = call.get("timestamp")
+                output = call.get("output", "")
+                args = call.get("arguments", {})
+                analysis_type = call.get("analysis_type", "static")
 
                 # Type indicator
                 type_icon = "[S]" if analysis_type == "static" else "[D]"
 
                 result += f"## {type_icon} Call #{i}: {tool_name}\n\n"
-                result += f"**Time:** {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(timestamp))}\n"
+                result += (
+                    f"**Time:** {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(timestamp))}\n"
+                )
 
                 if args:
                     result += "**Arguments:** "
@@ -2015,15 +2000,15 @@ def load_full_session(session_id: str) -> str:
         result += f"**Binary Hash:** `{session_data.get('binary_hash', 'N/A')[:16]}...`\n"
         result += f"**Created:** {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(session_data.get('created_at', 0)))}\n"
 
-        tool_calls = session_data.get('tool_calls', [])
+        tool_calls = session_data.get("tool_calls", [])
         result += f"**Tool Calls:** {len(tool_calls)}\n\n"
         result += "---\n\n"
 
         for i, call in enumerate(tool_calls, 1):
-            tool_name = call.get('tool_name')
-            timestamp = call.get('timestamp')
-            output = call.get('output', '')
-            args = call.get('arguments', {})
+            tool_name = call.get("tool_name")
+            timestamp = call.get("timestamp")
+            output = call.get("output", "")
+            args = call.get("arguments", {})
 
             result += f"## Tool Call #{i}: {tool_name}\n\n"
             result += f"**Time:** {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(timestamp))}\n"
@@ -2061,7 +2046,7 @@ def delete_session(session_id: str) -> str:
         # Get metadata first for confirmation message
         metadata = session_manager.get_metadata(session_id)
         if metadata:
-            name = metadata.get('name', 'Unknown')
+            name = metadata.get("name", "Unknown")
         else:
             return f"Error: Session '{session_id}' not found."
 
@@ -2099,10 +2084,7 @@ def find_related_sessions(binary_path: str, limit: int = 10) -> str:
         List of related sessions sorted by most recent first
     """
     try:
-        sessions = session_manager.find_sessions_for_binary(
-            binary_path=binary_path,
-            limit=limit
-        )
+        sessions = session_manager.find_sessions_for_binary(binary_path=binary_path, limit=limit)
 
         if not sessions:
             return f"No previous sessions found for: {Path(binary_path).name}"
@@ -2111,13 +2093,15 @@ def find_related_sessions(binary_path: str, limit: int = 10) -> str:
         result += f"Found {len(sessions)} session(s) for this binary:\n\n"
 
         for session in sessions:
-            session_id = session.get('session_id', 'Unknown')
-            name = session.get('name', 'Unknown')
-            updated = time.strftime('%Y-%m-%d %H:%M', time.localtime(session.get('updated_at', 0)))
-            analysis_type = session.get('analysis_type', 'static')
-            tool_count = session.get('tool_count', 0)
+            session_id = session.get("session_id", "Unknown")
+            name = session.get("name", "Unknown")
+            updated = time.strftime("%Y-%m-%d %H:%M", time.localtime(session.get("updated_at", 0)))
+            analysis_type = session.get("analysis_type", "static")
+            tool_count = session.get("tool_count", 0)
 
-            type_icon = {"static": "[S]", "dynamic": "[D]", "mixed": "[M]"}.get(analysis_type, "[?]")
+            type_icon = {"static": "[S]", "dynamic": "[D]", "mixed": "[M]"}.get(
+                analysis_type, "[?]"
+            )
 
             result += f"### {type_icon} {name}\n"
             result += f"- **ID:** `{session_id[:8]}...`\n"
@@ -2151,8 +2135,12 @@ def configure_auto_session(enabled: bool = True) -> str:
 
     if enabled:
         result = "**Auto-Session Enabled**\n\n"
-        result += "Sessions will now be automatically created/resumed when running analysis tools.\n"
-        result += "Recent sessions (within 1 hour) for the same binary will be resumed automatically.\n"
+        result += (
+            "Sessions will now be automatically created/resumed when running analysis tools.\n"
+        )
+        result += (
+            "Recent sessions (within 1 hour) for the same binary will be resumed automatically.\n"
+        )
     else:
         result = "**Auto-Session Disabled**\n\n"
         result += "You must manually call `start_analysis_session()` to create sessions.\n"
@@ -2178,8 +2166,8 @@ def get_active_session() -> str:
     if not data:
         return f"Active session ID: `{session_id}` (data unavailable)"
 
-    tool_count = len(data.get('tool_calls', []))
-    analysis_type = data.get('analysis_type', 'static')
+    tool_count = len(data.get("tool_calls", []))
+    analysis_type = data.get("analysis_type", "static")
 
     result = "**Active Session**\n\n"
     result += f"- **ID:** `{session_id}`\n"
@@ -2196,6 +2184,7 @@ def get_active_session() -> str:
 
 
 # --- Crypto Analysis Tools ---
+
 
 @app.tool()
 @log_to_session(analysis_type=AnalysisType.STATIC)
@@ -2295,10 +2284,7 @@ def detect_crypto_patterns(binary_path: str) -> str:
 @app.tool()
 @log_to_session(analysis_type=AnalysisType.STATIC)
 def analyze_xor_encryption(
-    binary_path: str,
-    min_key_length: int = 1,
-    max_key_length: int = 16,
-    sample_size: int = 10000
+    binary_path: str, min_key_length: int = 1, max_key_length: int = 16, sample_size: int = 10000
 ) -> str:
     """
     Analyze potential XOR encryption and find likely keys.
@@ -2329,18 +2315,14 @@ def analyze_xor_encryption(
 
         data = path.read_bytes()[:sample_size]
 
-        candidates = analyze_xor(
-            data,
-            key_length_range=(min_key_length, max_key_length),
-            top_n=5
-        )
+        candidates = analyze_xor(data, key_length_range=(min_key_length, max_key_length), top_n=5)
 
         output = [
             "XOR Encryption Analysis:",
             f"  File: {path.name}",
             f"  Sample size: {len(data)} bytes",
             f"  Key length range: {min_key_length}-{max_key_length}",
-            ""
+            "",
         ]
 
         if candidates:
@@ -2356,8 +2338,8 @@ def analyze_xor_encryption(
                 # Show sample of decrypted text
                 sample = candidate["decrypted_sample"]
                 try:
-                    text_sample = sample.decode('ascii', errors='replace')[:40]
-                    output.append(f"   Sample: \"{text_sample}\"")
+                    text_sample = sample.decode("ascii", errors="replace")[:40]
+                    output.append(f'   Sample: "{text_sample}"')
                 except Exception:
                     output.append(f"   Sample: {sample[:20].hex()}")
                 output.append("")
@@ -2375,11 +2357,7 @@ def analyze_xor_encryption(
 
 @app.tool()
 @log_to_session(analysis_type=AnalysisType.STATIC)
-def decrypt_xor(
-    binary_path: str,
-    key: str,
-    output_path: str | None = None
-) -> str:
+def decrypt_xor(binary_path: str, key: str, output_path: str | None = None) -> str:
     """
     Decrypt a file using XOR with the specified key.
 
@@ -2418,17 +2396,17 @@ def decrypt_xor(
             f"  Input: {path.name} ({len(data)} bytes)",
             f"  Key: {key_bytes.hex().upper()} ({len(key_bytes)} bytes)",
             f"  Decrypted entropy: {entropy:.2f} bits/byte",
-            ""
+            "",
         ]
 
         # Check for known file signatures
-        if decrypted[:2] == b'MZ':
+        if decrypted[:2] == b"MZ":
             output.append("  Signature: PE executable (MZ header)")
-        elif decrypted[:4] == b'\x7fELF':
+        elif decrypted[:4] == b"\x7fELF":
             output.append("  Signature: ELF executable")
-        elif decrypted[:3] == b'PK\x03':
+        elif decrypted[:3] == b"PK\x03":
             output.append("  Signature: ZIP archive")
-        elif decrypted[:8] == b'\x89PNG\r\n\x1a\n':
+        elif decrypted[:8] == b"\x89PNG\r\n\x1a\n":
             output.append("  Signature: PNG image")
 
         # Show preview
@@ -2436,8 +2414,8 @@ def decrypt_xor(
         output.append("Decrypted preview (first 64 bytes):")
         output.append(f"  Hex: {decrypted[:64].hex().upper()}")
         try:
-            text_preview = decrypted[:64].decode('ascii', errors='replace')
-            output.append(f"  Text: \"{text_preview}\"")
+            text_preview = decrypted[:64].decode("ascii", errors="replace")
+            output.append(f'  Text: "{text_preview}"')
         except Exception:
             pass
 
@@ -2467,10 +2445,7 @@ def decrypt_xor(
 
 @app.tool()
 @log_to_session(analysis_type=AnalysisType.STATIC)
-def decode_base64_file(
-    binary_path: str,
-    output_path: str | None = None
-) -> str:
+def decode_base64_file(binary_path: str, output_path: str | None = None) -> str:
     """
     Decode a Base64 encoded file.
 
@@ -2499,8 +2474,8 @@ def decode_base64_file(
 
         # Try to decode
         try:
-            text = data.decode('ascii', errors='ignore')
-            text = ''.join(text.split())  # Remove whitespace
+            text = data.decode("ascii", errors="ignore")
+            text = "".join(text.split())  # Remove whitespace
             decoded = base64.b64decode(text)
         except Exception as e:
             return f"Error: Failed to decode Base64: {e}"
@@ -2512,15 +2487,15 @@ def decode_base64_file(
             f"  Input: {path.name} ({len(data)} bytes)",
             f"  Decoded: {len(decoded)} bytes",
             f"  Decoded entropy: {entropy:.2f} bits/byte",
-            ""
+            "",
         ]
 
         # Check for known file signatures
-        if decoded[:2] == b'MZ':
+        if decoded[:2] == b"MZ":
             output.append("  Signature: PE executable (MZ header)")
-        elif decoded[:4] == b'\x7fELF':
+        elif decoded[:4] == b"\x7fELF":
             output.append("  Signature: ELF executable")
-        elif decoded[:3] == b'PK\x03':
+        elif decoded[:3] == b"PK\x03":
             output.append("  Signature: ZIP archive")
 
         # Show preview
@@ -2528,8 +2503,8 @@ def decode_base64_file(
         output.append("Decoded preview (first 64 bytes):")
         output.append(f"  Hex: {decoded[:64].hex().upper()}")
         try:
-            text_preview = decoded[:64].decode('ascii', errors='replace')
-            output.append(f"  Text: \"{text_preview}\"")
+            text_preview = decoded[:64].decode("ascii", errors="replace")
+            output.append(f'  Text: "{text_preview}"')
         except Exception:
             pass
 
@@ -2583,6 +2558,7 @@ def detect_python_packer(binary_path: str) -> str:
         binary_path = sanitize_binary_path(binary_path)
 
         from src.engines.static.python.analyzer import PythonPackerAnalyzer
+
         analyzer = PythonPackerAnalyzer()
         result = analyzer.detect_packer(binary_path)
 
@@ -2633,11 +2609,7 @@ def detect_python_packer(binary_path: str) -> str:
 
 @app.tool()
 @log_to_session(analysis_type=AnalysisType.STATIC)
-def extract_python_packed(
-    binary_path: str,
-    output_dir: str,
-    packer_type: str = "auto"
-) -> str:
+def extract_python_packed(binary_path: str, output_dir: str, packer_type: str = "auto") -> str:
     """
     Extract files from a Python packed executable.
 
@@ -2660,6 +2632,7 @@ def extract_python_packed(
         binary_path = sanitize_binary_path(binary_path)
 
         from src.engines.static.python.analyzer import PythonPackerAnalyzer
+
         analyzer = PythonPackerAnalyzer()
 
         # Auto-detect packer type if needed
@@ -2737,6 +2710,7 @@ def analyze_pyc_file(pyc_path: str) -> str:
         pyc_path = sanitize_binary_path(pyc_path)
 
         from src.engines.static.python.analyzer import PythonPackerAnalyzer
+
         analyzer = PythonPackerAnalyzer()
         result = analyzer.analyze_pyc(pyc_path)
 
@@ -2800,6 +2774,7 @@ def list_python_archive_contents(binary_path: str) -> str:
         binary_path = sanitize_binary_path(binary_path)
 
         from src.engines.static.python.analyzer import PythonPackerAnalyzer
+
         analyzer = PythonPackerAnalyzer()
         result = analyzer.list_archive_contents(binary_path)
 
@@ -2824,7 +2799,9 @@ def list_python_archive_contents(binary_path: str) -> str:
                 output.append(f"Python Bytecode Files ({len(pyc_files)}):")
                 for f in pyc_files[:15]:
                     ratio = f["compressed_size"] / f["size"] if f["size"] > 0 else 1
-                    output.append(f"  • {f['name']:<40} {f['size']:>8} bytes ({ratio:.0%} compressed)")
+                    output.append(
+                        f"  • {f['name']:<40} {f['size']:>8} bytes ({ratio:.0%} compressed)"
+                    )
                 if len(pyc_files) > 15:
                     output.append(f"  ... and {len(pyc_files) - 15} more .pyc files")
 
@@ -2849,11 +2826,164 @@ def list_python_archive_contents(binary_path: str) -> str:
         return f"Error listing archive contents: {e}"
 
 
+def validate_security_configuration(
+    transport: str, host: str, tls_mode: str, auth_token: str | None, allow_remote: bool
+) -> tuple[bool, str]:
+    """
+    Validate security configuration for remote access.
+
+    Args:
+        transport: Transport type
+        host: Bind host
+        tls_mode: TLS mode
+        auth_token: Authentication token (if set)
+        allow_remote: Whether remote access is allowed
+
+    Returns:
+        Tuple of (is_valid, error_message)
+    """
+    from src.utils.auth import TokenEntropyError, TokenFormatError, TokenValidator
+    from src.utils.config import get_config_bool, is_remote_host
+    from src.utils.tls import TLSMode
+
+    # Check if this is a remote configuration
+    is_remote = transport != "stdio" and (is_remote_host(host) or allow_remote)
+
+    if not is_remote:
+        # Local mode - all configurations acceptable
+        return (True, "")
+
+    # Remote mode - enforce security requirements
+
+    # 1. Authentication is mandatory for remote
+    if not auth_token:
+        return (
+            False,
+            "SECURITY ERROR: Remote access requires authentication.\n"
+            "Set MCP_AUTH_TOKEN environment variable or in .env file.\n"
+            "Generate a secure token: python scripts/generate_token.py\n"
+            "This is mandatory - remote access without authentication is disabled.",
+        )
+
+    # 2. TLS is strongly recommended (required by default)
+    try:
+        tls_enum = TLSMode(tls_mode) if tls_mode else TLSMode.DISABLED
+    except ValueError:
+        return (
+            False,
+            f"SECURITY ERROR: Invalid TLS mode '{tls_mode}'.\n"
+            "Valid options: disabled, self_signed, cert_file\n"
+            "Set MCP_TLS_MODE in your .env file.",
+        )
+    require_tls_remote = get_config_bool("MCP_TLS_REQUIRED_FOR_REMOTE", True)
+
+    if tls_enum == TLSMode.DISABLED:
+        if not require_tls_remote:
+            # User explicitly opted out of TLS requirement
+            logger.warning("=" * 70)
+            logger.warning(
+                "TLS DISABLED FOR REMOTE ACCESS (MCP_TLS_REQUIRED_FOR_REMOTE=false)"
+            )
+            logger.warning(
+                "All traffic is UNENCRYPTED. Tokens and data can be intercepted."
+            )
+            logger.warning("Only use this on trusted networks!")
+            logger.warning("=" * 70)
+        else:
+            return (
+                False,
+                "SECURITY ERROR: Remote access requires TLS encryption.\n"
+                "Set MCP_TLS_MODE=self_signed for auto-generated certificate,\n"
+                "or MCP_TLS_MODE=cert_file with MCP_TLS_CERT_PATH and MCP_TLS_KEY_PATH.\n"
+                "To bypass this (NOT RECOMMENDED), set MCP_TLS_REQUIRED_FOR_REMOTE=false.",
+            )
+
+    # 3. Warn about self-signed certificates
+    if tls_enum == TLSMode.SELF_SIGNED:
+        logger.warning("Using self-signed certificate for TLS.")
+        logger.warning("Clients must verify certificate fingerprint out-of-band.")
+        logger.warning("This is vulnerable to MITM if fingerprint not verified.")
+
+    # 4. Validate token strength
+    try:
+        TokenValidator.validate(auth_token, check_entropy=True)
+    except TokenFormatError as e:
+        return (
+            False,
+            f"SECURITY ERROR: Authentication token format invalid: {e}\n"
+            "Generate a new token: python scripts/generate_token.py",
+        )
+    except TokenEntropyError as e:
+        logger.warning(f"Token entropy warning: {e}")
+        logger.warning("Consider generating a stronger token.")
+
+    return (True, "")
+
+
 def main():
-    """Run the MCP server."""
+    """Run the MCP server with transport and security configuration."""
+    from src.utils.audit_log import get_audit_logger
+    from src.utils.config import get_config, get_config_bool, get_config_int
+    from src.utils.tls import TLSMode, get_tls_configuration_from_config, print_security_warning
+
+    # Load configuration
+    transport = get_config("MCP_TRANSPORT", "stdio")
+    host = get_config("MCP_HOST", "127.0.0.1")
+    port = get_config_int("MCP_PORT", 3000)
+    allow_remote = get_config_bool("MCP_ALLOW_REMOTE", False)
+    tls_mode_str = get_config("MCP_TLS_MODE", "disabled")
+    auth_token = get_config("MCP_AUTH_TOKEN")
+
     logger.info("Starting Binary MCP Server...")
     logger.info(f"Ghidra Path: {runner.ghidra_path}")
     logger.info(f"Cache Directory: {cache.cache_dir}")
+    logger.info(f"Transport: {transport}")
+
+    if transport != "stdio":
+        logger.info(f"Bind: {host}:{port}")
+        logger.info(f"TLS Mode: {tls_mode_str}")
+        logger.info(f"Authentication: {'enabled' if auth_token else 'DISABLED - INSECURE'}")
+
+    # Validate security configuration
+    is_valid, error_msg = validate_security_configuration(
+        transport=transport,
+        host=host,
+        tls_mode=tls_mode_str,
+        auth_token=auth_token,
+        allow_remote=allow_remote,
+    )
+
+    if not is_valid:
+        logger.error(error_msg)
+        print("\n" + "=" * 70)
+        print("SECURITY CONFIGURATION ERROR")
+        print("=" * 70)
+        print(error_msg)
+        print("=" * 70 + "\n")
+        sys.exit(1)
+
+    # Initialize security components
+    tls_mode = TLSMode.DISABLED
+    ssl_context = None
+
+    try:
+        # Initialize audit logging
+        audit_logger = get_audit_logger()
+        logger.info(f"Audit logging initialized: {audit_logger.log_dir}")
+
+        # Initialize TLS if configured
+        if transport != "stdio":
+            tls_mode, ssl_context = get_tls_configuration_from_config()
+            if ssl_context:
+                logger.info(f"TLS initialized ({tls_mode.value})")
+
+            # Print security warnings for remote access
+            print_security_warning(tls_mode, host, port, auth_enabled=(auth_token is not None))
+
+    except Exception as e:
+        logger.error(f"Failed to initialize security: {e}")
+        print(f"\nERROR: Security initialization failed: {e}")
+        sys.exit(1)
 
     # Register .NET analysis tools
     register_dotnet_tools(app)
@@ -2888,11 +3018,83 @@ def main():
     # Register PE structure analysis tools
     register_pe_tools(app, session_manager)
 
-    logger.info("Registered all analysis tools (static, dynamic, VT, triage, reporting, Yara, control flow, malware, function hash, PE structure)")
+    logger.info(
+        "Registered all analysis tools (static, dynamic, VT, triage, reporting, Yara, control flow, malware, function hash, PE structure)"
+    )
     logger.info(f"Session Directory: {session_manager.store_dir}")
 
-    # Run the FastMCP server (handles stdio automatically)
-    app.run()
+    # Log startup event to audit log
+    try:
+        from src.utils.audit_log import log_session_event
+
+        log_session_event(
+            session_id="server",
+            event_subtype="startup",
+            client_ip=None,
+            details={
+                "transport": transport,
+                "host": host,
+                "port": port,
+                "tls_mode": tls_mode.value,
+                "auth_enabled": auth_token is not None,
+            },
+        )
+    except Exception as e:
+        logger.warning(f"Failed to write startup audit event: {e}")
+
+    # Run server based on transport type
+    if transport == "stdio":
+        logger.info("Running in stdio mode (local only)")
+        app.run()
+
+    elif transport == "sse":
+        try:
+            from src.transports.sse_server import (
+                build_uvicorn_config,
+                configure_remote_access,
+                get_ip_allowlist_middleware,
+            )
+        except ImportError as e:
+            logger.error(f"SSE transport not available: {e}")
+            print("\nERROR: SSE transport requires additional dependencies.")
+            print("Install with: uv add 'fastmcp[sse]'")
+            sys.exit(1)
+
+        try:
+            # Configure auth, rate limiting, and audit middleware on the app
+            configure_remote_access(app, auth_token=auth_token)
+        except Exception as e:
+            logger.error(f"Failed to configure remote access: {e}")
+            print(f"\nERROR: Remote access configuration failed: {e}")
+            sys.exit(1)
+
+        # Build uvicorn config with TLS
+        uvicorn_config = build_uvicorn_config(
+            host=host,
+            port=port,
+            ssl_context=ssl_context,
+        )
+
+        # Get IP allowlist ASGI middleware if configured
+        asgi_middleware = []
+        ip_mw = get_ip_allowlist_middleware()
+        if ip_mw:
+            asgi_middleware.append(ip_mw)
+
+        logger.info(f"Starting SSE server on {host}:{port}")
+        app.run(
+            transport="sse",
+            host=host,
+            port=port,
+            uvicorn_config=uvicorn_config,
+            middleware=asgi_middleware if asgi_middleware else None,
+        )
+
+    else:
+        logger.error(f"Unknown transport: {transport}")
+        print(f"\nERROR: Unknown transport: {transport}")
+        print("Supported transports: stdio, sse")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

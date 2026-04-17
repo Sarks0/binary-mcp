@@ -114,6 +114,27 @@ class TestConnectWithMockedPybag:
         assert bridge._mode == WinDbgMode.KERNEL_MODE
         assert bridge.get_state() == DebuggerState.PAUSED
         mock_kd.attach.assert_called_once_with("net:port=50000,key=1.2.3.4")
+        # wait() must be called after attach() to confirm target broke in
+        mock_kd.wait.assert_called_once()
+
+    @patch("src.engines.dynamic.windbg.bridge.platform.system", return_value="Windows")
+    @patch("src.engines.dynamic.windbg.bridge.PYBAG_AVAILABLE", True)
+    @patch("src.engines.dynamic.windbg.bridge.pybag")
+    def test_connect_kernel_net_timeout(self, mock_pybag, mock_sys):
+        """connect_kernel_net() raises after timeout when target doesn't break in."""
+        import time as _time
+
+        mock_kd = MagicMock()
+        # attach() returns instantly (just opens port), wait() blocks forever
+        # (target never breaks in).  Must exceed timeout+5 to trip the outer
+        # futures timeout.
+        mock_kd.wait.side_effect = lambda _: _time.sleep(30)
+        mock_pybag.KernelDbg.return_value = mock_kd
+
+        bridge = WinDbgBridge()
+        with pytest.raises(WinDbgBridgeError) as exc_info:
+            bridge.connect_kernel_net(port=50000, key="1.2.3.4", timeout=1)
+        assert "timed out" in exc_info.value.message
 
     @patch("src.engines.dynamic.windbg.bridge.platform.system", return_value="Windows")
     @patch("src.engines.dynamic.windbg.bridge.PYBAG_AVAILABLE", True)

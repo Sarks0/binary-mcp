@@ -37,8 +37,10 @@ function Find-WinDbgPath {
     # Searches in priority order:
     #   1. WINDBG_PATH env var
     #   2. Standard Windows SDK paths
-    #   3. WinDbg Preview via Get-AppxPackage (Microsoft Store / winget)
-    #   4. cdb.exe on PATH
+    #   3. WinDbg Preview via Get-AppxPackage (Microsoft Store)
+    #   4. WinDbg Preview WindowsApps aliases (Store / winget)
+    #   5. WinDbg Preview in Program Files (winget / direct install)
+    #   6. cdb.exe on PATH
 
     # 1. Env var
     if ($env:WINDBG_PATH -and (Test-Path "$env:WINDBG_PATH\cdb.exe")) {
@@ -58,25 +60,51 @@ function Find-WinDbgPath {
         }
     }
 
-    # 3. WinDbg Preview (Microsoft Store / winget install)
+    # 3. WinDbg Preview via Get-AppxPackage (Microsoft Store)
     try {
         $appx = Get-AppxPackage -Name "Microsoft.WinDbg" -ErrorAction SilentlyContinue
         if ($appx -and $appx.InstallLocation) {
             $appxPath = $appx.InstallLocation
-            # cdb.exe may be in the root or in an amd64/ subfolder
-            if (Test-Path "$appxPath\amd64\cdb.exe") {
-                return "$appxPath\amd64"
-            } elseif (Test-Path "$appxPath\cdb.exe") {
-                return $appxPath
-            }
-            # Even without cdb.exe, the debugger is installed here
-            if (Test-Path "$appxPath\DbgX.Shell.exe") {
-                return $appxPath
+            foreach ($sub in @("amd64", "x64", "")) {
+                $candidate = if ($sub) { "$appxPath\$sub" } else { $appxPath }
+                if (Test-Path "$candidate\cdb.exe") {
+                    return $candidate
+                }
             }
         }
     } catch {}
 
-    # 4. cdb.exe on PATH
+    # 4. WinDbg Preview WindowsApps aliases (Store / winget symlinks)
+    try {
+        $localApps = "$env:LOCALAPPDATA\Microsoft\WindowsApps"
+        if (Test-Path $localApps) {
+            $windbgDirs = Get-ChildItem -Path $localApps -Directory -Filter "Microsoft.WinDbg*" -ErrorAction SilentlyContinue
+            foreach ($dir in $windbgDirs) {
+                foreach ($sub in @("amd64", "x64", "")) {
+                    $candidate = if ($sub) { "$($dir.FullName)\$sub" } else { $dir.FullName }
+                    if (Test-Path "$candidate\cdb.exe") {
+                        return $candidate
+                    }
+                }
+            }
+        }
+    } catch {}
+
+    # 5. WinDbg Preview in Program Files (winget / direct install)
+    foreach ($progDir in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+        if (-not $progDir) { continue }
+        $windbgDir = "$progDir\WinDbg"
+        if (Test-Path $windbgDir) {
+            foreach ($sub in @("amd64", "x64", "")) {
+                $candidate = if ($sub) { "$windbgDir\$sub" } else { $windbgDir }
+                if (Test-Path "$candidate\cdb.exe") {
+                    return $candidate
+                }
+            }
+        }
+    }
+
+    # 6. cdb.exe on PATH
     if (Test-Command cdb) {
         return (Get-Command cdb).Source | Split-Path
     }
@@ -957,8 +985,13 @@ function Get-McpServerConfig {
         $envVars["X64DBG_HOME"] = $X64DbgDir
     }
 
-    if ($env:WINDBG_PATH) {
+    if ($env:WINDBG_PATH -and (Test-Path "$env:WINDBG_PATH\cdb.exe")) {
         $envVars["WINDBG_PATH"] = $env:WINDBG_PATH
+    } else {
+        $detectedWinDbg = Find-WinDbgPath
+        if ($detectedWinDbg) {
+            $envVars["WINDBG_PATH"] = $detectedWinDbg
+        }
     }
 
     $serverConfig = @{

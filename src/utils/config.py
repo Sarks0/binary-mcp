@@ -160,7 +160,13 @@ CONFIG_KEYS = {
 
     # Ghidra
     "GHIDRA_HOME": "Path to Ghidra installation directory",
-    "GHIDRA_TIMEOUT": "Default timeout for Ghidra analysis (seconds)",
+    "GHIDRA_TIMEOUT": "Default wall-clock timeout for Ghidra analysis (seconds, 30–3600, default 1800)",
+    "GHIDRA_FUNCTION_TIMEOUT": "Per-function decompilation timeout (seconds, default 30)",
+    "GHIDRA_MAX_FUNCTIONS": "Cap on functions processed per Ghidra run (0 = unlimited)",
+    "GHIDRA_SKIP_DECOMPILE": "Skip decompilation for fast structural pass (1/true/yes)",
+    "GHIDRA_RESUME_CACHE": "Path to a prior cache (plain or .gz) to resume analysis from",
+    "GHIDRA_START_ADDRESS": "Hex start address for chunked analysis (e.g. 0x61abbc)",
+    "GHIDRA_END_ADDRESS": "Hex end address for chunked analysis",
 
     # x64dbg
     "X64DBG_BRIDGE_URL": "URL for x64dbg HTTP bridge (default: http://localhost:27042)",

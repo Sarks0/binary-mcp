@@ -6,6 +6,7 @@
 # Note: currentProgram and other Ghidra globals are provided at runtime
 
 import codecs
+import gzip
 import json
 import os
 import time
@@ -167,6 +168,54 @@ def decompile_with_timeout(decompiler, function, timeout_seconds, monitor, execu
         return (None, "error", safe_unicode(e))
 
 
+def _parse_hex_addr(raw):
+    """Parse an address string ('0x1800', '1800') to int, or None."""
+    if not raw:
+        return None
+    try:
+        raw = raw.strip()
+        if raw.lower().startswith("0x"):
+            return int(raw, 16)
+        return int(raw, 16)
+    except (ValueError, AttributeError):
+        return None
+
+
+def _load_resume_cache(path):
+    """
+    Load a previous analysis cache for resumable analysis.
+
+    Supports both gzipped (.json.gz) and plain (.json) cache files.
+    Returns (context_dict, set_of_analyzed_addresses) or (None, set()).
+    """
+    if not path or not os.path.exists(path):
+        return None, set()
+
+    try:
+        if path.endswith(".gz"):
+            f = gzip.open(path, "rb")
+            try:
+                data = json.loads(f.read().decode("utf-8"))
+            finally:
+                f.close()
+        else:
+            f = codecs.open(path, "r", encoding="utf-8")
+            try:
+                data = json.load(f)
+            finally:
+                f.close()
+
+        analyzed = set()
+        for func in data.get("functions", []):
+            addr = func.get("address")
+            if addr:
+                analyzed.add(addr)
+        return data, analyzed
+    except Exception as e:
+        print(safe_format("[!] Failed to load resume cache {}: {}", path, safe_unicode(e)))
+        return None, set()
+
+
 def extract_comprehensive_analysis():
     """Extract comprehensive analysis data from the current program."""
 
@@ -183,16 +232,33 @@ def extract_comprehensive_analysis():
     # GHIDRA_FUNCTION_TIMEOUT: Per-function decompilation timeout in seconds (default: 30)
     # GHIDRA_MAX_FUNCTIONS: Maximum number of functions to analyze (default: unlimited)
     # GHIDRA_SKIP_DECOMPILE: Skip decompilation entirely (faster, but no pseudocode)
+    # GHIDRA_RESUME_CACHE: Path to previous cache JSON; functions already in it are skipped
+    # GHIDRA_START_ADDRESS / GHIDRA_END_ADDRESS: Hex address bounds for chunked analysis
     function_timeout = int(os.environ.get("GHIDRA_FUNCTION_TIMEOUT", "30"))
     max_functions = int(os.environ.get("GHIDRA_MAX_FUNCTIONS", "0"))  # 0 = unlimited
     skip_decompile = os.environ.get("GHIDRA_SKIP_DECOMPILE", "").lower() in ("1", "true", "yes")
     total_budget = int(os.environ.get("GHIDRA_ANALYSIS_BUDGET", "540"))
+    resume_cache_path = os.environ.get("GHIDRA_RESUME_CACHE", "") or None
+    start_addr = _parse_hex_addr(os.environ.get("GHIDRA_START_ADDRESS"))
+    end_addr = _parse_hex_addr(os.environ.get("GHIDRA_END_ADDRESS"))
 
     print(safe_format("[*] Analysis settings:"))
     print(safe_format("    Function timeout: {}s", function_timeout))
     print(safe_format("    Max functions: {}", max_functions if max_functions > 0 else "unlimited"))
     print(safe_format("    Skip decompile: {}", skip_decompile))
     print(safe_format("    Wall-clock budget: {}s", total_budget))
+    if resume_cache_path:
+        print(safe_format("    Resume cache: {}", resume_cache_path))
+    if start_addr is not None:
+        print(safe_format("    Start address: 0x{:x}", start_addr))
+    if end_addr is not None:
+        print(safe_format("    End address: 0x{:x}", end_addr))
+
+    # Load prior cache if resuming
+    resume_context, already_analyzed = _load_resume_cache(resume_cache_path)
+    if resume_context:
+        print(safe_format("[*] Resumed from cache: {} functions already analyzed",
+                          len(already_analyzed)))
 
     # Initialize decompiler
     decompiler = DecompInterface()
@@ -202,31 +268,58 @@ def extract_comprehensive_analysis():
     # Tasks are submitted one at a time, so a single thread is sufficient
     decompile_executor = Executors.newSingleThreadExecutor()
 
-    context = {
-        "metadata": {},
-        "functions": [],
-        "imports": [],
-        "exports": [],
-        "strings": [],
-        "memory_map": [],
-        "xrefs": {},
-        "data_types": {
-            "structures": [],
-            "enums": []
-        },
-        "analysis_stats": {
+    if resume_context:
+        # Start from the previous cache — re-extract metadata/memory/imports/strings
+        # below, but preserve previously-decompiled functions.
+        context = resume_context
+        # Reset collections we re-extract every run
+        context["imports"] = []
+        context["exports"] = []
+        context["strings"] = []
+        context["memory_map"] = []
+        context.setdefault("functions", [])
+        context.setdefault("xrefs", {})
+        context.setdefault("data_types", {"structures": [], "enums": []})
+        context.setdefault("skipped_functions", [])
+        context["analysis_stats"] = {
             "functions_analyzed": 0,
             "functions_skipped": 0,
             "decompile_failures": 0,
             "decompile_timeouts": 0,
-            "thread_timeouts": 0,  # Hard thread timeouts (anti-analysis code)
-            "internal_timeouts": 0,  # Ghidra's internal decompiler timeouts
+            "thread_timeouts": 0,
+            "internal_timeouts": 0,
             "partial_results": False,
             "function_timeout_setting": function_timeout,
-            "max_functions_setting": max_functions if max_functions > 0 else None
-        },
-        "skipped_functions": []  # Track functions that couldn't be analyzed
-    }
+            "max_functions_setting": max_functions if max_functions > 0 else None,
+            "resumed": True,
+            "resumed_from_count": len(already_analyzed),
+        }
+    else:
+        context = {
+            "metadata": {},
+            "functions": [],
+            "imports": [],
+            "exports": [],
+            "strings": [],
+            "memory_map": [],
+            "xrefs": {},
+            "data_types": {
+                "structures": [],
+                "enums": []
+            },
+            "analysis_stats": {
+                "functions_analyzed": 0,
+                "functions_skipped": 0,
+                "decompile_failures": 0,
+                "decompile_timeouts": 0,
+                "thread_timeouts": 0,  # Hard thread timeouts (anti-analysis code)
+                "internal_timeouts": 0,  # Ghidra's internal decompiler timeouts
+                "partial_results": False,
+                "function_timeout_setting": function_timeout,
+                "max_functions_setting": max_functions if max_functions > 0 else None
+            },
+            "skipped_functions": []  # Track functions that couldn't be analyzed
+        }
 
     # Extract metadata
     print("[*] Extracting metadata...")
@@ -336,11 +429,37 @@ def extract_comprehensive_analysis():
 
     analysis_start = time.time()
 
+    skipped_by_resume = 0
+    skipped_by_range = 0
+
     while function_iterator.hasNext():
         function = function_iterator.next()
+
+        entry_point = function.getEntryPoint()
+        entry_str = safe_unicode(entry_point)
+
+        # Skip functions already present in resume cache
+        if already_analyzed and entry_str in already_analyzed:
+            skipped_by_resume += 1
+            continue
+
+        # Apply address-range filter (chunked analysis)
+        if start_addr is not None or end_addr is not None:
+            try:
+                ep_int = int(entry_point.getOffset())
+            except Exception:
+                ep_int = None
+            if ep_int is not None:
+                if start_addr is not None and ep_int < start_addr:
+                    skipped_by_range += 1
+                    continue
+                if end_addr is not None and ep_int > end_addr:
+                    skipped_by_range += 1
+                    continue
+
         function_count += 1
 
-        # Check max functions limit
+        # Check max functions limit (counts functions analyzed this run only)
         if max_functions > 0 and function_count > max_functions:
             print(safe_format("[!] Reached max function limit ({}), stopping analysis", max_functions))
             context["analysis_stats"]["partial_results"] = True
@@ -352,7 +471,6 @@ def extract_comprehensive_analysis():
 
         # Get function signature
         signature = function.getSignature()
-        entry_point = function.getEntryPoint()
         body = function.getBody()
 
         # Get basic info
@@ -507,6 +625,9 @@ def extract_comprehensive_analysis():
     context["analysis_stats"]["internal_timeouts"] = internal_timeout_count
     context["analysis_stats"]["decompile_failures"] = decompile_failure_count
     context["analysis_stats"]["functions_skipped"] = len(context["skipped_functions"])
+    context["analysis_stats"]["skipped_by_resume"] = skipped_by_resume
+    context["analysis_stats"]["skipped_by_range"] = skipped_by_range
+    context["analysis_stats"]["total_functions_in_cache"] = len(context["functions"])
 
     # Extract data types (structures)
     print("[*] Extracting data types...")

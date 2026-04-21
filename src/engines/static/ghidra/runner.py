@@ -201,6 +201,9 @@ class GhidraRunner:
         function_timeout: int | None = None,
         max_functions: int | None = None,
         skip_decompile: bool = False,
+        resume_from_cache: str | None = None,
+        start_address: str | None = None,
+        end_address: str | None = None,
     ) -> dict:
         """
         Run Ghidra headless analysis on a binary.
@@ -218,6 +221,10 @@ class GhidraRunner:
             function_timeout: Per-function decompilation timeout (default: 30s)
             max_functions: Maximum functions to analyze (default: unlimited)
             skip_decompile: Skip decompilation for faster analysis (default: False)
+            resume_from_cache: Path to a previous cache JSON (plain or .gz) — functions
+                already present are skipped and their results preserved
+            start_address: Hex start address (e.g. "0x61abbc") — skip functions below
+            end_address: Hex end address — skip functions above
 
         Returns:
             dict with analysis results and metadata
@@ -261,11 +268,21 @@ class GhidraRunner:
             env["GHIDRA_MAX_FUNCTIONS"] = str(max_functions)
         if skip_decompile:
             env["GHIDRA_SKIP_DECOMPILE"] = "1"
+        if resume_from_cache:
+            env["GHIDRA_RESUME_CACHE"] = str(resume_from_cache)
+        if start_address:
+            env["GHIDRA_START_ADDRESS"] = str(start_address)
+        if end_address:
+            env["GHIDRA_END_ADDRESS"] = str(end_address)
         # Give script a wall-clock budget with margin for JSON serialization
         env["GHIDRA_ANALYSIS_BUDGET"] = str(max(timeout - 60, 60))
 
-        logger.debug(f"Analysis settings: function_timeout={function_timeout}, "
-                     f"max_functions={max_functions}, skip_decompile={skip_decompile}")
+        logger.debug(
+            f"Analysis settings: function_timeout={function_timeout}, "
+            f"max_functions={max_functions}, skip_decompile={skip_decompile}, "
+            f"resume_from_cache={resume_from_cache}, "
+            f"start_address={start_address}, end_address={end_address}"
+        )
 
         # Build command - processor/loader must come immediately after binary path
         cmd = [

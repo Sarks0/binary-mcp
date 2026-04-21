@@ -276,7 +276,14 @@ def get_analysis_context(
     binary_path: str,
     force_reanalyze: bool = False,
     processor: str | None = None,
-    loader: str | None = None
+    loader: str | None = None,
+    *,
+    skip_decompile: bool = False,
+    max_functions: int | None = None,
+    function_timeout: int | None = None,
+    incremental: bool = False,
+    start_address: str | None = None,
+    end_address: str | None = None,
 ) -> dict:
     """
     Get or create analysis context for a binary.
@@ -286,6 +293,17 @@ def get_analysis_context(
         force_reanalyze: Force re-analysis even if cached
         processor: Optional processor specification (e.g., "x86:LE:64:default")
         loader: Optional loader name (e.g., "PeLoader" for Windows PE, "ElfLoader" for Linux ELF)
+        skip_decompile: Skip per-function decompilation for a much faster
+            structural pass (no pseudocode). Useful for large binaries where
+            decompilation dominates wall-clock time.
+        max_functions: Cap how many functions the Jython script will process
+            this run (useful with ``incremental`` for chunked coverage).
+        function_timeout: Per-function decompilation timeout in seconds.
+        incremental: When True and a cache already exists, pass it to Ghidra
+            as ``resume_from_cache`` so the script skips previously-analyzed
+            functions and extends coverage rather than restarting.
+        start_address / end_address: Hex bounds used to restrict the run to a
+            sub-range (``"0x61abbc"``). Pairs well with ``incremental``.
 
     Returns:
         Analysis context dict
@@ -310,8 +328,11 @@ def get_analysis_context(
         logger.error(f"Path validation failed: {e}")
         raise RuntimeError(f"Invalid binary path: {e}")
 
-    # Check cache first (skip cache if processor/loader specified)
-    if not force_reanalyze and not processor and not loader:
+    # Short-circuit to cache unless the caller asked to re-analyze,
+    # is overriding the processor/loader, or is extending coverage via
+    # incremental/range options.
+    extending = incremental or start_address or end_address
+    if not force_reanalyze and not processor and not loader and not extending:
         cached_context = cache.get_cached(binary_path)
         if cached_context:
             logger.info(f"Using cached analysis for {binary_path}")
@@ -325,10 +346,19 @@ def get_analysis_context(
     output_path = cache.cache_dir / f"temp_analysis_{Path(binary_path).stem}.json"
     script_path = Path(__file__).parent / "engines" / "static" / "ghidra" / "scripts"
 
+    # Resolve resume path if caller wants to extend an existing cache
+    resume_from_cache = None
+    if incremental:
+        resume_from_cache = cache.get_cache_path(binary_path)
+        if resume_from_cache is None:
+            logger.info("incremental=True but no cache exists yet; running full analysis")
+        else:
+            logger.info(f"Resuming analysis from cache: {resume_from_cache}")
+
     try:
-        # Use configurable timeout (default 600 seconds / 10 minutes)
-        # Bounds: minimum 30s, maximum 3600s (1 hour)
-        timeout = get_config_int("GHIDRA_TIMEOUT", 600)
+        # Default bumped to 1800s (30 min) — large binaries routinely need more
+        # than the old 10-minute ceiling. Bounds are still 30s..3600s.
+        timeout = get_config_int("GHIDRA_TIMEOUT", 1800)
         timeout = validate_numeric_range(timeout, 30, 3600, "GHIDRA_TIMEOUT")
         result = runner.analyze(
             binary_path=binary_path,
@@ -338,7 +368,13 @@ def get_analysis_context(
             keep_project=True,  # Keep project for incremental analysis
             timeout=timeout,
             processor=processor,
-            loader=loader
+            loader=loader,
+            skip_decompile=skip_decompile,
+            max_functions=max_functions,
+            function_timeout=function_timeout,
+            resume_from_cache=str(resume_from_cache) if resume_from_cache else None,
+            start_address=start_address,
+            end_address=end_address,
         )
 
         # Save Ghidra output to debug file for inspection
@@ -450,7 +486,13 @@ def analyze_binary(
     force_reanalyze: bool = False,
     processor: str | None = None,
     loader: str | None = None,
-    skip_compatibility_check: bool = False
+    skip_compatibility_check: bool = False,
+    skip_decompile: bool = False,
+    max_functions: int | None = None,
+    function_timeout: int | None = None,
+    incremental: bool = False,
+    start_address: str | None = None,
+    end_address: str | None = None,
 ) -> str:
     """
     Analyze a binary file with Ghidra headless analyzer.
@@ -468,6 +510,17 @@ def analyze_binary(
         processor: Optional processor spec when AutoImporter fails (e.g., "x86:LE:64:default")
         loader: Optional loader name when AutoImporter fails (e.g., "PeLoader" for Windows PE)
         skip_compatibility_check: Skip pre-analysis compatibility check (default: False)
+        skip_decompile: Skip decompilation for a fast structural pass (no pseudocode).
+            Recommended for a first pass on very large binaries — functions,
+            imports, strings, and memory map are still extracted.
+        max_functions: Cap how many functions to process this run (pairs with
+            ``incremental`` for multi-pass coverage of huge binaries).
+        function_timeout: Per-function decompile timeout (seconds). Lower values
+            skip anti-analysis code faster.
+        incremental: When True, extend an existing cache instead of starting
+            fresh. Previously-analyzed functions are skipped and preserved.
+        start_address / end_address: Hex bounds to restrict the run to an
+            address range (e.g. ``"0x61abbc"``).
 
     Returns:
         Analysis summary with basic statistics, or compatibility warning if issues detected
@@ -479,6 +532,11 @@ def analyze_binary(
         - For macOS Mach-O: processor="x86:LE:64:default", loader="MachoLoader"
 
         Common Ghidra loaders: PeLoader, ElfLoader, MachoLoader, BinaryLoader, CoffLoader
+
+        Large-binary workflow (e.g. 17MB+ with 60K+ functions):
+        1. First pass: ``analyze_binary(..., skip_decompile=True)`` — structure only.
+        2. Extend: ``analyze_binary(..., incremental=True, max_functions=5000)``
+           repeatedly, or target a range with ``start_address``/``end_address``.
     """
     # Store compatibility info for inclusion in output
     compat_warning = None
@@ -508,7 +566,18 @@ Format: {compat_info.format.value}
                 # Don't fail on compatibility check errors, just log and proceed
                 logger.warning(f"Compatibility check failed, proceeding with analysis: {e}")
 
-        context = get_analysis_context(binary_path, force_reanalyze, processor, loader)
+        context = get_analysis_context(
+            binary_path,
+            force_reanalyze,
+            processor,
+            loader,
+            skip_decompile=skip_decompile,
+            max_functions=max_functions,
+            function_timeout=function_timeout,
+            incremental=incremental,
+            start_address=start_address,
+            end_address=end_address,
+        )
 
         metadata = context.get("metadata", {})
         functions = context.get("functions", [])
@@ -556,6 +625,26 @@ Format: {compat_info.format.value}
             summary += "\n**Analysis Warnings:**\n"
             for warning in warnings:
                 summary += f"{warning}\n"
+
+        # Surface incremental / partial-run stats when present
+        stats = context.get("analysis_stats", {})
+        if stats.get("resumed") or stats.get("partial_results") or stats.get("skipped_by_range"):
+            summary += "\n**Analysis Run Stats:**\n"
+            if stats.get("resumed"):
+                summary += (
+                    f"- Resumed from prior cache: "
+                    f"{stats.get('resumed_from_count', 0)} functions preserved\n"
+                )
+            summary += f"- Functions processed this run: {stats.get('functions_analyzed', 0)}\n"
+            if stats.get("skipped_by_resume"):
+                summary += f"- Skipped (already in cache): {stats['skipped_by_resume']}\n"
+            if stats.get("skipped_by_range"):
+                summary += f"- Skipped (outside address range): {stats['skipped_by_range']}\n"
+            if stats.get("partial_results"):
+                summary += (
+                    "- ⚠️  Partial results — hit max_functions or wall-clock budget. "
+                    "Re-run with `incremental=True` to extend coverage.\n"
+                )
 
         summary += """
 Analysis cached for fast subsequent queries.

@@ -241,6 +241,7 @@ def extract_comprehensive_analysis():
     resume_cache_path = os.environ.get("GHIDRA_RESUME_CACHE", "") or None
     start_addr = _parse_hex_addr(os.environ.get("GHIDRA_START_ADDRESS"))
     end_addr = _parse_hex_addr(os.environ.get("GHIDRA_END_ADDRESS"))
+    enable_fid = os.environ.get("GHIDRA_ENABLE_FID", "").lower() in ("1", "true", "yes")
 
     print(safe_format("[*] Analysis settings:"))
     print(safe_format("    Function timeout: {}s", function_timeout))
@@ -253,6 +254,32 @@ def extract_comprehensive_analysis():
         print(safe_format("    Start address: 0x{:x}", start_addr))
     if end_addr is not None:
         print(safe_format("    End address: 0x{:x}", end_addr))
+    if enable_fid:
+        print(safe_format("    FID matching: enabled"))
+
+    # Lazy-initialise Ghidra's Function ID service. Wrapped because the FID
+    # APIs vary slightly across Ghidra versions — failure here degrades to
+    # "no FID matches", never a hard error.
+    fid_service = None
+    fid_files = None
+    if enable_fid:
+        try:
+            from ghidra.feature.fid.db import FidFileManager
+            from ghidra.feature.fid.service import FidService
+            fid_service = FidService()
+            fm = FidFileManager.getInstance()
+            if fm is not None:
+                fid_files = fm.getFidFiles()
+            if fid_service.canProcess(program.getLanguage()) and fid_files:
+                print(safe_format("    FID databases available: {}", len(fid_files)))
+            else:
+                print("    [!] FID enabled but no FID databases / unsupported language; disabling.")
+                fid_service = None
+                fid_files = None
+        except Exception as fid_err:
+            print(safe_format("    [!] FID init failed ({}); continuing without FID", safe_unicode(fid_err)))
+            fid_service = None
+            fid_files = None
 
     # Load prior cache if resuming
     resume_context, already_analyzed = _load_resume_cache(resume_cache_path)
@@ -473,6 +500,16 @@ def extract_comprehensive_analysis():
         signature = function.getSignature()
         body = function.getBody()
 
+        # Capture how the function name was assigned (USER_DEFINED / IMPORTED /
+        # ANALYSIS / DEFAULT). Analyzer-assigned non-default names are the
+        # signal that FID / demangler / stdlib-heuristic identified this as a
+        # known routine.
+        try:
+            sym = function.getSymbol()
+            name_source = safe_unicode(sym.getSource()) if sym else u"UNKNOWN"
+        except Exception:
+            name_source = u"UNKNOWN"
+
         # Get basic info
         function_info = {
             "name": safe_unicode(function.getName()),
@@ -481,11 +518,14 @@ def extract_comprehensive_analysis():
             "signature": safe_unicode(signature),
             "is_thunk": function.isThunk(),
             "is_external": function.isExternal(),
+            "name_source": name_source,
             "parameters": [],
             "local_variables": [],
             "called_functions": [],
             "pseudocode": None,
             "basic_blocks": [],
+            "jump_tables": [],
+            "fid_match": None,
             "decompile_status": "not_attempted"  # Track decompilation status
         }
 
@@ -533,6 +573,74 @@ def extract_comprehensive_analysis():
         except Exception as e:
             print(safe_format("    Warning: Could not extract basic blocks for {}: {}",
                               safe_unicode(function.getName()), safe_unicode(e)))
+
+        # Extract jump / switch tables — instructions whose flow type is a
+        # computed jump expose their resolved targets via getFlows(). Works
+        # without HighFunction/P-Code so it stays cheap and always available.
+        try:
+            if body:
+                instr_iter = listing.getInstructions(body, True)
+                while instr_iter.hasNext():
+                    inst = instr_iter.next()
+                    ft = inst.getFlowType()
+                    if ft is not None and ft.isComputed() and ft.isJump():
+                        try:
+                            targets = inst.getFlows()
+                        except Exception:
+                            targets = None
+                        if not targets:
+                            continue
+                        function_info["jump_tables"].append({
+                            "source_addr": safe_unicode(inst.getAddress()),
+                            "targets": [safe_unicode(t) for t in targets],
+                        })
+        except Exception as e:
+            print(safe_format("    Warning: Could not extract jump tables for {}: {}",
+                              safe_unicode(function.getName()), safe_unicode(e)))
+
+        # Optional: Function ID (FID) library match.
+        # Iterates installed FID databases and picks the highest-scoring
+        # match. Defensive: any API mismatch / version drift falls through
+        # to "no match" without interrupting analysis.
+        if fid_service is not None and fid_files:
+            try:
+                best = None
+                for fid_file in fid_files:
+                    try:
+                        matches = fid_service.processFunction(function, fid_file, monitor)
+                    except AttributeError:
+                        # Older Ghidra API — different signature, skip silently
+                        matches = None
+                    except Exception:
+                        matches = None
+                    if not matches:
+                        continue
+                    for m in matches:
+                        try:
+                            score = float(m.getOverallScore())
+                        except Exception:
+                            score = 0.0
+                        if best is None or score > best[0]:
+                            best = (score, m, fid_file)
+                if best is not None:
+                    _, m, fid_file = best
+                    try:
+                        name_match = safe_unicode(m.getNameMatch())
+                    except Exception:
+                        name_match = u""
+                    try:
+                        library = safe_unicode(fid_file.getName())
+                    except Exception:
+                        library = u""
+                    function_info["fid_match"] = {
+                        "name": name_match,
+                        "library": library,
+                        "confidence": best[0],
+                    }
+            except Exception as e:
+                # Never let FID failures break per-function extraction
+                print(safe_format("    Warning: FID match failed for {}: {}",
+                                  safe_unicode(function.getName()), safe_unicode(e)))
 
         # Decompile function (for non-thunk, non-external functions)
         if skip_decompile:

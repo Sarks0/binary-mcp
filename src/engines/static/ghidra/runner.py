@@ -156,6 +156,54 @@ class GhidraRunner:
 
         return path
 
+    def _stage_pdb(self, binary_path: Path | str, pdb_path: str) -> Path:
+        """
+        Stage a PDB file next to the binary so Ghidra's PdbUniversalAnalyzer
+        auto-locates it. Symlinks on Unix, copies on Windows (where symlinks
+        need admin privileges).
+
+        Returns the staged path. Callers should pass it to ``_cleanup_pdb``
+        once Ghidra has finished reading the binary.
+        """
+        import shutil
+
+        src = Path(pdb_path)
+        if not src.exists():
+            raise FileNotFoundError(f"PDB not found: {pdb_path}")
+
+        binary = Path(binary_path)
+        # Ghidra looks for <binary-with-suffix>.pdb adjacent to the binary
+        # (e.g. foo.exe → foo.pdb). Use stem to normalise.
+        dest = binary.parent / f"{binary.stem}.pdb"
+
+        if dest.exists() and dest.resolve() == src.resolve():
+            # Already in the right place
+            return dest
+
+        # Remove any prior artefact so staging is idempotent
+        if dest.exists() or dest.is_symlink():
+            dest.unlink()
+
+        if self.system == "Windows":
+            shutil.copy2(src, dest)
+        else:
+            try:
+                dest.symlink_to(src.resolve())
+            except OSError:
+                # Fallback to copy if symlink isn't allowed
+                shutil.copy2(src, dest)
+        return dest
+
+    def _cleanup_pdb(self, staged_pdb: Path | None) -> None:
+        """Best-effort removal of a PDB staged by ``_stage_pdb``."""
+        if staged_pdb is None:
+            return
+        try:
+            if staged_pdb.exists() or staged_pdb.is_symlink():
+                staged_pdb.unlink()
+        except OSError as e:
+            logger.warning(f"Failed to remove staged PDB {staged_pdb}: {e}")
+
     def _cleanup_project(self, project_dir: Path, project_name: str) -> None:
         """
         Clean up a Ghidra project directory and lock files.
@@ -204,6 +252,8 @@ class GhidraRunner:
         resume_from_cache: str | None = None,
         start_address: str | None = None,
         end_address: str | None = None,
+        pdb_path: str | None = None,
+        enable_fid: bool = False,
     ) -> dict:
         """
         Run Ghidra headless analysis on a binary.
@@ -225,6 +275,10 @@ class GhidraRunner:
                 already present are skipped and their results preserved
             start_address: Hex start address (e.g. "0x61abbc") — skip functions below
             end_address: Hex end address — skip functions above
+            pdb_path: Optional path to a PDB file. Staged next to the binary so
+                Ghidra's PdbUniversalAnalyzer picks it up automatically.
+            enable_fid: When True, set GHIDRA_ENABLE_FID=1 so the Jython script
+                runs Function ID library matching per function.
 
         Returns:
             dict with analysis results and metadata
@@ -274,8 +328,18 @@ class GhidraRunner:
             env["GHIDRA_START_ADDRESS"] = str(start_address)
         if end_address:
             env["GHIDRA_END_ADDRESS"] = str(end_address)
+        if enable_fid:
+            env["GHIDRA_ENABLE_FID"] = "1"
         # Give script a wall-clock budget with margin for JSON serialization
         env["GHIDRA_ANALYSIS_BUDGET"] = str(max(timeout - 60, 60))
+
+        # Stage PDB next to the binary so Ghidra's PdbUniversalAnalyzer finds
+        # it. Auto-cleanup on success/failure so we don't leave dangling
+        # artefacts.
+        staged_pdb = None
+        if pdb_path:
+            staged_pdb = self._stage_pdb(binary_path, pdb_path)
+            logger.info(f"Staged PDB at {staged_pdb}")
 
         logger.debug(
             f"Analysis settings: function_timeout={function_timeout}, "
@@ -385,6 +449,12 @@ class GhidraRunner:
                 f"Ghidra analysis failed with exit code {e.returncode}. "
                 f"stdout (last 2000 chars): {stdout_tail}"
             ) from e
+
+        finally:
+            # Always remove the PDB we staged — Ghidra has either read it by
+            # now or failed outright. Leaving it behind would confuse future
+            # analyses with a mismatched PDB.
+            self._cleanup_pdb(staged_pdb)
 
     def diagnose(self) -> dict:
         """

@@ -27,10 +27,12 @@ from src.engines.static.ghidra.runner import GhidraRunner
 from src.tools.control_flow_tools import register_control_flow_tools
 from src.tools.dotnet_tools import register_dotnet_tools
 from src.tools.dynamic_tools import register_dynamic_tools
+from src.tools.fid_tools import register_fid_tools
 from src.tools.function_hash_tools import register_function_hash_tools
 from src.tools.malware_tools import register_malware_tools
 from src.tools.pe_tools import register_pe_tools
 from src.tools.reporting import register_reporting_tools
+from src.tools.review_tools import register_review_tools
 from src.tools.triage_tools import register_triage_tools
 from src.tools.vt_tools import register_vt_tools
 from src.tools.windbg_tools import register_windbg_tools
@@ -284,6 +286,8 @@ def get_analysis_context(
     incremental: bool = False,
     start_address: str | None = None,
     end_address: str | None = None,
+    pdb_path: str | None = None,
+    enable_fid: bool = False,
 ) -> dict:
     """
     Get or create analysis context for a binary.
@@ -304,6 +308,9 @@ def get_analysis_context(
             functions and extends coverage rather than restarting.
         start_address / end_address: Hex bounds used to restrict the run to a
             sub-range (``"0x61abbc"``). Pairs well with ``incremental``.
+        pdb_path: Path to a PDB file. Staged next to the binary so Ghidra's
+            PdbUniversalAnalyzer picks it up. Forces a fresh analysis if set.
+        enable_fid: Run Ghidra's Function ID library matching per function.
 
     Returns:
         Analysis context dict
@@ -330,9 +337,10 @@ def get_analysis_context(
 
     # Short-circuit to cache unless the caller asked to re-analyze,
     # is overriding the processor/loader, or is extending coverage via
-    # incremental/range options.
+    # incremental/range options. PDB/FID both require a fresh Ghidra run.
     extending = incremental or start_address or end_address
-    if not force_reanalyze and not processor and not loader and not extending:
+    if not force_reanalyze and not processor and not loader and not extending \
+            and not pdb_path and not enable_fid:
         cached_context = cache.get_cached(binary_path)
         if cached_context:
             logger.info(f"Using cached analysis for {binary_path}")
@@ -375,6 +383,8 @@ def get_analysis_context(
             resume_from_cache=str(resume_from_cache) if resume_from_cache else None,
             start_address=start_address,
             end_address=end_address,
+            pdb_path=pdb_path,
+            enable_fid=enable_fid,
         )
 
         # Save Ghidra output to debug file for inspection
@@ -493,6 +503,8 @@ def analyze_binary(
     incremental: bool = False,
     start_address: str | None = None,
     end_address: str | None = None,
+    pdb_path: str | None = None,
+    enable_fid: bool = False,
 ) -> str:
     """
     Analyze a binary file with Ghidra headless analyzer.
@@ -521,6 +533,11 @@ def analyze_binary(
             fresh. Previously-analyzed functions are skipped and preserved.
         start_address / end_address: Hex bounds to restrict the run to an
             address range (e.g. ``"0x61abbc"``).
+        pdb_path: Path to a Windows PDB file. Staged next to the binary so
+            Ghidra's PdbUniversalAnalyzer can apply symbolic function names.
+        enable_fid: Run Ghidra's Function ID library fingerprinting; matches
+            are stored per-function in ``fid_match``. Query via ``fid_match``
+            tool after analysis.
 
     Returns:
         Analysis summary with basic statistics, or compatibility warning if issues detected
@@ -577,6 +594,8 @@ Format: {compat_info.format.value}
             incremental=incremental,
             start_address=start_address,
             end_address=end_address,
+            pdb_path=pdb_path,
+            enable_fid=enable_fid,
         )
 
         metadata = context.get("metadata", {})
@@ -662,6 +681,71 @@ Use other tools like get_functions, get_imports, decompile_function to explore t
         # Unexpected error - log internally, return safe message
         logger.exception(f"analyze_binary failed: {e}")
         return safe_error_message("Analysis failed unexpectedly", e)
+
+
+@app.tool()
+@log_to_session
+def load_pdb(binary_path: str, pdb_path: str) -> str:
+    """
+    Apply a Windows PDB to an analyzed binary.
+
+    Stages the PDB next to the binary (Ghidra's PdbUniversalAnalyzer
+    expects ``<binary-stem>.pdb`` adjacency), invalidates any existing
+    cache, and re-runs analysis so symbolic function names propagate.
+
+    Args:
+        binary_path: Path to the binary
+        pdb_path: Path to the PDB file
+
+    Returns:
+        Summary comparing pre/post symbolic-function counts.
+    """
+    try:
+        # Capture pre-state for before/after comparison
+        pre_cached = cache.get_cached(binary_path)
+        pre_named = 0
+        if pre_cached:
+            for f in pre_cached.get("functions", []):
+                name = f.get("name", "") or ""
+                if name and not name.startswith("FUN_") and not f.get("is_thunk"):
+                    pre_named += 1
+            cache.invalidate(binary_path)
+
+        context = get_analysis_context(
+            binary_path,
+            force_reanalyze=True,
+            pdb_path=pdb_path,
+        )
+
+        post_functions = context.get("functions", [])
+        post_named = sum(
+            1 for f in post_functions
+            if (f.get("name") or "") and not (f.get("name") or "").startswith("FUN_")
+            and not f.get("is_thunk")
+        )
+
+        lines = [
+            f"**PDB applied to {Path(binary_path).name}**",
+            f"- PDB: {pdb_path}",
+            f"- Functions with symbolic names before: {pre_named}",
+            f"- Functions with symbolic names after: {post_named}",
+            f"- Gain: +{post_named - pre_named}",
+        ]
+        if post_named <= pre_named:
+            lines.append(
+                "\n⚠️  No gain detected. The PDB may not match this binary, "
+                "or Ghidra's PdbUniversalAnalyzer did not run. Check the "
+                "debug log in the cache directory."
+            )
+        return "\n".join(lines)
+
+    except FileNotFoundError as e:
+        return f"PDB not found: {e}"
+    except (PathTraversalError, FileSizeError) as e:
+        return safe_error_message("Invalid binary or PDB path", e)
+    except Exception as e:
+        logger.exception(f"load_pdb failed: {e}")
+        return safe_error_message("Failed to apply PDB", e)
 
 
 @app.tool()
@@ -2977,7 +3061,13 @@ def main():
     # Register PE structure analysis tools
     register_pe_tools(app, session_manager)
 
-    logger.info("Registered all analysis tools (static, dynamic, VT, triage, reporting, Yara, control flow, malware, function hash, PE structure)")
+    # Register pseudocode-review + caller-analysis tools
+    register_review_tools(app, session_manager, cache, runner, api_patterns)
+
+    # Register Function ID (FID) library-match reader
+    register_fid_tools(app, session_manager, cache, runner)
+
+    logger.info("Registered all analysis tools (static, dynamic, VT, triage, reporting, Yara, control flow, malware, function hash, PE structure, review, fid)")
     logger.info(f"Session Directory: {session_manager.store_dir}")
 
     # Run the FastMCP server (handles stdio automatically)

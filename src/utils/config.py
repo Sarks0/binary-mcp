@@ -167,6 +167,7 @@ CONFIG_KEYS = {
     "GHIDRA_RESUME_CACHE": "Path to a prior cache (plain or .gz) to resume analysis from",
     "GHIDRA_START_ADDRESS": "Hex start address for chunked analysis (e.g. 0x61abbc)",
     "GHIDRA_END_ADDRESS": "Hex end address for chunked analysis",
+    "GHIDRA_ENABLE_FID": "Enable Function ID library matching during analysis (1/true/yes)",
 
     # x64dbg
     "X64DBG_BRIDGE_URL": "URL for x64dbg HTTP bridge (default: http://localhost:27042)",

@@ -228,6 +228,71 @@ class TestRunnerEnvPlumbing:
         assert "GHIDRA_START_ADDRESS" not in env
         assert "GHIDRA_END_ADDRESS" not in env
         assert "GHIDRA_SKIP_DECOMPILE" not in env
+        assert "GHIDRA_ENABLE_FID" not in env
+
+    def test_enable_fid_sets_env(self, runner, tmp_path):
+        binary, script_dir, output = self._prepare(runner, tmp_path)
+        captured = {}
+
+        def fake_run(cmd, env, **kwargs):
+            captured["env"] = dict(env)
+            return _FakeRunResult()
+
+        with patch("subprocess.run", side_effect=fake_run):
+            runner.analyze(
+                binary_path=str(binary),
+                script_path=str(script_dir),
+                script_name="core_analysis.py",
+                output_path=str(output),
+                enable_fid=True,
+            )
+
+        assert captured["env"]["GHIDRA_ENABLE_FID"] == "1"
+
+    def test_pdb_staged_adjacent_and_cleaned_up(self, runner, tmp_path):
+        """pdb_path should appear next to the binary while subprocess runs,
+        and be removed afterwards."""
+        binary, script_dir, output = self._prepare(runner, tmp_path)
+
+        pdb_src = tmp_path / "external" / "my_binary.pdb"
+        pdb_src.parent.mkdir()
+        pdb_src.write_bytes(b"PDB fake")
+
+        expected_staged = binary.parent / f"{binary.stem}.pdb"
+        saw_staged_during_run = {"ok": False}
+
+        def fake_run(cmd, env, **kwargs):
+            saw_staged_during_run["ok"] = expected_staged.exists()
+            return _FakeRunResult()
+
+        with patch("subprocess.run", side_effect=fake_run):
+            runner.analyze(
+                binary_path=str(binary),
+                script_path=str(script_dir),
+                script_name="core_analysis.py",
+                output_path=str(output),
+                pdb_path=str(pdb_src),
+            )
+
+        assert saw_staged_during_run["ok"], "PDB wasn't staged adjacent to binary"
+        # Cleaned up after analyze returns
+        assert not expected_staged.exists()
+
+    def test_pdb_missing_file_raises(self, runner, tmp_path):
+        binary, script_dir, output = self._prepare(runner, tmp_path)
+
+        with patch("subprocess.run", return_value=_FakeRunResult()):
+            try:
+                runner.analyze(
+                    binary_path=str(binary),
+                    script_path=str(script_dir),
+                    script_name="core_analysis.py",
+                    output_path=str(output),
+                    pdb_path=str(tmp_path / "nonexistent.pdb"),
+                )
+            except FileNotFoundError:
+                return
+        raise AssertionError("Expected FileNotFoundError for missing PDB")
 
 
 # -- get_analysis_context incremental wiring --------------------------------

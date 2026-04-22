@@ -797,7 +797,7 @@ def register_function_hash_tools(app, session_manager, cache, runner):
                             matched_b_names.add(name_b)
                             break
 
-            # Fuzzy matching for remaining functions — use bisect for size windowing
+            # Fuzzy matching for remaining functions -- use bisect for size windowing
             fuzzy_matches = []
             remaining_a = {
                 n: v for n, v in hashes_a.items() if n not in matched_a_names
@@ -843,7 +843,7 @@ def register_function_hash_tools(app, session_manager, cache, runner):
                     max_cc = max(cc_a, cc_b)
                     call_sim = 1.0 - (abs(cc_a - cc_b) / max_cc) if max_cc > 0 else 1.0
 
-                    # Called function name overlap (import overlap) — pre-computed frozensets
+                    # Called function name overlap (import overlap) -- pre-computed frozensets
                     set_a = info_a["called_functions"]
                     set_b = info_b["called_functions"]
                     if set_a and set_b:

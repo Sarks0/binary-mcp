@@ -4,7 +4,7 @@ Handles persistent storage and retrieval of analysis data.
 
 Caches are written as gzipped JSON (``.json.gz``). Legacy uncompressed
 ``.json`` caches are transparently read for backward compatibility; when a
-legacy cache is loaded via :meth:`get_cached` it is *not* auto-migrated — the
+legacy cache is loaded via :meth:`get_cached` it is *not* auto-migrated -- the
 next :meth:`save_cached` call will produce a ``.json.gz`` file alongside it.
 
 Alongside each cache a small ``.funcidx.json`` side-car is maintained mapping
@@ -199,7 +199,7 @@ class ProjectCache:
                 idx = index.get(address)
                 if idx is None:
                     return None
-                # We still need the full cache to get the function body — but
+                # We still need the full cache to get the function body -- but
                 # we now know it exists without scanning.
                 data = self.get_cached(binary_path)
                 if data is None:
@@ -209,7 +209,7 @@ class ProjectCache:
                     return functions[idx]
                 return None
 
-            # No index — legacy fallback: linear scan
+            # No index -- legacy fallback: linear scan
             data = self.get_cached(binary_path)
             if data is None:
                 return None

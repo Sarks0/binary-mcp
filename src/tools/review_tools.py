@@ -1,7 +1,7 @@
 """
 Review and caller-analysis tools backed by the cached Ghidra context.
 
-These tools never spawn Ghidra — they operate purely on the cache populated
+These tools never spawn Ghidra -- they operate purely on the cache populated
 by ``analyze_binary``. If a binary has not been analyzed yet, they run it
 once through the cache-miss path (mirroring the pattern used by
 ``control_flow_tools._get_or_run_analysis``).
@@ -22,7 +22,7 @@ from src.utils.security import (
 
 logger = logging.getLogger(__name__)
 
-# One module-level rules instance — pattern compilation is non-trivial and
+# One module-level rules instance -- pattern compilation is non-trivial and
 # the rules are stateless.
 _RULES = PseudocodeRules()
 
@@ -148,7 +148,7 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
 
         Args:
             binary_path: Path to analyzed binary
-            function_name_or_address: Target function — exact name, hex
+            function_name_or_address: Target function -- exact name, hex
                 address (with or without 0x), or unique substring match
             limit: Max callers to return (default 100, max 10000)
 
@@ -208,7 +208,7 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
         Scan cached pseudocode for CWE / vulnerability patterns.
 
         Applies a curated rule set (see ``src/utils/pseudocode_rules.py``) to
-        every function's decompiled output. Pattern-based triage — expect
+        every function's decompiled output. Pattern-based triage -- expect
         false positives; use findings as starting points, not verdicts.
 
         Args:
@@ -284,7 +284,7 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
             for hit in all_findings:
                 lines.append(
                     f"[{hit['severity'].upper()}] {hit['rule_id']} ({hit['cwe']}) "
-                    f"— {hit['function']} @ {hit['address']}"
+                    f"-- {hit['function']} @ {hit['address']}"
                 )
                 lines.append(f"    {hit['description']}")
                 lines.append(f"    excerpt: {hit['excerpt']}")
@@ -353,7 +353,7 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
                         apis_used.append(api)
 
             # Strings referenced at addresses inside this function's body
-            # (cheap: each string has xrefs with a "from" address — compare
+            # (cheap: each string has xrefs with a "from" address -- compare
             # against the function's basic-block ranges)
             strings_referenced: list[dict] = []
             func_ranges = []
@@ -389,7 +389,7 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
 
             # Format
             lines = [
-                f"# Review Package — {target.get('name')} @ {target.get('address')}",
+                f"# Review Package -- {target.get('name')} @ {target.get('address')}",
                 "",
                 "## Signature",
                 f"`{signature}`",
@@ -418,7 +418,7 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
                 if len(callers) > 25:
                     lines.append(f"  … and {len(callers) - 25} more")
             else:
-                lines.append("(none — entry point or unreferenced)")
+                lines.append("(none -- entry point or unreferenced)")
 
             lines.append("")
             lines.append("## Callees")
@@ -482,7 +482,7 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
                 lines.append("```")
             else:
                 lines.append(
-                    "(no pseudocode — function was likely analyzed with "
+                    "(no pseudocode -- function was likely analyzed with "
                     "skip_decompile=True or is a thunk/external)"
                 )
 
@@ -542,7 +542,7 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
 
             if not any_has_field:
                 return (
-                    "No jump_tables data in cache — this cache was produced "
+                    "No jump_tables data in cache -- this cache was produced "
                     "by a version of core_analysis.py that predates jump-table "
                     "extraction. Re-run `analyze_binary(path, force_reanalyze=True)`."
                 )
@@ -557,7 +557,7 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
             for func, jt in tables:
                 targets = jt.get("targets") or []
                 lines.append(
-                    f"- {func.get('name')} @ {func.get('address')} — "
+                    f"- {func.get('name')} @ {func.get('address')} -- "
                     f"switch @ {jt.get('source_addr')} → {len(targets)} cases"
                 )
                 for t in targets[:12]:

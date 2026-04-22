@@ -2,7 +2,7 @@
 Tests for review / pseudocode-analysis tools.
 
 Uses the _make_function() / _make_analysis_context() factory style
-established in tests/test_control_flow_tools.py — tests call tool
+established in tests/test_control_flow_tools.py -- tests call tool
 functions directly (returned by register_review_tools) with a MagicMock
 cache so no Ghidra is needed.
 """
@@ -163,7 +163,7 @@ class TestScanPseudocode:
         fn = _make_function(pseudocode='sscanf(input, "%d", &x);')
         tools = _register(_make_context(functions=[fn]))
 
-        # sscanf is CWE676_DANGEROUS_FN at severity "low" — floor=high should drop it
+        # sscanf is CWE676_DANGEROUS_FN at severity "low" -- floor=high should drop it
         result = tools["scan_pseudocode"]("/bin/test.exe", severity_floor="high")
         assert "CWE676_DANGEROUS_FN" not in result
 

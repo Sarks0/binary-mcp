@@ -229,7 +229,7 @@ def detect_crypto_patterns(data: bytes) -> list[dict]:
     entropy_sample = data[:65536] if len(data) > 65536 else data
     entropy = calculate_entropy(entropy_sample)
 
-    # Check for Base64 (only first 64KB — Base64 payloads are in headers/resources)
+    # Check for Base64 (only first 64KB -- Base64 payloads are in headers/resources)
     b64_sample = data[:65536] if len(data) > 65536 else data
     b64_result = detect_base64(b64_sample)
     if b64_result["detected"]:
@@ -242,7 +242,7 @@ def detect_crypto_patterns(data: bytes) -> list[dict]:
             }
         })
 
-    # XOR analysis on a sample (10KB) — full-file XOR is O(n * 256) per key length
+    # XOR analysis on a sample (10KB) -- full-file XOR is O(n * 256) per key length
     xor_sample = data[:10240] if len(data) > 10240 else data
 
     # Check for single-byte XOR

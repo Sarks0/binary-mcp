@@ -258,7 +258,7 @@ def extract_comprehensive_analysis():
         print(safe_format("    FID matching: enabled"))
 
     # Lazy-initialise Ghidra's Function ID service. Wrapped because the FID
-    # APIs vary slightly across Ghidra versions — failure here degrades to
+    # APIs vary slightly across Ghidra versions -- failure here degrades to
     # "no FID matches", never a hard error.
     fid_service = None
     fid_files = None
@@ -296,7 +296,7 @@ def extract_comprehensive_analysis():
     decompile_executor = Executors.newSingleThreadExecutor()
 
     if resume_context:
-        # Start from the previous cache — re-extract metadata/memory/imports/strings
+        # Start from the previous cache -- re-extract metadata/memory/imports/strings
         # below, but preserve previously-decompiled functions.
         context = resume_context
         # Reset collections we re-extract every run
@@ -574,7 +574,7 @@ def extract_comprehensive_analysis():
             print(safe_format("    Warning: Could not extract basic blocks for {}: {}",
                               safe_unicode(function.getName()), safe_unicode(e)))
 
-        # Extract jump / switch tables — instructions whose flow type is a
+        # Extract jump / switch tables -- instructions whose flow type is a
         # computed jump expose their resolved targets via getFlows(). Works
         # without HighFunction/P-Code so it stays cheap and always available.
         try:
@@ -609,7 +609,7 @@ def extract_comprehensive_analysis():
                     try:
                         matches = fid_service.processFunction(function, fid_file, monitor)
                     except AttributeError:
-                        # Older Ghidra API — different signature, skip silently
+                        # Older Ghidra API -- different signature, skip silently
                         matches = None
                     except Exception:
                         matches = None

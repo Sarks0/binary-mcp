@@ -3,7 +3,7 @@ Pseudocode vulnerability rule registry.
 
 Each rule runs as a regex against Ghidra-produced pseudocode (C-like text)
 and surfaces a structured finding. Rules are deliberately conservative on
-false negatives — false positives are expected and are the point: this is
+false negatives -- false positives are expected and are the point: this is
 triage, not proof. A finding says "look here", not "this is exploitable".
 """
 
@@ -80,7 +80,7 @@ class PseudocodeRules:
                 "CWE120_SPRINTF_UNBOUNDED",
                 "CWE-120",
                 "high",
-                "sprintf/wsprintf without length cap — caller trusts format output size",
+                "sprintf/wsprintf without length cap -- caller trusts format output size",
                 "Use snprintf/_snprintf_s with an explicit destination size.",
                 r"\b(sprintf|vsprintf|wsprintf[AW]?)\s*\(",
             ),
@@ -96,7 +96,7 @@ class PseudocodeRules:
                 "CWE120_MEMCPY_SIGNED_LEN",
                 "CWE-120",
                 "medium",
-                "memcpy/memmove with a signed/int-typed length — possible negative-to-size_t wrap",
+                "memcpy/memmove with a signed/int-typed length -- possible negative-to-size_t wrap",
                 "Cast/validate length as size_t and bound-check against destination size.",
                 r"\b(memcpy|memmove|RtlCopyMemory)\s*\([^,]+,[^,]+,\s*\(?\s*(int|short|char|long)\b",
             ),
@@ -104,7 +104,7 @@ class PseudocodeRules:
                 "CWE134_FORMAT_STRING",
                 "CWE-134",
                 "high",
-                "printf-family call with a non-literal format argument — classic format-string bug",
+                "printf-family call with a non-literal format argument -- classic format-string bug",
                 "Pass a literal format string; route user data through %s arguments.",
                 r"\b(printf|fprintf|vprintf|vfprintf|syslog)\s*\(\s*[a-zA-Z_][a-zA-Z0-9_]*\s*[,)]",
             ),
@@ -112,7 +112,7 @@ class PseudocodeRules:
                 "CWE190_MALLOC_ARITHMETIC",
                 "CWE-190",
                 "medium",
-                "Arithmetic inside malloc/calloc size argument — potential integer overflow before allocation",
+                "Arithmetic inside malloc/calloc size argument -- potential integer overflow before allocation",
                 "Validate both operands against SIZE_MAX / desired bound before multiplying.",
                 r"\b(malloc|calloc|HeapAlloc|VirtualAlloc)\s*\([^)]*[*+][^)]*\)",
             ),
@@ -120,7 +120,7 @@ class PseudocodeRules:
                 "CWE367_TOCTOU_ACCESS_OPEN",
                 "CWE-367",
                 "medium",
-                "access/stat followed by open — time-of-check to time-of-use race",
+                "access/stat followed by open -- time-of-check to time-of-use race",
                 "Open-then-check (fstat on the fd) instead of check-then-open.",
                 r"\b(access|stat|lstat)\s*\([^;]{1,200};[^;]{0,400}\b(open|fopen|CreateFile[AW]?)\s*\(",
             ),
@@ -128,7 +128,7 @@ class PseudocodeRules:
                 "CWE415_DOUBLE_FREE",
                 "CWE-415",
                 "high",
-                "Same pointer freed twice in the visible window — likely double-free",
+                "Same pointer freed twice in the visible window -- likely double-free",
                 "NULL the pointer immediately after free; add ownership discipline.",
                 r"\bfree\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)[^;]*;(?:[^;]{0,400};)?\s*free\s*\(\s*\1\s*\)",
             ),
@@ -152,7 +152,7 @@ class PseudocodeRules:
                 "CWE78_CREATEPROCESS_NONLITERAL",
                 "CWE-78",
                 "high",
-                "CreateProcess with non-literal command line — suspect if command data is attacker-influenced",
+                "CreateProcess with non-literal command line -- suspect if command data is attacker-influenced",
                 "Pass a fully-qualified application name; audit command-line construction.",
                 r"\bCreateProcess[AW]?\s*\([^)]*,[^,]*[a-zA-Z_][a-zA-Z0-9_]*\s*,",
             ),
@@ -160,7 +160,7 @@ class PseudocodeRules:
                 "CWE131_SIZEOF_TIMES_COUNT",
                 "CWE-131",
                 "low",
-                "Allocation of sizeof(T)*N — verify N is bounded (overflow check missing)",
+                "Allocation of sizeof(T)*N -- verify N is bounded (overflow check missing)",
                 "Bound-check N against SIZE_MAX/sizeof(T).",
                 r"\b(malloc|calloc|HeapAlloc)\s*\([^)]*sizeof\s*\([^)]+\)\s*\*\s*[A-Za-z_][A-Za-z0-9_]*",
             ),

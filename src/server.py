@@ -364,7 +364,7 @@ def get_analysis_context(
             logger.info(f"Resuming analysis from cache: {resume_from_cache}")
 
     try:
-        # Default bumped to 1800s (30 min) — large binaries routinely need more
+        # Default bumped to 1800s (30 min) -- large binaries routinely need more
         # than the old 10-minute ceiling. Bounds are still 30s..3600s.
         timeout = get_config_int("GHIDRA_TIMEOUT", 1800)
         timeout = validate_numeric_range(timeout, 30, 3600, "GHIDRA_TIMEOUT")
@@ -523,7 +523,7 @@ def analyze_binary(
         loader: Optional loader name when AutoImporter fails (e.g., "PeLoader" for Windows PE)
         skip_compatibility_check: Skip pre-analysis compatibility check (default: False)
         skip_decompile: Skip decompilation for a fast structural pass (no pseudocode).
-            Recommended for a first pass on very large binaries — functions,
+            Recommended for a first pass on very large binaries -- functions,
             imports, strings, and memory map are still extracted.
         max_functions: Cap how many functions to process this run (pairs with
             ``incremental`` for multi-pass coverage of huge binaries).
@@ -551,7 +551,7 @@ def analyze_binary(
         Common Ghidra loaders: PeLoader, ElfLoader, MachoLoader, BinaryLoader, CoffLoader
 
         Large-binary workflow (e.g. 17MB+ with 60K+ functions):
-        1. First pass: ``analyze_binary(..., skip_decompile=True)`` — structure only.
+        1. First pass: ``analyze_binary(..., skip_decompile=True)`` -- structure only.
         2. Extend: ``analyze_binary(..., incremental=True, max_functions=5000)``
            repeatedly, or target a range with ``start_address``/``end_address``.
     """
@@ -661,7 +661,7 @@ Format: {compat_info.format.value}
                 summary += f"- Skipped (outside address range): {stats['skipped_by_range']}\n"
             if stats.get("partial_results"):
                 summary += (
-                    "- ⚠️  Partial results — hit max_functions or wall-clock budget. "
+                    "- ⚠️  Partial results -- hit max_functions or wall-clock budget. "
                     "Re-run with `incremental=True` to extend coverage.\n"
                 )
 

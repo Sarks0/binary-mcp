@@ -56,7 +56,7 @@ class TestFidMatch:
             "functions": [_func("a", "0x1000", fid_match=None)],
         })
         result = fid_match("/bin/test.exe")
-        # Field exists but nothing matched — we get the summary and guidance
+        # Field exists but nothing matched -- we get the summary and guidance
         assert "0 matched" in result
 
     def test_matched_rendered(self):
@@ -77,7 +77,7 @@ class TestFidMatch:
         result = fid_match("/bin/test.exe", filter_unmatched=True)
         assert "memcpy" in result
         assert "msvcrt_md_v142" in result
-        # Header line mentions "unmatched" in the summary — check the row body
+        # Header line mentions "unmatched" in the summary -- check the row body
         assert "`unmatched`" not in result
         assert "1 matched" in result
 

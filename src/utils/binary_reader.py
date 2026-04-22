@@ -60,7 +60,7 @@ class BinaryReader:
         ):
             self._open_macho()
         else:
-            # Unknown format — open file for raw reads
+            # Unknown format -- open file for raw reads
             self._format = "raw"
             self._file = open(self._path, "rb")  # noqa: SIM115
 

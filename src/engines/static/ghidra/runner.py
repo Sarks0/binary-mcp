@@ -271,10 +271,10 @@ class GhidraRunner:
             function_timeout: Per-function decompilation timeout (default: 30s)
             max_functions: Maximum functions to analyze (default: unlimited)
             skip_decompile: Skip decompilation for faster analysis (default: False)
-            resume_from_cache: Path to a previous cache JSON (plain or .gz) — functions
+            resume_from_cache: Path to a previous cache JSON (plain or .gz) -- functions
                 already present are skipped and their results preserved
-            start_address: Hex start address (e.g. "0x61abbc") — skip functions below
-            end_address: Hex end address — skip functions above
+            start_address: Hex start address (e.g. "0x61abbc") -- skip functions below
+            end_address: Hex end address -- skip functions above
             pdb_path: Optional path to a PDB file. Staged next to the binary so
                 Ghidra's PdbUniversalAnalyzer picks it up automatically.
             enable_fid: When True, set GHIDRA_ENABLE_FID=1 so the Jython script
@@ -451,7 +451,7 @@ class GhidraRunner:
             ) from e
 
         finally:
-            # Always remove the PDB we staged — Ghidra has either read it by
+            # Always remove the PDB we staged -- Ghidra has either read it by
             # now or failed outright. Leaving it behind would confuse future
             # analyses with a mismatched PDB.
             self._cleanup_pdb(staged_pdb)

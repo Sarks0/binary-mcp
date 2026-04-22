@@ -466,7 +466,7 @@ def _parse_bound_imports(pe) -> list[str]:
 
 
 def _parse_exceptions(pe) -> list[str]:
-    """Parse exception directory — x64 RUNTIME_FUNCTION entries (full detail only)."""
+    """Parse exception directory -- x64 RUNTIME_FUNCTION entries (full detail only)."""
     lines = ["--- Exception Handlers ---"]
     if not hasattr(pe, "DIRECTORY_ENTRY_EXCEPTION") or not pe.DIRECTORY_ENTRY_EXCEPTION:
         lines.append("No exception directory")
@@ -527,7 +527,7 @@ def register_pe_tools(app, session_manager=None):
         Get comprehensive PE file structure information.
 
         Returns complete PE headers, sections, imports, exports, resources,
-        debug info, TLS, Rich header, and more — all from a single fast call
+        debug info, TLS, Rich header, and more -- all from a single fast call
         using pefile (no Ghidra dependency).
 
         Args:

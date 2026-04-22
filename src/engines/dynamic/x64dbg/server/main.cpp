@@ -31,7 +31,7 @@ static void InitLogging() {
     // If log file can't be opened, logging still works via stdout (if console exists)
 }
 
-// Simple logging — writes to log file and stdout
+// Simple logging -- writes to log file and stdout
 void Log(const char* format, ...) {
     char buffer[1024];
     va_list args;

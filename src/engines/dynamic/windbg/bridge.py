@@ -45,7 +45,7 @@ from .output_parser import WinDbgOutputParser
 
 logger = logging.getLogger(__name__)
 
-# Conditional Pybag import — only available on Windows with Pybag installed
+# Conditional Pybag import -- only available on Windows with Pybag installed
 PYBAG_AVAILABLE = False
 pybag = None
 try:
@@ -68,7 +68,7 @@ _SDK_SEARCH_PATHS = [
 _CDB_TIMEOUT = 30
 
 # Timeout for KDNET kernel attach (seconds).  pybag's KernelDbg.attach() blocks
-# indefinitely waiting for the target — this caps the wait so callers get an
+# indefinitely waiting for the target -- this caps the wait so callers get an
 # actionable error instead of hanging forever.  Override with KDNET_TIMEOUT env.
 _KDNET_TIMEOUT = int(os.environ.get("KDNET_TIMEOUT", "60"))
 
@@ -118,7 +118,7 @@ _BLOCKED_COMMANDS = (
 )
 
 
-# --- Debug trace — activate with WINDBG_DEBUG=1 to log all bridge calls to file ---
+# --- Debug trace -- activate with WINDBG_DEBUG=1 to log all bridge calls to file ---
 def _setup_debug_log() -> logging.Logger:
     """Configure file logging when WINDBG_DEBUG env var is set."""
     debug_logger = logging.getLogger("windbg.trace")
@@ -332,7 +332,7 @@ class WinDbgBridge(Debugger):
         self._require_not_local("pause")
         self._require_not_dump("pause")
         try:
-            # Pybag has no break_in() — use the low-level DbgEng COM interface
+            # Pybag has no break_in() -- use the low-level DbgEng COM interface
             self._dbg._control.SetInterrupt(0)  # DEBUG_INTERRUPT_ACTIVE = 0
             self._state = DebuggerState.PAUSED
             return True
@@ -460,7 +460,7 @@ class WinDbgBridge(Debugger):
             kd = pybag.KernelDbg()
 
             def _attach_and_wait():
-                # attach() only opens the listening port — it returns before
+                # attach() only opens the listening port -- it returns before
                 # the target has connected.  wait() blocks until the target
                 # actually breaks in, giving us a live debug session.
                 kd.attach(conn_str)
@@ -468,7 +468,7 @@ class WinDbgBridge(Debugger):
 
             # Run attach+wait in a daemon thread so we can enforce a timeout.
             # IMPORTANT: Do NOT use the ThreadPoolExecutor as a context manager
-            # here — its __exit__ calls shutdown(wait=True) which blocks until
+            # here -- its __exit__ calls shutdown(wait=True) which blocks until
             # the thread finishes.  If kd.wait() hangs (target never breaks
             # in), that deadlocks the entire MCP tool call.  Instead, on
             # timeout we call shutdown(wait=False) to abandon the thread.
@@ -486,7 +486,7 @@ class WinDbgBridge(Debugger):
                     f"KDNET connection timed out after {timeout}s. "
                     f"The target did not break in on port {port}.\n\n"
                     "Troubleshooting:\n"
-                    "1. Reboot the TARGET machine AFTER starting this connect call — "
+                    "1. Reboot the TARGET machine AFTER starting this connect call -- "
                     "the host must be listening before the target sends its initial break.\n"
                     "2. Verify the key matches exactly (bcdedit /dbgsettings on the target).\n"
                     "3. Confirm the target's NIC supports KDNET "
@@ -518,7 +518,7 @@ class WinDbgBridge(Debugger):
         runs as Administrator.
 
         Registers and execution control (breakpoints, stepping, halting)
-        are NOT available in local mode — the debugger cannot break into
+        are NOT available in local mode -- the debugger cannot break into
         a kernel it is running on.  Those features require a remote
         KDNET connection to a separate target machine.
         """
@@ -533,7 +533,7 @@ class WinDbgBridge(Debugger):
             self._is_local_kernel = True
 
             # --- Soft validation: check if module listing works ---
-            # Only test module_list() — register reads (get_pc) always
+            # Only test module_list() -- register reads (get_pc) always
             # fail in local kernel mode because you cannot break into
             # the kernel when debugging locally.  That is a fundamental
             # Windows limitation, not a sign that bcdedit debug is off.
@@ -541,7 +541,7 @@ class WinDbgBridge(Debugger):
             try:
                 modules = self._dbg.module_list()
                 if not modules:
-                    # No modules returned — debug may not be enabled
+                    # No modules returned -- debug may not be enabled
                     self._local_kernel_limited = True
                     logger.warning(
                         "Local kernel connected but no modules returned. "
@@ -749,7 +749,7 @@ class WinDbgBridge(Debugger):
                 logger.info("Found CDB in SDK: %s", cdb)
                 return cdb
 
-        # 3. WinDbg Preview (Microsoft Store / winget) — WindowsApps location
+        # 3. WinDbg Preview (Microsoft Store / winget) -- WindowsApps location
         try:
             local_apps = Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "WindowsApps"
             if local_apps.is_dir():
@@ -782,7 +782,7 @@ class WinDbgBridge(Debugger):
             logger.info("Found CDB on PATH: %s", cdb_on_path)
             return Path(cdb_on_path)
 
-        logger.warning("CDB not found — WinDbg commands will not be available")
+        logger.warning("CDB not found -- WinDbg commands will not be available")
         return None
 
     @staticmethod
@@ -813,7 +813,7 @@ class WinDbgBridge(Debugger):
             logger.info("Found KD on PATH: %s", kd_on_path)
             return Path(kd_on_path)
 
-        logger.info("KD not found — will fall back to CDB for kernel commands")
+        logger.info("KD not found -- will fall back to CDB for kernel commands")
         return None
 
     @_trace

@@ -272,10 +272,10 @@ class X64DbgBridge(Debugger):
             try:
                 return self._request(endpoint, data)
             except AddressValidationError:
-                # Address validation failures are deterministic — never retry
+                # Address validation failures are deterministic -- never retry
                 raise
             except X64DbgAPIError:
-                # API errors are deterministic — never retry
+                # API errors are deterministic -- never retry
                 raise
             except (ConnectionError, RuntimeError) as e:
                 last_error = e
@@ -294,7 +294,7 @@ class X64DbgBridge(Debugger):
                         f"{error_msg}. Attempting reconnect "
                         f"({reconnect_count}/{self._max_reconnects})..."
                     )
-                    # Reset auth token — plugin may have restarted with a new token
+                    # Reset auth token -- plugin may have restarted with a new token
                     self._auth_token = None
                     self.connected = False
                     try:
@@ -1992,10 +1992,10 @@ class X64DbgBridge(Debugger):
             "message": result.get("message", "Instruction undone"),
         }
 
-    # Commands that must never reach DbgCmdExec — they load external code,
+    # Commands that must never reach DbgCmdExec -- they load external code,
     # write arbitrary files, or compromise the debugging session.
     # Trace configuration commands are also blocked here because their
-    # arguments (arbitrary commands, file paths) bypass validation — use
+    # arguments (arbitrary commands, file paths) bypass validation -- use
     # the dedicated set_trace_command / set_trace_log_file methods instead.
     _BLOCKED_COMMANDS = frozenset({
         "scriptdll", "scriptload", "scriptrun",
@@ -2108,7 +2108,7 @@ class X64DbgBridge(Debugger):
 
         Args:
             index: Zero-based watch index
-            mode: Trigger mode — one of: changed, disabled, unchanged,
+            mode: Trigger mode -- one of: changed, disabled, unchanged,
                   istrue, isfalse, isgreater, isless, isnotequal
 
         Returns:
@@ -5355,7 +5355,7 @@ class X64DbgBridge(Debugger):
         """
         Overlay a struct/type on a memory address for structured viewing.
 
-        This is the key type system command — it interprets raw memory
+        This is the key type system command -- it interprets raw memory
         at the given address as the specified struct/type.
 
         Args:
@@ -5683,7 +5683,7 @@ class X64DbgBridge(Debugger):
 
         Args:
             text: Log format string (e.g. "RIP={rip} RAX={rax}")
-            condition: Optional condition — only log when true
+            condition: Optional condition -- only log when true
 
         Returns:
             Command result dictionary
@@ -5707,7 +5707,7 @@ class X64DbgBridge(Debugger):
 
         Args:
             command: x64dbg command to run per step
-            condition: Optional condition — only run when true
+            condition: Optional condition -- only run when true
 
         Returns:
             Command result dictionary
@@ -5717,7 +5717,7 @@ class X64DbgBridge(Debugger):
         """
         if not command or not command.strip():
             raise ValueError("Trace command cannot be empty")
-        # Validate the INNER command against the blocklist — the trace engine
+        # Validate the INNER command against the blocklist -- the trace engine
         # will execute it directly, bypassing the normal command validation path.
         self._validate_command(command.strip())
         cmd = f"TraceSetCommand {command.strip()}"
@@ -5787,7 +5787,7 @@ class X64DbgBridge(Debugger):
         cmd = f"ticnd {condition.strip()}, {max_steps}"
         self.execute_command(cmd)
 
-        # Wait for trace to complete — use generous timeout
+        # Wait for trace to complete -- use generous timeout
         timeout_ms = max(60000, max_steps * 2)
         wait_result = self.wait_until_paused(timeout=timeout_ms)
 
@@ -5878,7 +5878,7 @@ class X64DbgBridge(Debugger):
         """
         Trace into beyond the last record (OEP finding).
 
-        Executes ``tibt`` — traces into calls, recording execution, and stops
+        Executes ``tibt`` -- traces into calls, recording execution, and stops
         when execution goes beyond any previously recorded address. Used
         primarily for finding the Original Entry Point (OEP) of packed binaries.
 
@@ -5912,7 +5912,7 @@ class X64DbgBridge(Debugger):
         """
         Trace over beyond the last record (OEP finding, skipping calls).
 
-        Executes ``tobt`` — traces over calls, recording execution, and stops
+        Executes ``tobt`` -- traces over calls, recording execution, and stops
         when execution goes beyond any previously recorded address.
 
         Args:

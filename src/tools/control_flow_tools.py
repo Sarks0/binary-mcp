@@ -122,8 +122,13 @@ def _parse_capstone_arch(metadata: dict):
     """
     Determine capstone architecture constants from Ghidra metadata.
 
-    The ``language`` field from Ghidra looks like ``x86:LE:64:default``,
-    ``ARM:LE:32:v7``, ``AARCH64:LE:64:v8A``, etc.
+    Accepts three shapes of ``language`` field for backward compatibility:
+    1. Canonical Ghidra LanguageID: ``x86:LE:64:default``, ``ARM:LE:32:v7``,
+       ``AARCH64:LE:64:v8A`` (current format).
+    2. Description string from ``Language.toString()`` — older caches stored
+       this instead of the canonical ID. Parsed by keyword.
+    3. Empty / unparseable — falls through to ``executable_format`` keyword
+       inspection so PE/ELF-64 binaries still get x86-64 disassembly.
 
     Returns:
         Tuple of (cs_arch, cs_mode) or (None, None) if unsupported.
@@ -143,24 +148,49 @@ def _parse_capstone_arch(metadata: dict):
 
     lang = str(metadata.get("language", "")).upper()
 
-    # Parse Ghidra language id:  PROCESSOR:ENDIAN:SIZE:VARIANT
+    # --- Path 1: canonical colon-delimited ID -----------------------------
     parts = lang.split(":")
-    if len(parts) < 3:
-        return None, None
+    if len(parts) >= 3:
+        processor = parts[0]
+        bitness_str = parts[2]
+        if processor == "X86":
+            mode = CS_MODE_64 if bitness_str == "64" else CS_MODE_32
+            return CS_ARCH_X86, mode
+        if processor == "ARM" and bitness_str == "32":
+            return CS_ARCH_ARM, CS_MODE_ARM | CS_MODE_LITTLE_ENDIAN
+        if processor in ("AARCH64", "ARM") and bitness_str == "64":
+            return CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN
 
-    processor = parts[0]
-    bitness_str = parts[2]
+    # --- Path 2: description keyword match --------------------------------
+    # Covers Ghidra Language.toString() output plus older caches where the
+    # field was a mix of language info.
+    haystack = " ".join(
+        str(metadata.get(k, "")) for k in ("language", "language_description")
+    ).upper()
+    has_64 = "64" in haystack or "X86-64" in haystack or "AMD64" in haystack
 
-    if processor == "X86":
-        arch = CS_ARCH_X86
-        mode = CS_MODE_64 if bitness_str == "64" else CS_MODE_32
-        return arch, mode
-
-    if processor == "ARM" and bitness_str == "32":
-        return CS_ARCH_ARM, CS_MODE_ARM | CS_MODE_LITTLE_ENDIAN
-
-    if processor in ("AARCH64", "ARM") and bitness_str == "64":
+    if "AARCH64" in haystack or "ARM64" in haystack:
         return CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN
+    if "ARM" in haystack:
+        return CS_ARCH_ARM, CS_MODE_ARM | CS_MODE_LITTLE_ENDIAN
+    if "X86" in haystack or "X64" in haystack or "INTEL" in haystack:
+        return CS_ARCH_X86, CS_MODE_64 if has_64 else CS_MODE_32
+
+    # --- Path 3: executable_format fallback -------------------------------
+    # If the language field is useless, try to infer from the binary format.
+    # PE + 64-bit image_base >= 0x100000000 is a strong x86-64 signal.
+    exe_fmt = str(metadata.get("executable_format", "")).upper()
+    image_base_raw = str(metadata.get("image_base", "")).lower().replace("0x", "")
+    try:
+        image_base = int(image_base_raw, 16) if image_base_raw else 0
+    except ValueError:
+        image_base = 0
+
+    # PE is overwhelmingly x86/x64; image_base > 4GB is the classic PE32+
+    # signal for 64-bit. ELF gets no format fallback because ARM/MIPS/RISC-V
+    # ELFs would be mis-detected as x86.
+    if "PORTABLE EXECUTABLE" in exe_fmt or "PE " in exe_fmt or exe_fmt == "PE":
+        return CS_ARCH_X86, CS_MODE_64 if image_base > 0xFFFFFFFF else CS_MODE_32
 
     return None, None
 

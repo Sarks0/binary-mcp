@@ -235,7 +235,7 @@ class TestABCMethodsWithMockedPybag:
         assert "0x401000" not in bridge._breakpoints
 
     def test_delete_breakpoint_fallback(self, bridge):
-        """Delete a BP that wasn't tracked — falls back to command."""
+        """Delete a BP that wasn't tracked -- falls back to command."""
         result = bridge.delete_breakpoint("0x401000")
         assert result is True
         bridge._dbg.cmd.assert_called_once_with("bc 0x401000")
@@ -677,7 +677,7 @@ class TestDumpAnalysis:
 
     @patch("src.engines.dynamic.windbg.bridge.platform.system", return_value="Windows")
     def test_open_dump_cdb_only(self, mock_sys):
-        """open_dump() uses CDB subprocess — pybag OpenDumpFile is E_NOTIMPL."""
+        """open_dump() uses CDB subprocess -- pybag OpenDumpFile is E_NOTIMPL."""
         bridge = WinDbgBridge()
         bridge._cdb_path = Path("C:\\cdb.exe")
 

@@ -2070,7 +2070,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return "No stack frames available"
 
             if is_raw:
-                header = f"Stack contents (raw dump, not unwound call stack) — {len(frames)} entries:"
+                header = f"Stack contents (raw dump, not unwound call stack) -- {len(frames)} entries:"
             else:
                 header = f"Call Stack ({len(frames)} frames):"
 
@@ -3782,7 +3782,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
         "setwatchexpression", "setwatchname",
         # DLL breakpoints
         "bpdll", "bcdll", "bpedll", "bpddll",
-        # Trace configuration — tracesetcommand, tracesetlog, tracesetlogfile
+        # Trace configuration -- tracesetcommand, tracesetlog, tracesetlogfile
         # are intentionally EXCLUDED from this allowlist because their arguments
         # (arbitrary commands, file paths) bypass security validation. Use the
         # dedicated tools x64dbg_set_trace_command and x64dbg_set_trace_log_file
@@ -7990,14 +7990,14 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
         Args:
             index: Zero-based watch index
             mode: Trigger mode. One of:
-                  "changed" — value changed (default)
-                  "disabled" — watchdog off
-                  "unchanged" — value unchanged
-                  "istrue" — value is non-zero
-                  "isfalse" — value is zero
-                  "isgreater" — value increased
-                  "isless" — value decreased
-                  "isnotequal" — value differs from initial
+                  "changed" -- value changed (default)
+                  "disabled" -- watchdog off
+                  "unchanged" -- value unchanged
+                  "istrue" -- value is non-zero
+                  "isfalse" -- value is zero
+                  "isgreater" -- value increased
+                  "isless" -- value decreased
+                  "isnotequal" -- value differs from initial
 
         Returns:
             Confirmation message
@@ -8658,7 +8658,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
         """
         Overlay a struct/type on a memory address for structured viewing.
 
-        This is the key type system tool — it interprets raw memory at the
+        This is the key type system tool -- it interprets raw memory at the
         given address as the specified struct type, showing field names and values.
 
         Args:
@@ -9094,7 +9094,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         Uses x64dbg's trace-into-beyond-record (tibt) which tracks all executed
         addresses and stops when execution reaches a never-before-seen address
-        region — typically the OEP after unpacking completes.
+        region -- typically the OEP after unpacking completes.
 
         Args:
             max_steps: Maximum trace steps (default: 50000, increase for complex packers)
@@ -9146,7 +9146,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         Args:
             text: Log format string with x64dbg specifiers
-            condition: Optional condition — only log when this expression is true
+            condition: Optional condition -- only log when this expression is true
 
         Returns:
             Confirmation message
@@ -9157,10 +9157,10 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             x64dbg_set_trace_log("ESP={esp} [ESP]={[esp]}")
 
         Format Specifiers:
-            {rax}, {rbx}, etc. — register values
-            {[esp]}, {[rax+8]} — memory dereference
-            {dis.sel()} — disassembly at current address
-            {mem;addr;size} — memory dump
+            {rax}, {rbx}, etc. -- register values
+            {[esp]}, {[rax+8]} -- memory dereference
+            {dis.sel()} -- disassembly at current address
+            {mem;addr;size} -- memory dump
         """
         try:
             if not text or not text.strip():
@@ -9191,7 +9191,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         Args:
             command: x64dbg command to execute per step
-            condition: Optional condition — only run when this expression is true
+            condition: Optional condition -- only run when this expression is true
 
         Returns:
             Confirmation message

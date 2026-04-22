@@ -312,7 +312,7 @@ def register_windbg_tools(
                 loc = bridge.get_current_location()
                 return f"Break at 0x{loc.get('address', '?')}"
             except Exception:
-                return f"Timeout after {timeout}s — target still running"
+                return f"Timeout after {timeout}s -- target still running"
         except (WinDbgBridgeError, StructuredBaseError) as e:
             return f"Error: {e}"
 
@@ -342,7 +342,7 @@ def register_windbg_tools(
                 loc = bridge.get_current_location()
                 return f"Paused at 0x{loc.get('address', '?')}"
             except Exception:
-                return f"Timeout after {timeout}s — target not paused"
+                return f"Timeout after {timeout}s -- target not paused"
         except (WinDbgBridgeError, StructuredBaseError) as e:
             return f"Error: {e}"
 

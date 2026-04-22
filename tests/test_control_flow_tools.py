@@ -153,6 +153,115 @@ class TestControlFlowHelpers:
         assert "401000" in index["by_addr"]
 
 
+class TestParseCapstoneArch:
+    """Language string → capstone arch tuple, covering all three parser paths."""
+
+    def _capstone_consts(self):
+        """Load capstone constants once or return None if unavailable."""
+        try:
+            from capstone import (
+                CS_ARCH_ARM,
+                CS_ARCH_ARM64,
+                CS_ARCH_X86,
+                CS_MODE_32,
+                CS_MODE_64,
+            )
+            return {
+                "X86": CS_ARCH_X86,
+                "ARM": CS_ARCH_ARM,
+                "ARM64": CS_ARCH_ARM64,
+                "M32": CS_MODE_32,
+                "M64": CS_MODE_64,
+            }
+        except ImportError:
+            return None
+
+    def test_canonical_x86_64(self):
+        """Path 1: colon-delimited canonical LanguageID."""
+        from src.tools.control_flow_tools import _parse_capstone_arch
+        c = self._capstone_consts()
+        if c is None:
+            return
+        arch, mode = _parse_capstone_arch({"language": "x86:LE:64:default"})
+        assert arch == c["X86"]
+        assert mode == c["M64"]
+
+    def test_canonical_x86_32(self):
+        from src.tools.control_flow_tools import _parse_capstone_arch
+        c = self._capstone_consts()
+        if c is None:
+            return
+        arch, mode = _parse_capstone_arch({"language": "x86:LE:32:default"})
+        assert arch == c["X86"]
+        assert mode == c["M32"]
+
+    def test_canonical_aarch64(self):
+        from src.tools.control_flow_tools import _parse_capstone_arch
+        c = self._capstone_consts()
+        if c is None:
+            return
+        arch, _ = _parse_capstone_arch({"language": "AARCH64:LE:64:v8A"})
+        assert arch == c["ARM64"]
+
+    def test_description_string_x86_64(self):
+        """Path 2: older caches stored Language.toString() description."""
+        from src.tools.control_flow_tools import _parse_capstone_arch
+        c = self._capstone_consts()
+        if c is None:
+            return
+        arch, mode = _parse_capstone_arch({
+            "language": "x86 / Little Endian / 64-bit pointer / default"
+        })
+        assert arch == c["X86"]
+        assert mode == c["M64"]
+
+    def test_description_split_between_fields(self):
+        """Keywords may live across language + language_description."""
+        from src.tools.control_flow_tools import _parse_capstone_arch
+        c = self._capstone_consts()
+        if c is None:
+            return
+        arch, mode = _parse_capstone_arch({
+            "language": "x86",
+            "language_description": "Little endian 64-bit",
+        })
+        assert arch == c["X86"]
+        assert mode == c["M64"]
+
+    def test_executable_format_fallback_pe64(self):
+        """Path 3: language unparseable but PE + 64-bit image base → x86-64."""
+        from src.tools.control_flow_tools import _parse_capstone_arch
+        c = self._capstone_consts()
+        if c is None:
+            return
+        arch, mode = _parse_capstone_arch({
+            "language": "",
+            "executable_format": "Portable Executable (PE)",
+            "image_base": "0x140000000",
+        })
+        assert arch == c["X86"]
+        assert mode == c["M64"]
+
+    def test_executable_format_fallback_pe32(self):
+        from src.tools.control_flow_tools import _parse_capstone_arch
+        c = self._capstone_consts()
+        if c is None:
+            return
+        arch, mode = _parse_capstone_arch({
+            "language": "",
+            "executable_format": "Portable Executable (PE)",
+            "image_base": "0x00400000",
+        })
+        assert arch == c["X86"]
+        assert mode == c["M32"]
+
+    def test_unparseable_returns_none(self):
+        from src.tools.control_flow_tools import _parse_capstone_arch
+        arch, mode = _parse_capstone_arch({"language": ""})
+        assert arch is None
+        assert mode is None
+
+
 class TestControlFlowToolRegistration:
     """Test that tools register and handle basic inputs."""
 

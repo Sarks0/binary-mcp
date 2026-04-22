@@ -948,60 +948,207 @@ def get_strings(
         return f"Error: {e}"
 
 
+def _normalize_xref_addr(raw: str | None) -> str:
+    """Normalize an address for xref comparison: lowercase, no 0x, no leading zeros."""
+    if not raw:
+        return ""
+    return str(raw).lower().replace("0x", "").lstrip("0") or "0"
+
+
 @app.tool()
 @log_to_session
 def get_xrefs(
     binary_path: str,
     address: str | None = None,
     function_name: str | None = None,
-    direction: str = "to"
+    direction: str = "to",
+    limit: int = 200,
 ) -> str:
     """
-    Get cross-references for an address or function.
+    Get cross-references for a function or arbitrary address.
+
+    Derives xrefs from the cached Ghidra context:
+      * Function-to-function calls (inverts ``called_functions`` for
+        ``direction="to"``, uses the function's own callee list for
+        ``direction="from"``).
+      * String xrefs (existing per-string ``xrefs`` list).
+      * Pseudocode-mention scan as a last resort, surfacing any function
+        whose decompiled body references the target address literal.
 
     Args:
         binary_path: Path to analyzed binary
-        address: Hex address to find xrefs for
-        function_name: Function name to find xrefs for
-        direction: "to" (references to) or "from" (references from)
+        address: Hex address to find xrefs for (e.g. "0x401000")
+        function_name: Convenience alternative to address — resolves to the
+            function's entry point
+        direction: "to" (references inbound) or "from" (outbound)
+        limit: Max xref rows to list (default 200)
 
     Returns:
-        List of cross-references with types
+        Structured listing grouped by xref source, or a clear "no xrefs"
+        message (never "coming soon").
     """
     try:
         context = get_analysis_context(binary_path)
+        functions = context.get("functions", [])
 
         if function_name:
-            # Find function by name
-            functions = context.get("functions", [])
-            function = next((f for f in functions if f.get('name') == function_name), None)
-
+            function = next(
+                (f for f in functions if f.get("name") == function_name), None
+            )
             if not function:
                 return f"Error: Function '{function_name}' not found"
-
-            address = function.get('address')
+            address = function.get("address")
 
         if not address:
             return "Error: Must provide either address or function_name"
 
-        # For now, show xrefs from strings
-        # Full xref implementation would need additional Ghidra script support
-        strings = context.get("strings", [])
+        if direction not in ("to", "from"):
+            return "Error: direction must be 'to' or 'from'"
 
-        result = f"**Cross-references {direction} {address}:**\n\n"
+        target_norm = _normalize_xref_addr(address)
+        target_fn = next(
+            (f for f in functions if _normalize_xref_addr(f.get("address")) == target_norm),
+            None,
+        )
 
-        found = False
-        for string in strings:
-            for xref in string.get('xrefs', []):
-                if (direction == "to" and xref.get('from') == address) or \
-                   (direction == "from" and string.get('address') == address):
-                    result += f"- {xref.get('from')} -> {string.get('address')}: {string.get('value', '')[:50]}\n"
-                    found = True
+        function_xrefs: list[dict] = []
+        string_xrefs: list[dict] = []
+        pseudocode_xrefs: list[dict] = []
 
-        if not found:
-            result += "*No cross-references found. Note: Full xref support coming soon.*\n"
+        # --- function-to-function xrefs ---------------------------------
+        if direction == "to":
+            # Who calls this address? Scan called_functions of every function.
+            for caller in functions:
+                for call in caller.get("called_functions") or []:
+                    if _normalize_xref_addr(call.get("address")) == target_norm:
+                        function_xrefs.append({
+                            "from": caller.get("address"),
+                            "from_name": caller.get("name"),
+                            "to": address,
+                            "type": "CALL",
+                        })
+                        break
+        else:  # from
+            if target_fn:
+                for call in target_fn.get("called_functions") or []:
+                    function_xrefs.append({
+                        "from": target_fn.get("address"),
+                        "from_name": target_fn.get("name"),
+                        "to": call.get("address"),
+                        "to_name": call.get("name"),
+                        "type": "CALL",
+                    })
 
-        return result
+        # --- string xrefs -----------------------------------------------
+        for s in context.get("strings", []):
+            s_addr_norm = _normalize_xref_addr(s.get("address"))
+            if direction == "to":
+                # Caller asked "what xrefs point AT <address>?" -- for strings
+                # that means: is <address> the location of a string referenced
+                # from this function's body?
+                if s_addr_norm == target_norm:
+                    for xref in s.get("xrefs") or []:
+                        string_xrefs.append({
+                            "from": xref.get("from"),
+                            "to": s.get("address"),
+                            "type": f"DATA/{xref.get('type', 'REF')}",
+                            "value": (s.get("value") or "")[:80],
+                        })
+            else:  # from
+                # Caller asked "what xrefs originate AT/inside this address?"
+                for xref in s.get("xrefs") or []:
+                    if _normalize_xref_addr(xref.get("from")) == target_norm:
+                        string_xrefs.append({
+                            "from": xref.get("from"),
+                            "to": s.get("address"),
+                            "type": f"DATA/{xref.get('type', 'REF')}",
+                            "value": (s.get("value") or "")[:80],
+                        })
+
+        # --- pseudocode mention scan (last resort, direction=to only) ---
+        if direction == "to" and not function_xrefs and not string_xrefs:
+            needle_forms = {f"0x{target_norm}", f"0x{target_norm.zfill(8)}"}
+            for caller in functions:
+                pseudo = caller.get("pseudocode") or ""
+                if any(n in pseudo for n in needle_forms):
+                    pseudocode_xrefs.append({
+                        "from": caller.get("address"),
+                        "from_name": caller.get("name"),
+                        "type": "PSEUDOCODE_MENTION",
+                    })
+
+        total = len(function_xrefs) + len(string_xrefs) + len(pseudocode_xrefs)
+        if total == 0:
+            target_label = (
+                f"{target_fn.get('name')} @ {address}" if target_fn else address
+            )
+            return (
+                f"**Cross-references {direction} {target_label}:**\n\n"
+                f"*No xrefs found. This function may only be reached via "
+                f"indirect calls (vtable / function pointer) which are not "
+                f"resolved in the current extraction.*"
+            )
+
+        # Format output grouped by type
+        target_label = f"{target_fn.get('name')} @ {address}" if target_fn else address
+        lines = [f"**Cross-references {direction} {target_label}:**", ""]
+        lines.append(f"Total: {total}")
+        lines.append("")
+
+        shown = 0
+        if function_xrefs:
+            lines.append(f"### Function calls ({len(function_xrefs)})")
+            for x in function_xrefs:
+                if shown >= limit:
+                    break
+                if direction == "to":
+                    lines.append(
+                        f"- {x['from_name']} @ {x['from']}  [{x['type']}]"
+                    )
+                else:
+                    to_name = x.get("to_name") or "?"
+                    lines.append(
+                        f"- {x['from_name']} @ {x['from']}  ->  "
+                        f"{to_name} @ {x['to']}  [{x['type']}]"
+                    )
+                shown += 1
+            lines.append("")
+
+        if string_xrefs and shown < limit:
+            lines.append(f"### Data / string refs ({len(string_xrefs)})")
+            for x in string_xrefs:
+                if shown >= limit:
+                    break
+                lines.append(
+                    f"- {x['from']}  ->  {x['to']}  [{x['type']}]  "
+                    f"`{x['value']}`"
+                )
+                shown += 1
+            lines.append("")
+
+        if pseudocode_xrefs and shown < limit:
+            lines.append(
+                f"### Pseudocode mentions ({len(pseudocode_xrefs)})"
+            )
+            lines.append(
+                "_Function bodies that textually mention this address "
+                "(may include indirect-call resolutions)._"
+            )
+            for x in pseudocode_xrefs:
+                if shown >= limit:
+                    break
+                lines.append(
+                    f"- {x['from_name']} @ {x['from']}  [{x['type']}]"
+                )
+                shown += 1
+
+        if total > limit:
+            lines.append("")
+            lines.append(
+                f"*Showing {limit} of {total}. Increase `limit` to see more.*"
+            )
+
+        return "\n".join(lines)
 
     except Exception as e:
         logger.error(f"get_xrefs failed: {e}")

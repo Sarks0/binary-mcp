@@ -350,11 +350,27 @@ def extract_comprehensive_analysis():
 
     # Extract metadata
     print("[*] Extracting metadata...")
+    # `language` must be the canonical colon-delimited Ghidra LanguageID
+    # (e.g. "x86:LE:64:default") so downstream tools like analyze_control_flow
+    # can parse architecture/bitness. The Language object's toString() is a
+    # human-readable description, which is NOT parseable -- capture it
+    # separately for display.
+    try:
+        language_id = safe_unicode(program.getLanguageID().getIdAsString())
+    except Exception:
+        # Fall back to whatever the Language object stringifies to
+        language_id = safe_unicode(program.getLanguage())
+    try:
+        language_desc = safe_unicode(program.getLanguage())
+    except Exception:
+        language_desc = language_id
+
     context["metadata"] = {
         "name": safe_unicode(program.getName()),
         "executable_path": safe_unicode(program.getExecutablePath()),
         "executable_format": safe_unicode(program.getExecutableFormat()),
-        "language": safe_unicode(program.getLanguage()),
+        "language": language_id,
+        "language_description": language_desc,
         "compiler": safe_unicode(program.getCompilerSpec()),
         "image_base": safe_unicode(program.getImageBase()),
         "min_address": safe_unicode(program.getMinAddress()),

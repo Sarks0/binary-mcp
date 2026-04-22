@@ -19,9 +19,14 @@ import pytest
 sys.modules["mcp"] = MagicMock()
 sys.modules["mcp.server"] = MagicMock()
 sys.modules["mcp.types"] = MagicMock()
-# Also shim fastmcp so src.server can be imported without its real deps.
+# Shim fastmcp so src.server imports without its real deps. ``.tool()`` must
+# return an identity decorator so @app.tool-wrapped functions stay callable
+# from tests (shared with test_get_xrefs.py).
+_identity_decorator = lambda fn: fn  # noqa: E731
+_fastmcp_instance = MagicMock()
+_fastmcp_instance.tool = MagicMock(return_value=_identity_decorator)
 _fastmcp_stub = MagicMock()
-_fastmcp_stub.FastMCP = MagicMock()
+_fastmcp_stub.FastMCP = MagicMock(return_value=_fastmcp_instance)
 sys.modules["fastmcp"] = _fastmcp_stub
 
 

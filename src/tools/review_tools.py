@@ -203,6 +203,8 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
         severity_floor: str = "low",
         rule_ids: list[str] | None = None,
         limit: int = 50,
+        offset: int = 0,
+        mode: str = "findings",
     ) -> str:
         """
         Scan cached pseudocode for CWE / vulnerability patterns.
@@ -211,6 +213,16 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
         every function's decompiled output. Pattern-based triage -- expect
         false positives; use findings as starting points, not verdicts.
 
+        Modes:
+          - "findings" (default): full per-finding report with excerpt and
+            recommendation. Best for drilling into specific suspects.
+          - "summary": one line per function with finding counts grouped by
+            severity. Use this first on large binaries (e.g. 14K+ functions)
+            to see where to focus before pulling details.
+
+        Pagination: ``offset`` selects the page of results to return; the
+        footer shows the cursor for the next page.
+
         Args:
             binary_path: Path to analyzed binary (must have been analyzed
                 without ``skip_decompile=True``)
@@ -218,15 +230,24 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
             severity_floor: "info" | "low" | "medium" | "high" | "critical"
                 (default "low")
             rule_ids: Restrict scanning to specific rule ids
-            limit: Max findings to return (default 50, max 5000)
+            limit: Max rows to return (default 50, max 5000)
+            offset: Skip this many rows before returning ``limit`` (default 0)
+            mode: "findings" or "summary" (default "findings")
 
         Returns:
-            Formatted findings grouped by function, sorted by severity.
+            Findings list or per-function summary, plus pagination footer.
         """
         try:
             import re as _re
 
             limit = validate_numeric_range(limit, 1, 5000, "limit")
+            offset = validate_numeric_range(offset, 0, 1_000_000, "offset")
+            mode = mode.lower()
+            if mode not in ("findings", "summary"):
+                return (
+                    f"Invalid mode '{mode}'. Use 'findings' or 'summary'."
+                )
+
             context, _ = _load_context(binary_path, cache, runner)
             functions = context.get("functions", [])
 
@@ -246,6 +267,8 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
                 )
             }
 
+            # Per-function aggregation supports both modes from one pass
+            per_func: dict[str, dict] = {}
             all_findings: list[dict] = []
             scanned = 0
             for func in functions:
@@ -255,20 +278,25 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
                 if not pseudo:
                     continue
                 scanned += 1
+                fname = func.get("name") or "?"
+                faddr = func.get("address") or "?"
+                bucket = per_func.setdefault(fname, {
+                    "name": fname,
+                    "address": faddr,
+                    "by_severity": {},
+                    "max_severity_idx": -1,
+                    "total": 0,
+                })
                 for finding in scan_text(pseudo, rules):
-                    finding["function"] = func.get("name")
-                    finding["address"] = func.get("address")
+                    finding["function"] = fname
+                    finding["address"] = faddr
                     all_findings.append(finding)
-
-            # Sort by severity descending, then by rule id for determinism
-            all_findings.sort(
-                key=lambda f: (
-                    -severity_order.get(f["severity"], 0),
-                    f["rule_id"],
-                )
-            )
-            total = len(all_findings)
-            all_findings = all_findings[:limit]
+                    sev = finding["severity"]
+                    bucket["by_severity"][sev] = bucket["by_severity"].get(sev, 0) + 1
+                    bucket["total"] += 1
+                    sev_idx = severity_order.get(sev, 0)
+                    if sev_idx > bucket["max_severity_idx"]:
+                        bucket["max_severity_idx"] = sev_idx
 
             if not all_findings:
                 return (
@@ -276,12 +304,76 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
                     f"{len(rules)} rules at severity_floor='{severity_floor}'."
                 )
 
+            # Sort findings by severity desc, then rule id
+            all_findings.sort(
+                key=lambda f: (
+                    -severity_order.get(f["severity"], 0),
+                    f["rule_id"],
+                )
+            )
+
+            total_findings = len(all_findings)
+            total_funcs_with_findings = len(per_func)
+
+            if mode == "summary":
+                # One line per function, sorted by max severity desc, then total desc
+                summary_rows = sorted(
+                    per_func.values(),
+                    key=lambda r: (-r["max_severity_idx"], -r["total"], r["name"]),
+                )
+                page = summary_rows[offset:offset + limit]
+                lines = [
+                    f"**Pseudocode scan SUMMARY: {total_findings} finding(s) "
+                    f"across {total_funcs_with_findings} function(s) "
+                    f"of {scanned} scanned**",
+                    f"Rules: {len(rules)} | Severity floor: {severity_floor}",
+                    "",
+                ]
+                if not page:
+                    lines.append(
+                        f"Offset {offset} is beyond the result set "
+                        f"({total_funcs_with_findings} functions)."
+                    )
+                    return "\n".join(lines)
+
+                for row in page:
+                    sev_breakdown = " ".join(
+                        f"{sev}={row['by_severity'][sev]}"
+                        for sev in ("critical", "high", "medium", "low", "info")
+                        if row["by_severity"].get(sev)
+                    )
+                    lines.append(
+                        f"- {row['name']} @ {row['address']}  "
+                        f"({row['total']} total) {sev_breakdown}"
+                    )
+
+                next_offset = offset + len(page)
+                if next_offset < total_funcs_with_findings:
+                    lines.append("")
+                    lines.append(
+                        f"_Showing {offset + 1}-{next_offset} of "
+                        f"{total_funcs_with_findings}. "
+                        f"Call again with offset={next_offset} for the next page._"
+                    )
+                return "\n".join(lines)
+
+            # mode == "findings"
+            page = all_findings[offset:offset + limit]
             lines = [
-                f"**Pseudocode scan: {total} finding(s) across {scanned} function(s)**",
+                f"**Pseudocode scan: {total_findings} finding(s) "
+                f"across {total_funcs_with_findings} function(s) "
+                f"of {scanned} scanned**",
                 f"Rules: {len(rules)} | Severity floor: {severity_floor}",
                 "",
             ]
-            for hit in all_findings:
+            if not page:
+                lines.append(
+                    f"Offset {offset} is beyond the result set "
+                    f"({total_findings} findings)."
+                )
+                return "\n".join(lines)
+
+            for hit in page:
                 lines.append(
                     f"[{hit['severity'].upper()}] {hit['rule_id']} ({hit['cwe']}) "
                     f"-- {hit['function']} @ {hit['address']}"
@@ -290,6 +382,15 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
                 lines.append(f"    excerpt: {hit['excerpt']}")
                 lines.append(f"    → {hit['recommendation']}")
                 lines.append("")
+
+            next_offset = offset + len(page)
+            if next_offset < total_findings:
+                lines.append(
+                    f"_Showing {offset + 1}-{next_offset} of "
+                    f"{total_findings}. "
+                    f"Call again with offset={next_offset} for the next page. "
+                    f"Tip: try mode='summary' for a bird's-eye view._"
+                )
             return "\n".join(lines)
 
         except (PathTraversalError, FileSizeError, FileNotFoundError) as e:

@@ -209,6 +209,53 @@ class TestScanPseudocode:
             )
 
 
+class TestScanPseudocodePagination:
+    def _build(self):
+        # 25 functions, each with one strcpy finding
+        fns = [
+            _make_function(name=f"f{i:02d}", address=f"0x{0x1000+i:x}",
+                           pseudocode="strcpy(a,b);")
+            for i in range(25)
+        ]
+        return _register(_make_context(functions=fns))
+
+    def test_default_limit_returns_first_page(self):
+        tools = self._build()
+        result = tools["scan_pseudocode"]("/bin/test.exe", limit=10)
+        assert "25 finding" in result
+        assert "Showing 1-10 of 25" in result
+        assert "offset=10" in result
+
+    def test_offset_returns_next_page(self):
+        tools = self._build()
+        result = tools["scan_pseudocode"]("/bin/test.exe", limit=10, offset=10)
+        assert "Showing 11-20 of 25" in result
+
+    def test_offset_past_end(self):
+        tools = self._build()
+        result = tools["scan_pseudocode"]("/bin/test.exe", offset=999)
+        assert "beyond the result set" in result
+
+    def test_summary_mode(self):
+        # 2 functions, different finding counts
+        a = _make_function(name="hot", address="0x1000",
+                           pseudocode="strcpy(a,b); gets(c); system(d);")
+        b = _make_function(name="cool", address="0x2000",
+                           pseudocode="strcpy(x,y);")
+        tools = _register(_make_context(functions=[a, b]))
+        result = tools["scan_pseudocode"]("/bin/test.exe", mode="summary")
+        assert "SUMMARY" in result
+        assert "hot" in result and "cool" in result
+        # Hot function has the critical finding -- should appear before cool
+        assert result.index("hot") < result.index("cool")
+        assert "critical=" in result or "high=" in result
+
+    def test_invalid_mode(self):
+        tools = self._build()
+        result = tools["scan_pseudocode"]("/bin/test.exe", mode="bogus")
+        assert "Invalid mode" in result
+
+
 # -- get_review_package ----------------------------------------------------
 
 

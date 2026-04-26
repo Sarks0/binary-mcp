@@ -685,7 +685,7 @@ Use other tools like get_functions, get_imports, decompile_function to explore t
 
 @app.tool()
 @log_to_session
-def load_pdb(binary_path: str, pdb_path: str) -> str:
+def load_pdb(binary_path: str, pdb_path: str | None = None) -> str:
     """
     Apply a Windows PDB to an analyzed binary.
 
@@ -693,14 +693,30 @@ def load_pdb(binary_path: str, pdb_path: str) -> str:
     expects ``<binary-stem>.pdb`` adjacency), invalidates any existing
     cache, and re-runs analysis so symbolic function names propagate.
 
+    When ``pdb_path`` is omitted (or set to ``"auto"``), reads the binary's
+    CodeView (RSDS) debug record and downloads the matching PDB from the
+    Microsoft public symbol server, caching it under
+    ``~/.binary_mcp_cache/symbols/``.
+
     Args:
         binary_path: Path to the binary
-        pdb_path: Path to the PDB file
+        pdb_path: Path to the PDB file, or None / "auto" to fetch from
+                  the Microsoft symbol server.
 
     Returns:
         Summary comparing pre/post symbolic-function counts.
     """
     try:
+        if pdb_path in (None, "", "auto"):
+            from src.utils.pdb_fetcher import fetch_pdb
+            try:
+                fetched = fetch_pdb(binary_path)
+            except ValueError as e:
+                return f"Cannot auto-fetch PDB: {e}"
+            except RuntimeError as e:
+                return f"Symbol server fetch failed: {e}"
+            pdb_path = str(fetched)
+
         # Capture pre-state for before/after comparison
         pre_cached = cache.get_cached(binary_path)
         pre_named = 0
@@ -1441,51 +1457,192 @@ def extract_metadata(
         return f"Error: {e}"
 
 
+def _parse_byte_pattern(pattern: str) -> tuple[bytes, bytes] | None:
+    """
+    Parse a hex byte pattern, optionally with '?' or '??' wildcards.
+
+    Accepts forms like:
+      - "4883EC20"
+      - "48 83 EC 20"
+      - "48 83 ?? 20"  (single-byte wildcard)
+      - "48 83 EC ??"
+
+    Returns (needle_bytes, mask_bytes) where mask byte is 0xFF for fixed
+    bytes and 0x00 for wildcards. Returns None if the pattern is invalid.
+    """
+    cleaned = pattern.replace(" ", "").replace("\t", "").lower()
+    if len(cleaned) % 2 != 0 or len(cleaned) == 0:
+        return None
+
+    needle = bytearray()
+    mask = bytearray()
+    for i in range(0, len(cleaned), 2):
+        chunk = cleaned[i:i + 2]
+        if chunk in ("??", "?."):
+            needle.append(0)
+            mask.append(0)
+            continue
+        try:
+            needle.append(int(chunk, 16))
+            mask.append(0xFF)
+        except ValueError:
+            return None
+    return bytes(needle), bytes(mask)
+
+
+def _scan_with_mask(data: bytes, needle: bytes, mask: bytes, max_results: int) -> list[int]:
+    """Linear masked scan over a bytes buffer; returns list of file offsets."""
+    if not needle:
+        return []
+    has_wildcards = b"\x00" in mask and any(m != 0xFF for m in mask)
+    if not has_wildcards:
+        # Fast path: native bytes find
+        offsets: list[int] = []
+        start = 0
+        while len(offsets) < max_results:
+            idx = data.find(needle, start)
+            if idx < 0:
+                break
+            offsets.append(idx)
+            start = idx + 1
+        return offsets
+
+    # Wildcard path
+    offsets = []
+    n = len(needle)
+    end = len(data) - n
+    i = 0
+    while i <= end and len(offsets) < max_results:
+        match = True
+        for j in range(n):
+            if mask[j] and data[i + j] != needle[j]:
+                match = False
+                break
+        if match:
+            offsets.append(i)
+        i += 1
+    return offsets
+
+
 @app.tool()
 @log_to_session
 def search_bytes(
     binary_path: str,
     pattern: str,
-    max_results: int = 50
+    max_results: int = 50,
 ) -> str:
     """
-    Search for byte patterns in the binary.
+    Search for a byte/instruction pattern in the binary.
+
+    Reads the binary directly and reports each match's virtual address.
+    When an address falls inside a known function, the function name and
+    offset-into-function are surfaced so hits land in context.
 
     Args:
         binary_path: Path to analyzed binary
-        pattern: Hex byte pattern (e.g., "4883EC20" or "48 83 EC 20")
-        max_results: Maximum number of results (default: 50)
+        pattern: Hex byte pattern. Spaces optional; '??' (or '?.') marks a
+            single-byte wildcard. Examples:
+            - "4883EC20"           → exact 4 bytes
+            - "48 83 EC 20"        → same, with spaces
+            - "48 83 ?? 20"        → wildcard third byte
+        max_results: Maximum number of results (default 50, max 1000)
 
     Returns:
-        List of addresses where pattern was found
+        Listing of matches with VA, function context, and file offset.
     """
     try:
-        # This would require reading the binary directly
-        # For now, search in strings as a simple implementation
-        context = get_analysis_context(binary_path)
+        from src.utils.binary_reader import BinaryReader
 
-        # Remove spaces and convert to lowercase
-        clean_pattern = pattern.replace(' ', '').lower()
+        max_results = validate_numeric_range(max_results, 1, 1000, "max_results")
 
-        result = f"**Byte Pattern Search: '{pattern}'**\n\n"
-        result += "*Note: Full byte search requires direct binary access. Currently searching in extracted data.*\n\n"
+        parsed = _parse_byte_pattern(pattern)
+        if parsed is None:
+            return (
+                f"Error: invalid hex pattern '{pattern}'. Expected pairs of "
+                f"hex digits, optionally separated by spaces, with '??' for "
+                f"wildcards. Length must be a multiple of 2."
+            )
+        needle, mask = parsed
 
-        # Search in string data as a placeholder
-        strings = context.get("strings", [])
-        found = 0
+        # Cache may already exist; if not, just open the binary directly --
+        # search_bytes shouldn't trigger a full Ghidra run just to scan bytes.
+        cached = cache.get_cached(binary_path)
+        functions = cached.get("functions", []) if cached else []
 
-        for string in strings:
-            if clean_pattern in string.get('value', '').lower():
-                result += f"- Found in string at {string.get('address')}: {string.get('value')[:100]}\n"
-                found += 1
-                if found >= max_results:
-                    break
+        with BinaryReader(binary_path) as reader:
+            data = reader.read_full()
+            offsets = _scan_with_mask(data, needle, mask, max_results + 1)
+            # Translate to VAs
+            hits: list[dict] = []
+            for off in offsets:
+                va = reader.file_offset_to_va(off)
+                hits.append({"file_offset": off, "va": va})
 
-        if found == 0:
-            result += "No matches found.\n"
+        # Enrich VAs with function context when we can
+        if functions:
+            # Build a [(start, end, name)] list once, sorted by start
+            ranges: list[tuple[int, int, str]] = []
+            for f in functions:
+                try:
+                    start = int(str(f.get("address") or "0").replace("0x", ""), 16)
+                except ValueError:
+                    continue
+                # Use basic_blocks max_addr if available, otherwise approximate
+                end = start
+                for bb in f.get("basic_blocks") or []:
+                    try:
+                        bb_end = int(str(bb.get("end") or "0").replace("0x", ""), 16)
+                        if bb_end > end:
+                            end = bb_end
+                    except ValueError:
+                        continue
+                if end <= start:
+                    end = start + max(1, f.get("size") or 0)
+                ranges.append((start, end, f.get("name") or "?"))
+            ranges.sort()
 
-        return result
+            def _resolve(va: int | None) -> tuple[str, int] | None:
+                if va is None:
+                    return None
+                # Linear scan -- 14K functions × N hits is fine for max_results<=1000
+                for s, e, name in ranges:
+                    if s <= va <= e:
+                        return name, va - s
+                return None
 
+            for h in hits:
+                ctx = _resolve(h["va"])
+                if ctx:
+                    h["function"] = ctx[0]
+                    h["offset_in_function"] = ctx[1]
+
+        total = len(hits)
+        truncated = total > max_results
+        hits = hits[:max_results]
+
+        lines = [f"**Byte Pattern Search: `{pattern}`**", ""]
+        if total == 0:
+            lines.append("No matches found.")
+            return "\n".join(lines)
+
+        lines.append(
+            f"Found {total} match(es)"
+            + (f" (showing first {max_results})" if truncated else "")
+        )
+        lines.append("")
+        for h in hits:
+            va_str = f"0x{h['va']:x}" if h["va"] is not None else "(unmapped)"
+            line = f"- {va_str}  [file offset 0x{h['file_offset']:x}]"
+            if "function" in h:
+                line += f"  in `{h['function']}` +0x{h['offset_in_function']:x}"
+            lines.append(line)
+
+        return "\n".join(lines)
+
+    except FileNotFoundError as e:
+        return f"Binary not found: {e}"
+    except (PathTraversalError, FileSizeError) as e:
+        return safe_error_message("search_bytes", e)
     except Exception as e:
         logger.error(f"search_bytes failed: {e}")
         return f"Error: {e}"

@@ -4,6 +4,7 @@ and the cache-first fetch_pdb path.
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -152,7 +153,7 @@ class TestParseSymbolPath:
         cache, servers = parse_symbol_path(
             "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols"
         )
-        assert str(cache) == "C:\\symbols"
+        assert cache == Path("C:\\symbols")
         assert servers == ["https://msdl.microsoft.com/download/symbols"]
 
     def test_chained_entries(self):
@@ -162,7 +163,7 @@ class TestParseSymbolPath:
             "cache*/tmp/sym;srv*https://internal.example/sym;"
             "srv*https://msdl.microsoft.com/download/symbols"
         )
-        assert str(cache) == "/tmp/sym"
+        assert cache == Path("/tmp/sym")
         assert servers == [
             "https://internal.example/sym",
             "https://msdl.microsoft.com/download/symbols",
@@ -177,7 +178,7 @@ class TestParseSymbolPath:
             "srv*/var/sym*https://example.com/sym",
         )
         cache, servers = parse_symbol_path()
-        assert str(cache) == "/var/sym"
+        assert cache == Path("/var/sym")
         assert servers == ["https://example.com/sym"]
 
     def test_binary_mcp_var_takes_precedence(self, monkeypatch):
@@ -196,7 +197,7 @@ class TestParseSymbolPath:
         cache, servers = parse_symbol_path(
             "srv*/tmp/c*https://primary.example*https://secondary.example"
         )
-        assert str(cache) == "/tmp/c"
+        assert cache == Path("/tmp/c")
         assert servers == [
             "https://primary.example",
             "https://secondary.example",

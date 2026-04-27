@@ -685,7 +685,11 @@ Use other tools like get_functions, get_imports, decompile_function to explore t
 
 @app.tool()
 @log_to_session
-def load_pdb(binary_path: str, pdb_path: str | None = None) -> str:
+def load_pdb(
+    binary_path: str,
+    pdb_path: str | None = None,
+    symbol_path: str | None = None,
+) -> str:
     """
     Apply a Windows PDB to an analyzed binary.
 
@@ -701,7 +705,13 @@ def load_pdb(binary_path: str, pdb_path: str | None = None) -> str:
     Args:
         binary_path: Path to the binary
         pdb_path: Path to the PDB file, or None / "auto" to fetch from
-                  the Microsoft symbol server.
+                  a configured symbol server.
+        symbol_path: Optional Windows-style ``_NT_SYMBOL_PATH``
+                  (e.g. ``"srv*C:\\symbols*https://msdl.microsoft.com/download/symbols"``).
+                  Falls back to the ``BINARY_MCP_SYMBOL_PATH`` /
+                  ``_NT_SYMBOL_PATH`` env vars, then to the public
+                  Microsoft server. Multiple servers can be chained
+                  with ``;``.
 
     Returns:
         Summary comparing pre/post symbolic-function counts.
@@ -710,7 +720,7 @@ def load_pdb(binary_path: str, pdb_path: str | None = None) -> str:
         if pdb_path in (None, "", "auto"):
             from src.utils.pdb_fetcher import fetch_pdb
             try:
-                fetched = fetch_pdb(binary_path)
+                fetched = fetch_pdb(binary_path, symbol_path=symbol_path)
             except ValueError as e:
                 return f"Cannot auto-fetch PDB: {e}"
             except RuntimeError as e:

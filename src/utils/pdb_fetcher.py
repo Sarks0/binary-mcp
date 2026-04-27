@@ -18,6 +18,7 @@ Example::
 from __future__ import annotations
 
 import logging
+import os
 import struct
 from pathlib import Path
 
@@ -25,6 +26,69 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_SYMBOL_CACHE = Path.home() / ".binary_mcp_cache" / "symbols"
 DEFAULT_SYMBOL_SERVER = "https://msdl.microsoft.com/download/symbols"
+
+
+def parse_symbol_path(
+    symbol_path: str | None = None,
+) -> tuple[Path, list[str]]:
+    """
+    Parse a Windows-style ``_NT_SYMBOL_PATH`` into (local_cache, [servers]).
+
+    Recognised entry forms (separated by ``;``):
+      - ``srv*<localcache>*<url>`` -- standard symbol-server entry
+      - ``srv*<url>`` -- server with no explicit cache (uses default)
+      - ``cache*<localcache>`` -- override local cache only
+      - ``<url>`` -- bare URL, treated as a server with default cache
+
+    Resolution order:
+      1. Explicit ``symbol_path`` argument
+      2. ``BINARY_MCP_SYMBOL_PATH`` env var
+      3. ``_NT_SYMBOL_PATH`` env var
+      4. Built-in default (msdl.microsoft.com + ~/.binary_mcp_cache/symbols)
+
+    Returns the first ``cache*`` value (or default) and the ordered list of
+    server URLs to try. Cache lookup uses the single returned cache_dir;
+    downloads iterate the server list and stop on the first success.
+    """
+    if symbol_path is None:
+        symbol_path = (
+            os.environ.get("BINARY_MCP_SYMBOL_PATH")
+            or os.environ.get("_NT_SYMBOL_PATH")
+        )
+
+    cache_dir: Path = DEFAULT_SYMBOL_CACHE
+    servers: list[str] = []
+    cache_set = False
+
+    if symbol_path:
+        for entry in symbol_path.split(";"):
+            entry = entry.strip()
+            if not entry:
+                continue
+            parts = entry.split("*")
+            head = parts[0].lower()
+            if head == "srv":
+                # srv*url     | srv*cache*url   | srv*cache*url1*url2...
+                if len(parts) == 2:
+                    servers.append(parts[1])
+                elif len(parts) >= 3:
+                    if not cache_set:
+                        cache_dir = Path(parts[1])
+                        cache_set = True
+                    servers.extend(p for p in parts[2:] if p)
+            elif head == "cache":
+                if len(parts) >= 2 and not cache_set:
+                    cache_dir = Path(parts[1])
+                    cache_set = True
+            elif entry.lower().startswith(("http://", "https://")):
+                servers.append(entry)
+            # Anything else (e.g. plain local path) is ignored -- those are
+            # legitimate _NT_SYMBOL_PATH entries on Windows but we have no
+            # way to scan them remotely.
+
+    if not servers:
+        servers = [DEFAULT_SYMBOL_SERVER]
+    return cache_dir, servers
 
 
 def extract_codeview_record(binary_path: str | Path) -> dict | None:
@@ -147,7 +211,8 @@ def build_symbol_server_url(
 def fetch_pdb(
     binary_path: str | Path,
     cache_dir: Path | None = None,
-    server: str = DEFAULT_SYMBOL_SERVER,
+    server: str | None = None,
+    symbol_path: str | None = None,
     timeout: int = 60,
 ) -> Path:
     """
@@ -155,18 +220,23 @@ def fetch_pdb(
 
     Order of operations:
       1. Read CodeView record from the PE.
-      2. Compute the canonical cache path
+      2. Resolve cache_dir + server list (explicit args override
+         ``symbol_path`` / env vars; see :func:`parse_symbol_path`).
+      3. Compute the canonical cache path
          ``<cache_dir>/<pdb_filename>/<GUID><AGE>/<pdb_filename>``.
-      3. If already cached, return it.
-      4. Otherwise download from the symbol server and cache it.
+      4. If already cached, return it.
+      5. Otherwise try each server in order until one succeeds.
 
-    Returns the path to the cached PDB.
+    Args:
+        cache_dir: Override cache root (else from symbol_path / env).
+        server: Single server URL (legacy convenience -- prefer symbol_path).
+        symbol_path: Windows-style ``_NT_SYMBOL_PATH`` string.
+        timeout: Per-request timeout in seconds.
 
     Raises:
         ValueError: if the binary has no usable CodeView record.
-        RuntimeError: on HTTP failure.
+        RuntimeError: if every configured server fails.
     """
-    cache_dir = cache_dir or DEFAULT_SYMBOL_CACHE
     cv = extract_codeview_record(binary_path)
     if cv is None:
         raise ValueError(
@@ -174,6 +244,12 @@ def fetch_pdb(
             f"The binary was likely built without /DEBUG, or the debug "
             f"directory has been stripped."
         )
+
+    parsed_cache, servers = parse_symbol_path(symbol_path)
+    if cache_dir is None:
+        cache_dir = parsed_cache
+    if server is not None:
+        servers = [server]
 
     cache_path = (
         Path(cache_dir)
@@ -186,35 +262,37 @@ def fetch_pdb(
         return cache_path
 
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    url = build_symbol_server_url(cv, server)
-    logger.info(f"Downloading PDB: {url}")
 
-    # Use urllib (stdlib) so we don't add a hard dependency on requests.
     import urllib.error
     import urllib.request
 
-    req = urllib.request.Request(
-        url,
-        headers={
-            # Microsoft's symbol server requires a real-looking UA
-            "User-Agent": "Microsoft-Symbol-Server/10.0.0.0",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310
-            if resp.status != 200:
-                raise RuntimeError(
-                    f"Symbol server returned {resp.status} for {url}"
-                )
-            data = resp.read()
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(
-            f"Symbol server fetch failed ({e.code} {e.reason}) for {url}. "
-            f"Microsoft only hosts public PDBs; this binary may not have one."
-        ) from e
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"Network error fetching {url}: {e.reason}") from e
+    errors: list[str] = []
+    for srv in servers:
+        url = build_symbol_server_url(cv, srv)
+        logger.info(f"Trying symbol server: {url}")
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Microsoft-Symbol-Server/10.0.0.0",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310
+                if resp.status != 200:
+                    errors.append(f"{url} -> HTTP {resp.status}")
+                    continue
+                data = resp.read()
+        except urllib.error.HTTPError as e:
+            errors.append(f"{url} -> {e.code} {e.reason}")
+            continue
+        except urllib.error.URLError as e:
+            errors.append(f"{url} -> network error: {e.reason}")
+            continue
 
-    cache_path.write_bytes(data)
-    logger.info(f"PDB cached at {cache_path} ({len(data)} bytes)")
-    return cache_path
+        cache_path.write_bytes(data)
+        logger.info(f"PDB cached at {cache_path} ({len(data)} bytes)")
+        return cache_path
+
+    raise RuntimeError(
+        "All configured symbol servers failed:\n  " + "\n  ".join(errors)
+    )

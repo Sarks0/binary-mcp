@@ -132,6 +132,157 @@ def test_fetch_pdb_no_codeview_raises(tmp_path):
             mod.fetch_pdb(binary, cache_dir=tmp_path / "cache")
 
 
+class TestParseSymbolPath:
+    def test_default_when_unset(self, monkeypatch):
+        from src.utils.pdb_fetcher import (
+            DEFAULT_SYMBOL_CACHE,
+            DEFAULT_SYMBOL_SERVER,
+            parse_symbol_path,
+        )
+
+        monkeypatch.delenv("BINARY_MCP_SYMBOL_PATH", raising=False)
+        monkeypatch.delenv("_NT_SYMBOL_PATH", raising=False)
+        cache, servers = parse_symbol_path()
+        assert cache == DEFAULT_SYMBOL_CACHE
+        assert servers == [DEFAULT_SYMBOL_SERVER]
+
+    def test_srv_with_cache_and_url(self):
+        from src.utils.pdb_fetcher import parse_symbol_path
+
+        cache, servers = parse_symbol_path(
+            "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols"
+        )
+        assert str(cache) == "C:\\symbols"
+        assert servers == ["https://msdl.microsoft.com/download/symbols"]
+
+    def test_chained_entries(self):
+        from src.utils.pdb_fetcher import parse_symbol_path
+
+        cache, servers = parse_symbol_path(
+            "cache*/tmp/sym;srv*https://internal.example/sym;"
+            "srv*https://msdl.microsoft.com/download/symbols"
+        )
+        assert str(cache) == "/tmp/sym"
+        assert servers == [
+            "https://internal.example/sym",
+            "https://msdl.microsoft.com/download/symbols",
+        ]
+
+    def test_env_var_fallback(self, monkeypatch):
+        from src.utils.pdb_fetcher import parse_symbol_path
+
+        monkeypatch.delenv("BINARY_MCP_SYMBOL_PATH", raising=False)
+        monkeypatch.setenv(
+            "_NT_SYMBOL_PATH",
+            "srv*/var/sym*https://example.com/sym",
+        )
+        cache, servers = parse_symbol_path()
+        assert str(cache) == "/var/sym"
+        assert servers == ["https://example.com/sym"]
+
+    def test_binary_mcp_var_takes_precedence(self, monkeypatch):
+        from src.utils.pdb_fetcher import parse_symbol_path
+
+        monkeypatch.setenv("_NT_SYMBOL_PATH", "srv*https://nt-default")
+        monkeypatch.setenv(
+            "BINARY_MCP_SYMBOL_PATH", "srv*https://binmcp-pref"
+        )
+        _, servers = parse_symbol_path()
+        assert servers == ["https://binmcp-pref"]
+
+    def test_multi_url_within_single_srv(self):
+        from src.utils.pdb_fetcher import parse_symbol_path
+
+        cache, servers = parse_symbol_path(
+            "srv*/tmp/c*https://primary.example*https://secondary.example"
+        )
+        assert str(cache) == "/tmp/c"
+        assert servers == [
+            "https://primary.example",
+            "https://secondary.example",
+        ]
+
+
+def test_fetch_pdb_falls_back_to_second_server(tmp_path, monkeypatch):
+    """First server 404s, second server returns 200 -- PDB cached."""
+    import urllib.error
+
+    from src.utils import pdb_fetcher as mod
+
+    monkeypatch.delenv("BINARY_MCP_SYMBOL_PATH", raising=False)
+    monkeypatch.delenv("_NT_SYMBOL_PATH", raising=False)
+
+    cv = {
+        "guid": "12345678123456781234567812345678",
+        "age": 1,
+        "pdb_filename": "fb.pdb",
+    }
+    binary = tmp_path / "fb.exe"
+    binary.write_bytes(b"MZ")
+
+    fake_resp = MagicMock()
+    fake_resp.status = 200
+    fake_resp.read.return_value = b"FROM-FALLBACK"
+    fake_resp.__enter__ = lambda self: self
+    fake_resp.__exit__ = lambda self, *a: False
+
+    err = urllib.error.HTTPError(
+        url="http://primary", code=404, msg="Not Found",
+        hdrs=None, fp=None,
+    )
+
+    calls = []
+
+    def fake_urlopen(req, timeout=None):
+        calls.append(req.full_url)
+        if "primary" in req.full_url:
+            raise err
+        return fake_resp
+
+    with patch.object(mod, "extract_codeview_record", return_value=cv):
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            result = mod.fetch_pdb(
+                binary,
+                cache_dir=tmp_path / "cache",
+                symbol_path="srv*https://primary.example;"
+                            "srv*https://secondary.example",
+            )
+
+    assert len(calls) == 2
+    assert "primary" in calls[0]
+    assert "secondary" in calls[1]
+    assert result.read_bytes() == b"FROM-FALLBACK"
+
+
+def test_fetch_pdb_all_servers_fail(tmp_path, monkeypatch):
+    import urllib.error
+
+    from src.utils import pdb_fetcher as mod
+
+    monkeypatch.delenv("BINARY_MCP_SYMBOL_PATH", raising=False)
+    monkeypatch.delenv("_NT_SYMBOL_PATH", raising=False)
+
+    cv = {
+        "guid": "AAAA" * 8,
+        "age": 1,
+        "pdb_filename": "x.pdb",
+    }
+    binary = tmp_path / "x.exe"
+    binary.write_bytes(b"MZ")
+    err = urllib.error.HTTPError(
+        url="http://x", code=404, msg="Not Found", hdrs=None, fp=None,
+    )
+
+    with patch.object(mod, "extract_codeview_record", return_value=cv):
+        with patch("urllib.request.urlopen", side_effect=err):
+            with pytest.raises(RuntimeError, match="All configured symbol servers failed"):
+                mod.fetch_pdb(
+                    binary,
+                    cache_dir=tmp_path / "cache",
+                    symbol_path="srv*https://a.example;srv*https://b.example",
+                )
+
+
 def test_fetch_pdb_http_error_wraps_as_runtime(tmp_path):
     import urllib.error
 
@@ -150,4 +301,8 @@ def test_fetch_pdb_http_error_wraps_as_runtime(tmp_path):
     with patch.object(mod, "extract_codeview_record", return_value=cv):
         with patch("urllib.request.urlopen", side_effect=err):
             with pytest.raises(RuntimeError, match="404"):
-                mod.fetch_pdb(binary, cache_dir=tmp_path / "cache")
+                mod.fetch_pdb(
+                    binary,
+                    cache_dir=tmp_path / "cache",
+                    symbol_path="srv*https://msdl.microsoft.com/download/symbols",
+                )

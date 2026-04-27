@@ -140,42 +140,62 @@ def extract_codeview_record(binary_path: str | Path) -> dict | None:
 
 def _decode_codeview(entry, pe) -> dict | None:
     """Decode an RSDS CodeView entry into {guid, age, pdb_filename}."""
-    raw = entry.entry
-    # pefile's parsed RSDS object has these fields directly
-    if hasattr(raw, "PdbFileName") and hasattr(raw, "Signature_Data1"):
+    # Only CodeView debug entries (Type == 2) carry RSDS records.
+    if getattr(entry.struct, "Type", None) != 2:
+        return None
+
+    raw = getattr(entry, "entry", None)
+
+    # Path 1: pefile parsed it -- use Signature_String + Age + PdbFileName.
+    # Signature_String is the canonical 32-char uppercase hex GUID; some
+    # pefile versions emit it as bytes.
+    if raw is not None and hasattr(raw, "Signature_String") and hasattr(raw, "Age"):
         try:
-            d1 = raw.Signature_Data1
-            d2 = raw.Signature_Data2
-            d3 = raw.Signature_Data3
-            d4 = raw.Signature_Data4  # 8 bytes
-            age = raw.Age
-            pdb_name = bytes(raw.PdbFileName).rstrip(b"\x00").decode(
-                "utf-8", errors="replace"
-            )
-            # Microsoft's GUID format: little-endian for first three groups,
-            # then big-endian for the 8 trailing bytes -- printed as one
-            # uppercase hex string with no separators.
-            guid = "{:08X}{:04X}{:04X}{}".format(
-                d1, d2, d3,
-                "".join(f"{b:02X}" for b in d4),
-            )
-            return {
-                "guid": guid,
-                "age": age,
-                "pdb_filename": Path(pdb_name).name,
-            }
+            sig = raw.Signature_String
+            if isinstance(sig, bytes):
+                sig = sig.decode("ascii", errors="replace")
+            sig = sig.strip().upper()
+            age = int(raw.Age)
+            pdb_name = getattr(raw, "PdbFileName", b"") or b""
+            if isinstance(pdb_name, bytes):
+                pdb_name = pdb_name.rstrip(b"\x00").decode(
+                    "utf-8", errors="replace"
+                )
+            if sig and pdb_name:
+                return {
+                    "guid": sig,
+                    "age": age,
+                    "pdb_filename": Path(pdb_name).name,
+                }
         except Exception as e:
-            logger.debug(f"RSDS decode failed: {e}")
+            logger.debug(f"pefile RSDS decode failed: {e}")
+
+    # Path 2: read raw debug bytes directly from the file. Prefer
+    # PointerToRawData (file offset, always valid) over AddressOfRawData
+    # (RVA, may not be in any mapped section for some binaries).
+    file_off = getattr(entry.struct, "PointerToRawData", 0) or 0
+    size = getattr(entry.struct, "SizeOfData", 0) or 0
+    raw_bytes = b""
+    if file_off and size:
+        try:
+            raw_bytes = pe.__data__[file_off:file_off + size]
+        except Exception as e:
+            logger.debug(f"Direct read of debug bytes failed: {e}")
+
+    # Final fallback: try via RVA if file-offset path produced nothing.
+    if not raw_bytes:
+        try:
+            raw_bytes = pe.get_data(
+                entry.struct.AddressOfRawData, entry.struct.SizeOfData
+            )
+        except Exception as e:
+            logger.debug(f"RVA read of debug bytes failed: {e}")
             return None
 
-    # Manual fallback: walk raw debug bytes for "RSDS"
-    raw_bytes = pe.get_data(
-        entry.struct.AddressOfRawData, entry.struct.SizeOfData
-    )
-    if raw_bytes[:4] != b"RSDS":
+    if len(raw_bytes) < 24 or raw_bytes[:4] != b"RSDS":
         return None
     try:
-        # RSDS layout: 'RSDS' (4) + GUID (16) + Age (4 LE) + name (null-term ASCII)
+        # RSDS layout: 'RSDS' (4) + GUID (16) + Age (4 LE) + name (null-term)
         guid_bytes = raw_bytes[4:20]
         age = struct.unpack("<I", raw_bytes[20:24])[0]
         name = raw_bytes[24:].split(b"\x00", 1)[0].decode("utf-8", "replace")

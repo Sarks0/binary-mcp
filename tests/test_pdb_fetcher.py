@@ -58,6 +58,62 @@ def test_extract_codeview_no_pefile(tmp_path, monkeypatch):
     assert mod.extract_codeview_record(f) is None
 
 
+def test_decode_codeview_uses_signature_string():
+    """pefile exposes the GUID as Signature_String -- verify we use it."""
+    from src.utils.pdb_fetcher import _decode_codeview
+
+    inner = MagicMock()
+    inner.Signature_String = "FF0B0EA442E5A3444AE9E116143233F5"
+    inner.Age = 1
+    inner.PdbFileName = b"sample.pdb\x00"
+
+    entry = MagicMock()
+    entry.struct.Type = 2
+    entry.entry = inner
+
+    result = _decode_codeview(entry, MagicMock())
+    assert result == {
+        "guid": "FF0B0EA442E5A3444AE9E116143233F5",
+        "age": 1,
+        "pdb_filename": "sample.pdb",
+    }
+
+
+def test_decode_codeview_skips_non_codeview_type():
+    from src.utils.pdb_fetcher import _decode_codeview
+
+    entry = MagicMock()
+    entry.struct.Type = 12  # VC Feature, not CodeView
+    assert _decode_codeview(entry, MagicMock()) is None
+
+
+def test_decode_codeview_falls_back_to_file_bytes():
+    """When pefile didn't parse the entry, read raw bytes from file."""
+    from src.utils.pdb_fetcher import _decode_codeview
+
+    rsds = (
+        b"RSDS"
+        + bytes.fromhex("A442E50BFFA3444A4AE9E116143233F5"[:32])
+        + (1).to_bytes(4, "little")
+        + b"sample.pdb\x00"
+    )
+
+    pe = MagicMock()
+    pe.__data__ = b"\x00" * 0x100 + rsds + b"\x00" * 0x10
+
+    entry = MagicMock()
+    entry.struct.Type = 2
+    entry.struct.PointerToRawData = 0x100
+    entry.struct.SizeOfData = len(rsds)
+    entry.entry = None  # pefile didn't parse it
+
+    result = _decode_codeview(entry, pe)
+    assert result is not None
+    assert result["age"] == 1
+    assert result["pdb_filename"] == "sample.pdb"
+    assert len(result["guid"]) == 32
+
+
 def test_extract_codeview_non_pe_returns_none(tmp_path):
     from src.utils.pdb_fetcher import extract_codeview_record
 

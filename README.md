@@ -44,39 +44,39 @@ Or add to your MCP config (Claude Code `~/.claude/settings.json` or Claude Deskt
 
 ## What You Can Do
 
-**Static Analysis** -- Analyze any binary without running it.
+**Static Analysis** - Analyze any binary without running it.
 ```
 Analyze the binary at /path/to/malware.exe
 Decompile the function at 0x401000
 Find all suspicious API calls and crypto constants
 ```
 
-**Live Debugging** -- Control x64dbg from Claude.
+**Live Debugging** - Control x64dbg from Claude.
 ```
 Connect to x64dbg and set breakpoints on BCryptEncrypt
 Trace execution until EAX contains a decrypted pointer
 Find the OEP of this packed binary
 ```
 
-**Kernel Debugging** -- Inspect drivers and crash dumps.
+**Kernel Debugging** - Inspect drivers and crash dumps.
 ```
 Connect to the kernel debugger on port 50000
 Show the dispatch table for \\Driver\\MyDriver
 Analyze the crash dump at C:\Windows\MEMORY.DMP
 ```
 
-**.NET Analysis** -- Decompile managed assemblies.
+**.NET Analysis** - Decompile managed assemblies.
 ```
 Decompile the type MyNamespace.MyClass to C#
 ```
 
 ## Capabilities (245 tools)
 
-### Static Analysis (Ghidra) -- 35 tools
+### Static Analysis (Ghidra) - 35 tools
 
 Analysis, decompilation, cross-references, memory maps, byte pattern search, function renaming, call graphs, API pattern detection (100+ Windows APIs), crypto constant identification, IOC extraction, and binary compatibility checking.
 
-### Dynamic Analysis (x64dbg) -- 159 tools
+### Dynamic Analysis (x64dbg) - 159 tools
 
 | Category | What It Does |
 |----------|-------------|
@@ -95,28 +95,28 @@ Analysis, decompilation, cross-references, memory maps, byte pattern search, fun
 | **Process** | Attach/detach, minidump creation, module listing with exports |
 | **Navigation** | Navigate disassembly/dump/graph views, generic command execution |
 
-### Kernel Debugging (WinDbg) -- 20 tools
+### Kernel Debugging (WinDbg) - 20 tools
 
 Connection (KDNET, local kernel, crash dumps), execution control, breakpoints, register and memory inspection, driver object analysis, IOCTL decoding, process listing, and raw WinDbg command execution.
 
-### .NET Analysis (ILSpyCmd) -- 7 tools
+### .NET Analysis (ILSpyCmd) - 7 tools
 
 Type listing, C# decompilation, IL disassembly, type search, and full assembly decompilation.
 
-### PE Structure (pefile) -- 1 tool
+### PE Structure (pefile) - 1 tool
 
 Comprehensive PE header, section, import, export, resource, debug, TLS, and Rich header analysis in a single fast call (<500ms). Three detail levels (basic/standard/full) with decoded characteristic flags, compiler attribution, and malware indicators.
 
-### Other -- 23 tools
+### Other - 23 tools
 
-- **Triage (3)** -- Quick file type detection, packer identification, entropy analysis
-- **Malware Analysis (4)** -- Behavior detection, threat chain identification, IOC extraction
-- **Control Flow (4)** -- CFG generation, cyclomatic complexity, loop detection, dead code
-- **Function Hashing (4)** -- Cross-binary function matching and similarity scoring
-- **VirusTotal (4)** -- Hash lookups, file submission, detection reports
-- **Session Management** -- Persistent analysis tracking across conversations
-- **Reporting (2)** -- Generate structured analysis reports
-- **YARA (2)** -- Rule scanning (optional `yara-python` dependency)
+- **Triage (3)** - Quick file type detection, packer identification, entropy analysis
+- **Malware Analysis (4)** - Behavior detection, threat chain identification, IOC extraction
+- **Control Flow (4)** - CFG generation, cyclomatic complexity, loop detection, dead code
+- **Function Hashing (4)** - Cross-binary function matching and similarity scoring
+- **VirusTotal (4)** - Hash lookups, file submission, detection reports
+- **Session Management** - Persistent analysis tracking across conversations
+- **Reporting (2)** - Generate structured analysis reports
+- **YARA (2)** - Rule scanning (optional `yara-python` dependency)
 
 ## Supported Formats
 
@@ -174,4 +174,4 @@ uv run ruff check src/     # Lint
 
 ## License
 
-Apache 2.0 -- See [LICENSE](LICENSE) for details.
+Apache 2.0 - See [LICENSE](LICENSE) for details.

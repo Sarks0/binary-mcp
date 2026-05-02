@@ -198,6 +198,17 @@ class TestScanPseudocode:
             "CWE798_HARDCODED_PASSWORD": '"password=hunter2"',
             "CWE415_DOUBLE_FREE": "free(p); free(p);",
             "CWE190_MALLOC_ARITHMETIC": "malloc(n * m);",
+            "CWE416_USE_AFTER_FREE": "free(p); do_thing(); p->next = 0;",
+            "CWE805_MEMCPY_HEADER_DRIVEN_LEN": "memcpy(dst, src, hdr->payload_len);",
+            "CWE190_HEADER_LEN_TO_ALLOC": "buf = malloc(hdr->len * 4 + 8);",
+            "CWE401_REALLOC_SHADOW": "p = realloc(p, n);",
+            "CWE242_ALLOCA_VARIABLE": "tmp = _alloca(user_size);",
+            "CWE242_VIRTUALALLOC_RWX": (
+                "mem = VirtualAlloc(0, sz, MEM_COMMIT, PAGE_EXECUTE_READWRITE);"
+            ),
+            "CWE193_NULL_TERM_OFF_BY_ONE": "buf[buflen] = 0;",
+            "CWE822_DEREF_USER_OFFSET": "x = *(buf + idx);",
+            "CWE125_STRLEN_UNTRUSTED_PTR": "n = strlen(pkt->name);",
         }
         for rule_id, snippet in samples.items():
             fn = _make_function(pseudocode=snippet)

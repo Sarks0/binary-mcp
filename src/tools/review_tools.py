@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from src.utils.pseudocode_rules import PseudocodeRules, scan_text
+from src.utils.pseudocode_rules import PseudocodeRules, adjust_confidences, scan_text
 from src.utils.security import (
     FileSizeError,
     PathTraversalError,
@@ -198,6 +198,8 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
         function_filter: str | None = None,
         severity_floor: str = "low",
         rule_ids: list[str] | None = None,
+        exclude_rule_ids: list[str] | None = None,
+        confidence_floor: int = 0,
         limit: int = 50,
         offset: int = 0,
         mode: str = "findings",
@@ -205,39 +207,47 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
         """
         Scan cached pseudocode for CWE / vulnerability patterns.
 
-        Applies a curated rule set (see ``src/utils/pseudocode_rules.py``) to
-        every function's decompiled output. Pattern-based triage -- expect
-        false positives; use findings as starting points, not verdicts.
+        Pattern-based triage -- expect false positives. Each finding has a
+        confidence score (0-100) derived from rule baseline + per-function
+        context (corroboration from other rules, scanner-shape penalty,
+        dangerous-sink presence, regex-meta negative pattern).
+
+        Recommended workflow on large binaries (14K+ functions):
+          1. ``mode='summary', confidence_floor=60`` to surface top suspects
+          2. ``get_review_package(binary, top_function)`` for full context
+             so the model can confirm or reject each candidate.
 
         Modes:
           - "findings" (default): full per-finding report with excerpt and
-            recommendation. Best for drilling into specific suspects.
-          - "summary": one line per function with finding counts grouped by
-            severity. Use this first on large binaries (e.g. 14K+ functions)
-            to see where to focus before pulling details.
-
-        Pagination: ``offset`` selects the page of results to return; the
-        footer shows the cursor for the next page.
+            recommendation, sorted by severity then confidence desc.
+          - "summary": one line per function showing finding count, max
+            confidence in that function, and severity breakdown.
 
         Args:
             binary_path: Path to analyzed binary (must have been analyzed
                 without ``skip_decompile=True``)
             function_filter: Optional regex filtered against function names
             severity_floor: "info" | "low" | "medium" | "high" | "critical"
-                (default "low")
-            rule_ids: Restrict scanning to specific rule ids
+            rule_ids: Restrict scanning to specific rule ids (allowlist)
+            exclude_rule_ids: Drop these rule ids (blocklist; e.g. silence
+                a rule known to be noisy on this target)
+            confidence_floor: Drop findings whose computed confidence falls
+                below this value (0-100). Use 60-70 for first-pass triage.
             limit: Max rows to return (default 50, max 5000)
-            offset: Skip this many rows before returning ``limit`` (default 0)
-            mode: "findings" or "summary" (default "findings")
+            offset: Skip this many rows before returning ``limit``
+            mode: "findings" or "summary"
 
         Returns:
-            Findings list or per-function summary, plus pagination footer.
+            Findings or per-function summary, plus pagination footer.
         """
         try:
             import re as _re
 
             limit = validate_numeric_range(limit, 1, 5000, "limit")
             offset = validate_numeric_range(offset, 0, 1_000_000, "offset")
+            confidence_floor = validate_numeric_range(
+                confidence_floor, 0, 100, "confidence_floor"
+            )
             mode = mode.lower()
             if mode not in ("findings", "summary"):
                 return (
@@ -251,10 +261,14 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
             rules = _RULES.filter(
                 severity_floor=severity_floor, rule_ids=rule_ids
             )
+            if exclude_rule_ids:
+                excluded = set(exclude_rule_ids)
+                rules = [r for r in rules if r.id not in excluded]
             if not rules:
                 return (
                     f"No rules matched severity_floor={severity_floor} / "
-                    f"rule_ids={rule_ids}. See PseudocodeRules for available rules."
+                    f"rule_ids={rule_ids} / exclude_rule_ids={exclude_rule_ids}. "
+                    f"See PseudocodeRules for available rules."
                 )
 
             severity_order = {
@@ -266,6 +280,7 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
             per_func: dict[str, dict] = {}
             all_findings: list[dict] = []
             scanned = 0
+            dropped_by_confidence = 0
             for func in functions:
                 if pattern and not pattern.search(func.get("name") or ""):
                     continue
@@ -275,16 +290,30 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
                 scanned += 1
                 fname = func.get("name") or "?"
                 faddr = func.get("address") or "?"
+
+                func_findings = scan_text(pseudo, rules)
+                adjust_confidences(func_findings, pseudo)
+
+                kept: list[dict] = []
+                for finding in func_findings:
+                    if finding["confidence"] < confidence_floor:
+                        dropped_by_confidence += 1
+                        continue
+                    finding["function"] = fname
+                    finding["address"] = faddr
+                    kept.append(finding)
+                if not kept:
+                    continue
+
                 bucket = per_func.setdefault(fname, {
                     "name": fname,
                     "address": faddr,
                     "by_severity": {},
                     "max_severity_idx": -1,
+                    "max_confidence": 0,
                     "total": 0,
                 })
-                for finding in scan_text(pseudo, rules):
-                    finding["function"] = fname
-                    finding["address"] = faddr
+                for finding in kept:
                     all_findings.append(finding)
                     sev = finding["severity"]
                     bucket["by_severity"][sev] = bucket["by_severity"].get(sev, 0) + 1
@@ -292,16 +321,25 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
                     sev_idx = severity_order.get(sev, 0)
                     if sev_idx > bucket["max_severity_idx"]:
                         bucket["max_severity_idx"] = sev_idx
+                    if finding["confidence"] > bucket["max_confidence"]:
+                        bucket["max_confidence"] = finding["confidence"]
 
             if not all_findings:
-                return (
+                msg = (
                     f"No findings. Scanned {scanned} functions with "
-                    f"{len(rules)} rules at severity_floor='{severity_floor}'."
+                    f"{len(rules)} rules at severity_floor='{severity_floor}'"
                 )
+                if confidence_floor > 0:
+                    msg += (
+                        f", confidence_floor={confidence_floor} "
+                        f"(dropped {dropped_by_confidence} low-confidence hits)"
+                    )
+                return msg + "."
 
             all_findings.sort(
                 key=lambda f: (
                     -severity_order.get(f["severity"], 0),
+                    -f["confidence"],
                     f["rule_id"],
                 )
             )
@@ -312,16 +350,26 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
             if mode == "summary":
                 summary_rows = sorted(
                     per_func.values(),
-                    key=lambda r: (-r["max_severity_idx"], -r["total"], r["name"]),
+                    key=lambda r: (
+                        -r["max_severity_idx"],
+                        -r["max_confidence"],
+                        -r["total"],
+                        r["name"],
+                    ),
                 )
                 page = summary_rows[offset:offset + limit]
-                lines = [
+                header = (
                     f"**Pseudocode scan SUMMARY: {total_findings} finding(s) "
                     f"across {total_funcs_with_findings} function(s) "
-                    f"of {scanned} scanned**",
-                    f"Rules: {len(rules)} | Severity floor: {severity_floor}",
-                    "",
-                ]
+                    f"of {scanned} scanned**"
+                )
+                meta = f"Rules: {len(rules)} | Severity floor: {severity_floor}"
+                if confidence_floor > 0:
+                    meta += (
+                        f" | Confidence floor: {confidence_floor} "
+                        f"(dropped {dropped_by_confidence})"
+                    )
+                lines = [header, meta, ""]
                 if not page:
                     lines.append(
                         f"Offset {offset} is beyond the result set "
@@ -337,7 +385,8 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
                     )
                     lines.append(
                         f"- {row['name']} @ {row['address']}  "
-                        f"({row['total']} total) {sev_breakdown}"
+                        f"(conf={row['max_confidence']}, {row['total']} total) "
+                        f"{sev_breakdown}"
                     )
 
                 next_offset = offset + len(page)
@@ -351,13 +400,18 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
                 return "\n".join(lines)
 
             page = all_findings[offset:offset + limit]
-            lines = [
+            header = (
                 f"**Pseudocode scan: {total_findings} finding(s) "
                 f"across {total_funcs_with_findings} function(s) "
-                f"of {scanned} scanned**",
-                f"Rules: {len(rules)} | Severity floor: {severity_floor}",
-                "",
-            ]
+                f"of {scanned} scanned**"
+            )
+            meta = f"Rules: {len(rules)} | Severity floor: {severity_floor}"
+            if confidence_floor > 0:
+                meta += (
+                    f" | Confidence floor: {confidence_floor} "
+                    f"(dropped {dropped_by_confidence})"
+                )
+            lines = [header, meta, ""]
             if not page:
                 lines.append(
                     f"Offset {offset} is beyond the result set "
@@ -367,7 +421,8 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
 
             for hit in page:
                 lines.append(
-                    f"[{hit['severity'].upper()}] {hit['rule_id']} ({hit['cwe']}) "
+                    f"[{hit['severity'].upper()} conf={hit['confidence']}] "
+                    f"{hit['rule_id']} ({hit['cwe']}) "
                     f"-- {hit['function']} @ {hit['address']}"
                 )
                 lines.append(f"    {hit['description']}")

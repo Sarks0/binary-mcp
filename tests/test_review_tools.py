@@ -214,6 +214,197 @@ class TestScanPseudocode:
             )
 
 
+class TestCredentialFormatRules:
+    """High-confidence token-format rules that should not be down-ranked."""
+
+    def _scan(self, snippet, rule_id):
+        from src.utils.pseudocode_rules import PseudocodeRules, scan_text
+        rules = PseudocodeRules()
+        rule = rules.get(rule_id)
+        assert rule is not None, f"rule {rule_id} not registered"
+        return scan_text(snippet, [rule]), rule
+
+    def test_aws_access_key_fires(self):
+        hits, rule = self._scan(
+            'const char *k = "AKIAIOSFODNN7EXAMPLE";',
+            "CWE798_AWS_ACCESS_KEY",
+        )
+        assert len(hits) == 1
+        assert rule.severity == "critical"
+        assert hits[0]["confidence"] == 90
+
+    def test_aws_access_key_no_fire_on_label(self):
+        hits, _ = self._scan('const char *k = "AKIA";', "CWE798_AWS_ACCESS_KEY")
+        assert hits == []
+
+    def test_github_pat_fires(self):
+        hits, _ = self._scan(
+            'token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";',
+            "CWE798_GITHUB_TOKEN",
+        )
+        assert len(hits) == 1
+
+    def test_stripe_secret_fires(self):
+        hits, _ = self._scan(
+            'k = "sk_live_abcdefghij1234567890ZZZ";',
+            "CWE798_STRIPE_SECRET",
+        )
+        assert len(hits) == 1
+
+    def test_jwt_fires(self):
+        hits, _ = self._scan(
+            'auth = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.'
+            'eyJzdWIiOiJ1MSJ9.SIG_part_here";',
+            "CWE798_JWT_TOKEN",
+        )
+        assert len(hits) == 1
+
+    def test_jwt_no_fire_on_short_eyj(self):
+        hits, _ = self._scan('s = "eyJab";', "CWE798_JWT_TOKEN")
+        assert hits == []
+
+
+class TestConfidenceScoring:
+    """Per-finding confidence math: negative pattern, scanner penalty,
+    corroboration bonus, sink bonus."""
+
+    def test_baseline_confidence_present(self):
+        from src.utils.pseudocode_rules import PseudocodeRules, scan_text
+        rules = PseudocodeRules()
+        rule = rules.get("CWE120_GETS")
+        hits = scan_text("gets(buf);", [rule])
+        assert hits[0]["confidence"] == 95
+
+    def test_negative_pattern_penalises_credential_regex_string(self):
+        from src.utils.pseudocode_rules import PseudocodeRules, scan_text
+        rule = PseudocodeRules().get("CWE798_HARDCODED_PASSWORD")
+        # Regex-style literal -- should be penalised by negative_pattern.
+        hits = scan_text(r'pat = "(password|secret|api_key)";', [rule])
+        assert len(hits) == 1
+        assert hits[0]["confidence"] < 30  # baseline 30 minus 40 = floored to 0
+
+    def test_negative_pattern_skips_clean_credential(self):
+        from src.utils.pseudocode_rules import PseudocodeRules, scan_text
+        rule = PseudocodeRules().get("CWE798_HARDCODED_PASSWORD")
+        hits = scan_text('s = "password=hunter2";', [rule])
+        assert len(hits) == 1
+        assert hits[0]["confidence"] == 30
+
+    def test_corroboration_bonus_applies_when_multiple_rules_hit(self):
+        from src.utils.pseudocode_rules import (
+            PseudocodeRules,
+            adjust_confidences,
+            scan_text,
+        )
+        pseudo = "strcpy(dst, src); free(p); free(p);"
+        rules = PseudocodeRules()
+        hits = scan_text(pseudo, rules.rules)
+        adjust_confidences(hits, pseudo)
+        rule_ids = {h["rule_id"] for h in hits}
+        # At least CWE120_STRCPY and CWE415_DOUBLE_FREE
+        assert "CWE120_STRCPY" in rule_ids
+        assert "CWE415_DOUBLE_FREE" in rule_ids
+        for h in hits:
+            if h["rule_id"] == "CWE415_DOUBLE_FREE":
+                # Baseline 70 + corroboration 30 = 100 (clamped)
+                assert h["confidence"] >= 90
+
+    def test_scanner_penalty_drops_credential_in_regex_compiler(self):
+        from src.utils.pseudocode_rules import (
+            PseudocodeRules,
+            adjust_confidences,
+            scan_text,
+        )
+        pseudo = (
+            'pat = "password|secret|api_key"; '
+            'compiled = pcre_compile(pat, 0, &err);'
+        )
+        rule = PseudocodeRules().get("CWE798_HARDCODED_PASSWORD")
+        hits = scan_text(pseudo, [rule])
+        adjust_confidences(hits, pseudo)
+        assert hits[0]["confidence"] == 0  # negative + scanner penalty
+
+    def test_high_signal_credential_unaffected_by_scanner_penalty(self):
+        from src.utils.pseudocode_rules import (
+            PseudocodeRules,
+            adjust_confidences,
+            scan_text,
+        )
+        pseudo = (
+            'k = "AKIAIOSFODNN7EXAMPLE"; pat = pcre_compile("foo", 0, 0);'
+        )
+        rules = PseudocodeRules()
+        rule = rules.get("CWE798_AWS_ACCESS_KEY")
+        hits = scan_text(pseudo, [rule])
+        adjust_confidences(hits, pseudo)
+        # AWS rule keeps its 90 even when in a "scanner" function
+        assert hits[0]["confidence"] == 90
+
+    def test_sink_bonus_applies_to_strcpy_with_memcpy_in_function(self):
+        from src.utils.pseudocode_rules import (
+            PseudocodeRules,
+            adjust_confidences,
+            scan_text,
+        )
+        pseudo = "strcpy(dst, src); memcpy(other, x, 16);"
+        rule = PseudocodeRules().get("CWE120_STRCPY")
+        hits = scan_text(pseudo, [rule])
+        adjust_confidences(hits, pseudo)
+        # baseline 60 + sink bonus 20 = 80
+        assert hits[0]["confidence"] == 80
+
+
+class TestScanPseudocodeFiltering:
+    """exclude_rule_ids and confidence_floor surface tests."""
+
+    def test_exclude_rule_ids_drops_specified_rules(self):
+        fn = _make_function(pseudocode="strcpy(a,b); gets(c);")
+        tools = _register(_make_context(functions=[fn]))
+        result = tools["scan_pseudocode"](
+            "/bin/test.exe", exclude_rule_ids=["CWE120_STRCPY"]
+        )
+        assert "CWE120_STRCPY" not in result
+        assert "CWE120_GETS" in result
+
+    def test_confidence_floor_drops_low_confidence_findings(self):
+        # CWE798_HARDCODED_PASSWORD with regex-meta literal -> conf 0
+        fn = _make_function(pseudocode='p = "(pass|secret|key)";')
+        tools = _register(_make_context(functions=[fn]))
+
+        low = tools["scan_pseudocode"](
+            "/bin/test.exe", confidence_floor=0
+        )
+        assert "CWE798_HARDCODED_PASSWORD" in low
+
+        high = tools["scan_pseudocode"](
+            "/bin/test.exe", confidence_floor=50
+        )
+        assert "CWE798_HARDCODED_PASSWORD" not in high
+        assert "dropped" in high.lower()
+
+    def test_findings_sorted_by_confidence_within_severity(self):
+        # Two critical findings, different functions so corroboration doesn't
+        # level them. gets baseline 95 vs system baseline 75.
+        a = _make_function(
+            name="fa", address="0x1000", pseudocode="gets(buf);",
+        )
+        b = _make_function(
+            name="fb", address="0x2000", pseudocode="system(cmd);",
+        )
+        tools = _register(_make_context(functions=[a, b]))
+        result = tools["scan_pseudocode"]("/bin/test.exe")
+        gets_idx = result.find("CWE120_GETS")
+        sys_idx = result.find("CWE78_COMMAND_INJECTION")
+        assert gets_idx >= 0 and sys_idx >= 0
+        assert gets_idx < sys_idx, "Higher confidence should appear first"
+
+    def test_summary_shows_max_confidence_per_function(self):
+        fn = _make_function(pseudocode='k = "AKIAIOSFODNN7EXAMPLE";')
+        tools = _register(_make_context(functions=[fn]))
+        result = tools["scan_pseudocode"]("/bin/test.exe", mode="summary")
+        assert "conf=90" in result
+
+
 class TestMemoryCorruptionRules:
     """Positive + negative coverage for the parser-shaped rules.
 
@@ -435,7 +626,7 @@ class TestMemoryCorruptionRulesEndToEnd:
         # The malloc snippet legitimately matches both
         # CWE190_HEADER_LEN_TO_ALLOC and the broader CWE190_MALLOC_ARITHMETIC,
         # so we expect 4 findings consolidated under one function row.
-        assert "(4 total)" in result
+        assert "4 total" in result
         assert "1 function(s)" in result
 
 

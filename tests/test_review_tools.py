@@ -220,6 +220,231 @@ class TestScanPseudocode:
             )
 
 
+class TestMemoryCorruptionRules:
+    """Positive + negative coverage for the parser-shaped rules.
+
+    Negative cases guard against regex over-reach. Each test scans through
+    the real PseudocodeRules registry via scan_text, restricted to the
+    rule under test, so we exercise the same code path scan_pseudocode uses.
+    """
+
+    def _scan(self, snippet: str, rule_id: str):
+        from src.utils.pseudocode_rules import PseudocodeRules, scan_text
+        rules = PseudocodeRules()
+        rule = rules.get(rule_id)
+        assert rule is not None, f"rule {rule_id} not registered"
+        return scan_text(snippet, [rule]), rule
+
+    def test_uaf_fires_on_member_deref_after_free(self):
+        hits, rule = self._scan(
+            "free(p); log_event(); p->next = NULL;",
+            "CWE416_USE_AFTER_FREE",
+        )
+        assert len(hits) == 1
+        assert rule.severity == "high"
+
+    def test_uaf_no_fire_when_pointer_only_freed(self):
+        hits, _ = self._scan("free(p); p = NULL;", "CWE416_USE_AFTER_FREE")
+        assert hits == []
+
+    def test_uaf_no_fire_when_different_pointer_used(self):
+        hits, _ = self._scan(
+            "free(p); q->next = NULL;", "CWE416_USE_AFTER_FREE"
+        )
+        assert hits == []
+
+    def test_memcpy_header_driven_fires_on_struct_field(self):
+        hits, _ = self._scan(
+            "memcpy(dst, src, hdr->payload_len);",
+            "CWE805_MEMCPY_HEADER_DRIVEN_LEN",
+        )
+        assert len(hits) == 1
+
+    def test_memcpy_header_driven_fires_on_deref_len(self):
+        hits, _ = self._scan(
+            "memcpy(dst, src, *len_ptr);",
+            "CWE805_MEMCPY_HEADER_DRIVEN_LEN",
+        )
+        assert len(hits) == 1
+
+    def test_memcpy_header_driven_no_fire_with_literal_len(self):
+        hits, _ = self._scan(
+            "memcpy(dst, src, 16);", "CWE805_MEMCPY_HEADER_DRIVEN_LEN"
+        )
+        assert hits == []
+
+    def test_memcpy_header_driven_no_fire_with_local_len(self):
+        # plain identifier (not deref/member/index) should not match
+        hits, _ = self._scan(
+            "memcpy(dst, src, n);", "CWE805_MEMCPY_HEADER_DRIVEN_LEN"
+        )
+        assert hits == []
+
+    def test_header_len_to_alloc_fires_on_member_with_arithmetic(self):
+        hits, _ = self._scan(
+            "buf = malloc(hdr->len * 4 + 8);",
+            "CWE190_HEADER_LEN_TO_ALLOC",
+        )
+        assert len(hits) == 1
+
+    def test_header_len_to_alloc_no_fire_on_constant_alloc(self):
+        hits, _ = self._scan("malloc(64);", "CWE190_HEADER_LEN_TO_ALLOC")
+        assert hits == []
+
+    def test_realloc_shadow_fires(self):
+        hits, rule = self._scan(
+            "p = realloc(p, n);", "CWE401_REALLOC_SHADOW"
+        )
+        assert len(hits) == 1
+        assert rule.cwe == "CWE-401"
+
+    def test_realloc_shadow_no_fire_with_temp(self):
+        hits, _ = self._scan(
+            "tmp = realloc(p, n);", "CWE401_REALLOC_SHADOW"
+        )
+        assert hits == []
+
+    def test_alloca_variable_fires(self):
+        hits, _ = self._scan(
+            "tmp = _alloca(user_size);", "CWE242_ALLOCA_VARIABLE"
+        )
+        assert len(hits) == 1
+
+    def test_alloca_variable_no_fire_on_constant_size(self):
+        hits, _ = self._scan(
+            "tmp = _alloca(0x100);", "CWE242_ALLOCA_VARIABLE"
+        )
+        assert hits == []
+
+    def test_virtualalloc_rwx_fires(self):
+        hits, _ = self._scan(
+            "mem = VirtualAlloc(NULL, sz, MEM_COMMIT, PAGE_EXECUTE_READWRITE);",
+            "CWE242_VIRTUALALLOC_RWX",
+        )
+        assert len(hits) == 1
+
+    def test_virtualalloc_rw_no_fire(self):
+        hits, _ = self._scan(
+            "mem = VirtualAlloc(NULL, sz, MEM_COMMIT, PAGE_READWRITE);",
+            "CWE242_VIRTUALALLOC_RWX",
+        )
+        assert hits == []
+
+    def test_virtualprotect_to_rwx_fires(self):
+        hits, _ = self._scan(
+            "VirtualProtect(addr, sz, PAGE_EXECUTE_READWRITE, &old);",
+            "CWE242_VIRTUALALLOC_RWX",
+        )
+        assert len(hits) == 1
+
+    def test_off_by_one_fires_on_len_index(self):
+        hits, _ = self._scan(
+            "buf[buflen] = 0;", "CWE193_NULL_TERM_OFF_BY_ONE"
+        )
+        assert len(hits) == 1
+
+    def test_off_by_one_fires_on_size_suffix(self):
+        hits, _ = self._scan(
+            "out[outSize] = '\\0';", "CWE193_NULL_TERM_OFF_BY_ONE"
+        )
+        assert len(hits) == 1
+
+    def test_off_by_one_no_fire_on_constant_index(self):
+        hits, _ = self._scan(
+            "buf[15] = 0;", "CWE193_NULL_TERM_OFF_BY_ONE"
+        )
+        assert hits == []
+
+    def test_off_by_one_no_fire_on_unrelated_var(self):
+        # variable not named like a length/size
+        hits, _ = self._scan(
+            "buf[idx] = 0;", "CWE193_NULL_TERM_OFF_BY_ONE"
+        )
+        assert hits == []
+
+    def test_user_offset_deref_fires(self):
+        hits, _ = self._scan("x = *(buf + idx);", "CWE822_DEREF_USER_OFFSET")
+        assert len(hits) == 1
+
+    def test_user_offset_deref_no_fire_on_constant(self):
+        hits, _ = self._scan("x = *(buf + 4);", "CWE822_DEREF_USER_OFFSET")
+        assert hits == []
+
+    def test_strlen_untrusted_member_fires(self):
+        hits, _ = self._scan(
+            "n = strlen(pkt->name);", "CWE125_STRLEN_UNTRUSTED_PTR"
+        )
+        assert len(hits) == 1
+
+    def test_strlen_untrusted_deref_fires(self):
+        hits, _ = self._scan(
+            "n = strlen(*pp);", "CWE125_STRLEN_UNTRUSTED_PTR"
+        )
+        assert len(hits) == 1
+
+    def test_strlen_local_var_no_fire(self):
+        hits, _ = self._scan(
+            "n = strlen(buf);", "CWE125_STRLEN_UNTRUSTED_PTR"
+        )
+        assert hits == []
+
+
+class TestMemoryCorruptionRulesEndToEnd:
+    """Drive the new rules through the actual scan_pseudocode tool surface."""
+
+    def test_severity_floor_filters_low_severity_new_rules(self):
+        # CWE125_STRLEN_UNTRUSTED_PTR is severity=low; floor=high should drop
+        fn = _make_function(pseudocode="n = strlen(pkt->name);")
+        tools = _register(_make_context(functions=[fn]))
+
+        low_result = tools["scan_pseudocode"](
+            "/bin/test.exe", severity_floor="low"
+        )
+        assert "CWE125_STRLEN_UNTRUSTED_PTR" in low_result
+
+        high_result = tools["scan_pseudocode"](
+            "/bin/test.exe", severity_floor="high"
+        )
+        assert "CWE125_STRLEN_UNTRUSTED_PTR" not in high_result
+
+    def test_rule_ids_filter_isolates_single_new_rule(self):
+        # Pseudocode triggers multiple rules -- rule_ids should isolate one.
+        fn = _make_function(
+            pseudocode=(
+                "free(p); p->next = NULL; "
+                "memcpy(dst, src, hdr->len); "
+                "buf = malloc(hdr->len * 2);"
+            ),
+        )
+        tools = _register(_make_context(functions=[fn]))
+
+        result = tools["scan_pseudocode"](
+            "/bin/test.exe", rule_ids=["CWE416_USE_AFTER_FREE"]
+        )
+        assert "CWE416_USE_AFTER_FREE" in result
+        assert "CWE805_MEMCPY_HEADER_DRIVEN_LEN" not in result
+        assert "CWE190_HEADER_LEN_TO_ALLOC" not in result
+
+    def test_summary_mode_groups_findings_per_function(self):
+        parser = _make_function(
+            name="parse_packet",
+            address="0x1000",
+            pseudocode=(
+                "memcpy(dst, src, hdr->len); "
+                "buf = malloc(hdr->len * 2 + 8); "
+                "x = *(buf + idx);"
+            ),
+        )
+        tools = _register(_make_context(functions=[parser]))
+        result = tools["scan_pseudocode"]("/bin/test.exe", mode="summary")
+        assert "parse_packet" in result
+        # The malloc snippet legitimately matches both
+        # CWE190_HEADER_LEN_TO_ALLOC and the broader CWE190_MALLOC_ARITHMETIC,
+        # so we expect 4 findings consolidated under one function row.
+        assert "(4 total)" in result
+        assert "1 function(s)" in result
+
+
 class TestScanPseudocodePagination:
     def _build(self):
         # 25 functions, each with one strcpy finding

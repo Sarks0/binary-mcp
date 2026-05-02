@@ -1506,7 +1506,6 @@ def _scan_with_mask(data: bytes, needle: bytes, mask: bytes, max_results: int) -
         return []
     has_wildcards = b"\x00" in mask and any(m != 0xFF for m in mask)
     if not has_wildcards:
-        # Fast path: native bytes find
         offsets: list[int] = []
         start = 0
         while len(offsets) < max_results:
@@ -1517,7 +1516,6 @@ def _scan_with_mask(data: bytes, needle: bytes, mask: bytes, max_results: int) -
             start = idx + 1
         return offsets
 
-    # Wildcard path
     offsets = []
     n = len(needle)
     end = len(data) - n
@@ -1574,30 +1572,26 @@ def search_bytes(
             )
         needle, mask = parsed
 
-        # Cache may already exist; if not, just open the binary directly --
-        # search_bytes shouldn't trigger a full Ghidra run just to scan bytes.
+        # Don't trigger a Ghidra run just to scan bytes -- if cache is
+        # missing, fall back to context-free hits.
         cached = cache.get_cached(binary_path)
         functions = cached.get("functions", []) if cached else []
 
         with BinaryReader(binary_path) as reader:
             data = reader.read_full()
             offsets = _scan_with_mask(data, needle, mask, max_results + 1)
-            # Translate to VAs
             hits: list[dict] = []
             for off in offsets:
                 va = reader.file_offset_to_va(off)
                 hits.append({"file_offset": off, "va": va})
 
-        # Enrich VAs with function context when we can
         if functions:
-            # Build a [(start, end, name)] list once, sorted by start
             ranges: list[tuple[int, int, str]] = []
             for f in functions:
                 try:
                     start = int(str(f.get("address") or "0").replace("0x", ""), 16)
                 except ValueError:
                     continue
-                # Use basic_blocks max_addr if available, otherwise approximate
                 end = start
                 for bb in f.get("basic_blocks") or []:
                     try:
@@ -1614,7 +1608,6 @@ def search_bytes(
             def _resolve(va: int | None) -> tuple[str, int] | None:
                 if va is None:
                     return None
-                # Linear scan -- 14K functions × N hits is fine for max_results<=1000
                 for s, e, name in ranges:
                     if s <= va <= e:
                         return name, va - s

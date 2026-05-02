@@ -32,9 +32,6 @@ _fastmcp_stub.FastMCP = MagicMock(return_value=_fastmcp_instance)
 sys.modules["fastmcp"] = _fastmcp_stub
 
 
-# -- _parse_byte_pattern ----------------------------------------------------
-
-
 class TestParseBytePattern:
     def _parse(self):
         from src.server import _parse_byte_pattern
@@ -67,9 +64,6 @@ class TestParseBytePattern:
         assert self._parse()("") is None
 
 
-# -- _scan_with_mask --------------------------------------------------------
-
-
 class TestScanWithMask:
     def _scan(self):
         from src.server import _scan_with_mask
@@ -91,9 +85,6 @@ class TestScanWithMask:
             data, b"\x48\x83\x00\x20", b"\xff\xff\x00\xff", max_results=10
         )
         assert offsets == [1, 6]
-
-
-# -- BinaryReader.file_offset_to_va ----------------------------------------
 
 
 class TestFileOffsetToVa:
@@ -123,9 +114,6 @@ class TestFileOffsetToVa:
             assert r.file_offset_to_va(0x1050) == 0x600050
             # Outside any segment → None
             assert r.file_offset_to_va(0x9999) is None
-
-
-# -- search_bytes end-to-end -----------------------------------------------
 
 
 @pytest.fixture

@@ -27,8 +27,6 @@ logger = logging.getLogger(__name__)
 _RULES = PseudocodeRules()
 
 
-# -- shared helpers ---------------------------------------------------------
-
 def _normalize_addr(raw: str | None) -> str:
     """Normalize an address string for comparison: lowercase, no 0x, no leading zeros."""
     if not raw:
@@ -116,8 +114,6 @@ def _load_context(binary_path: str, cache, runner):
     output_path.unlink(missing_ok=True)
     return context, bp
 
-
-# -- registration -----------------------------------------------------------
 
 def register_review_tools(app, session_manager, cache, runner, api_patterns=None):
     """
@@ -267,7 +263,6 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
                 )
             }
 
-            # Per-function aggregation supports both modes from one pass
             per_func: dict[str, dict] = {}
             all_findings: list[dict] = []
             scanned = 0
@@ -304,7 +299,6 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
                     f"{len(rules)} rules at severity_floor='{severity_floor}'."
                 )
 
-            # Sort findings by severity desc, then rule id
             all_findings.sort(
                 key=lambda f: (
                     -severity_order.get(f["severity"], 0),
@@ -316,7 +310,6 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
             total_funcs_with_findings = len(per_func)
 
             if mode == "summary":
-                # One line per function, sorted by max severity desc, then total desc
                 summary_rows = sorted(
                     per_func.values(),
                     key=lambda r: (-r["max_severity_idx"], -r["total"], r["name"]),
@@ -357,7 +350,6 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
                     )
                 return "\n".join(lines)
 
-            # mode == "findings"
             page = all_findings[offset:offset + limit]
             lines = [
                 f"**Pseudocode scan: {total_findings} finding(s) "
@@ -594,8 +586,6 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
         except Exception as e:
             logger.exception(f"get_review_package failed: {e}")
             return f"Error: {e}"
-
-    # -- switch-tables reader (pairs with core_analysis.py extension) -------
 
     @app.tool()
     def get_switch_tables(

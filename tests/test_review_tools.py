@@ -88,9 +88,6 @@ def _register(cache_data):
     }
 
 
-# -- get_function_callers --------------------------------------------------
-
-
 class TestGetFunctionCallers:
     def test_callers_inverted_correctly(self):
         a = _make_function(name="target", address="0x1000", pseudocode="")
@@ -137,9 +134,6 @@ class TestGetFunctionCallers:
         tools = _register(_make_context(functions=[a, b]))
         result = tools["get_function_callers"]("/bin/test.exe", "0x1000")
         assert "b" in result
-
-
-# -- scan_pseudocode -------------------------------------------------------
 
 
 class TestScanPseudocode:
@@ -492,9 +486,6 @@ class TestScanPseudocodePagination:
         assert "Invalid mode" in result
 
 
-# -- get_review_package ----------------------------------------------------
-
-
 class TestGetReviewPackage:
     def test_bundles_expected_sections(self):
         target = _make_function(
@@ -554,9 +545,6 @@ class TestGetReviewPackage:
         tools = _register(_make_context(functions=[_make_function()]))
         result = tools["get_review_package"]("/bin/test.exe", "missing")
         assert "not found" in result.lower()
-
-
-# -- get_switch_tables -----------------------------------------------------
 
 
 class TestGetSwitchTables:

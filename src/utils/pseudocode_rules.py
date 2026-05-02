@@ -188,14 +188,12 @@ class PseudocodeRules:
                 "Audit usage; prefer safer library equivalents where available.",
                 r"\b(scanf|sscanf|fscanf|alloca|_alloca|tmpnam|mktemp)\s*\(",
             ),
-            # -- memory-corruption / parser-focused rules ----------------
             (
                 "CWE416_USE_AFTER_FREE",
                 "CWE-416",
                 "high",
                 "Pointer used after free in the visible window",
                 "NULL the pointer at free; restructure ownership so freed memory is unreachable.",
-                # free(x); ... ; (x-> OR *x OR x[ )
                 r"\bfree\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)[^;]*;(?:[^;]{0,400};){0,4}"
                 r"[^;]*\b\1\s*(?:->|\[)|\*\s*\1\b",
             ),
@@ -207,7 +205,6 @@ class PseudocodeRules:
                 "classic 'attacker-controlled size from packet' shape",
                 "Validate the size against the destination capacity AND the remaining input "
                 "before copying.",
-                # memcpy(dst, src, p->field) or (*p) or p[idx]
                 r"\b(memcpy|memmove|RtlCopyMemory|RtlMoveMemory)\s*\("
                 r"[^,]+,[^,]+,\s*"
                 r"(?:\*\s*[A-Za-z_]|\(?\s*[A-Za-z_][A-Za-z0-9_]*\s*->\s*[A-Za-z_]"
@@ -220,7 +217,6 @@ class PseudocodeRules:
                 "Allocation size derived from a struct/deref field with arithmetic -- "
                 "header-length integer overflow before alloc",
                 "Range-check the length field BEFORE arithmetic; reject sizes that would overflow size_t.",
-                # malloc(p->len + ...) | malloc(*p + ...) | malloc(p->len * ...)
                 r"\b(malloc|calloc|HeapAlloc|RtlAllocateHeap|VirtualAlloc|new\b)\s*\("
                 r"[^)]*"
                 r"(?:[A-Za-z_][A-Za-z0-9_]*\s*->\s*[A-Za-z_]|\*\s*[A-Za-z_])"
@@ -241,7 +237,6 @@ class PseudocodeRules:
                 "high",
                 "Variable-size _alloca/alloca -- attacker-sized stack growth enables stack pivots and exhaustion",
                 "Replace with malloc + free, or cap the size with a hard-coded ceiling.",
-                # _alloca(var) where var is not a digit
                 r"\b_?alloca\s*\(\s*[A-Za-z_][A-Za-z0-9_]*\s*\)",
             ),
             (
@@ -259,7 +254,6 @@ class PseudocodeRules:
                 "medium",
                 "Null terminator written at index equal to a length variable -- classic off-by-one if buffer was sized exactly len",
                 "Allocate len+1 bytes, or write the terminator at len-1 after a bounded copy.",
-                # buf[len] = 0 / '\0'
                 r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\[\s*([A-Za-z_][A-Za-z0-9_]*(?:_len|len|Length|size|Size))\s*\]"
                 r"\s*=\s*(?:0|'\\0'|L?\"\\0\")",
             ),
@@ -269,7 +263,6 @@ class PseudocodeRules:
                 "medium",
                 "Pointer arithmetic with a non-constant offset followed by deref -- bounds may not be enforced",
                 "Verify the offset is within the buffer length before dereferencing.",
-                # *(buf + var) | *(var + buf) where var is identifier (not digit)
                 r"\*\s*\(\s*[A-Za-z_][A-Za-z0-9_]*\s*\+\s*[A-Za-z_][A-Za-z0-9_]*\s*\)",
             ),
             (

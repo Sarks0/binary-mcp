@@ -68,7 +68,6 @@ def parse_symbol_path(
             parts = entry.split("*")
             head = parts[0].lower()
             if head == "srv":
-                # srv*url     | srv*cache*url   | srv*cache*url1*url2...
                 if len(parts) == 2:
                     servers.append(parts[1])
                 elif len(parts) >= 3:
@@ -82,9 +81,8 @@ def parse_symbol_path(
                     cache_set = True
             elif entry.lower().startswith(("http://", "https://")):
                 servers.append(entry)
-            # Anything else (e.g. plain local path) is ignored -- those are
-            # legitimate _NT_SYMBOL_PATH entries on Windows but we have no
-            # way to scan them remotely.
+            # Plain local-path entries are valid _NT_SYMBOL_PATH but we have
+            # no way to scan them remotely, so they are ignored.
 
     if not servers:
         servers = [DEFAULT_SYMBOL_SERVER]
@@ -121,9 +119,6 @@ def extract_codeview_record(binary_path: str | Path) -> dict | None:
             data = getattr(entry, "entry", None)
             if data is None:
                 continue
-            # CodeView entry exposes PdbFileName + Signature_(Data1..Data4) +
-            # Age, but only when pefile recognises RSDS. Fall back to manual
-            # parsing if not.
             cv = _decode_codeview(entry, pe)
             if cv:
                 return cv
@@ -140,15 +135,12 @@ def extract_codeview_record(binary_path: str | Path) -> dict | None:
 
 def _decode_codeview(entry, pe) -> dict | None:
     """Decode an RSDS CodeView entry into {guid, age, pdb_filename}."""
-    # Only CodeView debug entries (Type == 2) carry RSDS records.
     if getattr(entry.struct, "Type", None) != 2:
         return None
 
     raw = getattr(entry, "entry", None)
 
-    # Path 1: pefile parsed it -- use Signature_String + Age + PdbFileName.
-    # Signature_String is the canonical 32-char uppercase hex GUID; some
-    # pefile versions emit it as bytes.
+    # Some pefile versions emit Signature_String as bytes instead of str.
     if raw is not None and hasattr(raw, "Signature_String") and hasattr(raw, "Age"):
         try:
             sig = raw.Signature_String
@@ -170,9 +162,8 @@ def _decode_codeview(entry, pe) -> dict | None:
         except Exception as e:
             logger.debug(f"pefile RSDS decode failed: {e}")
 
-    # Path 2: read raw debug bytes directly from the file. Prefer
-    # PointerToRawData (file offset, always valid) over AddressOfRawData
-    # (RVA, may not be in any mapped section for some binaries).
+    # PointerToRawData (file offset) is always valid; AddressOfRawData (RVA)
+    # may not map to any section in some binaries, so try the file path first.
     file_off = getattr(entry.struct, "PointerToRawData", 0) or 0
     size = getattr(entry.struct, "SizeOfData", 0) or 0
     raw_bytes = b""
@@ -182,7 +173,6 @@ def _decode_codeview(entry, pe) -> dict | None:
         except Exception as e:
             logger.debug(f"Direct read of debug bytes failed: {e}")
 
-    # Final fallback: try via RVA if file-offset path produced nothing.
     if not raw_bytes:
         try:
             raw_bytes = pe.get_data(

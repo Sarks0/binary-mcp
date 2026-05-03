@@ -274,6 +274,92 @@ def _get_elf_loader_recommendation(binary_path: str) -> str | None:
         return None
 
 
+def _write_resume_manifest(
+    cache_dir: Path,
+    binary_path: str,
+    existing_cache: dict,
+    skip_decompile: bool,
+) -> str | None:
+    """
+    Write a tiny ``{"complete_addresses": [...]}`` sidecar so the Ghidra
+    Jython script can skip already-analyzed functions without loading the
+    multi-GB resume JSON (which OOMs the JVM on large binaries).
+
+    "Complete" depends on the upcoming run:
+      - ``skip_decompile=True`` -> every cached entry counts as complete
+      - ``skip_decompile=False`` -> only entries with pseudocode (or
+        thunks/externals that are intentionally never decompiled)
+    """
+    try:
+        complete = []
+        for func in existing_cache.get("functions", []):
+            addr = func.get("address")
+            if not addr:
+                continue
+            if skip_decompile:
+                complete.append(addr)
+                continue
+            if func.get("pseudocode"):
+                complete.append(addr)
+                continue
+            if func.get("decompile_status") == "skipped_thunk_or_external":
+                complete.append(addr)
+                continue
+        manifest_path = (
+            Path(cache_dir) / f"resume_manifest_{Path(binary_path).stem}.json"
+        )
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump({"complete_addresses": complete}, f)
+        logger.info(
+            f"Wrote resume manifest with {len(complete)} complete addresses "
+            f"to {manifest_path}"
+        )
+        return str(manifest_path)
+    except Exception as e:
+        logger.warning(f"Failed to write resume manifest: {e}")
+        return None
+
+
+def _merge_delta_into_cache(existing: dict, delta: dict) -> dict:
+    """
+    Merge a delta context (output of an incremental Ghidra run) into the
+    existing cached context.
+
+    Top-level fields from the new run replace the old ones (metadata,
+    imports, exports, strings, memory_map, data_types, analysis_stats).
+    The functions list is merged per-address: delta entries replace old
+    entries with the same address; new addresses are appended; addresses
+    that the delta did not touch are preserved from the existing cache.
+    """
+    merged = dict(delta)
+
+    # Index existing functions by address for fast replacement.
+    existing_funcs = existing.get("functions", []) or []
+    addr_to_idx = {}
+    for idx, f in enumerate(existing_funcs):
+        a = f.get("address")
+        if a:
+            addr_to_idx[a] = idx
+
+    merged_funcs = list(existing_funcs)
+    for new_func in delta.get("functions", []) or []:
+        addr = new_func.get("address")
+        if not addr:
+            continue
+        if addr in addr_to_idx:
+            merged_funcs[addr_to_idx[addr]] = new_func
+        else:
+            merged_funcs.append(new_func)
+    merged["functions"] = merged_funcs
+
+    # Preserve previously-extracted skipped_functions list if the delta
+    # didn't produce one (rare, but be defensive).
+    if not merged.get("skipped_functions") and existing.get("skipped_functions"):
+        merged["skipped_functions"] = existing["skipped_functions"]
+
+    return merged
+
+
 def get_analysis_context(
     binary_path: str,
     force_reanalyze: bool = False,
@@ -368,12 +454,27 @@ def get_analysis_context(
             incremental = True
 
     resume_from_cache = None
+    resume_manifest_path = None
+    existing_cache_data = None
     if incremental:
         resume_from_cache = cache.get_cache_path(binary_path)
         if resume_from_cache is None:
             logger.info("incremental=True but no cache exists yet; running full analysis")
         else:
             logger.info(f"Resuming analysis from cache: {resume_from_cache}")
+            # Build a tiny manifest of "complete" addresses so the Jython
+            # script can skip them without loading the multi-GB resume JSON.
+            # This avoids the OutOfMemoryError seen on mpengine-class binaries.
+            try:
+                existing_cache_data = cache.get_cached(binary_path)
+            except Exception as e:
+                logger.warning(f"Could not pre-load cache for delta merge: {e}")
+                existing_cache_data = None
+            if existing_cache_data is not None:
+                resume_manifest_path = _write_resume_manifest(
+                    cache.cache_dir, binary_path, existing_cache_data,
+                    skip_decompile=skip_decompile,
+                )
 
     try:
         # Default bumped to 1800s (30 min) -- large binaries routinely need more
@@ -392,7 +493,10 @@ def get_analysis_context(
             skip_decompile=skip_decompile,
             max_functions=max_functions,
             function_timeout=function_timeout,
-            resume_from_cache=str(resume_from_cache) if resume_from_cache else None,
+            resume_from_cache=None if resume_manifest_path else (
+                str(resume_from_cache) if resume_from_cache else None
+            ),
+            resume_manifest=resume_manifest_path,
             start_address=start_address,
             end_address=end_address,
             pdb_path=pdb_path,
@@ -462,6 +566,18 @@ def get_analysis_context(
         with open(output_path, encoding="utf-8") as f:
             context = json.load(f)
 
+        # If the Ghidra script ran in delta mode (manifest-based resume),
+        # ``context`` holds only NEW or RE-DECOMPILED functions plus refreshed
+        # top-level fields. Merge it into the existing cache before validation
+        # so a small delta does not get rejected for having "too few functions".
+        is_delta_run = bool(context.get("analysis_stats", {}).get("delta_run"))
+        if is_delta_run and existing_cache_data is not None:
+            logger.info(
+                f"Merging delta ({len(context.get('functions', []))} entries) "
+                f"into cache ({len(existing_cache_data.get('functions', []))} entries)"
+            )
+            context = _merge_delta_into_cache(existing_cache_data, context)
+
         # Validate the analysis context has meaningful data
         is_valid, validation_error = _validate_analysis_context(
             context, binary_path, ghidra_stdout, ghidra_stderr
@@ -497,6 +613,12 @@ def get_analysis_context(
     except Exception as e:
         logger.error(f"Analysis failed: {e}")
         raise RuntimeError(f"Failed to analyze binary: {e}")
+    finally:
+        if resume_manifest_path:
+            try:
+                Path(resume_manifest_path).unlink(missing_ok=True)
+            except Exception as e:
+                logger.debug(f"Could not clean up resume manifest: {e}")
 
 
 # --- Phase 1: Core Tools (P0 - Critical) ---

@@ -164,10 +164,12 @@ CONFIG_KEYS = {
     "GHIDRA_FUNCTION_TIMEOUT": "Per-function decompilation timeout (seconds, default 30)",
     "GHIDRA_MAX_FUNCTIONS": "Cap on functions processed per Ghidra run (0 = unlimited)",
     "GHIDRA_SKIP_DECOMPILE": "Skip decompilation for fast structural pass (1/true/yes)",
-    "GHIDRA_RESUME_CACHE": "Path to a prior cache (plain or .gz) to resume analysis from",
+    "GHIDRA_RESUME_CACHE": "Legacy: path to a prior cache JSON. Loads the full cache in Jython and is OOM-prone on large binaries; prefer GHIDRA_RESUME_MANIFEST.",
+    "GHIDRA_RESUME_MANIFEST": "Path to a small {complete_addresses:[...]} sidecar so the script can skip already-analyzed functions without loading the full cache. Set automatically by the server.",
     "GHIDRA_START_ADDRESS": "Hex start address for chunked analysis (e.g. 0x61abbc)",
     "GHIDRA_END_ADDRESS": "Hex end address for chunked analysis",
     "GHIDRA_ENABLE_FID": "Enable Function ID library matching during analysis (1/true/yes)",
+    "GHIDRA_MAX_HEAP_MB": "JVM max heap for Ghidra subprocess in MB (default 4096). Bump to 6144-8192 for very large binaries.",
 
     # x64dbg
     "X64DBG_BRIDGE_URL": "URL for x64dbg HTTP bridge (default: http://localhost:27042)",

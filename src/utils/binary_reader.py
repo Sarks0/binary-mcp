@@ -221,6 +221,36 @@ class BinaryReader:
         except Exception:
             return None
 
+    def file_offset_to_va(self, offset: int) -> int | None:
+        """
+        Translate a file offset back to its mapped virtual address.
+
+        Used by tools like ``search_bytes`` that scan the raw file and need
+        to surface VA-relative results. Returns None for offsets that aren't
+        mapped into the runtime image (e.g. PE overlay, debug data outside
+        any section).
+        """
+        if self._format == "pe" and self._pe is not None:
+            try:
+                rva = self._pe.get_rva_from_offset(offset)
+                return self._pe_image_base + rva
+            except Exception:
+                return None
+        if self._format in ("elf", "macho"):
+            for seg_start, seg_end, seg_fileoff in self._segments:
+                seg_filesize = seg_end - seg_start
+                if seg_fileoff <= offset < seg_fileoff + seg_filesize:
+                    return seg_start + (offset - seg_fileoff)
+            return None
+        if self._format == "raw":
+            return offset
+        return None
+
+    def read_full(self) -> bytes:
+        """Read the entire binary file. Used for byte-pattern scanning."""
+        with open(self._path, "rb") as f:
+            return f.read()
+
     @property
     def format(self) -> str | None:
         """Return detected format: 'pe', 'elf', 'macho', 'raw', or None."""

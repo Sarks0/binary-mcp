@@ -250,10 +250,12 @@ class GhidraRunner:
         max_functions: int | None = None,
         skip_decompile: bool = False,
         resume_from_cache: str | None = None,
+        resume_manifest: str | None = None,
         start_address: str | None = None,
         end_address: str | None = None,
         pdb_path: str | None = None,
         enable_fid: bool = False,
+        max_heap_mb: int | None = None,
     ) -> dict:
         """
         Run Ghidra headless analysis on a binary.
@@ -324,6 +326,8 @@ class GhidraRunner:
             env["GHIDRA_SKIP_DECOMPILE"] = "1"
         if resume_from_cache:
             env["GHIDRA_RESUME_CACHE"] = str(resume_from_cache)
+        if resume_manifest:
+            env["GHIDRA_RESUME_MANIFEST"] = str(resume_manifest)
         if start_address:
             env["GHIDRA_START_ADDRESS"] = str(start_address)
         if end_address:
@@ -332,6 +336,22 @@ class GhidraRunner:
             env["GHIDRA_ENABLE_FID"] = "1"
         # Give script a wall-clock budget with margin for JSON serialization
         env["GHIDRA_ANALYSIS_BUDGET"] = str(max(timeout - 60, 60))
+
+        # Bump JVM heap. Loading a multi-GB resume cache or decompiling
+        # complex functions on large binaries will OOM Ghidra's default heap.
+        # _JAVA_OPTIONS is picked up by every JVM the analyzeHeadless script
+        # spawns, including the one running our Jython post-script.
+        if max_heap_mb is None:
+            try:
+                max_heap_mb = int(os.environ.get("GHIDRA_MAX_HEAP_MB", "4096"))
+            except ValueError:
+                max_heap_mb = 4096
+        if max_heap_mb > 0:
+            existing = env.get("_JAVA_OPTIONS", "")
+            if "-Xmx" not in existing:
+                env["_JAVA_OPTIONS"] = (
+                    f"{existing} -Xmx{max_heap_mb}m".strip()
+                )
 
         # Stage PDB next to the binary so Ghidra's PdbUniversalAnalyzer finds
         # it. Auto-cleanup on success/failure so we don't leave dangling

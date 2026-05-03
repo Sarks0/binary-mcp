@@ -10,6 +10,7 @@ Covers:
 
 import gzip
 import json
+import os
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -283,6 +284,85 @@ class TestRunnerEnvPlumbing:
         # Cleaned up after analyze returns
         assert not expected_staged.exists()
 
+    def test_max_heap_sets_java_options(self, runner, tmp_path):
+        binary, script_dir, output = self._prepare(runner, tmp_path)
+        captured = {}
+
+        def fake_run(cmd, env, **kwargs):
+            captured["env"] = dict(env)
+            return _FakeRunResult()
+
+        with patch("subprocess.run", side_effect=fake_run):
+            runner.analyze(
+                binary_path=str(binary),
+                script_path=str(script_dir),
+                script_name="core_analysis.py",
+                output_path=str(output),
+                max_heap_mb=8192,
+            )
+
+        assert "-Xmx8192m" in captured["env"]["_JAVA_OPTIONS"]
+
+    def test_max_heap_default_from_env_var(self, runner, tmp_path, monkeypatch):
+        binary, script_dir, output = self._prepare(runner, tmp_path)
+        monkeypatch.setenv("GHIDRA_MAX_HEAP_MB", "6144")
+        captured = {}
+
+        def fake_run(cmd, env, **kwargs):
+            captured["env"] = dict(env)
+            return _FakeRunResult()
+
+        with patch("subprocess.run", side_effect=fake_run):
+            runner.analyze(
+                binary_path=str(binary),
+                script_path=str(script_dir),
+                script_name="core_analysis.py",
+                output_path=str(output),
+            )
+
+        assert "-Xmx6144m" in captured["env"]["_JAVA_OPTIONS"]
+
+    def test_max_heap_respects_existing_xmx(self, runner, tmp_path, monkeypatch):
+        """If the user has already set -Xmx via _JAVA_OPTIONS, do not clobber it."""
+        binary, script_dir, output = self._prepare(runner, tmp_path)
+        monkeypatch.setenv("_JAVA_OPTIONS", "-Xmx16g -XX:+UseG1GC")
+        captured = {}
+
+        def fake_run(cmd, env, **kwargs):
+            captured["env"] = dict(env)
+            return _FakeRunResult()
+
+        with patch("subprocess.run", side_effect=fake_run):
+            runner.analyze(
+                binary_path=str(binary),
+                script_path=str(script_dir),
+                script_name="core_analysis.py",
+                output_path=str(output),
+                max_heap_mb=4096,
+            )
+
+        # User-provided -Xmx16g preserved; runner did not append a second one.
+        assert captured["env"]["_JAVA_OPTIONS"] == "-Xmx16g -XX:+UseG1GC"
+
+    def test_resume_manifest_env_var(self, runner, tmp_path):
+        binary, script_dir, output = self._prepare(runner, tmp_path)
+        captured = {}
+
+        def fake_run(cmd, env, **kwargs):
+            captured["env"] = dict(env)
+            return _FakeRunResult()
+
+        with patch("subprocess.run", side_effect=fake_run):
+            runner.analyze(
+                binary_path=str(binary),
+                script_path=str(script_dir),
+                script_name="core_analysis.py",
+                output_path=str(output),
+                resume_manifest="/tmp/manifest.json",
+            )
+
+        assert captured["env"]["GHIDRA_RESUME_MANIFEST"] == "/tmp/manifest.json"
+
     def test_pdb_missing_file_raises(self, runner, tmp_path):
         binary, script_dir, output = self._prepare(runner, tmp_path)
 
@@ -357,6 +437,341 @@ class TestIncrementalWiring:
 
         server_module.get_analysis_context(str(binary), incremental=True)
 
-        resume_arg = captured.get("resume_from_cache")
-        assert resume_arg is not None
-        assert resume_arg.endswith(".json.gz")
+        # Manifest path now does the work that resume_from_cache used to.
+        # The legacy resume_from_cache kwarg is set to None when manifest is
+        # present so the Jython script never loads the multi-GB JSON.
+        manifest_arg = captured.get("resume_manifest")
+        assert manifest_arg is not None
+        assert manifest_arg.endswith(".json")
+        assert captured.get("resume_from_cache") is None
+
+    def test_address_range_without_incremental_auto_promotes(
+        self, tmp_path, monkeypatch, server_module
+    ):
+        """Caller passes start_address with incremental=False and an existing
+        cache. Server must auto-promote to incremental so the cache merges
+        instead of getting overwritten."""
+        from src.engines.static.ghidra.project_cache import ProjectCache
+
+        binary = tmp_path / "target.bin"
+        binary.write_bytes(b"\x7fELF" + b"\x00" * 128)
+
+        cache_obj = ProjectCache(cache_dir=str(tmp_path / "cache"))
+        # Pretend we already have a 41K-function cache from a structural pass.
+        cache_obj.save_cached(
+            str(binary),
+            {
+                "functions": [
+                    {"address": f"0x{0x1000+i:x}", "name": f"f{i}"}
+                    for i in range(10)
+                ],
+                "metadata": {"executable_format": "ELF"},
+            },
+        )
+
+        monkeypatch.setattr(server_module, "cache", cache_obj)
+        monkeypatch.setattr(
+            server_module, "get_allowed_dirs", lambda: [tmp_path]
+        )
+
+        captured = {}
+
+        def fake_analyze(**kwargs):
+            captured.update(kwargs)
+            Path(kwargs["output_path"]).write_text(json.dumps({
+                "metadata": {"executable_format": "ELF"},
+                "functions": [{"address": "0x1000", "name": "pre"}],
+                "imports": [], "strings": [], "memory_map": [{"name": ".text"}],
+                "analysis_stats": {"resumed": True, "resumed_from_count": 10},
+            }))
+            return {"elapsed_time": 1.0, "stdout": "", "stderr": ""}
+
+        monkeypatch.setattr(server_module.runner, "analyze", fake_analyze)
+
+        # Call without incremental=True. Should auto-promote.
+        server_module.get_analysis_context(
+            str(binary),
+            start_address="0x180920000",
+            end_address="0x180BA46FC",
+            skip_decompile=False,
+        )
+
+        manifest_arg = captured.get("resume_manifest")
+        assert manifest_arg is not None, (
+            "auto-promotion should have written a resume manifest to merge "
+            "instead of overwriting the existing cache"
+        )
+        assert captured.get("resume_from_cache") is None
+
+    def test_address_range_without_incremental_no_cache_runs_full(
+        self, tmp_path, monkeypatch, server_module
+    ):
+        """If no cache exists yet, do not auto-promote -- a fresh range run
+        is fine when there is nothing to preserve."""
+        from src.engines.static.ghidra.project_cache import ProjectCache
+
+        binary = tmp_path / "target.bin"
+        binary.write_bytes(b"\x7fELF" + b"\x00" * 128)
+
+        cache_obj = ProjectCache(cache_dir=str(tmp_path / "cache"))
+
+        monkeypatch.setattr(server_module, "cache", cache_obj)
+        monkeypatch.setattr(
+            server_module, "get_allowed_dirs", lambda: [tmp_path]
+        )
+
+        captured = {}
+
+        def fake_analyze(**kwargs):
+            captured.update(kwargs)
+            Path(kwargs["output_path"]).write_text(json.dumps({
+                "metadata": {"executable_format": "ELF"},
+                "functions": [], "imports": [], "strings": [],
+                "memory_map": [{"name": ".text"}],
+                "analysis_stats": {},
+            }))
+            return {"elapsed_time": 1.0, "stdout": "", "stderr": ""}
+
+        monkeypatch.setattr(server_module.runner, "analyze", fake_analyze)
+
+        server_module.get_analysis_context(
+            str(binary), start_address="0x1000", end_address="0x2000",
+        )
+
+        assert captured.get("resume_from_cache") is None
+
+
+class TestResumeManifest:
+    def test_manifest_skip_decompile_true_marks_all_complete(self, tmp_path):
+        from src.server import _write_resume_manifest
+
+        existing = {
+            "functions": [
+                {"address": "0x1000", "pseudocode": None},
+                {"address": "0x2000", "pseudocode": "int f() { return 0; }"},
+                {"address": "0x3000", "decompile_status": "skipped_thunk_or_external"},
+            ],
+        }
+        path = _write_resume_manifest(
+            tmp_path, "/tmp/whatever.bin", existing, skip_decompile=True,
+        )
+        assert path is not None
+        with open(path) as f:
+            data = json.load(f)
+        # skip_decompile=True -> every entry counts as complete
+        assert set(data["complete_addresses"]) == {"0x1000", "0x2000", "0x3000"}
+
+    def test_manifest_skip_decompile_false_only_with_pseudocode(self, tmp_path):
+        from src.server import _write_resume_manifest
+
+        existing = {
+            "functions": [
+                {"address": "0x1000", "pseudocode": None},
+                {"address": "0x2000", "pseudocode": "int f() {}"},
+                {"address": "0x3000", "decompile_status": "skipped_thunk_or_external"},
+                {"address": "0x4000", "decompile_status": "thread_timeout",
+                 "pseudocode": None},
+            ],
+        }
+        path = _write_resume_manifest(
+            tmp_path, "/tmp/whatever.bin", existing, skip_decompile=False,
+        )
+        with open(path) as f:
+            data = json.load(f)
+        # skip_decompile=False -> only entries with pseudocode (or thunks)
+        assert set(data["complete_addresses"]) == {"0x2000", "0x3000"}
+        # 0x1000 (no pseudocode) and 0x4000 (timed out) are NOT complete and
+        # will be re-decompiled this run.
+
+    def test_manifest_handles_no_functions(self, tmp_path):
+        from src.server import _write_resume_manifest
+
+        path = _write_resume_manifest(
+            tmp_path, "/tmp/x.bin", {"functions": []}, skip_decompile=False,
+        )
+        with open(path) as f:
+            data = json.load(f)
+        assert data["complete_addresses"] == []
+
+    def test_manifest_includes_run_id(self, tmp_path):
+        from src.server import _write_resume_manifest
+
+        path = _write_resume_manifest(
+            tmp_path, "/tmp/x.bin", {"functions": []}, skip_decompile=False,
+        )
+        with open(path) as f:
+            data = json.load(f)
+        assert "run_id" in data
+        assert "-" in data["run_id"]  # "<pid>-<monotonic_ns>"
+
+    def test_manifest_atomic_write(self, tmp_path):
+        """Verify the writer goes through .tmp + os.replace, not a direct open."""
+        from unittest.mock import patch
+
+        from src.server import _write_resume_manifest
+
+        observed_replace = []
+
+        real_replace = os.replace
+
+        def spy_replace(src, dst):
+            observed_replace.append((str(src), str(dst)))
+            return real_replace(src, dst)
+
+        with patch("src.server.os.replace", side_effect=spy_replace):
+            _write_resume_manifest(
+                tmp_path, "/tmp/x.bin", {"functions": []}, skip_decompile=False,
+            )
+
+        assert len(observed_replace) == 1
+        src, dst = observed_replace[0]
+        assert src.endswith(".tmp")
+        assert dst.endswith(".json")
+
+
+class TestDeltaRunLock:
+    def test_concurrent_delta_runs_blocked(self, tmp_path):
+        """Acquiring the lock once blocks a second concurrent acquisition."""
+        from src.server import _delta_run_lock
+
+        with _delta_run_lock(tmp_path, "/tmp/sample.bin"):
+            with pytest.raises(RuntimeError, match="incremental analysis is already running"):
+                with _delta_run_lock(tmp_path, "/tmp/sample.bin"):
+                    pass  # pragma: no cover
+
+    def test_lock_releases_after_use(self, tmp_path):
+        """After exit, a follow-up acquisition succeeds."""
+        from src.server import _delta_run_lock
+
+        with _delta_run_lock(tmp_path, "/tmp/sample.bin"):
+            pass
+        # Should not raise.
+        with _delta_run_lock(tmp_path, "/tmp/sample.bin"):
+            pass
+
+
+class TestDeltaMerge:
+    def test_replaces_by_address(self):
+        from src.server import _merge_delta_into_cache
+
+        existing = {
+            "functions": [
+                {"address": "0x1000", "name": "old", "pseudocode": None},
+                {"address": "0x2000", "name": "untouched"},
+            ],
+            "imports": [{"library": "old.dll"}],
+        }
+        delta = {
+            "functions": [
+                {"address": "0x1000", "name": "new", "pseudocode": "int f() {}"},
+            ],
+            "imports": [{"library": "new.dll"}],
+            "metadata": {"format": "PE"},
+            "analysis_stats": {"delta_run": True, "functions_analyzed": 1},
+        }
+        merged = _merge_delta_into_cache(existing, delta)
+        # 0x1000 replaced; 0x2000 preserved unchanged
+        funcs_by_addr = {f["address"]: f for f in merged["functions"]}
+        assert funcs_by_addr["0x1000"]["pseudocode"] == "int f() {}"
+        assert funcs_by_addr["0x2000"]["name"] == "untouched"
+        # Top-level fields take from delta
+        assert merged["imports"] == [{"library": "new.dll"}]
+        assert merged["metadata"] == {"format": "PE"}
+
+    def test_appends_new_addresses(self):
+        from src.server import _merge_delta_into_cache
+
+        existing = {"functions": [{"address": "0x1000", "name": "old"}]}
+        delta = {
+            "functions": [
+                {"address": "0x1000", "name": "old"},
+                {"address": "0x9000", "name": "newly_discovered"},
+            ],
+            "analysis_stats": {"delta_run": True},
+        }
+        merged = _merge_delta_into_cache(existing, delta)
+        addrs = [f["address"] for f in merged["functions"]]
+        assert "0x9000" in addrs
+        assert len(addrs) == 2
+
+    def test_preserves_skipped_functions_when_delta_lacks_them(self):
+        from src.server import _merge_delta_into_cache
+
+        existing = {
+            "functions": [],
+            "skipped_functions": [{"name": "fail", "address": "0xdead"}],
+        }
+        delta = {"functions": [], "analysis_stats": {"delta_run": True}}
+        merged = _merge_delta_into_cache(existing, delta)
+        assert merged["skipped_functions"] == [
+            {"name": "fail", "address": "0xdead"}
+        ]
+
+
+class TestDeltaIntegration:
+    def test_delta_run_merges_into_existing_cache(
+        self, tmp_path, monkeypatch, server_module
+    ):
+        """End-to-end: existing cache has 5 structural-only entries, the
+        Ghidra delta brings pseudocode for 2 of them. Result should be the
+        full 5 with pseudocode filled where the delta provided it."""
+        from src.engines.static.ghidra.project_cache import ProjectCache
+
+        binary = tmp_path / "target.bin"
+        binary.write_bytes(b"\x7fELF" + b"\x00" * 128)
+
+        cache_obj = ProjectCache(cache_dir=str(tmp_path / "cache"))
+        existing = {
+            "metadata": {"executable_format": "ELF"},
+            "functions": [
+                {"address": f"0x{0x1000+i*0x10:x}", "name": f"f{i}",
+                 "pseudocode": None}
+                for i in range(5)
+            ],
+            "imports": [{"library": "libc"}],
+            "strings": [],
+            "memory_map": [{"name": ".text"}],
+        }
+        cache_obj.save_cached(str(binary), existing)
+
+        monkeypatch.setattr(server_module, "cache", cache_obj)
+        monkeypatch.setattr(
+            server_module, "get_allowed_dirs", lambda: [tmp_path]
+        )
+
+        def fake_analyze(**kwargs):
+            output = Path(kwargs["output_path"])
+            # Simulate delta containing only the 2 newly-decompiled funcs.
+            output.write_text(json.dumps({
+                "metadata": {"executable_format": "ELF"},
+                "functions": [
+                    {"address": "0x1010", "name": "f1",
+                     "pseudocode": "int f1() { return 1; }"},
+                    {"address": "0x1020", "name": "f2",
+                     "pseudocode": "int f2() { return 2; }"},
+                ],
+                "imports": [{"library": "libc"}],
+                "strings": [],
+                "memory_map": [{"name": ".text"}],
+                "analysis_stats": {
+                    "delta_run": True, "functions_analyzed": 2,
+                },
+            }))
+            return {"elapsed_time": 1.0, "stdout": "", "stderr": ""}
+
+        monkeypatch.setattr(server_module.runner, "analyze", fake_analyze)
+
+        merged = server_module.get_analysis_context(
+            str(binary), incremental=True, skip_decompile=False,
+        )
+
+        addrs = {f["address"]: f for f in merged["functions"]}
+        # All 5 retained
+        assert len(addrs) == 5
+        # The two delta entries got their pseudocode filled in
+        assert addrs["0x1010"]["pseudocode"].startswith("int f1")
+        assert addrs["0x1020"]["pseudocode"].startswith("int f2")
+        # The three untouched still have None pseudocode
+        assert addrs["0x1000"]["pseudocode"] is None
+        assert addrs["0x1030"]["pseudocode"] is None
+        assert addrs["0x1040"]["pseudocode"] is None

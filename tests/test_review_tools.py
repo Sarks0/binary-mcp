@@ -88,9 +88,6 @@ def _register(cache_data):
     }
 
 
-# -- get_function_callers --------------------------------------------------
-
-
 class TestGetFunctionCallers:
     def test_callers_inverted_correctly(self):
         a = _make_function(name="target", address="0x1000", pseudocode="")
@@ -137,9 +134,6 @@ class TestGetFunctionCallers:
         tools = _register(_make_context(functions=[a, b]))
         result = tools["get_function_callers"]("/bin/test.exe", "0x1000")
         assert "b" in result
-
-
-# -- scan_pseudocode -------------------------------------------------------
 
 
 class TestScanPseudocode:
@@ -198,6 +192,17 @@ class TestScanPseudocode:
             "CWE798_HARDCODED_PASSWORD": '"password=hunter2"',
             "CWE415_DOUBLE_FREE": "free(p); free(p);",
             "CWE190_MALLOC_ARITHMETIC": "malloc(n * m);",
+            "CWE416_USE_AFTER_FREE": "free(p); do_thing(); p->next = 0;",
+            "CWE805_MEMCPY_HEADER_DRIVEN_LEN": "memcpy(dst, src, hdr->payload_len);",
+            "CWE190_HEADER_LEN_TO_ALLOC": "buf = malloc(hdr->len * 4 + 8);",
+            "CWE401_REALLOC_SHADOW": "p = realloc(p, n);",
+            "CWE242_ALLOCA_VARIABLE": "tmp = _alloca(user_size);",
+            "CWE242_VIRTUALALLOC_RWX": (
+                "mem = VirtualAlloc(0, sz, MEM_COMMIT, PAGE_EXECUTE_READWRITE);"
+            ),
+            "CWE193_NULL_TERM_OFF_BY_ONE": "buf[buflen] = 0;",
+            "CWE822_DEREF_USER_OFFSET": "x = *(buf + idx);",
+            "CWE125_STRLEN_UNTRUSTED_PTR": "n = strlen(pkt->name);",
         }
         for rule_id, snippet in samples.items():
             fn = _make_function(pseudocode=snippet)
@@ -209,7 +214,467 @@ class TestScanPseudocode:
             )
 
 
-# -- get_review_package ----------------------------------------------------
+class TestCredentialFormatRules:
+    """High-confidence token-format rules that should not be down-ranked."""
+
+    def _scan(self, snippet, rule_id):
+        from src.utils.pseudocode_rules import PseudocodeRules, scan_text
+        rules = PseudocodeRules()
+        rule = rules.get(rule_id)
+        assert rule is not None, f"rule {rule_id} not registered"
+        return scan_text(snippet, [rule]), rule
+
+    def test_aws_access_key_fires(self):
+        hits, rule = self._scan(
+            'const char *k = "AKIAIOSFODNN7EXAMPLE";',
+            "CWE798_AWS_ACCESS_KEY",
+        )
+        assert len(hits) == 1
+        assert rule.severity == "critical"
+        assert hits[0]["confidence"] == 90
+
+    def test_aws_access_key_no_fire_on_label(self):
+        hits, _ = self._scan('const char *k = "AKIA";', "CWE798_AWS_ACCESS_KEY")
+        assert hits == []
+
+    def test_github_pat_fires(self):
+        hits, _ = self._scan(
+            'token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";',
+            "CWE798_GITHUB_TOKEN",
+        )
+        assert len(hits) == 1
+
+    def test_stripe_secret_fires(self):
+        hits, _ = self._scan(
+            'k = "sk_live_abcdefghij1234567890ZZZ";',
+            "CWE798_STRIPE_SECRET",
+        )
+        assert len(hits) == 1
+
+    def test_jwt_fires(self):
+        hits, _ = self._scan(
+            'auth = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.'
+            'eyJzdWIiOiJ1MSJ9.SIG_part_here";',
+            "CWE798_JWT_TOKEN",
+        )
+        assert len(hits) == 1
+
+    def test_jwt_no_fire_on_short_eyj(self):
+        hits, _ = self._scan('s = "eyJab";', "CWE798_JWT_TOKEN")
+        assert hits == []
+
+
+class TestConfidenceScoring:
+    """Per-finding confidence math: negative pattern, scanner penalty,
+    corroboration bonus, sink bonus."""
+
+    def test_baseline_confidence_present(self):
+        from src.utils.pseudocode_rules import PseudocodeRules, scan_text
+        rules = PseudocodeRules()
+        rule = rules.get("CWE120_GETS")
+        hits = scan_text("gets(buf);", [rule])
+        assert hits[0]["confidence"] == 95
+
+    def test_negative_pattern_penalises_credential_regex_string(self):
+        from src.utils.pseudocode_rules import PseudocodeRules, scan_text
+        rule = PseudocodeRules().get("CWE798_HARDCODED_PASSWORD")
+        # Regex-style literal -- should be penalised by negative_pattern.
+        hits = scan_text(r'pat = "(password|secret|api_key)";', [rule])
+        assert len(hits) == 1
+        assert hits[0]["confidence"] < 30  # baseline 30 minus 40 = floored to 0
+
+    def test_negative_pattern_skips_clean_credential(self):
+        from src.utils.pseudocode_rules import PseudocodeRules, scan_text
+        rule = PseudocodeRules().get("CWE798_HARDCODED_PASSWORD")
+        hits = scan_text('s = "password=hunter2";', [rule])
+        assert len(hits) == 1
+        assert hits[0]["confidence"] == 30
+
+    def test_corroboration_bonus_applies_when_multiple_rules_hit(self):
+        from src.utils.pseudocode_rules import (
+            PseudocodeRules,
+            adjust_confidences,
+            scan_text,
+        )
+        pseudo = "strcpy(dst, src); free(p); free(p);"
+        rules = PseudocodeRules()
+        hits = scan_text(pseudo, rules.rules)
+        adjust_confidences(hits, pseudo)
+        rule_ids = {h["rule_id"] for h in hits}
+        # At least CWE120_STRCPY and CWE415_DOUBLE_FREE
+        assert "CWE120_STRCPY" in rule_ids
+        assert "CWE415_DOUBLE_FREE" in rule_ids
+        for h in hits:
+            if h["rule_id"] == "CWE415_DOUBLE_FREE":
+                # Baseline 70 + corroboration 30 = 100 (clamped)
+                assert h["confidence"] >= 90
+
+    def test_scanner_penalty_drops_credential_in_regex_compiler(self):
+        from src.utils.pseudocode_rules import (
+            PseudocodeRules,
+            adjust_confidences,
+            scan_text,
+        )
+        pseudo = (
+            'pat = "password|secret|api_key"; '
+            'compiled = pcre_compile(pat, 0, &err);'
+        )
+        rule = PseudocodeRules().get("CWE798_HARDCODED_PASSWORD")
+        hits = scan_text(pseudo, [rule])
+        adjust_confidences(hits, pseudo)
+        assert hits[0]["confidence"] == 0  # negative + scanner penalty
+
+    def test_high_signal_credential_unaffected_by_scanner_penalty(self):
+        from src.utils.pseudocode_rules import (
+            PseudocodeRules,
+            adjust_confidences,
+            scan_text,
+        )
+        pseudo = (
+            'k = "AKIAIOSFODNN7EXAMPLE"; pat = pcre_compile("foo", 0, 0);'
+        )
+        rules = PseudocodeRules()
+        rule = rules.get("CWE798_AWS_ACCESS_KEY")
+        hits = scan_text(pseudo, [rule])
+        adjust_confidences(hits, pseudo)
+        # AWS rule keeps its 90 even when in a "scanner" function
+        assert hits[0]["confidence"] == 90
+
+    def test_sink_bonus_applies_to_strcpy_with_memcpy_in_function(self):
+        from src.utils.pseudocode_rules import (
+            PseudocodeRules,
+            adjust_confidences,
+            scan_text,
+        )
+        pseudo = "strcpy(dst, src); memcpy(other, x, 16);"
+        rule = PseudocodeRules().get("CWE120_STRCPY")
+        hits = scan_text(pseudo, [rule])
+        adjust_confidences(hits, pseudo)
+        # baseline 60 + sink bonus 20 = 80
+        assert hits[0]["confidence"] == 80
+
+
+class TestScanPseudocodeFiltering:
+    """exclude_rule_ids and confidence_floor surface tests."""
+
+    def test_exclude_rule_ids_drops_specified_rules(self):
+        fn = _make_function(pseudocode="strcpy(a,b); gets(c);")
+        tools = _register(_make_context(functions=[fn]))
+        result = tools["scan_pseudocode"](
+            "/bin/test.exe", exclude_rule_ids=["CWE120_STRCPY"]
+        )
+        assert "CWE120_STRCPY" not in result
+        assert "CWE120_GETS" in result
+
+    def test_confidence_floor_drops_low_confidence_findings(self):
+        # CWE798_HARDCODED_PASSWORD with regex-meta literal -> conf 0
+        fn = _make_function(pseudocode='p = "(pass|secret|key)";')
+        tools = _register(_make_context(functions=[fn]))
+
+        low = tools["scan_pseudocode"](
+            "/bin/test.exe", confidence_floor=0
+        )
+        assert "CWE798_HARDCODED_PASSWORD" in low
+
+        high = tools["scan_pseudocode"](
+            "/bin/test.exe", confidence_floor=50
+        )
+        assert "CWE798_HARDCODED_PASSWORD" not in high
+        assert "dropped" in high.lower()
+
+    def test_findings_sorted_by_confidence_within_severity(self):
+        # Two critical findings, different functions so corroboration doesn't
+        # level them. gets baseline 95 vs system baseline 75.
+        a = _make_function(
+            name="fa", address="0x1000", pseudocode="gets(buf);",
+        )
+        b = _make_function(
+            name="fb", address="0x2000", pseudocode="system(cmd);",
+        )
+        tools = _register(_make_context(functions=[a, b]))
+        result = tools["scan_pseudocode"]("/bin/test.exe")
+        gets_idx = result.find("CWE120_GETS")
+        sys_idx = result.find("CWE78_COMMAND_INJECTION")
+        assert gets_idx >= 0 and sys_idx >= 0
+        assert gets_idx < sys_idx, "Higher confidence should appear first"
+
+    def test_summary_shows_max_confidence_per_function(self):
+        fn = _make_function(pseudocode='k = "AKIAIOSFODNN7EXAMPLE";')
+        tools = _register(_make_context(functions=[fn]))
+        result = tools["scan_pseudocode"]("/bin/test.exe", mode="summary")
+        assert "conf=90" in result
+
+
+class TestMemoryCorruptionRules:
+    """Positive + negative coverage for the parser-shaped rules.
+
+    Negative cases guard against regex over-reach. Each test scans through
+    the real PseudocodeRules registry via scan_text, restricted to the
+    rule under test, so we exercise the same code path scan_pseudocode uses.
+    """
+
+    def _scan(self, snippet: str, rule_id: str):
+        from src.utils.pseudocode_rules import PseudocodeRules, scan_text
+        rules = PseudocodeRules()
+        rule = rules.get(rule_id)
+        assert rule is not None, f"rule {rule_id} not registered"
+        return scan_text(snippet, [rule]), rule
+
+    def test_uaf_fires_on_member_deref_after_free(self):
+        hits, rule = self._scan(
+            "free(p); log_event(); p->next = NULL;",
+            "CWE416_USE_AFTER_FREE",
+        )
+        assert len(hits) == 1
+        assert rule.severity == "high"
+
+    def test_uaf_no_fire_when_pointer_only_freed(self):
+        hits, _ = self._scan("free(p); p = NULL;", "CWE416_USE_AFTER_FREE")
+        assert hits == []
+
+    def test_uaf_no_fire_when_different_pointer_used(self):
+        hits, _ = self._scan(
+            "free(p); q->next = NULL;", "CWE416_USE_AFTER_FREE"
+        )
+        assert hits == []
+
+    def test_memcpy_header_driven_fires_on_struct_field(self):
+        hits, _ = self._scan(
+            "memcpy(dst, src, hdr->payload_len);",
+            "CWE805_MEMCPY_HEADER_DRIVEN_LEN",
+        )
+        assert len(hits) == 1
+
+    def test_memcpy_header_driven_fires_on_deref_len(self):
+        hits, _ = self._scan(
+            "memcpy(dst, src, *len_ptr);",
+            "CWE805_MEMCPY_HEADER_DRIVEN_LEN",
+        )
+        assert len(hits) == 1
+
+    def test_memcpy_header_driven_no_fire_with_literal_len(self):
+        hits, _ = self._scan(
+            "memcpy(dst, src, 16);", "CWE805_MEMCPY_HEADER_DRIVEN_LEN"
+        )
+        assert hits == []
+
+    def test_memcpy_header_driven_no_fire_with_local_len(self):
+        # plain identifier (not deref/member/index) should not match
+        hits, _ = self._scan(
+            "memcpy(dst, src, n);", "CWE805_MEMCPY_HEADER_DRIVEN_LEN"
+        )
+        assert hits == []
+
+    def test_header_len_to_alloc_fires_on_member_with_arithmetic(self):
+        hits, _ = self._scan(
+            "buf = malloc(hdr->len * 4 + 8);",
+            "CWE190_HEADER_LEN_TO_ALLOC",
+        )
+        assert len(hits) == 1
+
+    def test_header_len_to_alloc_no_fire_on_constant_alloc(self):
+        hits, _ = self._scan("malloc(64);", "CWE190_HEADER_LEN_TO_ALLOC")
+        assert hits == []
+
+    def test_realloc_shadow_fires(self):
+        hits, rule = self._scan(
+            "p = realloc(p, n);", "CWE401_REALLOC_SHADOW"
+        )
+        assert len(hits) == 1
+        assert rule.cwe == "CWE-401"
+
+    def test_realloc_shadow_no_fire_with_temp(self):
+        hits, _ = self._scan(
+            "tmp = realloc(p, n);", "CWE401_REALLOC_SHADOW"
+        )
+        assert hits == []
+
+    def test_alloca_variable_fires(self):
+        hits, _ = self._scan(
+            "tmp = _alloca(user_size);", "CWE242_ALLOCA_VARIABLE"
+        )
+        assert len(hits) == 1
+
+    def test_alloca_variable_no_fire_on_constant_size(self):
+        hits, _ = self._scan(
+            "tmp = _alloca(0x100);", "CWE242_ALLOCA_VARIABLE"
+        )
+        assert hits == []
+
+    def test_virtualalloc_rwx_fires(self):
+        hits, _ = self._scan(
+            "mem = VirtualAlloc(NULL, sz, MEM_COMMIT, PAGE_EXECUTE_READWRITE);",
+            "CWE242_VIRTUALALLOC_RWX",
+        )
+        assert len(hits) == 1
+
+    def test_virtualalloc_rw_no_fire(self):
+        hits, _ = self._scan(
+            "mem = VirtualAlloc(NULL, sz, MEM_COMMIT, PAGE_READWRITE);",
+            "CWE242_VIRTUALALLOC_RWX",
+        )
+        assert hits == []
+
+    def test_virtualprotect_to_rwx_fires(self):
+        hits, _ = self._scan(
+            "VirtualProtect(addr, sz, PAGE_EXECUTE_READWRITE, &old);",
+            "CWE242_VIRTUALALLOC_RWX",
+        )
+        assert len(hits) == 1
+
+    def test_off_by_one_fires_on_len_index(self):
+        hits, _ = self._scan(
+            "buf[buflen] = 0;", "CWE193_NULL_TERM_OFF_BY_ONE"
+        )
+        assert len(hits) == 1
+
+    def test_off_by_one_fires_on_size_suffix(self):
+        hits, _ = self._scan(
+            "out[outSize] = '\\0';", "CWE193_NULL_TERM_OFF_BY_ONE"
+        )
+        assert len(hits) == 1
+
+    def test_off_by_one_no_fire_on_constant_index(self):
+        hits, _ = self._scan(
+            "buf[15] = 0;", "CWE193_NULL_TERM_OFF_BY_ONE"
+        )
+        assert hits == []
+
+    def test_off_by_one_no_fire_on_unrelated_var(self):
+        # variable not named like a length/size
+        hits, _ = self._scan(
+            "buf[idx] = 0;", "CWE193_NULL_TERM_OFF_BY_ONE"
+        )
+        assert hits == []
+
+    def test_user_offset_deref_fires(self):
+        hits, _ = self._scan("x = *(buf + idx);", "CWE822_DEREF_USER_OFFSET")
+        assert len(hits) == 1
+
+    def test_user_offset_deref_no_fire_on_constant(self):
+        hits, _ = self._scan("x = *(buf + 4);", "CWE822_DEREF_USER_OFFSET")
+        assert hits == []
+
+    def test_strlen_untrusted_member_fires(self):
+        hits, _ = self._scan(
+            "n = strlen(pkt->name);", "CWE125_STRLEN_UNTRUSTED_PTR"
+        )
+        assert len(hits) == 1
+
+    def test_strlen_untrusted_deref_fires(self):
+        hits, _ = self._scan(
+            "n = strlen(*pp);", "CWE125_STRLEN_UNTRUSTED_PTR"
+        )
+        assert len(hits) == 1
+
+    def test_strlen_local_var_no_fire(self):
+        hits, _ = self._scan(
+            "n = strlen(buf);", "CWE125_STRLEN_UNTRUSTED_PTR"
+        )
+        assert hits == []
+
+
+class TestMemoryCorruptionRulesEndToEnd:
+    """Drive the new rules through the actual scan_pseudocode tool surface."""
+
+    def test_severity_floor_filters_low_severity_new_rules(self):
+        # CWE125_STRLEN_UNTRUSTED_PTR is severity=low; floor=high should drop
+        fn = _make_function(pseudocode="n = strlen(pkt->name);")
+        tools = _register(_make_context(functions=[fn]))
+
+        low_result = tools["scan_pseudocode"](
+            "/bin/test.exe", severity_floor="low"
+        )
+        assert "CWE125_STRLEN_UNTRUSTED_PTR" in low_result
+
+        high_result = tools["scan_pseudocode"](
+            "/bin/test.exe", severity_floor="high"
+        )
+        assert "CWE125_STRLEN_UNTRUSTED_PTR" not in high_result
+
+    def test_rule_ids_filter_isolates_single_new_rule(self):
+        # Pseudocode triggers multiple rules -- rule_ids should isolate one.
+        fn = _make_function(
+            pseudocode=(
+                "free(p); p->next = NULL; "
+                "memcpy(dst, src, hdr->len); "
+                "buf = malloc(hdr->len * 2);"
+            ),
+        )
+        tools = _register(_make_context(functions=[fn]))
+
+        result = tools["scan_pseudocode"](
+            "/bin/test.exe", rule_ids=["CWE416_USE_AFTER_FREE"]
+        )
+        assert "CWE416_USE_AFTER_FREE" in result
+        assert "CWE805_MEMCPY_HEADER_DRIVEN_LEN" not in result
+        assert "CWE190_HEADER_LEN_TO_ALLOC" not in result
+
+    def test_summary_mode_groups_findings_per_function(self):
+        parser = _make_function(
+            name="parse_packet",
+            address="0x1000",
+            pseudocode=(
+                "memcpy(dst, src, hdr->len); "
+                "buf = malloc(hdr->len * 2 + 8); "
+                "x = *(buf + idx);"
+            ),
+        )
+        tools = _register(_make_context(functions=[parser]))
+        result = tools["scan_pseudocode"]("/bin/test.exe", mode="summary")
+        assert "parse_packet" in result
+        # The malloc snippet legitimately matches both
+        # CWE190_HEADER_LEN_TO_ALLOC and the broader CWE190_MALLOC_ARITHMETIC,
+        # so we expect 4 findings consolidated under one function row.
+        assert "4 total" in result
+        assert "1 function(s)" in result
+
+
+class TestScanPseudocodePagination:
+    def _build(self):
+        # 25 functions, each with one strcpy finding
+        fns = [
+            _make_function(name=f"f{i:02d}", address=f"0x{0x1000+i:x}",
+                           pseudocode="strcpy(a,b);")
+            for i in range(25)
+        ]
+        return _register(_make_context(functions=fns))
+
+    def test_default_limit_returns_first_page(self):
+        tools = self._build()
+        result = tools["scan_pseudocode"]("/bin/test.exe", limit=10)
+        assert "25 finding" in result
+        assert "Showing 1-10 of 25" in result
+        assert "offset=10" in result
+
+    def test_offset_returns_next_page(self):
+        tools = self._build()
+        result = tools["scan_pseudocode"]("/bin/test.exe", limit=10, offset=10)
+        assert "Showing 11-20 of 25" in result
+
+    def test_offset_past_end(self):
+        tools = self._build()
+        result = tools["scan_pseudocode"]("/bin/test.exe", offset=999)
+        assert "beyond the result set" in result
+
+    def test_summary_mode(self):
+        # 2 functions, different finding counts
+        a = _make_function(name="hot", address="0x1000",
+                           pseudocode="strcpy(a,b); gets(c); system(d);")
+        b = _make_function(name="cool", address="0x2000",
+                           pseudocode="strcpy(x,y);")
+        tools = _register(_make_context(functions=[a, b]))
+        result = tools["scan_pseudocode"]("/bin/test.exe", mode="summary")
+        assert "SUMMARY" in result
+        assert "hot" in result and "cool" in result
+        # Hot function has the critical finding -- should appear before cool
+        assert result.index("hot") < result.index("cool")
+        assert "critical=" in result or "high=" in result
+
+    def test_invalid_mode(self):
+        tools = self._build()
+        result = tools["scan_pseudocode"]("/bin/test.exe", mode="bogus")
+        assert "Invalid mode" in result
 
 
 class TestGetReviewPackage:
@@ -271,9 +736,6 @@ class TestGetReviewPackage:
         tools = _register(_make_context(functions=[_make_function()]))
         result = tools["get_review_package"]("/bin/test.exe", "missing")
         assert "not found" in result.lower()
-
-
-# -- get_switch_tables -----------------------------------------------------
 
 
 class TestGetSwitchTables:

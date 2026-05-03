@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from src.utils.pseudocode_rules import PseudocodeRules, scan_text
+from src.utils.pseudocode_rules import PseudocodeRules, adjust_confidences, scan_text
 from src.utils.security import (
     FileSizeError,
     PathTraversalError,
@@ -26,8 +26,6 @@ logger = logging.getLogger(__name__)
 # the rules are stateless.
 _RULES = PseudocodeRules()
 
-
-# -- shared helpers ---------------------------------------------------------
 
 def _normalize_addr(raw: str | None) -> str:
     """Normalize an address string for comparison: lowercase, no 0x, no leading zeros."""
@@ -117,8 +115,6 @@ def _load_context(binary_path: str, cache, runner):
     return context, bp
 
 
-# -- registration -----------------------------------------------------------
-
 def register_review_tools(app, session_manager, cache, runner, api_patterns=None):
     """
     Register review-oriented MCP tools.
@@ -202,31 +198,62 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
         function_filter: str | None = None,
         severity_floor: str = "low",
         rule_ids: list[str] | None = None,
+        exclude_rule_ids: list[str] | None = None,
+        confidence_floor: int = 0,
         limit: int = 50,
+        offset: int = 0,
+        mode: str = "findings",
     ) -> str:
         """
         Scan cached pseudocode for CWE / vulnerability patterns.
 
-        Applies a curated rule set (see ``src/utils/pseudocode_rules.py``) to
-        every function's decompiled output. Pattern-based triage -- expect
-        false positives; use findings as starting points, not verdicts.
+        Pattern-based triage -- expect false positives. Each finding has a
+        confidence score (0-100) derived from rule baseline + per-function
+        context (corroboration from other rules, scanner-shape penalty,
+        dangerous-sink presence, regex-meta negative pattern).
+
+        Recommended workflow on large binaries (14K+ functions):
+          1. ``mode='summary', confidence_floor=60`` to surface top suspects
+          2. ``get_review_package(binary, top_function)`` for full context
+             so the model can confirm or reject each candidate.
+
+        Modes:
+          - "findings" (default): full per-finding report with excerpt and
+            recommendation, sorted by severity then confidence desc.
+          - "summary": one line per function showing finding count, max
+            confidence in that function, and severity breakdown.
 
         Args:
             binary_path: Path to analyzed binary (must have been analyzed
                 without ``skip_decompile=True``)
             function_filter: Optional regex filtered against function names
             severity_floor: "info" | "low" | "medium" | "high" | "critical"
-                (default "low")
-            rule_ids: Restrict scanning to specific rule ids
-            limit: Max findings to return (default 50, max 5000)
+            rule_ids: Restrict scanning to specific rule ids (allowlist)
+            exclude_rule_ids: Drop these rule ids (blocklist; e.g. silence
+                a rule known to be noisy on this target)
+            confidence_floor: Drop findings whose computed confidence falls
+                below this value (0-100). Use 60-70 for first-pass triage.
+            limit: Max rows to return (default 50, max 5000)
+            offset: Skip this many rows before returning ``limit``
+            mode: "findings" or "summary"
 
         Returns:
-            Formatted findings grouped by function, sorted by severity.
+            Findings or per-function summary, plus pagination footer.
         """
         try:
             import re as _re
 
             limit = validate_numeric_range(limit, 1, 5000, "limit")
+            offset = validate_numeric_range(offset, 0, 1_000_000, "offset")
+            confidence_floor = validate_numeric_range(
+                confidence_floor, 0, 100, "confidence_floor"
+            )
+            mode = mode.lower()
+            if mode not in ("findings", "summary"):
+                return (
+                    f"Invalid mode '{mode}'. Use 'findings' or 'summary'."
+                )
+
             context, _ = _load_context(binary_path, cache, runner)
             functions = context.get("functions", [])
 
@@ -234,10 +261,14 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
             rules = _RULES.filter(
                 severity_floor=severity_floor, rule_ids=rule_ids
             )
+            if exclude_rule_ids:
+                excluded = set(exclude_rule_ids)
+                rules = [r for r in rules if r.id not in excluded]
             if not rules:
                 return (
                     f"No rules matched severity_floor={severity_floor} / "
-                    f"rule_ids={rule_ids}. See PseudocodeRules for available rules."
+                    f"rule_ids={rule_ids} / exclude_rule_ids={exclude_rule_ids}. "
+                    f"See PseudocodeRules for available rules."
                 )
 
             severity_order = {
@@ -246,8 +277,10 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
                 )
             }
 
+            per_func: dict[str, dict] = {}
             all_findings: list[dict] = []
             scanned = 0
+            dropped_by_confidence = 0
             for func in functions:
                 if pattern and not pattern.search(func.get("name") or ""):
                     continue
@@ -255,41 +288,156 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
                 if not pseudo:
                     continue
                 scanned += 1
-                for finding in scan_text(pseudo, rules):
-                    finding["function"] = func.get("name")
-                    finding["address"] = func.get("address")
-                    all_findings.append(finding)
+                fname = func.get("name") or "?"
+                faddr = func.get("address") or "?"
 
-            # Sort by severity descending, then by rule id for determinism
+                func_findings = scan_text(pseudo, rules)
+                adjust_confidences(func_findings, pseudo)
+
+                kept: list[dict] = []
+                for finding in func_findings:
+                    if finding["confidence"] < confidence_floor:
+                        dropped_by_confidence += 1
+                        continue
+                    finding["function"] = fname
+                    finding["address"] = faddr
+                    kept.append(finding)
+                if not kept:
+                    continue
+
+                bucket = per_func.setdefault(fname, {
+                    "name": fname,
+                    "address": faddr,
+                    "by_severity": {},
+                    "max_severity_idx": -1,
+                    "max_confidence": 0,
+                    "total": 0,
+                })
+                for finding in kept:
+                    all_findings.append(finding)
+                    sev = finding["severity"]
+                    bucket["by_severity"][sev] = bucket["by_severity"].get(sev, 0) + 1
+                    bucket["total"] += 1
+                    sev_idx = severity_order.get(sev, 0)
+                    if sev_idx > bucket["max_severity_idx"]:
+                        bucket["max_severity_idx"] = sev_idx
+                    if finding["confidence"] > bucket["max_confidence"]:
+                        bucket["max_confidence"] = finding["confidence"]
+
+            if not all_findings:
+                msg = (
+                    f"No findings. Scanned {scanned} functions with "
+                    f"{len(rules)} rules at severity_floor='{severity_floor}'"
+                )
+                if confidence_floor > 0:
+                    msg += (
+                        f", confidence_floor={confidence_floor} "
+                        f"(dropped {dropped_by_confidence} low-confidence hits)"
+                    )
+                return msg + "."
+
             all_findings.sort(
                 key=lambda f: (
                     -severity_order.get(f["severity"], 0),
+                    -f["confidence"],
                     f["rule_id"],
                 )
             )
-            total = len(all_findings)
-            all_findings = all_findings[:limit]
 
-            if not all_findings:
-                return (
-                    f"No findings. Scanned {scanned} functions with "
-                    f"{len(rules)} rules at severity_floor='{severity_floor}'."
+            total_findings = len(all_findings)
+            total_funcs_with_findings = len(per_func)
+
+            if mode == "summary":
+                summary_rows = sorted(
+                    per_func.values(),
+                    key=lambda r: (
+                        -r["max_severity_idx"],
+                        -r["max_confidence"],
+                        -r["total"],
+                        r["name"],
+                    ),
                 )
+                page = summary_rows[offset:offset + limit]
+                header = (
+                    f"**Pseudocode scan SUMMARY: {total_findings} finding(s) "
+                    f"across {total_funcs_with_findings} function(s) "
+                    f"of {scanned} scanned**"
+                )
+                meta = f"Rules: {len(rules)} | Severity floor: {severity_floor}"
+                if confidence_floor > 0:
+                    meta += (
+                        f" | Confidence floor: {confidence_floor} "
+                        f"(dropped {dropped_by_confidence})"
+                    )
+                lines = [header, meta, ""]
+                if not page:
+                    lines.append(
+                        f"Offset {offset} is beyond the result set "
+                        f"({total_funcs_with_findings} functions)."
+                    )
+                    return "\n".join(lines)
 
-            lines = [
-                f"**Pseudocode scan: {total} finding(s) across {scanned} function(s)**",
-                f"Rules: {len(rules)} | Severity floor: {severity_floor}",
-                "",
-            ]
-            for hit in all_findings:
+                for row in page:
+                    sev_breakdown = " ".join(
+                        f"{sev}={row['by_severity'][sev]}"
+                        for sev in ("critical", "high", "medium", "low", "info")
+                        if row["by_severity"].get(sev)
+                    )
+                    lines.append(
+                        f"- {row['name']} @ {row['address']}  "
+                        f"(conf={row['max_confidence']}, {row['total']} total) "
+                        f"{sev_breakdown}"
+                    )
+
+                next_offset = offset + len(page)
+                if next_offset < total_funcs_with_findings:
+                    lines.append("")
+                    lines.append(
+                        f"_Showing {offset + 1}-{next_offset} of "
+                        f"{total_funcs_with_findings}. "
+                        f"Call again with offset={next_offset} for the next page._"
+                    )
+                return "\n".join(lines)
+
+            page = all_findings[offset:offset + limit]
+            header = (
+                f"**Pseudocode scan: {total_findings} finding(s) "
+                f"across {total_funcs_with_findings} function(s) "
+                f"of {scanned} scanned**"
+            )
+            meta = f"Rules: {len(rules)} | Severity floor: {severity_floor}"
+            if confidence_floor > 0:
+                meta += (
+                    f" | Confidence floor: {confidence_floor} "
+                    f"(dropped {dropped_by_confidence})"
+                )
+            lines = [header, meta, ""]
+            if not page:
                 lines.append(
-                    f"[{hit['severity'].upper()}] {hit['rule_id']} ({hit['cwe']}) "
+                    f"Offset {offset} is beyond the result set "
+                    f"({total_findings} findings)."
+                )
+                return "\n".join(lines)
+
+            for hit in page:
+                lines.append(
+                    f"[{hit['severity'].upper()} conf={hit['confidence']}] "
+                    f"{hit['rule_id']} ({hit['cwe']}) "
                     f"-- {hit['function']} @ {hit['address']}"
                 )
                 lines.append(f"    {hit['description']}")
                 lines.append(f"    excerpt: {hit['excerpt']}")
                 lines.append(f"    → {hit['recommendation']}")
                 lines.append("")
+
+            next_offset = offset + len(page)
+            if next_offset < total_findings:
+                lines.append(
+                    f"_Showing {offset + 1}-{next_offset} of "
+                    f"{total_findings}. "
+                    f"Call again with offset={next_offset} for the next page. "
+                    f"Tip: try mode='summary' for a bird's-eye view._"
+                )
             return "\n".join(lines)
 
         except (PathTraversalError, FileSizeError, FileNotFoundError) as e:
@@ -493,8 +641,6 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
         except Exception as e:
             logger.exception(f"get_review_package failed: {e}")
             return f"Error: {e}"
-
-    # -- switch-tables reader (pairs with core_analysis.py extension) -------
 
     @app.tool()
     def get_switch_tables(

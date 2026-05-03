@@ -185,11 +185,14 @@ def _load_resume_cache(path):
     """
     Load a previous analysis cache for resumable analysis.
 
-    Supports both gzipped (.json.gz) and plain (.json) cache files.
-    Returns (context_dict, set_of_analyzed_addresses) or (None, set()).
+    Returns ``(context_dict, addr_to_index)`` where ``addr_to_index`` maps each
+    cached function address to its position in ``context_dict["functions"]``.
+    Callers use the index for in-place replacement when re-processing a
+    function (e.g. extending pseudocode coverage onto a structural-only run).
+    Returns ``(None, {})`` if the cache cannot be loaded.
     """
     if not path or not os.path.exists(path):
-        return None, set()
+        return None, {}
 
     try:
         if path.endswith(".gz"):
@@ -205,15 +208,49 @@ def _load_resume_cache(path):
             finally:
                 f.close()
 
-        analyzed = set()
-        for func in data.get("functions", []):
+        addr_to_index = {}
+        for idx, func in enumerate(data.get("functions", [])):
             addr = func.get("address")
             if addr:
-                analyzed.add(addr)
-        return data, analyzed
+                addr_to_index[addr] = idx
+        return data, addr_to_index
     except Exception as e:
         print(safe_format("[!] Failed to load resume cache {}: {}", path, safe_unicode(e)))
-        return None, set()
+        return None, {}
+
+
+def _existing_has_pseudocode(existing):
+    """True iff a cached function entry already carries usable pseudocode."""
+    if not existing:
+        return False
+    if existing.get("pseudocode"):
+        return True
+    # Thunks / externals are intentionally never decompiled, treat as complete.
+    if existing.get("decompile_status") in ("skipped_thunk_or_external",):
+        return True
+    return False
+
+
+def _load_resume_manifest(path):
+    """
+    Load a small ``{"complete_addresses": [...]}`` sidecar.
+
+    Returns ``set(addresses_to_skip)``. Empty set on missing or malformed
+    manifest (caller is expected to fall back to a full run in that case).
+    """
+    if not path or not os.path.exists(path):
+        return set()
+    try:
+        f = codecs.open(path, "r", encoding="utf-8")
+        try:
+            data = json.load(f)
+        finally:
+            f.close()
+        return set(data.get("complete_addresses", []) or [])
+    except Exception as e:
+        print(safe_format("[!] Failed to load resume manifest {}: {}",
+                          path, safe_unicode(e)))
+        return set()
 
 
 def extract_comprehensive_analysis():
@@ -238,6 +275,10 @@ def extract_comprehensive_analysis():
     max_functions = int(os.environ.get("GHIDRA_MAX_FUNCTIONS", "0"))  # 0 = unlimited
     skip_decompile = os.environ.get("GHIDRA_SKIP_DECOMPILE", "").lower() in ("1", "true", "yes")
     total_budget = int(os.environ.get("GHIDRA_ANALYSIS_BUDGET", "540"))
+    # GHIDRA_RESUME_MANIFEST is preferred -- a tiny sidecar with just the
+    # complete-address list. GHIDRA_RESUME_CACHE remains for backward compat
+    # but loading the full multi-GB cache will OOM the JVM on large binaries.
+    resume_manifest_path = os.environ.get("GHIDRA_RESUME_MANIFEST", "") or None
     resume_cache_path = os.environ.get("GHIDRA_RESUME_CACHE", "") or None
     start_addr = _parse_hex_addr(os.environ.get("GHIDRA_START_ADDRESS"))
     end_addr = _parse_hex_addr(os.environ.get("GHIDRA_END_ADDRESS"))
@@ -248,7 +289,9 @@ def extract_comprehensive_analysis():
     print(safe_format("    Max functions: {}", max_functions if max_functions > 0 else "unlimited"))
     print(safe_format("    Skip decompile: {}", skip_decompile))
     print(safe_format("    Wall-clock budget: {}s", total_budget))
-    if resume_cache_path:
+    if resume_manifest_path:
+        print(safe_format("    Resume manifest: {}", resume_manifest_path))
+    elif resume_cache_path:
         print(safe_format("    Resume cache: {}", resume_cache_path))
     if start_addr is not None:
         print(safe_format("    Start address: 0x{:x}", start_addr))
@@ -281,11 +324,28 @@ def extract_comprehensive_analysis():
             fid_service = None
             fid_files = None
 
-    # Load prior cache if resuming
-    resume_context, already_analyzed = _load_resume_cache(resume_cache_path)
-    if resume_context:
-        print(safe_format("[*] Resumed from cache: {} functions already analyzed",
-                          len(already_analyzed)))
+    # Load resume state. Manifest (delta mode) is preferred -- it never loads
+    # the multi-GB cache into the JVM. Legacy GHIDRA_RESUME_CACHE remains for
+    # callers that have not been updated, but is OOM-prone on large binaries.
+    delta_mode = False
+    addr_to_index = {}
+    resume_context = None
+    skip_addresses = set()
+    if resume_manifest_path:
+        skip_addresses = _load_resume_manifest(resume_manifest_path)
+        delta_mode = True
+        if skip_addresses:
+            print(safe_format(
+                "[*] Delta mode: {} addresses marked complete in manifest",
+                len(skip_addresses),
+            ))
+    elif resume_cache_path:
+        resume_context, addr_to_index = _load_resume_cache(resume_cache_path)
+        if resume_context:
+            print(safe_format(
+                "[*] Resumed from cache: {} functions already analyzed",
+                len(addr_to_index),
+            ))
 
     # Initialize decompiler
     decompiler = DecompInterface()
@@ -319,7 +379,7 @@ def extract_comprehensive_analysis():
             "function_timeout_setting": function_timeout,
             "max_functions_setting": max_functions if max_functions > 0 else None,
             "resumed": True,
-            "resumed_from_count": len(already_analyzed),
+            "resumed_from_count": len(addr_to_index),
         }
     else:
         context = {
@@ -343,7 +403,8 @@ def extract_comprehensive_analysis():
                 "internal_timeouts": 0,  # Ghidra's internal decompiler timeouts
                 "partial_results": False,
                 "function_timeout_setting": function_timeout,
-                "max_functions_setting": max_functions if max_functions > 0 else None
+                "max_functions_setting": max_functions if max_functions > 0 else None,
+                "delta_run": delta_mode,
             },
             "skipped_functions": []  # Track functions that couldn't be analyzed
         }
@@ -474,17 +535,37 @@ def extract_comprehensive_analysis():
 
     skipped_by_resume = 0
     skipped_by_range = 0
+    redecompiled_count = 0
 
+    # When ``existing_index`` is set on the loop, we are extending an already-
+    # cached entry rather than appending a new one. Used to fill in pseudocode
+    # for functions previously analyzed with skip_decompile=True.
     while function_iterator.hasNext():
         function = function_iterator.next()
 
         entry_point = function.getEntryPoint()
         entry_str = safe_unicode(entry_point)
 
-        # Skip functions already present in resume cache
-        if already_analyzed and entry_str in already_analyzed:
-            skipped_by_resume += 1
-            continue
+        # Delta mode: a tiny manifest tells us which addresses are already
+        # complete. We skip those and emit only NEW or RE-DECOMPILED entries;
+        # the Python side merges into the existing cache.
+        if delta_mode:
+            if entry_str in skip_addresses:
+                skipped_by_resume += 1
+                continue
+            existing_index = None
+        else:
+            existing_index = addr_to_index.get(entry_str) if addr_to_index else None
+            existing_entry = (
+                context["functions"][existing_index] if existing_index is not None else None
+            )
+            if existing_entry is not None:
+                # If the prior run already produced everything we need for this
+                # function, skip it. Otherwise fall through and re-process so the
+                # missing fields (typically pseudocode) get filled in.
+                if skip_decompile or _existing_has_pseudocode(existing_entry):
+                    skipped_by_resume += 1
+                    continue
 
         # Apply address-range filter (chunked analysis)
         if start_addr is not None or end_addr is not None:
@@ -734,7 +815,13 @@ def extract_comprehensive_analysis():
         else:
             function_info["decompile_status"] = "skipped_thunk_or_external"
 
-        context["functions"].append(function_info)
+        if existing_index is not None:
+            # Extending a previously-cached entry (typically backfilling
+            # pseudocode onto a structural-only run). Replace in place.
+            context["functions"][existing_index] = function_info
+            redecompiled_count += 1
+        else:
+            context["functions"].append(function_info)
 
         # Check wall-clock budget to prevent total data loss on process timeout
         if time.time() - analysis_start > total_budget:
@@ -751,6 +838,7 @@ def extract_comprehensive_analysis():
     context["analysis_stats"]["functions_skipped"] = len(context["skipped_functions"])
     context["analysis_stats"]["skipped_by_resume"] = skipped_by_resume
     context["analysis_stats"]["skipped_by_range"] = skipped_by_range
+    context["analysis_stats"]["redecompiled"] = redecompiled_count
     context["analysis_stats"]["total_functions_in_cache"] = len(context["functions"])
 
     # Extract data types (structures)

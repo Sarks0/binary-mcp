@@ -10,9 +10,11 @@ Provides 245 tools for static and dynamic binary analysis:
 - Function hashing and cross-binary matching
 """
 
+import contextlib
 import functools
 import json
 import logging
+import os
 import re
 import struct
 import sys
@@ -274,6 +276,163 @@ def _get_elf_loader_recommendation(binary_path: str) -> str | None:
         return None
 
 
+def _write_resume_manifest(
+    cache_dir: Path,
+    binary_path: str,
+    existing_cache: dict,
+    skip_decompile: bool,
+) -> str | None:
+    """
+    Write a tiny ``{"complete_addresses": [...]}`` sidecar so the Ghidra
+    Jython script can skip already-analyzed functions without loading the
+    multi-GB resume JSON (which OOMs the JVM on large binaries).
+
+    "Complete" depends on the upcoming run:
+      - ``skip_decompile=True`` -> every cached entry counts as complete
+      - ``skip_decompile=False`` -> only entries with pseudocode (or
+        thunks/externals that are intentionally never decompiled)
+
+    Writes are atomic (tmp file + os.replace) so a crashed run cannot leave
+    a partial JSON that the next run silently trusts.
+    """
+    try:
+        complete = []
+        for func in existing_cache.get("functions", []):
+            addr = func.get("address")
+            if not addr:
+                continue
+            if skip_decompile:
+                complete.append(addr)
+                continue
+            if func.get("pseudocode"):
+                complete.append(addr)
+                continue
+            if func.get("decompile_status") == "skipped_thunk_or_external":
+                complete.append(addr)
+                continue
+        manifest_path = (
+            Path(cache_dir) / f"resume_manifest_{Path(binary_path).stem}.json"
+        )
+        tmp_path = manifest_path.with_suffix(manifest_path.suffix + ".tmp")
+        run_id = f"{os.getpid()}-{time.monotonic_ns()}"
+        body = {"complete_addresses": complete, "run_id": run_id}
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(body, f)
+        os.replace(tmp_path, manifest_path)
+        logger.info(
+            f"Wrote resume manifest with {len(complete)} complete addresses "
+            f"to {manifest_path} (run_id={run_id})"
+        )
+        return str(manifest_path)
+    except Exception as e:
+        logger.warning(f"Failed to write resume manifest: {e}")
+        return None
+
+
+@contextlib.contextmanager
+def _delta_run_lock(cache_dir: Path, binary_path: str):
+    """
+    Cross-platform exclusive lock for incremental Ghidra runs on a binary.
+
+    Two parallel ``analyze_binary(..., incremental=True)`` calls on the same
+    binary would race on the manifest, the temp output JSON, and the cache
+    file. This advisory lock makes the second caller fail fast with a clear
+    message instead of silently corrupting cache state.
+    """
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = cache_dir / f"delta_run_{Path(binary_path).stem}.lock"
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+    locked = False
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+            try:
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                locked = True
+            except OSError:
+                raise RuntimeError(
+                    f"Another incremental analysis is already running for "
+                    f"{binary_path}. Wait for it to finish or remove "
+                    f"{lock_path} if you are sure no run is in progress."
+                )
+        else:
+            import fcntl
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+            except (BlockingIOError, OSError):
+                raise RuntimeError(
+                    f"Another incremental analysis is already running for "
+                    f"{binary_path}. Wait for it to finish or remove "
+                    f"{lock_path} if you are sure no run is in progress."
+                )
+        yield
+    finally:
+        if locked:
+            try:
+                if sys.platform == "win32":
+                    import msvcrt
+                    try:
+                        os.lseek(fd, 0, os.SEEK_SET)
+                        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                    except OSError:
+                        pass
+                else:
+                    import fcntl
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            except Exception:
+                pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            lock_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _merge_delta_into_cache(existing: dict, delta: dict) -> dict:
+    """
+    Merge a delta context (output of an incremental Ghidra run) into the
+    existing cached context.
+
+    Top-level fields from the new run replace the old ones (metadata,
+    imports, exports, strings, memory_map, data_types, analysis_stats).
+    The functions list is merged per-address: delta entries replace old
+    entries with the same address; new addresses are appended; addresses
+    that the delta did not touch are preserved from the existing cache.
+    """
+    merged = dict(delta)
+
+    # Index existing functions by address for fast replacement.
+    existing_funcs = existing.get("functions", []) or []
+    addr_to_idx = {}
+    for idx, f in enumerate(existing_funcs):
+        a = f.get("address")
+        if a:
+            addr_to_idx[a] = idx
+
+    merged_funcs = list(existing_funcs)
+    for new_func in delta.get("functions", []) or []:
+        addr = new_func.get("address")
+        if not addr:
+            continue
+        if addr in addr_to_idx:
+            merged_funcs[addr_to_idx[addr]] = new_func
+        else:
+            merged_funcs.append(new_func)
+    merged["functions"] = merged_funcs
+
+    # Preserve previously-extracted skipped_functions list if the delta
+    # didn't produce one (rare, but be defensive).
+    if not merged.get("skipped_functions") and existing.get("skipped_functions"):
+        merged["skipped_functions"] = existing["skipped_functions"]
+
+    return merged
+
+
 def get_analysis_context(
     binary_path: str,
     force_reanalyze: bool = False,
@@ -354,14 +513,43 @@ def get_analysis_context(
     output_path = cache.cache_dir / f"temp_analysis_{Path(binary_path).stem}.json"
     script_path = Path(__file__).parent / "engines" / "static" / "ghidra" / "scripts"
 
-    # Resolve resume path if caller wants to extend an existing cache
+    # Resolve resume path if caller wants to extend an existing cache.
+    # When the caller passed start_address/end_address but did not also pass
+    # incremental=True, auto-promote: a ranged run without resume would
+    # overwrite the existing full cache with a tiny range-only result.
+    if (start_address or end_address) and not incremental:
+        existing = cache.get_cache_path(binary_path)
+        if existing is not None:
+            logger.info(
+                "Address range supplied without incremental=True; auto-promoting "
+                "to incremental to avoid overwriting the existing cache."
+            )
+            incremental = True
+
     resume_from_cache = None
+    resume_manifest_path = None
+    existing_cache_data = None
+    delta_lock_cm = contextlib.nullcontext()
     if incremental:
         resume_from_cache = cache.get_cache_path(binary_path)
         if resume_from_cache is None:
             logger.info("incremental=True but no cache exists yet; running full analysis")
         else:
             logger.info(f"Resuming analysis from cache: {resume_from_cache}")
+            # Acquire an advisory lock so a second concurrent incremental run
+            # on the same binary fails fast instead of corrupting the cache.
+            delta_lock_cm = _delta_run_lock(cache.cache_dir, binary_path)
+            delta_lock_cm.__enter__()
+            try:
+                existing_cache_data = cache.get_cached(binary_path)
+            except Exception as e:
+                logger.warning(f"Could not pre-load cache for delta merge: {e}")
+                existing_cache_data = None
+            if existing_cache_data is not None:
+                resume_manifest_path = _write_resume_manifest(
+                    cache.cache_dir, binary_path, existing_cache_data,
+                    skip_decompile=skip_decompile,
+                )
 
     try:
         # Default bumped to 1800s (30 min) -- large binaries routinely need more
@@ -380,7 +568,10 @@ def get_analysis_context(
             skip_decompile=skip_decompile,
             max_functions=max_functions,
             function_timeout=function_timeout,
-            resume_from_cache=str(resume_from_cache) if resume_from_cache else None,
+            resume_from_cache=None if resume_manifest_path else (
+                str(resume_from_cache) if resume_from_cache else None
+            ),
+            resume_manifest=resume_manifest_path,
             start_address=start_address,
             end_address=end_address,
             pdb_path=pdb_path,
@@ -450,6 +641,18 @@ def get_analysis_context(
         with open(output_path, encoding="utf-8") as f:
             context = json.load(f)
 
+        # If the Ghidra script ran in delta mode (manifest-based resume),
+        # ``context`` holds only NEW or RE-DECOMPILED functions plus refreshed
+        # top-level fields. Merge it into the existing cache before validation
+        # so a small delta does not get rejected for having "too few functions".
+        is_delta_run = bool(context.get("analysis_stats", {}).get("delta_run"))
+        if is_delta_run and existing_cache_data is not None:
+            logger.info(
+                f"Merging delta ({len(context.get('functions', []))} entries) "
+                f"into cache ({len(existing_cache_data.get('functions', []))} entries)"
+            )
+            context = _merge_delta_into_cache(existing_cache_data, context)
+
         # Validate the analysis context has meaningful data
         is_valid, validation_error = _validate_analysis_context(
             context, binary_path, ghidra_stdout, ghidra_stderr
@@ -485,6 +688,16 @@ def get_analysis_context(
     except Exception as e:
         logger.error(f"Analysis failed: {e}")
         raise RuntimeError(f"Failed to analyze binary: {e}")
+    finally:
+        if resume_manifest_path:
+            try:
+                Path(resume_manifest_path).unlink(missing_ok=True)
+            except Exception as e:
+                logger.debug(f"Could not clean up resume manifest: {e}")
+        try:
+            delta_lock_cm.__exit__(None, None, None)
+        except Exception as e:
+            logger.debug(f"Delta-run lock release failed: {e}")
 
 
 # --- Phase 1: Core Tools (P0 - Critical) ---
@@ -647,7 +860,10 @@ Format: {compat_info.format.value}
 
         # Surface incremental / partial-run stats when present
         stats = context.get("analysis_stats", {})
-        if stats.get("resumed") or stats.get("partial_results") or stats.get("skipped_by_range"):
+        if (
+            stats.get("resumed") or stats.get("partial_results")
+            or stats.get("skipped_by_range") or stats.get("redecompiled")
+        ):
             summary += "\n**Analysis Run Stats:**\n"
             if stats.get("resumed"):
                 summary += (
@@ -655,8 +871,13 @@ Format: {compat_info.format.value}
                     f"{stats.get('resumed_from_count', 0)} functions preserved\n"
                 )
             summary += f"- Functions processed this run: {stats.get('functions_analyzed', 0)}\n"
+            if stats.get("redecompiled"):
+                summary += (
+                    f"- Re-decompiled (pseudocode added to existing entries): "
+                    f"{stats['redecompiled']}\n"
+                )
             if stats.get("skipped_by_resume"):
-                summary += f"- Skipped (already in cache): {stats['skipped_by_resume']}\n"
+                summary += f"- Skipped (already complete in cache): {stats['skipped_by_resume']}\n"
             if stats.get("skipped_by_range"):
                 summary += f"- Skipped (outside address range): {stats['skipped_by_range']}\n"
             if stats.get("partial_results"):
@@ -685,7 +906,11 @@ Use other tools like get_functions, get_imports, decompile_function to explore t
 
 @app.tool()
 @log_to_session
-def load_pdb(binary_path: str, pdb_path: str) -> str:
+def load_pdb(
+    binary_path: str,
+    pdb_path: str | None = None,
+    symbol_path: str | None = None,
+) -> str:
     """
     Apply a Windows PDB to an analyzed binary.
 
@@ -693,14 +918,36 @@ def load_pdb(binary_path: str, pdb_path: str) -> str:
     expects ``<binary-stem>.pdb`` adjacency), invalidates any existing
     cache, and re-runs analysis so symbolic function names propagate.
 
+    When ``pdb_path`` is omitted (or set to ``"auto"``), reads the binary's
+    CodeView (RSDS) debug record and downloads the matching PDB from the
+    Microsoft public symbol server, caching it under
+    ``~/.binary_mcp_cache/symbols/``.
+
     Args:
         binary_path: Path to the binary
-        pdb_path: Path to the PDB file
+        pdb_path: Path to the PDB file, or None / "auto" to fetch from
+                  a configured symbol server.
+        symbol_path: Optional Windows-style ``_NT_SYMBOL_PATH``
+                  (e.g. ``"srv*C:\\symbols*https://msdl.microsoft.com/download/symbols"``).
+                  Falls back to the ``BINARY_MCP_SYMBOL_PATH`` /
+                  ``_NT_SYMBOL_PATH`` env vars, then to the public
+                  Microsoft server. Multiple servers can be chained
+                  with ``;``.
 
     Returns:
         Summary comparing pre/post symbolic-function counts.
     """
     try:
+        if pdb_path in (None, "", "auto"):
+            from src.utils.pdb_fetcher import fetch_pdb
+            try:
+                fetched = fetch_pdb(binary_path, symbol_path=symbol_path)
+            except ValueError as e:
+                return f"Cannot auto-fetch PDB: {e}"
+            except RuntimeError as e:
+                return f"Symbol server fetch failed: {e}"
+            pdb_path = str(fetched)
+
         # Capture pre-state for before/after comparison
         pre_cached = cache.get_cached(binary_path)
         pre_named = 0
@@ -978,7 +1225,7 @@ def get_xrefs(
     Args:
         binary_path: Path to analyzed binary
         address: Hex address to find xrefs for (e.g. "0x401000")
-        function_name: Convenience alternative to address — resolves to the
+        function_name: Convenience alternative to address - resolves to the
             function's entry point
         direction: "to" (references inbound) or "from" (outbound)
         limit: Max xref rows to list (default 200)
@@ -1441,51 +1688,185 @@ def extract_metadata(
         return f"Error: {e}"
 
 
+def _parse_byte_pattern(pattern: str) -> tuple[bytes, bytes] | None:
+    """
+    Parse a hex byte pattern, optionally with '?' or '??' wildcards.
+
+    Accepts forms like:
+      - "4883EC20"
+      - "48 83 EC 20"
+      - "48 83 ?? 20"  (single-byte wildcard)
+      - "48 83 EC ??"
+
+    Returns (needle_bytes, mask_bytes) where mask byte is 0xFF for fixed
+    bytes and 0x00 for wildcards. Returns None if the pattern is invalid.
+    """
+    cleaned = pattern.replace(" ", "").replace("\t", "").lower()
+    if len(cleaned) % 2 != 0 or len(cleaned) == 0:
+        return None
+
+    needle = bytearray()
+    mask = bytearray()
+    for i in range(0, len(cleaned), 2):
+        chunk = cleaned[i:i + 2]
+        if chunk in ("??", "?."):
+            needle.append(0)
+            mask.append(0)
+            continue
+        try:
+            needle.append(int(chunk, 16))
+            mask.append(0xFF)
+        except ValueError:
+            return None
+    return bytes(needle), bytes(mask)
+
+
+def _scan_with_mask(data: bytes, needle: bytes, mask: bytes, max_results: int) -> list[int]:
+    """Linear masked scan over a bytes buffer; returns list of file offsets."""
+    if not needle:
+        return []
+    has_wildcards = b"\x00" in mask and any(m != 0xFF for m in mask)
+    if not has_wildcards:
+        offsets: list[int] = []
+        start = 0
+        while len(offsets) < max_results:
+            idx = data.find(needle, start)
+            if idx < 0:
+                break
+            offsets.append(idx)
+            start = idx + 1
+        return offsets
+
+    offsets = []
+    n = len(needle)
+    end = len(data) - n
+    i = 0
+    while i <= end and len(offsets) < max_results:
+        match = True
+        for j in range(n):
+            if mask[j] and data[i + j] != needle[j]:
+                match = False
+                break
+        if match:
+            offsets.append(i)
+        i += 1
+    return offsets
+
+
 @app.tool()
 @log_to_session
 def search_bytes(
     binary_path: str,
     pattern: str,
-    max_results: int = 50
+    max_results: int = 50,
 ) -> str:
     """
-    Search for byte patterns in the binary.
+    Search for a byte/instruction pattern in the binary.
+
+    Reads the binary directly and reports each match's virtual address.
+    When an address falls inside a known function, the function name and
+    offset-into-function are surfaced so hits land in context.
 
     Args:
         binary_path: Path to analyzed binary
-        pattern: Hex byte pattern (e.g., "4883EC20" or "48 83 EC 20")
-        max_results: Maximum number of results (default: 50)
+        pattern: Hex byte pattern. Spaces optional; '??' (or '?.') marks a
+            single-byte wildcard. Examples:
+            - "4883EC20"           → exact 4 bytes
+            - "48 83 EC 20"        → same, with spaces
+            - "48 83 ?? 20"        → wildcard third byte
+        max_results: Maximum number of results (default 50, max 1000)
 
     Returns:
-        List of addresses where pattern was found
+        Listing of matches with VA, function context, and file offset.
     """
     try:
-        # This would require reading the binary directly
-        # For now, search in strings as a simple implementation
-        context = get_analysis_context(binary_path)
+        from src.utils.binary_reader import BinaryReader
 
-        # Remove spaces and convert to lowercase
-        clean_pattern = pattern.replace(' ', '').lower()
+        max_results = validate_numeric_range(max_results, 1, 1000, "max_results")
 
-        result = f"**Byte Pattern Search: '{pattern}'**\n\n"
-        result += "*Note: Full byte search requires direct binary access. Currently searching in extracted data.*\n\n"
+        parsed = _parse_byte_pattern(pattern)
+        if parsed is None:
+            return (
+                f"Error: invalid hex pattern '{pattern}'. Expected pairs of "
+                f"hex digits, optionally separated by spaces, with '??' for "
+                f"wildcards. Length must be a multiple of 2."
+            )
+        needle, mask = parsed
 
-        # Search in string data as a placeholder
-        strings = context.get("strings", [])
-        found = 0
+        # Don't trigger a Ghidra run just to scan bytes -- if cache is
+        # missing, fall back to context-free hits.
+        cached = cache.get_cached(binary_path)
+        functions = cached.get("functions", []) if cached else []
 
-        for string in strings:
-            if clean_pattern in string.get('value', '').lower():
-                result += f"- Found in string at {string.get('address')}: {string.get('value')[:100]}\n"
-                found += 1
-                if found >= max_results:
-                    break
+        with BinaryReader(binary_path) as reader:
+            data = reader.read_full()
+            offsets = _scan_with_mask(data, needle, mask, max_results + 1)
+            hits: list[dict] = []
+            for off in offsets:
+                va = reader.file_offset_to_va(off)
+                hits.append({"file_offset": off, "va": va})
 
-        if found == 0:
-            result += "No matches found.\n"
+        if functions:
+            ranges: list[tuple[int, int, str]] = []
+            for f in functions:
+                try:
+                    start = int(str(f.get("address") or "0").replace("0x", ""), 16)
+                except ValueError:
+                    continue
+                end = start
+                for bb in f.get("basic_blocks") or []:
+                    try:
+                        bb_end = int(str(bb.get("end") or "0").replace("0x", ""), 16)
+                        if bb_end > end:
+                            end = bb_end
+                    except ValueError:
+                        continue
+                if end <= start:
+                    end = start + max(1, f.get("size") or 0)
+                ranges.append((start, end, f.get("name") or "?"))
+            ranges.sort()
 
-        return result
+            def _resolve(va: int | None) -> tuple[str, int] | None:
+                if va is None:
+                    return None
+                for s, e, name in ranges:
+                    if s <= va <= e:
+                        return name, va - s
+                return None
 
+            for h in hits:
+                ctx = _resolve(h["va"])
+                if ctx:
+                    h["function"] = ctx[0]
+                    h["offset_in_function"] = ctx[1]
+
+        total = len(hits)
+        truncated = total > max_results
+        hits = hits[:max_results]
+
+        lines = [f"**Byte Pattern Search: `{pattern}`**", ""]
+        if total == 0:
+            lines.append("No matches found.")
+            return "\n".join(lines)
+
+        lines.append(
+            f"Found {total} match(es)"
+            + (f" (showing first {max_results})" if truncated else "")
+        )
+        lines.append("")
+        for h in hits:
+            va_str = f"0x{h['va']:x}" if h["va"] is not None else "(unmapped)"
+            line = f"- {va_str}  [file offset 0x{h['file_offset']:x}]"
+            if "function" in h:
+                line += f"  in `{h['function']}` +0x{h['offset_in_function']:x}"
+            lines.append(line)
+
+        return "\n".join(lines)
+
+    except FileNotFoundError as e:
+        return f"Binary not found: {e}"
+    except (PathTraversalError, FileSizeError) as e:
+        return safe_error_message("search_bytes", e)
     except Exception as e:
         logger.error(f"search_bytes failed: {e}")
         return f"Error: {e}"

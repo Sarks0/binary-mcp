@@ -1,13 +1,25 @@
-"""Tests for src/utils/pdb_fetcher.py — CodeView extraction, URL building,
+"""Tests for src/utils/pdb_fetcher.py - CodeView extraction, URL building,
 and the cache-first fetch_pdb path.
 """
 
 from __future__ import annotations
 
+import io
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+
+def _streaming_response(payload: bytes, status: int = 200):
+    """Build a context-manager mock that streams ``payload`` like urlopen()."""
+    buf = io.BytesIO(payload)
+    resp = MagicMock()
+    resp.getcode.return_value = status
+    resp.read = buf.read
+    resp.__enter__ = lambda self: self
+    resp.__exit__ = lambda self, *a: False
+    return resp
 
 
 def test_build_symbol_server_url():
@@ -160,11 +172,7 @@ def test_fetch_pdb_downloads_when_not_cached(tmp_path):
     binary = tmp_path / "test.exe"
     binary.write_bytes(b"MZ")
 
-    fake_resp = MagicMock()
-    fake_resp.status = 200
-    fake_resp.read.return_value = b"PDB-DOWNLOADED"
-    fake_resp.__enter__ = lambda self: self
-    fake_resp.__exit__ = lambda self, *a: False
+    fake_resp = _streaming_response(b"PDB-DOWNLOADED")
 
     with patch.object(mod, "extract_codeview_record", return_value=cv):
         with patch("urllib.request.urlopen", return_value=fake_resp) as urlopen:
@@ -277,12 +285,6 @@ def test_fetch_pdb_falls_back_to_second_server(tmp_path, monkeypatch):
     binary = tmp_path / "fb.exe"
     binary.write_bytes(b"MZ")
 
-    fake_resp = MagicMock()
-    fake_resp.status = 200
-    fake_resp.read.return_value = b"FROM-FALLBACK"
-    fake_resp.__enter__ = lambda self: self
-    fake_resp.__exit__ = lambda self, *a: False
-
     err = urllib.error.HTTPError(
         url="http://primary", code=404, msg="Not Found",
         hdrs=None, fp=None,
@@ -294,7 +296,7 @@ def test_fetch_pdb_falls_back_to_second_server(tmp_path, monkeypatch):
         calls.append(req.full_url)
         if "primary" in req.full_url:
             raise err
-        return fake_resp
+        return _streaming_response(b"FROM-FALLBACK")
 
     with patch.object(mod, "extract_codeview_record", return_value=cv):
         with patch("urllib.request.urlopen", side_effect=fake_urlopen):
@@ -363,3 +365,183 @@ def test_fetch_pdb_http_error_wraps_as_runtime(tmp_path):
                     cache_dir=tmp_path / "cache",
                     symbol_path="srv*https://msdl.microsoft.com/download/symbols",
                 )
+
+
+# --- Sanitisation / hardening tests --------------------------------------
+
+class TestSanitisePdbName:
+    def test_rejects_path_traversal(self):
+        from src.utils.pdb_fetcher import _sanitize_pdb_name
+
+        assert _sanitize_pdb_name("..\\evil.pdb") is None
+        assert _sanitize_pdb_name("/etc/passwd") is None
+        assert _sanitize_pdb_name("foo/bar.pdb") is None
+        assert _sanitize_pdb_name("..") is None
+        assert _sanitize_pdb_name(".") is None
+        assert _sanitize_pdb_name("") is None
+        assert _sanitize_pdb_name(None) is None
+
+    def test_strips_nul_bytes(self):
+        from src.utils.pdb_fetcher import _sanitize_pdb_name
+
+        assert _sanitize_pdb_name("ok.pdb\x00") == "ok.pdb"
+        assert _sanitize_pdb_name(b"ok.pdb\x00\x00\x00") == "ok.pdb"
+
+    def test_requires_pdb_extension(self):
+        from src.utils.pdb_fetcher import _sanitize_pdb_name
+
+        assert _sanitize_pdb_name("file.txt") is None
+        assert _sanitize_pdb_name("noext") is None
+
+    def test_allows_legit_names(self):
+        from src.utils.pdb_fetcher import _sanitize_pdb_name
+
+        assert _sanitize_pdb_name("ntdll.pdb") == "ntdll.pdb"
+        assert _sanitize_pdb_name("Foo-bar_v2.pdb") == "Foo-bar_v2.pdb"
+
+    def test_caps_length(self):
+        from src.utils.pdb_fetcher import _sanitize_pdb_name
+
+        assert _sanitize_pdb_name("a" * 300 + ".pdb") is None
+
+
+class TestSanitiseGuid:
+    def test_rejects_non_hex(self):
+        from src.utils.pdb_fetcher import _sanitize_guid
+
+        assert _sanitize_guid("XYZ") is None
+        assert _sanitize_guid("AABB") is None  # too short
+        assert _sanitize_guid("Z" * 32) is None
+        assert _sanitize_guid(None) is None
+
+    def test_accepts_canonical_and_dashed(self):
+        from src.utils.pdb_fetcher import _sanitize_guid
+
+        canonical = "AABBCCDDEEFF00112233445566778899"
+        assert _sanitize_guid(canonical) == canonical
+        assert _sanitize_guid("aabbccdd-eeff-0011-2233-445566778899") == canonical
+
+
+def test_decode_codeview_rejects_oversized_size_of_data():
+    """SizeOfData > 64 KB cap returns None without reading the slice."""
+    from src.utils.pdb_fetcher import _decode_codeview
+
+    pe = MagicMock()
+    pe.__data__ = b""
+
+    entry = MagicMock()
+    entry.struct.Type = 2
+    entry.struct.PointerToRawData = 0x100
+    entry.struct.SizeOfData = 1 << 30
+    entry.entry = None
+
+    assert _decode_codeview(entry, pe) is None
+
+
+def test_decode_codeview_rejects_traversal_pdb_name():
+    """RSDS bytes with a '..' filename are rejected via _sanitize_pdb_name."""
+    from src.utils.pdb_fetcher import _decode_codeview
+
+    rsds = (
+        b"RSDS"
+        + bytes.fromhex("A442E50BFFA3444A4AE9E116143233F5"[:32])
+        + (1).to_bytes(4, "little")
+        + b"..\\evil.pdb\x00"
+    )
+    pe = MagicMock()
+    pe.__data__ = b"\x00" * 0x100 + rsds
+
+    entry = MagicMock()
+    entry.struct.Type = 2
+    entry.struct.PointerToRawData = 0x100
+    entry.struct.SizeOfData = len(rsds)
+    entry.entry = None
+
+    assert _decode_codeview(entry, pe) is None
+
+
+class TestParseSymbolPathHttpHardening:
+    def test_http_dropped_without_optin(self, monkeypatch):
+        from src.utils.pdb_fetcher import (
+            DEFAULT_SYMBOL_SERVER,
+            parse_symbol_path,
+        )
+
+        monkeypatch.delenv("BINARY_MCP_ALLOW_HTTP_SYMBOLS", raising=False)
+        _, servers = parse_symbol_path("srv*/tmp/c*http://untrusted.example/p")
+        assert servers == [DEFAULT_SYMBOL_SERVER]  # http dropped, default added
+
+    def test_http_kept_with_optin(self, monkeypatch):
+        from src.utils.pdb_fetcher import parse_symbol_path
+
+        monkeypatch.setenv("BINARY_MCP_ALLOW_HTTP_SYMBOLS", "1")
+        _, servers = parse_symbol_path("srv*http://internal.example/p")
+        assert servers == ["http://internal.example/p"]
+
+    def test_unrecognised_entry_warns(self, caplog):
+        import logging
+
+        from src.utils.pdb_fetcher import parse_symbol_path
+
+        caplog.set_level(logging.WARNING, logger="src.utils.pdb_fetcher")
+        parse_symbol_path("garbage-token")
+        assert any("Ignoring unrecognized" in r.message for r in caplog.records)
+
+
+def test_build_symbol_server_url_encodes_filename():
+    from src.utils.pdb_fetcher import build_symbol_server_url
+
+    cv = {
+        "guid": "AABBCCDDEEFF00112233445566778899",
+        "age": 1,
+        "pdb_filename": "weird name.pdb",
+    }
+    url = build_symbol_server_url(cv)
+    assert "weird%20name.pdb" in url
+    assert " " not in url
+
+
+def test_fetch_pdb_writes_full_file_no_part_left(tmp_path):
+    """Streaming download lands a complete file and removes .part on success."""
+    from src.utils import pdb_fetcher as mod
+
+    cv = {
+        "guid": "11112222333344445555666677778888",
+        "age": 3,
+        "pdb_filename": "stream.pdb",
+    }
+    binary = tmp_path / "stream.exe"
+    binary.write_bytes(b"MZ")
+    payload = b"X" * (256 * 1024 + 17)  # spans many chunks
+
+    fake_resp = _streaming_response(payload)
+    cache_dir = tmp_path / "cache"
+
+    with patch.object(mod, "extract_codeview_record", return_value=cv):
+        with patch("urllib.request.urlopen", return_value=fake_resp):
+            result = mod.fetch_pdb(binary, cache_dir=cache_dir)
+
+    assert result.read_bytes() == payload
+    leftovers = list(cache_dir.rglob("*.part"))
+    assert leftovers == []
+
+
+def test_fetch_pdb_raises_on_unwritable_cache(tmp_path, monkeypatch):
+    """When mkdir succeeds but writes fail, surface a clear RuntimeError."""
+    from src.utils import pdb_fetcher as mod
+
+    cv = {
+        "guid": "AAAA" * 8,
+        "age": 1,
+        "pdb_filename": "ro.pdb",
+    }
+    binary = tmp_path / "ro.exe"
+    binary.write_bytes(b"MZ")
+
+    def boom(self, data):
+        raise OSError("read-only fs")
+
+    with patch.object(mod, "extract_codeview_record", return_value=cv):
+        with patch.object(Path, "write_bytes", boom):
+            with pytest.raises(RuntimeError, match="not writable"):
+                mod.fetch_pdb(binary, cache_dir=tmp_path / "cache")

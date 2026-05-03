@@ -10,9 +10,11 @@ Provides 245 tools for static and dynamic binary analysis:
 - Function hashing and cross-binary matching
 """
 
+import contextlib
 import functools
 import json
 import logging
+import os
 import re
 import struct
 import sys
@@ -289,6 +291,9 @@ def _write_resume_manifest(
       - ``skip_decompile=True`` -> every cached entry counts as complete
       - ``skip_decompile=False`` -> only entries with pseudocode (or
         thunks/externals that are intentionally never decompiled)
+
+    Writes are atomic (tmp file + os.replace) so a crashed run cannot leave
+    a partial JSON that the next run silently trusts.
     """
     try:
         complete = []
@@ -308,16 +313,84 @@ def _write_resume_manifest(
         manifest_path = (
             Path(cache_dir) / f"resume_manifest_{Path(binary_path).stem}.json"
         )
-        with open(manifest_path, "w", encoding="utf-8") as f:
-            json.dump({"complete_addresses": complete}, f)
+        tmp_path = manifest_path.with_suffix(manifest_path.suffix + ".tmp")
+        run_id = f"{os.getpid()}-{time.monotonic_ns()}"
+        body = {"complete_addresses": complete, "run_id": run_id}
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(body, f)
+        os.replace(tmp_path, manifest_path)
         logger.info(
             f"Wrote resume manifest with {len(complete)} complete addresses "
-            f"to {manifest_path}"
+            f"to {manifest_path} (run_id={run_id})"
         )
         return str(manifest_path)
     except Exception as e:
         logger.warning(f"Failed to write resume manifest: {e}")
         return None
+
+
+@contextlib.contextmanager
+def _delta_run_lock(cache_dir: Path, binary_path: str):
+    """
+    Cross-platform exclusive lock for incremental Ghidra runs on a binary.
+
+    Two parallel ``analyze_binary(..., incremental=True)`` calls on the same
+    binary would race on the manifest, the temp output JSON, and the cache
+    file. This advisory lock makes the second caller fail fast with a clear
+    message instead of silently corrupting cache state.
+    """
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = cache_dir / f"delta_run_{Path(binary_path).stem}.lock"
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+    locked = False
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+            try:
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                locked = True
+            except OSError:
+                raise RuntimeError(
+                    f"Another incremental analysis is already running for "
+                    f"{binary_path}. Wait for it to finish or remove "
+                    f"{lock_path} if you are sure no run is in progress."
+                )
+        else:
+            import fcntl
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+            except (BlockingIOError, OSError):
+                raise RuntimeError(
+                    f"Another incremental analysis is already running for "
+                    f"{binary_path}. Wait for it to finish or remove "
+                    f"{lock_path} if you are sure no run is in progress."
+                )
+        yield
+    finally:
+        if locked:
+            try:
+                if sys.platform == "win32":
+                    import msvcrt
+                    try:
+                        os.lseek(fd, 0, os.SEEK_SET)
+                        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                    except OSError:
+                        pass
+                else:
+                    import fcntl
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            except Exception:
+                pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            lock_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _merge_delta_into_cache(existing: dict, delta: dict) -> dict:
@@ -456,15 +529,17 @@ def get_analysis_context(
     resume_from_cache = None
     resume_manifest_path = None
     existing_cache_data = None
+    delta_lock_cm = contextlib.nullcontext()
     if incremental:
         resume_from_cache = cache.get_cache_path(binary_path)
         if resume_from_cache is None:
             logger.info("incremental=True but no cache exists yet; running full analysis")
         else:
             logger.info(f"Resuming analysis from cache: {resume_from_cache}")
-            # Build a tiny manifest of "complete" addresses so the Jython
-            # script can skip them without loading the multi-GB resume JSON.
-            # This avoids the OutOfMemoryError seen on mpengine-class binaries.
+            # Acquire an advisory lock so a second concurrent incremental run
+            # on the same binary fails fast instead of corrupting the cache.
+            delta_lock_cm = _delta_run_lock(cache.cache_dir, binary_path)
+            delta_lock_cm.__enter__()
             try:
                 existing_cache_data = cache.get_cached(binary_path)
             except Exception as e:
@@ -619,6 +694,10 @@ def get_analysis_context(
                 Path(resume_manifest_path).unlink(missing_ok=True)
             except Exception as e:
                 logger.debug(f"Could not clean up resume manifest: {e}")
+        try:
+            delta_lock_cm.__exit__(None, None, None)
+        except Exception as e:
+            logger.debug(f"Delta-run lock release failed: {e}")
 
 
 # --- Phase 1: Core Tools (P0 - Critical) ---
@@ -1146,7 +1225,7 @@ def get_xrefs(
     Args:
         binary_path: Path to analyzed binary
         address: Hex address to find xrefs for (e.g. "0x401000")
-        function_name: Convenience alternative to address — resolves to the
+        function_name: Convenience alternative to address - resolves to the
             function's entry point
         direction: "to" (references inbound) or "from" (outbound)
         limit: Max xref rows to list (default 200)

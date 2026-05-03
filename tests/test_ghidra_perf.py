@@ -10,6 +10,7 @@ Covers:
 
 import gzip
 import json
+import os
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -591,6 +592,62 @@ class TestResumeManifest:
         with open(path) as f:
             data = json.load(f)
         assert data["complete_addresses"] == []
+
+    def test_manifest_includes_run_id(self, tmp_path):
+        from src.server import _write_resume_manifest
+
+        path = _write_resume_manifest(
+            tmp_path, "/tmp/x.bin", {"functions": []}, skip_decompile=False,
+        )
+        with open(path) as f:
+            data = json.load(f)
+        assert "run_id" in data
+        assert "-" in data["run_id"]  # "<pid>-<monotonic_ns>"
+
+    def test_manifest_atomic_write(self, tmp_path):
+        """Verify the writer goes through .tmp + os.replace, not a direct open."""
+        from unittest.mock import patch
+
+        from src.server import _write_resume_manifest
+
+        observed_replace = []
+
+        real_replace = os.replace
+
+        def spy_replace(src, dst):
+            observed_replace.append((str(src), str(dst)))
+            return real_replace(src, dst)
+
+        with patch("src.server.os.replace", side_effect=spy_replace):
+            _write_resume_manifest(
+                tmp_path, "/tmp/x.bin", {"functions": []}, skip_decompile=False,
+            )
+
+        assert len(observed_replace) == 1
+        src, dst = observed_replace[0]
+        assert src.endswith(".tmp")
+        assert dst.endswith(".json")
+
+
+class TestDeltaRunLock:
+    def test_concurrent_delta_runs_blocked(self, tmp_path):
+        """Acquiring the lock once blocks a second concurrent acquisition."""
+        from src.server import _delta_run_lock
+
+        with _delta_run_lock(tmp_path, "/tmp/sample.bin"):
+            with pytest.raises(RuntimeError, match="incremental analysis is already running"):
+                with _delta_run_lock(tmp_path, "/tmp/sample.bin"):
+                    pass  # pragma: no cover
+
+    def test_lock_releases_after_use(self, tmp_path):
+        """After exit, a follow-up acquisition succeeds."""
+        from src.server import _delta_run_lock
+
+        with _delta_run_lock(tmp_path, "/tmp/sample.bin"):
+            pass
+        # Should not raise.
+        with _delta_run_lock(tmp_path, "/tmp/sample.bin"):
+            pass
 
 
 class TestDeltaMerge:

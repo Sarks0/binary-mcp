@@ -175,6 +175,10 @@ CONFIG_KEYS = {
     "X64DBG_BRIDGE_URL": "URL for x64dbg HTTP bridge (default: http://localhost:27042)",
     "X64DBG_TIMEOUT": "Default timeout for x64dbg commands (seconds)",
 
+    # Symbol server (PDB fetch)
+    "BINARY_MCP_SYMBOL_PATH": "Windows-style _NT_SYMBOL_PATH for PDB fetch (overrides _NT_SYMBOL_PATH).",
+    "BINARY_MCP_ALLOW_HTTP_SYMBOLS": "Set to 1 to permit http:// symbol servers (off by default; PDBs are MITM-sensitive).",
+
     # Analysis
     "BINARY_MCP_CACHE_DIR": "Directory for caching analysis results",
     "BINARY_MCP_SESSION_DIR": "Directory for storing session data",

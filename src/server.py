@@ -354,7 +354,19 @@ def get_analysis_context(
     output_path = cache.cache_dir / f"temp_analysis_{Path(binary_path).stem}.json"
     script_path = Path(__file__).parent / "engines" / "static" / "ghidra" / "scripts"
 
-    # Resolve resume path if caller wants to extend an existing cache
+    # Resolve resume path if caller wants to extend an existing cache.
+    # When the caller passed start_address/end_address but did not also pass
+    # incremental=True, auto-promote: a ranged run without resume would
+    # overwrite the existing full cache with a tiny range-only result.
+    if (start_address or end_address) and not incremental:
+        existing = cache.get_cache_path(binary_path)
+        if existing is not None:
+            logger.info(
+                "Address range supplied without incremental=True; auto-promoting "
+                "to incremental to avoid overwriting the existing cache."
+            )
+            incremental = True
+
     resume_from_cache = None
     if incremental:
         resume_from_cache = cache.get_cache_path(binary_path)
@@ -647,7 +659,10 @@ Format: {compat_info.format.value}
 
         # Surface incremental / partial-run stats when present
         stats = context.get("analysis_stats", {})
-        if stats.get("resumed") or stats.get("partial_results") or stats.get("skipped_by_range"):
+        if (
+            stats.get("resumed") or stats.get("partial_results")
+            or stats.get("skipped_by_range") or stats.get("redecompiled")
+        ):
             summary += "\n**Analysis Run Stats:**\n"
             if stats.get("resumed"):
                 summary += (
@@ -655,8 +670,13 @@ Format: {compat_info.format.value}
                     f"{stats.get('resumed_from_count', 0)} functions preserved\n"
                 )
             summary += f"- Functions processed this run: {stats.get('functions_analyzed', 0)}\n"
+            if stats.get("redecompiled"):
+                summary += (
+                    f"- Re-decompiled (pseudocode added to existing entries): "
+                    f"{stats['redecompiled']}\n"
+                )
             if stats.get("skipped_by_resume"):
-                summary += f"- Skipped (already in cache): {stats['skipped_by_resume']}\n"
+                summary += f"- Skipped (already complete in cache): {stats['skipped_by_resume']}\n"
             if stats.get("skipped_by_range"):
                 summary += f"- Skipped (outside address range): {stats['skipped_by_range']}\n"
             if stats.get("partial_results"):

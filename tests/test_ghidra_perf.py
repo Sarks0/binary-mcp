@@ -360,3 +360,97 @@ class TestIncrementalWiring:
         resume_arg = captured.get("resume_from_cache")
         assert resume_arg is not None
         assert resume_arg.endswith(".json.gz")
+
+    def test_address_range_without_incremental_auto_promotes(
+        self, tmp_path, monkeypatch, server_module
+    ):
+        """Caller passes start_address with incremental=False and an existing
+        cache. Server must auto-promote to incremental so the cache merges
+        instead of getting overwritten."""
+        from src.engines.static.ghidra.project_cache import ProjectCache
+
+        binary = tmp_path / "target.bin"
+        binary.write_bytes(b"\x7fELF" + b"\x00" * 128)
+
+        cache_obj = ProjectCache(cache_dir=str(tmp_path / "cache"))
+        # Pretend we already have a 41K-function cache from a structural pass.
+        cache_obj.save_cached(
+            str(binary),
+            {
+                "functions": [
+                    {"address": f"0x{0x1000+i:x}", "name": f"f{i}"}
+                    for i in range(10)
+                ],
+                "metadata": {"executable_format": "ELF"},
+            },
+        )
+
+        monkeypatch.setattr(server_module, "cache", cache_obj)
+        monkeypatch.setattr(
+            server_module, "get_allowed_dirs", lambda: [tmp_path]
+        )
+
+        captured = {}
+
+        def fake_analyze(**kwargs):
+            captured.update(kwargs)
+            Path(kwargs["output_path"]).write_text(json.dumps({
+                "metadata": {"executable_format": "ELF"},
+                "functions": [{"address": "0x1000", "name": "pre"}],
+                "imports": [], "strings": [], "memory_map": [{"name": ".text"}],
+                "analysis_stats": {"resumed": True, "resumed_from_count": 10},
+            }))
+            return {"elapsed_time": 1.0, "stdout": "", "stderr": ""}
+
+        monkeypatch.setattr(server_module.runner, "analyze", fake_analyze)
+
+        # Call without incremental=True. Should auto-promote.
+        server_module.get_analysis_context(
+            str(binary),
+            start_address="0x180920000",
+            end_address="0x180BA46FC",
+            skip_decompile=False,
+        )
+
+        resume_arg = captured.get("resume_from_cache")
+        assert resume_arg is not None, (
+            "auto-promotion should have set resume_from_cache to merge "
+            "instead of overwriting the existing cache"
+        )
+
+    def test_address_range_without_incremental_no_cache_runs_full(
+        self, tmp_path, monkeypatch, server_module
+    ):
+        """If no cache exists yet, do not auto-promote -- a fresh range run
+        is fine when there is nothing to preserve."""
+        from src.engines.static.ghidra.project_cache import ProjectCache
+
+        binary = tmp_path / "target.bin"
+        binary.write_bytes(b"\x7fELF" + b"\x00" * 128)
+
+        cache_obj = ProjectCache(cache_dir=str(tmp_path / "cache"))
+
+        monkeypatch.setattr(server_module, "cache", cache_obj)
+        monkeypatch.setattr(
+            server_module, "get_allowed_dirs", lambda: [tmp_path]
+        )
+
+        captured = {}
+
+        def fake_analyze(**kwargs):
+            captured.update(kwargs)
+            Path(kwargs["output_path"]).write_text(json.dumps({
+                "metadata": {"executable_format": "ELF"},
+                "functions": [], "imports": [], "strings": [],
+                "memory_map": [{"name": ".text"}],
+                "analysis_stats": {},
+            }))
+            return {"elapsed_time": 1.0, "stdout": "", "stderr": ""}
+
+        monkeypatch.setattr(server_module.runner, "analyze", fake_analyze)
+
+        server_module.get_analysis_context(
+            str(binary), start_address="0x1000", end_address="0x2000",
+        )
+
+        assert captured.get("resume_from_cache") is None

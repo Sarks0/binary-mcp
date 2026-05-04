@@ -16,6 +16,83 @@ from src.utils.security import validate_parameter_pattern
 logger = logging.getLogger(__name__)
 
 
+# Patterns we look for in Ghidra stdout/stderr to surface actionable failure
+# reasons. Ghidra's headless analyzer dumps a lot of noise; these markers are
+# what users actually need to see to self-diagnose (cache poisoning, JDK
+# mismatch, missing files, OOM, etc.).
+_GHIDRA_FAILURE_MARKERS = (
+    "ERROR Abort due to",
+    "UnsupportedClassVersionError",
+    "ClassNotFoundException",
+    "NoClassDefFoundError",
+    "OutOfMemoryError",
+    "Exception in thread",
+    "Caused by:",
+    "ERROR REPORT",
+    "FileNotFoundException",
+    "IOException",
+)
+
+
+def _extract_ghidra_diagnostic(stdout: str, stderr: str, max_chars: int = 1500) -> str:
+    """
+    Pull the actionable bits out of Ghidra's stdout/stderr.
+
+    Ghidra logs the real failure reason (e.g. UnsupportedClassVersionError
+    from a poisoned OSGi cache) buried in long output. We grab matching
+    lines plus their immediate trailing context so the model/user gets a
+    diagnosis instead of a generic "Analysis failed" message.
+    """
+    matched: list[str] = []
+    for stream_name, stream in (("stderr", stderr or ""), ("stdout", stdout or "")):
+        if not stream:
+            continue
+        lines = stream.splitlines()
+        for i, line in enumerate(lines):
+            if any(marker in line for marker in _GHIDRA_FAILURE_MARKERS):
+                # Include up to 4 trailing lines of stack/context per match.
+                chunk = "\n".join(lines[i : i + 5])
+                matched.append(f"[{stream_name}] {chunk}")
+
+    if matched:
+        # Dedupe while preserving order.
+        seen: set[str] = set()
+        unique = []
+        for m in matched:
+            if m not in seen:
+                seen.add(m)
+                unique.append(m)
+        diagnostic = "\n---\n".join(unique)
+    else:
+        # No specific marker found -- fall back to last chunk of each stream.
+        diagnostic = ""
+        if stderr:
+            diagnostic += f"[stderr tail]\n{stderr[-800:]}"
+        if stdout:
+            if diagnostic:
+                diagnostic += "\n---\n"
+            diagnostic += f"[stdout tail]\n{stdout[-800:]}"
+
+    if len(diagnostic) > max_chars:
+        diagnostic = diagnostic[:max_chars] + f"\n[...truncated, {len(diagnostic) - max_chars} more chars]"
+    return diagnostic
+
+
+class GhidraAnalysisError(RuntimeError):
+    """
+    Raised when Ghidra's headless analysis fails with a non-zero exit code
+    or times out. Carries a user-facing ``diagnostic`` string extracted from
+    Ghidra's own output, so callers can surface the real reason (e.g. JDK
+    class-version mismatch from a poisoned OSGi cache) instead of a generic
+    "Analysis failed" message.
+    """
+
+    def __init__(self, message: str, diagnostic: str = "", returncode: int | None = None):
+        super().__init__(message)
+        self.diagnostic = diagnostic
+        self.returncode = returncode
+
+
 class GhidraRunner:
     """Manages Ghidra headless analysis execution."""
 
@@ -286,8 +363,9 @@ class GhidraRunner:
             dict with analysis results and metadata
 
         Raises:
-            subprocess.TimeoutExpired: If analysis exceeds timeout
-            subprocess.CalledProcessError: If Ghidra analysis fails
+            GhidraAnalysisError: If Ghidra exits non-zero or times out. Carries
+                a ``.diagnostic`` string extracted from Ghidra's own output so
+                callers can surface the real failure reason.
             FileNotFoundError: If binary or script not found
 
         Note:
@@ -450,9 +528,17 @@ class GhidraRunner:
             # Clean up locked project to prevent future lock errors
             self._cleanup_project(project_dir, project_name)
 
-            raise RuntimeError(
+            # TimeoutExpired surfaces partial output; capture whatever we
+            # got so the user can see how far Ghidra progressed.
+            partial_stdout = (e.stdout.decode("utf-8", errors="replace")
+                              if isinstance(e.stdout, bytes) else (e.stdout or ""))
+            partial_stderr = (e.stderr.decode("utf-8", errors="replace")
+                              if isinstance(e.stderr, bytes) else (e.stderr or ""))
+            diagnostic = _extract_ghidra_diagnostic(partial_stdout, partial_stderr)
+            raise GhidraAnalysisError(
                 f"Ghidra analysis timed out after {timeout}s. "
-                f"Binary may be too large or complex."
+                f"Binary may be too large or complex.",
+                diagnostic=diagnostic,
             ) from e
 
         except subprocess.CalledProcessError as e:
@@ -464,10 +550,11 @@ class GhidraRunner:
             # Clean up locked project to prevent future lock errors
             self._cleanup_project(project_dir, project_name)
 
-            stdout_tail = (e.stdout or "")[-2000:]
-            raise RuntimeError(
-                f"Ghidra analysis failed with exit code {e.returncode}. "
-                f"stdout (last 2000 chars): {stdout_tail}"
+            diagnostic = _extract_ghidra_diagnostic(e.stdout or "", e.stderr or "")
+            raise GhidraAnalysisError(
+                f"Ghidra analysis failed with exit code {e.returncode}.",
+                diagnostic=diagnostic,
+                returncode=e.returncode,
             ) from e
 
         finally:

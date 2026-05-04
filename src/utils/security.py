@@ -410,4 +410,17 @@ def safe_error_message(
     if internal_details:
         logger.error(f"Error {error_id}: {internal_details}", exc_info=True)
 
+    # If the exception carries a curated diagnostic (e.g. GhidraAnalysisError
+    # with extracted stderr context), surface it. The diagnostic is already
+    # filtered to actionable lines from a trusted subprocess -- it tells the
+    # user *why* the call failed (poisoned OSGi cache, JDK mismatch, OOM,
+    # missing file, ...) rather than hiding behind a reference ID.
+    diagnostic = getattr(internal_details, "diagnostic", None) if internal_details else None
+    if diagnostic:
+        return (
+            f"Error: {user_message}\n"
+            f"Reference ID: {error_id}\n\n"
+            f"Diagnostic:\n{diagnostic}"
+        )
+
     return f"Error: {user_message}\nReference ID: {error_id}\nPlease contact support with this reference ID."

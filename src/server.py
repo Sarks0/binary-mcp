@@ -25,7 +25,7 @@ from fastmcp import FastMCP
 
 from src.engines.session import AnalysisType, UnifiedSessionManager
 from src.engines.static.ghidra.project_cache import ProjectCache
-from src.engines.static.ghidra.runner import GhidraRunner
+from src.engines.static.ghidra.runner import GhidraAnalysisError, GhidraRunner
 from src.tools.control_flow_tools import register_control_flow_tools
 from src.tools.dotnet_tools import register_dotnet_tools
 from src.tools.dynamic_tools import register_dynamic_tools
@@ -898,6 +898,22 @@ Use other tools like get_functions, get_imports, decompile_function to explore t
     except (PathTraversalError, FileSizeError) as e:
         # Security errors - return safe message
         return safe_error_message("Invalid binary file or path", e)
+    except GhidraAnalysisError as e:
+        # Ghidra itself failed (subprocess error or timeout). The diagnostic
+        # is curated from Ghidra's own stdout/stderr -- surface it so users
+        # can self-remediate (poisoned OSGi cache, JDK mismatch, OOM, etc.)
+        # instead of getting an opaque reference ID.
+        logger.error(f"analyze_binary -- Ghidra failure: {e}")
+        msg = f"Error: {e}"
+        if e.diagnostic:
+            msg += f"\n\nGhidra diagnostic:\n{e.diagnostic}"
+            msg += (
+                "\n\nIf you see UnsupportedClassVersionError or similar class-loading"
+                " errors, your Ghidra OSGi cache may be stale (e.g. compiled with a"
+                " different JDK than the one currently running). Clearing the"
+                " compiled-bundles cache and retrying usually resolves this."
+            )
+        return msg
     except Exception as e:
         # Unexpected error - log internally, return safe message
         logger.exception(f"analyze_binary failed: {e}")

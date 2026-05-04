@@ -125,9 +125,9 @@ def _parse_capstone_arch(metadata: dict):
     Accepts three shapes of ``language`` field for backward compatibility:
     1. Canonical Ghidra LanguageID: ``x86:LE:64:default``, ``ARM:LE:32:v7``,
        ``AARCH64:LE:64:v8A`` (current format).
-    2. Description string from ``Language.toString()`` — older caches stored
+    2. Description string from ``Language.toString()`` - older caches stored
        this instead of the canonical ID. Parsed by keyword.
-    3. Empty / unparseable — falls through to ``executable_format`` keyword
+    3. Empty / unparseable - falls through to ``executable_format`` keyword
        inspection so PE/ELF-64 binaries still get x86-64 disassembly.
 
     Returns:
@@ -283,7 +283,7 @@ def _build_cfg(func: dict, reader, metadata: dict):
         # Read raw bytes for the block
         raw = reader.read_bytes_at_va(blk_addr, blk_size)
         if not raw:
-            # Can't disassemble – assume fallthrough to next block
+            # Can't disassemble - assume fallthrough to next block
             idx = addr_to_idx[blk_addr]
             if idx + 1 < len(sorted_addrs):
                 edges.append((blk_addr, sorted_addrs[idx + 1]))
@@ -303,7 +303,7 @@ def _build_cfg(func: dict, reader, metadata: dict):
         is_ret = any(g in last_insn.groups for g in (CS_GRP_RET,))
 
         if is_ret:
-            # No successors – function returns
+            # No successors - function returns
             pass
         elif is_jump:
             mnemonic = last_insn.mnemonic.lower()

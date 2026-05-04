@@ -99,7 +99,7 @@ class TestFileOffsetToVa:
             assert r.file_offset_to_va(0x10) == 0x10
 
     def test_elf_segments(self, tmp_path):
-        """Mocked ELF segments — file_offset_to_va inverts the segment table."""
+        """Mocked ELF segments - file_offset_to_va inverts the segment table."""
         from src.utils.binary_reader import BinaryReader
 
         # Synthesize a minimal ELF that pyelftools won't actually parse for

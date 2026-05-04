@@ -160,7 +160,7 @@ CONFIG_KEYS = {
 
     # Ghidra
     "GHIDRA_HOME": "Path to Ghidra installation directory",
-    "GHIDRA_TIMEOUT": "Default wall-clock timeout for Ghidra analysis (seconds, 30–3600, default 1800)",
+    "GHIDRA_TIMEOUT": "Default wall-clock timeout for Ghidra analysis (seconds, 30-3600, default 1800)",
     "GHIDRA_FUNCTION_TIMEOUT": "Per-function decompilation timeout (seconds, default 30)",
     "GHIDRA_MAX_FUNCTIONS": "Cap on functions processed per Ghidra run (0 = unlimited)",
     "GHIDRA_SKIP_DECOMPILE": "Skip decompilation for fast structural pass (1/true/yes)",

@@ -824,7 +824,11 @@ class WinDbgBridge(Debugger):
 
     @_trace
     def connect_kernel_net(
-        self, port: int, key: str, timeout: int | None = None
+        self,
+        port: int,
+        key: str,
+        timeout: int | None = None,
+        ipversion: int = 4,
     ) -> dict[str, Any]:
         """Connect to a KDNET kernel debug target.
 
@@ -846,14 +850,142 @@ class WinDbgBridge(Debugger):
             key: KDNET session key (w.x.y.z format).
             timeout: Seconds to wait for target to break in.
                      Defaults to ``_KDNET_TIMEOUT`` (env ``KDNET_TIMEOUT``, 60s).
+            ipversion: 4 (default) or 6. Adds ``,ipversion=6`` per
+                       MS Learn: Setting Up KDNET. Win11+ targets only.
         """
         self._require_windows()
         self._require_pybag()
+        if ipversion not in (4, 6):
+            raise WinDbgBridgeError(
+                "connect_kernel_net", f"invalid ipversion {ipversion!r}; expected 4 or 6"
+            )
         timeout = timeout if timeout is not None else _KDNET_TIMEOUT
 
+        conn_str = f"net:port={port},key={key}"
+        if ipversion == 6:
+            conn_str += ",ipversion=6"
+        return self._attach_kernel_session(
+            conn_str=conn_str,
+            timeout=timeout,
+            operation="connect_kernel_net",
+            transport_label=f"KDNET port={port}",
+            extra_result={"port": port},
+            timeout_advice=(
+                "1. Reboot the TARGET machine AFTER starting this connect call - "
+                "the host must be listening before the target sends its initial break.\n"
+                "2. Verify the key matches exactly (bcdedit /dbgsettings on the target).\n"
+                "3. Confirm the target's NIC supports KDNET "
+                "(kdnet.exe on the target will tell you).\n"
+                "4. Ensure no firewall is blocking the UDP port on BOTH machines.\n"
+                "5. Increase timeout: set KDNET_TIMEOUT=120"
+            ),
+        )
+
+    @_trace
+    def connect_kernel_serial(
+        self,
+        port: str,
+        baud: int = 115200,
+        pipe: bool = False,
+        reconnect: bool = True,
+        timeout: int | None = None,
+    ) -> dict[str, Any]:
+        """Connect to a kernel target over a serial transport (KDSERIAL).
+
+        Builds a ``com:port=<port>,baud=<baud>[,pipe][,reconnect]``
+        connection string per MS Learn: Setting Up a Null-Modem Cable
+        Connection in WinDbg. Returns the same structured result as
+        :meth:`connect_kernel_net`.
+
+        Args:
+            port: COM port (e.g. ``COM1``) or pipe path when ``pipe=True``
+                  (e.g. ``\\\\.\\pipe\\com_1``).
+            baud: Serial baud rate. Default 115200.
+            pipe: True if the target is reached over a named pipe (Hyper-V).
+            reconnect: True to retry on disconnect.
+            timeout: Seconds to wait for break-in. Defaults to ``_KDNET_TIMEOUT``.
+        """
+        self._require_windows()
+        self._require_pybag()
+        if not port or not str(port).strip():
+            raise WinDbgBridgeError("connect_kernel_serial", "port is required")
+        if baud <= 0:
+            raise WinDbgBridgeError(
+                "connect_kernel_serial", f"invalid baud {baud!r}; expected positive int"
+            )
+        timeout = timeout if timeout is not None else _KDNET_TIMEOUT
+
+        parts = [f"com:port={port}", f"baud={baud}"]
+        if pipe:
+            parts.append("pipe")
+        if reconnect:
+            parts.append("reconnect")
+        conn_str = ",".join(parts)
+        return self._attach_kernel_session(
+            conn_str=conn_str,
+            timeout=timeout,
+            operation="connect_kernel_serial",
+            transport_label=f"KDSERIAL port={port} baud={baud}",
+            extra_result={"port": port, "baud": baud, "pipe": pipe},
+            timeout_advice=(
+                "1. Verify the target has bcdedit /dbgsettings serial baudrate=<baud> debugport=<n>.\n"
+                "2. For Hyper-V, ensure the VM's COM port is bound to the named pipe.\n"
+                "3. Confirm cable wiring (null-modem) and that no other process holds the port.\n"
+                "4. Increase timeout: set KDNET_TIMEOUT=120"
+            ),
+        )
+
+    @_trace
+    def connect_kernel_pipe(
+        self,
+        pipe_name: str,
+        reconnect: bool = True,
+        timeout: int | None = None,
+    ) -> dict[str, Any]:
+        """Connect to a Hyper-V kernel target over a named pipe.
+
+        Convenience wrapper for serial-over-pipe transports. Builds
+        ``com:pipe,port=<pipe_name>[,reconnect]``. ``pipe_name`` may be
+        the bare pipe name (``com_1``) or the full UNC form
+        (``\\\\.\\pipe\\com_1``); the latter is preferred by dbgeng.
+        """
+        self._require_windows()
+        self._require_pybag()
+        if not pipe_name or not str(pipe_name).strip():
+            raise WinDbgBridgeError("connect_kernel_pipe", "pipe_name is required")
+        timeout = timeout if timeout is not None else _KDNET_TIMEOUT
+
+        parts = ["com:pipe", f"port={pipe_name}"]
+        if reconnect:
+            parts.append("reconnect")
+        conn_str = ",".join(parts)
+        return self._attach_kernel_session(
+            conn_str=conn_str,
+            timeout=timeout,
+            operation="connect_kernel_pipe",
+            transport_label=f"KDPIPE {pipe_name}",
+            extra_result={"pipe_name": pipe_name},
+            timeout_advice=(
+                "1. Confirm the Hyper-V VM has a COM port mapped to this named pipe.\n"
+                "2. Start the host listener BEFORE booting the VM, or boot the VM with "
+                "debugging enabled then start the listener.\n"
+                "3. Increase timeout: set KDNET_TIMEOUT=120"
+            ),
+        )
+
+    def _attach_kernel_session(
+        self,
+        *,
+        conn_str: str,
+        timeout: int,
+        operation: str,
+        transport_label: str,
+        extra_result: dict[str, Any],
+        timeout_advice: str,
+    ) -> dict[str, Any]:
+        """Shared attach+wait+classify pipeline used by every kernel transport."""
         kd = None
         try:
-            conn_str = f"net:port={port},key={key}"
             kd = pybag.KernelDbg()
 
             def _attach_and_wait():
@@ -864,9 +996,9 @@ class WinDbgBridge(Debugger):
                 kd.wait(timeout * 1000)
 
             # Run attach+wait in a daemon thread so we can enforce a timeout.
-            # See bug history: do NOT use the ThreadPoolExecutor as a context
-            # manager here - shutdown(wait=True) deadlocks the entire MCP tool
-            # call if kd.wait() hangs.
+            # Do NOT use the ThreadPoolExecutor as a context manager here -
+            # shutdown(wait=True) deadlocks the entire MCP tool call if
+            # kd.wait() hangs.
             self._session.set_state(KernelSessionState.LISTENING)
             pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
             future = pool.submit(_attach_and_wait)
@@ -875,43 +1007,30 @@ class WinDbgBridge(Debugger):
             except concurrent.futures.TimeoutError:
                 pool.shutdown(wait=False, cancel_futures=True)
                 logger.warning(
-                    "KDNET attach timed out after %ds (port=%d)", timeout, port
+                    "%s attach timed out after %ds", transport_label, timeout
                 )
                 raise WinDbgBridgeError(
-                    "connect_kernel_net",
-                    f"KDNET connection timed out after {timeout}s. "
-                    f"The target did not break in on port {port}.\n\n"
-                    "Troubleshooting:\n"
-                    "1. Reboot the TARGET machine AFTER starting this connect call - "
-                    "the host must be listening before the target sends its initial break.\n"
-                    "2. Verify the key matches exactly (bcdedit /dbgsettings on the target).\n"
-                    "3. Confirm the target's NIC supports KDNET "
-                    "(kdnet.exe on the target will tell you).\n"
-                    "4. Ensure no firewall is blocking the UDP port on BOTH machines.\n"
-                    "5. Increase timeout: set KDNET_TIMEOUT=120"
+                    operation,
+                    f"{transport_label} connection timed out after {timeout}s. "
+                    f"The target did not break in.\n\nTroubleshooting:\n"
+                    f"{timeout_advice}"
                 )
             else:
                 pool.shutdown(wait=False)
 
-            # Register event callbacks before classifying state - SessionStatus
-            # / Breakpoint events arriving during attach may have been buffered.
+            # Register event callbacks before classifying state - buffered
+            # SessionStatus / Breakpoint events flush as soon as the COM
+            # vtable is wired in.
             self._dbg = kd
             self._mode = WinDbgMode.KERNEL_MODE
             self._attach_event_callbacks()
             self._apply_default_sympath()
 
-            # If wait() returned but no Breakpoint/Exception event has been
-            # observed, the engine has a session but no current thread. This
-            # is the half-handshake: legacy code reported success here, then
-            # every follow-up command failed. We auto-interrupt to force a
-            # state-change packet; if that still doesn't break, the caller
-            # gets a structured 'target running' response so they know to
-            # invoke break_in once the target hits a natural break point.
             if not self._session.is_broken():
                 logger.info(
-                    "KDNET attach returned without break (state=%s); "
-                    "attempting auto-interrupt to acquire current thread",
-                    self._session.state.value,
+                    "%s attach returned without break (state=%s); "
+                    "attempting auto-interrupt",
+                    transport_label, self._session.state.value,
                 )
                 try:
                     self.break_in(timeout=5)
@@ -920,7 +1039,7 @@ class WinDbgBridge(Debugger):
                     self._state = DebuggerState.RUNNING
                     return {
                         "status": "connected_target_running",
-                        "port": port,
+                        **extra_result,
                         "advice": (
                             "Connected, but target was running and did not "
                             "break. Call windbg_break() once the target "
@@ -931,17 +1050,17 @@ class WinDbgBridge(Debugger):
                     }
 
             self._state = DebuggerState.PAUSED
-            logger.info("Connected to kernel target via KDNET port=%d", port)
+            logger.info("Connected to kernel target via %s", transport_label)
             return {
                 "status": "connected_broken",
-                "port": port,
+                **extra_result,
                 "session": self._session.snapshot(),
             }
         except WinDbgBridgeError:
             self._safe_disconnect()
             raise
         except Exception as exc:
-            self._log_error("connect_kernel_net", exc)
+            self._log_error(operation, exc)
             self._safe_disconnect()
             structured = create_kernel_not_connected_error(str(exc))
             raise StructuredBaseError(structured) from exc

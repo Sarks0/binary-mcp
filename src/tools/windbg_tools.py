@@ -147,7 +147,12 @@ def register_windbg_tools(
 
     @app.tool()
     @log_windbg_tool
-    def windbg_connect_kernel(port: int = 50000, key: str = "", timeout: int = 120) -> str:
+    def windbg_connect_kernel(
+        port: int = 50000,
+        key: str = "",
+        timeout: int = 120,
+        ipversion: int = 4,
+    ) -> str:
         """Connect to a kernel debug target via KDNET.
 
         Opens the KDNET listening port and waits for the target to break in.
@@ -165,6 +170,8 @@ def register_windbg_tools(
                  instead, use ``windbg_connect_local_kernel``.
             timeout: Seconds to wait for target to break in (default 120).
                      Set higher if the target has a slow boot.
+            ipversion: 4 (default) or 6. Use 6 only if the target advertises
+                       KDNET over IPv6 (Windows 11+).
 
         Returns:
             Connection status message.
@@ -178,17 +185,91 @@ def register_windbg_tools(
                 "on the target to retrieve it. To attach to the local "
                 "kernel instead, call windbg_connect_local_kernel."
             )
+        if ipversion not in (4, 6):
+            return f"Error: ipversion must be 4 or 6, got {ipversion!r}"
         try:
             bridge = get_windbg_bridge()
-            result = bridge.connect_kernel_net(port=port, key=key, timeout=timeout)
+            result = bridge.connect_kernel_net(
+                port=port, key=key, timeout=timeout, ipversion=ipversion
+            )
             status = result.get("status", "connected")
+            v6 = " IPv6" if ipversion == 6 else ""
             if status == "connected_target_running":
                 return (
-                    f"Connected to kernel target via KDNET (port={port}), "
+                    f"Connected to kernel target via KDNET{v6} (port={port}), "
                     f"but target is running and did not break.\n"
                     f"{result.get('advice', 'Call windbg_break() to interrupt.')}"
                 )
-            return f"Connected to kernel target via KDNET (port={port}, broken-in)"
+            return f"Connected to kernel target via KDNET{v6} (port={port}, broken-in)"
+        except (WinDbgBridgeError, StructuredBaseError) as e:
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_windbg_tool
+    def windbg_connect_kernel_serial(
+        port: str,
+        baud: int = 115200,
+        pipe: bool = False,
+        reconnect: bool = True,
+        timeout: int = 120,
+    ) -> str:
+        """Connect to a kernel debug target over a serial transport (KDSERIAL).
+
+        Args:
+            port: COM port name (e.g. ``COM1``) or pipe path when
+                  ``pipe=True`` (e.g. ``\\\\.\\pipe\\com_1``).
+            baud: Serial baud rate. Default 115200.
+            pipe: True if the target is reached over a named pipe.
+            reconnect: True to retry on disconnect.
+            timeout: Seconds to wait for target to break in.
+        """
+        if not _is_windows():
+            return _PLATFORM_MSG
+        try:
+            bridge = get_windbg_bridge()
+            result = bridge.connect_kernel_serial(
+                port=port, baud=baud, pipe=pipe, reconnect=reconnect, timeout=timeout
+            )
+            status = result.get("status", "connected")
+            label = f"KDSERIAL port={port} baud={baud}"
+            if status == "connected_target_running":
+                return (
+                    f"Connected via {label}, but target was running and did "
+                    f"not break.\n{result.get('advice', 'Call windbg_break().')}"
+                )
+            return f"Connected via {label} (broken-in)"
+        except (WinDbgBridgeError, StructuredBaseError) as e:
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_windbg_tool
+    def windbg_connect_kernel_pipe(
+        pipe_name: str,
+        reconnect: bool = True,
+        timeout: int = 120,
+    ) -> str:
+        """Connect to a Hyper-V kernel target over a named pipe.
+
+        Args:
+            pipe_name: Pipe path (``\\\\.\\pipe\\com_1``) or bare pipe name.
+            reconnect: True to retry on disconnect.
+            timeout: Seconds to wait for target to break in.
+        """
+        if not _is_windows():
+            return _PLATFORM_MSG
+        try:
+            bridge = get_windbg_bridge()
+            result = bridge.connect_kernel_pipe(
+                pipe_name=pipe_name, reconnect=reconnect, timeout=timeout
+            )
+            status = result.get("status", "connected")
+            label = f"KDPIPE {pipe_name}"
+            if status == "connected_target_running":
+                return (
+                    f"Connected via {label}, but target was running and did "
+                    f"not break.\n{result.get('advice', 'Call windbg_break().')}"
+                )
+            return f"Connected via {label} (broken-in)"
         except (WinDbgBridgeError, StructuredBaseError) as e:
             return f"Error: {e}"
 

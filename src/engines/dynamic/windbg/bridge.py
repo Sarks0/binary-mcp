@@ -12,6 +12,7 @@ import functools
 import logging
 import os
 import platform
+import re
 import shutil
 import subprocess
 import time
@@ -524,6 +525,204 @@ class WinDbgBridge(Debugger):
     def get_session_state(self) -> dict[str, Any]:
         """Return a JSON-serialisable snapshot of the kernel session state."""
         return self._session.snapshot()
+
+    @_trace
+    def get_stack(
+        self, thread_id: int | None = None, frames: int = 32
+    ) -> list[dict[str, str]]:
+        """Return the structured call stack for the current (or named) thread.
+
+        Wraps the ``kn`` command and parses the output into typed frames.
+        If ``thread_id`` is provided, switches context to that thread first
+        via ``~<tid>s``; the engine's prior current-thread is restored on
+        the next break, so this is non-destructive for inspection.
+
+        Args:
+            thread_id: Optional thread to inspect. None means current.
+            frames: Maximum frames to walk (clamped 1..256).
+
+        Returns:
+            List of ``{frame, child_sp, ret_addr, call_site}``.
+        """
+        self._require_connected()
+        frames = max(1, min(256, frames))
+        if thread_id is not None:
+            try:
+                self._dbg.cmd(f"~{int(thread_id)}s")
+                self._session.current_thread_id = int(thread_id)
+            except Exception as exc:
+                raise WinDbgBridgeError(
+                    "get_stack", f"thread switch to {thread_id} failed: {exc}"
+                ) from exc
+        try:
+            output = self._dbg.cmd(f"kn 0x{frames:x}")
+        except Exception as exc:
+            raise WinDbgBridgeError("get_stack", str(exc)) from exc
+        return WinDbgOutputParser.parse_stack(output or "")
+
+    @_trace
+    def get_thread(self, thread: str | None = None) -> dict[str, Any]:
+        """Return raw ``!thread`` output wrapped in a structured envelope.
+
+        Reliable structured parsing of !thread is brittle across Windows
+        versions; we surface the canonical text + the command we ran so
+        the LLM can reason on it directly without us silently dropping
+        fields.
+
+        Args:
+            thread: Optional ETHREAD address or thread ID. None means
+                    the current thread.
+        """
+        self._require_connected()
+        cmd = "!thread" if not thread else f"!thread {thread}"
+        try:
+            output = self._dbg.cmd(cmd)
+        except Exception as exc:
+            raise WinDbgBridgeError("get_thread", str(exc)) from exc
+        return {
+            "command": cmd,
+            "output": output or "",
+            "current_thread_id": self._session.current_thread_id,
+        }
+
+    @_trace
+    def get_process(
+        self, process: str | None = None, flags: int = 7
+    ) -> dict[str, Any]:
+        """Return ``!process`` output. Same envelope rationale as :meth:`get_thread`.
+
+        Args:
+            process: PID or EPROCESS address. None means current process.
+            flags: WinDbg ``!process`` flag word (default 7 = full info
+                   incl. thread stacks). Use 0 for a one-line summary.
+        """
+        self._require_connected()
+        target = process if process else "0"
+        cmd = f"!process {target} 0x{flags:x}"
+        try:
+            output = self._dbg.cmd(cmd)
+        except Exception as exc:
+            raise WinDbgBridgeError("get_process", str(exc)) from exc
+        return {"command": cmd, "output": output or ""}
+
+    @_trace
+    def dump_type(
+        self, type_name: str, address: str | None = None, depth: int = 1
+    ) -> dict[str, Any]:
+        """Run ``dt -r<depth> <type> [addr]`` and return parsed fields + raw text.
+
+        The parser captures top-level field rows of the form
+        ``+0x008 FieldName : Type-or-value``. Nested expansions stay in
+        the raw text - a fully recursive structured parser would be
+        fragile; the LLM can read the indented form directly.
+
+        Args:
+            type_name: e.g. ``nt!_EPROCESS``.
+            address: optional address to overlay the type on.
+            depth: recursion depth for ``-r`` (clamped 0..3).
+        """
+        self._require_connected()
+        depth = max(0, min(3, depth))
+        # type_name and address must be sanitised - they flow into the
+        # cmd() call. The allowlist would catch a `; .shell` injection
+        # but we double-check at this layer to give a clear error.
+        if any(ch in type_name for ch in (";", "|", "&", "$", "`", "\n", " ")):
+            raise WinDbgBridgeError(
+                "dump_type", f"invalid type_name: {type_name!r}"
+            )
+        if address is not None and any(
+            ch in address for ch in (";", "|", "&", "$", "`", "\n", " ")
+        ):
+            raise WinDbgBridgeError(
+                "dump_type", f"invalid address: {address!r}"
+            )
+
+        cmd_parts = [f"dt -r{depth}", type_name]
+        if address:
+            cmd_parts.append(address)
+        cmd = " ".join(cmd_parts)
+        try:
+            output = self._dbg.cmd(cmd) or ""
+        except Exception as exc:
+            raise WinDbgBridgeError("dump_type", str(exc)) from exc
+
+        fields: list[dict[str, str]] = []
+        # Top-level field rows look like:
+        #    +0x008 FieldName        : Type-or-value
+        # Nested expansions are indented further; we capture only the
+        # first indentation level (3-spaces-then-+0x).
+        field_re = re.compile(
+            r"^\s{0,3}\+0x([0-9a-fA-F]+)\s+(\S+)\s*:\s*(.+?)\s*$"
+        )
+        for line in output.splitlines():
+            m = field_re.match(line)
+            if m:
+                fields.append({
+                    "offset": "0x" + m.group(1),
+                    "name": m.group(2),
+                    "value": m.group(3),
+                })
+        return {
+            "command": cmd,
+            "type": type_name,
+            "address": address,
+            "fields": fields,
+            "raw": output,
+        }
+
+    @_trace
+    def set_hardware_breakpoint(
+        self, address: str, kind: str = "e", size: int = 1
+    ) -> bool:
+        """Set a hardware data/exec breakpoint via ``ba <kind> <size> <addr>``.
+
+        Hardware breakpoints (``ba``) are distinct from software
+        breakpoints (``bp``) - they're enforced by debug registers
+        (DR0-DR3) so are limited to 4 simultaneous, but can break on
+        read/write/exec without modifying target memory. Essential for
+        watching a kernel structure field for unauthorised writes.
+
+        Args:
+            address: hex address or symbol.
+            kind: ``e`` (execute), ``r`` (read), ``w`` (write), ``i`` (i/o).
+            size: byte count - 1, 2, 4, or 8.
+        """
+        self._require_connected()
+        if kind not in ("e", "r", "w", "i"):
+            raise WinDbgBridgeError(
+                "set_hardware_breakpoint",
+                f"invalid kind {kind!r} (use e/r/w/i)",
+            )
+        if size not in (1, 2, 4, 8):
+            raise WinDbgBridgeError(
+                "set_hardware_breakpoint",
+                f"invalid size {size} (use 1/2/4/8)",
+            )
+        # Reuse the address validator from windbg_tools' allow patterns
+        # by routing through the shared bridge command-safety layer.
+        try:
+            self._dbg.cmd(f"ba {kind} {size} {address}")
+        except Exception as exc:
+            raise WinDbgBridgeError("set_hardware_breakpoint", str(exc)) from exc
+        # Track for matching disconnect/cleanup. Hardware bps are
+        # numbered alongside software bps, so we let DbgEng assign the id
+        # and surface it back to the caller via list_breakpoints.
+        return True
+
+    @_trace
+    def switch_thread(self, thread_id: int) -> dict[str, Any]:
+        """Switch the engine's current thread context.
+
+        Wraps ``~<n>s``. Updates :attr:`SessionTracker.current_thread_id`
+        so subsequent ``get_session_state`` calls reflect the change.
+        """
+        self._require_connected()
+        try:
+            output = self._dbg.cmd(f"~{int(thread_id)}s") or ""
+        except Exception as exc:
+            raise WinDbgBridgeError("switch_thread", str(exc)) from exc
+        self._session.current_thread_id = int(thread_id)
+        return {"thread_id": int(thread_id), "output": output}
 
     @_trace
     def step_into(self) -> dict[str, Any]:

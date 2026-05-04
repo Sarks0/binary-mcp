@@ -390,6 +390,179 @@ def register_windbg_tools(
         except (WinDbgBridgeError, StructuredBaseError) as e:
             return f"Error: {e}"
 
+    # --- Structured kernel primitives (6) ---
+
+    @app.tool()
+    @log_windbg_tool
+    def windbg_get_stack(thread_id: int | None = None, frames: int = 32) -> str:
+        """Walk the current (or named) thread's call stack.
+
+        Wraps ``kn`` with structured frame parsing. If ``thread_id`` is
+        provided, switches context to that thread first via ``~<n>s``.
+
+        Args:
+            thread_id: Optional thread to inspect. None means current.
+            frames: Maximum frames to walk (default 32, capped 256).
+
+        Returns:
+            Newline-separated frames in the form
+            ``frame  child_sp  ret_addr  call_site``.
+        """
+        if not _is_windows():
+            return _PLATFORM_MSG
+        try:
+            bridge = get_windbg_bridge()
+            stack = bridge.get_stack(thread_id=thread_id, frames=frames)
+            if not stack:
+                return "Stack walk returned no frames."
+            return "\n".join(
+                f"{f['frame']}  {f['child_sp']}  {f['ret_addr']}  {f['call_site']}"
+                for f in stack
+            )
+        except (WinDbgBridgeError, StructuredBaseError) as e:
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_windbg_tool
+    def windbg_get_thread(thread: str = "") -> str:
+        """Inspect a kernel thread via ``!thread``.
+
+        Returns the engine's full ``!thread`` text - reliable structured
+        parsing across Windows versions is brittle, so the canonical
+        output is surfaced for direct inspection.
+
+        Args:
+            thread: Optional ETHREAD address (hex) or thread ID. Empty
+                    string means the current thread.
+        """
+        if not _is_windows():
+            return _PLATFORM_MSG
+        if thread:
+            err = _validate_address(thread)
+            if err:
+                return err
+        try:
+            bridge = get_windbg_bridge()
+            result = bridge.get_thread(thread=thread or None)
+            return f"$ {result['command']}\n\n{result['output']}"
+        except (WinDbgBridgeError, StructuredBaseError) as e:
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_windbg_tool
+    def windbg_get_process(process: str = "", flags: int = 7) -> str:
+        """Inspect a kernel process via ``!process``.
+
+        Args:
+            process: PID (hex) or EPROCESS address. Empty = current process.
+            flags: ``!process`` flag word (default 7 = full info incl.
+                   thread stacks; use 0 for one-line summary).
+        """
+        if not _is_windows():
+            return _PLATFORM_MSG
+        if process:
+            err = _validate_address(process)
+            if err:
+                return err
+        if flags < 0 or flags > 0xFF:
+            return "Error: flags must be 0..0xFF."
+        try:
+            bridge = get_windbg_bridge()
+            result = bridge.get_process(process=process or None, flags=flags)
+            return f"$ {result['command']}\n\n{result['output']}"
+        except (WinDbgBridgeError, StructuredBaseError) as e:
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_windbg_tool
+    def windbg_dt(type_name: str, address: str = "", depth: int = 1) -> str:
+        """Dump a typed structure with ``dt -r<depth> <type> [addr]``.
+
+        Returns a structured field list (offset, name, value) plus the
+        full raw text. Top-level fields parse cleanly; nested fields
+        from the ``-r`` recursion stay in the raw output.
+
+        Args:
+            type_name: e.g. ``nt!_EPROCESS`` or ``module!_STRUCT``.
+            address: Optional address to overlay the type on.
+            depth: Recursion depth 0..3 (default 1).
+        """
+        if not _is_windows():
+            return _PLATFORM_MSG
+        # Tighter validation than _validate_address - dt accepts
+        # module!type with !, *, _, and . characters only.
+        if not type_name or not _SAFE_SYMBOL_RE.match(type_name):
+            return f"Error: invalid type_name {type_name!r}."
+        if address:
+            err = _validate_address(address)
+            if err:
+                return err
+        try:
+            bridge = get_windbg_bridge()
+            result = bridge.dump_type(
+                type_name=type_name,
+                address=address or None,
+                depth=depth,
+            )
+            lines = [f"$ {result['command']}", ""]
+            for f in result["fields"]:
+                lines.append(f"  {f['offset']}  {f['name']:<32} {f['value']}")
+            if not result["fields"]:
+                lines.append("(no top-level fields parsed)")
+            lines.append("")
+            lines.append("--- raw ---")
+            lines.append(result["raw"])
+            return "\n".join(lines)
+        except (WinDbgBridgeError, StructuredBaseError) as e:
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_windbg_tool
+    def windbg_set_hardware_breakpoint(
+        address: str, kind: str = "e", size: int = 1
+    ) -> str:
+        """Set a hardware data/exec breakpoint via ``ba``.
+
+        Hardware breakpoints use debug registers (DR0-DR3) - max 4
+        simultaneous - and break on read/write/exec without modifying
+        target memory. Use this to watch a kernel structure field for
+        unauthorised writes (e.g. EPROCESS.Token).
+
+        Args:
+            address: Hex address or symbol.
+            kind: ``e`` (execute) | ``r`` (read) | ``w`` (write) | ``i`` (i/o).
+            size: Watch width in bytes (1, 2, 4, or 8).
+        """
+        if not _is_windows():
+            return _PLATFORM_MSG
+        err = _validate_address(address)
+        if err:
+            return err
+        try:
+            bridge = get_windbg_bridge()
+            bridge.set_hardware_breakpoint(address=address, kind=kind, size=size)
+            return f"Hardware breakpoint armed: ba {kind} {size} {address}"
+        except (WinDbgBridgeError, StructuredBaseError) as e:
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_windbg_tool
+    def windbg_switch_thread(thread_id: int) -> str:
+        """Switch the engine's current thread context via ``~<n>s``.
+
+        Subsequent inspection commands (``windbg_get_stack``,
+        ``windbg_get_thread``, register reads) will operate against the
+        new thread. Use ``windbg_session_status`` to confirm the change.
+        """
+        if not _is_windows():
+            return _PLATFORM_MSG
+        try:
+            bridge = get_windbg_bridge()
+            result = bridge.switch_thread(thread_id=thread_id)
+            return f"Switched to thread {result['thread_id']}.\n{result['output']}"
+        except (WinDbgBridgeError, StructuredBaseError) as e:
+            return f"Error: {e}"
+
     @app.tool()
     @log_windbg_tool
     def windbg_step_into() -> str:

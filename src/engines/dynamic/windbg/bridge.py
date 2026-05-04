@@ -33,6 +33,7 @@ from src.utils.structured_errors import (
 
 from ..base import Debugger, DebuggerState
 from .error_logger import ErrorContext, WinDbgErrorLogger
+from .event_callbacks import BinaryMcpEventCallbacks, register_callbacks
 from .kernel_types import (
     CrashAnalysis,
     DeviceObject,
@@ -42,6 +43,7 @@ from .kernel_types import (
     WinDbgMode,
 )
 from .output_parser import WinDbgOutputParser
+from .session_state import KernelSessionState, SessionTracker
 
 logger = logging.getLogger(__name__)
 
@@ -201,8 +203,48 @@ class WinDbgBridge(Debugger):
         self._cdb_proc: subprocess.Popen | None = None
         self._breakpoint_counter: int = 0
         self._breakpoints: dict[str, int] = {}  # address -> bp id
+        self._session = SessionTracker()
+        self._event_callbacks = BinaryMcpEventCallbacks(self._session)
+        self._callbacks_registered = False
 
         logger.info("WinDbgBridge initialized (pybag=%s)", PYBAG_AVAILABLE)
+
+    def _attach_event_callbacks(self) -> None:
+        """Attach our IDebugEventCallbacks shim to the live engine.
+
+        Best-effort: if the registration fails (no comtypes, unexpected
+        pybag layout, COM error), we log a warning and proceed. The
+        bridge still works in the legacy ``wait()``-poll mode; only
+        the session-state machine is degraded.
+        """
+        if self._callbacks_registered or self._dbg is None:
+            return
+        try:
+            self._callbacks_registered = register_callbacks(
+                self._dbg, self._event_callbacks
+            )
+        except Exception as exc:
+            logger.warning("Event-callback registration raised: %s", exc)
+            self._callbacks_registered = False
+
+    def _safe_disconnect(self) -> None:
+        """Tear down the engine state without re-raising.
+
+        Used in the except branches of attach paths so a failed connect
+        cannot leave the bridge holding a half-attached engine.
+        """
+        try:
+            if self._dbg is not None:
+                try:
+                    self._dbg.detach()
+                except Exception:
+                    pass
+        finally:
+            self._dbg = None
+            self._callbacks_registered = False
+            self._session.reset()
+            self._state = DebuggerState.NOT_LOADED
+            self._is_local_kernel = False
 
     # --- Debugger ABC implementation ---
 
@@ -242,6 +284,8 @@ class WinDbgBridge(Debugger):
                 pass
             self._dbg = None
 
+        self._callbacks_registered = False
+        self._session.reset()
         self._state = DebuggerState.NOT_LOADED
         self._mode = WinDbgMode.USER_MODE
         self._is_local_kernel = False
@@ -339,6 +383,82 @@ class WinDbgBridge(Debugger):
         except Exception as exc:
             self._log_error("pause", exc)
             raise WinDbgBridgeError("pause", str(exc)) from exc
+
+    @_trace
+    def break_in(self, timeout: int = 5) -> bool:
+        """Force the target to surface a state-change packet.
+
+        Distinct from :meth:`pause`: ``pause`` flips the engine flag and
+        returns. ``break_in`` flips the flag *and waits* for DbgEng to
+        consume the resulting state-change so the engine acquires a
+        current thread/process. Use this to recover from the KDNET
+        half-handshake (handshake completed, but no break event ever
+        fired, leaving every command saying "debugger does not have a
+        current process or thread").
+
+        Args:
+            timeout: Seconds to wait for the break to land.
+
+        Raises:
+            WinDbgBridgeError: if the target does not break within
+                ``timeout`` even after a fallback ``.break`` command.
+        """
+        self._require_connected()
+        self._require_not_local("break_in")
+        self._require_not_dump("break_in")
+
+        def _wait_for_break(seconds: int) -> bool:
+            deadline = time.monotonic() + seconds
+            try:
+                self._dbg.wait(seconds * 1000)
+            except Exception as exc:
+                logger.debug("wait() during break_in raised: %s", exc)
+            # Even without callbacks the wait() return is enough to mark
+            # the engine as broken-in for legacy mode; with callbacks the
+            # tracker is the source of truth.
+            while time.monotonic() < deadline:
+                if self._session.is_broken():
+                    return True
+                time.sleep(0.05)
+            return self._session.is_broken()
+
+        try:
+            try:
+                self._dbg._control.SetInterrupt(0)  # DEBUG_INTERRUPT_ACTIVE
+            except Exception as exc:
+                logger.warning("SetInterrupt raised: %s", exc)
+
+            if _wait_for_break(timeout):
+                self._state = DebuggerState.PAUSED
+                return True
+
+            # Fallback: dispatch the .break command. Some target/transport
+            # combinations refuse SetInterrupt but honour the meta-command.
+            logger.info("SetInterrupt did not break target; trying .break")
+            try:
+                self._dbg.cmd(".break")
+            except Exception as exc:
+                logger.debug(".break command raised: %s", exc)
+
+            if _wait_for_break(timeout):
+                self._state = DebuggerState.PAUSED
+                return True
+
+            raise WinDbgBridgeError(
+                "break_in",
+                f"Target did not break within {timeout}s. "
+                "If the target is reachable, trigger a break from the target "
+                "side (kdbreak / Ctrl+Scroll Lock) and retry.",
+            )
+        except WinDbgBridgeError:
+            raise
+        except Exception as exc:
+            self._log_error("break_in", exc)
+            raise WinDbgBridgeError("break_in", str(exc)) from exc
+
+    def get_session_state(self) -> dict[str, Any]:
+        """Return a JSON-serialisable snapshot of the kernel session state."""
+        return self._session.snapshot()
 
     @_trace
     def step_into(self) -> dict[str, Any]:
@@ -439,12 +559,23 @@ class WinDbgBridge(Debugger):
     # --- Kernel-specific methods ---
 
     @_trace
-    def connect_kernel_net(self, port: int, key: str, timeout: int | None = None) -> bool:
+    def connect_kernel_net(
+        self, port: int, key: str, timeout: int | None = None
+    ) -> dict[str, Any]:
         """Connect to a KDNET kernel debug target.
 
-        Opens the KDNET listening port via ``attach()``, then waits for the
-        target to actually break in via ``wait()``.  Only reports success
-        once the debug engine has an active session.
+        Opens the KDNET listening port via ``attach()``, registers our
+        event callbacks, then waits for the engine to declare the
+        session live. Returns a structured result so callers can
+        distinguish three real outcomes:
+
+          - ``connected_broken``: target broke in, current thread/process
+            exists, all commands work.
+          - ``connected_target_running``: handshake completed but no break
+            event fired (the half-handshake state). The auto-interrupt
+            retry failed; caller should invoke :meth:`break_in` once the
+            target reaches a natural break point.
+          - exception: handshake never completed within ``timeout``.
 
         Args:
             port: KDNET port number (e.g. 50000).
@@ -455,23 +586,24 @@ class WinDbgBridge(Debugger):
         self._require_windows()
         self._require_pybag()
         timeout = timeout if timeout is not None else _KDNET_TIMEOUT
+
+        kd = None
         try:
             conn_str = f"net:port={port},key={key}"
             kd = pybag.KernelDbg()
 
             def _attach_and_wait():
                 # attach() only opens the listening port -- it returns before
-                # the target has connected.  wait() blocks until the target
-                # actually breaks in, giving us a live debug session.
+                # the target has connected.  wait() blocks until the engine
+                # surfaces a state change (handshake, break, exception, ...).
                 kd.attach(conn_str)
                 kd.wait(timeout * 1000)
 
             # Run attach+wait in a daemon thread so we can enforce a timeout.
-            # IMPORTANT: Do NOT use the ThreadPoolExecutor as a context manager
-            # here -- its __exit__ calls shutdown(wait=True) which blocks until
-            # the thread finishes.  If kd.wait() hangs (target never breaks
-            # in), that deadlocks the entire MCP tool call.  Instead, on
-            # timeout we call shutdown(wait=False) to abandon the thread.
+            # See bug history: do NOT use the ThreadPoolExecutor as a context
+            # manager here - shutdown(wait=True) deadlocks the entire MCP tool
+            # call if kd.wait() hangs.
+            self._session.set_state(KernelSessionState.LISTENING)
             pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
             future = pool.submit(_attach_and_wait)
             try:
@@ -486,7 +618,7 @@ class WinDbgBridge(Debugger):
                     f"KDNET connection timed out after {timeout}s. "
                     f"The target did not break in on port {port}.\n\n"
                     "Troubleshooting:\n"
-                    "1. Reboot the TARGET machine AFTER starting this connect call -- "
+                    "1. Reboot the TARGET machine AFTER starting this connect call - "
                     "the host must be listening before the target sends its initial break.\n"
                     "2. Verify the key matches exactly (bcdedit /dbgsettings on the target).\n"
                     "3. Confirm the target's NIC supports KDNET "
@@ -497,15 +629,55 @@ class WinDbgBridge(Debugger):
             else:
                 pool.shutdown(wait=False)
 
+            # Register event callbacks before classifying state - SessionStatus
+            # / Breakpoint events arriving during attach may have been buffered.
             self._dbg = kd
             self._mode = WinDbgMode.KERNEL_MODE
+            self._attach_event_callbacks()
+
+            # If wait() returned but no Breakpoint/Exception event has been
+            # observed, the engine has a session but no current thread. This
+            # is the half-handshake: legacy code reported success here, then
+            # every follow-up command failed. We auto-interrupt to force a
+            # state-change packet; if that still doesn't break, the caller
+            # gets a structured 'target running' response so they know to
+            # invoke break_in once the target hits a natural break point.
+            if not self._session.is_broken():
+                logger.info(
+                    "KDNET attach returned without break (state=%s); "
+                    "attempting auto-interrupt to acquire current thread",
+                    self._session.state.value,
+                )
+                try:
+                    self.break_in(timeout=5)
+                except Exception as exc:
+                    logger.warning("Auto-interrupt failed: %s", exc)
+                    self._state = DebuggerState.RUNNING
+                    return {
+                        "status": "connected_target_running",
+                        "port": port,
+                        "advice": (
+                            "Connected, but target was running and did not "
+                            "break. Call windbg_break() once the target "
+                            "reaches a break, or trigger a target-side "
+                            "interrupt (Ctrl+Break in WinDbg, kdbreak)."
+                        ),
+                        "session": self._session.snapshot(),
+                    }
+
             self._state = DebuggerState.PAUSED
             logger.info("Connected to kernel target via KDNET port=%d", port)
-            return True
+            return {
+                "status": "connected_broken",
+                "port": port,
+                "session": self._session.snapshot(),
+            }
         except WinDbgBridgeError:
+            self._safe_disconnect()
             raise
         except Exception as exc:
             self._log_error("connect_kernel_net", exc)
+            self._safe_disconnect()
             structured = create_kernel_not_connected_error(str(exc))
             raise StructuredBaseError(structured) from exc
 
@@ -527,6 +699,7 @@ class WinDbgBridge(Debugger):
         try:
             self._dbg = pybag.KernelDbg()
             self._dbg.attach("local")
+            self._attach_event_callbacks()
 
             self._mode = WinDbgMode.KERNEL_MODE
             self._state = DebuggerState.PAUSED

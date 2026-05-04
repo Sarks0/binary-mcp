@@ -15,6 +15,7 @@ from src.engines.dynamic.windbg.bridge import (
     WinDbgBridgeError,
 )
 from src.engines.dynamic.windbg.kernel_types import WinDbgMode
+from src.utils.structured_errors import StructuredBaseError
 
 
 class TestPlatformGuard:
@@ -105,17 +106,98 @@ class TestConnectWithMockedPybag:
     @patch("src.engines.dynamic.windbg.bridge.PYBAG_AVAILABLE", True)
     @patch("src.engines.dynamic.windbg.bridge.pybag")
     def test_connect_kernel_net(self, mock_pybag, mock_sys):
+        """Happy path: target broke in cleanly; returns connected_broken."""
+        from src.engines.dynamic.windbg.session_state import KernelSessionState
+
         mock_kd = MagicMock()
         mock_pybag.KernelDbg.return_value = mock_kd
 
         bridge = WinDbgBridge()
+
+        # Simulate a real broken-in target: as soon as wait() runs, our
+        # event-callback would mark the tracker as BROKEN. Drive that
+        # transition directly (the COM shim is not exercised under test).
+        def _wait_and_break(_ms):
+            bridge._session.record_break(thread_id=0xABCD)
+
+        mock_kd.wait.side_effect = _wait_and_break
+
         result = bridge.connect_kernel_net(port=50000, key="1.2.3.4")
-        assert result is True
+        assert result["status"] == "connected_broken"
+        assert result["port"] == 50000
         assert bridge._mode == WinDbgMode.KERNEL_MODE
         assert bridge.get_state() == DebuggerState.PAUSED
+        assert bridge._session.state == KernelSessionState.BROKEN
         mock_kd.attach.assert_called_once_with("net:port=50000,key=1.2.3.4")
-        # wait() must be called after attach() to confirm target broke in
         mock_kd.wait.assert_called_once()
+
+    @patch("src.engines.dynamic.windbg.bridge.platform.system", return_value="Windows")
+    @patch("src.engines.dynamic.windbg.bridge.PYBAG_AVAILABLE", True)
+    @patch("src.engines.dynamic.windbg.bridge.pybag")
+    def test_connect_kernel_net_half_handshake_auto_break(
+        self, mock_pybag, mock_sys
+    ):
+        """wait() returns but no break event - auto-interrupt unsticks the engine."""
+        from src.engines.dynamic.windbg.session_state import KernelSessionState
+
+        mock_kd = MagicMock()
+        mock_pybag.KernelDbg.return_value = mock_kd
+
+        bridge = WinDbgBridge()
+
+        # Tracker stays in LISTENING after wait() (no callback fired). The
+        # auto-interrupt path inside connect_kernel_net should call our
+        # break_in(), which we mock at the bridge level so the test does
+        # not depend on _control.SetInterrupt internals.
+        def _fake_break_in(timeout=5):
+            bridge._session.record_break(thread_id=0xCAFE)
+            bridge._state = DebuggerState.PAUSED
+            return True
+
+        with patch.object(bridge, "break_in", side_effect=_fake_break_in):
+            result = bridge.connect_kernel_net(port=50000, key="1.2.3.4")
+
+        assert result["status"] == "connected_broken"
+        assert bridge._session.state == KernelSessionState.BROKEN
+
+    @patch("src.engines.dynamic.windbg.bridge.platform.system", return_value="Windows")
+    @patch("src.engines.dynamic.windbg.bridge.PYBAG_AVAILABLE", True)
+    @patch("src.engines.dynamic.windbg.bridge.pybag")
+    def test_connect_kernel_net_running_target_returns_advice(
+        self, mock_pybag, mock_sys
+    ):
+        """Half-handshake + auto-interrupt fails - return structured advice, do not raise."""
+        mock_kd = MagicMock()
+        mock_pybag.KernelDbg.return_value = mock_kd
+
+        bridge = WinDbgBridge()
+
+        with patch.object(
+            bridge, "break_in", side_effect=WinDbgBridgeError("break_in", "no break")
+        ):
+            result = bridge.connect_kernel_net(port=50000, key="1.2.3.4")
+
+        assert result["status"] == "connected_target_running"
+        assert "windbg_break" in result["advice"]
+        assert bridge.get_state() == DebuggerState.RUNNING
+
+    @patch("src.engines.dynamic.windbg.bridge.platform.system", return_value="Windows")
+    @patch("src.engines.dynamic.windbg.bridge.PYBAG_AVAILABLE", True)
+    @patch("src.engines.dynamic.windbg.bridge.pybag")
+    def test_connect_kernel_net_cleans_up_on_attach_failure(
+        self, mock_pybag, mock_sys
+    ):
+        """attach() raises - bridge must not retain a half-attached _dbg."""
+        mock_kd = MagicMock()
+        mock_kd.attach.side_effect = RuntimeError("kdnet failed")
+        mock_pybag.KernelDbg.return_value = mock_kd
+
+        bridge = WinDbgBridge()
+        with pytest.raises(StructuredBaseError):
+            bridge.connect_kernel_net(port=50000, key="1.2.3.4", timeout=1)
+
+        assert bridge._dbg is None
+        assert bridge.get_state() == DebuggerState.NOT_LOADED
 
     @patch("src.engines.dynamic.windbg.bridge.platform.system", return_value="Windows")
     @patch("src.engines.dynamic.windbg.bridge.PYBAG_AVAILABLE", True)

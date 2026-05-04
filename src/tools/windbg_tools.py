@@ -167,8 +167,15 @@ def register_windbg_tools(
         try:
             bridge = get_windbg_bridge()
             if key:
-                bridge.connect_kernel_net(port=port, key=key, timeout=timeout)
-                return f"Connected to kernel target via KDNET (port={port})"
+                result = bridge.connect_kernel_net(port=port, key=key, timeout=timeout)
+                status = result.get("status", "connected")
+                if status == "connected_target_running":
+                    return (
+                        f"Connected to kernel target via KDNET (port={port}), "
+                        f"but target is running and did not break.\n"
+                        f"{result.get('advice', 'Call windbg_break() to interrupt.')}"
+                    )
+                return f"Connected to kernel target via KDNET (port={port}, broken-in)"
             else:
                 bridge.connect_kernel_local()
                 return "Connected to local kernel (read-only)"
@@ -244,6 +251,52 @@ def register_windbg_tools(
             bridge = get_windbg_bridge()
             bridge.pause()
             return "Execution paused"
+        except (WinDbgBridgeError, StructuredBaseError) as e:
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_windbg_tool
+    def windbg_break(timeout: int = 5) -> str:
+        """Force the target to break in and acquire a current thread/process.
+
+        Distinct from ``windbg_pause``: this also waits for the engine to
+        consume the resulting state-change packet, so commands like
+        ``vertarget``, ``.reload``, and ``!process`` will work after it
+        returns. Use this to recover from a KDNET half-handshake state
+        where ``windbg_connect_kernel`` reported success but commands
+        warn "debugger does not have a current process or thread".
+
+        Args:
+            timeout: Seconds to wait for the break to land (default 5).
+
+        Returns:
+            Status message including the post-break session snapshot.
+        """
+        if not _is_windows():
+            return _PLATFORM_MSG
+        try:
+            bridge = get_windbg_bridge()
+            bridge.break_in(timeout=timeout)
+            snap = bridge.get_session_state()
+            return f"Target broke in. Session: {snap}"
+        except (WinDbgBridgeError, StructuredBaseError) as e:
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_windbg_tool
+    def windbg_session_status() -> str:
+        """Return the live kernel-debug session state.
+
+        Reports state transitions observed via DbgEng's event callbacks:
+        ``listening`` / ``established`` / ``running`` / ``broken`` /
+        ``gone`` / ``bugcheck``. Use to poll after a target reboot or
+        when a connect call returns ``connected_target_running``.
+        """
+        if not _is_windows():
+            return _PLATFORM_MSG
+        try:
+            bridge = get_windbg_bridge()
+            return f"{bridge.get_session_state()}"
         except (WinDbgBridgeError, StructuredBaseError) as e:
             return f"Error: {e}"
 

@@ -44,6 +44,14 @@ from .kernel_types import (
 )
 from .output_parser import WinDbgOutputParser
 from .session_state import KernelSessionState, SessionTracker
+from .sympath import (
+    compute_nt_symbol_path,
+    get_engine_sympath,
+    join_sympath,
+    set_engine_sympath,
+    subprocess_env_with_sympath,
+    validate_sympath_element,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -208,6 +216,51 @@ class WinDbgBridge(Debugger):
         self._callbacks_registered = False
 
         logger.info("WinDbgBridge initialized (pybag=%s)", PYBAG_AVAILABLE)
+
+    def _apply_default_sympath(self) -> None:
+        """Push the unified ``_NT_SYMBOL_PATH`` into the live engine.
+
+        Best-effort. Failure does not prevent the bridge from working - the
+        engine just keeps whatever sympath it was using, which is usually
+        the inherited environment ``_NT_SYMBOL_PATH``.
+        """
+        if self._dbg is None:
+            return
+        try:
+            set_engine_sympath(self._dbg, compute_nt_symbol_path())
+        except Exception as exc:
+            logger.debug("Engine sympath wiring failed: %s", exc)
+
+    def set_sympath(self, elements: list[str]) -> str:
+        """Set the engine sympath from a list of validated elements.
+
+        Each element must pass :func:`validate_sympath_element` - we
+        refuse to forward UNC paths, http servers without an explicit
+        opt-in, or shell metacharacters into ``IDebugSymbols::SetSymbolPath``.
+        """
+        self._require_connected()
+        bad = []
+        for e in elements:
+            reason = validate_sympath_element(e)
+            if reason is not None:
+                bad.append(f"{e!r}: {reason}")
+        if bad:
+            raise WinDbgBridgeError(
+                "set_sympath", "rejected entries: " + "; ".join(bad)
+            )
+        joined = join_sympath(elements)
+        if not set_engine_sympath(self._dbg, joined):
+            raise WinDbgBridgeError(
+                "set_sympath",
+                "engine refused new sympath (no _symbols handle or "
+                "SetSymbolPath returned an error)",
+            )
+        return joined
+
+    def get_sympath(self) -> str | None:
+        """Return the engine's current ``_NT_SYMBOL_PATH``."""
+        self._require_connected()
+        return get_engine_sympath(self._dbg)
 
     def _attach_event_callbacks(self) -> None:
         """Attach our IDebugEventCallbacks shim to the live engine.
@@ -408,14 +461,26 @@ class WinDbgBridge(Debugger):
         self._require_not_dump("break_in")
 
         def _wait_for_break(seconds: int) -> bool:
-            deadline = time.monotonic() + seconds
+            wait_failed = False
             try:
                 self._dbg.wait(seconds * 1000)
             except Exception as exc:
                 logger.debug("wait() during break_in raised: %s", exc)
-            # Even without callbacks the wait() return is enough to mark
-            # the engine as broken-in for legacy mode; with callbacks the
-            # tracker is the source of truth.
+                wait_failed = True
+
+            # In legacy mode (event callbacks not registered) the tracker
+            # is never populated by COM events, so wait() returning normally
+            # is the only signal we have that a state change landed. Treat
+            # that as broken-in. With callbacks, the tracker is the source
+            # of truth and may lag wait() by a few ms.
+            if not wait_failed and not self._callbacks_registered:
+                self._session.record_break()
+                return True
+
+            # With callbacks, wait() may return slightly before the state
+            # transition arrives on the COM thread. Drain for a short
+            # window after wait() returns.
+            deadline = time.monotonic() + 1.0
             while time.monotonic() < deadline:
                 if self._session.is_broken():
                     return True
@@ -634,6 +699,7 @@ class WinDbgBridge(Debugger):
             self._dbg = kd
             self._mode = WinDbgMode.KERNEL_MODE
             self._attach_event_callbacks()
+            self._apply_default_sympath()
 
             # If wait() returned but no Breakpoint/Exception event has been
             # observed, the engine has a session but no current thread. This
@@ -700,6 +766,7 @@ class WinDbgBridge(Debugger):
             self._dbg = pybag.KernelDbg()
             self._dbg.attach("local")
             self._attach_event_callbacks()
+            self._apply_default_sympath()
 
             self._mode = WinDbgMode.KERNEL_MODE
             self._state = DebuggerState.PAUSED
@@ -1035,6 +1102,7 @@ class WinDbgBridge(Debugger):
                 capture_output=True,
                 text=True,
                 timeout=self._timeout,
+                env=subprocess_env_with_sympath(),
             )
             if result.stderr:
                 logger.warning("CDB/KD stderr: %s", result.stderr.strip())
@@ -1244,29 +1312,22 @@ class WinDbgBridge(Debugger):
     def _validate_command_safety(self, command: str) -> None:
         """Block dangerous WinDbg meta-commands for defense-in-depth.
 
-        Checks the command string (case-insensitively) against
-        ``_BLOCKED_COMMANDS`` using substring matching, since dangerous
-        commands can appear after semicolons in compound expressions.
-        Also checks for common bypass techniques.
+        Delegates to the token-aware :func:`allowlist.validate_command`
+        which understands compound commands, quoted regions, and
+        ``.foreach``/``.for`` block bodies. The legacy substring matcher
+        was simultaneously over- and under-blocking; see ``allowlist.py``
+        for the current rule set.
 
         Raises:
             WinDbgBridgeError: If a blocked command is detected.
         """
-        lower_cmd = command.lower().strip()
+        from .allowlist import validate_command
 
-        # Check each blocked command as substring
-        for blocked in _BLOCKED_COMMANDS:
-            if blocked in lower_cmd:
-                raise WinDbgBridgeError(
-                    "command_validation",
-                    f"Command blocked: '{blocked}' is not allowed for security reasons.",
-                )
-
-        # Block commands with excessive semicolons (compound command chains)
-        if lower_cmd.count(';') > 5:
+        ok, reason = validate_command(command)
+        if not ok:
             raise WinDbgBridgeError(
                 "command_validation",
-                "Command blocked: too many compound commands (max 5 semicolons).",
+                f"Command blocked: {reason}.",
             )
 
     def _log_error(

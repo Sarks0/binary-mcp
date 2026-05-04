@@ -43,6 +43,10 @@ def _is_windows() -> bool:
 _SAFE_ADDRESS_RE = re.compile(r'^[0-9a-fA-F`x]+$')  # Hex addresses with optional backticks and 0x prefix
 _SAFE_SYMBOL_RE = re.compile(r'^[a-zA-Z0-9_!.*+:]+$')  # Symbol names like nt!NtCreateFile or module!*
 _SAFE_CONDITION_RE = re.compile(r'^[a-zA-Z0-9_!=<>&|+\-*/()\s,]+$')  # WinDbg expressions
+# KDNET session key produced by `bcdedit /dbgsettings`: four dot-separated
+# alnum tokens. Loose enough to accept all real keys, strict enough to
+# reject empties / accidental whitespace / shell metacharacters.
+_KDNET_KEY_RE = re.compile(r'^[0-9a-z]+\.[0-9a-z]+\.[0-9a-z]+\.[0-9a-z]+$')
 
 
 def _validate_address(address: str) -> str:
@@ -155,7 +159,10 @@ def register_windbg_tools(
 
         Args:
             port: KDNET port number (default 50000).
-            key: KDNET session key in w.x.y.z format.
+            key: KDNET session key in ``w.x.y.z`` format (four dot-separated
+                 alphanumeric tokens, as printed by ``bcdedit /dbgsettings``
+                 on the target). REQUIRED. To attach to the local kernel
+                 instead, use ``windbg_connect_local_kernel``.
             timeout: Seconds to wait for target to break in (default 120).
                      Set higher if the target has a slow boot.
 
@@ -164,21 +171,50 @@ def register_windbg_tools(
         """
         if not _is_windows():
             return _PLATFORM_MSG
+        if not key or not _KDNET_KEY_RE.match(key.strip()):
+            return (
+                "Error: KDNET key required (format w.x.y.z; example "
+                "1a2b3c.4d5e6f.7890ab.cdef01). Run `bcdedit /dbgsettings` "
+                "on the target to retrieve it. To attach to the local "
+                "kernel instead, call windbg_connect_local_kernel."
+            )
         try:
             bridge = get_windbg_bridge()
-            if key:
-                result = bridge.connect_kernel_net(port=port, key=key, timeout=timeout)
-                status = result.get("status", "connected")
-                if status == "connected_target_running":
-                    return (
-                        f"Connected to kernel target via KDNET (port={port}), "
-                        f"but target is running and did not break.\n"
-                        f"{result.get('advice', 'Call windbg_break() to interrupt.')}"
-                    )
-                return f"Connected to kernel target via KDNET (port={port}, broken-in)"
-            else:
-                bridge.connect_kernel_local()
-                return "Connected to local kernel (read-only)"
+            result = bridge.connect_kernel_net(port=port, key=key, timeout=timeout)
+            status = result.get("status", "connected")
+            if status == "connected_target_running":
+                return (
+                    f"Connected to kernel target via KDNET (port={port}), "
+                    f"but target is running and did not break.\n"
+                    f"{result.get('advice', 'Call windbg_break() to interrupt.')}"
+                )
+            return f"Connected to kernel target via KDNET (port={port}, broken-in)"
+        except (WinDbgBridgeError, StructuredBaseError) as e:
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_windbg_tool
+    def windbg_connect_local_kernel() -> str:
+        """Attach to the LOCAL kernel for read-only inspection.
+
+        Equivalent to running ``kd -kl`` as Administrator. Provides read
+        access to memory, modules, and symbols when ``bcdedit -debug on``
+        is set. Registers and execution control (breakpoints, stepping,
+        halting) are NOT available - those require a remote KDNET
+        connection to a separate target machine via
+        ``windbg_connect_kernel``.
+
+        This tool is the explicit, intentional local-kernel attach. The
+        prior behaviour of ``windbg_connect_kernel`` silently falling
+        back to the local kernel when ``key`` was omitted has been
+        removed - too easy to confuse a missing key with intent.
+        """
+        if not _is_windows():
+            return _PLATFORM_MSG
+        try:
+            bridge = get_windbg_bridge()
+            bridge.connect_kernel_local()
+            return "Connected to local kernel (read-only)"
         except (WinDbgBridgeError, StructuredBaseError) as e:
             return f"Error: {e}"
 
@@ -297,6 +333,60 @@ def register_windbg_tools(
         try:
             bridge = get_windbg_bridge()
             return f"{bridge.get_session_state()}"
+        except (WinDbgBridgeError, StructuredBaseError) as e:
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_windbg_tool
+    def windbg_get_sympath() -> str:
+        """Return the engine's current ``_NT_SYMBOL_PATH``.
+
+        Reads ``IDebugSymbols::GetSymbolPath`` directly. Use to verify
+        which symbol cache + servers the engine is consulting before
+        kicking off `.reload` or symbol-resolving commands.
+        """
+        if not _is_windows():
+            return _PLATFORM_MSG
+        try:
+            bridge = get_windbg_bridge()
+            current = bridge.get_sympath()
+            if current is None:
+                return "Engine has no _NT_SYMBOL_PATH set."
+            return current
+        except (WinDbgBridgeError, StructuredBaseError) as e:
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_windbg_tool
+    def windbg_set_sympath(elements: list[str]) -> str:
+        """Set the engine's symbol path from a list of elements.
+
+        Each element is validated before being forwarded to
+        ``IDebugSymbols::SetSymbolPath``. Allowed forms:
+
+          - ``srv*<cache>*<https-url>`` - standard downstream-store entry.
+            ``<cache>`` must live under ``BINARY_MCP_SYMBOL_CACHE``.
+          - ``srv*<https-url>`` - server, default cache.
+          - ``cache*<path>`` - cache override (must live under our root).
+          - ``<https-url>`` - bare server.
+          - bare local path - private symbol store.
+
+        Rejected: UNC paths, http:// without ``BINARY_MCP_ALLOW_HTTP_SYMBOLS=1``,
+        any element containing shell metacharacters. The legacy
+        ``.sympath`` meta-command stays blocked: route all symbol-path
+        changes through this structured tool.
+
+        Args:
+            elements: List of symbol-path entries, in priority order.
+
+        Returns:
+            The new symbol path the engine is using.
+        """
+        if not _is_windows():
+            return _PLATFORM_MSG
+        try:
+            bridge = get_windbg_bridge()
+            return bridge.set_sympath(elements)
         except (WinDbgBridgeError, StructuredBaseError) as e:
             return f"Error: {e}"
 

@@ -197,7 +197,31 @@ class TestBridgeIntegration:
 
     @patch("src.engines.dynamic.windbg.bridge.platform.system", return_value="Windows")
     @patch("src.engines.dynamic.windbg.bridge.PYBAG_AVAILABLE", True)
-    def test_break_in_falls_back_to_dotbreak_then_raises(self, _system):
+    def test_break_in_legacy_mode_uses_wait_return_as_break_signal(
+        self, _system
+    ):
+        """Without event callbacks (comtypes unavailable, legacy pybag),
+        a clean wait() return must be treated as broken-in. Otherwise
+        the tracker is never populated and break_in always fails -
+        exactly the regression PR #115 review caught.
+        """
+        from src.engines.dynamic.base import DebuggerState
+        from src.engines.dynamic.windbg.bridge import WinDbgBridge
+
+        bridge = WinDbgBridge()
+        bridge._dbg = MagicMock()
+        bridge._state = DebuggerState.RUNNING
+        bridge._callbacks_registered = False  # legacy mode
+        bridge._dbg.wait.return_value = None  # clean wait, no callback fires
+
+        assert bridge.break_in(timeout=1) is True
+        assert bridge._session.is_broken()
+
+    @patch("src.engines.dynamic.windbg.bridge.platform.system", return_value="Windows")
+    @patch("src.engines.dynamic.windbg.bridge.PYBAG_AVAILABLE", True)
+    def test_break_in_with_callbacks_falls_back_to_dotbreak_then_raises(
+        self, _system
+    ):
         from src.engines.dynamic.base import DebuggerState
         from src.engines.dynamic.windbg.bridge import (
             WinDbgBridge,
@@ -207,12 +231,14 @@ class TestBridgeIntegration:
         bridge = WinDbgBridge()
         bridge._dbg = MagicMock()
         bridge._state = DebuggerState.RUNNING
-        # SetInterrupt + .break both no-op; tracker stays unbroken.
+        # With callbacks registered the legacy short-circuit does not apply,
+        # so a wait() that returns without driving the tracker is genuinely
+        # a non-break and we must fall through to .break and then raise.
+        bridge._callbacks_registered = True
         bridge._dbg.wait.return_value = None
 
         with pytest.raises(WinDbgBridgeError, match="did not break"):
             bridge.break_in(timeout=1)
 
-        # Both interrupt mechanisms attempted before raising.
         bridge._dbg._control.SetInterrupt.assert_called_once_with(0)
         bridge._dbg.cmd.assert_called_with(".break")

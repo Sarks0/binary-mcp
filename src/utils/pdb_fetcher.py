@@ -32,7 +32,19 @@ logger = logging.getLogger(__name__)
 
 
 def _default_symbol_cache() -> Path:
-    """Resolve the default symbol cache path, honoring XDG_CACHE_HOME on POSIX."""
+    """Resolve the default symbol cache path, honoring XDG_CACHE_HOME on POSIX.
+
+    Override priority:
+      1. ``BINARY_MCP_SYMBOL_CACHE`` env var (unified across static
+         analysis and dynamic WinDbg debugging - both surfaces share
+         the same cache so a PDB downloaded for analyze_binary is
+         immediately available to a live KDNET session).
+      2. Platform default (Windows: ``~/.binary_mcp_cache/symbols``;
+         POSIX: ``$XDG_CACHE_HOME/binary_mcp/symbols``).
+    """
+    explicit = os.environ.get("BINARY_MCP_SYMBOL_CACHE")
+    if explicit:
+        return Path(explicit)
     if sys.platform == "win32":
         return Path.home() / ".binary_mcp_cache" / "symbols"
     xdg = os.environ.get("XDG_CACHE_HOME")
@@ -41,7 +53,10 @@ def _default_symbol_cache() -> Path:
 
 
 DEFAULT_SYMBOL_CACHE = _default_symbol_cache()
-DEFAULT_SYMBOL_SERVER = "https://msdl.microsoft.com/download/symbols"
+DEFAULT_SYMBOL_SERVER = os.environ.get(
+    "BINARY_MCP_SYMBOL_SERVER",
+    "https://msdl.microsoft.com/download/symbols",
+)
 
 MAX_CODEVIEW_BYTES = 64 * 1024
 _PDB_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+\.pdb$", re.IGNORECASE)

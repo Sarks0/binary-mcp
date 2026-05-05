@@ -235,7 +235,7 @@ class ILSpyRunner:
             result = subprocess.run(
                 [ilspycmd, "--version"],
                 capture_output=True,
-                text=True,
+                text=True, encoding="utf-8", errors="replace",
                 timeout=10
             )
             return result.stdout.strip() or result.stderr.strip()
@@ -344,7 +344,7 @@ class ILSpyRunner:
                 result = subprocess.run(
                     [ilspycmd, "-l", filter_code, str(assembly_path)],
                     capture_output=True,
-                    text=True,
+                    text=True, encoding="utf-8", errors="replace",
                     timeout=120
                 )
                 if result.returncode == 0 and result.stdout.strip():
@@ -376,7 +376,7 @@ class ILSpyRunner:
                 result = subprocess.run(
                     [ilspycmd, str(assembly_path)],
                     capture_output=True,
-                    text=True,
+                    text=True, encoding="utf-8", errors="replace",
                     timeout=120
                 )
                 if result.returncode != 0:
@@ -559,7 +559,7 @@ class ILSpyRunner:
             result = subprocess.run(
                 [ilspycmd, str(assembly_path), "-o", str(output_dir)],
                 capture_output=True,
-                text=True,
+                text=True, encoding="utf-8", errors="replace",
                 timeout=300  # 5 minute timeout
             )
 
@@ -617,7 +617,7 @@ class ILSpyRunner:
             result = subprocess.run(
                 [ilspycmd, str(assembly_path), "-t", validated_type_name],
                 capture_output=True,
-                text=True,
+                text=True, encoding="utf-8", errors="replace",
                 timeout=60
             )
 
@@ -676,7 +676,7 @@ class ILSpyRunner:
             result = subprocess.run(
                 cmd,
                 capture_output=True,
-                text=True,
+                text=True, encoding="utf-8", errors="replace",
                 timeout=120
             )
 
@@ -753,7 +753,7 @@ class ILSpyRunner:
                 result = subprocess.run(
                     [dotnet, "--version"],
                     capture_output=True,
-                    text=True,
+                    text=True, encoding="utf-8", errors="replace",
                     timeout=10
                 )
                 diag["dotnet_version"] = result.stdout.strip()

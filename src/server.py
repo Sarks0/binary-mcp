@@ -447,6 +447,7 @@ def get_analysis_context(
     end_address: str | None = None,
     pdb_path: str | None = None,
     enable_fid: bool = False,
+    analysis_depth: str = "full",
 ) -> dict:
     """
     Get or create analysis context for a binary.
@@ -502,8 +503,22 @@ def get_analysis_context(
             and not pdb_path and not enable_fid:
         cached_context = cache.get_cached(binary_path)
         if cached_context:
-            logger.info(f"Using cached analysis for {binary_path}")
-            return cached_context
+            # If the cache was produced at a shallower depth than the caller
+            # asked for, run a fresh analysis instead. shallow < structural < full.
+            depth_rank = {"shallow": 0, "structural": 1, "full": 2}
+            cached_depth = cached_context.get("metadata", {}).get(
+                "analysis_depth", "full"
+            )
+            if depth_rank.get(cached_depth, 2) >= depth_rank.get(analysis_depth, 2):
+                logger.info(
+                    "Using cached analysis for %s (cached_depth=%s)",
+                    binary_path, cached_depth,
+                )
+                return cached_context
+            logger.info(
+                "Cache depth %s is shallower than requested %s; reanalyzing",
+                cached_depth, analysis_depth,
+            )
 
     # Run Ghidra analysis
     logger.info(f"Analyzing {binary_path} with Ghidra...")
@@ -568,6 +583,7 @@ def get_analysis_context(
             skip_decompile=skip_decompile,
             max_functions=max_functions,
             function_timeout=function_timeout,
+            analysis_depth=analysis_depth,
             resume_from_cache=None if resume_manifest_path else (
                 str(resume_from_cache) if resume_from_cache else None
             ),
@@ -581,7 +597,7 @@ def get_analysis_context(
         # Save Ghidra output to debug file for inspection
         debug_file = cache.cache_dir / "ghidra_debug.log"
         try:
-            with open(debug_file, 'w') as f:
+            with open(debug_file, 'w', encoding='utf-8', errors='replace') as f:
                 f.write("=== GHIDRA ANALYSIS DEBUG LOG ===\n")
                 f.write(f"Binary: {binary_path}\n")
                 f.write(f"Output Path: {output_path}\n")
@@ -676,6 +692,13 @@ def get_analysis_context(
             output_path.unlink(missing_ok=True)
             raise UserFacingError(user_message, internal_details=internal_details)
 
+        # Tag the cache with the depth it was produced at so callers can
+        # detect a thin shallow/structural cache and upgrade if they need
+        # decompiled output. Existing caches without this field count as
+        # "full" because that was the only mode prior to PR #116.
+        meta = context.setdefault("metadata", {})
+        meta["analysis_depth"] = analysis_depth
+
         # Cache the results
         cache.save_cached(binary_path, context)
 
@@ -718,6 +741,7 @@ def analyze_binary(
     end_address: str | None = None,
     pdb_path: str | None = None,
     enable_fid: bool = False,
+    analysis_depth: str = "full",
 ) -> str:
     """
     Analyze a binary file with Ghidra headless analyzer.
@@ -751,6 +775,14 @@ def analyze_binary(
         enable_fid: Run Ghidra's Function ID library fingerprinting; matches
             are stored per-function in ``fid_match``. Query via ``fid_match``
             tool after analysis.
+        analysis_depth: Analysis tier. ``"full"`` (default) runs all auto-analyzers
+            and decompiles every function. ``"structural"`` runs auto-analyzers
+            but skips decompilation (equivalent to ``skip_decompile=True``).
+            ``"shallow"`` adds Ghidra's ``-noanalysis`` flag for the fastest
+            possible pass: function table from PE/ELF symbols + basic disasm,
+            no xrefs, no decompile. Use shallow for VR triage on multi-MB
+            binaries, then upgrade with ``analysis_depth="structural"`` or
+            ``"full"`` once you've narrowed the target.
 
     Returns:
         Analysis summary with basic statistics, or compatibility warning if issues detected
@@ -809,6 +841,7 @@ Format: {compat_info.format.value}
             end_address=end_address,
             pdb_path=pdb_path,
             enable_fid=enable_fid,
+            analysis_depth=analysis_depth,
         )
 
         metadata = context.get("metadata", {})

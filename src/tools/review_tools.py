@@ -255,6 +255,23 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
                 )
 
             context, _ = _load_context(binary_path, cache, runner)
+
+            # scan_pseudocode is meaningless on a shallow/structural cache:
+            # there is no decompiled text to match rules against. Surface
+            # this explicitly instead of silently scanning zero functions.
+            cached_depth = (
+                context.get("metadata", {}).get("analysis_depth", "full")
+            )
+            if cached_depth in ("shallow", "structural"):
+                return (
+                    f"scan_pseudocode requires a full Ghidra cache, but the "
+                    f"existing cache for this binary was produced with "
+                    f"analysis_depth='{cached_depth}' (no pseudocode).\n\n"
+                    f"To fix: analyze_binary(binary_path, force_reanalyze=True)\n\n"
+                    f"For string-only triage that does not need pseudocode, "
+                    f"use search_strings or search_bytes."
+                )
+
             functions = context.get("functions", [])
 
             pattern = _re.compile(function_filter) if function_filter else None

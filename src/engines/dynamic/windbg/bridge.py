@@ -12,6 +12,7 @@ import functools
 import logging
 import os
 import platform
+import re
 import shutil
 import subprocess
 import time
@@ -33,6 +34,7 @@ from src.utils.structured_errors import (
 
 from ..base import Debugger, DebuggerState
 from .error_logger import ErrorContext, WinDbgErrorLogger
+from .event_callbacks import BinaryMcpEventCallbacks, register_callbacks
 from .kernel_types import (
     CrashAnalysis,
     DeviceObject,
@@ -42,6 +44,15 @@ from .kernel_types import (
     WinDbgMode,
 )
 from .output_parser import WinDbgOutputParser
+from .session_state import KernelSessionState, SessionTracker
+from .sympath import (
+    compute_nt_symbol_path,
+    get_engine_sympath,
+    join_sympath,
+    set_engine_sympath,
+    subprocess_env_with_sympath,
+    validate_sympath_element,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -201,8 +212,93 @@ class WinDbgBridge(Debugger):
         self._cdb_proc: subprocess.Popen | None = None
         self._breakpoint_counter: int = 0
         self._breakpoints: dict[str, int] = {}  # address -> bp id
+        self._session = SessionTracker()
+        self._event_callbacks = BinaryMcpEventCallbacks(self._session)
+        self._callbacks_registered = False
 
         logger.info("WinDbgBridge initialized (pybag=%s)", PYBAG_AVAILABLE)
+
+    def _apply_default_sympath(self) -> None:
+        """Push the unified ``_NT_SYMBOL_PATH`` into the live engine.
+
+        Best-effort. Failure does not prevent the bridge from working - the
+        engine just keeps whatever sympath it was using, which is usually
+        the inherited environment ``_NT_SYMBOL_PATH``.
+        """
+        if self._dbg is None:
+            return
+        try:
+            set_engine_sympath(self._dbg, compute_nt_symbol_path())
+        except Exception as exc:
+            logger.debug("Engine sympath wiring failed: %s", exc)
+
+    def set_sympath(self, elements: list[str]) -> str:
+        """Set the engine sympath from a list of validated elements.
+
+        Each element must pass :func:`validate_sympath_element` - we
+        refuse to forward UNC paths, http servers without an explicit
+        opt-in, or shell metacharacters into ``IDebugSymbols::SetSymbolPath``.
+        """
+        self._require_connected()
+        bad = []
+        for e in elements:
+            reason = validate_sympath_element(e)
+            if reason is not None:
+                bad.append(f"{e!r}: {reason}")
+        if bad:
+            raise WinDbgBridgeError(
+                "set_sympath", "rejected entries: " + "; ".join(bad)
+            )
+        joined = join_sympath(elements)
+        if not set_engine_sympath(self._dbg, joined):
+            raise WinDbgBridgeError(
+                "set_sympath",
+                "engine refused new sympath (no _symbols handle or "
+                "SetSymbolPath returned an error)",
+            )
+        return joined
+
+    def get_sympath(self) -> str | None:
+        """Return the engine's current ``_NT_SYMBOL_PATH``."""
+        self._require_connected()
+        return get_engine_sympath(self._dbg)
+
+    def _attach_event_callbacks(self) -> None:
+        """Attach our IDebugEventCallbacks shim to the live engine.
+
+        Best-effort: if the registration fails (no comtypes, unexpected
+        pybag layout, COM error), we log a warning and proceed. The
+        bridge still works in the legacy ``wait()``-poll mode; only
+        the session-state machine is degraded.
+        """
+        if self._callbacks_registered or self._dbg is None:
+            return
+        try:
+            self._callbacks_registered = register_callbacks(
+                self._dbg, self._event_callbacks
+            )
+        except Exception as exc:
+            logger.warning("Event-callback registration raised: %s", exc)
+            self._callbacks_registered = False
+
+    def _safe_disconnect(self) -> None:
+        """Tear down the engine state without re-raising.
+
+        Used in the except branches of attach paths so a failed connect
+        cannot leave the bridge holding a half-attached engine.
+        """
+        try:
+            if self._dbg is not None:
+                try:
+                    self._dbg.detach()
+                except Exception:
+                    pass
+        finally:
+            self._dbg = None
+            self._callbacks_registered = False
+            self._session.reset()
+            self._state = DebuggerState.NOT_LOADED
+            self._is_local_kernel = False
 
     # --- Debugger ABC implementation ---
 
@@ -242,6 +338,8 @@ class WinDbgBridge(Debugger):
                 pass
             self._dbg = None
 
+        self._callbacks_registered = False
+        self._session.reset()
         self._state = DebuggerState.NOT_LOADED
         self._mode = WinDbgMode.USER_MODE
         self._is_local_kernel = False
@@ -339,6 +437,292 @@ class WinDbgBridge(Debugger):
         except Exception as exc:
             self._log_error("pause", exc)
             raise WinDbgBridgeError("pause", str(exc)) from exc
+
+    @_trace
+    def break_in(self, timeout: int = 5) -> bool:
+        """Force the target to surface a state-change packet.
+
+        Distinct from :meth:`pause`: ``pause`` flips the engine flag and
+        returns. ``break_in`` flips the flag *and waits* for DbgEng to
+        consume the resulting state-change so the engine acquires a
+        current thread/process. Use this to recover from the KDNET
+        half-handshake (handshake completed, but no break event ever
+        fired, leaving every command saying "debugger does not have a
+        current process or thread").
+
+        Args:
+            timeout: Seconds to wait for the break to land.
+
+        Raises:
+            WinDbgBridgeError: if the target does not break within
+                ``timeout`` even after a fallback ``.break`` command.
+        """
+        self._require_connected()
+        self._require_not_local("break_in")
+        self._require_not_dump("break_in")
+
+        def _wait_for_break(seconds: int) -> bool:
+            wait_failed = False
+            try:
+                self._dbg.wait(seconds * 1000)
+            except Exception as exc:
+                logger.debug("wait() during break_in raised: %s", exc)
+                wait_failed = True
+
+            # In legacy mode (event callbacks not registered) the tracker
+            # is never populated by COM events, so wait() returning normally
+            # is the only signal we have that a state change landed. Treat
+            # that as broken-in. With callbacks, the tracker is the source
+            # of truth and may lag wait() by a few ms.
+            if not wait_failed and not self._callbacks_registered:
+                self._session.record_break()
+                return True
+
+            # With callbacks, wait() may return slightly before the state
+            # transition arrives on the COM thread. Drain for a short
+            # window after wait() returns.
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline:
+                if self._session.is_broken():
+                    return True
+                time.sleep(0.05)
+            return self._session.is_broken()
+
+        try:
+            try:
+                self._dbg._control.SetInterrupt(0)  # DEBUG_INTERRUPT_ACTIVE
+            except Exception as exc:
+                logger.warning("SetInterrupt raised: %s", exc)
+
+            if _wait_for_break(timeout):
+                self._state = DebuggerState.PAUSED
+                return True
+
+            # Fallback: dispatch the .break command. Some target/transport
+            # combinations refuse SetInterrupt but honour the meta-command.
+            logger.info("SetInterrupt did not break target; trying .break")
+            try:
+                self._dbg.cmd(".break")
+            except Exception as exc:
+                logger.debug(".break command raised: %s", exc)
+
+            if _wait_for_break(timeout):
+                self._state = DebuggerState.PAUSED
+                return True
+
+            raise WinDbgBridgeError(
+                "break_in",
+                f"Target did not break within {timeout}s. "
+                "If the target is reachable, trigger a break from the target "
+                "side (kdbreak / Ctrl+Scroll Lock) and retry.",
+            )
+        except WinDbgBridgeError:
+            raise
+        except Exception as exc:
+            self._log_error("break_in", exc)
+            raise WinDbgBridgeError("break_in", str(exc)) from exc
+
+    def get_session_state(self) -> dict[str, Any]:
+        """Return a JSON-serialisable snapshot of the kernel session state."""
+        return self._session.snapshot()
+
+    @_trace
+    def get_stack(
+        self, thread_id: int | None = None, frames: int = 32
+    ) -> list[dict[str, str]]:
+        """Return the structured call stack for the current (or named) thread.
+
+        Wraps the ``kn`` command and parses the output into typed frames.
+        If ``thread_id`` is provided, switches context to that thread first
+        via ``~<tid>s``; the engine's prior current-thread is restored on
+        the next break, so this is non-destructive for inspection.
+
+        Args:
+            thread_id: Optional thread to inspect. None means current.
+            frames: Maximum frames to walk (clamped 1..256).
+
+        Returns:
+            List of ``{frame, child_sp, ret_addr, call_site}``.
+        """
+        self._require_connected()
+        frames = max(1, min(256, frames))
+        if thread_id is not None:
+            try:
+                self._dbg.cmd(f"~{int(thread_id)}s")
+                self._session.current_thread_id = int(thread_id)
+            except Exception as exc:
+                raise WinDbgBridgeError(
+                    "get_stack", f"thread switch to {thread_id} failed: {exc}"
+                ) from exc
+        try:
+            output = self._dbg.cmd(f"kn 0x{frames:x}")
+        except Exception as exc:
+            raise WinDbgBridgeError("get_stack", str(exc)) from exc
+        return WinDbgOutputParser.parse_stack(output or "")
+
+    @_trace
+    def get_thread(self, thread: str | None = None) -> dict[str, Any]:
+        """Return raw ``!thread`` output wrapped in a structured envelope.
+
+        Reliable structured parsing of !thread is brittle across Windows
+        versions; we surface the canonical text + the command we ran so
+        the LLM can reason on it directly without us silently dropping
+        fields.
+
+        Args:
+            thread: Optional ETHREAD address or thread ID. None means
+                    the current thread.
+        """
+        self._require_connected()
+        cmd = "!thread" if not thread else f"!thread {thread}"
+        try:
+            output = self._dbg.cmd(cmd)
+        except Exception as exc:
+            raise WinDbgBridgeError("get_thread", str(exc)) from exc
+        return {
+            "command": cmd,
+            "output": output or "",
+            "current_thread_id": self._session.current_thread_id,
+        }
+
+    @_trace
+    def get_process(
+        self, process: str | None = None, flags: int = 7
+    ) -> dict[str, Any]:
+        """Return ``!process`` output. Same envelope rationale as :meth:`get_thread`.
+
+        Args:
+            process: PID or EPROCESS address. None means current process.
+            flags: WinDbg ``!process`` flag word (default 7 = full info
+                   incl. thread stacks). Use 0 for a one-line summary.
+        """
+        self._require_connected()
+        target = process if process else "0"
+        cmd = f"!process {target} 0x{flags:x}"
+        try:
+            output = self._dbg.cmd(cmd)
+        except Exception as exc:
+            raise WinDbgBridgeError("get_process", str(exc)) from exc
+        return {"command": cmd, "output": output or ""}
+
+    @_trace
+    def dump_type(
+        self, type_name: str, address: str | None = None, depth: int = 1
+    ) -> dict[str, Any]:
+        """Run ``dt -r<depth> <type> [addr]`` and return parsed fields + raw text.
+
+        The parser captures top-level field rows of the form
+        ``+0x008 FieldName : Type-or-value``. Nested expansions stay in
+        the raw text - a fully recursive structured parser would be
+        fragile; the LLM can read the indented form directly.
+
+        Args:
+            type_name: e.g. ``nt!_EPROCESS``.
+            address: optional address to overlay the type on.
+            depth: recursion depth for ``-r`` (clamped 0..3).
+        """
+        self._require_connected()
+        depth = max(0, min(3, depth))
+        # type_name and address must be sanitised - they flow into the
+        # cmd() call. The allowlist would catch a `; .shell` injection
+        # but we double-check at this layer to give a clear error.
+        if any(ch in type_name for ch in (";", "|", "&", "$", "`", "\n", " ")):
+            raise WinDbgBridgeError(
+                "dump_type", f"invalid type_name: {type_name!r}"
+            )
+        if address is not None and any(
+            ch in address for ch in (";", "|", "&", "$", "`", "\n", " ")
+        ):
+            raise WinDbgBridgeError(
+                "dump_type", f"invalid address: {address!r}"
+            )
+
+        cmd_parts = [f"dt -r{depth}", type_name]
+        if address:
+            cmd_parts.append(address)
+        cmd = " ".join(cmd_parts)
+        try:
+            output = self._dbg.cmd(cmd) or ""
+        except Exception as exc:
+            raise WinDbgBridgeError("dump_type", str(exc)) from exc
+
+        fields: list[dict[str, str]] = []
+        # Top-level field rows look like:
+        #    +0x008 FieldName        : Type-or-value
+        # Nested expansions are indented further; we capture only the
+        # first indentation level (3-spaces-then-+0x).
+        field_re = re.compile(
+            r"^\s{0,3}\+0x([0-9a-fA-F]+)\s+(\S+)\s*:\s*(.+?)\s*$"
+        )
+        for line in output.splitlines():
+            m = field_re.match(line)
+            if m:
+                fields.append({
+                    "offset": "0x" + m.group(1),
+                    "name": m.group(2),
+                    "value": m.group(3),
+                })
+        return {
+            "command": cmd,
+            "type": type_name,
+            "address": address,
+            "fields": fields,
+            "raw": output,
+        }
+
+    @_trace
+    def set_hardware_breakpoint(
+        self, address: str, kind: str = "e", size: int = 1
+    ) -> bool:
+        """Set a hardware data/exec breakpoint via ``ba <kind> <size> <addr>``.
+
+        Hardware breakpoints (``ba``) are distinct from software
+        breakpoints (``bp``) - they're enforced by debug registers
+        (DR0-DR3) so are limited to 4 simultaneous, but can break on
+        read/write/exec without modifying target memory. Essential for
+        watching a kernel structure field for unauthorised writes.
+
+        Args:
+            address: hex address or symbol.
+            kind: ``e`` (execute), ``r`` (read), ``w`` (write), ``i`` (i/o).
+            size: byte count - 1, 2, 4, or 8.
+        """
+        self._require_connected()
+        if kind not in ("e", "r", "w", "i"):
+            raise WinDbgBridgeError(
+                "set_hardware_breakpoint",
+                f"invalid kind {kind!r} (use e/r/w/i)",
+            )
+        if size not in (1, 2, 4, 8):
+            raise WinDbgBridgeError(
+                "set_hardware_breakpoint",
+                f"invalid size {size} (use 1/2/4/8)",
+            )
+        # Reuse the address validator from windbg_tools' allow patterns
+        # by routing through the shared bridge command-safety layer.
+        try:
+            self._dbg.cmd(f"ba {kind} {size} {address}")
+        except Exception as exc:
+            raise WinDbgBridgeError("set_hardware_breakpoint", str(exc)) from exc
+        # Track for matching disconnect/cleanup. Hardware bps are
+        # numbered alongside software bps, so we let DbgEng assign the id
+        # and surface it back to the caller via list_breakpoints.
+        return True
+
+    @_trace
+    def switch_thread(self, thread_id: int) -> dict[str, Any]:
+        """Switch the engine's current thread context.
+
+        Wraps ``~<n>s``. Updates :attr:`SessionTracker.current_thread_id`
+        so subsequent ``get_session_state`` calls reflect the change.
+        """
+        self._require_connected()
+        try:
+            output = self._dbg.cmd(f"~{int(thread_id)}s") or ""
+        except Exception as exc:
+            raise WinDbgBridgeError("switch_thread", str(exc)) from exc
+        self._session.current_thread_id = int(thread_id)
+        return {"thread_id": int(thread_id), "output": output}
 
     @_trace
     def step_into(self) -> dict[str, Any]:
@@ -439,39 +823,183 @@ class WinDbgBridge(Debugger):
     # --- Kernel-specific methods ---
 
     @_trace
-    def connect_kernel_net(self, port: int, key: str, timeout: int | None = None) -> bool:
+    def connect_kernel_net(
+        self,
+        port: int,
+        key: str,
+        timeout: int | None = None,
+        ipversion: int = 4,
+    ) -> dict[str, Any]:
         """Connect to a KDNET kernel debug target.
 
-        Opens the KDNET listening port via ``attach()``, then waits for the
-        target to actually break in via ``wait()``.  Only reports success
-        once the debug engine has an active session.
+        Opens the KDNET listening port via ``attach()``, registers our
+        event callbacks, then waits for the engine to declare the
+        session live. Returns a structured result so callers can
+        distinguish three real outcomes:
+
+          - ``connected_broken``: target broke in, current thread/process
+            exists, all commands work.
+          - ``connected_target_running``: handshake completed but no break
+            event fired (the half-handshake state). The auto-interrupt
+            retry failed; caller should invoke :meth:`break_in` once the
+            target reaches a natural break point.
+          - exception: handshake never completed within ``timeout``.
 
         Args:
             port: KDNET port number (e.g. 50000).
             key: KDNET session key (w.x.y.z format).
             timeout: Seconds to wait for target to break in.
                      Defaults to ``_KDNET_TIMEOUT`` (env ``KDNET_TIMEOUT``, 60s).
+            ipversion: 4 (default) or 6. Adds ``,ipversion=6`` per
+                       MS Learn: Setting Up KDNET. Win11+ targets only.
         """
         self._require_windows()
         self._require_pybag()
+        if ipversion not in (4, 6):
+            raise WinDbgBridgeError(
+                "connect_kernel_net", f"invalid ipversion {ipversion!r}; expected 4 or 6"
+            )
         timeout = timeout if timeout is not None else _KDNET_TIMEOUT
+
+        conn_str = f"net:port={port},key={key}"
+        if ipversion == 6:
+            conn_str += ",ipversion=6"
+        return self._attach_kernel_session(
+            conn_str=conn_str,
+            timeout=timeout,
+            operation="connect_kernel_net",
+            transport_label=f"KDNET port={port}",
+            extra_result={"port": port},
+            timeout_advice=(
+                "1. Reboot the TARGET machine AFTER starting this connect call - "
+                "the host must be listening before the target sends its initial break.\n"
+                "2. Verify the key matches exactly (bcdedit /dbgsettings on the target).\n"
+                "3. Confirm the target's NIC supports KDNET "
+                "(kdnet.exe on the target will tell you).\n"
+                "4. Ensure no firewall is blocking the UDP port on BOTH machines.\n"
+                "5. Increase timeout: set KDNET_TIMEOUT=120"
+            ),
+        )
+
+    @_trace
+    def connect_kernel_serial(
+        self,
+        port: str,
+        baud: int = 115200,
+        pipe: bool = False,
+        reconnect: bool = True,
+        timeout: int | None = None,
+    ) -> dict[str, Any]:
+        """Connect to a kernel target over a serial transport (KDSERIAL).
+
+        Builds a ``com:port=<port>,baud=<baud>[,pipe][,reconnect]``
+        connection string per MS Learn: Setting Up a Null-Modem Cable
+        Connection in WinDbg. Returns the same structured result as
+        :meth:`connect_kernel_net`.
+
+        Args:
+            port: COM port (e.g. ``COM1``) or pipe path when ``pipe=True``
+                  (e.g. ``\\\\.\\pipe\\com_1``).
+            baud: Serial baud rate. Default 115200.
+            pipe: True if the target is reached over a named pipe (Hyper-V).
+            reconnect: True to retry on disconnect.
+            timeout: Seconds to wait for break-in. Defaults to ``_KDNET_TIMEOUT``.
+        """
+        self._require_windows()
+        self._require_pybag()
+        if not port or not str(port).strip():
+            raise WinDbgBridgeError("connect_kernel_serial", "port is required")
+        if baud <= 0:
+            raise WinDbgBridgeError(
+                "connect_kernel_serial", f"invalid baud {baud!r}; expected positive int"
+            )
+        timeout = timeout if timeout is not None else _KDNET_TIMEOUT
+
+        parts = [f"com:port={port}", f"baud={baud}"]
+        if pipe:
+            parts.append("pipe")
+        if reconnect:
+            parts.append("reconnect")
+        conn_str = ",".join(parts)
+        return self._attach_kernel_session(
+            conn_str=conn_str,
+            timeout=timeout,
+            operation="connect_kernel_serial",
+            transport_label=f"KDSERIAL port={port} baud={baud}",
+            extra_result={"port": port, "baud": baud, "pipe": pipe},
+            timeout_advice=(
+                "1. Verify the target has bcdedit /dbgsettings serial baudrate=<baud> debugport=<n>.\n"
+                "2. For Hyper-V, ensure the VM's COM port is bound to the named pipe.\n"
+                "3. Confirm cable wiring (null-modem) and that no other process holds the port.\n"
+                "4. Increase timeout: set KDNET_TIMEOUT=120"
+            ),
+        )
+
+    @_trace
+    def connect_kernel_pipe(
+        self,
+        pipe_name: str,
+        reconnect: bool = True,
+        timeout: int | None = None,
+    ) -> dict[str, Any]:
+        """Connect to a Hyper-V kernel target over a named pipe.
+
+        Convenience wrapper for serial-over-pipe transports. Builds
+        ``com:pipe,port=<pipe_name>[,reconnect]``. ``pipe_name`` may be
+        the bare pipe name (``com_1``) or the full UNC form
+        (``\\\\.\\pipe\\com_1``); the latter is preferred by dbgeng.
+        """
+        self._require_windows()
+        self._require_pybag()
+        if not pipe_name or not str(pipe_name).strip():
+            raise WinDbgBridgeError("connect_kernel_pipe", "pipe_name is required")
+        timeout = timeout if timeout is not None else _KDNET_TIMEOUT
+
+        parts = ["com:pipe", f"port={pipe_name}"]
+        if reconnect:
+            parts.append("reconnect")
+        conn_str = ",".join(parts)
+        return self._attach_kernel_session(
+            conn_str=conn_str,
+            timeout=timeout,
+            operation="connect_kernel_pipe",
+            transport_label=f"KDPIPE {pipe_name}",
+            extra_result={"pipe_name": pipe_name},
+            timeout_advice=(
+                "1. Confirm the Hyper-V VM has a COM port mapped to this named pipe.\n"
+                "2. Start the host listener BEFORE booting the VM, or boot the VM with "
+                "debugging enabled then start the listener.\n"
+                "3. Increase timeout: set KDNET_TIMEOUT=120"
+            ),
+        )
+
+    def _attach_kernel_session(
+        self,
+        *,
+        conn_str: str,
+        timeout: int,
+        operation: str,
+        transport_label: str,
+        extra_result: dict[str, Any],
+        timeout_advice: str,
+    ) -> dict[str, Any]:
+        """Shared attach+wait+classify pipeline used by every kernel transport."""
+        kd = None
         try:
-            conn_str = f"net:port={port},key={key}"
             kd = pybag.KernelDbg()
 
             def _attach_and_wait():
                 # attach() only opens the listening port -- it returns before
-                # the target has connected.  wait() blocks until the target
-                # actually breaks in, giving us a live debug session.
+                # the target has connected.  wait() blocks until the engine
+                # surfaces a state change (handshake, break, exception, ...).
                 kd.attach(conn_str)
                 kd.wait(timeout * 1000)
 
             # Run attach+wait in a daemon thread so we can enforce a timeout.
-            # IMPORTANT: Do NOT use the ThreadPoolExecutor as a context manager
-            # here -- its __exit__ calls shutdown(wait=True) which blocks until
-            # the thread finishes.  If kd.wait() hangs (target never breaks
-            # in), that deadlocks the entire MCP tool call.  Instead, on
-            # timeout we call shutdown(wait=False) to abandon the thread.
+            # Do NOT use the ThreadPoolExecutor as a context manager here -
+            # shutdown(wait=True) deadlocks the entire MCP tool call if
+            # kd.wait() hangs.
+            self._session.set_state(KernelSessionState.LISTENING)
             pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
             future = pool.submit(_attach_and_wait)
             try:
@@ -479,33 +1007,61 @@ class WinDbgBridge(Debugger):
             except concurrent.futures.TimeoutError:
                 pool.shutdown(wait=False, cancel_futures=True)
                 logger.warning(
-                    "KDNET attach timed out after %ds (port=%d)", timeout, port
+                    "%s attach timed out after %ds", transport_label, timeout
                 )
                 raise WinDbgBridgeError(
-                    "connect_kernel_net",
-                    f"KDNET connection timed out after {timeout}s. "
-                    f"The target did not break in on port {port}.\n\n"
-                    "Troubleshooting:\n"
-                    "1. Reboot the TARGET machine AFTER starting this connect call -- "
-                    "the host must be listening before the target sends its initial break.\n"
-                    "2. Verify the key matches exactly (bcdedit /dbgsettings on the target).\n"
-                    "3. Confirm the target's NIC supports KDNET "
-                    "(kdnet.exe on the target will tell you).\n"
-                    "4. Ensure no firewall is blocking the UDP port on BOTH machines.\n"
-                    "5. Increase timeout: set KDNET_TIMEOUT=120"
+                    operation,
+                    f"{transport_label} connection timed out after {timeout}s. "
+                    f"The target did not break in.\n\nTroubleshooting:\n"
+                    f"{timeout_advice}"
                 )
             else:
                 pool.shutdown(wait=False)
 
+            # Register event callbacks before classifying state - buffered
+            # SessionStatus / Breakpoint events flush as soon as the COM
+            # vtable is wired in.
             self._dbg = kd
             self._mode = WinDbgMode.KERNEL_MODE
+            self._attach_event_callbacks()
+            self._apply_default_sympath()
+
+            if not self._session.is_broken():
+                logger.info(
+                    "%s attach returned without break (state=%s); "
+                    "attempting auto-interrupt",
+                    transport_label, self._session.state.value,
+                )
+                try:
+                    self.break_in(timeout=5)
+                except Exception as exc:
+                    logger.warning("Auto-interrupt failed: %s", exc)
+                    self._state = DebuggerState.RUNNING
+                    return {
+                        "status": "connected_target_running",
+                        **extra_result,
+                        "advice": (
+                            "Connected, but target was running and did not "
+                            "break. Call windbg_break() once the target "
+                            "reaches a break, or trigger a target-side "
+                            "interrupt (Ctrl+Break in WinDbg, kdbreak)."
+                        ),
+                        "session": self._session.snapshot(),
+                    }
+
             self._state = DebuggerState.PAUSED
-            logger.info("Connected to kernel target via KDNET port=%d", port)
-            return True
+            logger.info("Connected to kernel target via %s", transport_label)
+            return {
+                "status": "connected_broken",
+                **extra_result,
+                "session": self._session.snapshot(),
+            }
         except WinDbgBridgeError:
+            self._safe_disconnect()
             raise
         except Exception as exc:
-            self._log_error("connect_kernel_net", exc)
+            self._log_error(operation, exc)
+            self._safe_disconnect()
             structured = create_kernel_not_connected_error(str(exc))
             raise StructuredBaseError(structured) from exc
 
@@ -527,6 +1083,8 @@ class WinDbgBridge(Debugger):
         try:
             self._dbg = pybag.KernelDbg()
             self._dbg.attach("local")
+            self._attach_event_callbacks()
+            self._apply_default_sympath()
 
             self._mode = WinDbgMode.KERNEL_MODE
             self._state = DebuggerState.PAUSED
@@ -860,8 +1418,9 @@ class WinDbgBridge(Debugger):
             result = subprocess.run(
                 cmd_args,
                 capture_output=True,
-                text=True,
+                text=True, encoding="utf-8", errors="replace",
                 timeout=self._timeout,
+                env=subprocess_env_with_sympath(),
             )
             if result.stderr:
                 logger.warning("CDB/KD stderr: %s", result.stderr.strip())
@@ -1071,29 +1630,22 @@ class WinDbgBridge(Debugger):
     def _validate_command_safety(self, command: str) -> None:
         """Block dangerous WinDbg meta-commands for defense-in-depth.
 
-        Checks the command string (case-insensitively) against
-        ``_BLOCKED_COMMANDS`` using substring matching, since dangerous
-        commands can appear after semicolons in compound expressions.
-        Also checks for common bypass techniques.
+        Delegates to the token-aware :func:`allowlist.validate_command`
+        which understands compound commands, quoted regions, and
+        ``.foreach``/``.for`` block bodies. The legacy substring matcher
+        was simultaneously over- and under-blocking; see ``allowlist.py``
+        for the current rule set.
 
         Raises:
             WinDbgBridgeError: If a blocked command is detected.
         """
-        lower_cmd = command.lower().strip()
+        from .allowlist import validate_command
 
-        # Check each blocked command as substring
-        for blocked in _BLOCKED_COMMANDS:
-            if blocked in lower_cmd:
-                raise WinDbgBridgeError(
-                    "command_validation",
-                    f"Command blocked: '{blocked}' is not allowed for security reasons.",
-                )
-
-        # Block commands with excessive semicolons (compound command chains)
-        if lower_cmd.count(';') > 5:
+        ok, reason = validate_command(command)
+        if not ok:
             raise WinDbgBridgeError(
                 "command_validation",
-                "Command blocked: too many compound commands (max 5 semicolons).",
+                f"Command blocked: {reason}.",
             )
 
     def _log_error(

@@ -160,7 +160,7 @@ CONFIG_KEYS = {
 
     # Ghidra
     "GHIDRA_HOME": "Path to Ghidra installation directory",
-    "GHIDRA_TIMEOUT": "Default wall-clock timeout for Ghidra analysis (seconds, 30–3600, default 1800)",
+    "GHIDRA_TIMEOUT": "Default wall-clock timeout for Ghidra analysis (seconds, 30-3600, default 1800)",
     "GHIDRA_FUNCTION_TIMEOUT": "Per-function decompilation timeout (seconds, default 30)",
     "GHIDRA_MAX_FUNCTIONS": "Cap on functions processed per Ghidra run (0 = unlimited)",
     "GHIDRA_SKIP_DECOMPILE": "Skip decompilation for fast structural pass (1/true/yes)",
@@ -175,8 +175,11 @@ CONFIG_KEYS = {
     "X64DBG_BRIDGE_URL": "URL for x64dbg HTTP bridge (default: http://localhost:27042)",
     "X64DBG_TIMEOUT": "Default timeout for x64dbg commands (seconds)",
 
-    # Symbol server (PDB fetch)
+    # Symbol server (PDB fetch + WinDbg sympath - shared by static analysis and live debugging)
     "BINARY_MCP_SYMBOL_PATH": "Windows-style _NT_SYMBOL_PATH for PDB fetch (overrides _NT_SYMBOL_PATH).",
+    "BINARY_MCP_SYMBOL_CACHE": "Override the on-disk symbol cache directory (defaults to ~/.cache/binary_mcp/symbols on POSIX, ~/.binary_mcp_cache/symbols on Windows). Shared by analyze_binary and live WinDbg sessions.",
+    "BINARY_MCP_SYMBOL_SERVER": "Override upstream symbol server (default https://msdl.microsoft.com/download/symbols).",
+    "BINARY_MCP_SYMBOL_OFFLINE": "Set to 1 to skip the upstream symbol server and serve only from the local cache (air-gapped sessions).",
     "BINARY_MCP_ALLOW_HTTP_SYMBOLS": "Set to 1 to permit http:// symbol servers (off by default; PDBs are MITM-sensitive).",
 
     # Analysis

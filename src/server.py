@@ -581,7 +581,7 @@ def get_analysis_context(
         # Save Ghidra output to debug file for inspection
         debug_file = cache.cache_dir / "ghidra_debug.log"
         try:
-            with open(debug_file, 'w') as f:
+            with open(debug_file, 'w', encoding='utf-8', errors='replace') as f:
                 f.write("=== GHIDRA ANALYSIS DEBUG LOG ===\n")
                 f.write(f"Binary: {binary_path}\n")
                 f.write(f"Output Path: {output_path}\n")

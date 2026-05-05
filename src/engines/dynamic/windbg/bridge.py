@@ -1418,7 +1418,7 @@ class WinDbgBridge(Debugger):
             result = subprocess.run(
                 cmd_args,
                 capture_output=True,
-                text=True,
+                text=True, encoding="utf-8", errors="replace",
                 timeout=self._timeout,
                 env=subprocess_env_with_sympath(),
             )

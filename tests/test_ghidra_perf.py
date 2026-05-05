@@ -851,3 +851,90 @@ class TestDeltaIntegration:
         assert addrs["0x1000"]["pseudocode"] is None
         assert addrs["0x1030"]["pseudocode"] is None
         assert addrs["0x1040"]["pseudocode"] is None
+
+
+# -- Error propagation through get_analysis_context -------------------------
+# Regression tests for docs/ghidra-mcp-defender-issues.md (Issue 2):
+# get_analysis_context used to wrap every exception in a plain RuntimeError,
+# stripping GhidraAnalysisError.diagnostic and UserFacingError type info so
+# analyze_binary's curated handlers were unreachable.
+
+
+class TestErrorPropagation:
+    def _setup(self, tmp_path, monkeypatch, server_module):
+        from src.engines.static.ghidra.project_cache import ProjectCache
+        binary = tmp_path / "target.bin"
+        binary.write_bytes(b"MZ" + b"\x00" * 128)
+        cache_obj = ProjectCache(cache_dir=str(tmp_path / "cache"))
+        monkeypatch.setattr(server_module, "cache", cache_obj)
+        monkeypatch.setattr(server_module, "get_allowed_dirs", lambda: [tmp_path])
+        return binary
+
+    def test_ghidra_analysis_error_propagates_with_diagnostic(
+        self, tmp_path, monkeypatch, server_module
+    ):
+        from src.engines.static.ghidra.runner import GhidraAnalysisError
+        binary = self._setup(tmp_path, monkeypatch, server_module)
+
+        def fake_analyze(**kwargs):
+            raise GhidraAnalysisError(
+                "Ghidra exited with code 1",
+                diagnostic="UnsupportedClassVersionError: Ghidra/Util/Exception/CancelledException",
+            )
+
+        monkeypatch.setattr(server_module.runner, "analyze", fake_analyze)
+
+        with pytest.raises(GhidraAnalysisError) as exc_info:
+            server_module.get_analysis_context(str(binary))
+
+        assert "UnsupportedClassVersionError" in exc_info.value.diagnostic
+
+    def test_user_facing_error_propagates(
+        self, tmp_path, monkeypatch, server_module
+    ):
+        from src.utils.security import UserFacingError
+        binary = self._setup(tmp_path, monkeypatch, server_module)
+
+        def fake_analyze(**kwargs):
+            output = Path(kwargs["output_path"])
+            output.write_text(json.dumps({
+                "metadata": {},
+                "functions": [],
+                "imports": [],
+                "strings": [],
+                "memory_map": [],
+            }))
+            return {
+                "elapsed_time": 1.0,
+                "stdout": "Exception: Cannot import file",
+                "stderr": "",
+            }
+
+        monkeypatch.setattr(server_module.runner, "analyze", fake_analyze)
+
+        with pytest.raises(UserFacingError) as exc_info:
+            server_module.get_analysis_context(str(binary))
+
+        assert exc_info.value.user_message
+        assert exc_info.value.error_id
+
+    def test_analyze_binary_surfaces_ghidra_diagnostic(
+        self, tmp_path, monkeypatch, server_module
+    ):
+        from src.engines.static.ghidra.runner import GhidraAnalysisError
+        binary = self._setup(tmp_path, monkeypatch, server_module)
+
+        def fake_analyze(**kwargs):
+            raise GhidraAnalysisError(
+                "Ghidra exited with code 1",
+                diagnostic="OSGi bundle cache corrupt; clear ~/.ghidra/.../osgi",
+            )
+
+        monkeypatch.setattr(server_module.runner, "analyze", fake_analyze)
+
+        result = server_module.analyze_binary(
+            str(binary), skip_compatibility_check=True
+        )
+
+        assert "OSGi bundle cache corrupt" in result
+        assert "Reference ID:" not in result or "Diagnostic:" in result

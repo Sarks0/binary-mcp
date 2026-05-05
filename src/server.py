@@ -708,6 +708,12 @@ def get_analysis_context(
         logger.info(f"Analysis complete: {result['elapsed_time']:.2f}s")
         return context
 
+    except (UserFacingError, GhidraAnalysisError, PathTraversalError, FileSizeError):
+        # Preserve curated user-facing errors and Ghidra diagnostics so callers
+        # like analyze_binary() can surface the real failure reason instead of
+        # collapsing every failure into an opaque "Failed to analyze binary" /
+        # reference-ID response. See docs/ghidra-mcp-defender-issues.md (Issue 2).
+        raise
     except Exception as e:
         logger.error(f"Analysis failed: {e}")
         raise RuntimeError(f"Failed to analyze binary: {e}")

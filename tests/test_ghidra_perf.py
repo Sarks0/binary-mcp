@@ -255,6 +255,82 @@ class TestRunnerEnvPlumbing:
 
         assert captured["env"]["GHIDRA_ENABLE_FID"] == "1"
 
+    def test_analysis_depth_full_default(self, runner, tmp_path):
+        binary, script_dir, output = self._prepare(runner, tmp_path)
+        captured = {}
+
+        def fake_run(cmd, env, **kwargs):
+            captured["cmd"] = list(cmd)
+            captured["env"] = dict(env)
+            return _FakeRunResult()
+
+        with patch("subprocess.run", side_effect=fake_run):
+            runner.analyze(
+                binary_path=str(binary),
+                script_path=str(script_dir),
+                script_name="core_analysis.py",
+                output_path=str(output),
+            )
+
+        assert "-noanalysis" not in captured["cmd"]
+        assert "GHIDRA_SKIP_DECOMPILE" not in captured["env"]
+        assert captured["env"]["GHIDRA_ANALYSIS_DEPTH"] == "full"
+
+    def test_analysis_depth_structural(self, runner, tmp_path):
+        binary, script_dir, output = self._prepare(runner, tmp_path)
+        captured = {}
+
+        def fake_run(cmd, env, **kwargs):
+            captured["cmd"] = list(cmd)
+            captured["env"] = dict(env)
+            return _FakeRunResult()
+
+        with patch("subprocess.run", side_effect=fake_run):
+            runner.analyze(
+                binary_path=str(binary),
+                script_path=str(script_dir),
+                script_name="core_analysis.py",
+                output_path=str(output),
+                analysis_depth="structural",
+            )
+
+        assert "-noanalysis" not in captured["cmd"]
+        assert captured["env"]["GHIDRA_SKIP_DECOMPILE"] == "1"
+        assert captured["env"]["GHIDRA_ANALYSIS_DEPTH"] == "structural"
+
+    def test_analysis_depth_shallow_adds_noanalysis_flag(self, runner, tmp_path):
+        binary, script_dir, output = self._prepare(runner, tmp_path)
+        captured = {}
+
+        def fake_run(cmd, env, **kwargs):
+            captured["cmd"] = list(cmd)
+            captured["env"] = dict(env)
+            return _FakeRunResult()
+
+        with patch("subprocess.run", side_effect=fake_run):
+            runner.analyze(
+                binary_path=str(binary),
+                script_path=str(script_dir),
+                script_name="core_analysis.py",
+                output_path=str(output),
+                analysis_depth="shallow",
+            )
+
+        assert "-noanalysis" in captured["cmd"]
+        assert captured["env"]["GHIDRA_SKIP_DECOMPILE"] == "1"
+        assert captured["env"]["GHIDRA_ANALYSIS_DEPTH"] == "shallow"
+
+    def test_analysis_depth_invalid_rejected(self, runner, tmp_path):
+        binary, script_dir, output = self._prepare(runner, tmp_path)
+        with pytest.raises(ValueError, match="Invalid analysis_depth"):
+            runner.analyze(
+                binary_path=str(binary),
+                script_path=str(script_dir),
+                script_name="core_analysis.py",
+                output_path=str(output),
+                analysis_depth="thorough",
+            )
+
     def test_pdb_staged_adjacent_and_cleaned_up(self, runner, tmp_path):
         """pdb_path should appear next to the binary while subprocess runs,
         and be removed afterwards."""

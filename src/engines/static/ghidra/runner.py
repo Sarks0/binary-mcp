@@ -256,6 +256,7 @@ class GhidraRunner:
         pdb_path: str | None = None,
         enable_fid: bool = False,
         max_heap_mb: int | None = None,
+        analysis_depth: str = "full",
     ) -> dict:
         """
         Run Ghidra headless analysis on a binary.
@@ -322,8 +323,20 @@ class GhidraRunner:
             env["GHIDRA_FUNCTION_TIMEOUT"] = str(function_timeout)
         if max_functions is not None and max_functions > 0:
             env["GHIDRA_MAX_FUNCTIONS"] = str(max_functions)
-        if skip_decompile:
+        # Map analysis_depth onto Ghidra flags. Both skip_decompile and
+        # analysis_depth coexist; analysis_depth wins when set to a non-default.
+        # - full:       all auto-analyzers + decompile (legacy behavior)
+        # - structural: all auto-analyzers, skip per-function decompile
+        # - shallow:    pass -noanalysis to analyzeHeadless and skip decompile;
+        #               function table comes from PE/ELF symbols + basic disasm.
+        if analysis_depth not in ("full", "structural", "shallow"):
+            raise ValueError(
+                f"Invalid analysis_depth {analysis_depth!r}; "
+                "expected 'full', 'structural', or 'shallow'"
+            )
+        if analysis_depth in ("structural", "shallow") or skip_decompile:
             env["GHIDRA_SKIP_DECOMPILE"] = "1"
+        env["GHIDRA_ANALYSIS_DEPTH"] = analysis_depth
         if resume_from_cache:
             env["GHIDRA_RESUME_CACHE"] = str(resume_from_cache)
         if resume_manifest:
@@ -404,6 +417,9 @@ class GhidraRunner:
             "-scriptPath", str(script_path),
             "-postScript", script_name,
         ])
+
+        if analysis_depth == "shallow":
+            cmd.append("-noanalysis")
 
         if not keep_project:
             cmd.append("-deleteProject")

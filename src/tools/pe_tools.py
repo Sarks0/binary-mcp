@@ -811,4 +811,46 @@ def register_pe_tools(app, session_manager=None):
             logger.error(f"extract_embedded_binaries failed: {e}")
             return safe_error_message("Failed to extract embedded binaries", e)
 
-    logger.info("Registered 3 PE structure tools")
+    @app.tool()
+    def compute_similarity_hashes(binary_path: str) -> str:
+        """
+        Compute every cheap similarity / clustering hash for a PE file.
+
+        Emits:
+        - imphash (toolchain + import-set cluster)
+        - rich_hash = md5(RICH_HEADER.clear_data) -- Mandiant / Yara standard
+          for VT pivots; un-XORed canonical bytes so the hash is consistent
+          across files built with the same compiler/linker version mix.
+        - authentihash (sha256, full file regardless of signing)
+        - per-section sha256
+        - ssdeep + tlsh (when their optional native deps are importable)
+
+        Each hash includes a "VT search:" pivot hint. Missing fuzzy libraries
+        cause a footer note rather than a failure -- imphash, rich_hash,
+        authentihash, and section hashes are always emitted.
+
+        Args:
+            binary_path: Path to the PE file.
+
+        Returns:
+            Markdown report. Pivot hints are formatted as
+            ``VT search: imphash:e87a45c...`` so they paste straight into
+            VirusTotal's intelligence search.
+
+        Example:
+            compute_similarity_hashes("/path/to/sample.exe")
+        """
+        from src.utils.similarity_hashes import compute, render_markdown
+        from src.utils.structured_errors import StructuredBaseError
+
+        try:
+            return render_markdown(compute(binary_path))
+        except StructuredBaseError as e:
+            return e.structured_error.to_user_message()
+        except (PathTraversalError, FileSizeError) as e:
+            return safe_error_message("compute_similarity_hashes", e)
+        except Exception as e:
+            logger.error(f"compute_similarity_hashes failed: {e}")
+            return safe_error_message("Failed to compute similarity hashes", e)
+
+    logger.info("Registered 4 PE structure tools")

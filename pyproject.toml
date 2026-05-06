@@ -24,6 +24,16 @@ yara = [
 windbg = [
     "pybag>=2.2.16; sys_platform == 'win32'",
 ]
+# Fuzzy-hashing libraries (ssdeep, python-tlsh) wrap native C libraries
+# (libfuzzy, libtlsh) and have packaging quirks -- ssdeep's setup.py imports
+# pkg_resources, which uv's lockfile resolution cannot satisfy on some
+# environments. They are intentionally NOT declared as project extras here;
+# users who want fuzzy hashing should install them manually:
+#
+#   pip install ssdeep python-tlsh    # may need apt install libfuzzy-dev
+#
+# `compute_similarity_hashes` detects their absence via try/except ImportError
+# and emits a footer hint; all other similarity hashes still work without them.
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",

@@ -155,10 +155,29 @@ class TestProjectCacheCompression:
 
 
 class _FakeRunResult:
-    def __init__(self):
-        self.returncode = 0
-        self.stdout = ""
-        self.stderr = ""
+    """Popen-shaped stand-in for runner.analyze tests.
+
+    runner.analyze now uses subprocess.Popen + manual lifecycle (so timeout
+    cleanup can fan out to grandchildren). Tests patch subprocess.Popen and
+    return one of these to simulate a successful run.
+    """
+
+    def __init__(self, returncode=0, stdout="", stderr=""):
+        self.returncode = returncode
+        self.stdout = None
+        self.stderr = None
+        self.pid = 1
+        self._out = stdout
+        self._err = stderr
+
+    def communicate(self, timeout=None):
+        return (self._out, self._err)
+
+    def poll(self):
+        return self.returncode
+
+    def kill(self):
+        pass
 
 
 @pytest.fixture
@@ -190,7 +209,7 @@ class TestRunnerEnvPlumbing:
             captured["env"] = dict(env)
             return _FakeRunResult()
 
-        with patch("subprocess.run", side_effect=fake_run):
+        with patch("subprocess.Popen", side_effect=fake_run):
             runner.analyze(
                 binary_path=str(binary),
                 script_path=str(script_dir),
@@ -221,7 +240,7 @@ class TestRunnerEnvPlumbing:
             captured["env"] = dict(env)
             return _FakeRunResult()
 
-        with patch("subprocess.run", side_effect=fake_run):
+        with patch("subprocess.Popen", side_effect=fake_run):
             runner.analyze(
                 binary_path=str(binary),
                 script_path=str(script_dir),
@@ -244,7 +263,7 @@ class TestRunnerEnvPlumbing:
             captured["env"] = dict(env)
             return _FakeRunResult()
 
-        with patch("subprocess.run", side_effect=fake_run):
+        with patch("subprocess.Popen", side_effect=fake_run):
             runner.analyze(
                 binary_path=str(binary),
                 script_path=str(script_dir),
@@ -264,7 +283,7 @@ class TestRunnerEnvPlumbing:
             captured["env"] = dict(env)
             return _FakeRunResult()
 
-        with patch("subprocess.run", side_effect=fake_run):
+        with patch("subprocess.Popen", side_effect=fake_run):
             runner.analyze(
                 binary_path=str(binary),
                 script_path=str(script_dir),
@@ -285,7 +304,7 @@ class TestRunnerEnvPlumbing:
             captured["env"] = dict(env)
             return _FakeRunResult()
 
-        with patch("subprocess.run", side_effect=fake_run):
+        with patch("subprocess.Popen", side_effect=fake_run):
             runner.analyze(
                 binary_path=str(binary),
                 script_path=str(script_dir),
@@ -307,7 +326,7 @@ class TestRunnerEnvPlumbing:
             captured["env"] = dict(env)
             return _FakeRunResult()
 
-        with patch("subprocess.run", side_effect=fake_run):
+        with patch("subprocess.Popen", side_effect=fake_run):
             runner.analyze(
                 binary_path=str(binary),
                 script_path=str(script_dir),
@@ -347,7 +366,7 @@ class TestRunnerEnvPlumbing:
             saw_staged_during_run["ok"] = expected_staged.exists()
             return _FakeRunResult()
 
-        with patch("subprocess.run", side_effect=fake_run):
+        with patch("subprocess.Popen", side_effect=fake_run):
             runner.analyze(
                 binary_path=str(binary),
                 script_path=str(script_dir),
@@ -368,7 +387,7 @@ class TestRunnerEnvPlumbing:
             captured["env"] = dict(env)
             return _FakeRunResult()
 
-        with patch("subprocess.run", side_effect=fake_run):
+        with patch("subprocess.Popen", side_effect=fake_run):
             runner.analyze(
                 binary_path=str(binary),
                 script_path=str(script_dir),
@@ -388,7 +407,7 @@ class TestRunnerEnvPlumbing:
             captured["env"] = dict(env)
             return _FakeRunResult()
 
-        with patch("subprocess.run", side_effect=fake_run):
+        with patch("subprocess.Popen", side_effect=fake_run):
             runner.analyze(
                 binary_path=str(binary),
                 script_path=str(script_dir),
@@ -408,7 +427,7 @@ class TestRunnerEnvPlumbing:
             captured["env"] = dict(env)
             return _FakeRunResult()
 
-        with patch("subprocess.run", side_effect=fake_run):
+        with patch("subprocess.Popen", side_effect=fake_run):
             runner.analyze(
                 binary_path=str(binary),
                 script_path=str(script_dir),
@@ -428,7 +447,7 @@ class TestRunnerEnvPlumbing:
             captured["env"] = dict(env)
             return _FakeRunResult()
 
-        with patch("subprocess.run", side_effect=fake_run):
+        with patch("subprocess.Popen", side_effect=fake_run):
             runner.analyze(
                 binary_path=str(binary),
                 script_path=str(script_dir),
@@ -442,7 +461,7 @@ class TestRunnerEnvPlumbing:
     def test_pdb_missing_file_raises(self, runner, tmp_path):
         binary, script_dir, output = self._prepare(runner, tmp_path)
 
-        with patch("subprocess.run", return_value=_FakeRunResult()):
+        with patch("subprocess.Popen", return_value=_FakeRunResult()):
             try:
                 runner.analyze(
                     binary_path=str(binary),
@@ -454,6 +473,182 @@ class TestRunnerEnvPlumbing:
             except FileNotFoundError:
                 return
         raise AssertionError("Expected FileNotFoundError for missing PDB")
+
+
+# -- GhidraRunner timeout cleanup -------------------------------------------
+#
+# Regression: subprocess.run on Windows can hang indefinitely after timeout
+# fires because Ghidra's java.exe grandchildren survive the .bat kill and
+# keep the captured pipes open. runner.analyze now uses Popen + manual
+# lifecycle and calls _kill_process_tree on timeout (taskkill /F /T on
+# Windows, killpg(SIGKILL) on POSIX).
+
+
+class _StuckPopen:
+    """Popen stand-in whose first communicate() call raises TimeoutExpired."""
+
+    def __init__(self, *, drain_returns=("partial-stdout", "partial-stderr"),
+                 poll_after_kill=-9):
+        self.pid = 9999
+        self.returncode = None
+        self.stdout = None
+        self.stderr = None
+        self._communicate_calls = 0
+        self._drain_returns = drain_returns
+        self._poll_after_kill = poll_after_kill
+        self.kill_called = False
+
+    def communicate(self, timeout=None):
+        self._communicate_calls += 1
+        if self._communicate_calls == 1:
+            import subprocess as _subprocess
+            raise _subprocess.TimeoutExpired(
+                cmd=["fake-ghidra"], timeout=timeout, output="hang-stdout",
+                stderr="hang-stderr",
+            )
+        return self._drain_returns
+
+    def poll(self):
+        return self.returncode if self.kill_called else None
+
+    def kill(self):
+        self.kill_called = True
+        self.returncode = self._poll_after_kill
+
+
+class TestRunnerTimeoutCleanup:
+    def _prepare(self, runner, tmp_path):
+        binary = tmp_path / "sample.bin"
+        binary.write_bytes(b"\x00" * 128)
+        script_dir = tmp_path / "scripts"
+        script_dir.mkdir()
+        output = tmp_path / "out.json"
+        return binary, script_dir, output
+
+    def test_timeout_invokes_process_tree_kill(self, runner, tmp_path, monkeypatch):
+        """When communicate() times out, _kill_process_tree must be called
+        with the Popen instance so the whole java.exe tree gets torn down."""
+        from src.engines.static.ghidra import runner as runner_mod
+
+        binary, script_dir, output = self._prepare(runner, tmp_path)
+        stuck = _StuckPopen()
+
+        kill_calls = []
+
+        def fake_kill(proc):
+            kill_calls.append(proc)
+            proc.kill()
+
+        monkeypatch.setattr(runner_mod, "_kill_process_tree", fake_kill)
+
+        with patch("subprocess.Popen", return_value=stuck):
+            with pytest.raises(runner_mod.GhidraAnalysisError) as exc_info:
+                runner.analyze(
+                    binary_path=str(binary),
+                    script_path=str(script_dir),
+                    script_name="core_analysis.py",
+                    output_path=str(output),
+                    timeout=30,
+                )
+
+        assert kill_calls == [stuck], "tree-kill must run exactly once on timeout"
+        assert "timed out after 30s" in str(exc_info.value)
+        # Diagnostic should surface partial output so the user sees how far
+        # Ghidra got.
+        assert exc_info.value.diagnostic, "diagnostic must not be empty on timeout"
+
+    def test_drain_timeout_does_not_hang(self, runner, tmp_path, monkeypatch):
+        """If even the post-kill drain communicate() times out (descendant
+        still holding pipes), runner.analyze must still return promptly via
+        GhidraAnalysisError instead of blocking indefinitely."""
+        from src.engines.static.ghidra import runner as runner_mod
+
+        binary, script_dir, output = self._prepare(runner, tmp_path)
+
+        class _DoublyStuckPopen(_StuckPopen):
+            def communicate(self, timeout=None):
+                self._communicate_calls += 1
+                import subprocess as _subprocess
+                raise _subprocess.TimeoutExpired(
+                    cmd=["fake-ghidra"], timeout=timeout,
+                    output="hang", stderr="hang",
+                )
+
+        stuck = _DoublyStuckPopen()
+        monkeypatch.setattr(runner_mod, "_kill_process_tree",
+                            lambda p: setattr(p, "returncode", -9))
+
+        # Force-close the proc's pipes; runner code should swallow that.
+        with patch("subprocess.Popen", return_value=stuck):
+            with pytest.raises(runner_mod.GhidraAnalysisError):
+                runner.analyze(
+                    binary_path=str(binary),
+                    script_path=str(script_dir),
+                    script_name="core_analysis.py",
+                    output_path=str(output),
+                    timeout=10,
+                )
+
+    def test_kill_process_tree_uses_taskkill_on_windows(self, monkeypatch):
+        """_kill_process_tree on Windows must invoke taskkill /F /T."""
+        from src.engines.static.ghidra import runner as runner_mod
+
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = list(cmd)
+            captured["kwargs"] = kwargs
+            class R:
+                returncode = 0
+            return R()
+
+        # Pretend we're on Windows.
+        monkeypatch.setattr(runner_mod.os, "name", "nt")
+
+        proc = _StuckPopen()  # poll() returns None until kill()
+
+        with patch("subprocess.run", side_effect=fake_run):
+            runner_mod._kill_process_tree(proc)
+
+        assert captured["cmd"][0] == "taskkill"
+        assert "/F" in captured["cmd"]
+        assert "/T" in captured["cmd"]
+        assert str(proc.pid) in captured["cmd"]
+
+    def test_kill_process_tree_uses_killpg_on_posix(self, monkeypatch):
+        """_kill_process_tree on POSIX must SIGKILL the child's process group."""
+        from src.engines.static.ghidra import runner as runner_mod
+
+        monkeypatch.setattr(runner_mod.os, "name", "posix")
+
+        killpg_calls = []
+
+        def fake_killpg(pgid, sig):
+            killpg_calls.append((pgid, sig))
+
+        monkeypatch.setattr(runner_mod.os, "killpg", fake_killpg)
+        monkeypatch.setattr(runner_mod.os, "getpgid", lambda pid: 12345)
+
+        proc = _StuckPopen()
+        runner_mod._kill_process_tree(proc)
+
+        assert killpg_calls, "killpg must be invoked on POSIX"
+        pgid, sig = killpg_calls[0]
+        assert pgid == 12345
+        assert sig == runner_mod.signal.SIGKILL
+
+    def test_kill_process_tree_skips_already_dead_proc(self):
+        """Don't bother killing if the process already exited."""
+        from src.engines.static.ghidra import runner as runner_mod
+
+        class _DeadPopen:
+            pid = 1
+            def poll(self):
+                return 0  # already exited
+
+        with patch("subprocess.run") as mock_run:
+            runner_mod._kill_process_tree(_DeadPopen())
+            assert not mock_run.called
 
 
 # -- get_analysis_context incremental wiring --------------------------------

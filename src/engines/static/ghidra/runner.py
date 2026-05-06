@@ -7,6 +7,7 @@ import logging
 import os
 import platform
 import re
+import signal
 import subprocess  # nosec B404 - Required for Ghidra headless execution
 import time
 from pathlib import Path
@@ -14,6 +15,44 @@ from pathlib import Path
 from src.utils.security import validate_parameter_pattern
 
 logger = logging.getLogger(__name__)
+
+
+def _kill_process_tree(proc: subprocess.Popen) -> None:
+    """
+    Best-effort kill of a subprocess and all of its descendants.
+
+    On Windows, ``proc.kill()`` only terminates the immediate child. Ghidra's
+    ``analyzeHeadless.bat`` spawns ``java.exe`` grandchildren that survive
+    the .bat's death and keep the captured stdout/stderr pipes open. The
+    parent's post-timeout ``communicate()`` then blocks indefinitely. We
+    invoke ``taskkill /F /T /PID`` to terminate the whole tree.
+
+    On POSIX, the child is launched with ``start_new_session=True`` so it
+    has its own process group, and we send SIGKILL to the group.
+    """
+    if proc.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            subprocess.run(  # nosec B603 B607 - tear down stuck Ghidra tree
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+                check=False,
+            )
+        else:
+            try:
+                pgid = os.getpgid(proc.pid)
+                os.killpg(pgid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                proc.kill()
+    except Exception as e:
+        logger.warning(f"_kill_process_tree failed for pid {proc.pid}: {e}")
+        try:
+            proc.kill()
+        except Exception:
+            pass
 
 
 # Patterns we look for in Ghidra stdout/stderr to surface actionable failure
@@ -507,25 +546,81 @@ class GhidraRunner:
 
         start_time = time.time()
 
+        # Use Popen + manual lifecycle (instead of subprocess.run) so timeout
+        # cleanup can kill Ghidra's whole java.exe grandchild tree. With
+        # subprocess.run on Windows, the post-timeout drain blocks
+        # indefinitely if Java keeps the pipes open after the .bat dies.
+        proc = subprocess.Popen(  # nosec B603 - cmd built from validated args
+            cmd,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            shell=False,
+            # POSIX: own process group so SIGKILL can fan out via killpg.
+            # Windows ignores start_new_session; we use taskkill /T instead.
+            start_new_session=(os.name != "nt"),
+        )
+
         try:
-            # On Windows, don't use shell=True - it causes path handling issues
-            # The .bat file can be executed directly without shell
-            result = subprocess.run(
-                cmd,
-                env=env,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=timeout,
-                shell=False,  # Changed: shell=False to fix Windows path handling
-                check=True,
-            )
+            try:
+                stdout, stderr = proc.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired as e:
+                elapsed_time = time.time() - start_time
+                logger.error(f"Analysis timeout after {elapsed_time:.2f}s")
+
+                _kill_process_tree(proc)
+                try:
+                    drain_stdout, drain_stderr = proc.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    # Pipes still held by an unreachable descendant. Close
+                    # them so we don't leak fds; partial output captured by
+                    # the original TimeoutExpired is still useful.
+                    for stream in (proc.stdout, proc.stderr):
+                        try:
+                            if stream is not None:
+                                stream.close()
+                        except Exception:
+                            pass
+                    drain_stdout, drain_stderr = "", ""
+
+                self._cleanup_project(project_dir, project_name)
+
+                partial_stdout = (e.stdout.decode("utf-8", errors="replace")
+                                  if isinstance(e.stdout, bytes)
+                                  else (e.stdout or "")) or drain_stdout
+                partial_stderr = (e.stderr.decode("utf-8", errors="replace")
+                                  if isinstance(e.stderr, bytes)
+                                  else (e.stderr or "")) or drain_stderr
+                diagnostic = _extract_ghidra_diagnostic(
+                    partial_stdout, partial_stderr
+                )
+                raise GhidraAnalysisError(
+                    f"Ghidra analysis timed out after {timeout}s. "
+                    f"Binary may be too large or complex.",
+                    diagnostic=diagnostic,
+                ) from e
 
             elapsed_time = time.time() - start_time
 
+            if proc.returncode != 0:
+                logger.error(f"Analysis failed after {elapsed_time:.2f}s")
+                logger.error(f"stdout: {stdout}")
+                logger.error(f"stderr: {stderr}")
+
+                self._cleanup_project(project_dir, project_name)
+
+                diagnostic = _extract_ghidra_diagnostic(stdout or "", stderr or "")
+                raise GhidraAnalysisError(
+                    f"Ghidra analysis failed with exit code {proc.returncode}.",
+                    diagnostic=diagnostic,
+                    returncode=proc.returncode,
+                )
+
             logger.info(f"Analysis completed in {elapsed_time:.2f}s")
-            logger.debug(f"stdout: {result.stdout[:500]}")
+            logger.debug(f"stdout: {stdout[:500]}")
 
             return {
                 "success": True,
@@ -533,47 +628,18 @@ class GhidraRunner:
                 "project_name": project_name,
                 "output_path": output_path,
                 "elapsed_time": elapsed_time,
-                "stdout": result.stdout,
-                "stderr": result.stderr,
+                "stdout": stdout,
+                "stderr": stderr,
             }
 
-        except subprocess.TimeoutExpired as e:
-            elapsed_time = time.time() - start_time
-            logger.error(f"Analysis timeout after {elapsed_time:.2f}s")
-
-            # Clean up locked project to prevent future lock errors
-            self._cleanup_project(project_dir, project_name)
-
-            # TimeoutExpired surfaces partial output; capture whatever we
-            # got so the user can see how far Ghidra progressed.
-            partial_stdout = (e.stdout.decode("utf-8", errors="replace")
-                              if isinstance(e.stdout, bytes) else (e.stdout or ""))
-            partial_stderr = (e.stderr.decode("utf-8", errors="replace")
-                              if isinstance(e.stderr, bytes) else (e.stderr or ""))
-            diagnostic = _extract_ghidra_diagnostic(partial_stdout, partial_stderr)
-            raise GhidraAnalysisError(
-                f"Ghidra analysis timed out after {timeout}s. "
-                f"Binary may be too large or complex.",
-                diagnostic=diagnostic,
-            ) from e
-
-        except subprocess.CalledProcessError as e:
-            elapsed_time = time.time() - start_time
-            logger.error(f"Analysis failed after {elapsed_time:.2f}s")
-            logger.error(f"stdout: {e.stdout}")
-            logger.error(f"stderr: {e.stderr}")
-
-            # Clean up locked project to prevent future lock errors
-            self._cleanup_project(project_dir, project_name)
-
-            diagnostic = _extract_ghidra_diagnostic(e.stdout or "", e.stderr or "")
-            raise GhidraAnalysisError(
-                f"Ghidra analysis failed with exit code {e.returncode}.",
-                diagnostic=diagnostic,
-                returncode=e.returncode,
-            ) from e
-
         finally:
+            # Ensure no zombie even on unexpected exception paths.
+            if proc.poll() is None:
+                _kill_process_tree(proc)
+                try:
+                    proc.communicate(timeout=5)
+                except Exception:
+                    pass
             # Always remove the PDB we staged -- Ghidra has either read it by
             # now or failed outright. Leaving it behind would confuse future
             # analyses with a mismatched PDB.

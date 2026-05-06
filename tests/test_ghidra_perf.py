@@ -150,6 +150,31 @@ class TestProjectCacheCompression:
         assert not (tmp_path / f"{h}.funcidx.json").exists()
         assert not (tmp_path / f"{h}.meta.json").exists()
 
+    def test_invalidate_keeps_notes_sidecar(self, tmp_path):
+        # Wave 1B: user-supplied notes must survive cache.invalidate so
+        # that force_reanalyze / load_pdb don't wipe annotations.
+        cache = self._cache(tmp_path)
+        binary = self._make_binary(tmp_path)
+        cache.save_cached(str(binary), {"functions": [{"address": "0x1", "name": "a"}]})
+        cache.write_notes(
+            str(binary),
+            [{"function_key": "a", "kind": "plate", "addr": None, "text": "n"}],
+        )
+
+        import hashlib
+        h = hashlib.sha256(binary.read_bytes()).hexdigest()
+        notes_path = tmp_path / f"{h}.notes.json"
+        assert notes_path.exists()
+
+        assert cache.invalidate(str(binary))
+
+        # Cache artefacts gone, side-car preserved.
+        assert not (tmp_path / f"{h}.json.gz").exists()
+        assert notes_path.exists()
+        assert cache.read_notes(str(binary)) == [
+            {"function_key": "a", "kind": "plate", "addr": None, "text": "n"}
+        ]
+
 
 # -- GhidraRunner env plumbing ----------------------------------------------
 

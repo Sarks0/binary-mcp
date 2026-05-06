@@ -709,6 +709,17 @@ def get_analysis_context(
         # Cache the results
         cache.save_cached(binary_path, context)
 
+        # Replay any user-supplied notes onto the freshly-built cache
+        # (the side-car survives invalidate, so this is what makes
+        # annotations persist across force_reanalyze / load_pdb). The
+        # second save is cheap and keeps the on-disk cache annotated
+        # so cache-direct readers see notes too.
+        try:
+            cache.apply_notes_overlay(binary_path, context)
+            cache.save_cached(binary_path, context)
+        except Exception as e:
+            logger.warning(f"Failed to apply notes overlay after analysis: {e}")
+
         # Clean up temp file
         output_path.unlink()
 
@@ -1262,6 +1273,62 @@ def _normalize_xref_addr(raw: str | None) -> str:
     if not raw:
         return ""
     return str(raw).lower().replace("0x", "").lstrip("0") or "0"
+
+
+def _resolve_function_note_key(
+    context: dict, address: str
+) -> tuple[dict | None, str | None]:
+    """Resolve an address to ``(function_dict, function_key)``.
+
+    The returned key is the function's symbolic name when its
+    ``name_source`` is anything other than ``"DEFAULT"``, and
+    ``"rva:0xHEX"`` (computed against ``metadata.image_base``) otherwise
+    -- the same scheme :class:`ProjectCache` overlay uses, so notes
+    written under one rebuild reattach correctly after another.
+
+    Falls back to whichever key form is computable when only one is
+    available. Returns ``(None, None)`` if no function in the cache
+    contains the supplied address.
+    """
+    if not address:
+        return None, None
+    target_norm = _normalize_xref_addr(address)
+    functions = context.get("functions") or []
+    target_fn: dict | None = None
+    for fn in functions:
+        if _normalize_xref_addr(fn.get("address")) == target_norm:
+            target_fn = fn
+            break
+    if target_fn is None:
+        return None, None
+
+    name = target_fn.get("name") or ""
+    name_source = target_fn.get("name_source") or ""
+    if name and name_source and name_source != "DEFAULT":
+        return target_fn, name
+
+    metadata = context.get("metadata") or {}
+    raw_base = metadata.get("image_base") or ""
+    try:
+        image_base_int = int(str(raw_base).lower().replace("0x", ""), 16)
+    except (ValueError, TypeError):
+        # No usable image base and no symbolic name -- best effort: use
+        # the function's own address. This is only a fallback for
+        # synthetic test fixtures; real binaries always carry an
+        # image_base in metadata.
+        return target_fn, name or target_fn.get("address") or None
+
+    try:
+        addr_int = int(
+            str(target_fn.get("address") or "").lower().replace("0x", ""), 16
+        )
+    except (ValueError, TypeError):
+        return target_fn, name or target_fn.get("address") or None
+
+    rva = addr_int - image_base_int
+    if rva < 0:
+        return target_fn, name or target_fn.get("address") or None
+    return target_fn, f"rva:0x{rva:x}"
 
 
 @app.tool()
@@ -2428,6 +2495,289 @@ def rename_function(
 
     except Exception as e:
         logger.error(f"rename_function failed: {e}")
+        return f"Error: {e}"
+
+
+_NOTE_KIND_VALUES = ("plate", "pre", "post")
+_NOTE_TEXT_MAX = 4096
+
+
+def _matching_note_index(
+    notes: list[dict], function_key: str, kind: str, addr: str | None
+) -> int | None:
+    """Return the index of the existing note row matching the
+    ``(function_key, kind, addr)`` triple, or ``None`` if no row matches.
+    Used so ``add_note`` overwrites in place and ``delete_note`` knows
+    which row to drop.
+    """
+    norm_addr = (addr or "").lower()
+    for idx, row in enumerate(notes):
+        if not isinstance(row, dict):
+            continue
+        if row.get("function_key") != function_key:
+            continue
+        if row.get("kind") != kind:
+            continue
+        if kind == "plate":
+            if not row.get("addr"):
+                return idx
+        else:
+            row_addr = (row.get("addr") or "").lower()
+            if row_addr == norm_addr:
+                return idx
+    return None
+
+
+@app.tool()
+@log_to_session
+def add_note(
+    binary_path: str,
+    address: str,
+    note: str,
+    kind: str = "plate",
+) -> str:
+    """
+    Attach a free-text annotation to a function or specific instruction.
+
+    Notes are stored in a side-car file alongside the analysis cache and
+    survive ``analyze_binary(force_reanalyze=True)`` and ``load_pdb``. Use
+    them to record what a function does, what an instruction means, why
+    a branch matters -- anything you want carried forward across
+    re-analyses.
+
+    Args:
+        binary_path: Path to the analyzed binary
+        address: Hex address. For ``kind="plate"`` this is the function's
+            entry point. For ``kind="pre"`` / ``kind="post"`` this is the
+            instruction the comment is pinned to (the function it
+            belongs to is resolved automatically).
+        note: Free-text annotation (1..4096 chars)
+        kind: ``"plate"`` (function-level), ``"pre"`` (above an
+            instruction), or ``"post"`` (below an instruction)
+
+    Returns:
+        Confirmation including the resolved function_key.
+    """
+    try:
+        if kind not in _NOTE_KIND_VALUES:
+            return (
+                f"Error: kind must be one of {', '.join(_NOTE_KIND_VALUES)}; "
+                f"got '{kind}'"
+            )
+        if not address:
+            return "Error: 'address' is required"
+        text = (note or "").strip()
+        if not text:
+            return "Error: 'note' cannot be empty"
+        if len(text) > _NOTE_TEXT_MAX:
+            return (
+                f"Error: 'note' exceeds the {_NOTE_TEXT_MAX}-char limit "
+                f"({len(text)} given)"
+            )
+
+        context = get_analysis_context(binary_path)
+        target_fn, function_key = _resolve_function_note_key(context, address)
+        if target_fn is None or function_key is None:
+            return f"Error: No function contains address {address}"
+
+        notes = cache.read_notes(binary_path)
+        note_addr = None if kind == "plate" else address
+        existing_idx = _matching_note_index(notes, function_key, kind, note_addr)
+        new_row = {
+            "function_key": function_key,
+            "kind": kind,
+            "addr": note_addr,
+            "text": text,
+            "created_at": time.time(),
+        }
+        if existing_idx is None:
+            notes.append(new_row)
+            verb = "Added"
+        else:
+            notes[existing_idx] = new_row
+            verb = "Replaced"
+
+        if not cache.write_notes(binary_path, notes):
+            return "Error: Failed to persist notes side-car"
+
+        # Re-overlay so cache reads pick up the new note immediately
+        # without waiting for the next analysis run.
+        try:
+            cache.apply_notes_overlay(binary_path, context)
+            cache.save_cached(binary_path, context)
+        except Exception as e:
+            logger.warning(f"add_note overlay refresh failed: {e}")
+
+        result = "**Note Saved**\n\n"
+        result += f"- **Action:** {verb}\n"
+        result += f"- **Function key:** `{function_key}`\n"
+        result += f"- **Address:** `{address}`\n"
+        result += f"- **Kind:** `{kind}`\n"
+        result += f"- **Text:** {text}\n\n"
+        result += (
+            "*Stored in the per-binary side-car. Survives "
+            "force_reanalyze and load_pdb.*"
+        )
+        return result
+    except Exception as e:
+        logger.error(f"add_note failed: {e}")
+        return f"Error: {e}"
+
+
+@app.tool()
+@log_to_session
+def get_notes(
+    binary_path: str,
+    address: str | None = None,
+) -> str:
+    """
+    List user-supplied annotations for a binary.
+
+    With no ``address``, returns every note in the side-car. With an
+    ``address`` set, returns notes attached to that function (any kind)
+    plus any pre/post notes pinned exactly to that instruction.
+
+    Args:
+        binary_path: Path to the analyzed binary
+        address: Optional hex address to filter by
+
+    Returns:
+        Markdown listing grouped by function_key, or "No notes" when empty.
+    """
+    try:
+        notes = cache.read_notes(binary_path)
+        if not notes:
+            return f"**Notes for {Path(binary_path).name}:** *(none)*"
+
+        if address:
+            context = get_analysis_context(binary_path)
+            _target_fn, function_key = _resolve_function_note_key(
+                context, address
+            )
+            target_addr_norm = _normalize_xref_addr(address)
+            filtered = []
+            for row in notes:
+                if not isinstance(row, dict):
+                    continue
+                if function_key and row.get("function_key") == function_key:
+                    filtered.append(row)
+                    continue
+                row_addr = row.get("addr")
+                if row_addr and _normalize_xref_addr(row_addr) == target_addr_norm:
+                    filtered.append(row)
+            notes = filtered
+            if not notes:
+                return (
+                    f"**Notes for {Path(binary_path).name} @ {address}:** "
+                    f"*(none)*"
+                )
+
+        # Group by function_key for stable presentation.
+        grouped: dict[str, list[dict]] = {}
+        for row in notes:
+            if not isinstance(row, dict):
+                continue
+            grouped.setdefault(row.get("function_key") or "<unknown>", []).append(row)
+
+        lines = [f"**Notes for {Path(binary_path).name}:**", ""]
+        total = 0
+        for key in sorted(grouped):
+            rows = grouped[key]
+            lines.append(f"### `{key}` ({len(rows)})")
+            for row in rows:
+                kind = row.get("kind") or "?"
+                addr = row.get("addr") or ""
+                text = row.get("text") or ""
+                if kind == "plate":
+                    lines.append(f"- [plate] {text}")
+                else:
+                    lines.append(f"- [{kind} @ {addr}] {text}")
+                total += 1
+            lines.append("")
+        lines.append(f"_Total: {total}_")
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error(f"get_notes failed: {e}")
+        return f"Error: {e}"
+
+
+@app.tool()
+@log_to_session
+def delete_note(
+    binary_path: str,
+    address: str,
+    kind: str = "plate",
+) -> str:
+    """
+    Remove a user-supplied annotation.
+
+    Args:
+        binary_path: Path to the analyzed binary
+        address: Hex address used when the note was added (function
+            entry for plate, instruction PC for pre/post)
+        kind: ``"plate"``, ``"pre"``, or ``"post"`` -- must match the
+            kind given to ``add_note``
+
+    Returns:
+        Confirmation that the note was dropped, or an error if it was
+        not found.
+    """
+    try:
+        if kind not in _NOTE_KIND_VALUES:
+            return (
+                f"Error: kind must be one of {', '.join(_NOTE_KIND_VALUES)}; "
+                f"got '{kind}'"
+            )
+        if not address:
+            return "Error: 'address' is required"
+
+        context = get_analysis_context(binary_path)
+        target_fn, function_key = _resolve_function_note_key(context, address)
+        if target_fn is None or function_key is None:
+            return f"Error: No function contains address {address}"
+
+        notes = cache.read_notes(binary_path)
+        note_addr = None if kind == "plate" else address
+        existing_idx = _matching_note_index(notes, function_key, kind, note_addr)
+        if existing_idx is None:
+            return (
+                f"Error: No {kind} note for `{function_key}`"
+                + (f" at {address}" if note_addr else "")
+            )
+
+        removed = notes.pop(existing_idx)
+        if not cache.write_notes(binary_path, notes):
+            return "Error: Failed to persist notes side-car"
+
+        # Re-overlay onto the in-memory context. Because the deleted
+        # note's slot in ``notes[func]`` is no longer rewritten, we
+        # also drop it from the cache's func entry directly.
+        try:
+            target = next(
+                (
+                    f for f in context.get("functions") or []
+                    if f is target_fn
+                ),
+                None,
+            )
+            if target is not None and isinstance(target.get("notes"), dict):
+                bucket = target["notes"]
+                if kind == "plate":
+                    bucket["plate"] = ""
+                elif note_addr:
+                    bucket.get(kind, {}).pop(note_addr, None)
+            cache.save_cached(binary_path, context)
+        except Exception as e:
+            logger.warning(f"delete_note cache refresh failed: {e}")
+
+        result = "**Note Deleted**\n\n"
+        result += f"- **Function key:** `{function_key}`\n"
+        result += f"- **Address:** `{address}`\n"
+        result += f"- **Kind:** `{kind}`\n"
+        result += f"- **Text:** {removed.get('text', '')}\n"
+        return result
+    except Exception as e:
+        logger.error(f"delete_note failed: {e}")
         return f"Error: {e}"
 
 

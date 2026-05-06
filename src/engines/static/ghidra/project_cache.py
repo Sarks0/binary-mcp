@@ -72,6 +72,15 @@ class ProjectCache:
     def _get_funcidx_path(self, binary_hash: str) -> Path:
         return self.cache_dir / f"{binary_hash}.funcidx.json"
 
+    def _get_notes_path(self, binary_hash: str) -> Path:
+        """Path for the per-binary annotation side-car (Wave 1B).
+
+        Survives :meth:`invalidate` so user-supplied notes are not lost
+        when ``analyze_binary(force_reanalyze=True)`` or ``load_pdb``
+        rebuilds the cache.
+        """
+        return self.cache_dir / f"{binary_hash}.notes.json"
+
     def has_cached(self, binary_path: str) -> bool:
         """Check if analysis results are cached for a binary."""
         try:
@@ -223,7 +232,13 @@ class ProjectCache:
             return None
 
     def invalidate(self, binary_path: str) -> bool:
-        """Invalidate cached results for a binary (all formats + sidecars)."""
+        """Invalidate cached results for a binary (all formats + sidecars).
+
+        The notes side-car (``<hash>.notes.json``) is intentionally
+        preserved so that user-supplied annotations survive a
+        ``force_reanalyze`` or ``load_pdb`` rebuild. Use :meth:`clear_all`
+        for an explicit full wipe.
+        """
         try:
             binary_hash = self._get_binary_hash(binary_path)
             paths = [
@@ -275,7 +290,11 @@ class ProjectCache:
         return sorted(cached_binaries, key=lambda x: x.get("cached_at", 0), reverse=True)
 
     def clear_all(self) -> int:
-        """Clear all cached data (gz, legacy json, meta, funcidx)."""
+        """Clear all cached data (gz, legacy json, meta, funcidx, notes).
+
+        Unlike :meth:`invalidate`, this is a destructive full wipe and
+        also drops user-supplied annotation side-cars.
+        """
         count = 0
 
         for pattern in ("*.json.gz", "*.json"):
@@ -288,6 +307,149 @@ class ProjectCache:
 
         logger.info(f"Cleared {count} cache entries")
         return count
+
+    # --- Annotation side-car (Wave 1B) -------------------------------------
+
+    def read_notes(self, binary_path: str) -> list[dict]:
+        """Load the annotation side-car for a binary.
+
+        Returns the ``notes`` list (possibly empty). Missing or
+        malformed side-cars are logged and treated as "no notes".
+        """
+        try:
+            binary_hash = self._get_binary_hash(binary_path)
+            notes_path = self._get_notes_path(binary_hash)
+            if not notes_path.exists():
+                return []
+            with open(notes_path, encoding="utf-8") as f:
+                payload = json.load(f)
+            notes = payload.get("notes")
+            if not isinstance(notes, list):
+                logger.warning(
+                    f"Notes side-car for {binary_path} has no 'notes' list; "
+                    "treating as empty"
+                )
+                return []
+            return notes
+        except Exception as e:
+            logger.error(f"Error reading notes side-car: {e}")
+            return []
+
+    def write_notes(self, binary_path: str, notes: list[dict]) -> bool:
+        """Persist the annotation side-car for a binary.
+
+        Writes ``{"version": 1, "notes": [...]}`` to
+        ``<hash>.notes.json``. Returns ``True`` on success.
+        """
+        try:
+            binary_hash = self._get_binary_hash(binary_path)
+            notes_path = self._get_notes_path(binary_hash)
+            payload = {"version": 1, "notes": notes}
+            with open(notes_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, ensure_ascii=False)
+            return True
+        except Exception as e:
+            logger.error(f"Error writing notes side-car: {e}")
+            return False
+
+    @staticmethod
+    def _function_key_for(func: dict, image_base_int: int | None) -> list[str]:
+        """Return the candidate keys a function should match against.
+
+        The first key is the symbolic name when the function carries a
+        non-default name source. The RVA-based key
+        (``"rva:0xHEX"``) is always included as a fallback so a single
+        side-car entry can match either way -- e.g. when an analysis
+        rerun upgrades a default name to a symbolic one (PDB load).
+        """
+        keys: list[str] = []
+        name_source = func.get("name_source") or ""
+        name = func.get("name") or ""
+        if name and name_source and name_source != "DEFAULT":
+            keys.append(name)
+        if image_base_int is not None:
+            try:
+                addr_str = func.get("address") or ""
+                addr_int = int(str(addr_str).lower().replace("0x", ""), 16)
+                rva = addr_int - image_base_int
+                if rva >= 0:
+                    keys.append(f"rva:0x{rva:x}")
+            except (ValueError, TypeError):
+                pass
+        return keys
+
+    @staticmethod
+    def _parse_image_base(metadata: dict) -> int | None:
+        try:
+            raw = metadata.get("image_base") or ""
+            if not raw:
+                return None
+            return int(str(raw).lower().replace("0x", ""), 16)
+        except (ValueError, TypeError):
+            return None
+
+    def apply_notes_overlay(self, binary_path: str, data: dict) -> dict:
+        """Overlay user-supplied notes onto a freshly-built cache.
+
+        Mutates ``data`` in place: each function entry whose name or
+        RVA matches a side-car ``function_key`` gets a ``notes`` block
+        attached with three sub-fields (``plate``, ``pre``, ``post``).
+        ``plate`` is a flat string; ``pre`` / ``post`` are ``addr -> text``
+        dicts. Ghidra-supplied ``plate_comment`` is left untouched
+        because user notes live under the separate ``notes`` key --
+        this guarantees a fresh Ghidra plate is never clobbered by an
+        empty side-car entry.
+        """
+        try:
+            notes = self.read_notes(binary_path)
+            if not notes:
+                return data
+            functions = data.get("functions") or []
+            if not functions:
+                return data
+
+            metadata = data.get("metadata") or {}
+            image_base_int = self._parse_image_base(metadata)
+
+            # Build a single-pass index from every key form a function
+            # answers to (symbolic name plus RVA fallback) so each note
+            # is delivered in O(1).
+            key_to_func: dict[str, dict] = {}
+            for func in functions:
+                for key in self._function_key_for(func, image_base_int):
+                    key_to_func.setdefault(key, func)
+
+            for note in notes:
+                if not isinstance(note, dict):
+                    continue
+                func_key = note.get("function_key")
+                kind = note.get("kind")
+                text = note.get("text")
+                addr = note.get("addr")
+                if not func_key or not kind or not text:
+                    continue
+                target = key_to_func.get(func_key)
+                if target is None:
+                    continue
+                bucket = target.setdefault(
+                    "notes", {"plate": "", "pre": {}, "post": {}}
+                )
+                # Defensive backfill in case a prior overlay produced a
+                # legacy partial shape.
+                bucket.setdefault("plate", "")
+                bucket.setdefault("pre", {})
+                bucket.setdefault("post", {})
+                if kind == "plate":
+                    bucket["plate"] = text
+                elif kind in ("pre", "post") and addr:
+                    bucket[kind][str(addr)] = text
+
+            return data
+        except Exception as e:
+            # Overlay failures must never break analysis -- log and move
+            # on with the unannotated cache.
+            logger.error(f"Error applying notes overlay: {e}")
+            return data
 
     def get_cache_size(self) -> int:
         """Get total size of cache in bytes (all cache + sidecar files)."""

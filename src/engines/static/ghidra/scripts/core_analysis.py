@@ -15,6 +15,7 @@ from ghidra.app.decompiler import DecompInterface
 from ghidra.program.model.block import BasicBlockModel
 from ghidra.program.model.data import Enum as GhidraEnum
 from ghidra.program.model.data import Structure as GhidraStructure
+from ghidra.program.model.listing import CodeUnit
 from ghidra.util.task import ConsoleTaskMonitor
 from java.lang import InterruptedException, Thread
 from java.util.concurrent import Callable, Executors, TimeoutException, TimeUnit
@@ -244,6 +245,64 @@ def _existing_has_pseudocode(existing):
     if existing.get("decompile_status") in ("skipped_thunk_or_external",):
         return True
     return False
+
+
+def _extract_comments(function, listing):
+    """Capture Ghidra-supplied comments for a function.
+
+    Returns a tuple of ``(plate_comment, instruction_comments)``:
+
+    * ``plate_comment`` is the function's plate comment as a unicode
+      string (empty when none).
+    * ``instruction_comments`` is a list of ``{addr, kind, text}`` dicts
+      capturing pre / post / EOL comments for every instruction in the
+      function body. Comments commonly arrive from PDB load or from
+      manual annotation in the Ghidra GUI.
+
+    All exceptions are swallowed -- comment extraction must never break
+    analysis. Cheap (no decompile) so it is safe to call from the
+    resume-mode backfill path too.
+    """
+    plate_comment = u""
+    try:
+        raw_plate = function.getComment()
+        if raw_plate:
+            plate_comment = safe_unicode(raw_plate)
+    except Exception:
+        plate_comment = u""
+
+    instruction_comments = []
+    try:
+        body = function.getBody()
+        if body is None:
+            return plate_comment, instruction_comments
+        instr_iter = listing.getInstructions(body, True)
+        # ``listing.getComment(int, Address)`` is the long-stable API
+        # across Ghidra 10/11. The newer ``getCommentAt`` alias is not
+        # present in every install we target, so we stick with the
+        # CodeUnit constants.
+        kind_pairs = (
+            (CodeUnit.PRE_COMMENT, u"pre"),
+            (CodeUnit.POST_COMMENT, u"post"),
+            (CodeUnit.EOL_COMMENT, u"eol"),
+        )
+        while instr_iter.hasNext():
+            inst = instr_iter.next()
+            for code, kind in kind_pairs:
+                try:
+                    txt = listing.getComment(code, inst.getAddress())
+                except Exception:
+                    txt = None
+                if txt:
+                    instruction_comments.append({
+                        "addr": safe_unicode(inst.getAddress()),
+                        "kind": kind,
+                        "text": safe_unicode(txt),
+                    })
+    except Exception as e:
+        print(safe_format("    Warning: Could not extract comments for {}: {}",
+                          safe_unicode(function.getName()), safe_unicode(e)))
+    return plate_comment, instruction_comments
 
 
 def _extract_call_sites(function, listing, function_manager):
@@ -658,6 +717,15 @@ def extract_comprehensive_analysis():
                             )
                         except Exception:
                             existing_entry["call_sites"] = []
+                    # Same backfill for Wave 1B's Ghidra-supplied
+                    # comments. ``plate_comment`` and ``instruction_comments``
+                    # are added together so the absence of either is
+                    # treated as an upgrade trigger.
+                    if ("plate_comment" not in existing_entry
+                            or "instruction_comments" not in existing_entry):
+                        plate, instr_comments = _extract_comments(function, listing)
+                        existing_entry["plate_comment"] = plate
+                        existing_entry["instruction_comments"] = instr_comments
                     skipped_by_resume += 1
                     continue
 
@@ -718,6 +786,8 @@ def extract_comprehensive_analysis():
             "basic_blocks": [],
             "jump_tables": [],
             "fid_match": None,
+            "plate_comment": u"",
+            "instruction_comments": [],
             "decompile_status": "not_attempted"  # Track decompilation status
         }
 
@@ -802,6 +872,14 @@ def extract_comprehensive_analysis():
         except Exception as e:
             print(safe_format("    Warning: Could not extract call sites for {}: {}",
                               safe_unicode(function.getName()), safe_unicode(e)))
+
+        # Extract Ghidra-supplied comments (plate + per-instruction
+        # pre/post/eol). These commonly arrive from PDB load or from
+        # in-Ghidra-GUI annotations and are independent of the user
+        # notes side-car maintained server-side.
+        plate, instr_comments = _extract_comments(function, listing)
+        function_info["plate_comment"] = plate
+        function_info["instruction_comments"] = instr_comments
 
         # Optional: Function ID (FID) library match.
         # Iterates installed FID databases and picks the highest-scoring

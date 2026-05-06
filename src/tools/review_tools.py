@@ -10,9 +10,16 @@ once through the cache-miss path (mirroring the pattern used by
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 
-from src.utils.pseudocode_rules import PseudocodeRules, adjust_confidences, scan_text
+from src.utils.pseudocode_rules import (
+    SINK_HINTS,
+    PseudocodeRules,
+    _split_statements,
+    adjust_confidences,
+    scan_text,
+)
 from src.utils.security import (
     FileSizeError,
     PathTraversalError,
@@ -113,6 +120,232 @@ def _load_context(binary_path: str, cache, runner):
     cache.save_cached(bp, context)
     output_path.unlink(missing_ok=True)
     return context, bp
+
+
+# ---------------------------------------------------------------------------
+# get_param_sinks helpers
+# ---------------------------------------------------------------------------
+
+# Maximum chain depth for parameter → sink propagation. Findings whose chain
+# exceeds this are dropped (per Wave 3B brief), reflecting our honesty about
+# how much we can usefully follow before the noise floor swallows the signal.
+_PARAM_SINK_MAX_CHAIN = 6
+
+# Bare-identifier scanner for taint propagation; preserved as a single
+# pre-compiled object since this is hot in the per-statement sweep.
+_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+# A simple `lhs = rhs` matcher that accepts an identifier or a small dotted
+# chain on the LHS (``foo``, ``foo.bar``); rejects ``*p =`` and ``p->x =``
+# so we don't fool ourselves into thinking we modeled aliasing.
+_ASSIGN_RE = re.compile(
+    r"^\s*([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\s*=\s*(.+)$"
+)
+
+# Pointer/field-indirection markers that demote chain confidence to
+# ``indirect`` (the consumer should treat such chains as advisory only).
+_INDIRECT_MARKERS = ("*", "->", "[")
+
+
+def _collect_param_names(func: dict) -> set[str]:
+    """Return the set of parameter names that act as taint roots."""
+    roots: set[str] = set()
+    for idx, p in enumerate(func.get("parameters") or []):
+        name = (p.get("name") or "").strip()
+        if name:
+            roots.add(name)
+        else:
+            roots.add(f"param_{idx + 1}")
+    return roots
+
+
+def _split_args(text: str, open_paren_idx: int) -> list[str]:
+    """
+    Split the call's argument list at depth 0.
+
+    ``text[open_paren_idx]`` must be ``'('``; returns the list of comma-
+    separated args without the surrounding parens. Robust to nested parens,
+    bracket subscripts, and angle-bracket templates.
+    """
+    args: list[str] = []
+    if open_paren_idx >= len(text) or text[open_paren_idx] != "(":
+        return args
+    depth = 0
+    buf: list[str] = []
+    for ch in text[open_paren_idx:]:
+        if ch == "(":
+            depth += 1
+            if depth == 1:
+                continue
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                arg = "".join(buf).strip()
+                if arg:
+                    args.append(arg)
+                return args
+        if depth == 1 and ch == ",":
+            arg = "".join(buf).strip()
+            if arg:
+                args.append(arg)
+            buf = []
+            continue
+        buf.append(ch)
+    # Unbalanced parens — return whatever we collected so far.
+    arg = "".join(buf).strip()
+    if arg:
+        args.append(arg)
+    return args
+
+
+def _build_taint_aliases(statements, param_names: set[str]) -> dict[str, dict]:
+    """
+    Forward-sweep alias map.
+
+    Each tainted variable carries: ``root`` (the originating parameter
+    name), ``defined_at`` (statement index in ``statements``), and the
+    ``expr`` text of the assignment that propagated the taint.
+
+    The map is intentionally simplistic — pure ``lhs = rhs`` propagation,
+    no field- / pointer-sensitivity. Dropped statements include anything
+    that does not match a bare/dotted ``lhs``, or whose ``rhs`` does not
+    contain at least one already-tainted identifier.
+    """
+    tainted: dict[str, dict] = {}
+    # Roots themselves are tainted "for free" so chain walks bottom-out.
+    for root in param_names:
+        tainted[root] = {"root": root, "defined_at": -1, "expr": ""}
+
+    for idx, stmt in enumerate(statements):
+        m = _ASSIGN_RE.match(stmt.text)
+        if not m:
+            continue
+        lhs = m.group(1)
+        rhs = m.group(2)
+        rhs_idents = set(_IDENT_RE.findall(rhs))
+        # Skip self-references (``x = x + 1``) so we don't shadow an
+        # earlier root binding.
+        for name in rhs_idents:
+            if name == lhs:
+                continue
+            if name in tainted:
+                tainted[lhs] = {
+                    "root": tainted[name]["root"],
+                    "defined_at": idx,
+                    "expr": stmt.text,
+                }
+                break
+    return tainted
+
+
+def _walk_back_chain(
+    var_name: str,
+    tainted: dict[str, dict],
+    statements,
+    max_depth: int,
+) -> list[dict] | None:
+    """
+    Reconstruct the propagation chain that made ``var_name`` tainted.
+
+    Returns ``None`` when the chain is longer than ``max_depth`` so the
+    caller can suppress the finding (per task brief). A single-step chain
+    where ``var_name`` is itself the parameter root produces an empty
+    list (the chain is trivial).
+    """
+    chain: list[dict] = []
+    current = var_name
+    visited: set[str] = set()
+    while current in tainted and current not in visited:
+        visited.add(current)
+        record = tainted[current]
+        if record["defined_at"] < 0:
+            # Reached the root — done.
+            break
+        if len(chain) >= max_depth:
+            return None  # signal "chain too long; suppress"
+        stmt = statements[record["defined_at"]]
+        chain.append({"line": stmt.start_line, "text": stmt.text})
+        # Follow back to the root via the rhs identifier that introduced
+        # the taint. Pick the FIRST tainted rhs ident matching the
+        # propagation that built this entry (re-derive cheaply).
+        rhs_idents = set(_IDENT_RE.findall(stmt.text))
+        next_var = None
+        for name in rhs_idents:
+            if name == current:
+                continue
+            if name in tainted:
+                next_var = name
+                break
+        if next_var is None:
+            break
+        current = next_var
+    return list(reversed(chain))  # oldest first
+
+
+def _chain_confidence(chain: list[dict], arg_text: str) -> str:
+    """``indirect`` if any chain step or the sink arg crosses pointer/field."""
+    if any(marker in arg_text for marker in _INDIRECT_MARKERS):
+        return "indirect"
+    for step in chain:
+        if any(marker in step["text"] for marker in _INDIRECT_MARKERS):
+            return "indirect"
+    return "structural"
+
+
+def _collect_param_sink_findings(
+    statements, tainted: dict[str, dict], param_names: set[str]
+) -> list[dict]:
+    """Walk statements, emit one finding per (sink, tainted-arg) pair."""
+    findings: list[dict] = []
+    seen: set[tuple[int, int, str]] = set()
+
+    for idx, stmt in enumerate(statements):
+        for sink_match in SINK_HINTS.finditer(stmt.text):
+            sink_name = sink_match.group(1)
+            # SINK_HINTS regex ends with ``\s*\(`` — the open paren sits
+            # at sink_match.end() - 1 in the statement text.
+            open_paren_idx = sink_match.end() - 1
+            args = _split_args(stmt.text, open_paren_idx)
+
+            for arg_idx, arg in enumerate(args):
+                arg_idents = set(_IDENT_RE.findall(arg))
+                root = None
+                anchor = None
+                for name in arg_idents:
+                    if name in param_names:
+                        root, anchor = name, name
+                        break
+                if root is None:
+                    for name in arg_idents:
+                        if name in tainted:
+                            root, anchor = tainted[name]["root"], name
+                            break
+                if root is None:
+                    continue
+
+                key = (stmt.start_line, arg_idx, root)
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                chain = _walk_back_chain(
+                    anchor, tainted, statements, _PARAM_SINK_MAX_CHAIN
+                )
+                if chain is None:
+                    # Chain longer than the depth budget — drop per brief.
+                    continue
+
+                findings.append({
+                    "sink": sink_name,
+                    "sink_line": stmt.start_line,
+                    "arg_index": arg_idx,
+                    "taint_chain": chain,
+                    "parameter_root": root,
+                    "confidence": _chain_confidence(chain, arg),
+                })
+
+    findings.sort(key=lambda f: (f["sink_line"], f["arg_index"]))
+    return findings
 
 
 def register_review_tools(app, session_manager, cache, runner, api_patterns=None):
@@ -737,10 +970,115 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
             logger.exception(f"get_switch_tables failed: {e}")
             return f"Error: {e}"
 
+    @app.tool()
+    def get_param_sinks(binary_path: str, function: str) -> str:
+        """
+        Trace untrusted-input → dangerous-sink chains in one function.
+
+        Builds a syntactic taint chain across pseudocode statements: each
+        function parameter is treated as a taint root, simple ``lhs = rhs``
+        assignments propagate the taint through aliases, and any call to a
+        recognised sink (memcpy, RtlCopyMemory, ProbeForRead, etc.) whose
+        argument identifiers map back to a parameter is reported.
+
+        IMPORTANT: this is a syntactic chain, not real taint analysis.
+        Pure-text propagation drops through pointer indirection (``*p``,
+        ``p->field``, ``p[i]``); when a chain crosses any of these the
+        confidence is downgraded from ``structural`` to ``indirect`` so the
+        consumer can prioritise accordingly.
+
+        Args:
+            binary_path: Path to analyzed binary.
+            function: Function name or hex address.
+
+        Returns:
+            Formatted markdown-style report listing every (sink, arg)
+            chain that traces back to a parameter, ordered by sink line.
+        """
+        try:
+            context, _ = _load_context(binary_path, cache, runner)
+
+            cached_depth = context.get("metadata", {}).get("analysis_depth", "full")
+            if cached_depth in ("shallow", "structural"):
+                return (
+                    f"get_param_sinks requires a full Ghidra cache, but the "
+                    f"existing cache for this binary was produced with "
+                    f"analysis_depth='{cached_depth}' (no pseudocode).\n\n"
+                    f"To fix: analyze_binary(binary_path, force_reanalyze=True)"
+                )
+
+            functions = context.get("functions", [])
+            target = _find_function(functions, function)
+            if not target:
+                return (
+                    f"Function not found: {function}. "
+                    f"Try an exact name or address like '0x1800abcd'."
+                )
+
+            pseudo = target.get("pseudocode") or ""
+            if not pseudo.strip():
+                return (
+                    f"Function {target.get('name')} @ {target.get('address')} "
+                    f"has no pseudocode in the cache. Re-analyze with full "
+                    f"decompilation enabled."
+                )
+
+            param_names = _collect_param_names(target)
+            if not param_names:
+                return (
+                    f"Function {target.get('name')} @ {target.get('address')} "
+                    f"has no parameters in the cache; nothing to trace."
+                )
+
+            statements = _split_statements(pseudo)
+            tainted = _build_taint_aliases(statements, param_names)
+            findings = _collect_param_sink_findings(
+                statements, tainted, param_names
+            )
+
+            lines = [
+                f"### Param-sink chains for {target.get('name')} @ {target.get('address')}",
+                f"Parameters: {', '.join(sorted(param_names))}",
+                f"Findings:   {len(findings)}",
+                "",
+                "_Syntactic chain only — not real taint analysis. "
+                "`indirect` confidence means the chain crossed pointer / "
+                "field indirection that pure-text propagation cannot follow._",
+                "",
+            ]
+            if not findings:
+                lines.append(
+                    "No parameter-derived sink calls detected. Consider "
+                    "running scan_pseudocode for unconditional sink hits."
+                )
+                return "\n".join(lines)
+
+            for f in findings:
+                lines.append(
+                    f"- {f['sink']}() arg #{f['arg_index']} "
+                    f"@ line {f['sink_line']}  "
+                    f"[root={f['parameter_root']}, "
+                    f"confidence={f['confidence']}]"
+                )
+                for step in f["taint_chain"]:
+                    lines.append(
+                        f"    L{step['line']}: {step['text']}"
+                    )
+                lines.append("")
+
+            return "\n".join(lines)
+
+        except (PathTraversalError, FileSizeError, FileNotFoundError) as e:
+            return f"Invalid binary path: {e}"
+        except Exception as e:
+            logger.exception(f"get_param_sinks failed: {e}")
+            return f"Error: {e}"
+
     # Keep a tuple export so the caller can introspect what was registered
     return (
         get_function_callers,
         scan_pseudocode,
         get_review_package,
         get_switch_tables,
+        get_param_sinks,
     )

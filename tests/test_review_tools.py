@@ -72,6 +72,7 @@ def _register(cache_data):
         scan_pseudocode,
         get_review_package,
         get_switch_tables,
+        get_param_sinks,
     ) = register_review_tools(app, session_manager, cache, runner)
 
     # Patch sanitize so tests don't need a real file on disk
@@ -83,6 +84,7 @@ def _register(cache_data):
         "scan_pseudocode": scan_pseudocode,
         "get_review_package": get_review_package,
         "get_switch_tables": get_switch_tables,
+        "get_param_sinks": get_param_sinks,
         "cache": cache,
         "runner": runner,
     }
@@ -1179,3 +1181,147 @@ class TestContextRuleScanPseudocodeIntegration:
         )
         assert "CTX_A" in result
         assert "CTX_B" not in result
+
+
+def _vuln_function(pseudocode: str, *, params=None, name="vuln", address="0x4000"):
+    """Build a function dict with sensible defaults for param-sink tests."""
+    return _make_function(
+        name=name,
+        address=address,
+        pseudocode=pseudocode,
+        parameters=params
+        or [
+            {"name": "param_1", "datatype": "PIRP"},
+            {"name": "param_2", "datatype": "ULONG"},
+            {"name": "param_3", "datatype": "ULONG"},
+        ],
+    )
+
+
+class TestGetParamSinks:
+    def test_param_size_to_memcpy_flagged(self):
+        pseudo = (
+            "int handler() {\n"
+            "  memcpy(dst, src, param_3);\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        tools = _register(_make_context(functions=[_vuln_function(pseudo)]))
+        result = tools["get_param_sinks"]("/bin/test.sys", "vuln")
+
+        assert "memcpy()" in result
+        assert "arg #2" in result
+        assert "root=param_3" in result
+        assert "structural" in result
+
+    def test_constant_size_not_flagged(self):
+        pseudo = "memcpy(dst, src, 0x100);"
+        tools = _register(_make_context(functions=[_vuln_function(pseudo)]))
+        result = tools["get_param_sinks"]("/bin/test.sys", "vuln")
+
+        assert "Findings:   0" in result
+
+    def test_unrelated_local_not_flagged(self):
+        pseudo = (
+            "local_x = 42;\n"
+            "memcpy(dst, src, local_x);\n"
+        )
+        tools = _register(_make_context(functions=[_vuln_function(pseudo)]))
+        result = tools["get_param_sinks"]("/bin/test.sys", "vuln")
+
+        assert "Findings:   0" in result
+
+    def test_alias_propagation_flagged(self):
+        pseudo = (
+            "local_x = param_1;\n"
+            "memcpy(dst, src, local_x);\n"
+        )
+        tools = _register(_make_context(functions=[_vuln_function(pseudo)]))
+        result = tools["get_param_sinks"]("/bin/test.sys", "vuln")
+
+        assert "memcpy()" in result
+        assert "root=param_1" in result
+        # The intermediate alias statement should appear in the chain.
+        assert "local_x = param_1" in result
+
+    def test_chain_depth_limit_drops_finding(self):
+        # 7 hops (param_1 → a → b → c → d → e → f) plus the sink is too long.
+        pseudo = (
+            "a = param_1;\n"
+            "b = a;\n"
+            "c = b;\n"
+            "d = c;\n"
+            "e = d;\n"
+            "f = e;\n"
+            "g = f;\n"
+            "memcpy(dst, src, g);\n"
+        )
+        tools = _register(_make_context(functions=[_vuln_function(pseudo)]))
+        result = tools["get_param_sinks"]("/bin/test.sys", "vuln")
+
+        assert "Findings:   0" in result
+
+    def test_pointer_indirection_demotes_confidence(self):
+        pseudo = (
+            "n = *p;\n"
+            "n = n + param_1;\n"
+            "memcpy(dst, src, n);\n"
+        )
+        tools = _register(_make_context(functions=[_vuln_function(pseudo)]))
+        result = tools["get_param_sinks"]("/bin/test.sys", "vuln")
+
+        assert "memcpy()" in result
+        assert "indirect" in result
+
+    def test_kernel_sink_recognised(self):
+        pseudo = (
+            "len = param_2;\n"
+            "RtlCopyMemory(dst, src, len);\n"
+        )
+        tools = _register(_make_context(functions=[_vuln_function(pseudo)]))
+        result = tools["get_param_sinks"]("/bin/test.sys", "vuln")
+
+        assert "RtlCopyMemory()" in result
+        assert "root=param_2" in result
+
+    def test_probe_for_read_recognised(self):
+        pseudo = "ProbeForRead(param_1, param_2, 1);"
+        tools = _register(_make_context(functions=[_vuln_function(pseudo)]))
+        result = tools["get_param_sinks"]("/bin/test.sys", "vuln")
+
+        assert "ProbeForRead()" in result
+
+    def test_function_not_found(self):
+        tools = _register(_make_context(functions=[_vuln_function("ret;")]))
+        result = tools["get_param_sinks"]("/bin/test.sys", "missing_func")
+
+        assert "Function not found" in result
+
+    def test_no_pseudocode(self):
+        f = _make_function(name="empty", address="0x5000", pseudocode="")
+        tools = _register(_make_context(functions=[f]))
+        result = tools["get_param_sinks"]("/bin/test.sys", "empty")
+
+        assert "no pseudocode" in result
+
+    def test_no_parameters(self):
+        f = _make_function(
+            name="leaf", address="0x6000",
+            pseudocode="memcpy(dst, src, 16);",
+            parameters=[],
+        )
+        tools = _register(_make_context(functions=[f]))
+        result = tools["get_param_sinks"]("/bin/test.sys", "leaf")
+
+        assert "no parameters" in result
+
+    def test_shallow_cache_warning(self):
+        ctx = _make_context(
+            functions=[_vuln_function("memcpy(dst, src, param_1);")],
+        )
+        ctx["metadata"]["analysis_depth"] = "structural"
+        tools = _register(ctx)
+        result = tools["get_param_sinks"]("/bin/test.sys", "vuln")
+
+        assert "structural" in result
+        assert "force_reanalyze=True" in result

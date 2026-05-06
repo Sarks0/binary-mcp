@@ -89,7 +89,10 @@ SCANNER_HINTS = re.compile(
 )
 SINK_HINTS = re.compile(
     r"\b(memcpy|memmove|strcpy|strcat|wcscpy|wcscat|sprintf|system|popen|"
-    r"WinExec|ShellExecute|CreateProcess)\s*\(",
+    r"WinExec|ShellExecute|CreateProcess|"
+    # Windows kernel sinks worth correlating to user-derived inputs:
+    r"ProbeForRead|ProbeForWrite|MmMapLockedPagesSpecifyCache|"
+    r"RtlCopyMemory|IoAllocateMdl|ExAllocatePoolWithTag)\s*\(",
 )
 
 

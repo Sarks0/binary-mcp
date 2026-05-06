@@ -46,14 +46,22 @@ def _func(name, address, called_functions=None, pseudocode="", is_thunk=False):
     }
 
 
-def _ctx(functions=None, strings=None):
-    return {
+def _ctx(functions=None, strings=None, xrefs_to_function=None, xrefs_to_import=None):
+    ctx = {
         "metadata": {"name": "test.exe"},
         "functions": functions or [],
         "imports": [],
         "strings": strings or [],
         "memory_map": [],
     }
+    # Only attach the new reverse-index keys when explicitly provided so
+    # that legacy-cache code paths (which expect the keys to be absent)
+    # remain exercised by the existing tests.
+    if xrefs_to_function is not None:
+        ctx["xrefs_to_function"] = xrefs_to_function
+    if xrefs_to_import is not None:
+        ctx["xrefs_to_import"] = xrefs_to_import
+    return ctx
 
 
 @pytest.fixture
@@ -178,3 +186,121 @@ class TestGetXrefsPseudocodeFallback:
         result = server_module.get_xrefs("/bin/test.exe", function_name="target")
         assert "Pseudocode mentions" in result
         assert "indirect_caller" in result
+
+
+class TestGetXrefsReverseIndex:
+    """Wave 1A: ``get_xrefs(direction='to', ...)`` should consult the
+    precomputed ``xrefs_to_function`` map populated by core_analysis.py
+    and fall back to the legacy linear scan only when the key is absent.
+    """
+
+    def test_reverse_index_used_when_present(self, server_module, monkeypatch):
+        # Target and callers exist in the function list, but their
+        # ``called_functions`` arrays are deliberately empty -- if the
+        # implementation still performed the legacy linear scan it would
+        # report zero callers. The reverse index is the only source of
+        # truth in this fixture, so any caller surfaced proves the
+        # index path executed.
+        target = _func("handler", "0x1000")
+        caller_a = _func("dispatch_a", "0x2000")
+        caller_b = _func("dispatch_b", "0x3000")
+        caller_c = _func("dispatch_c", "0x4000")
+        xrefs_to_function = {
+            # Key is the normalized form (no 0x, no leading zeros).
+            "1000": [
+                {"from_func_addr": "0x2000", "from_func_name": "dispatch_a",
+                 "from_call_site": "0x200a"},
+                {"from_func_addr": "0x3000", "from_func_name": "dispatch_b",
+                 "from_call_site": "0x3014"},
+                {"from_func_addr": "0x4000", "from_func_name": "dispatch_c",
+                 "from_call_site": "0x4022"},
+            ],
+        }
+        _wire(
+            server_module,
+            _ctx(
+                functions=[target, caller_a, caller_b, caller_c],
+                xrefs_to_function=xrefs_to_function,
+            ),
+            monkeypatch,
+        )
+
+        result = server_module.get_xrefs(
+            "/bin/test.exe", function_name="handler"
+        )
+
+        assert "Function calls (3)" in result
+        assert "dispatch_a" in result
+        assert "dispatch_b" in result
+        assert "dispatch_c" in result
+        # Call-site precision must surface in the formatted output.
+        assert "call site: 0x200a" in result
+        assert "call site: 0x3014" in result
+        assert "call site: 0x4022" in result
+        # The always-on indirect-call disclaimer must accompany non-empty
+        # direction=to results so a downstream LLM doesn't conclude that
+        # the listed callers are exhaustive.
+        assert "indirect calls" in result.lower()
+
+    def test_reverse_index_lookup_is_o1(self, server_module, monkeypatch):
+        # Build a reverse index where the *only* entry matching the
+        # target lives behind the normalized key ``1000``. Populate
+        # additional functions with garbage ``called_functions`` data
+        # that, if scanned linearly, would either miss or pick the wrong
+        # entries. A correct implementation reads from the dict directly
+        # and is not affected by the noise.
+        target = _func("handler", "0x1000")
+        noisy_caller = _func(
+            "noisy",
+            "0x9000",
+            # Linear-scan trap: pretend "noisy" calls "0x1000". The
+            # legacy path would emit a CALL row for it; the index path
+            # must not, because the index is the source of truth.
+            called_functions=[{"name": "handler", "address": "0x1000"}],
+        )
+        real_caller = _func("real_caller", "0x2000")
+        xrefs_to_function = {
+            "1000": [
+                {"from_func_addr": "0x2000", "from_func_name": "real_caller",
+                 "from_call_site": "0x2050"},
+            ],
+        }
+        _wire(
+            server_module,
+            _ctx(
+                functions=[target, noisy_caller, real_caller],
+                xrefs_to_function=xrefs_to_function,
+            ),
+            monkeypatch,
+        )
+
+        result = server_module.get_xrefs(
+            "/bin/test.exe", function_name="handler"
+        )
+
+        assert "Function calls (1)" in result
+        assert "real_caller" in result
+        assert "noisy" not in result
+
+    def test_legacy_cache_falls_back_to_linear_scan(
+        self, server_module, monkeypatch
+    ):
+        # No ``xrefs_to_function`` key at all -- this is the shape of a
+        # cache built before Wave 1A. The legacy linear scan over
+        # ``called_functions`` must still produce results.
+        target = _func("handler", "0x1000")
+        caller = _func(
+            "dispatch",
+            "0x2000",
+            called_functions=[{"name": "handler", "address": "0x1000"}],
+        )
+        # Critically: do NOT pass xrefs_to_function -- _ctx() omits the
+        # key entirely, mirroring a pre-Wave-1A cache.
+        _wire(server_module, _ctx(functions=[target, caller]), monkeypatch)
+
+        result = server_module.get_xrefs(
+            "/bin/test.exe", function_name="handler"
+        )
+
+        assert "Function calls (1)" in result
+        assert "dispatch" in result

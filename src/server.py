@@ -1326,17 +1326,35 @@ def get_xrefs(
 
         # --- function-to-function xrefs ---------------------------------
         if direction == "to":
-            # Who calls this address? Scan called_functions of every function.
-            for caller in functions:
-                for call in caller.get("called_functions") or []:
-                    if _normalize_xref_addr(call.get("address")) == target_norm:
-                        function_xrefs.append({
-                            "from": caller.get("address"),
-                            "from_name": caller.get("name"),
-                            "to": address,
-                            "type": "CALL",
-                        })
-                        break
+            # Prefer the precomputed reverse index (populated by
+            # core_analysis.py since Wave 1A): keys are normalized callee
+            # addresses, values are lists of caller records carrying the
+            # precise call-site PC. Falls back to the legacy linear scan
+            # over called_functions for caches built before the index
+            # existed.
+            xrefs_idx = context.get("xrefs_to_function")
+            if isinstance(xrefs_idx, dict):
+                for r in xrefs_idx.get(target_norm) or []:
+                    function_xrefs.append({
+                        "from": r.get("from_func_addr"),
+                        "from_name": r.get("from_func_name"),
+                        "to": address,
+                        "type": "CALL",
+                        "call_site": r.get("from_call_site"),
+                    })
+            else:
+                # Legacy cache (no reverse index): scan every function's
+                # called_functions list. Lacks call-site precision.
+                for caller in functions:
+                    for call in caller.get("called_functions") or []:
+                        if _normalize_xref_addr(call.get("address")) == target_norm:
+                            function_xrefs.append({
+                                "from": caller.get("address"),
+                                "from_name": caller.get("name"),
+                                "to": address,
+                                "type": "CALL",
+                            })
+                            break
         else:  # from
             if target_fn:
                 for call in target_fn.get("called_functions") or []:
@@ -1411,8 +1429,10 @@ def get_xrefs(
                 if shown >= limit:
                     break
                 if direction == "to":
+                    call_site = x.get("call_site")
+                    site_suffix = f" (call site: {call_site})" if call_site else ""
                     lines.append(
-                        f"- {x['from_name']} @ {x['from']}  [{x['type']}]"
+                        f"- {x['from_name']} @ {x['from']}{site_suffix}  [{x['type']}]"
                     )
                 else:
                     to_name = x.get("to_name") or "?"
@@ -1422,6 +1442,13 @@ def get_xrefs(
                     )
                 shown += 1
             lines.append("")
+            if direction == "to":
+                lines.append(
+                    "*Note: indirect calls (vtable / function pointer / "
+                    "`CALL [reg+N]`) are not represented in this index; "
+                    "results may be incomplete.*"
+                )
+                lines.append("")
 
         if string_xrefs and shown < limit:
             lines.append(f"### Data / string refs ({len(string_xrefs)})")

@@ -81,6 +81,21 @@ def safe_format(fmt_string, *args, **kwargs):
             return "<formatting_error>"
 
 
+def _normalize_addr_for_xref(raw):
+    """Normalize an address into the same canonical form server-side
+    ``_normalize_xref_addr`` produces (lowercase, no ``0x`` prefix, no
+    leading zeros, never empty). Keeps cache keys aligned with how
+    ``get_xrefs`` looks them up so the reverse index is a true O(1) hit.
+    """
+    if not raw:
+        return u""
+    s = safe_unicode(raw).lower()
+    if s.startswith(u"0x"):
+        s = s[2:]
+    s = s.lstrip(u"0")
+    return s if s else u"0"
+
+
 class DecompileCallable(Callable):
     """
     Java Callable wrapper for decompilation with thread-based timeout.
@@ -231,6 +246,70 @@ def _existing_has_pseudocode(existing):
     return False
 
 
+def _extract_call_sites(function, listing, function_manager):
+    """Walk a function's body and collect direct-call sites.
+
+    Returns a list of records with the call-site PC, the resolved
+    callee's entry-point address, the callee's name, and whether the
+    callee resolves to an external import (including thunks-to-external).
+    Indirect calls (no flows) are silently skipped -- those are Wave 2's
+    territory. Cheap enough to run during resume backfill because no
+    decompilation is involved, just instruction iteration.
+    """
+    sites = []
+    body = function.getBody()
+    if not body:
+        return sites
+    instr_iter = listing.getInstructions(body, True)
+    while instr_iter.hasNext():
+        inst = instr_iter.next()
+        ft = inst.getFlowType()
+        if ft is None or not ft.isCall():
+            continue
+        try:
+            targets = inst.getFlows()
+        except Exception:
+            targets = None
+        if not targets:
+            continue
+        call_site = safe_unicode(inst.getAddress())
+        for target_addr in targets:
+            try:
+                target_fn = function_manager.getFunctionAt(target_addr)
+            except Exception:
+                target_fn = None
+            if target_fn is None:
+                # Direct call into code Ghidra didn't tag as a function
+                # (rare; e.g. tail-call into an unrecognised stub).
+                # Record by address so the reverse index still resolves.
+                sites.append({
+                    "call_site": call_site,
+                    "callee_addr": safe_unicode(target_addr),
+                    "callee_name": safe_unicode(target_addr),
+                    "is_external": False,
+                })
+                continue
+            is_external = False
+            callee_name = safe_unicode(target_fn.getName())
+            try:
+                if target_fn.isExternal():
+                    is_external = True
+                elif target_fn.isThunk():
+                    thunked = target_fn.getThunkedFunction(True)
+                    if thunked is not None and thunked.isExternal():
+                        is_external = True
+                        callee_name = safe_unicode(thunked.getName())
+            except Exception:
+                pass
+            sites.append({
+                "call_site": call_site,
+                "callee_addr": safe_unicode(target_fn.getEntryPoint()),
+                "callee_name": callee_name,
+                "is_external": is_external,
+            })
+    return sites
+
+
 def _load_resume_manifest(path):
     """
     Load a small ``{"complete_addresses": [...]}`` sidecar.
@@ -366,6 +445,8 @@ def extract_comprehensive_analysis():
         context["memory_map"] = []
         context.setdefault("functions", [])
         context.setdefault("xrefs", {})
+        context.setdefault("xrefs_to_function", {})
+        context.setdefault("xrefs_to_import", {})
         context.setdefault("data_types", {"structures": [], "enums": []})
         context.setdefault("skipped_functions", [])
         context["analysis_stats"] = {
@@ -390,6 +471,8 @@ def extract_comprehensive_analysis():
             "strings": [],
             "memory_map": [],
             "xrefs": {},
+            "xrefs_to_function": {},
+            "xrefs_to_import": {},
             "data_types": {
                 "structures": [],
                 "enums": []
@@ -564,6 +647,17 @@ def extract_comprehensive_analysis():
                 # function, skip it. Otherwise fall through and re-process so the
                 # missing fields (typically pseudocode) get filled in.
                 if skip_decompile or _existing_has_pseudocode(existing_entry):
+                    # Backfill the call_sites field if missing -- the
+                    # entry was produced by a pre-Wave-1A run that never
+                    # captured per-call-site PCs. Cheap (no decompile),
+                    # keeps the reverse index complete on resume.
+                    if "call_sites" not in existing_entry:
+                        try:
+                            existing_entry["call_sites"] = _extract_call_sites(
+                                function, listing, function_manager
+                            )
+                        except Exception:
+                            existing_entry["call_sites"] = []
                     skipped_by_resume += 1
                     continue
 
@@ -619,6 +713,7 @@ def extract_comprehensive_analysis():
             "parameters": [],
             "local_variables": [],
             "called_functions": [],
+            "call_sites": [],
             "pseudocode": None,
             "basic_blocks": [],
             "jump_tables": [],
@@ -693,6 +788,19 @@ def extract_comprehensive_analysis():
                         })
         except Exception as e:
             print(safe_format("    Warning: Could not extract jump tables for {}: {}",
+                              safe_unicode(function.getName()), safe_unicode(e)))
+
+        # Capture direct-call sites with instruction-level precision.
+        # Indirect calls (CALL [reg+N] / vtable / fnptr) yield no flows
+        # and are intentionally skipped -- resolving them is Wave 2's
+        # job. The data feeds the post-loop reverse-index build at the
+        # end of ``extract_comprehensive_analysis``.
+        try:
+            function_info["call_sites"] = _extract_call_sites(
+                function, listing, function_manager
+            )
+        except Exception as e:
+            print(safe_format("    Warning: Could not extract call sites for {}: {}",
                               safe_unicode(function.getName()), safe_unicode(e)))
 
         # Optional: Function ID (FID) library match.
@@ -886,6 +994,34 @@ def extract_comprehensive_analysis():
 
             context["data_types"]["enums"].append(enum_info)
 
+    # Build reverse-xref indices from the per-function ``call_sites`` lists
+    # we captured during the function loop. Inverting in one pass here
+    # turns ``get_xrefs(direction="to", ...)`` from an O(n*m) sweep over
+    # every caller's called_functions into an O(1) dict lookup. Indirect
+    # calls aren't represented (they had no resolvable target above) -- the
+    # server-side disclaimer covers that gap.
+    xrefs_to_function = {}
+    xrefs_to_import = {}
+    for fn in context["functions"]:
+        caller_addr = fn.get("address")
+        caller_name = fn.get("name")
+        for site in fn.get("call_sites") or []:
+            record = {
+                "from_func_addr": caller_addr,
+                "from_func_name": caller_name,
+                "from_call_site": site.get("call_site"),
+            }
+            if site.get("is_external"):
+                key = site.get("callee_name") or u""
+                if key:
+                    xrefs_to_import.setdefault(key, []).append(record)
+            else:
+                key = _normalize_addr_for_xref(site.get("callee_addr"))
+                if key:
+                    xrefs_to_function.setdefault(key, []).append(record)
+    context["xrefs_to_function"] = xrefs_to_function
+    context["xrefs_to_import"] = xrefs_to_import
+
     print("[*] Extraction complete!")
     print(safe_format("    Functions: {}", len(context["functions"])))
     print(safe_format("    Imports: {}", len(context["imports"])))
@@ -893,6 +1029,8 @@ def extract_comprehensive_analysis():
     print(safe_format("    Strings: {}", len(context["strings"])))
     print(safe_format("    Structures: {}", len(context["data_types"]["structures"])))
     print(safe_format("    Enums: {}", len(context["data_types"]["enums"])))
+    print(safe_format("    Reverse-xref entries: {} func / {} import",
+                      len(xrefs_to_function), len(xrefs_to_import)))
 
     # Print analysis statistics
     stats = context["analysis_stats"]

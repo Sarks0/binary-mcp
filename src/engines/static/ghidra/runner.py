@@ -550,21 +550,25 @@ class GhidraRunner:
         # cleanup can kill Ghidra's whole java.exe grandchild tree. With
         # subprocess.run on Windows, the post-timeout drain blocks
         # indefinitely if Java keeps the pipes open after the .bat dies.
-        proc = subprocess.Popen(  # nosec B603 - cmd built from validated args
-            cmd,
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            shell=False,
-            # POSIX: own process group so SIGKILL can fan out via killpg.
-            # Windows ignores start_new_session; we use taskkill /T instead.
-            start_new_session=(os.name != "nt"),
-        )
-
+        # Popen sits inside the try so spawn-time failures (missing
+        # analyzeHeadless, fd exhaustion, bad argv) still hit the staged-PDB
+        # cleanup in finally.
+        proc = None
         try:
+            proc = subprocess.Popen(  # nosec B603 - cmd built from validated args
+                cmd,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                shell=False,
+                # POSIX: own process group so SIGKILL can fan out via killpg.
+                # Windows ignores start_new_session; we use taskkill /T instead.
+                start_new_session=(os.name != "nt"),
+            )
+
             try:
                 stdout, stderr = proc.communicate(timeout=timeout)
             except subprocess.TimeoutExpired as e:
@@ -633,8 +637,11 @@ class GhidraRunner:
             }
 
         finally:
-            # Ensure no zombie even on unexpected exception paths.
-            if proc.poll() is None:
+            # Ensure no zombie even on unexpected exception paths. proc may
+            # be None if subprocess.Popen itself raised (missing
+            # analyzeHeadless, fd exhaustion, bad argv) -- staged-PDB
+            # cleanup must still run in that case.
+            if proc is not None and proc.poll() is None:
                 _kill_process_tree(proc)
                 try:
                     proc.communicate(timeout=5)

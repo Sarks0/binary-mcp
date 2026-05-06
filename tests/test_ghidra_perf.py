@@ -462,6 +462,38 @@ class TestRunnerEnvPlumbing:
         # Cleaned up after analyze returns
         assert not expected_staged.exists()
 
+    def test_staged_pdb_cleaned_up_when_popen_raises(self, runner, tmp_path):
+        """Regression: ultrareview bug_006. If subprocess.Popen raises before
+        the try/finally block opens (missing analyzeHeadless, fd exhaustion,
+        bad argv), the staged <binary>.pdb must STILL be removed -- otherwise
+        Ghidra's PdbUniversalAnalyzer auto-locates a stale PDB on subsequent
+        analysis runs of the same binary."""
+        binary, script_dir, output = self._prepare(runner, tmp_path)
+
+        pdb_src = tmp_path / "external" / "my_binary.pdb"
+        pdb_src.parent.mkdir()
+        pdb_src.write_bytes(b"PDB fake")
+
+        expected_staged = binary.parent / f"{binary.stem}.pdb"
+
+        def boom(*args, **kwargs):
+            raise FileNotFoundError(2, "analyzeHeadless not found")
+
+        with patch("subprocess.Popen", side_effect=boom):
+            with pytest.raises(FileNotFoundError):
+                runner.analyze(
+                    binary_path=str(binary),
+                    script_path=str(script_dir),
+                    script_name="core_analysis.py",
+                    output_path=str(output),
+                    pdb_path=str(pdb_src),
+                )
+
+        assert not expected_staged.exists(), (
+            "Staged PDB leaked when subprocess.Popen raised before the "
+            "try/finally block"
+        )
+
     def test_max_heap_sets_java_options(self, runner, tmp_path):
         binary, script_dir, output = self._prepare(runner, tmp_path)
         captured = {}

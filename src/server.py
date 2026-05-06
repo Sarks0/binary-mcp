@@ -32,6 +32,7 @@ from src.tools.dotnet_tools import register_dotnet_tools
 from src.tools.dynamic_tools import register_dynamic_tools
 from src.tools.fid_tools import register_fid_tools
 from src.tools.function_hash_tools import register_function_hash_tools
+from src.tools.indirect_call_tools import register_indirect_call_tools
 from src.tools.malware_tools import register_malware_tools
 from src.tools.pe_tools import register_pe_tools
 from src.tools.reporting import register_reporting_tools
@@ -1391,6 +1392,8 @@ def get_xrefs(
         function_xrefs: list[dict] = []
         string_xrefs: list[dict] = []
         pseudocode_xrefs: list[dict] = []
+        indirect_xrefs: list[dict] = []
+        vtable_hits: list[dict] = []
 
         # --- function-to-function xrefs ---------------------------------
         if direction == "to":
@@ -1434,6 +1437,38 @@ def get_xrefs(
                         "type": "CALL",
                     })
 
+        # --- indirect-call candidates (Wave 2) -------------------------
+        # Surfaces vtable slots and indirect-call sites whose static
+        # ``loaded_from`` immediate resolves to the target. Indirect
+        # calls have no direct caller in the call graph, so this block
+        # appears alongside direct callers (not only when direct is
+        # empty) -- the LLM should see all evidence.
+        if direction == "to":
+            iidx = context.get("xrefs_to_function_indirect")
+            if isinstance(iidx, dict):
+                for r in iidx.get(target_norm) or []:
+                    indirect_xrefs.append({
+                        "from": r.get("from_func_addr"),
+                        "from_name": r.get("from_func_name"),
+                        "to": address,
+                        "type": "INDIRECT_CALL",
+                        "call_site": r.get("from_call_site"),
+                        "operand": r.get("operand"),
+                    })
+
+            for vt in context.get("vtables") or []:
+                for tgt in vt.get("targets") or []:
+                    if (
+                        _normalize_xref_addr(tgt.get("address"))
+                        == target_norm
+                    ):
+                        vtable_hits.append({
+                            "table_address": vt.get("address"),
+                            "section": vt.get("section"),
+                            "slot": tgt.get("slot"),
+                            "tags": vt.get("tags") or [],
+                        })
+
         # --- string xrefs -----------------------------------------------
         for s in context.get("strings", []):
             s_addr_norm = _normalize_xref_addr(s.get("address"))
@@ -1472,7 +1507,13 @@ def get_xrefs(
                         "type": "PSEUDOCODE_MENTION",
                     })
 
-        total = len(function_xrefs) + len(string_xrefs) + len(pseudocode_xrefs)
+        total = (
+            len(function_xrefs)
+            + len(string_xrefs)
+            + len(pseudocode_xrefs)
+            + len(indirect_xrefs)
+            + len(vtable_hits)
+        )
         if total == 0:
             target_label = (
                 f"{target_fn.get('name')} @ {address}" if target_fn else address
@@ -1543,6 +1584,46 @@ def get_xrefs(
                     break
                 lines.append(
                     f"- {x['from_name']} @ {x['from']}  [{x['type']}]"
+                )
+                shown += 1
+            lines.append("")
+
+        # --- indirect candidates (Wave 2) ------------------------------
+        indirect_total = len(indirect_xrefs) + len(vtable_hits)
+        if indirect_total and shown < limit:
+            lines.append(
+                f"### Indirect call candidates ({indirect_total})"
+            )
+            lines.append(
+                "_Inferred from static MOV/LEA loads and `.rdata`/`.data` "
+                "vtable scans. Run `find_vtables` to populate or refresh "
+                "the vtable hit list._"
+            )
+            for x in indirect_xrefs:
+                if shown >= limit:
+                    break
+                operand = x.get("operand") or ""
+                operand_text = f", operand: `{operand}`" if operand else ""
+                call_site = x.get("call_site") or ""
+                site_text = (
+                    f" (call site: {call_site}{operand_text})"
+                    if call_site
+                    else ""
+                )
+                lines.append(
+                    f"- {x['from_name']} @ {x['from']}{site_text}  "
+                    f"[{x['type']}]"
+                )
+                shown += 1
+            for vt in vtable_hits:
+                if shown >= limit:
+                    break
+                tag_text = (
+                    f" [{', '.join(vt['tags'])}]" if vt.get("tags") else ""
+                )
+                lines.append(
+                    f"- vtable @ {vt['table_address']} ({vt['section']}) "
+                    f"slot {vt['slot']}{tag_text}  [VTABLE]"
                 )
                 shown += 1
 
@@ -4084,6 +4165,9 @@ def main():
 
     # Register PE structure analysis tools
     register_pe_tools(app, session_manager)
+
+    # Register indirect-call / vtable enumeration tool (Wave 2)
+    register_indirect_call_tools(app, cache, runner)
 
     # Register pseudocode-review + caller-analysis tools
     register_review_tools(app, session_manager, cache, runner, api_patterns)

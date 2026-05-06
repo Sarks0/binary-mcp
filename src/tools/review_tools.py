@@ -176,8 +176,10 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
             if not shown:
                 lines.append("No callers found in this binary.")
                 lines.append(
-                    "Note: indirect calls (vtable/function pointer) are not "
-                    "resolved in the current extraction."
+                    "Note: indirect calls are not represented in the direct "
+                    "call graph. Run `find_vtables` to enumerate "
+                    "function-pointer tables and `get_xrefs(direction=\"to\", "
+                    "...)` for combined direct + indirect candidates."
                 )
             else:
                 for caller in shown:

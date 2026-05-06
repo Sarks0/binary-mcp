@@ -82,6 +82,124 @@ def safe_format(fmt_string, *args, **kwargs):
             return "<formatting_error>"
 
 
+def _operand_base_register(inst):
+    """Best-effort: pull the base register name out of an indirect
+    call's primary operand. Handles ``RAX``, ``[RAX]``, ``[RAX+0x10]``,
+    ``qword ptr [RAX+0x18]``, ``[RIP+0x100]``. Returns ``None`` when
+    the operand is a literal address (no register) or unparseable.
+    """
+    try:
+        operand = inst.getDefaultOperandRepresentation(0)
+    except Exception:
+        return None
+    if not operand:
+        return None
+    text = safe_unicode(operand).upper()
+    # Strip size hints: "QWORD PTR ", "DWORD PTR ", "PTR " -- they are
+    # presentation-only and never carry the register we care about.
+    for prefix in (u"QWORD PTR ", u"DWORD PTR ", u"WORD PTR ",
+                   u"BYTE PTR ", u"PTR "):
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+            break
+    inner = text.strip()
+    if inner.startswith(u"["):
+        end = inner.find(u"]")
+        if end < 0:
+            return None
+        inner = inner[1:end]
+    # ``RAX+0x10`` / ``RAX-0x4`` / ``RIP+0x100`` -- take the LHS token.
+    for sep in (u"+", u"-", u"*"):
+        idx = inner.find(sep)
+        if idx >= 0:
+            inner = inner[:idx]
+            break
+    inner = inner.strip()
+    # Reject hex literals masquerading as register names.
+    if not inner or inner.startswith(u"0X") or inner.isdigit():
+        return None
+    # Crude register-name shape check: 2-4 alphanumerics. Accepts
+    # x86/x64 (RAX, EAX, R8D), ARM64 (X0, W0, X29), and exotic regs
+    # without enumerating them.
+    if 1 <= len(inner) <= 4 and inner[0].isalpha():
+        return inner
+    return None
+
+
+def _extract_immediate(operand_text):
+    """Extract a single ``0xHEX`` literal from an operand string when
+    the operand is a direct or memory-indirect immediate. Returns the
+    canonical lowercase ``"0xHEX"`` form or ``None``.
+    """
+    if not operand_text:
+        return None
+    text = safe_unicode(operand_text).strip()
+    # Strip size hints.
+    for prefix in (u"qword ptr ", u"dword ptr ", u"word ptr ",
+                   u"byte ptr ", u"ptr ", u"QWORD PTR ", u"DWORD PTR ",
+                   u"WORD PTR ", u"BYTE PTR ", u"PTR "):
+        if text.startswith(prefix):
+            text = text[len(prefix):].strip()
+            break
+    if text.startswith(u"["):
+        end = text.find(u"]")
+        if end < 0:
+            return None
+        text = text[1:end].strip()
+    # Reject anything that contains operators (would be reg + imm).
+    for op in (u"+", u"-", u"*"):
+        if op in text:
+            return None
+    if text.lower().startswith(u"0x"):
+        body = text[2:]
+        if body and all(c in u"0123456789abcdefABCDEF" for c in body):
+            return u"0x" + body.lower()
+    return None
+
+
+def _resolve_loaded_from(inst, listing):
+    """Best-effort static resolver for indirect-call targets.
+
+    Walks back up to 5 instructions looking for a ``MOV`` or ``LEA``
+    whose destination is the same register the call dereferences and
+    whose source is a literal immediate (e.g. ``MOV RAX,
+    [0x140020000]``). Returns the immediate as a canonical
+    ``"0xHEX"`` string, or ``None`` when the target is not statically
+    determinable -- which is the common case for vtable dispatch
+    (``MOV RAX, [RCX]; CALL [RAX+0x18]``).
+    """
+    base_reg = _operand_base_register(inst)
+    if not base_reg:
+        return None
+    cur = inst
+    for _ in range(5):
+        try:
+            cur = listing.getInstructionBefore(cur.getAddress())
+        except Exception:
+            return None
+        if cur is None:
+            return None
+        try:
+            mn = safe_unicode(cur.getMnemonicString()).upper()
+        except Exception:
+            continue
+        if mn not in (u"MOV", u"LEA"):
+            continue
+        try:
+            dest = safe_unicode(
+                cur.getDefaultOperandRepresentation(0)
+            ).upper()
+            src = safe_unicode(cur.getDefaultOperandRepresentation(1))
+        except Exception:
+            continue
+        if dest != base_reg.upper():
+            continue
+        addr = _extract_immediate(src)
+        if addr:
+            return addr
+    return None
+
+
 def _normalize_addr_for_xref(raw):
     """Normalize an address into the same canonical form server-side
     ``_normalize_xref_addr`` produces (lowercase, no ``0x`` prefix, no
@@ -306,25 +424,54 @@ def _extract_comments(function, listing):
 
 
 def _extract_call_sites(function, listing, function_manager):
-    """Walk a function's body and collect direct-call sites.
+    """Walk a function's body and collect call-site information.
 
-    Returns a list of records with the call-site PC, the resolved
-    callee's entry-point address, the callee's name, and whether the
-    callee resolves to an external import (including thunks-to-external).
-    Indirect calls (no flows) are silently skipped -- those are Wave 2's
-    territory. Cheap enough to run during resume backfill because no
-    decompilation is involved, just instruction iteration.
+    Returns a tuple ``(direct_calls, indirect_calls)``:
+
+    * ``direct_calls`` carries records with the call-site PC, the
+      resolved callee's entry-point address, the callee's name, and
+      whether the callee resolves to an external import (thunks
+      followed). These feed the Wave 1A reverse index.
+    * ``indirect_calls`` covers ``ft.isCall() and ft.isComputed()``
+      sites -- ``CALL [reg+N]``, vtable dispatch, fnptr loads --
+      capturing the call-site PC, the operand expression, and a
+      best-effort static ``loaded_from`` immediate when the prior
+      MOV/LEA is statically resolvable.
+
+    Cheap (no decompile) so it doubles as the resume-mode backfill.
     """
-    sites = []
+    direct = []
+    indirect = []
     body = function.getBody()
     if not body:
-        return sites
+        return direct, indirect
     instr_iter = listing.getInstructions(body, True)
     while instr_iter.hasNext():
         inst = instr_iter.next()
         ft = inst.getFlowType()
         if ft is None or not ft.isCall():
             continue
+
+        # --- Indirect calls (Wave 2) --------------------------------
+        if ft.isComputed():
+            try:
+                operand = safe_unicode(
+                    inst.getDefaultOperandRepresentation(0)
+                )
+            except Exception:
+                try:
+                    operand = safe_unicode(inst.toString())
+                except Exception:
+                    operand = u""
+            loaded_from = _resolve_loaded_from(inst, listing)
+            indirect.append({
+                "call_site": safe_unicode(inst.getAddress()),
+                "operand": operand,
+                "loaded_from": loaded_from,
+            })
+            continue
+
+        # --- Direct calls (Wave 1A) ---------------------------------
         try:
             targets = inst.getFlows()
         except Exception:
@@ -341,7 +488,7 @@ def _extract_call_sites(function, listing, function_manager):
                 # Direct call into code Ghidra didn't tag as a function
                 # (rare; e.g. tail-call into an unrecognised stub).
                 # Record by address so the reverse index still resolves.
-                sites.append({
+                direct.append({
                     "call_site": call_site,
                     "callee_addr": safe_unicode(target_addr),
                     "callee_name": safe_unicode(target_addr),
@@ -360,13 +507,13 @@ def _extract_call_sites(function, listing, function_manager):
                         callee_name = safe_unicode(thunked.getName())
             except Exception:
                 pass
-            sites.append({
+            direct.append({
                 "call_site": call_site,
                 "callee_addr": safe_unicode(target_fn.getEntryPoint()),
                 "callee_name": callee_name,
                 "is_external": is_external,
             })
-    return sites
+    return direct, indirect
 
 
 def _load_resume_manifest(path):
@@ -506,6 +653,7 @@ def extract_comprehensive_analysis():
         context.setdefault("xrefs", {})
         context.setdefault("xrefs_to_function", {})
         context.setdefault("xrefs_to_import", {})
+        context.setdefault("xrefs_to_function_indirect", {})
         context.setdefault("data_types", {"structures": [], "enums": []})
         context.setdefault("skipped_functions", [])
         context["analysis_stats"] = {
@@ -532,6 +680,7 @@ def extract_comprehensive_analysis():
             "xrefs": {},
             "xrefs_to_function": {},
             "xrefs_to_import": {},
+            "xrefs_to_function_indirect": {},
             "data_types": {
                 "structures": [],
                 "enums": []
@@ -706,17 +855,20 @@ def extract_comprehensive_analysis():
                 # function, skip it. Otherwise fall through and re-process so the
                 # missing fields (typically pseudocode) get filled in.
                 if skip_decompile or _existing_has_pseudocode(existing_entry):
-                    # Backfill the call_sites field if missing -- the
-                    # entry was produced by a pre-Wave-1A run that never
-                    # captured per-call-site PCs. Cheap (no decompile),
-                    # keeps the reverse index complete on resume.
-                    if "call_sites" not in existing_entry:
+                    # Backfill call-site data if missing. ``call_sites``
+                    # (Wave 1A) and ``indirect_calls`` (Wave 2) come from
+                    # the same instruction walk, so we always recompute
+                    # them together when either is absent.
+                    if ("call_sites" not in existing_entry
+                            or "indirect_calls" not in existing_entry):
                         try:
-                            existing_entry["call_sites"] = _extract_call_sites(
+                            d_sites, i_sites = _extract_call_sites(
                                 function, listing, function_manager
                             )
                         except Exception:
-                            existing_entry["call_sites"] = []
+                            d_sites, i_sites = [], []
+                        existing_entry["call_sites"] = d_sites
+                        existing_entry["indirect_calls"] = i_sites
                     # Same backfill for Wave 1B's Ghidra-supplied
                     # comments. ``plate_comment`` and ``instruction_comments``
                     # are added together so the absence of either is
@@ -782,6 +934,7 @@ def extract_comprehensive_analysis():
             "local_variables": [],
             "called_functions": [],
             "call_sites": [],
+            "indirect_calls": [],
             "pseudocode": None,
             "basic_blocks": [],
             "jump_tables": [],
@@ -860,15 +1013,16 @@ def extract_comprehensive_analysis():
             print(safe_format("    Warning: Could not extract jump tables for {}: {}",
                               safe_unicode(function.getName()), safe_unicode(e)))
 
-        # Capture direct-call sites with instruction-level precision.
-        # Indirect calls (CALL [reg+N] / vtable / fnptr) yield no flows
-        # and are intentionally skipped -- resolving them is Wave 2's
-        # job. The data feeds the post-loop reverse-index build at the
-        # end of ``extract_comprehensive_analysis``.
+        # Capture call sites with instruction-level precision. Direct
+        # calls feed the Wave 1A reverse index; indirect calls (Wave 2)
+        # carry operand text plus a best-effort ``loaded_from``
+        # resolution from the prior static MOV/LEA.
         try:
-            function_info["call_sites"] = _extract_call_sites(
+            direct_sites, indirect_sites = _extract_call_sites(
                 function, listing, function_manager
             )
+            function_info["call_sites"] = direct_sites
+            function_info["indirect_calls"] = indirect_sites
         except Exception as e:
             print(safe_format("    Warning: Could not extract call sites for {}: {}",
                               safe_unicode(function.getName()), safe_unicode(e)))
@@ -1072,14 +1226,20 @@ def extract_comprehensive_analysis():
 
             context["data_types"]["enums"].append(enum_info)
 
-    # Build reverse-xref indices from the per-function ``call_sites`` lists
+    # Build reverse-xref indices from the per-function call-site lists
     # we captured during the function loop. Inverting in one pass here
     # turns ``get_xrefs(direction="to", ...)`` from an O(n*m) sweep over
-    # every caller's called_functions into an O(1) dict lookup. Indirect
-    # calls aren't represented (they had no resolvable target above) -- the
-    # server-side disclaimer covers that gap.
+    # every caller's called_functions into an O(1) dict lookup.
+    #
+    # ``xrefs_to_function_indirect`` (Wave 2) covers the indirect-call
+    # arm: any indirect call whose ``loaded_from`` immediate was
+    # statically resolvable (typical of fnptr loads from .data /
+    # globals; vtable dispatch usually leaves loaded_from=None) is
+    # surfaced here so ``get_xrefs`` can answer "is this function
+    # reached via a static fnptr load?".
     xrefs_to_function = {}
     xrefs_to_import = {}
+    xrefs_to_function_indirect = {}
     for fn in context["functions"]:
         caller_addr = fn.get("address")
         caller_name = fn.get("name")
@@ -1097,8 +1257,22 @@ def extract_comprehensive_analysis():
                 key = _normalize_addr_for_xref(site.get("callee_addr"))
                 if key:
                     xrefs_to_function.setdefault(key, []).append(record)
+        for ic in fn.get("indirect_calls") or []:
+            loaded = ic.get("loaded_from")
+            if not loaded:
+                continue
+            key = _normalize_addr_for_xref(loaded)
+            if not key:
+                continue
+            xrefs_to_function_indirect.setdefault(key, []).append({
+                "from_func_addr": caller_addr,
+                "from_func_name": caller_name,
+                "from_call_site": ic.get("call_site"),
+                "operand": ic.get("operand"),
+            })
     context["xrefs_to_function"] = xrefs_to_function
     context["xrefs_to_import"] = xrefs_to_import
+    context["xrefs_to_function_indirect"] = xrefs_to_function_indirect
 
     print("[*] Extraction complete!")
     print(safe_format("    Functions: {}", len(context["functions"])))

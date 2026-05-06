@@ -150,6 +150,64 @@ class TestProjectCacheCompression:
         assert not (tmp_path / f"{h}.funcidx.json").exists()
         assert not (tmp_path / f"{h}.meta.json").exists()
 
+    def test_indirect_call_keys_round_trip_through_gzip(self, tmp_path):
+        # Wave 2: indirect_calls + xrefs_to_function_indirect + vtables
+        # are additive cache keys. They must survive the gzip cache
+        # round-trip cleanly (no schema-level rewriting / lossy
+        # serialisation).
+        cache = self._cache(tmp_path)
+        binary = self._make_binary(tmp_path)
+        payload = {
+            "metadata": {"name": "x", "image_base": "0x140000000"},
+            "functions": [
+                {
+                    "address": "0x140001000",
+                    "name": "dispatcher",
+                    "indirect_calls": [
+                        {
+                            "call_site": "0x14000204a",
+                            "operand": "[RAX+0x18]",
+                            "loaded_from": None,
+                        },
+                        {
+                            "call_site": "0x140002080",
+                            "operand": "[0x140030000]",
+                            "loaded_from": "0x140030000",
+                        },
+                    ],
+                },
+            ],
+            "xrefs_to_function_indirect": {
+                "140030000": [
+                    {
+                        "from_func_addr": "0x140001000",
+                        "from_func_name": "dispatcher",
+                        "from_call_site": "0x140002080",
+                        "operand": "[0x140030000]",
+                    },
+                ],
+            },
+            "vtables": [
+                {
+                    "section": ".rdata",
+                    "address": "0x140030000",
+                    "slot_count": 28,
+                    "stride": 8,
+                    "tags": ["DRIVER_DISPATCH_TABLE"],
+                    "targets": [
+                        {
+                            "slot": 0,
+                            "address": "0x140001000",
+                            "name": "DriverEntry",
+                        },
+                    ],
+                },
+            ],
+        }
+        cache.save_cached(str(binary), payload)
+        loaded = cache.get_cached(str(binary))
+        assert loaded == payload
+
     def test_invalidate_keeps_notes_sidecar(self, tmp_path):
         # Wave 1B: user-supplied notes must survive cache.invalidate so
         # that force_reanalyze / load_pdb don't wipe annotations.

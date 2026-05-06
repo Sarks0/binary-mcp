@@ -105,9 +105,7 @@ SINK_HINTS = re.compile(
 # ---------------------------------------------------------------------------
 
 # Probe-call extractor: ProbeForRead(arg, ...) / ProbeForWrite(arg, ...).
-_PROBE_RE = re.compile(
-    r"\bProbeFor(?:Read|Write)\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)"
-)
+_PROBE_RE = re.compile(r"\bProbeFor(?:Read|Write)\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)")
 
 
 def _kernel_double_fetch(pseudocode: str, statements: list) -> list:
@@ -140,9 +138,7 @@ def _kernel_double_fetch(pseudocode: str, statements: list) -> list:
             rf"[^,]+,\s*&?\s*{arg_re}\s*[,)]"
         )
         # Callee capture: <non-param_local> = func(... arg ,/)) ...
-        callee_capture_re = re.compile(
-            rf"^\s*(?!param_)\w+\s*=\s*\w+\s*\([^)]*\b{arg_re}\s*[,)]"
-        )
+        callee_capture_re = re.compile(rf"^\s*(?!param_)\w+\s*=\s*\w+\s*\([^)]*\b{arg_re}\s*[,)]")
 
         captured = False
         seen_fields: set[str] = set()
@@ -158,14 +154,10 @@ def _kernel_double_fetch(pseudocode: str, statements: list) -> list:
                 field = m.group(1)
                 if field not in seen_fields:
                     seen_fields.add(field)
-                    derefs.append(
-                        {"field": field, "line": statements[idx].start_line}
-                    )
+                    derefs.append({"field": field, "line": statements[idx].start_line})
             if deref_pointer_re.search(text) and "*deref*" not in seen_fields:
                 seen_fields.add("*deref*")
-                derefs.append(
-                    {"field": "*deref*", "line": statements[idx].start_line}
-                )
+                derefs.append({"field": "*deref*", "line": statements[idx].start_line})
 
         if not captured and len(derefs) >= 2:
             findings.append(
@@ -233,91 +225,130 @@ class PseudocodeRules:
 
         raw: list[tuple] = [
             (
-                "CWE120_STRCPY", "CWE-120", "high", 60,
+                "CWE120_STRCPY",
+                "CWE-120",
+                "high",
+                60,
                 "Use of strcpy/strcat without explicit length bounds",
                 "Replace with strncpy_s/strlcpy or equivalent bounded variant.",
                 r"\b(strcpy|strcat|wcscpy|wcscat|lstrcpy[AW]?|lstrcat[AW]?)\s*\(",
                 None,
             ),
             (
-                "CWE120_SPRINTF_UNBOUNDED", "CWE-120", "high", 55,
+                "CWE120_SPRINTF_UNBOUNDED",
+                "CWE-120",
+                "high",
+                55,
                 "sprintf/wsprintf without length cap -- caller trusts format output size",
                 "Use snprintf/_snprintf_s with an explicit destination size.",
                 r"\b(sprintf|vsprintf|wsprintf[AW]?)\s*\(",
                 None,
             ),
             (
-                "CWE120_GETS", "CWE-120", "critical", 95,
+                "CWE120_GETS",
+                "CWE-120",
+                "critical",
+                95,
                 "gets() always reads unbounded input",
                 "Replace with fgets() or getline().",
                 r"\bgets\s*\(",
                 None,
             ),
             (
-                "CWE120_MEMCPY_SIGNED_LEN", "CWE-120", "medium", 50,
+                "CWE120_MEMCPY_SIGNED_LEN",
+                "CWE-120",
+                "medium",
+                50,
                 "memcpy/memmove with a signed/int-typed length -- possible negative-to-size_t wrap",
                 "Cast/validate length as size_t and bound-check against destination size.",
                 r"\b(memcpy|memmove|RtlCopyMemory)\s*\([^,]+,[^,]+,\s*\(?\s*(int|short|char|long)\b",
                 None,
             ),
             (
-                "CWE134_FORMAT_STRING", "CWE-134", "high", 65,
+                "CWE134_FORMAT_STRING",
+                "CWE-134",
+                "high",
+                65,
                 "printf-family call with a non-literal format argument -- classic format-string bug",
                 "Pass a literal format string; route user data through %s arguments.",
                 r"\b(printf|fprintf|vprintf|vfprintf|syslog)\s*\(\s*[a-zA-Z_][a-zA-Z0-9_]*\s*[,)]",
                 None,
             ),
             (
-                "CWE190_MALLOC_ARITHMETIC", "CWE-190", "medium", 40,
+                "CWE190_MALLOC_ARITHMETIC",
+                "CWE-190",
+                "medium",
+                40,
                 "Arithmetic inside malloc/calloc size argument -- potential integer overflow before allocation",
                 "Validate both operands against SIZE_MAX / desired bound before multiplying.",
                 r"\b(malloc|calloc|HeapAlloc|VirtualAlloc)\s*\([^)]*[*+][^)]*\)",
                 None,
             ),
             (
-                "CWE367_TOCTOU_ACCESS_OPEN", "CWE-367", "medium", 55,
+                "CWE367_TOCTOU_ACCESS_OPEN",
+                "CWE-367",
+                "medium",
+                55,
                 "access/stat followed by open -- time-of-check to time-of-use race",
                 "Open-then-check (fstat on the fd) instead of check-then-open.",
                 r"\b(access|stat|lstat)\s*\([^;]{1,200};[^;]{0,400}\b(open|fopen|CreateFile[AW]?)\s*\(",
                 None,
             ),
             (
-                "CWE415_DOUBLE_FREE", "CWE-415", "high", 70,
+                "CWE415_DOUBLE_FREE",
+                "CWE-415",
+                "high",
+                70,
                 "Same pointer freed twice in the visible window -- likely double-free",
                 "NULL the pointer immediately after free; add ownership discipline.",
                 r"\bfree\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)[^;]*;(?:[^;]{0,400};)?\s*free\s*\(\s*\1\s*\)",
                 None,
             ),
             (
-                "CWE476_NULL_DEREF_POST_MALLOC", "CWE-476", "medium", 50,
+                "CWE476_NULL_DEREF_POST_MALLOC",
+                "CWE-476",
+                "medium",
+                50,
                 "Pointer dereference immediately after malloc without a NULL check",
                 "Check the returned pointer against NULL before use.",
                 r"=\s*(malloc|calloc|realloc)\s*\([^;]{1,200};\s*\*",
                 None,
             ),
             (
-                "CWE78_COMMAND_INJECTION", "CWE-78", "critical", 75,
+                "CWE78_COMMAND_INJECTION",
+                "CWE-78",
+                "critical",
+                75,
                 "system/popen/exec/ShellExecute with non-literal command argument",
                 "Use execve with argv array; never pass concatenated user data to a shell.",
                 r"\b(system|popen|WinExec|ShellExecute[AW]?|_?execl[pe]?|_?execv[pe]?)\s*\(\s*[a-zA-Z_][a-zA-Z0-9_]*\s*[,)]",
                 None,
             ),
             (
-                "CWE78_CREATEPROCESS_NONLITERAL", "CWE-78", "high", 55,
+                "CWE78_CREATEPROCESS_NONLITERAL",
+                "CWE-78",
+                "high",
+                55,
                 "CreateProcess with non-literal command line -- suspect if command data is attacker-influenced",
                 "Pass a fully-qualified application name; audit command-line construction.",
                 r"\bCreateProcess[AW]?\s*\([^)]*,[^,]*[a-zA-Z_][a-zA-Z0-9_]*\s*,",
                 None,
             ),
             (
-                "CWE131_SIZEOF_TIMES_COUNT", "CWE-131", "low", 35,
+                "CWE131_SIZEOF_TIMES_COUNT",
+                "CWE-131",
+                "low",
+                35,
                 "Allocation of sizeof(T)*N -- verify N is bounded (overflow check missing)",
                 "Bound-check N against SIZE_MAX/sizeof(T).",
                 r"\b(malloc|calloc|HeapAlloc)\s*\([^)]*sizeof\s*\([^)]+\)\s*\*\s*[A-Za-z_][A-Za-z0-9_]*",
                 None,
             ),
             (
-                "CWE798_HARDCODED_PASSWORD", "CWE-798", "medium", 30,
+                "CWE798_HARDCODED_PASSWORD",
+                "CWE-798",
+                "medium",
+                30,
                 "String literal resembling a password/secret hardcoded in decompilation -- "
                 "this rule is noisy by design; corroborate before reporting",
                 "Load secrets from configuration/secret store, never embed in code.",
@@ -327,49 +358,70 @@ class PseudocodeRules:
                 regex_meta,
             ),
             (
-                "CWE798_AWS_ACCESS_KEY", "CWE-798", "critical", 90,
+                "CWE798_AWS_ACCESS_KEY",
+                "CWE-798",
+                "critical",
+                90,
                 "AWS access-key-shaped literal -- AKIA + 16 base32 characters",
                 "Rotate immediately; load credentials from IAM role / env / SSO.",
                 r'"AKIA[0-9A-Z]{16}"',
                 None,
             ),
             (
-                "CWE798_GITHUB_TOKEN", "CWE-798", "critical", 90,
+                "CWE798_GITHUB_TOKEN",
+                "CWE-798",
+                "critical",
+                90,
                 "GitHub-style PAT/OAuth token literal (ghp_/gho_/ghs_/ghu_)",
                 "Rotate the token via GitHub UI; never commit PATs to artifacts.",
                 r'"gh[opsu]_[A-Za-z0-9]{36,}"',
                 None,
             ),
             (
-                "CWE798_STRIPE_SECRET", "CWE-798", "critical", 90,
+                "CWE798_STRIPE_SECRET",
+                "CWE-798",
+                "critical",
+                90,
                 "Stripe live secret key literal (sk_live_)",
                 "Rotate via the Stripe dashboard; load from secret store.",
                 r'"sk_live_[A-Za-z0-9]{20,}"',
                 None,
             ),
             (
-                "CWE798_JWT_TOKEN", "CWE-798", "high", 80,
+                "CWE798_JWT_TOKEN",
+                "CWE-798",
+                "high",
+                80,
                 "JWT-shaped literal -- header.payload.signature with eyJ prefix",
                 "If genuine, rotate the signing key; do not embed bearer tokens in binaries.",
                 r'"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{6,}"',
                 None,
             ),
             (
-                "CWE121_STACK_COPY_NO_BOUNDS", "CWE-121", "medium", 50,
+                "CWE121_STACK_COPY_NO_BOUNDS",
+                "CWE-121",
+                "medium",
+                50,
                 "Stack-buffer copy without visible bound check (strncpy/memcpy of stack array)",
                 "Ensure source length ≤ destination size; prefer safer wrappers.",
                 r"\b(strncpy|memcpy|RtlCopyMemory)\s*\(\s*(local_|auStack|acStack|l?u?Stack)",
                 None,
             ),
             (
-                "CWE676_DANGEROUS_FN", "CWE-676", "low", 30,
+                "CWE676_DANGEROUS_FN",
+                "CWE-676",
+                "low",
+                30,
                 "Use of historically dangerous function family",
                 "Audit usage; prefer safer library equivalents where available.",
                 r"\b(scanf|sscanf|fscanf|alloca|_alloca|tmpnam|mktemp)\s*\(",
                 None,
             ),
             (
-                "CWE416_USE_AFTER_FREE", "CWE-416", "high", 65,
+                "CWE416_USE_AFTER_FREE",
+                "CWE-416",
+                "high",
+                65,
                 "Pointer used after free in the visible window",
                 "NULL the pointer at free; restructure ownership so freed memory is unreachable.",
                 r"\bfree\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)[^;]*;(?:[^;]{0,400};){0,4}"
@@ -377,7 +429,10 @@ class PseudocodeRules:
                 None,
             ),
             (
-                "CWE805_MEMCPY_HEADER_DRIVEN_LEN", "CWE-805", "high", 70,
+                "CWE805_MEMCPY_HEADER_DRIVEN_LEN",
+                "CWE-805",
+                "high",
+                70,
                 "memcpy/memmove length comes from a struct field or pointer deref -- "
                 "classic 'attacker-controlled size from packet' shape",
                 "Validate the size against the destination capacity AND the remaining input "
@@ -389,7 +444,10 @@ class PseudocodeRules:
                 None,
             ),
             (
-                "CWE190_HEADER_LEN_TO_ALLOC", "CWE-190", "high", 70,
+                "CWE190_HEADER_LEN_TO_ALLOC",
+                "CWE-190",
+                "high",
+                70,
                 "Allocation size derived from a struct/deref field with arithmetic -- "
                 "header-length integer overflow before alloc",
                 "Range-check the length field BEFORE arithmetic; reject sizes that would overflow size_t.",
@@ -400,7 +458,10 @@ class PseudocodeRules:
                 None,
             ),
             (
-                "CWE401_REALLOC_SHADOW", "CWE-401", "medium", 60,
+                "CWE401_REALLOC_SHADOW",
+                "CWE-401",
+                "medium",
+                60,
                 "realloc result assigned back to the same pointer -- on failure the original "
                 "pointer is leaked and may also be left dangling",
                 "Use a temporary: tmp = realloc(p, n); if (tmp) p = tmp; else handle_failure().",
@@ -408,14 +469,20 @@ class PseudocodeRules:
                 None,
             ),
             (
-                "CWE242_ALLOCA_VARIABLE", "CWE-242", "high", 60,
+                "CWE242_ALLOCA_VARIABLE",
+                "CWE-242",
+                "high",
+                60,
                 "Variable-size _alloca/alloca -- attacker-sized stack growth enables stack pivots and exhaustion",
                 "Replace with malloc + free, or cap the size with a hard-coded ceiling.",
                 r"\b_?alloca\s*\(\s*[A-Za-z_][A-Za-z0-9_]*\s*\)",
                 None,
             ),
             (
-                "CWE242_VIRTUALALLOC_RWX", "CWE-242", "high", 80,
+                "CWE242_VIRTUALALLOC_RWX",
+                "CWE-242",
+                "high",
+                80,
                 "Memory page allocated with PAGE_EXECUTE_READWRITE -- RWX is a strong code-injection signal",
                 "Allocate RW, then VirtualProtect to RX. Avoid RWX outside JIT engines.",
                 r"\b(VirtualAlloc(?:Ex)?|NtAllocateVirtualMemory|VirtualProtect(?:Ex)?)\s*\("
@@ -423,7 +490,10 @@ class PseudocodeRules:
                 None,
             ),
             (
-                "CWE193_NULL_TERM_OFF_BY_ONE", "CWE-193", "medium", 50,
+                "CWE193_NULL_TERM_OFF_BY_ONE",
+                "CWE-193",
+                "medium",
+                50,
                 "Null terminator written at index equal to a length variable -- classic off-by-one if buffer was sized exactly len",
                 "Allocate len+1 bytes, or write the terminator at len-1 after a bounded copy.",
                 r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\[\s*([A-Za-z_][A-Za-z0-9_]*(?:_len|len|Length|size|Size))\s*\]"
@@ -431,14 +501,20 @@ class PseudocodeRules:
                 None,
             ),
             (
-                "CWE822_DEREF_USER_OFFSET", "CWE-822", "medium", 35,
+                "CWE822_DEREF_USER_OFFSET",
+                "CWE-822",
+                "medium",
+                35,
                 "Pointer arithmetic with a non-constant offset followed by deref -- bounds may not be enforced",
                 "Verify the offset is within the buffer length before dereferencing.",
                 r"\*\s*\(\s*[A-Za-z_][A-Za-z0-9_]*\s*\+\s*[A-Za-z_][A-Za-z0-9_]*\s*\)",
                 None,
             ),
             (
-                "CWE125_STRLEN_UNTRUSTED_PTR", "CWE-125", "low", 40,
+                "CWE125_STRLEN_UNTRUSTED_PTR",
+                "CWE-125",
+                "low",
+                40,
                 "strlen on a pointer derived from input -- if the buffer isn't NUL-terminated this is an OOB read",
                 "Use strnlen with the known buffer length; never trust input to be terminated.",
                 r"\bstrlen\s*\(\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*->\s*|\*\s*)",
@@ -457,10 +533,7 @@ class PseudocodeRules:
                     description=desc,
                     recommendation=rec,
                     pattern=re.compile(regex, re.MULTILINE | re.DOTALL),
-                    negative_pattern=(
-                        re.compile(neg, re.MULTILINE | re.DOTALL)
-                        if neg else None
-                    ),
+                    negative_pattern=(re.compile(neg, re.MULTILINE | re.DOTALL) if neg else None),
                 )
             )
 

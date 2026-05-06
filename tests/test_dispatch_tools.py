@@ -9,6 +9,22 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _restore_module_globals():
+    """Restore monkey-patched ``BinaryReader`` after every test so
+    unrelated test files (e.g. ``test_search_bytes``) don't inherit the
+    fake reader."""
+    import src.utils.binary_reader as br
+
+    orig_reader = br.BinaryReader
+    try:
+        yield
+    finally:
+        br.BinaryReader = orig_reader
+
 
 def _make_function(
     name="DriverDispatch",

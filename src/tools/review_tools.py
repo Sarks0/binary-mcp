@@ -94,13 +94,7 @@ def _load_context(binary_path: str, cache, runner):
         return cached, bp
 
     output_path = cache.cache_dir / f"temp_analysis_{Path(bp).stem}.json"
-    script_path = (
-        Path(__file__).parent.parent
-        / "engines"
-        / "static"
-        / "ghidra"
-        / "scripts"
-    )
+    script_path = Path(__file__).parent.parent / "engines" / "static" / "ghidra" / "scripts"
     timeout = get_config_int("GHIDRA_TIMEOUT", 1800)
     timeout = validate_numeric_range(timeout, 30, 3600, "GHIDRA_TIMEOUT")
 
@@ -138,9 +132,7 @@ _IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 # A simple `lhs = rhs` matcher that accepts an identifier or a small dotted
 # chain on the LHS (``foo``, ``foo.bar``); rejects ``*p =`` and ``p->x =``
 # so we don't fool ourselves into thinking we modeled aliasing.
-_ASSIGN_RE = re.compile(
-    r"^\s*([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\s*=\s*(.+)$"
-)
+_ASSIGN_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\s*=\s*(.+)$")
 
 # Pointer/field-indirection markers that demote chain confidence to
 # ``indirect`` (the consumer should treat such chains as advisory only).
@@ -328,21 +320,21 @@ def _collect_param_sink_findings(
                     continue
                 seen.add(key)
 
-                chain = _walk_back_chain(
-                    anchor, tainted, statements, _PARAM_SINK_MAX_CHAIN
-                )
+                chain = _walk_back_chain(anchor, tainted, statements, _PARAM_SINK_MAX_CHAIN)
                 if chain is None:
                     # Chain longer than the depth budget — drop per brief.
                     continue
 
-                findings.append({
-                    "sink": sink_name,
-                    "sink_line": stmt.start_line,
-                    "arg_index": arg_idx,
-                    "taint_chain": chain,
-                    "parameter_root": root,
-                    "confidence": _chain_confidence(chain, arg),
-                })
+                findings.append(
+                    {
+                        "sink": sink_name,
+                        "sink_line": stmt.start_line,
+                        "arg_index": arg_idx,
+                        "taint_chain": chain,
+                        "parameter_root": root,
+                        "confidence": _chain_confidence(chain, arg),
+                    }
+                )
 
     findings.sort(key=lambda f: (f["sink_line"], f["arg_index"]))
     return findings
@@ -411,14 +403,12 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
                 lines.append(
                     "Note: indirect calls are not represented in the direct "
                     "call graph. Run `find_vtables` to enumerate "
-                    "function-pointer tables and `get_xrefs(direction=\"to\", "
+                    'function-pointer tables and `get_xrefs(direction="to", '
                     "...)` for combined direct + indirect candidates."
                 )
             else:
                 for caller in shown:
-                    lines.append(
-                        f"- {caller.get('name')} @ {caller.get('address')}"
-                    )
+                    lines.append(f"- {caller.get('name')} @ {caller.get('address')}")
             return "\n".join(lines)
 
         except (PathTraversalError, FileSizeError, FileNotFoundError) as e:
@@ -480,23 +470,17 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
 
             limit = validate_numeric_range(limit, 1, 5000, "limit")
             offset = validate_numeric_range(offset, 0, 1_000_000, "offset")
-            confidence_floor = validate_numeric_range(
-                confidence_floor, 0, 100, "confidence_floor"
-            )
+            confidence_floor = validate_numeric_range(confidence_floor, 0, 100, "confidence_floor")
             mode = mode.lower()
             if mode not in ("findings", "summary"):
-                return (
-                    f"Invalid mode '{mode}'. Use 'findings' or 'summary'."
-                )
+                return f"Invalid mode '{mode}'. Use 'findings' or 'summary'."
 
             context, _ = _load_context(binary_path, cache, runner)
 
             # scan_pseudocode is meaningless on a shallow/structural cache:
             # there is no decompiled text to match rules against. Surface
             # this explicitly instead of silently scanning zero functions.
-            cached_depth = (
-                context.get("metadata", {}).get("analysis_depth", "full")
-            )
+            cached_depth = context.get("metadata", {}).get("analysis_depth", "full")
             if cached_depth in ("shallow", "structural"):
                 return (
                     f"scan_pseudocode requires a full Ghidra cache, but the "
@@ -510,9 +494,7 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
             functions = context.get("functions", [])
 
             pattern = _re.compile(function_filter) if function_filter else None
-            rules = _RULES.filter(
-                severity_floor=severity_floor, rule_ids=rule_ids
-            )
+            rules = _RULES.filter(severity_floor=severity_floor, rule_ids=rule_ids)
             if exclude_rule_ids:
                 excluded = set(exclude_rule_ids)
                 rules = [r for r in rules if r.id not in excluded]
@@ -524,9 +506,7 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
                 )
 
             severity_order = {
-                s: i for i, s in enumerate(
-                    ("info", "low", "medium", "high", "critical")
-                )
+                s: i for i, s in enumerate(("info", "low", "medium", "high", "critical"))
             }
 
             per_func: dict[str, dict] = {}
@@ -557,14 +537,17 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
                 if not kept:
                     continue
 
-                bucket = per_func.setdefault(fname, {
-                    "name": fname,
-                    "address": faddr,
-                    "by_severity": {},
-                    "max_severity_idx": -1,
-                    "max_confidence": 0,
-                    "total": 0,
-                })
+                bucket = per_func.setdefault(
+                    fname,
+                    {
+                        "name": fname,
+                        "address": faddr,
+                        "by_severity": {},
+                        "max_severity_idx": -1,
+                        "max_confidence": 0,
+                        "total": 0,
+                    },
+                )
                 for finding in kept:
                     all_findings.append(finding)
                     sev = finding["severity"]
@@ -609,7 +592,7 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
                         r["name"],
                     ),
                 )
-                page = summary_rows[offset:offset + limit]
+                page = summary_rows[offset : offset + limit]
                 header = (
                     f"**Pseudocode scan SUMMARY: {total_findings} finding(s) "
                     f"across {total_funcs_with_findings} function(s) "
@@ -618,8 +601,7 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
                 meta = f"Rules: {len(rules)} | Severity floor: {severity_floor}"
                 if confidence_floor > 0:
                     meta += (
-                        f" | Confidence floor: {confidence_floor} "
-                        f"(dropped {dropped_by_confidence})"
+                        f" | Confidence floor: {confidence_floor} (dropped {dropped_by_confidence})"
                     )
                 lines = [header, meta, ""]
                 if not page:
@@ -651,7 +633,7 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
                     )
                 return "\n".join(lines)
 
-            page = all_findings[offset:offset + limit]
+            page = all_findings[offset : offset + limit]
             header = (
                 f"**Pseudocode scan: {total_findings} finding(s) "
                 f"across {total_funcs_with_findings} function(s) "
@@ -659,15 +641,11 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
             )
             meta = f"Rules: {len(rules)} | Severity floor: {severity_floor}"
             if confidence_floor > 0:
-                meta += (
-                    f" | Confidence floor: {confidence_floor} "
-                    f"(dropped {dropped_by_confidence})"
-                )
+                meta += f" | Confidence floor: {confidence_floor} (dropped {dropped_by_confidence})"
             lines = [header, meta, ""]
             if not page:
                 lines.append(
-                    f"Offset {offset} is beyond the result set "
-                    f"({total_findings} findings)."
+                    f"Offset {offset} is beyond the result set ({total_findings} findings)."
                 )
                 return "\n".join(lines)
 
@@ -736,9 +714,7 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
             jump_tables = target.get("jump_tables") or []
 
             caller_index = _build_caller_index(functions)
-            callers = caller_index.get(
-                _normalize_addr(target.get("address")), []
-            )
+            callers = caller_index.get(_normalize_addr(target.get("address")), [])
 
             # APIs actually referenced in pseudocode
             import_names: set[str] = set()
@@ -769,16 +745,16 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
                 for s in context.get("strings", []):
                     for xref in s.get("xrefs") or []:
                         try:
-                            xa = int(
-                                str(xref.get("from", "")).replace("0x", ""), 16
-                            )
+                            xa = int(str(xref.get("from", "")).replace("0x", ""), 16)
                         except ValueError:
                             continue
                         if any(a <= xa <= b for a, b in func_ranges):
-                            strings_referenced.append({
-                                "address": s.get("address"),
-                                "value": (s.get("value") or "")[:120],
-                            })
+                            strings_referenced.append(
+                                {
+                                    "address": s.get("address"),
+                                    "value": (s.get("value") or "")[:120],
+                                }
+                            )
                             break
 
             # Rule findings for this function only
@@ -846,9 +822,7 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
                 for s in strings_referenced[:25]:
                     lines.append(f"- `{s['value']}` @ {s['address']}")
                 if len(strings_referenced) > 25:
-                    lines.append(
-                        f"  … and {len(strings_referenced) - 25} more"
-                    )
+                    lines.append(f"  … and {len(strings_referenced) - 25} more")
             else:
                 lines.append("(none)")
 
@@ -857,10 +831,7 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
                 lines.append("## Jump tables")
                 for jt in jump_tables:
                     targets = jt.get("targets") or []
-                    lines.append(
-                        f"- switch @ {jt.get('source_addr')} → "
-                        f"{len(targets)} cases"
-                    )
+                    lines.append(f"- switch @ {jt.get('source_addr')} → {len(targets)} cases")
 
             lines.append("")
             lines.append("## Pseudocode rule findings")
@@ -1032,9 +1003,7 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
 
             statements = _split_statements(pseudo)
             tainted = _build_taint_aliases(statements, param_names)
-            findings = _collect_param_sink_findings(
-                statements, tainted, param_names
-            )
+            findings = _collect_param_sink_findings(statements, tainted, param_names)
 
             lines = [
                 f"### Param-sink chains for {target.get('name')} @ {target.get('address')}",
@@ -1061,9 +1030,7 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
                     f"confidence={f['confidence']}]"
                 )
                 for step in f["taint_chain"]:
-                    lines.append(
-                        f"    L{step['line']}: {step['text']}"
-                    )
+                    lines.append(f"    L{step['line']}: {step['text']}")
                 lines.append("")
 
             return "\n".join(lines)

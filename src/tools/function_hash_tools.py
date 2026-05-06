@@ -345,10 +345,7 @@ def register_function_hash_tools(app, session_manager, cache, runner):
 
             cached = cache.get_cached(binary_path)
             if not cached:
-                return (
-                    "Error: Binary has not been analyzed yet. "
-                    "Run analyze_binary first."
-                )
+                return "Error: Binary has not been analyzed yet. Run analyze_binary first."
 
             functions = cached.get("functions", [])
             func = _lookup_function(functions, function_name_or_address)
@@ -356,7 +353,8 @@ def register_function_hash_tools(app, session_manager, cache, runner):
             if not func:
                 # Try fuzzy name match for helpful suggestions
                 matches = [
-                    f for f in functions
+                    f
+                    for f in functions
                     if function_name_or_address.lower() in f.get("name", "").lower()
                 ]
                 if matches:
@@ -449,10 +447,7 @@ def register_function_hash_tools(app, session_manager, cache, runner):
 
             cached = cache.get_cached(binary_path)
             if not cached:
-                return (
-                    "Error: Binary has not been analyzed yet. "
-                    "Run analyze_binary first."
-                )
+                return "Error: Binary has not been analyzed yet. Run analyze_binary first."
 
             all_functions = cached.get("functions", [])
 
@@ -551,17 +546,15 @@ def register_function_hash_tools(app, session_manager, cache, runner):
 
             cached = cache.get_cached(binary_path)
             if not cached:
-                return (
-                    "Error: Binary has not been analyzed yet. "
-                    "Run analyze_binary first."
-                )
+                return "Error: Binary has not been analyzed yet. Run analyze_binary first."
 
             all_functions = cached.get("functions", [])
             func = _lookup_function(all_functions, function_name_or_address)
 
             if not func:
                 matches = [
-                    f for f in all_functions
+                    f
+                    for f in all_functions
                     if function_name_or_address.lower() in f.get("name", "").lower()
                 ]
                 if matches:
@@ -599,9 +592,7 @@ def register_function_hash_tools(app, session_manager, cache, runner):
                 breakdown.append("[ +0] No pseudocode available")
                 status = func.get("decompile_status", "unknown")
                 if status in ("timeout", "thread_timeout", "internal_timeout"):
-                    suggestions.append(
-                        "Decompilation timed out - function may have anti-analysis"
-                    )
+                    suggestions.append("Decompilation timed out - function may have anti-analysis")
                 else:
                     suggestions.append("Try re-analyzing with longer timeout")
 
@@ -609,9 +600,9 @@ def register_function_hash_tools(app, session_manager, cache, runner):
             params = func.get("parameters", [])
             if params:
                 typed_params = [
-                    p for p in params
-                    if p.get("datatype")
-                    and "undefined" not in p.get("datatype", "").lower()
+                    p
+                    for p in params
+                    if p.get("datatype") and "undefined" not in p.get("datatype", "").lower()
                 ]
                 if len(typed_params) == len(params):
                     score += 15
@@ -620,8 +611,7 @@ def register_function_hash_tools(app, session_manager, cache, runner):
                     partial = int(15 * len(typed_params) / len(params))
                     score += partial
                     breakdown.append(
-                        f"[+{partial:2d}] {len(typed_params)}/{len(params)} "
-                        f"parameters have types"
+                        f"[+{partial:2d}] {len(typed_params)}/{len(params)} parameters have types"
                     )
                     suggestions.append("Set types for remaining undefined parameters")
                 else:
@@ -641,14 +631,12 @@ def register_function_hash_tools(app, session_manager, cache, runner):
                     r"pcVar[0-9]+|puVar[0-9]+|in_[A-Z]+|Stack.*|param_[0-9]+)$"
                 )
                 named_vars = [
-                    v for v in local_vars
-                    if v.get("name") and not auto_var_pattern.match(v["name"])
+                    v for v in local_vars if v.get("name") and not auto_var_pattern.match(v["name"])
                 ]
                 if len(named_vars) >= len(local_vars) * 0.5 and local_vars:
                     score += 10
                     breakdown.append(
-                        f"[+10] {len(named_vars)}/{len(local_vars)} "
-                        f"variables have meaningful names"
+                        f"[+10] {len(named_vars)}/{len(local_vars)} variables have meaningful names"
                     )
                 elif named_vars:
                     partial = int(10 * len(named_vars) / len(local_vars))
@@ -686,7 +674,9 @@ def register_function_hash_tools(app, session_manager, cache, runner):
             else:
                 breakdown.append("[ +0] No callers found (orphaned or entry point)")
                 if name not in ("main", "entry", "_start", "DllMain", "WinMain"):
-                    suggestions.append("Function appears unreferenced - may be dead code or indirect call target")
+                    suggestions.append(
+                        "Function appears unreferenced - may be dead code or indirect call target"
+                    )
 
             # 6. Has callees (+5)
             called_functions = func.get("called_functions", [])
@@ -703,7 +693,9 @@ def register_function_hash_tools(app, session_manager, cache, runner):
                 score += 5
                 breakdown.append(f"[ +5] Reasonable size ({total_addresses} addresses)")
             elif total_addresses <= 4:
-                breakdown.append(f"[ +0] Very small ({total_addresses} addresses) - may be thunk/stub")
+                breakdown.append(
+                    f"[ +0] Very small ({total_addresses} addresses) - may be thunk/stub"
+                )
                 suggestions.append("Very small function - may be a thunk or wrapper")
             else:
                 breakdown.append(f"[ +0] Very large ({total_addresses} addresses)")
@@ -828,14 +820,14 @@ def register_function_hash_tools(app, session_manager, cache, runner):
                 )
 
             funcs_a = [
-                f for f in cached_a.get("functions", [])
-                if not f.get("is_thunk") and not f.get("is_external")
-                and f.get("basic_blocks")
+                f
+                for f in cached_a.get("functions", [])
+                if not f.get("is_thunk") and not f.get("is_external") and f.get("basic_blocks")
             ]
             funcs_b = [
-                f for f in cached_b.get("functions", [])
-                if not f.get("is_thunk") and not f.get("is_external")
-                and f.get("basic_blocks")
+                f
+                for f in cached_b.get("functions", [])
+                if not f.get("is_thunk") and not f.get("is_external") and f.get("basic_blocks")
             ]
 
             if not funcs_a:
@@ -913,12 +905,8 @@ def register_function_hash_tools(app, session_manager, cache, runner):
 
             # Fuzzy matching for remaining functions -- use bisect for size windowing
             fuzzy_matches = []
-            remaining_a = {
-                n: v for n, v in hashes_a.items() if n not in matched_a_names
-            }
-            remaining_b = {
-                n: v for n, v in hashes_b.items() if n not in matched_b_names
-            }
+            remaining_a = {n: v for n, v in hashes_a.items() if n not in matched_a_names}
+            remaining_b = {n: v for n, v in hashes_b.items() if n not in matched_b_names}
 
             # Sort remaining_b by instruction count for binary search windowing
             sorted_b = sorted(
@@ -992,7 +980,9 @@ def register_function_hash_tools(app, session_manager, cache, runner):
             output.append("CROSS-BINARY FUNCTION MATCHING")
             output.append("=" * 60)
             output.append(f"Source: {Path(binary_path).name} ({len(hashes_a)} hashable functions)")
-            output.append(f"Target: {Path(target_binary_path).name} ({len(hashes_b)} hashable functions)")
+            output.append(
+                f"Target: {Path(target_binary_path).name} ({len(hashes_b)} hashable functions)"
+            )
             output.append(f"Threshold: {threshold:.0%}")
             output.append("")
 
@@ -1011,17 +1001,16 @@ def register_function_hash_tools(app, session_manager, cache, runner):
                 for name_a, name_b, score in fuzzy_matches:
                     addr_a = hashes_a[name_a]["func"].get("address", "?")
                     addr_b = hashes_b[name_b]["func"].get("address", "?")
-                    output.append(
-                        f"  {name_a} ({addr_a})  <->  {name_b} ({addr_b})  "
-                        f"[{score:.0%}]"
-                    )
+                    output.append(f"  {name_a} ({addr_a})  <->  {name_b} ({addr_b})  [{score:.0%}]")
                 output.append("")
 
             total = len(exact_matches) + len(fuzzy_matches)
             if total == 0:
                 output.append("No matching functions found above threshold.")
             else:
-                output.append(f"Total: {total} matches ({len(exact_matches)} exact, {len(fuzzy_matches)} fuzzy)")
+                output.append(
+                    f"Total: {total} matches ({len(exact_matches)} exact, {len(fuzzy_matches)} fuzzy)"
+                )
 
             return "\n".join(output)
 
@@ -1092,29 +1081,20 @@ def register_function_hash_tools(app, session_manager, cache, runner):
 
             cached = cache.get_cached(binary_path)
             if not cached:
-                return (
-                    "Error: Binary has not been analyzed yet. "
-                    "Run analyze_binary first."
-                )
+                return "Error: Binary has not been analyzed yet. Run analyze_binary first."
 
             funcs = [
-                f for f in cached.get("functions", [])
-                if not f.get("is_thunk") and not f.get("is_external")
-                and f.get("basic_blocks")
+                f
+                for f in cached.get("functions", [])
+                if not f.get("is_thunk") and not f.get("is_external") and f.get("basic_blocks")
             ]
 
             if not funcs:
-                return (
-                    f"Error: No hashable functions found in "
-                    f"{Path(binary_path).name}"
-                )
+                return f"Error: No hashable functions found in {Path(binary_path).name}"
 
             mode = _get_capstone_mode(binary_path)
             if mode is None:
-                return (
-                    f"Error: Unsupported architecture for "
-                    f"{Path(binary_path).name}"
-                )
+                return f"Error: Unsupported architecture for {Path(binary_path).name}"
             cs_arch, cs_mode = mode
 
             from src.utils.binary_reader import BinaryReader
@@ -1122,26 +1102,21 @@ def register_function_hash_tools(app, session_manager, cache, runner):
             hashed: list[dict] = []
             with BinaryReader(binary_path) as reader:
                 for func in funcs:
-                    result = _compute_function_hash(
-                        reader, cs_arch, cs_mode, func
-                    )
+                    result = _compute_function_hash(reader, cs_arch, cs_mode, func)
                     if result is None:
                         continue
-                    hashed.append({
-                        "hash": result["hash"],
-                        "instruction_count": result["instruction_count"],
-                        "func": func,
-                    })
+                    hashed.append(
+                        {
+                            "hash": result["hash"],
+                            "instruction_count": result["instruction_count"],
+                            "func": func,
+                        }
+                    )
 
             if not hashed:
-                return (
-                    f"Error: Could not hash any functions in "
-                    f"{Path(binary_path).name}"
-                )
+                return f"Error: Could not hash any functions in {Path(binary_path).name}"
 
-            clusters = _cluster_functions_by_hash(
-                hashed, min_cluster_size, min_instructions
-            )
+            clusters = _cluster_functions_by_hash(hashed, min_cluster_size, min_instructions)
 
             output = []
             output.append("=" * 60)
@@ -1153,10 +1128,7 @@ def register_function_hash_tools(app, session_manager, cache, runner):
             output.append(f"min_cluster_size:   {min_cluster_size}")
             output.append(f"min_instructions:   {min_instructions}")
             total_members = sum(c["cluster_size"] for c in clusters)
-            output.append(
-                f"Clusters found:     {len(clusters)} "
-                f"({total_members} total members)"
-            )
+            output.append(f"Clusters found:     {len(clusters)} ({total_members} total members)")
             output.append("")
 
             if not clusters:
@@ -1178,9 +1150,7 @@ def register_function_hash_tools(app, session_manager, cache, runner):
                 output.append("")
                 output.append("Members:")
                 for member in cluster["members"]:
-                    output.append(
-                        f"  {member['address']}  {member['name']}"
-                    )
+                    output.append(f"  {member['address']}  {member['name']}")
                 output.append("")
                 if cluster["called_apis"]:
                     output.append(
@@ -1193,14 +1163,11 @@ def register_function_hash_tools(app, session_manager, cache, runner):
                 pseudocode = cluster["representative_pseudocode"]
                 if pseudocode:
                     output.append(
-                        f"Representative pseudocode "
-                        f"(from {cluster['representative_address']}):"
+                        f"Representative pseudocode (from {cluster['representative_address']}):"
                     )
                     output.append(pseudocode)
                 else:
-                    output.append(
-                        "(no pseudocode available for representative)"
-                    )
+                    output.append("(no pseudocode available for representative)")
                 output.append("")
 
             output.append("=" * 60)
@@ -1214,9 +1181,7 @@ def register_function_hash_tools(app, session_manager, cache, runner):
             return safe_error_message("find_inlined_clones", e)
         except ImportError as e:
             logger.error(f"find_inlined_clones missing library: {e}")
-            return safe_error_message(
-                "Required library not available for clone detection", e
-            )
+            return safe_error_message("Required library not available for clone detection", e)
         except Exception as e:
             logger.error(f"find_inlined_clones failed: {e}")
             return safe_error_message("Failed to find inlined clones", e)

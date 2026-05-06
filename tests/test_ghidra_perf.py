@@ -615,6 +615,11 @@ class TestRunnerTimeoutCleanup:
         assert "/T" in captured["cmd"]
         assert str(proc.pid) in captured["cmd"]
 
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="os.killpg/os.getpgid are POSIX-only; the Windows path is "
+               "covered by test_kill_process_tree_uses_taskkill_on_windows.",
+    )
     def test_kill_process_tree_uses_killpg_on_posix(self, monkeypatch):
         """_kill_process_tree on POSIX must SIGKILL the child's process group."""
         from src.engines.static.ghidra import runner as runner_mod

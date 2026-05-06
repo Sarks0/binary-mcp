@@ -27,6 +27,7 @@ from src.engines.session import AnalysisType, UnifiedSessionManager
 from src.engines.static.ghidra.project_cache import ProjectCache
 from src.engines.static.ghidra.runner import GhidraAnalysisError, GhidraRunner
 from src.tools.control_flow_tools import register_control_flow_tools
+from src.tools.dispatch_tools import register_dispatch_tools
 from src.tools.dotnet_tools import register_dotnet_tools
 from src.tools.dynamic_tools import register_dynamic_tools
 from src.tools.fid_tools import register_fid_tools
@@ -4077,6 +4078,9 @@ def main():
 
     # Register function hash and cross-binary matching tools
     register_function_hash_tools(app, session_manager, cache, runner)
+
+    # Register dispatch / IOCTL recovery tools
+    register_dispatch_tools(app, session_manager, cache, runner)
 
     # Register PE structure analysis tools
     register_pe_tools(app, session_manager)

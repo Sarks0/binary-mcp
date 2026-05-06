@@ -1,29 +1,84 @@
 """
 Pseudocode vulnerability rule registry.
 
-Each rule runs as a regex against Ghidra-produced pseudocode (C-like text)
-and surfaces a structured finding. Rules are deliberately conservative on
-false negatives -- false positives are expected and are the point: this is
-triage, not proof. A finding says "look here", not "this is exploitable".
+Each rule runs as either a regex match or a context-aware callable against
+Ghidra-produced pseudocode (C-like text) and surfaces a structured finding.
+Rules are deliberately conservative on false negatives -- false positives
+are expected and are the point: this is triage, not proof. A finding says
+"look here", not "this is exploitable".
+
+Rule kinds:
+    REGEX   -- one ``re.Pattern`` per rule, optional negative pattern.
+               One match yields one finding (the historical model).
+    CONTEXT -- a callable receiving the full pseudocode plus a list of
+               ``Statement``s (split on ``;``/``{``/``}``) and returning
+               ``ContextFinding`` records that carry their own line range,
+               severity override, message, and confidence. Suitable for
+               multi-statement patterns like double-fetch and TOCTOU where
+               a single regex cannot express ordering.
 """
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
+from enum import Enum
 
 SEVERITY_ORDER = ("info", "low", "medium", "high", "critical")
+
+
+class RuleKind(str, Enum):
+    """Classifies how a ``PseudocodeRule`` is applied to pseudocode."""
+
+    REGEX = "regex"
+    CONTEXT = "context"
+
+
+@dataclass(frozen=True)
+class Statement:
+    """One pseudocode statement with 1-based line range it spans."""
+
+    text: str
+    start_line: int
+    end_line: int
+
+
+@dataclass(frozen=True)
+class ContextFinding:
+    """
+    Structured finding emitted by a context rule.
+
+    ``severity`` may be ``None`` to inherit the rule's baseline severity;
+    callers should set it only when the finding genuinely warrants
+    promoting or demoting the rule's default level.
+    """
+
+    message: str
+    confidence: int
+    start_line: int
+    end_line: int
+    severity: str | None = None
 
 
 @dataclass(frozen=True)
 class PseudocodeRule:
     """One vulnerability / anti-pattern rule applied to decompiled C."""
+
     id: str
     cwe: str
     severity: str
     confidence: int
     description: str
     recommendation: str
-    pattern: re.Pattern
+    pattern: re.Pattern | None = None
     negative_pattern: re.Pattern | None = None
+    kind: RuleKind = RuleKind.REGEX
+    context_fn: Callable[[str, list[Statement]], list[ContextFinding]] | None = None
+
+    def __post_init__(self) -> None:
+        if self.kind is RuleKind.REGEX and self.pattern is None:
+            raise ValueError(f"PseudocodeRule {self.id!r}: kind=regex requires a 'pattern'.")
+        if self.kind is RuleKind.CONTEXT and self.context_fn is None:
+            raise ValueError(f"PseudocodeRule {self.id!r}: kind=context requires a 'context_fn'.")
 
 
 # Heuristics applied across findings to nudge confidence.
@@ -337,7 +392,120 @@ def find_line_excerpt(pseudocode: str, match: re.Match, context_chars: int = 120
     return excerpt
 
 
+def _excerpt_from_lines(
+    pseudocode: str,
+    start_line: int,
+    end_line: int,
+    max_chars: int = 240,
+) -> str:
+    """
+    Return a single-line excerpt covering ``start_line``..``end_line`` (1-based).
+
+    Mirrors ``find_line_excerpt`` formatting (collapsed whitespace, ellipsis
+    sentinels) so context findings render alongside regex findings without
+    surprises in the scan_pseudocode formatter.
+    """
+    if not pseudocode or start_line < 1 or end_line < start_line:
+        return ""
+    lines = pseudocode.splitlines()
+    if not lines:
+        return ""
+    lo = max(0, start_line - 1)
+    hi = min(len(lines), end_line)
+    chunk = "\n".join(lines[lo:hi])
+    excerpt = re.sub(r"\s+", " ", chunk).strip()
+    if len(excerpt) > max_chars:
+        excerpt = excerpt[: max_chars - 1] + "…"
+    if lo > 0:
+        excerpt = "…" + excerpt
+    if hi < len(lines):
+        excerpt = excerpt + "…"
+    return excerpt
+
+
+# Statement boundaries used by ``_split_statements``. Brace tokens are
+# treated as terminators but are not themselves emitted as statement text;
+# a balanced brace block becomes two empty terminators with the body
+# statements in between, which is exactly what context rules want.
+_STATEMENT_TERMINATORS = frozenset(";{}")
+
+
+def _split_statements(pseudocode: str | None) -> list[Statement]:
+    """
+    Split decompiled C-like pseudocode into ``Statement`` records.
+
+    Splits on ``;``, ``{``, and ``}`` only. No real C parser, no preprocessor
+    handling, no string-literal awareness -- this matches the project's
+    "triage not proof" stance and keeps context rules cheap. Empty
+    fragments (whitespace-only) are dropped. 1-based line numbers track the
+    original source lines a fragment spans.
+
+    Returns an empty list for ``None`` / empty / whitespace-only input.
+    """
+    if not pseudocode or not pseudocode.strip():
+        return []
+
+    statements: list[Statement] = []
+    buf: list[str] = []
+    line = 1
+    fragment_start_line = 1
+
+    def _flush(end_line: int) -> None:
+        text = "".join(buf).strip()
+        if text:
+            statements.append(
+                Statement(text=text, start_line=fragment_start_line, end_line=end_line)
+            )
+        buf.clear()
+
+    for ch in pseudocode:
+        if ch in _STATEMENT_TERMINATORS:
+            _flush(line)
+            fragment_start_line = line
+            continue
+        buf.append(ch)
+        if ch == "\n":
+            line += 1
+            # If the buffer is still pure whitespace, advance the fragment
+            # start so a leading blank line doesn't get attributed to the
+            # next real statement.
+            if not "".join(buf).strip():
+                fragment_start_line = line
+
+    _flush(line)
+    return statements
+
+
 NEGATIVE_PATTERN_PENALTY = 40
+
+
+def _build_regex_finding(rule: PseudocodeRule, pseudocode: str, match: re.Match) -> dict:
+    confidence = rule.confidence
+    if rule.negative_pattern and rule.negative_pattern.search(match.group(0)):
+        confidence = max(0, confidence - NEGATIVE_PATTERN_PENALTY)
+    return {
+        "rule_id": rule.id,
+        "cwe": rule.cwe,
+        "severity": rule.severity,
+        "confidence": confidence,
+        "description": rule.description,
+        "recommendation": rule.recommendation,
+        "excerpt": find_line_excerpt(pseudocode, match),
+    }
+
+
+def _build_context_finding(rule: PseudocodeRule, pseudocode: str, cf: ContextFinding) -> dict:
+    severity = cf.severity if cf.severity else rule.severity
+    confidence = max(0, min(100, cf.confidence))
+    return {
+        "rule_id": rule.id,
+        "cwe": rule.cwe,
+        "severity": severity,
+        "confidence": confidence,
+        "description": cf.message or rule.description,
+        "recommendation": rule.recommendation,
+        "excerpt": _excerpt_from_lines(pseudocode, cf.start_line, cf.end_line),
+    }
 
 
 def scan_text(pseudocode: str, rules: list[PseudocodeRule]) -> list[dict]:
@@ -345,28 +513,31 @@ def scan_text(pseudocode: str, rules: list[PseudocodeRule]) -> list[dict]:
     Apply a rule set to one pseudocode string, return a list of findings.
 
     Each finding has: rule_id, cwe, severity, confidence (rule baseline,
-    adjusted down if the rule's negative_pattern matched the literal),
-    description, recommendation, excerpt. Cross-rule corroboration and
-    function-shape adjustments happen in the caller.
+    adjusted down if the rule's negative_pattern matched the literal for
+    regex rules; clamped to 0..100 from the context rule for context
+    rules), description, recommendation, excerpt. Cross-rule corroboration
+    and function-shape adjustments happen in the caller.
+
+    Both regex and context rules are dispatched here so callers (notably
+    ``scan_pseudocode``) need not branch on ``rule.kind``.
     """
     findings: list[dict] = []
     if not pseudocode:
         return findings
 
+    statements: list[Statement] | None = None
+
     for rule in rules:
-        for match in rule.pattern.finditer(pseudocode):
-            confidence = rule.confidence
-            if rule.negative_pattern and rule.negative_pattern.search(match.group(0)):
-                confidence = max(0, confidence - NEGATIVE_PATTERN_PENALTY)
-            findings.append({
-                "rule_id": rule.id,
-                "cwe": rule.cwe,
-                "severity": rule.severity,
-                "confidence": confidence,
-                "description": rule.description,
-                "recommendation": rule.recommendation,
-                "excerpt": find_line_excerpt(pseudocode, match),
-            })
+        if rule.kind is RuleKind.REGEX:
+            assert rule.pattern is not None  # guaranteed by __post_init__
+            for match in rule.pattern.finditer(pseudocode):
+                findings.append(_build_regex_finding(rule, pseudocode, match))
+        elif rule.kind is RuleKind.CONTEXT:
+            assert rule.context_fn is not None  # guaranteed by __post_init__
+            if statements is None:
+                statements = _split_statements(pseudocode)
+            for cf in rule.context_fn(pseudocode, statements) or []:
+                findings.append(_build_context_finding(rule, pseudocode, cf))
     return findings
 
 

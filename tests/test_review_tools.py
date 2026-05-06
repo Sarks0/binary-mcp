@@ -780,3 +780,402 @@ class TestGetSwitchTables:
         result = tools["get_switch_tables"]("/bin/test.exe", "keep")
         assert "keep" in result
         assert "skip" not in result
+
+
+def _ctx_rule(
+    rid: str,
+    severity: str,
+    confidence: int,
+    fn,
+    cwe: str = "CWE-000",
+    description: str = "synthetic context rule",
+    recommendation: str = "synthetic recommendation",
+):
+    """Build a synthetic context rule for the tests below."""
+    from src.utils.pseudocode_rules import PseudocodeRule, RuleKind
+
+    return PseudocodeRule(
+        id=rid,
+        cwe=cwe,
+        severity=severity,
+        confidence=confidence,
+        description=description,
+        recommendation=recommendation,
+        kind=RuleKind.CONTEXT,
+        context_fn=fn,
+    )
+
+
+def _regex_rule(
+    rid: str,
+    severity: str,
+    confidence: int,
+    pattern: str,
+    cwe: str = "CWE-000",
+    description: str = "synthetic regex rule",
+    recommendation: str = "synthetic recommendation",
+):
+    """Build a synthetic regex rule for the tests below."""
+    import re as _re
+
+    from src.utils.pseudocode_rules import PseudocodeRule, RuleKind
+
+    return PseudocodeRule(
+        id=rid,
+        cwe=cwe,
+        severity=severity,
+        confidence=confidence,
+        description=description,
+        recommendation=recommendation,
+        pattern=_re.compile(pattern, _re.MULTILINE),
+        kind=RuleKind.REGEX,
+    )
+
+
+class TestSplitStatements:
+    """Statement-splitter is the foundation for context-rule line ranges."""
+
+    def test_returns_empty_for_none(self):
+        from src.utils.pseudocode_rules import _split_statements
+
+        assert _split_statements(None) == []
+
+    def test_returns_empty_for_blank(self):
+        from src.utils.pseudocode_rules import _split_statements
+
+        assert _split_statements("") == []
+        assert _split_statements("   \n\n  ") == []
+
+    def test_simple_statements(self):
+        from src.utils.pseudocode_rules import _split_statements
+
+        stmts = _split_statements("a = 1; b = 2; c = a + b;")
+
+        assert [s.text for s in stmts] == ["a = 1", "b = 2", "c = a + b"]
+        assert all(s.start_line == 1 and s.end_line == 1 for s in stmts)
+
+    def test_brace_block(self):
+        from src.utils.pseudocode_rules import _split_statements
+
+        stmts = _split_statements("if (x) { a = 1; b = 2; }")
+
+        # Splits on '(', ';', '{', '}' -> keeps non-empty fragments.
+        assert "if (x)" in [s.text for s in stmts]
+        assert "a = 1" in [s.text for s in stmts]
+        assert "b = 2" in [s.text for s in stmts]
+
+    def test_line_numbers_track_newlines(self):
+        from src.utils.pseudocode_rules import _split_statements
+
+        pseudo = "a = 1;\nb = 2;\nc = 3;\n"
+        stmts = _split_statements(pseudo)
+
+        assert [s.start_line for s in stmts] == [1, 2, 3]
+        assert [s.end_line for s in stmts] == [1, 2, 3]
+
+    def test_multiline_statement_spans_lines(self):
+        from src.utils.pseudocode_rules import _split_statements
+
+        pseudo = "a =\n  foo(\n    bar\n  );"
+        stmts = _split_statements(pseudo)
+
+        assert len(stmts) == 1
+        assert stmts[0].start_line == 1
+        assert stmts[0].end_line == 4
+
+
+class TestPseudocodeRulePostInit:
+    """__post_init__ guards prevent half-built rules at registration time."""
+
+    def test_regex_rule_requires_pattern(self):
+        import pytest
+
+        from src.utils.pseudocode_rules import PseudocodeRule, RuleKind
+
+        with pytest.raises(ValueError, match="MISSING_PATTERN.*requires a 'pattern'"):
+            PseudocodeRule(
+                id="MISSING_PATTERN",
+                cwe="CWE-000",
+                severity="low",
+                confidence=10,
+                description="x",
+                recommendation="x",
+                pattern=None,
+                kind=RuleKind.REGEX,
+            )
+
+    def test_context_rule_requires_context_fn(self):
+        import pytest
+
+        from src.utils.pseudocode_rules import PseudocodeRule, RuleKind
+
+        with pytest.raises(ValueError, match="MISSING_FN.*requires a 'context_fn'"):
+            PseudocodeRule(
+                id="MISSING_FN",
+                cwe="CWE-000",
+                severity="low",
+                confidence=10,
+                description="x",
+                recommendation="x",
+                kind=RuleKind.CONTEXT,
+                context_fn=None,
+            )
+
+
+class TestContextRuleDispatch:
+    """Context rules dispatched through scan_text alongside regex rules."""
+
+    def test_regex_rule_unchanged(self):
+        """Existing regex rules emit the historical finding shape."""
+        from src.utils.pseudocode_rules import PseudocodeRules, scan_text
+
+        rule = PseudocodeRules().get("CWE120_STRCPY")
+        hits = scan_text("strcpy(dest, src);", [rule])
+
+        assert len(hits) == 1
+        assert hits[0]["rule_id"] == "CWE120_STRCPY"
+        assert hits[0]["cwe"] == "CWE-120"
+        assert "excerpt" in hits[0]
+        assert "description" in hits[0]
+        assert "recommendation" in hits[0]
+        assert "confidence" in hits[0]
+        assert "severity" in hits[0]
+
+    def test_context_rule_fires_with_message_and_lines(self):
+        """A synthetic context rule emits findings carrying its own line range."""
+        from src.utils.pseudocode_rules import ContextFinding, scan_text
+
+        pseudo = (
+            "int handler() {\n"
+            "  copy_from_user(buf, in, n);\n"
+            "  *p = a;\n"
+            "  *q = b;\n"
+            "  *r = c;\n"
+            "}\n"
+        )
+
+        def detect_post_probe_derefs(pcode, statements):
+            findings: list[ContextFinding] = []
+            seen_probe = False
+            deref_count = 0
+            first_line = 0
+            last_line = 0
+            for stmt in statements:
+                if "copy_from_user" in stmt.text:
+                    seen_probe = True
+                    continue
+                if seen_probe and "*" in stmt.text and "=" in stmt.text:
+                    deref_count += 1
+                    if first_line == 0:
+                        first_line = stmt.start_line
+                    last_line = stmt.end_line
+            if deref_count >= 3:
+                findings.append(
+                    ContextFinding(
+                        message=f"{deref_count} dereferences after probe call",
+                        confidence=85,
+                        start_line=first_line,
+                        end_line=last_line,
+                    )
+                )
+            return findings
+
+        rule = _ctx_rule("DEREF_AFTER_PROBE", "high", 50, detect_post_probe_derefs)
+
+        hits = scan_text(pseudo, [rule])
+
+        assert len(hits) == 1
+        assert hits[0]["rule_id"] == "DEREF_AFTER_PROBE"
+        assert hits[0]["severity"] == "high"  # inherited from rule baseline
+        assert hits[0]["confidence"] == 85  # finding overrides rule baseline
+        assert "3 dereferences" in hits[0]["description"]
+        assert "*p = a" in hits[0]["excerpt"]
+
+    def test_context_finding_can_promote_severity(self):
+        """ContextFinding(severity='critical') overrides rule.severity."""
+        from src.utils.pseudocode_rules import ContextFinding, scan_text
+
+        def fn(pcode, statements):
+            return [
+                ContextFinding(
+                    message="elevated",
+                    confidence=70,
+                    start_line=1,
+                    end_line=1,
+                    severity="critical",
+                )
+            ]
+
+        rule = _ctx_rule("PROMOTE", "low", 10, fn)
+        hits = scan_text("foo;", [rule])
+
+        assert hits[0]["severity"] == "critical"
+
+    def test_context_finding_confidence_clamped(self):
+        from src.utils.pseudocode_rules import ContextFinding, scan_text
+
+        def fn(pcode, statements):
+            return [
+                ContextFinding(
+                    message="overflow", confidence=999, start_line=1, end_line=1
+                ),
+                ContextFinding(
+                    message="underflow", confidence=-50, start_line=1, end_line=1
+                ),
+            ]
+
+        rule = _ctx_rule("CLAMP", "low", 10, fn)
+        hits = scan_text("foo;", [rule])
+
+        assert [h["confidence"] for h in hits] == [100, 0]
+
+    def test_context_rule_no_findings_returns_empty(self):
+        from src.utils.pseudocode_rules import scan_text
+
+        def fn(pcode, statements):
+            return []
+
+        rule = _ctx_rule("EMPTY", "low", 10, fn)
+        assert scan_text("foo;", [rule]) == []
+
+    def test_context_rule_skipped_on_empty_pseudocode(self):
+        from src.utils.pseudocode_rules import scan_text
+
+        def fn(pcode, statements):  # pragma: no cover - should not be called
+            raise AssertionError("context_fn invoked on empty pseudocode")
+
+        rule = _ctx_rule("SKIP", "low", 10, fn)
+        assert scan_text("", [rule]) == []
+        assert scan_text(None, [rule]) == []  # type: ignore[arg-type]
+
+    def test_mixed_kinds_compose_under_adjust_confidences(self):
+        """Both kinds in one scan: corroboration bonus applies across kinds."""
+        from src.utils.pseudocode_rules import (
+            CORROBORATION_BONUS,
+            ContextFinding,
+            adjust_confidences,
+            scan_text,
+        )
+
+        def fn(pcode, statements):
+            return [
+                ContextFinding(
+                    message="ctx hit", confidence=40, start_line=1, end_line=1
+                )
+            ]
+
+        ctx_rule = _ctx_rule("CTX", "medium", 40, fn)
+        rx_rule = _regex_rule("RX", "high", 50, r"\bdanger\b")
+
+        pseudo = "danger;"
+        hits = scan_text(pseudo, [ctx_rule, rx_rule])
+        adjust_confidences(hits, pseudo)
+
+        assert {h["rule_id"] for h in hits} == {"CTX", "RX"}
+        # Two distinct rules fired -> corroboration bonus applied to both.
+        for h in hits:
+            assert h["confidence"] >= 40 + CORROBORATION_BONUS - 1  # post-clamp
+
+
+class TestContextRuleScanPseudocodeIntegration:
+    """End-to-end via scan_pseudocode with monkey-patched rule registry."""
+
+    def _install_rules(self, monkeypatch, rules):
+        from src.utils.pseudocode_rules import PseudocodeRules
+
+        registry = PseudocodeRules()
+        # Replace the loaded rules with our synthetic set.
+        registry.rules = list(rules)
+        registry._rules_by_id = {r.id: r for r in registry.rules}
+
+        import src.tools.review_tools as rt
+
+        monkeypatch.setattr(rt, "_RULES", registry)
+
+    def test_context_rule_surfaces_in_scan_pseudocode(self, monkeypatch):
+        from src.utils.pseudocode_rules import ContextFinding
+
+        def fn(pcode, statements):
+            if any("FETCH_USER" in s.text for s in statements):
+                return [
+                    ContextFinding(
+                        message="user fetch detected",
+                        confidence=90,
+                        start_line=1,
+                        end_line=1,
+                    )
+                ]
+            return []
+
+        rule = _ctx_rule("USER_FETCH", "high", 70, fn)
+        self._install_rules(monkeypatch, [rule])
+
+        fn_dict = _make_function(
+            name="vuln", address="0x1000", pseudocode="FETCH_USER(buf);"
+        )
+        tools = _register(_make_context(functions=[fn_dict]))
+
+        result = tools["scan_pseudocode"]("/bin/test.exe")
+
+        assert "USER_FETCH" in result
+        assert "vuln" in result
+        assert "user fetch detected" in result
+
+    def test_severity_floor_filters_context_rule(self, monkeypatch):
+        from src.utils.pseudocode_rules import ContextFinding
+
+        def fn(pcode, statements):
+            return [
+                ContextFinding(
+                    message="info-level chatter",
+                    confidence=99,
+                    start_line=1,
+                    end_line=1,
+                )
+            ]
+
+        rule = _ctx_rule("INFO_RULE", "info", 99, fn)
+        self._install_rules(monkeypatch, [rule])
+
+        fn_dict = _make_function(
+            name="any", address="0x1000", pseudocode="anything;"
+        )
+        tools = _register(_make_context(functions=[fn_dict]))
+
+        # severity_floor=medium suppresses an info-severity context rule.
+        result = tools["scan_pseudocode"](
+            "/bin/test.exe", severity_floor="medium"
+        )
+        assert "INFO_RULE" not in result
+
+    def test_rule_ids_filter_context_rule(self, monkeypatch):
+        from src.utils.pseudocode_rules import ContextFinding
+
+        def fn_a(pcode, statements):
+            return [
+                ContextFinding(
+                    message="a fired", confidence=80, start_line=1, end_line=1
+                )
+            ]
+
+        def fn_b(pcode, statements):
+            return [
+                ContextFinding(
+                    message="b fired", confidence=80, start_line=1, end_line=1
+                )
+            ]
+
+        rule_a = _ctx_rule("CTX_A", "high", 50, fn_a)
+        rule_b = _ctx_rule("CTX_B", "high", 50, fn_b)
+        self._install_rules(monkeypatch, [rule_a, rule_b])
+
+        fn_dict = _make_function(
+            name="z", address="0x1000", pseudocode="anything;"
+        )
+        tools = _register(_make_context(functions=[fn_dict]))
+
+        result = tools["scan_pseudocode"](
+            "/bin/test.exe", rule_ids=["CTX_A"]
+        )
+        assert "CTX_A" in result
+        assert "CTX_B" not in result

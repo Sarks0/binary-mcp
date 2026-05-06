@@ -993,3 +993,163 @@ class TestDecompileOnDemand:
         assert captured.get("start_address") == "0x401000"
         assert captured.get("max_functions") == 1
         assert "FUN_401000(void) { return; }" in result
+
+
+# Regression for the cache depth-rejection bug introduced by PR #116:
+# tools that don't read pseudocode (get_strings, get_imports, ...) must
+# accept a cached structural analysis. Previously they inherited the "full"
+# default and forced a 30-min Ghidra reanalysis on every call.
+class TestDefaultDepthAcceptsStructuralCache:
+    def _seed(self, tmp_path, monkeypatch, server_module, cached_depth):
+        from src.engines.static.ghidra.project_cache import ProjectCache
+
+        binary = tmp_path / "target.bin"
+        binary.write_bytes(b"MZ" + b"\x00" * 128)
+
+        cache_obj = ProjectCache(cache_dir=str(tmp_path / "cache"))
+        cache_obj.save_cached(
+            str(binary),
+            {
+                "metadata": {"analysis_depth": cached_depth},
+                "functions": [
+                    {"address": "0x401000", "name": "main",
+                     "signature": "int main(void)", "pseudocode": None},
+                ],
+                "imports": [{"library": "kernel32.dll", "name": "CreateFileA"}],
+                "exports": [],
+                "strings": [
+                    {"address": "0x402000", "value": "ExclusionList",
+                     "length": 13, "type": "string", "xrefs": []},
+                ],
+                "memory_map": [{"name": ".text"}],
+            },
+        )
+        monkeypatch.setattr(server_module, "cache", cache_obj)
+        monkeypatch.setattr(server_module, "get_allowed_dirs", lambda: [tmp_path])
+        return binary
+
+    def test_get_strings_returns_from_structural_cache_without_running_ghidra(
+        self, tmp_path, monkeypatch, server_module
+    ):
+        binary = self._seed(tmp_path, monkeypatch, server_module, "structural")
+
+        def fail_if_called(**kwargs):
+            raise AssertionError(
+                "runner.analyze must NOT be invoked when a structural cache "
+                "satisfies the default-depth caller (regression: PR #116)."
+            )
+
+        monkeypatch.setattr(server_module.runner, "analyze", fail_if_called)
+
+        result = server_module.get_strings(str(binary))
+
+        assert "ExclusionList" in result
+
+    def test_get_imports_returns_from_structural_cache_without_running_ghidra(
+        self, tmp_path, monkeypatch, server_module
+    ):
+        binary = self._seed(tmp_path, monkeypatch, server_module, "structural")
+
+        def fail_if_called(**kwargs):
+            raise AssertionError(
+                "runner.analyze must NOT be invoked for get_imports on a "
+                "structural cache."
+            )
+
+        monkeypatch.setattr(server_module.runner, "analyze", fail_if_called)
+
+        result = server_module.get_imports(str(binary))
+
+        assert "CreateFileA" in result
+
+    def test_full_cache_also_satisfies_default_depth(
+        self, tmp_path, monkeypatch, server_module
+    ):
+        binary = self._seed(tmp_path, monkeypatch, server_module, "full")
+
+        def fail_if_called(**kwargs):
+            raise AssertionError(
+                "runner.analyze must NOT be invoked when a full cache is "
+                "available."
+            )
+
+        monkeypatch.setattr(server_module.runner, "analyze", fail_if_called)
+
+        result = server_module.get_strings(str(binary))
+
+        assert "ExclusionList" in result
+
+    def test_shallow_cache_still_forces_reanalysis(
+        self, tmp_path, monkeypatch, server_module
+    ):
+        """A shallow cache lacks auto-analyzer-derived strings; the depth
+        check must still upgrade it to structural."""
+        binary = self._seed(tmp_path, monkeypatch, server_module, "shallow")
+
+        captured = {}
+
+        def fake_analyze(**kwargs):
+            captured.update(kwargs)
+            output = Path(kwargs["output_path"])
+            output.write_text(json.dumps({
+                "metadata": {"analysis_depth": "structural"},
+                "functions": [
+                    {"address": "0x401000", "name": "main",
+                     "signature": "int main(void)", "pseudocode": None},
+                ],
+                "imports": [{"library": "kernel32.dll", "name": "CreateFileA"}],
+                "exports": [],
+                "strings": [
+                    {"address": "0x402000", "value": "FreshAfterReanalyze",
+                     "length": 19, "type": "string", "xrefs": []},
+                ],
+                "memory_map": [{"name": ".text"}],
+            }))
+            return {"elapsed_time": 1.0, "stdout": "", "stderr": ""}
+
+        monkeypatch.setattr(server_module.runner, "analyze", fake_analyze)
+
+        result = server_module.get_strings(str(binary))
+
+        assert captured, "runner.analyze should be invoked for shallow cache"
+        assert "FreshAfterReanalyze" in result
+
+    def test_analyze_binary_top_level_default_remains_full(
+        self, tmp_path, monkeypatch, server_module
+    ):
+        """analyze_binary is the user-facing entry point and must default to
+        analysis_depth='full' regardless of the lowered get_analysis_context
+        floor."""
+        binary = tmp_path / "target.bin"
+        binary.write_bytes(b"MZ" + b"\x00" * 128)
+
+        from src.engines.static.ghidra.project_cache import ProjectCache
+        cache_obj = ProjectCache(cache_dir=str(tmp_path / "cache"))
+        monkeypatch.setattr(server_module, "cache", cache_obj)
+        monkeypatch.setattr(server_module, "get_allowed_dirs", lambda: [tmp_path])
+
+        captured = {}
+
+        def fake_analyze(**kwargs):
+            captured.update(kwargs)
+            output = Path(kwargs["output_path"])
+            output.write_text(json.dumps({
+                "metadata": {"executable_format": "PE",
+                             "analysis_depth": "full"},
+                "functions": [
+                    {"address": "0x401000", "name": "main",
+                     "signature": "int main(void)",
+                     "pseudocode": "int main(void) { return 0; }"},
+                ],
+                "imports": [], "strings": [], "memory_map": [{"name": ".text"}],
+            }))
+            return {"elapsed_time": 1.0, "stdout": "", "stderr": ""}
+
+        monkeypatch.setattr(server_module.runner, "analyze", fake_analyze)
+
+        server_module.analyze_binary(str(binary), skip_compatibility_check=True)
+
+        assert captured.get("analysis_depth") == "full", (
+            "analyze_binary's top-level default must remain 'full'; "
+            f"got {captured.get('analysis_depth')!r}"
+        )

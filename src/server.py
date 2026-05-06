@@ -447,7 +447,7 @@ def get_analysis_context(
     end_address: str | None = None,
     pdb_path: str | None = None,
     enable_fid: bool = False,
-    analysis_depth: str = "full",
+    analysis_depth: str = "structural",
 ) -> dict:
     """
     Get or create analysis context for a binary.
@@ -471,6 +471,13 @@ def get_analysis_context(
         pdb_path: Path to a PDB file. Staged next to the binary so Ghidra's
             PdbUniversalAnalyzer picks it up. Forces a fresh analysis if set.
         enable_fid: Run Ghidra's Function ID library matching per function.
+        analysis_depth: Cache-acceptance floor. Default ``"structural"`` so
+            tools that don't read pseudocode (get_strings, get_imports,
+            get_xrefs, etc.) hit a structural cache without forcing a fresh
+            full Ghidra run. ``analyze_binary`` keeps ``"full"`` as its
+            top-level default. Tools that genuinely need pseudocode either
+            request ``"full"`` explicitly or use the peek-and-upgrade
+            pattern in ``decompile_function``.
 
     Returns:
         Analysis context dict

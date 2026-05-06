@@ -938,3 +938,58 @@ class TestErrorPropagation:
 
         assert "OSGi bundle cache corrupt" in result
         assert "Reference ID:" not in result or "Diagnostic:" in result
+
+
+class TestDecompileOnDemand:
+    """decompile_function should auto-fill pseudocode when the cache was
+    produced with skip_decompile / analysis_depth=structural."""
+
+    def test_structural_cache_triggers_targeted_decompile(
+        self, tmp_path, monkeypatch, server_module
+    ):
+        from src.engines.static.ghidra.project_cache import ProjectCache
+
+        binary = tmp_path / "target.bin"
+        binary.write_bytes(b"MZ" + b"\x00" * 128)
+
+        cache_obj = ProjectCache(cache_dir=str(tmp_path / "cache"))
+        # Pre-seed a structural cache: function exists, pseudocode is None.
+        cache_obj.save_cached(
+            str(binary),
+            {
+                "metadata": {"analysis_depth": "structural"},
+                "functions": [
+                    {"address": "0x401000", "name": "FUN_401000",
+                     "signature": "void FUN_401000(void)", "pseudocode": None},
+                ],
+                "imports": [], "strings": [], "memory_map": [],
+            },
+        )
+
+        monkeypatch.setattr(server_module, "cache", cache_obj)
+        monkeypatch.setattr(server_module, "get_allowed_dirs", lambda: [tmp_path])
+
+        captured = {}
+
+        def fake_analyze(**kwargs):
+            captured.update(kwargs)
+            output = Path(kwargs["output_path"])
+            output.write_text(json.dumps({
+                "metadata": {"analysis_depth": "full"},
+                "functions": [
+                    {"address": "0x401000", "name": "FUN_401000",
+                     "signature": "void FUN_401000(void)",
+                     "pseudocode": "void FUN_401000(void) { return; }"},
+                ],
+                "imports": [], "strings": [], "memory_map": [],
+                "analysis_stats": {"delta_run": True, "redecompiled": 1},
+            }))
+            return {"elapsed_time": 1.0, "stdout": "", "stderr": ""}
+
+        monkeypatch.setattr(server_module.runner, "analyze", fake_analyze)
+
+        result = server_module.decompile_function(str(binary), "FUN_401000")
+
+        assert captured.get("start_address") == "0x401000"
+        assert captured.get("max_functions") == 1
+        assert "FUN_401000(void) { return; }" in result

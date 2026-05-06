@@ -1466,6 +1466,15 @@ def decompile_function(
     """
     Decompile a function to C-like pseudocode.
 
+    If the cache for ``binary_path`` was built with ``skip_decompile=True``
+    (or ``analysis_depth="shallow"``/``"structural"``), pseudocode for the
+    requested function will be missing. In that case this tool runs a
+    targeted incremental decompile for the single function at its known
+    address (``max_functions=1``) and merges the result back into the
+    cache, so the typical workflow of "fast structural pass → LLM picks
+    targets → decompile on demand" just works without an explicit
+    re-analyze step.
+
     Args:
         binary_path: Path to analyzed binary
         function_name: Name of the function to decompile
@@ -1474,7 +1483,19 @@ def decompile_function(
         Decompiled C pseudocode
     """
     try:
-        context = get_analysis_context(binary_path)
+        # Peek at the existing cache first. If it was produced shallow/structural,
+        # do NOT trigger get_analysis_context's depth-upgrade path -- that would
+        # re-analyze the whole binary. Instead we'll do a targeted single-function
+        # decompile below.
+        peek = cache.get_cached(binary_path)
+        cached_depth = (
+            peek.get("metadata", {}).get("analysis_depth", "full") if peek else "full"
+        )
+
+        if peek and cached_depth in ("shallow", "structural"):
+            context = peek
+        else:
+            context = get_analysis_context(binary_path)
         functions = context.get("functions", [])
 
         # Find function by name
@@ -1495,7 +1516,39 @@ def decompile_function(
                 return f"Function '{function_name}' is a thunk and cannot be decompiled."
             if function.get('is_external'):
                 return f"Function '{function_name}' is external and cannot be decompiled."
-            return f"Function '{function_name}' could not be decompiled (decompilation may have failed)."
+
+            # Cache was produced shallow/structural -- pseudocode was opted out,
+            # not a decompile failure. Run a targeted incremental decompile for
+            # just this function and merge the result back into the cache so
+            # subsequent calls hit the warm path.
+            fn_address = function.get("address")
+            if cached_depth in ("shallow", "structural") and fn_address:
+                logger.info(
+                    "decompile_function: pseudocode missing for %s on %s cache -- "
+                    "running targeted incremental decompile at %s",
+                    function_name, cached_depth, fn_address,
+                )
+                try:
+                    context = get_analysis_context(
+                        binary_path,
+                        incremental=True,
+                        start_address=fn_address,
+                        max_functions=1,
+                    )
+                    functions = context.get("functions", [])
+                    function = next(
+                        (f for f in functions if f.get('name') == function_name),
+                        function,
+                    )
+                    pseudocode = function.get("pseudocode")
+                except Exception as e:
+                    logger.warning(f"On-demand decompile failed for {function_name}: {e}")
+
+            if not pseudocode:
+                return (
+                    f"Function '{function_name}' could not be decompiled "
+                    f"(decompilation may have failed)."
+                )
 
         # Format output
         result = f"**Decompiled: {function_name}**\n\n"

@@ -723,4 +723,41 @@ def register_pe_tools(app, session_manager=None):
             logger.error(f"get_pe_info failed: {e}")
             return safe_error_message("Failed to analyze PE file", e)
 
-    logger.info("Registered 1 PE structure tools")
+    @app.tool()
+    def inspect_authenticode(binary_path: str) -> str:
+        """
+        Inspect a PE file's Authenticode (PKCS#7) signature.
+
+        Parses the WIN_CERTIFICATE blob in DATA_DIRECTORY[4], surfaces the
+        signer CN, full issuer chain (with per-cert SHA-256 for VT / CT-log
+        pivoting), digest algorithm, validity window, and any embedded
+        RFC3161 / legacy counter-signature timestamp. Recomputes the
+        Authentihash per the Microsoft spec and compares it to the embedded
+        SpcIndirectDataContent.messageDigest -- a mismatch flags tampering.
+
+        Args:
+            binary_path: Path to a Windows PE file.
+
+        Returns:
+            Markdown report. For unsigned files: "Signed: no -- no security
+            data directory present". For signed files: signer / issuer /
+            timestamp / Authentihash with match status.
+
+        Example:
+            inspect_authenticode("/path/to/notepad.exe")
+        """
+        from src.utils.authenticode import inspect, render_markdown
+        from src.utils.structured_errors import StructuredBaseError
+
+        try:
+            result = inspect(binary_path)
+            return render_markdown(result)
+        except StructuredBaseError as e:
+            return e.structured_error.to_user_message()
+        except (PathTraversalError, FileSizeError) as e:
+            return safe_error_message("inspect_authenticode", e)
+        except Exception as e:
+            logger.error(f"inspect_authenticode failed: {e}")
+            return safe_error_message("Failed to inspect Authenticode signature", e)
+
+    logger.info("Registered 2 PE structure tools")

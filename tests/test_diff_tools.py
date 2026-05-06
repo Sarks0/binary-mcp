@@ -10,6 +10,34 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _restore_module_globals():
+    """
+    Restore module-level monkey-patches at the end of every test.
+
+    ``_register`` rewrites ``src.utils.binary_reader.BinaryReader`` so
+    unrelated test modules (e.g. ``test_search_bytes``) don't inherit
+    the fake reader. ``_compute_function_hash`` and
+    ``_get_capstone_mode`` are also patched on ``diff_tools``; they are
+    real module attributes (imported at the top of ``diff_tools.py``)
+    so we save and restore them too.
+    """
+    import src.tools.diff_tools as dt
+    import src.utils.binary_reader as br
+
+    orig_reader = br.BinaryReader
+    orig_hash = dt._compute_function_hash
+    orig_mode = dt._get_capstone_mode
+    try:
+        yield
+    finally:
+        br.BinaryReader = orig_reader
+        dt._compute_function_hash = orig_hash
+        dt._get_capstone_mode = orig_mode
+
 
 def _make_function(
     name="func",
@@ -47,8 +75,15 @@ def _make_context(functions=None, xrefs_to_function=None, name="bin.exe"):
     return ctx
 
 
-def _register(old_ctx, new_ctx, hash_table=None):
-    """Register diff tool. ``hash_table`` maps function ``name`` → hash str."""
+def _register(monkeypatch, old_ctx, new_ctx, hash_table=None):
+    """Register diff tool. ``hash_table`` maps function ``name`` → hash str.
+
+    All module-attribute mutations go through ``monkeypatch.setattr`` so
+    they auto-restore at test teardown. Direct assignment leaks across
+    pytest's alphabetical test ordering -- a fake ``BinaryReader`` from
+    this file would otherwise survive into ``tests/test_search_bytes.py``
+    and break it.
+    """
     from src.tools import diff_tools
 
     captured: dict = {}
@@ -78,20 +113,19 @@ def _register(old_ctx, new_ctx, hash_table=None):
     # Stub sanitize so we don't need a real file on disk.
     import src.utils.security as security
 
-    original = security.sanitize_binary_path
-    security.sanitize_binary_path = lambda p, **kw: type("P", (), {"__str__": lambda self: p})()
-
-    try:
-        diff_tools.register_diff_tools(app, session_manager, cache, runner)
-    finally:
-        security.sanitize_binary_path = original
+    monkeypatch.setattr(
+        security,
+        "sanitize_binary_path",
+        lambda p, **kw: type("P", (), {"__str__": lambda self: p})(),
+    )
+    diff_tools.register_diff_tools(app, session_manager, cache, runner)
 
     # Force capstone mode resolution to a fixed pair so we never touch a
     # real file. Hashing is mocked too — _hash_functions and
     # _confirm_phase1_buckets both call _compute_function_hash directly.
     import src.tools.diff_tools as dt
 
-    dt._get_capstone_mode = lambda p: (1, 2)
+    monkeypatch.setattr(dt, "_get_capstone_mode", lambda p: (1, 2))
 
     class _FakeReader:
         def __init__(self, path):
@@ -105,7 +139,7 @@ def _register(old_ctx, new_ctx, hash_table=None):
 
     import src.utils.binary_reader as br
 
-    br.BinaryReader = _FakeReader
+    monkeypatch.setattr(br, "BinaryReader", _FakeReader)
 
     if hash_table is not None:
 
@@ -119,7 +153,7 @@ def _register(old_ctx, new_ctx, hash_table=None):
                 "operands_normalized": 0,
             }
 
-        dt._compute_function_hash = _fake_hash
+        monkeypatch.setattr(dt, "_compute_function_hash", _fake_hash)
 
     return captured["diff_binaries"], cache, runner
 
@@ -154,7 +188,7 @@ class TestPdbNamePredicate:
 
 
 class TestPairingByPdbName:
-    def test_one_added_one_removed_one_modified(self):
+    def test_one_added_one_removed_one_modified(self, monkeypatch):
         old_ctx = _make_context(
             functions=[
                 _make_function(name="kept_unchanged", address="0x1000"),
@@ -183,7 +217,7 @@ class TestPairingByPdbName:
             "kept_modified": ("h_old", "h_new"),
         }
 
-        tool, _cache, runner = _register(old_ctx, new_ctx)
+        tool, _cache, runner = _register(monkeypatch, old_ctx, new_ctx)
 
         # Replace the hash function with the per-side variant.
         import src.tools.diff_tools as dt
@@ -218,7 +252,7 @@ class TestPairingByPdbName:
 
 
 class TestSecurityRanking:
-    def test_bounds_check_addition_ranks_above_cosmetic_rename(self):
+    def test_bounds_check_addition_ranks_above_cosmetic_rename(self, monkeypatch):
         # Two modified-pending pairs through phase 1: one with new bounds
         # check, one with no body change beyond a comment-equivalent
         # rename.
@@ -262,7 +296,7 @@ class TestSecurityRanking:
             "B_mod": ("h_B_old", "h_B_new"),
         }
 
-        tool, *_ = _register(old_ctx, new_ctx)
+        tool, *_ = _register(monkeypatch, old_ctx, new_ctx)
 
         import src.tools.diff_tools as dt
 
@@ -292,7 +326,7 @@ class TestSecurityRanking:
 
 
 class TestModeNoneOrdering:
-    def test_mode_none_does_not_score(self):
+    def test_mode_none_does_not_score(self, monkeypatch):
         old_ctx = _make_context(
             functions=[
                 _make_function(name="A_mod", address="0x1000"),
@@ -318,7 +352,7 @@ class TestModeNoneOrdering:
             "B_mod": ("hb_old", "hb_new"),
         }
 
-        tool, *_ = _register(old_ctx, new_ctx)
+        tool, *_ = _register(monkeypatch, old_ctx, new_ctx)
 
         import src.tools.diff_tools as dt
 
@@ -348,7 +382,7 @@ class TestModeNoneOrdering:
 
 
 class TestAslrShiftedAddresses:
-    def test_pdb_pairing_works_with_shifted_addresses(self):
+    def test_pdb_pairing_works_with_shifted_addresses(self, monkeypatch):
         old_ctx = _make_context(
             functions=[
                 _make_function(name="A", address="0x1000"),
@@ -367,7 +401,7 @@ class TestAslrShiftedAddresses:
             "B": ("hb_old", "hb_new"),  # modified
         }
 
-        tool, *_ = _register(old_ctx, new_ctx)
+        tool, *_ = _register(monkeypatch, old_ctx, new_ctx)
 
         import src.tools.diff_tools as dt
 
@@ -401,7 +435,7 @@ class TestAslrShiftedAddresses:
 
 
 class TestPhase2HashRename:
-    def test_unrelated_names_paired_via_hash(self):
+    def test_unrelated_names_paired_via_hash(self, monkeypatch):
         # Both functions are FUN_-named so they fail PDB-name pairing,
         # but their bodies hash identically -> phase-2 pairs them.
         old_ctx = _make_context(
@@ -426,7 +460,7 @@ class TestPhase2HashRename:
             "FUN_00401000": "h_same",
             "FUN_00501000": "h_same",
         }
-        tool, *_ = _register(old_ctx, new_ctx, hash_table=hash_table)
+        tool, *_ = _register(monkeypatch, old_ctx, new_ctx, hash_table=hash_table)
         result = tool("/old.bin", "/new.bin")
 
         assert "MODIFIED (1)" in result
@@ -434,7 +468,7 @@ class TestPhase2HashRename:
 
 
 class TestPhase3CalleeMatch:
-    def test_jaccard_above_threshold_pairs(self):
+    def test_jaccard_above_threshold_pairs(self, monkeypatch):
         # Two FUN_ functions, identical callee sets, identical bb count.
         callees = [{"name": "memcpy", "address": "0xa00"}, {"name": "free", "address": "0xb00"}]
         old_ctx = _make_context(
@@ -470,13 +504,13 @@ class TestPhase3CalleeMatch:
             "FUN_00401000": "h_old",
             "FUN_00501000": "h_new",
         }
-        tool, *_ = _register(old_ctx, new_ctx, hash_table=hash_table)
+        tool, *_ = _register(monkeypatch, old_ctx, new_ctx, hash_table=hash_table)
         result = tool("/old.bin", "/new.bin")
 
         assert "MODIFIED (1)" in result
         assert "[modified-renamed]" in result
 
-    def test_jaccard_below_threshold_falls_through_to_added_removed(self):
+    def test_jaccard_below_threshold_falls_through_to_added_removed(self, monkeypatch):
         old_ctx = _make_context(
             functions=[
                 _make_function(
@@ -503,7 +537,7 @@ class TestPhase3CalleeMatch:
             "FUN_00401000": "h_old",
             "FUN_00501000": "h_new",
         }
-        tool, *_ = _register(old_ctx, new_ctx, hash_table=hash_table)
+        tool, *_ = _register(monkeypatch, old_ctx, new_ctx, hash_table=hash_table)
         result = tool("/old.bin", "/new.bin")
 
         assert "ADDED (1)" in result
@@ -512,7 +546,7 @@ class TestPhase3CalleeMatch:
 
 
 class TestCallerDelta:
-    def test_caller_delta_uses_xrefs_index(self):
+    def test_caller_delta_uses_xrefs_index(self, monkeypatch):
         # PDB-named A_mod with callers in old=2, new=4 -> delta=+2.
         old_xrefs = {
             "1000": [
@@ -544,7 +578,7 @@ class TestCallerDelta:
         )
         per_side = {"A_mod": ("h_old", "h_new")}
 
-        tool, *_ = _register(old_ctx, new_ctx)
+        tool, *_ = _register(monkeypatch, old_ctx, new_ctx)
 
         import src.tools.diff_tools as dt
 
@@ -570,33 +604,33 @@ class TestCallerDelta:
 
 
 class TestCacheMiss:
-    def test_old_cache_miss(self):
+    def test_old_cache_miss(self, monkeypatch):
         old_ctx = None
         new_ctx = _make_context(functions=[_make_function()])
-        tool, *_ = _register(old_ctx, new_ctx)
+        tool, *_ = _register(monkeypatch, old_ctx, new_ctx)
         result = tool("/old.bin", "/new.bin")
         assert "Old binary" in result
         assert "has not been analyzed yet" in result
 
-    def test_new_cache_miss(self):
+    def test_new_cache_miss(self, monkeypatch):
         old_ctx = _make_context(functions=[_make_function()])
         new_ctx = None
-        tool, *_ = _register(old_ctx, new_ctx)
+        tool, *_ = _register(monkeypatch, old_ctx, new_ctx)
         result = tool("/old.bin", "/new.bin")
         assert "New binary" in result
         assert "has not been analyzed yet" in result
 
-    def test_invalid_mode(self):
+    def test_invalid_mode(self, monkeypatch):
         old_ctx = _make_context(functions=[_make_function()])
         new_ctx = _make_context(functions=[_make_function()])
-        tool, *_ = _register(old_ctx, new_ctx)
+        tool, *_ = _register(monkeypatch, old_ctx, new_ctx)
         result = tool("/old.bin", "/new.bin", mode="bogus")
         assert "Error: mode" in result
 
-    def test_invalid_group_by(self):
+    def test_invalid_group_by(self, monkeypatch):
         old_ctx = _make_context(functions=[_make_function()])
         new_ctx = _make_context(functions=[_make_function()])
-        tool, *_ = _register(old_ctx, new_ctx)
+        tool, *_ = _register(monkeypatch, old_ctx, new_ctx)
         result = tool("/old.bin", "/new.bin", group_by="garbage")
         assert "Error: group_by" in result
 

@@ -1298,10 +1298,41 @@ def _resolve_function_note_key(
     target_norm = _normalize_xref_addr(address)
     functions = context.get("functions") or []
     target_fn: dict | None = None
+    # First pass: entry-point exact match (cheap, common case for plate notes).
     for fn in functions:
         if _normalize_xref_addr(fn.get("address")) == target_norm:
             target_fn = fn
             break
+    # Second pass: body containment via basic_blocks. Required for pre/post
+    # notes pinned to internal instruction PCs -- the public docstring of
+    # add_note promises "the function it belongs to is resolved
+    # automatically" for those kinds.
+    if target_fn is None:
+        try:
+            target_int = int(target_norm, 16)
+        except (ValueError, TypeError):
+            target_int = None
+        if target_int is not None:
+            for fn in functions:
+                for bb in fn.get("basic_blocks") or []:
+                    bb_start_raw = bb.get("start")
+                    bb_end_raw = bb.get("end")
+                    if not bb_start_raw or not bb_end_raw:
+                        continue
+                    try:
+                        bb_start = int(
+                            str(bb_start_raw).lower().replace("0x", ""), 16
+                        )
+                        bb_end = int(
+                            str(bb_end_raw).lower().replace("0x", ""), 16
+                        )
+                    except (ValueError, TypeError):
+                        continue
+                    if bb_start <= target_int <= bb_end:
+                        target_fn = fn
+                        break
+                if target_fn is not None:
+                    break
     if target_fn is None:
         return None, None
 

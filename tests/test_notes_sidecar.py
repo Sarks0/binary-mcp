@@ -355,13 +355,9 @@ class TestServerToolsRoundTrip:
         _wire_for_notes(server_module, ctx, monkeypatch)
         _wire_real_cache(server_module, monkeypatch, tmp_path)
 
-        # Even though we pass an instruction PC, the function key the
-        # note attaches to is the containing function's symbolic name
-        # because the resolver matches the function entry exactly. For
-        # pre-notes pinned somewhere inside the body, the user is
-        # expected to pass the function's entry plus the pre-comment
-        # location -- matching the constraint that the side-car never
-        # keys on absolute VA. Here we simulate the entry-plus-pre case.
+        # Pin a pre-note at the function entry. The function key is the
+        # containing function's symbolic name; the addr field captures
+        # the instruction PC for display in get_notes.
         result = server_module.add_note(
             str(binary), "0x140001000", "checks magic", kind="pre"
         )
@@ -370,3 +366,49 @@ class TestServerToolsRoundTrip:
         listing = server_module.get_notes(str(binary))
         assert "checks magic" in listing
         assert "[pre @ 0x140001000]" in listing
+
+    def test_pre_note_pinned_to_internal_instruction_pc(
+        self, server_module, tmp_path, monkeypatch
+    ):
+        """Regression: ultrareview bug_001. _resolve_function_note_key used
+        to require an entry-point exact match, so pinning a pre/post note at
+        any address inside the function body would fail with 'No function
+        contains address X' -- contradicting add_note's docstring promise
+        that the function 'is resolved automatically'. Walk basic_blocks
+        for body containment so internal-PC pinning works."""
+        binary = _binary(tmp_path)
+        ctx = _ctx(
+            functions=[
+                _func(
+                    "dispatcher",
+                    "0x140001000",
+                    basic_blocks=[
+                        {"start": "0x140001000", "end": "0x14000107f"},
+                    ],
+                )
+            ]
+        )
+        _wire_for_notes(server_module, ctx, monkeypatch)
+        _wire_real_cache(server_module, monkeypatch, tmp_path)
+
+        # Address 0x140001050 is inside the basic block's [start, end] range
+        # but is NOT the function entry. Should resolve via body containment.
+        result = server_module.add_note(
+            str(binary), "0x140001050", "magic check here", kind="pre"
+        )
+        assert "Note Saved" in result, (
+            f"Internal instruction PC 0x140001050 should resolve to dispatcher "
+            f"via basic_blocks containment; got: {result}"
+        )
+
+        listing = server_module.get_notes(str(binary))
+        assert "magic check here" in listing
+        assert "[pre @ 0x140001050]" in listing
+
+        # Address outside any function's body still fails with the same
+        # "no function contains" error (regression guard).
+        bad = server_module.add_note(
+            str(binary), "0xdeadbeef", "should fail", kind="pre"
+        )
+        assert "Error" in bad
+        assert "No function" in bad

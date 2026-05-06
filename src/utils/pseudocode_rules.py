@@ -96,6 +96,94 @@ SINK_HINTS = re.compile(
 )
 
 
+# ---------------------------------------------------------------------------
+# Wave 3C: KERNEL_DOUBLE_FETCH helper.
+# Implemented up here so PseudocodeRules._load_default_rules can register
+# the rule without relying on late-bound name resolution at class
+# definition time. The helper is module-private (leading underscore) but
+# unit-testable on its own.
+# ---------------------------------------------------------------------------
+
+# Probe-call extractor: ProbeForRead(arg, ...) / ProbeForWrite(arg, ...).
+_PROBE_RE = re.compile(
+    r"\bProbeFor(?:Read|Write)\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)"
+)
+
+
+def _kernel_double_fetch(pseudocode: str, statements: list) -> list:
+    """
+    Detect classic double-fetch shapes: Probe(arg) followed by ≥2 distinct
+    dereferences of arg without an intervening copy / callee capture.
+
+    See ``ContextFinding`` for the return shape; the dispatcher in
+    ``scan_text`` converts these to finding dicts.
+    """
+    findings: list[ContextFinding] = []
+    if not statements:
+        return findings
+
+    # Collect every probe site once.
+    probes: list[tuple[int, str, int]] = []
+    for idx, stmt in enumerate(statements):
+        for m in _PROBE_RE.finditer(stmt.text):
+            probes.append((idx, m.group(1), stmt.start_line))
+
+    for probe_idx, arg, probe_line in probes:
+        arg_re = re.escape(arg)
+        deref_member_re = re.compile(rf"\b{arg_re}\s*->\s*(\w+)")
+        deref_pointer_re = re.compile(rf"\*\s*{arg_re}\b")
+        # Copy capture: memcpy/RtlCopyMemory/memmove/RtlMoveMemory(_, &?arg, ...)
+        # where the second positional arg is the bare arg token (followed
+        # by `,` or `)`), NOT arg->field.
+        copy_capture_re = re.compile(
+            rf"\b(?:memcpy|RtlCopyMemory|memmove|RtlMoveMemory)\s*\("
+            rf"[^,]+,\s*&?\s*{arg_re}\s*[,)]"
+        )
+        # Callee capture: <non-param_local> = func(... arg ,/)) ...
+        callee_capture_re = re.compile(
+            rf"^\s*(?!param_)\w+\s*=\s*\w+\s*\([^)]*\b{arg_re}\s*[,)]"
+        )
+
+        captured = False
+        seen_fields: set[str] = set()
+        derefs: list[dict] = []
+
+        for idx in range(probe_idx + 1, len(statements)):
+            text = statements[idx].text
+            if copy_capture_re.search(text) or callee_capture_re.search(text):
+                captured = True
+                break
+
+            for m in deref_member_re.finditer(text):
+                field = m.group(1)
+                if field not in seen_fields:
+                    seen_fields.add(field)
+                    derefs.append(
+                        {"field": field, "line": statements[idx].start_line}
+                    )
+            if deref_pointer_re.search(text) and "*deref*" not in seen_fields:
+                seen_fields.add("*deref*")
+                derefs.append(
+                    {"field": "*deref*", "line": statements[idx].start_line}
+                )
+
+        if not captured and len(derefs) >= 2:
+            findings.append(
+                ContextFinding(
+                    message=(
+                        f"Possible double-fetch: ProbeFor* on `{arg}` "
+                        f"followed by {len(derefs)} dereferences without "
+                        f"capture into a stack-typed local."
+                    ),
+                    confidence=70,
+                    start_line=probe_line,
+                    end_line=derefs[-1]["line"],
+                )
+            )
+
+    return findings
+
+
 class PseudocodeRules:
     """Database of CWE/anti-pattern rules applied to cached pseudocode."""
 
@@ -375,6 +463,27 @@ class PseudocodeRules:
                     ),
                 )
             )
+
+        # Wave 3C: KERNEL_DOUBLE_FETCH context rule. Cannot be expressed
+        # by a single regex because it requires "after probe" ordering
+        # and "no intervening capture" suppression.
+        rules.append(
+            PseudocodeRule(
+                id="KERNEL_DOUBLE_FETCH",
+                cwe="CWE-367",
+                severity="high",
+                confidence=70,
+                description="Possible double-fetch of probed user-mode data",
+                recommendation=(
+                    "Capture the probed user struct into a stack-typed local "
+                    "with RtlCopyMemory before reading any field; do not "
+                    "dereference the original user pointer after Probe."
+                ),
+                kind=RuleKind.CONTEXT,
+                context_fn=_kernel_double_fetch,
+            )
+        )
+
         return rules
 
 

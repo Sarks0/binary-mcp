@@ -1325,3 +1325,173 @@ class TestGetParamSinks:
 
         assert "structural" in result
         assert "force_reanalyze=True" in result
+
+
+def _double_fetch_rule():
+    from src.utils.pseudocode_rules import PseudocodeRules
+
+    rule = PseudocodeRules().get("KERNEL_DOUBLE_FETCH")
+    assert rule is not None
+    return rule
+
+
+class TestKernelDoubleFetch:
+    def test_classic_double_fetch_flagged(self):
+        from src.utils.pseudocode_rules import scan_text
+
+        rule = _double_fetch_rule()
+        pseudo = (
+            "void handler(PVOID p) {\n"
+            "  ProbeForRead(p, 0x10, 1);\n"
+            "  x = p->Length;\n"
+            "  memcpy(buf, p->Data, p->Length);\n"
+            "}\n"
+        )
+        hits = scan_text(pseudo, [rule])
+
+        assert len(hits) == 1
+        assert hits[0]["rule_id"] == "KERNEL_DOUBLE_FETCH"
+        assert hits[0]["severity"] == "high"
+        assert hits[0]["confidence"] == 70
+        assert "ProbeFor* on `p`" in hits[0]["description"]
+
+    def test_capture_into_local_suppresses(self):
+        from src.utils.pseudocode_rules import scan_text
+
+        rule = _double_fetch_rule()
+        pseudo = (
+            "ProbeForRead(p, 0x10, 1);\n"
+            "RtlCopyMemory(local, p, sizeof(USER_STRUCT));\n"
+            "use(local->Length);\n"
+            "use(local->Data);\n"
+        )
+        hits = scan_text(pseudo, [rule])
+
+        assert hits == []
+
+    def test_callee_capture_suppresses(self):
+        from src.utils.pseudocode_rules import scan_text
+
+        rule = _double_fetch_rule()
+        pseudo = (
+            "ProbeForRead(p, 0x10, 1);\n"
+            "local = Capture(p);\n"
+            "use(local->x);\n"
+            "use(local->y);\n"
+        )
+        hits = scan_text(pseudo, [rule])
+
+        assert hits == []
+
+    def test_callee_capture_into_param_does_not_suppress(self):
+        """A param_N lhs is not a stack-local, so capture suppression
+        does not fire and post-probe derefs are still counted."""
+        from src.utils.pseudocode_rules import scan_text
+
+        rule = _double_fetch_rule()
+        pseudo = (
+            "ProbeForRead(p, 0x10, 1);\n"
+            "param_3 = Capture(p);\n"
+            "x = p->Length;\n"
+            "y = p->Other;\n"
+        )
+        hits = scan_text(pseudo, [rule])
+
+        assert len(hits) == 1
+        assert "ProbeFor* on `p`" in hits[0]["description"]
+
+    def test_single_deref_not_flagged(self):
+        from src.utils.pseudocode_rules import scan_text
+
+        rule = _double_fetch_rule()
+        pseudo = (
+            "ProbeForRead(p, 0x10, 1);\n"
+            "x = p->Length;\n"
+        )
+        hits = scan_text(pseudo, [rule])
+        assert hits == []
+
+    def test_repeated_pointer_deref_dedup(self):
+        """Two identical ``*p`` derefs collapse to one distinct access."""
+        from src.utils.pseudocode_rules import scan_text
+
+        rule = _double_fetch_rule()
+        pseudo = (
+            "ProbeForRead(p, 0x10, 1);\n"
+            "a = *p;\n"
+            "b = *p;\n"
+        )
+        hits = scan_text(pseudo, [rule])
+        assert hits == []
+
+    def test_pointer_plus_member_deref_flags(self):
+        from src.utils.pseudocode_rules import scan_text
+
+        rule = _double_fetch_rule()
+        pseudo = (
+            "ProbeForRead(p, 0x10, 1);\n"
+            "a = *p;\n"
+            "b = p->Field;\n"
+        )
+        hits = scan_text(pseudo, [rule])
+        assert len(hits) == 1
+
+    def test_multi_probe_multi_arg(self):
+        from src.utils.pseudocode_rules import scan_text
+
+        rule = _double_fetch_rule()
+        pseudo = (
+            "ProbeForRead(p, 0x10, 1);\n"
+            "ProbeForRead(q, 0x10, 1);\n"
+            "x = p->A;\n"
+            "y = p->B;\n"
+            "z = q->C;\n"
+            "w = q->D;\n"
+        )
+        hits = scan_text(pseudo, [rule])
+
+        assert len(hits) == 2
+        descs = [h["description"] for h in hits]
+        assert any("on `p`" in d for d in descs)
+        assert any("on `q`" in d for d in descs)
+
+    def test_no_probe_no_finding(self):
+        from src.utils.pseudocode_rules import scan_text
+
+        rule = _double_fetch_rule()
+        pseudo = "x = p->A; y = p->B; z = p->C;"
+        hits = scan_text(pseudo, [rule])
+        assert hits == []
+
+    def test_capture_with_amp_prefix(self):
+        from src.utils.pseudocode_rules import scan_text
+
+        rule = _double_fetch_rule()
+        pseudo = (
+            "ProbeForRead(p, 0x10, 1);\n"
+            "RtlCopyMemory(local, &p, sizeof(USER_STRUCT));\n"
+            "use(local->A);\n"
+            "use(local->B);\n"
+        )
+        hits = scan_text(pseudo, [rule])
+        assert hits == []
+
+    def test_runs_through_scan_pseudocode(self):
+        """End-to-end: the rule surfaces from the default registry via
+        scan_pseudocode just like any regex rule."""
+        f = _make_function(
+            name="vuln",
+            address="0x4000",
+            pseudocode=(
+                "ProbeForRead(p, 0x10, 1);\n"
+                "x = p->Length;\n"
+                "memcpy(buf, p->Data, p->Length);\n"
+            ),
+        )
+        tools = _register(_make_context(functions=[f]))
+        result = tools["scan_pseudocode"](
+            "/bin/test.sys", rule_ids=["KERNEL_DOUBLE_FETCH"]
+        )
+
+        assert "KERNEL_DOUBLE_FETCH" in result
+        assert "vuln" in result

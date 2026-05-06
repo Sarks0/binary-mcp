@@ -68,13 +68,45 @@ def _get_capstone_mode(binary_path: str):
     return None
 
 
+# Stack-pointer arithmetic normalisation: collapses prologue/epilogue frame-size
+# variance (e.g. ``sub rsp, 0x28`` vs ``sub rsp, 0x38``) so otherwise-identical
+# inlined clones hash to the same value.
+_STACK_REG_PATTERN = re.compile(r"^(rsp|esp|sp)\b", re.IGNORECASE)
+_STACK_IMM_PATTERN = re.compile(r"#?-?0x[0-9a-fA-F]+|#-?\d+")
+
+
+def _normalize_stack_imm(mnemonic: str, op_str: str) -> tuple[str, int]:
+    """
+    Replace stack-pointer arithmetic immediates with a STACK_IMM placeholder.
+
+    Targets only ``sub``/``add``/``lea`` instructions whose first operand is a
+    stack-pointer register (``rsp``/``esp``/``sp``). Non-stack arithmetic is
+    left untouched so unrelated small immediates keep their distinguishing
+    power.
+
+    Args:
+        mnemonic: Capstone instruction mnemonic
+        op_str: Capstone instruction operand string
+
+    Returns:
+        Tuple of (normalized_op_str, replacement_count)
+    """
+    mnem = mnemonic.lower()
+    if mnem not in ("sub", "add", "lea"):
+        return op_str, 0
+    if not _STACK_REG_PATTERN.match(op_str.lstrip()):
+        return op_str, 0
+    return _STACK_IMM_PATTERN.subn("STACK_IMM", op_str)
+
+
 def _normalize_instructions(disasm_instructions) -> tuple[str, dict]:
     """
     Normalize disassembled instructions for hashing.
 
     Replaces absolute address operands with a placeholder while keeping
-    opcodes and register names intact. This allows matching the "same"
-    function across different builds where only addresses differ.
+    opcodes and register names intact. Stack-pointer arithmetic immediates
+    are collapsed to ``STACK_IMM`` so prologue frame-size differences do
+    not fragment otherwise-identical inlined clones.
 
     Args:
         disasm_instructions: Iterable of capstone instruction objects
@@ -91,6 +123,11 @@ def _normalize_instructions(disasm_instructions) -> tuple[str, dict]:
     for insn in disasm_instructions:
         stats["total_instructions"] += 1
         op_str = insn.op_str
+
+        # Collapse stack-pointer arithmetic immediates first so frame-size
+        # variance hashes identically across inlined clones.
+        op_str, stack_count = _normalize_stack_imm(insn.mnemonic, op_str)
+        stats["operands_normalized"] += stack_count
 
         # Normalize absolute address operands to ADDR placeholder
         normalized_op, count = addr_pattern.subn("ADDR", op_str)
@@ -160,6 +197,83 @@ def _compute_function_hash(reader, cs_arch, cs_mode, func: dict) -> dict | None:
         "instruction_count": stats["total_instructions"],
         "operands_normalized": stats["operands_normalized"],
     }
+
+
+def _cluster_functions_by_hash(
+    hashed_funcs: list,
+    min_cluster_size: int,
+    min_instructions: int,
+) -> list:
+    """
+    Bucket hashed functions by hash and emit clone-family records.
+
+    Buckets with fewer than ``min_cluster_size`` members are dropped, as are
+    buckets whose representative instruction count falls below
+    ``min_instructions``. Each surviving bucket produces a cluster record
+    with sorted-by-address members, the unioned set of called API names,
+    and the first member's cached pseudocode as a representative dump.
+
+    Args:
+        hashed_funcs: List of dicts each containing keys ``hash``,
+            ``instruction_count``, and ``func`` (raw cached function dict).
+        min_cluster_size: Minimum number of members for a bucket to count.
+        min_instructions: Minimum instruction count per cluster.
+
+    Returns:
+        List of cluster dicts sorted largest-first. Each cluster has keys:
+        ``hash``, ``cluster_size``, ``instruction_count``,
+        ``representative_address``, ``representative_pseudocode``,
+        ``members`` (sorted-by-address list of {address, name}), and
+        ``called_apis`` (sorted union across members).
+    """
+    buckets: dict[str, list[dict]] = {}
+    for entry in hashed_funcs:
+        buckets.setdefault(entry["hash"], []).append(entry)
+
+    clusters: list[dict] = []
+    for hash_value, entries in buckets.items():
+        if len(entries) < min_cluster_size:
+            continue
+        instruction_count = entries[0]["instruction_count"]
+        if instruction_count < min_instructions:
+            continue
+
+        members_sorted = sorted(
+            entries,
+            key=lambda e: (
+                e["func"].get("address") or "",
+                e["func"].get("name") or "",
+            ),
+        )
+
+        called_apis: set[str] = set()
+        for member in entries:
+            for called in member["func"].get("called_functions", []) or []:
+                name = called.get("name")
+                if name:
+                    called_apis.add(name)
+
+        rep = members_sorted[0]
+        clusters.append(
+            {
+                "hash": hash_value,
+                "cluster_size": len(entries),
+                "instruction_count": instruction_count,
+                "representative_address": rep["func"].get("address", ""),
+                "representative_pseudocode": rep["func"].get("pseudocode") or "",
+                "members": [
+                    {
+                        "address": m["func"].get("address", ""),
+                        "name": m["func"].get("name", ""),
+                    }
+                    for m in members_sorted
+                ],
+                "called_apis": sorted(called_apis),
+            }
+        )
+
+    clusters.sort(key=lambda c: (-c["cluster_size"], -c["instruction_count"], c["hash"]))
+    return clusters
 
 
 def _lookup_function(functions: list, name_or_address: str) -> dict | None:
@@ -920,4 +1034,191 @@ def register_function_hash_tools(app, session_manager, cache, runner):
             logger.error(f"find_similar_functions failed: {e}")
             return safe_error_message("Failed to find similar functions", e)
 
-    logger.info("Registered 4 function hash tools")
+    @app.tool()
+    def find_inlined_clones(
+        binary_path: str,
+        min_cluster_size: int = 3,
+        min_instructions: int = 10,
+    ) -> str:
+        """
+        Detect intra-binary clusters of inlined function clones.
+
+        Compilers frequently inline helpers like memcpy/strlen/refcount
+        adjusters and crypto round functions, leaving large binaries with
+        hundreds of opcode-identical bodies named ``FUN_*``. This tool reuses
+        the normalized opcode hash from get_function_hash to bucket cached
+        functions in a single binary into clone families, so you can name
+        one canonical example and review siblings together.
+
+        The hash collapses absolute addresses and stack-pointer arithmetic
+        immediates, so frame-size variance between inlined copies does not
+        fragment otherwise-identical clusters.
+
+        LIMITATION: link-time-optimised or ICF-deduplicated builds may
+        produce zero exact-hash clusters because the linker has already
+        merged duplicates. Such binaries are healthier candidates for fuzzy
+        matching via find_similar_functions.
+
+        The binary must already be analyzed with analyze_binary; this tool
+        is cache-only and does not invoke Ghidra.
+
+        Args:
+            binary_path: Path to an already-analyzed binary
+            min_cluster_size: Minimum number of clone members per family
+                (default: 3, must be >= 2)
+            min_instructions: Minimum normalized instruction count per
+                cluster (default: 10, must be >= 1)
+
+        Returns:
+            Sorted clone-family report with representative pseudocode,
+            member addresses, called-API set, and cluster size for each
+            family. Clusters are ranked largest-first.
+
+        Example:
+            find_inlined_clones("/path/to/binary.exe")
+            find_inlined_clones("/path/to/binary.exe", min_cluster_size=5)
+
+        Note:
+            Bulk-rename of a clone family is not yet implemented; rename one
+            representative per cluster manually.
+        """
+        try:
+            binary_path = str(sanitize_binary_path(binary_path))
+
+            if min_cluster_size < 2:
+                return "Error: min_cluster_size must be >= 2"
+            if min_instructions < 1:
+                return "Error: min_instructions must be >= 1"
+
+            cached = cache.get_cached(binary_path)
+            if not cached:
+                return (
+                    "Error: Binary has not been analyzed yet. "
+                    "Run analyze_binary first."
+                )
+
+            funcs = [
+                f for f in cached.get("functions", [])
+                if not f.get("is_thunk") and not f.get("is_external")
+                and f.get("basic_blocks")
+            ]
+
+            if not funcs:
+                return (
+                    f"Error: No hashable functions found in "
+                    f"{Path(binary_path).name}"
+                )
+
+            mode = _get_capstone_mode(binary_path)
+            if mode is None:
+                return (
+                    f"Error: Unsupported architecture for "
+                    f"{Path(binary_path).name}"
+                )
+            cs_arch, cs_mode = mode
+
+            from src.utils.binary_reader import BinaryReader
+
+            hashed: list[dict] = []
+            with BinaryReader(binary_path) as reader:
+                for func in funcs:
+                    result = _compute_function_hash(
+                        reader, cs_arch, cs_mode, func
+                    )
+                    if result is None:
+                        continue
+                    hashed.append({
+                        "hash": result["hash"],
+                        "instruction_count": result["instruction_count"],
+                        "func": func,
+                    })
+
+            if not hashed:
+                return (
+                    f"Error: Could not hash any functions in "
+                    f"{Path(binary_path).name}"
+                )
+
+            clusters = _cluster_functions_by_hash(
+                hashed, min_cluster_size, min_instructions
+            )
+
+            output = []
+            output.append("=" * 60)
+            output.append("INTRA-BINARY INLINED CLONE FAMILIES")
+            output.append("=" * 60)
+            output.append(f"Binary:             {Path(binary_path).name}")
+            output.append(f"Functions scanned:  {len(funcs)}")
+            output.append(f"Functions hashed:   {len(hashed)}")
+            output.append(f"min_cluster_size:   {min_cluster_size}")
+            output.append(f"min_instructions:   {min_instructions}")
+            total_members = sum(c["cluster_size"] for c in clusters)
+            output.append(
+                f"Clusters found:     {len(clusters)} "
+                f"({total_members} total members)"
+            )
+            output.append("")
+
+            if not clusters:
+                output.append(
+                    "No clone families detected. This is normal on LTO/ICF "
+                    "builds where the linker has already merged identical "
+                    "bodies. Try find_similar_functions for fuzzy "
+                    "intra-binary matching."
+                )
+                return "\n".join(output)
+
+            for idx, cluster in enumerate(clusters, 1):
+                output.append("-" * 60)
+                output.append(
+                    f"Cluster #{idx}  -  size={cluster['cluster_size']}, "
+                    f"instructions={cluster['instruction_count']}"
+                )
+                output.append(f"Hash: {cluster['hash']}")
+                output.append("")
+                output.append("Members:")
+                for member in cluster["members"]:
+                    output.append(
+                        f"  {member['address']}  {member['name']}"
+                    )
+                output.append("")
+                if cluster["called_apis"]:
+                    output.append(
+                        f"Called APIs ({len(cluster['called_apis'])}): "
+                        + ", ".join(cluster["called_apis"])
+                    )
+                else:
+                    output.append("Called APIs: (leaf body)")
+                output.append("")
+                pseudocode = cluster["representative_pseudocode"]
+                if pseudocode:
+                    output.append(
+                        f"Representative pseudocode "
+                        f"(from {cluster['representative_address']}):"
+                    )
+                    output.append(pseudocode)
+                else:
+                    output.append(
+                        "(no pseudocode available for representative)"
+                    )
+                output.append("")
+
+            output.append("=" * 60)
+            output.append(
+                "Tip: rename one representative per cluster, then review "
+                "remaining members. Bulk-rename helper not yet implemented."
+            )
+            return "\n".join(output)
+
+        except (PathTraversalError, FileSizeError) as e:
+            return safe_error_message("find_inlined_clones", e)
+        except ImportError as e:
+            logger.error(f"find_inlined_clones missing library: {e}")
+            return safe_error_message(
+                "Required library not available for clone detection", e
+            )
+        except Exception as e:
+            logger.error(f"find_inlined_clones failed: {e}")
+            return safe_error_message("Failed to find inlined clones", e)
+
+    logger.info("Registered 5 function hash tools")

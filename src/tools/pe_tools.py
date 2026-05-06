@@ -760,4 +760,55 @@ def register_pe_tools(app, session_manager=None):
             logger.error(f"inspect_authenticode failed: {e}")
             return safe_error_message("Failed to inspect Authenticode signature", e)
 
-    logger.info("Registered 2 PE structure tools")
+    @app.tool()
+    def extract_embedded_binaries(
+        binary_path: str,
+        output_dir: str | None = None,
+        max_total_mb: int = 64,
+    ) -> str:
+        """
+        Walk a PE's resources + overlay, flag/dump suspicious embedded blobs.
+
+        Each blob is classified by magic bytes (PE / ELF / Mach-O / OLE / MSI /
+        ZIP / PDF / .NET / 7z / RAR / gzip / bzip2 / xz) plus a Shannon-entropy
+        fallback (entropy > 7.2 with size > 2 KB). Shellcode prologues
+        (call/pop, cld;call, FS:[0x30] / GS:[0x60] PEB walks) are detected too.
+
+        Flagged blobs are written to ``<output_dir>/<sha256>`` with a sidecar
+        ``<sha256>.json`` describing source (resource type/ID or overlay) and
+        the parent binary's SHA-256. Existing files are never overwritten.
+
+        Args:
+            binary_path: Path to the PE file.
+            output_dir: Where to dump flagged blobs. Defaults to
+                ``~/.binary_mcp_cache/carved/<binary-sha256>/`` on Windows or
+                ``${XDG_CACHE_HOME:-~/.cache}/binary_mcp/carved/<sha256>/`` on
+                POSIX. Honors ``$BINARY_MCP_CARVE_DIR``.
+            max_total_mb: Total carved-byte budget (default 64). Resource-bombs
+                trip this and the remaining flagged blobs are listed but not
+                written.
+
+        Returns:
+            Markdown table of every blob found (resource path, offset, size,
+            SHA-256, detected type, entropy, flag reasons, write status).
+
+        Example:
+            extract_embedded_binaries("/path/to/dropper.exe")
+            extract_embedded_binaries("sample.exe", output_dir="/tmp/carved")
+        """
+        from src.utils.carving import carve, render_markdown
+        from src.utils.structured_errors import StructuredBaseError
+
+        try:
+            out_path = Path(output_dir).expanduser() if output_dir else None
+            result = carve(binary_path, out_path, max_total_mb=max_total_mb)
+            return render_markdown(result)
+        except StructuredBaseError as e:
+            return e.structured_error.to_user_message()
+        except (PathTraversalError, FileSizeError) as e:
+            return safe_error_message("extract_embedded_binaries", e)
+        except Exception as e:
+            logger.error(f"extract_embedded_binaries failed: {e}")
+            return safe_error_message("Failed to extract embedded binaries", e)
+
+    logger.info("Registered 3 PE structure tools")

@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 # rejects anything matching this pattern.
 _AUTO_NAME_RE = re.compile(
     r"^(?:FUN_[0-9a-fA-F]+|sub_[0-9a-fA-F]+|thunk_FUN_[0-9a-fA-F]+|"
-    r"unnamed_[A-Za-z0-9_]+|func_\d+|FUN_.*)$",
+    r"unnamed_[A-Za-z0-9_]+|func_\d+)$",
     re.IGNORECASE,
 )
 

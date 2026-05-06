@@ -186,6 +186,18 @@ class TestPdbNamePredicate:
             _make_function(name="thunk_FUN_00401000", name_source="USER_DEFINED")
         )
 
+    def test_pdb_named_accepts_lowercase_fun_prefix_with_non_hex_suffix(self):
+        """Regression: ultrareview bug_003. Drop redundant `FUN_.*` alternative
+        from _AUTO_NAME_RE so legitimate user symbols starting with 'fun_' or
+        'Fun_' (e.g. `fun_init`, `fun_facts`, `Fun_Test`) aren't misclassified
+        as Ghidra auto-generated. Real auto-names are FUN_<hex> only."""
+        from src.tools.diff_tools import _is_pdb_named
+
+        for legit_name in ("fun_init", "fun_facts", "Fun_Test", "FUN_NaN"):
+            assert _is_pdb_named(
+                _make_function(name=legit_name, name_source="USER_DEFINED")
+            ), f"{legit_name} should be treated as a PDB-named function"
+
 
 class TestPairingByPdbName:
     def test_one_added_one_removed_one_modified(self, monkeypatch):

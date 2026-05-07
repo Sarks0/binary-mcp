@@ -408,6 +408,29 @@ class TestInspectMalformedSignature:
         assert result["signed"] is True
         assert result["parsed"] is False
 
+    def test_pkcs7_size_cap_rejects_oversized_cert_table(self, tmp_path: Path):
+        """A security data-directory entry advertising > 16 MB is rejected
+        before the cert blob ever reaches asn1crypto."""
+        from src.utils.authenticode import MAX_PKCS7_BYTES
+        from src.utils.structured_errors import StructuredBaseError
+
+        # The DD entry claims a 17 MB cert table, but we don't actually
+        # write 17 MB of bytes -- the size cap fires before we get to
+        # the "extends past EOF" check.
+        oversized = MAX_PKCS7_BYTES + 1
+        pe_bytes = _build_minimal_pe(
+            security_va=0x800,
+            security_size=oversized,
+        )
+        pe_file = tmp_path / "huge-sig.exe"
+        pe_file.write_bytes(pe_bytes)
+
+        with pytest.raises(StructuredBaseError) as excinfo:
+            inspect(pe_file)
+        msg = str(excinfo.value).lower()
+        assert "too large" in msg or "exceeds" in msg
+        assert str(oversized) in str(excinfo.value)
+
 
 # ---------------------------------------------------------------------------
 # Bad input handling

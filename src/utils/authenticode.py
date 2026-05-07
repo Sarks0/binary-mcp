@@ -35,6 +35,13 @@ PKCS9_MESSAGE_DIGEST_OID = "1.2.840.113549.1.9.4"
 # WIN_CERTIFICATE.wCertificateType
 WIN_CERT_TYPE_PKCS_SIGNED_DATA = 0x0002
 
+# Hard cap on the security-directory blob size. Real-world Authenticode
+# signatures top out around ~80 KB even with full timestamp chains; 16 MB
+# is generous headroom for legitimate edge cases (multi-sig builds, deep
+# counter-signatures) while still bounding asn1crypto's parse cost on
+# malformed or hostile inputs.
+MAX_PKCS7_BYTES = 16 * 1024 * 1024
+
 
 # --- Dataclasses ---
 
@@ -546,6 +553,26 @@ def inspect(binary_path: str | Path) -> dict[str, Any]:
         data = bytes(pe.__data__)
         cert_offset = sec_dir.VirtualAddress
         cert_size = sec_dir.Size
+        if cert_size > MAX_PKCS7_BYTES:
+            raise StructuredBaseError(
+                StructuredError(
+                    error=ErrorCode.PARAMETER_INVALID,
+                    message="Certificate table is too large",
+                    reason=(
+                        f"cert_size={cert_size} exceeds the "
+                        f"{MAX_PKCS7_BYTES}-byte cap; refusing to parse."
+                    ),
+                    suggestions=[
+                        "File may be malformed or carry a hostile signature blob",
+                        "Inspect the security data-directory entry manually",
+                    ],
+                    debug_info={
+                        "cert_size": cert_size,
+                        "max": MAX_PKCS7_BYTES,
+                        "cert_offset": cert_offset,
+                    },
+                )
+            )
         if cert_offset + cert_size > len(data):
             raise StructuredBaseError(
                 StructuredError(

@@ -286,13 +286,28 @@ class TestFindVtables:
         assert "Tables: 1" in second
 
     def test_invalid_min_run_rejected(self, find_vtables, tmp_path):
+        # min_run < 2 should propagate to ``validate_numeric_range`` and
+        # surface a safe-error-message envelope (project convention --
+        # see fid_tools.py for the same pattern). The user gets a
+        # tool-name-keyed reference rather than the raw ValueError text.
         tool, cache = find_vtables
         pe_path = _write_pe(tmp_path, _build_pe_with_rdata(b""))
         cache.save_cached(str(pe_path), _ctx_for_addresses([]))
 
         result = tool(str(pe_path), min_run=1)
         assert "Error" in result
-        assert "min_run" in result
+        assert "find_vtables" in result
+
+    def test_min_run_above_upper_bound_rejected(self, find_vtables, tmp_path):
+        # Wave 2 review fix: validate_numeric_range now also enforces a
+        # 1024 upper bound to reject pathological inputs.
+        tool, cache = find_vtables
+        pe_path = _write_pe(tmp_path, _build_pe_with_rdata(b""))
+        cache.save_cached(str(pe_path), _ctx_for_addresses([]))
+
+        result = tool(str(pe_path), min_run=2048)
+        assert "Error" in result
+        assert "find_vtables" in result
 
 
 class TestGetXrefsIndirectSurfacing:

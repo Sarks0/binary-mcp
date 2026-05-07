@@ -557,7 +557,7 @@ def register_diff_tools(app, session_manager, cache, runner):
         except (PathTraversalError, FileSizeError) as e:
             return safe_error_message("diff_binaries", e)
         except Exception as e:
-            logger.error(f"diff_binaries failed: {e}")
+            logger.exception("diff_binaries failed")
             return safe_error_message("Failed to diff binaries", e)
 
     logger.info("Registered 1 diff tool")

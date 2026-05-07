@@ -335,7 +335,9 @@ def register_indirect_call_tools(app, cache, runner=None):
     from src.utils.security import (
         FileSizeError,
         PathTraversalError,
+        safe_error_message,
         sanitize_binary_path,
+        validate_numeric_range,
     )
 
     @app.tool()
@@ -379,11 +381,9 @@ def register_indirect_call_tools(app, cache, runner=None):
             binary_path = str(validated)
 
             try:
-                min_run = int(min_run)
-            except (TypeError, ValueError):
-                return "Error: min_run must be an integer"
-            if min_run < 2:
-                return "Error: min_run must be >= 2"
+                min_run = validate_numeric_range(min_run, 2, 1024, "min_run")
+            except (TypeError, ValueError) as e:
+                return safe_error_message("find_vtables", e)
 
             context = cache.get_cached(binary_path)
             if context is None:
@@ -407,13 +407,15 @@ def register_indirect_call_tools(app, cache, runner=None):
             context["vtables_min_run"] = min_run
             try:
                 cache.save_cached(binary_path, context)
-            except Exception as e:
-                logger.warning("Failed to persist vtables to cache: %s", e)
+            except Exception:
+                logger.exception("Failed to persist vtables to cache")
 
             return _format_vtables(Path(binary_path).name, vtables)
+        except (PathTraversalError, FileSizeError) as e:
+            return safe_error_message("find_vtables", e)
         except Exception as e:
-            logger.exception("find_vtables failed: %s", e)
-            return f"Error: {e}"
+            logger.exception("find_vtables failed")
+            return safe_error_message("Failed to scan for vtables", e)
 
     logger.info("Registered 1 indirect-call tool")
     return {"find_vtables": find_vtables}

@@ -265,6 +265,24 @@ _DANGEROUS_PREFIXES: tuple[str, ...] = (
 )
 
 
+def _is_within(child: Path, parent: Path) -> bool:
+    """Cross-platform check that ``child`` is inside ``parent``.
+
+    Path.is_relative_to() does case-sensitive part-by-part comparison and
+    breaks on Windows where C:\\Users\\...\\sandbox\\out vs the same path
+    with mixed case fails despite being the same directory. Normalize via
+    os.path.normcase + commonpath instead.
+    """
+    try:
+        c = os.path.normcase(str(child))
+        p = os.path.normcase(str(parent))
+        return os.path.commonpath([c, p]) == p
+    except (ValueError, OSError):
+        # commonpath raises on different drives (Windows) or absolute-vs-
+        # relative mix. In either case, the child is not within the parent.
+        return False
+
+
 def _validate_output_dir(out: Path) -> Path:
     """
     Validate a user-supplied carving output directory.
@@ -359,11 +377,8 @@ def _validate_output_dir(out: Path) -> Path:
                 d_resolved = d.resolve()
             except (OSError, RuntimeError):
                 continue
-            try:
-                if resolved.is_relative_to(d_resolved):
-                    return resolved
-            except ValueError:
-                continue
+            if _is_within(resolved, d_resolved):
+                return resolved
         raise StructuredBaseError(
             StructuredError(
                 error=ErrorCode.PARAMETER_INVALID,

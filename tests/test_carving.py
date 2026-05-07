@@ -534,6 +534,10 @@ class TestCarveIntegration:
 class TestOutputDirHardening:
     """Reject system directories, symlinks, and respect BINARY_MCP_ALLOWED_DIRS."""
 
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="POSIX system-dir denylist; /etc is not a real path on Windows.",
+    )
     def test_rejects_etc(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         from src.utils.structured_errors import StructuredBaseError
 
@@ -544,6 +548,10 @@ class TestOutputDirHardening:
         msg = str(excinfo.value).lower()
         assert "system directory" in msg or "output_dir" in msg
 
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="POSIX system-dir denylist; /var/spool is not a real path on Windows.",
+    )
     def test_rejects_var_spool_cron_subpath(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):

@@ -23,6 +23,7 @@ from src.utils.pseudocode_rules import (
 from src.utils.security import (
     FileSizeError,
     PathTraversalError,
+    safe_error_message,
     sanitize_binary_path,
     validate_numeric_range,
 )
@@ -1038,8 +1039,8 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
         except (PathTraversalError, FileSizeError, FileNotFoundError) as e:
             return f"Invalid binary path: {e}"
         except Exception as e:
-            logger.exception(f"get_param_sinks failed: {e}")
-            return f"Error: {e}"
+            logger.error(f"get_param_sinks failed: {e}")
+            return safe_error_message("Failed to trace parameter sinks", e)
 
     # Keep a tuple export so the caller can introspect what was registered
     return (

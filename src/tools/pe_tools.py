@@ -797,9 +797,17 @@ def register_pe_tools(app, session_manager=None):
             extract_embedded_binaries("sample.exe", output_dir="/tmp/carved")
         """
         from src.utils.carving import carve, render_markdown
+        from src.utils.security import validate_numeric_range
         from src.utils.structured_errors import StructuredBaseError
 
         try:
+            try:
+                max_total_mb = validate_numeric_range(
+                    max_total_mb, 1, 4096, "max_total_mb"
+                )
+            except (TypeError, ValueError) as e:
+                return f"Error [PARAMETER_INVALID]: {e}"
+
             out_path = Path(output_dir).expanduser() if output_dir else None
             result = carve(binary_path, out_path, max_total_mb=max_total_mb)
             return render_markdown(result)

@@ -625,6 +625,60 @@ class TestOutputDirHardening:
 
 
 # ---------------------------------------------------------------------------
+# pe_tools wrapper input-validation (T19 LOW)
+# ---------------------------------------------------------------------------
+
+
+class TestExtractEmbeddedBinariesWrapper:
+    """Verify the @app.tool() wrapper validates max_total_mb via
+    validate_numeric_range before delegating to carve()."""
+
+    def _registered_tool(self):
+        from unittest.mock import MagicMock
+
+        from fastmcp import FastMCP
+
+        from src.tools.pe_tools import register_pe_tools
+
+        app = FastMCP("test-extract")
+        register_pe_tools(app, MagicMock())
+        # FastMCP exposes registered tools via app._tool_manager; navigate via
+        # public-ish API. Easiest: capture via decorator side effect.
+        registered: dict = {}
+
+        # Re-register against a shim app to capture functions
+        shim = MagicMock()
+
+        def tool_decorator(*_args, **_kwargs):
+            def _wrap(fn):
+                registered[fn.__name__] = fn
+                return fn
+            return _wrap
+
+        shim.tool = MagicMock(side_effect=tool_decorator)
+        register_pe_tools(shim, MagicMock())
+        return registered["extract_embedded_binaries"]
+
+    def test_max_total_mb_zero_rejected(self, tmp_path: Path):
+        pe_path = _write_pe(tmp_path, _build_pe_with_resources(), name="x.exe")
+        tool = self._registered_tool()
+        out = tool(str(pe_path), max_total_mb=0)
+        assert "PARAMETER_INVALID" in out
+
+    def test_max_total_mb_negative_rejected(self, tmp_path: Path):
+        pe_path = _write_pe(tmp_path, _build_pe_with_resources(), name="y.exe")
+        tool = self._registered_tool()
+        out = tool(str(pe_path), max_total_mb=-1)
+        assert "PARAMETER_INVALID" in out
+
+    def test_max_total_mb_oversized_rejected(self, tmp_path: Path):
+        pe_path = _write_pe(tmp_path, _build_pe_with_resources(), name="z.exe")
+        tool = self._registered_tool()
+        out = tool(str(pe_path), max_total_mb=10_000)  # > 4096 cap
+        assert "PARAMETER_INVALID" in out
+
+
+# ---------------------------------------------------------------------------
 # Default cache-dir resolution
 # ---------------------------------------------------------------------------
 

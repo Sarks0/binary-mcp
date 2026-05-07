@@ -420,6 +420,30 @@ def test_max_local_offset_rejection():
     assert out == [] or all(a.offset <= 0x10000 for a in out)
 
 
+def test_pseudocode_length_cap_truncates_with_warning(caplog: pytest.LogCaptureFixture):
+    """Pseudocode > 1 MB is truncated; a warning is logged."""
+    import logging
+
+    from src.utils.stack_strings import MAX_PSEUDOCODE_LEN
+
+    # 2 MB of inert pseudocode followed by an assignment that WOULD reconstruct
+    # if we scanned it -- but it's past the cap so we won't see it.
+    inert = "/* harmless comment */\n" * 90_000  # ~2 MB
+    assert len(inert) > MAX_PSEUDOCODE_LEN
+    tail = "  local_10 = 'X';\n  local_11 = 'X';\n  local_12 = 'X';\n  local_13 = 'X';\n"
+    pc = inert + tail
+
+    with caplog.at_level(logging.WARNING, logger="src.utils.stack_strings"):
+        strings, _ = scan(pc, min_length=4, function_name="huge_func")
+    # Should not have decoded the trailing assignment because it was past cap
+    assert all(s.value != "XXXX" for s in strings)
+    # Warning should have fired with truncation note
+    assert any(
+        "truncating" in r.message and "huge_func" in r.message
+        for r in caplog.records
+    )
+
+
 def test_assignment_dataclass_immutable():
     a = StackAssignment(base="local", offset=0x10, width=1, bytes_le=b"X", raw_match="")
     with pytest.raises(Exception):

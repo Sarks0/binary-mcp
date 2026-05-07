@@ -41,6 +41,11 @@ WIDTH_FROM_TYPE: dict[str, int] = {
     "QWORD": 8, "longlong": 8, "ulonglong": 8, "undefined8": 8, "u8": 8,
 }
 MAX_LOCAL_OFFSET = 0x10000  # Sanity cap on stack frame size
+# Cap on the pseudocode string length per scan() call. Real Ghidra
+# pseudocode for a single function is < 50 KB; obfuscated samples reach
+# ~200 KB. 1 MB is 5x headroom while still bounding the linear regex
+# passes against a malformed or hostile cache entry.
+MAX_PSEUDOCODE_LEN = 1_000_000
 
 
 # --- Dataclasses ---
@@ -506,6 +511,15 @@ def scan(
     """Run parse + reconstruct + xor-detect + xor-emulate for one function."""
     if not pseudocode:
         return [], []
+
+    if len(pseudocode) > MAX_PSEUDOCODE_LEN:
+        logger.warning(
+            "pseudocode for %s is %d bytes; truncating to %d to bound regex scan",
+            function_name,
+            len(pseudocode),
+            MAX_PSEUDOCODE_LEN,
+        )
+        pseudocode = pseudocode[:MAX_PSEUDOCODE_LEN]
 
     assignments = parse_assignments(pseudocode)
     strings = reconstruct_strings(

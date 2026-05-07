@@ -63,8 +63,14 @@ def _make_context(functions=None, analysis_depth="full"):
     }
 
 
-def _register(cache_data):
-    """Register dispatch tools with a MagicMock cache and return the callables."""
+def _register(monkeypatch, cache_data):
+    """Register dispatch tools with a MagicMock cache and return the callables.
+
+    Uses ``monkeypatch.setattr`` so module-attribute swaps auto-restore at
+    test teardown — see the autouse ``_restore_module_globals`` fixture
+    above for the defensive cushion that catches any direct assignments
+    that slip past pytest fixtures.
+    """
     from src.tools.dispatch_tools import register_dispatch_tools
 
     captured: dict = {}
@@ -87,13 +93,13 @@ def _register(cache_data):
     import src.tools.dispatch_tools as dt
     import src.utils.security as security
 
-    original = security.sanitize_binary_path
-    security.sanitize_binary_path = lambda p, **kw: type("P", (), {"__str__": lambda self: p})()
+    monkeypatch.setattr(
+        security,
+        "sanitize_binary_path",
+        lambda p, **kw: type("P", (), {"__str__": lambda self: p})(),
+    )
 
-    try:
-        register_dispatch_tools(app, session_manager, cache, runner)
-    finally:
-        security.sanitize_binary_path = original
+    register_dispatch_tools(app, session_manager, cache, runner)
 
     return captured["find_ioctl_handlers"], cache, runner, dt
 
@@ -322,7 +328,7 @@ class TestJumpTableJoin:
 
 
 class TestInlinedTailCall:
-    def test_recursion_finds_constants_in_callee(self):
+    def test_recursion_finds_constants_in_callee(self, monkeypatch):
         """An entry function with no constants but a single callee that
         does have them surfaces as a dispatcher anchored on the entry."""
         callee = _make_function(
@@ -337,7 +343,7 @@ class TestInlinedTailCall:
             called_functions=[{"name": "DispatchInternal", "address": "0x140012100"}],
         )
 
-        tools, *_ = _register(_make_context(functions=[entry, callee]))
+        tools, *_ = _register(monkeypatch, _make_context(functions=[entry, callee]))
         result = tools("/some.sys")
 
         assert "DriverDispatch @ 0x140012000" in result
@@ -346,51 +352,51 @@ class TestInlinedTailCall:
 
 
 class TestEarlyErrors:
-    def test_no_cache_returns_canonical_error(self):
-        tool, *_ = _register(None)
+    def test_no_cache_returns_canonical_error(self, monkeypatch):
+        tool, *_ = _register(monkeypatch, None)
         result = tool("/bin/test.sys")
         assert "has not been analyzed yet" in result
 
-    def test_shallow_cache_guidance(self):
+    def test_shallow_cache_guidance(self, monkeypatch):
         ctx = _make_context(analysis_depth="structural", functions=[])
-        tool, *_ = _register(ctx)
+        tool, *_ = _register(monkeypatch, ctx)
         result = tool("/bin/test.sys")
         assert "structural" in result
         assert "force_reanalyze=True" in result
 
-    def test_no_functions_returns_summary(self):
-        tool, *_ = _register(_make_context(functions=[]))
+    def test_no_functions_returns_summary(self, monkeypatch):
+        tool, *_ = _register(monkeypatch, _make_context(functions=[]))
         result = tool("/bin/test.sys")
         assert "No functions found" in result
 
-    def test_no_dispatchers_returns_friendly_summary(self):
+    def test_no_dispatchers_returns_friendly_summary(self, monkeypatch):
         f = _make_function(
             name="boring_helper",
             parameters=[{"name": "x", "datatype": "int"}],
             pseudocode="return x + 1;",
         )
-        tool, *_ = _register(_make_context(functions=[f]))
+        tool, *_ = _register(monkeypatch, _make_context(functions=[f]))
         result = tool("/bin/test.sys")
         assert "No IOCTL dispatchers detected" in result
 
-    def test_invalid_function_filter_regex(self):
+    def test_invalid_function_filter_regex(self, monkeypatch):
         f = _make_function(name="DriverDispatch")
-        tool, *_ = _register(_make_context(functions=[f]))
+        tool, *_ = _register(monkeypatch, _make_context(functions=[f]))
         result = tool("/bin/test.sys", function_filter="(unclosed[")
         assert "invalid function_filter" in result
 
-    def test_safe_regex_compile_rejects_redos(self):
+    def test_safe_regex_compile_rejects_redos(self, monkeypatch):
         """ReDoS-shaped patterns are rejected by safe_regex_compile and
         surface as a structured error rather than reaching the regex engine."""
         f = _make_function(name="DriverDispatch")
-        tool, *_ = _register(_make_context(functions=[f]))
+        tool, *_ = _register(monkeypatch, _make_context(functions=[f]))
         result = tool("/bin/test.sys", function_filter="(.+)+a")
         assert "invalid function_filter" in result
         assert "ReDoS" in result or "nested quantifiers" in result
 
 
 class TestFunctionFilter:
-    def test_filter_restricts_results(self):
+    def test_filter_restricts_results(self, monkeypatch):
         keep = _make_function(
             name="KeepDispatch",
             address="0x100",
@@ -401,7 +407,7 @@ class TestFunctionFilter:
             address="0x200",
             pseudocode="case 0x222004: b();",
         )
-        tool, *_ = _register(_make_context(functions=[keep, skip]))
+        tool, *_ = _register(monkeypatch, _make_context(functions=[keep, skip]))
 
         result = tool("/bin/test.sys", function_filter="^Keep")
         assert "KeepDispatch" in result
@@ -409,13 +415,13 @@ class TestFunctionFilter:
 
 
 class TestCacheOnlyContract:
-    def test_runner_never_invoked(self):
+    def test_runner_never_invoked(self, monkeypatch):
         f = _make_function(
             name="DriverDispatch",
             address="0x100",
             pseudocode="case 0x222000: a();",
         )
-        tool, _cache, runner, _dt = _register(_make_context(functions=[f]))
+        tool, _cache, runner, _dt = _register(monkeypatch, _make_context(functions=[f]))
         tool("/bin/test.sys")
         assert runner.method_calls == []
         assert runner.mock_calls == []

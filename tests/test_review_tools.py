@@ -56,8 +56,14 @@ def _make_context(functions=None, imports=None, strings=None):
     }
 
 
-def _register(cache_data):
-    """Register tools with a cache mock that returns the given context."""
+def _register(monkeypatch, cache_data):
+    """Register tools with a cache mock that returns the given context.
+
+    ``monkeypatch`` is required so the ``sanitize_binary_path`` swap on
+    ``src.tools.review_tools`` auto-restores at test teardown -- direct
+    assignment here would leak into unrelated test modules and was the
+    pattern that caused the T15 cross-test bug fixed in 3415c14.
+    """
     from src.tools.review_tools import register_review_tools
 
     app = MagicMock()
@@ -75,9 +81,15 @@ def _register(cache_data):
         get_param_sinks,
     ) = register_review_tools(app, session_manager, cache, runner)
 
-    # Patch sanitize so tests don't need a real file on disk
+    # Patch sanitize so tests don't need a real file on disk; routed
+    # through monkeypatch so pytest restores it at test teardown.
     import src.tools.review_tools as rt
-    rt.sanitize_binary_path = lambda p, **kw: type("P", (), {"__str__": lambda self: p})()
+
+    monkeypatch.setattr(
+        rt,
+        "sanitize_binary_path",
+        lambda p, **kw: type("P", (), {"__str__": lambda self: p})(),
+    )
 
     return {
         "get_function_callers": get_function_callers,
@@ -91,7 +103,7 @@ def _register(cache_data):
 
 
 class TestGetFunctionCallers:
-    def test_callers_inverted_correctly(self):
+    def test_callers_inverted_correctly(self, monkeypatch):
         a = _make_function(name="target", address="0x1000", pseudocode="")
         b = _make_function(
             name="caller_b", address="0x2000", pseudocode="",
@@ -101,19 +113,19 @@ class TestGetFunctionCallers:
             name="caller_c", address="0x3000", pseudocode="",
             called_functions=[{"name": "target", "address": "0x1000"}],
         )
-        tools = _register(_make_context(functions=[a, b, c]))
+        tools = _register(monkeypatch, _make_context(functions=[a, b, c]))
 
         result = tools["get_function_callers"]("/bin/test.exe", "target")
         assert "caller_b" in result
         assert "caller_c" in result
         assert "Total: 2" in result
 
-    def test_unknown_function(self):
-        tools = _register(_make_context(functions=[_make_function()]))
+    def test_unknown_function(self, monkeypatch):
+        tools = _register(monkeypatch, _make_context(functions=[_make_function()]))
         result = tools["get_function_callers"]("/bin/test.exe", "missing")
         assert "not found" in result.lower()
 
-    def test_limit_honoured(self):
+    def test_limit_honoured(self, monkeypatch):
         target = _make_function(name="t", address="0x1000", pseudocode="")
         callers = [
             _make_function(
@@ -122,60 +134,60 @@ class TestGetFunctionCallers:
             )
             for i in range(10)
         ]
-        tools = _register(_make_context(functions=[target] + callers))
+        tools = _register(monkeypatch, _make_context(functions=[target] + callers))
         result = tools["get_function_callers"]("/bin/test.exe", "t", limit=3)
         assert "Total: 10" in result
         assert "showing 3" in result
 
-    def test_address_lookup(self):
+    def test_address_lookup(self, monkeypatch):
         a = _make_function(name="target", address="0x1000", pseudocode="")
         b = _make_function(
             name="b", address="0x2000", pseudocode="",
             called_functions=[{"name": "target", "address": "0x1000"}],
         )
-        tools = _register(_make_context(functions=[a, b]))
+        tools = _register(monkeypatch, _make_context(functions=[a, b]))
         result = tools["get_function_callers"]("/bin/test.exe", "0x1000")
         assert "b" in result
 
 
 class TestScanPseudocode:
-    def test_strcpy_flagged(self):
+    def test_strcpy_flagged(self, monkeypatch):
         fn = _make_function(pseudocode="char buf[16]; strcpy(buf, input);")
-        tools = _register(_make_context(functions=[fn]))
+        tools = _register(monkeypatch, _make_context(functions=[fn]))
 
         result = tools["scan_pseudocode"]("/bin/test.exe")
         assert "CWE120_STRCPY" in result
         assert "CWE-120" in result
 
-    def test_gets_flagged_as_critical(self):
+    def test_gets_flagged_as_critical(self, monkeypatch):
         fn = _make_function(pseudocode="char buf[16]; gets(buf);")
-        tools = _register(_make_context(functions=[fn]))
+        tools = _register(monkeypatch, _make_context(functions=[fn]))
 
         result = tools["scan_pseudocode"]("/bin/test.exe")
         assert "CWE120_GETS" in result
         assert "CRITICAL" in result
 
-    def test_severity_floor_filters_low(self):
+    def test_severity_floor_filters_low(self, monkeypatch):
         fn = _make_function(pseudocode='sscanf(input, "%d", &x);')
-        tools = _register(_make_context(functions=[fn]))
+        tools = _register(monkeypatch, _make_context(functions=[fn]))
 
         # sscanf is CWE676_DANGEROUS_FN at severity "low" -- floor=high should drop it
         result = tools["scan_pseudocode"]("/bin/test.exe", severity_floor="high")
         assert "CWE676_DANGEROUS_FN" not in result
 
-    def test_no_findings_clean_code(self):
+    def test_no_findings_clean_code(self, monkeypatch):
         fn = _make_function(pseudocode="int f() { return 42; }")
-        tools = _register(_make_context(functions=[fn]))
+        tools = _register(monkeypatch, _make_context(functions=[fn]))
 
         result = tools["scan_pseudocode"]("/bin/test.exe")
         assert "No findings" in result
 
-    def test_function_filter_regex(self):
+    def test_function_filter_regex(self, monkeypatch):
         hits = _make_function(name="vuln_handler", pseudocode="strcpy(a, b);")
         misses = _make_function(
             name="safe_handler", address="0x2000", pseudocode="strcpy(c, d);"
         )
-        tools = _register(_make_context(functions=[hits, misses]))
+        tools = _register(monkeypatch, _make_context(functions=[hits, misses]))
 
         result = tools["scan_pseudocode"](
             "/bin/test.exe", function_filter="^vuln_"
@@ -183,7 +195,7 @@ class TestScanPseudocode:
         assert "vuln_handler" in result
         assert "safe_handler" not in result
 
-    def test_multiple_cwe_rules_fire(self):
+    def test_multiple_cwe_rules_fire(self, monkeypatch):
         """Assorted shipped rules each have a positive test case."""
         samples = {
             "CWE120_STRCPY": "strcpy(dst, src);",
@@ -208,7 +220,7 @@ class TestScanPseudocode:
         }
         for rule_id, snippet in samples.items():
             fn = _make_function(pseudocode=snippet)
-            tools = _register(_make_context(functions=[fn]))
+            tools = _register(monkeypatch, _make_context(functions=[fn]))
             result = tools["scan_pseudocode"]("/bin/test.exe")
             assert rule_id in result, (
                 f"Rule {rule_id} did not fire on snippet: {snippet}\n"
@@ -359,19 +371,19 @@ class TestConfidenceScoring:
 class TestScanPseudocodeFiltering:
     """exclude_rule_ids and confidence_floor surface tests."""
 
-    def test_exclude_rule_ids_drops_specified_rules(self):
+    def test_exclude_rule_ids_drops_specified_rules(self, monkeypatch):
         fn = _make_function(pseudocode="strcpy(a,b); gets(c);")
-        tools = _register(_make_context(functions=[fn]))
+        tools = _register(monkeypatch, _make_context(functions=[fn]))
         result = tools["scan_pseudocode"](
             "/bin/test.exe", exclude_rule_ids=["CWE120_STRCPY"]
         )
         assert "CWE120_STRCPY" not in result
         assert "CWE120_GETS" in result
 
-    def test_confidence_floor_drops_low_confidence_findings(self):
+    def test_confidence_floor_drops_low_confidence_findings(self, monkeypatch):
         # CWE798_HARDCODED_PASSWORD with regex-meta literal -> conf 0
         fn = _make_function(pseudocode='p = "(pass|secret|key)";')
-        tools = _register(_make_context(functions=[fn]))
+        tools = _register(monkeypatch, _make_context(functions=[fn]))
 
         low = tools["scan_pseudocode"](
             "/bin/test.exe", confidence_floor=0
@@ -384,7 +396,7 @@ class TestScanPseudocodeFiltering:
         assert "CWE798_HARDCODED_PASSWORD" not in high
         assert "dropped" in high.lower()
 
-    def test_findings_sorted_by_confidence_within_severity(self):
+    def test_findings_sorted_by_confidence_within_severity(self, monkeypatch):
         # Two critical findings, different functions so corroboration doesn't
         # level them. gets baseline 95 vs system baseline 75.
         a = _make_function(
@@ -393,16 +405,16 @@ class TestScanPseudocodeFiltering:
         b = _make_function(
             name="fb", address="0x2000", pseudocode="system(cmd);",
         )
-        tools = _register(_make_context(functions=[a, b]))
+        tools = _register(monkeypatch, _make_context(functions=[a, b]))
         result = tools["scan_pseudocode"]("/bin/test.exe")
         gets_idx = result.find("CWE120_GETS")
         sys_idx = result.find("CWE78_COMMAND_INJECTION")
         assert gets_idx >= 0 and sys_idx >= 0
         assert gets_idx < sys_idx, "Higher confidence should appear first"
 
-    def test_summary_shows_max_confidence_per_function(self):
+    def test_summary_shows_max_confidence_per_function(self, monkeypatch):
         fn = _make_function(pseudocode='k = "AKIAIOSFODNN7EXAMPLE";')
-        tools = _register(_make_context(functions=[fn]))
+        tools = _register(monkeypatch, _make_context(functions=[fn]))
         result = tools["scan_pseudocode"]("/bin/test.exe", mode="summary")
         assert "conf=90" in result
 
@@ -579,10 +591,10 @@ class TestMemoryCorruptionRules:
 class TestMemoryCorruptionRulesEndToEnd:
     """Drive the new rules through the actual scan_pseudocode tool surface."""
 
-    def test_severity_floor_filters_low_severity_new_rules(self):
+    def test_severity_floor_filters_low_severity_new_rules(self, monkeypatch):
         # CWE125_STRLEN_UNTRUSTED_PTR is severity=low; floor=high should drop
         fn = _make_function(pseudocode="n = strlen(pkt->name);")
-        tools = _register(_make_context(functions=[fn]))
+        tools = _register(monkeypatch, _make_context(functions=[fn]))
 
         low_result = tools["scan_pseudocode"](
             "/bin/test.exe", severity_floor="low"
@@ -594,7 +606,7 @@ class TestMemoryCorruptionRulesEndToEnd:
         )
         assert "CWE125_STRLEN_UNTRUSTED_PTR" not in high_result
 
-    def test_rule_ids_filter_isolates_single_new_rule(self):
+    def test_rule_ids_filter_isolates_single_new_rule(self, monkeypatch):
         # Pseudocode triggers multiple rules -- rule_ids should isolate one.
         fn = _make_function(
             pseudocode=(
@@ -603,7 +615,7 @@ class TestMemoryCorruptionRulesEndToEnd:
                 "buf = malloc(hdr->len * 2);"
             ),
         )
-        tools = _register(_make_context(functions=[fn]))
+        tools = _register(monkeypatch, _make_context(functions=[fn]))
 
         result = tools["scan_pseudocode"](
             "/bin/test.exe", rule_ids=["CWE416_USE_AFTER_FREE"]
@@ -612,7 +624,7 @@ class TestMemoryCorruptionRulesEndToEnd:
         assert "CWE805_MEMCPY_HEADER_DRIVEN_LEN" not in result
         assert "CWE190_HEADER_LEN_TO_ALLOC" not in result
 
-    def test_summary_mode_groups_findings_per_function(self):
+    def test_summary_mode_groups_findings_per_function(self, monkeypatch):
         parser = _make_function(
             name="parse_packet",
             address="0x1000",
@@ -622,7 +634,7 @@ class TestMemoryCorruptionRulesEndToEnd:
                 "x = *(buf + idx);"
             ),
         )
-        tools = _register(_make_context(functions=[parser]))
+        tools = _register(monkeypatch, _make_context(functions=[parser]))
         result = tools["scan_pseudocode"]("/bin/test.exe", mode="summary")
         assert "parse_packet" in result
         # The malloc snippet legitimately matches both
@@ -633,39 +645,39 @@ class TestMemoryCorruptionRulesEndToEnd:
 
 
 class TestScanPseudocodePagination:
-    def _build(self):
+    def _build(self, monkeypatch):
         # 25 functions, each with one strcpy finding
         fns = [
             _make_function(name=f"f{i:02d}", address=f"0x{0x1000+i:x}",
                            pseudocode="strcpy(a,b);")
             for i in range(25)
         ]
-        return _register(_make_context(functions=fns))
+        return _register(monkeypatch, _make_context(functions=fns))
 
-    def test_default_limit_returns_first_page(self):
-        tools = self._build()
+    def test_default_limit_returns_first_page(self, monkeypatch):
+        tools = self._build(monkeypatch)
         result = tools["scan_pseudocode"]("/bin/test.exe", limit=10)
         assert "25 finding" in result
         assert "Showing 1-10 of 25" in result
         assert "offset=10" in result
 
-    def test_offset_returns_next_page(self):
-        tools = self._build()
+    def test_offset_returns_next_page(self, monkeypatch):
+        tools = self._build(monkeypatch)
         result = tools["scan_pseudocode"]("/bin/test.exe", limit=10, offset=10)
         assert "Showing 11-20 of 25" in result
 
-    def test_offset_past_end(self):
-        tools = self._build()
+    def test_offset_past_end(self, monkeypatch):
+        tools = self._build(monkeypatch)
         result = tools["scan_pseudocode"]("/bin/test.exe", offset=999)
         assert "beyond the result set" in result
 
-    def test_summary_mode(self):
+    def test_summary_mode(self, monkeypatch):
         # 2 functions, different finding counts
         a = _make_function(name="hot", address="0x1000",
                            pseudocode="strcpy(a,b); gets(c); system(d);")
         b = _make_function(name="cool", address="0x2000",
                            pseudocode="strcpy(x,y);")
-        tools = _register(_make_context(functions=[a, b]))
+        tools = _register(monkeypatch, _make_context(functions=[a, b]))
         result = tools["scan_pseudocode"]("/bin/test.exe", mode="summary")
         assert "SUMMARY" in result
         assert "hot" in result and "cool" in result
@@ -673,14 +685,14 @@ class TestScanPseudocodePagination:
         assert result.index("hot") < result.index("cool")
         assert "critical=" in result or "high=" in result
 
-    def test_invalid_mode(self):
-        tools = self._build()
+    def test_invalid_mode(self, monkeypatch):
+        tools = self._build(monkeypatch)
         result = tools["scan_pseudocode"]("/bin/test.exe", mode="bogus")
         assert "Invalid mode" in result
 
 
 class TestGetReviewPackage:
-    def test_bundles_expected_sections(self):
+    def test_bundles_expected_sections(self, monkeypatch):
         target = _make_function(
             name="handler",
             address="0x1000",
@@ -697,7 +709,7 @@ class TestGetReviewPackage:
         )
         imports = [{"library": "msvcrt.dll", "name": "strlen", "address": None}]
         ctx = _make_context(functions=[target, caller], imports=imports)
-        tools = _register(ctx)
+        tools = _register(monkeypatch, ctx)
 
         result = tools["get_review_package"]("/bin/test.exe", "handler")
 
@@ -723,34 +735,34 @@ class TestGetReviewPackage:
         # Pseudocode embedded
         assert "return strlen(ctx)" in result
 
-    def test_partial_package_no_pseudocode(self):
+    def test_partial_package_no_pseudocode(self, monkeypatch):
         target = _make_function(
             name="stub",
             address="0x1000",
             pseudocode=None,
             basic_blocks=[{"start": "0x1000", "end": "0x1010", "num_addresses": 16}],
         )
-        tools = _register(_make_context(functions=[target]))
+        tools = _register(monkeypatch, _make_context(functions=[target]))
         result = tools["get_review_package"]("/bin/test.exe", "stub")
         assert "no pseudocode" in result.lower()
 
-    def test_unknown_function(self):
-        tools = _register(_make_context(functions=[_make_function()]))
+    def test_unknown_function(self, monkeypatch):
+        tools = _register(monkeypatch, _make_context(functions=[_make_function()]))
         result = tools["get_review_package"]("/bin/test.exe", "missing")
         assert "not found" in result.lower()
 
 
 class TestGetSwitchTables:
-    def test_no_field_in_cache(self):
+    def test_no_field_in_cache(self, monkeypatch):
         """Legacy cache without jump_tables key returns guidance."""
         legacy = _make_function()
         del legacy["jump_tables"]
-        tools = _register(_make_context(functions=[legacy]))
+        tools = _register(monkeypatch, _make_context(functions=[legacy]))
 
         result = tools["get_switch_tables"]("/bin/test.exe")
         assert "predates" in result.lower() or "re-run" in result.lower()
 
-    def test_lists_tables(self):
+    def test_lists_tables(self, monkeypatch):
         fn = _make_function(
             name="dispatcher",
             address="0x1000",
@@ -761,13 +773,13 @@ class TestGetSwitchTables:
                 }
             ],
         )
-        tools = _register(_make_context(functions=[fn]))
+        tools = _register(monkeypatch, _make_context(functions=[fn]))
         result = tools["get_switch_tables"]("/bin/test.exe")
         assert "dispatcher" in result
         assert "switch @ 0x1020" in result
         assert "3 cases" in result
 
-    def test_filter_to_one_function(self):
+    def test_filter_to_one_function(self, monkeypatch):
         matching = _make_function(
             name="keep",
             address="0x1000",
@@ -778,7 +790,7 @@ class TestGetSwitchTables:
             address="0x3000",
             jump_tables=[{"source_addr": "0x3020", "targets": ["0x4000"]}],
         )
-        tools = _register(_make_context(functions=[matching, other]))
+        tools = _register(monkeypatch, _make_context(functions=[matching, other]))
         result = tools["get_switch_tables"]("/bin/test.exe", "keep")
         assert "keep" in result
         assert "skip" not in result
@@ -1050,7 +1062,7 @@ class TestContextRuleDispatch:
         assert scan_text("", [rule]) == []
         assert scan_text(None, [rule]) == []  # type: ignore[arg-type]
 
-    def test_mixed_kinds_compose_under_adjust_confidences(self):
+    def test_mixed_kinds_compose_under_adjust_confidences(self, monkeypatch):
         """Both kinds in one scan: corroboration bonus applies across kinds."""
         from src.utils.pseudocode_rules import (
             CORROBORATION_BONUS,
@@ -1115,7 +1127,7 @@ class TestContextRuleScanPseudocodeIntegration:
         fn_dict = _make_function(
             name="vuln", address="0x1000", pseudocode="FETCH_USER(buf);"
         )
-        tools = _register(_make_context(functions=[fn_dict]))
+        tools = _register(monkeypatch, _make_context(functions=[fn_dict]))
 
         result = tools["scan_pseudocode"]("/bin/test.exe")
 
@@ -1142,7 +1154,7 @@ class TestContextRuleScanPseudocodeIntegration:
         fn_dict = _make_function(
             name="any", address="0x1000", pseudocode="anything;"
         )
-        tools = _register(_make_context(functions=[fn_dict]))
+        tools = _register(monkeypatch, _make_context(functions=[fn_dict]))
 
         # severity_floor=medium suppresses an info-severity context rule.
         result = tools["scan_pseudocode"](
@@ -1174,7 +1186,7 @@ class TestContextRuleScanPseudocodeIntegration:
         fn_dict = _make_function(
             name="z", address="0x1000", pseudocode="anything;"
         )
-        tools = _register(_make_context(functions=[fn_dict]))
+        tools = _register(monkeypatch, _make_context(functions=[fn_dict]))
 
         result = tools["scan_pseudocode"](
             "/bin/test.exe", rule_ids=["CTX_A"]
@@ -1199,14 +1211,14 @@ def _vuln_function(pseudocode: str, *, params=None, name="vuln", address="0x4000
 
 
 class TestGetParamSinks:
-    def test_param_size_to_memcpy_flagged(self):
+    def test_param_size_to_memcpy_flagged(self, monkeypatch):
         pseudo = (
             "int handler() {\n"
             "  memcpy(dst, src, param_3);\n"
             "  return 0;\n"
             "}\n"
         )
-        tools = _register(_make_context(functions=[_vuln_function(pseudo)]))
+        tools = _register(monkeypatch, _make_context(functions=[_vuln_function(pseudo)]))
         result = tools["get_param_sinks"]("/bin/test.sys", "vuln")
 
         assert "memcpy()" in result
@@ -1214,29 +1226,29 @@ class TestGetParamSinks:
         assert "root=param_3" in result
         assert "structural" in result
 
-    def test_constant_size_not_flagged(self):
+    def test_constant_size_not_flagged(self, monkeypatch):
         pseudo = "memcpy(dst, src, 0x100);"
-        tools = _register(_make_context(functions=[_vuln_function(pseudo)]))
+        tools = _register(monkeypatch, _make_context(functions=[_vuln_function(pseudo)]))
         result = tools["get_param_sinks"]("/bin/test.sys", "vuln")
 
         assert "Findings:   0" in result
 
-    def test_unrelated_local_not_flagged(self):
+    def test_unrelated_local_not_flagged(self, monkeypatch):
         pseudo = (
             "local_x = 42;\n"
             "memcpy(dst, src, local_x);\n"
         )
-        tools = _register(_make_context(functions=[_vuln_function(pseudo)]))
+        tools = _register(monkeypatch, _make_context(functions=[_vuln_function(pseudo)]))
         result = tools["get_param_sinks"]("/bin/test.sys", "vuln")
 
         assert "Findings:   0" in result
 
-    def test_alias_propagation_flagged(self):
+    def test_alias_propagation_flagged(self, monkeypatch):
         pseudo = (
             "local_x = param_1;\n"
             "memcpy(dst, src, local_x);\n"
         )
-        tools = _register(_make_context(functions=[_vuln_function(pseudo)]))
+        tools = _register(monkeypatch, _make_context(functions=[_vuln_function(pseudo)]))
         result = tools["get_param_sinks"]("/bin/test.sys", "vuln")
 
         assert "memcpy()" in result
@@ -1244,7 +1256,7 @@ class TestGetParamSinks:
         # The intermediate alias statement should appear in the chain.
         assert "local_x = param_1" in result
 
-    def test_chain_depth_limit_drops_finding(self):
+    def test_chain_depth_limit_drops_finding(self, monkeypatch):
         # 7 hops (param_1 → a → b → c → d → e → f) plus the sink is too long.
         pseudo = (
             "a = param_1;\n"
@@ -1256,71 +1268,71 @@ class TestGetParamSinks:
             "g = f;\n"
             "memcpy(dst, src, g);\n"
         )
-        tools = _register(_make_context(functions=[_vuln_function(pseudo)]))
+        tools = _register(monkeypatch, _make_context(functions=[_vuln_function(pseudo)]))
         result = tools["get_param_sinks"]("/bin/test.sys", "vuln")
 
         assert "Findings:   0" in result
 
-    def test_pointer_indirection_demotes_confidence(self):
+    def test_pointer_indirection_demotes_confidence(self, monkeypatch):
         pseudo = (
             "n = *p;\n"
             "n = n + param_1;\n"
             "memcpy(dst, src, n);\n"
         )
-        tools = _register(_make_context(functions=[_vuln_function(pseudo)]))
+        tools = _register(monkeypatch, _make_context(functions=[_vuln_function(pseudo)]))
         result = tools["get_param_sinks"]("/bin/test.sys", "vuln")
 
         assert "memcpy()" in result
         assert "indirect" in result
 
-    def test_kernel_sink_recognised(self):
+    def test_kernel_sink_recognised(self, monkeypatch):
         pseudo = (
             "len = param_2;\n"
             "RtlCopyMemory(dst, src, len);\n"
         )
-        tools = _register(_make_context(functions=[_vuln_function(pseudo)]))
+        tools = _register(monkeypatch, _make_context(functions=[_vuln_function(pseudo)]))
         result = tools["get_param_sinks"]("/bin/test.sys", "vuln")
 
         assert "RtlCopyMemory()" in result
         assert "root=param_2" in result
 
-    def test_probe_for_read_recognised(self):
+    def test_probe_for_read_recognised(self, monkeypatch):
         pseudo = "ProbeForRead(param_1, param_2, 1);"
-        tools = _register(_make_context(functions=[_vuln_function(pseudo)]))
+        tools = _register(monkeypatch, _make_context(functions=[_vuln_function(pseudo)]))
         result = tools["get_param_sinks"]("/bin/test.sys", "vuln")
 
         assert "ProbeForRead()" in result
 
-    def test_function_not_found(self):
-        tools = _register(_make_context(functions=[_vuln_function("ret;")]))
+    def test_function_not_found(self, monkeypatch):
+        tools = _register(monkeypatch, _make_context(functions=[_vuln_function("ret;")]))
         result = tools["get_param_sinks"]("/bin/test.sys", "missing_func")
 
         assert "Function not found" in result
 
-    def test_no_pseudocode(self):
+    def test_no_pseudocode(self, monkeypatch):
         f = _make_function(name="empty", address="0x5000", pseudocode="")
-        tools = _register(_make_context(functions=[f]))
+        tools = _register(monkeypatch, _make_context(functions=[f]))
         result = tools["get_param_sinks"]("/bin/test.sys", "empty")
 
         assert "no pseudocode" in result
 
-    def test_no_parameters(self):
+    def test_no_parameters(self, monkeypatch):
         f = _make_function(
             name="leaf", address="0x6000",
             pseudocode="memcpy(dst, src, 16);",
             parameters=[],
         )
-        tools = _register(_make_context(functions=[f]))
+        tools = _register(monkeypatch, _make_context(functions=[f]))
         result = tools["get_param_sinks"]("/bin/test.sys", "leaf")
 
         assert "no parameters" in result
 
-    def test_shallow_cache_warning(self):
+    def test_shallow_cache_warning(self, monkeypatch):
         ctx = _make_context(
             functions=[_vuln_function("memcpy(dst, src, param_1);")],
         )
         ctx["metadata"]["analysis_depth"] = "structural"
-        tools = _register(ctx)
+        tools = _register(monkeypatch, ctx)
         result = tools["get_param_sinks"]("/bin/test.sys", "vuln")
 
         assert "structural" in result
@@ -1476,7 +1488,7 @@ class TestKernelDoubleFetch:
         hits = scan_text(pseudo, [rule])
         assert hits == []
 
-    def test_runs_through_scan_pseudocode(self):
+    def test_runs_through_scan_pseudocode(self, monkeypatch):
         """End-to-end: the rule surfaces from the default registry via
         scan_pseudocode just like any regex rule."""
         f = _make_function(
@@ -1488,7 +1500,7 @@ class TestKernelDoubleFetch:
                 "memcpy(buf, p->Data, p->Length);\n"
             ),
         )
-        tools = _register(_make_context(functions=[f]))
+        tools = _register(monkeypatch, _make_context(functions=[f]))
         result = tools["scan_pseudocode"](
             "/bin/test.sys", rule_ids=["KERNEL_DOUBLE_FETCH"]
         )

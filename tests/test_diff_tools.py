@@ -247,7 +247,7 @@ class TestPairingByPdbName:
             h = entry[min(count, len(entry) - 1)]
             return {"hash": h, "instruction_count": 10, "operands_normalized": 0}
 
-        dt._compute_function_hash = _fake_hash
+        monkeypatch.setattr(dt, "_compute_function_hash", _fake_hash)
 
         result = tool("/old.bin", "/new.bin")
 
@@ -324,7 +324,7 @@ class TestSecurityRanking:
             h = entry[min(count, len(entry) - 1)]
             return {"hash": h, "instruction_count": 10, "operands_normalized": 0}
 
-        dt._compute_function_hash = _fake_hash
+        monkeypatch.setattr(dt, "_compute_function_hash", _fake_hash)
 
         result = tool("/old.bin", "/new.bin", mode="security")
 
@@ -383,7 +383,7 @@ class TestModeNoneOrdering:
                 "operands_normalized": 0,
             }
 
-        dt._compute_function_hash = _fake_hash
+        monkeypatch.setattr(dt, "_compute_function_hash", _fake_hash)
 
         result = tool("/old.bin", "/new.bin", mode="none")
 
@@ -432,7 +432,7 @@ class TestAslrShiftedAddresses:
                 "operands_normalized": 0,
             }
 
-        dt._compute_function_hash = _fake_hash
+        monkeypatch.setattr(dt, "_compute_function_hash", _fake_hash)
 
         result = tool("/old.bin", "/new.bin")
 
@@ -609,7 +609,7 @@ class TestCallerDelta:
                 "operands_normalized": 0,
             }
 
-        dt._compute_function_hash = _fake_hash
+        monkeypatch.setattr(dt, "_compute_function_hash", _fake_hash)
 
         result = tool("/old.bin", "/new.bin")
         assert "callers=+2" in result

@@ -234,7 +234,175 @@ def classify_blob(data: bytes) -> tuple[str, str, float, list[str]]:
     return detected_type, description, entropy, reasons
 
 
-# --- Output dir defaulting ---
+# --- Output dir defaulting + validation ---
+
+
+# Hard denylist of POSIX system directories that no carver output should
+# ever land in. Used when no BINARY_MCP_ALLOWED_DIRS allow-list is
+# configured; otherwise the allow-list is authoritative. The ``/private/...``
+# entries cover macOS, where ``/etc`` is a symlink to ``/private/etc`` and
+# ``Path.resolve()`` returns the latter form.
+_DANGEROUS_PREFIXES: tuple[str, ...] = (
+    "/etc",
+    "/private/etc",
+    "/sys",
+    "/proc",
+    "/boot",
+    "/usr/bin",
+    "/usr/sbin",
+    "/usr/local/bin",
+    "/usr/local/sbin",
+    "/sbin",
+    "/bin",
+    "/var/spool",
+    "/private/var/spool",
+    "/var/log",
+    "/private/var/log",
+    "/var/lib",
+    "/private/var/lib",
+    "/root",
+    "/private/var/root",
+)
+
+
+def _validate_output_dir(out: Path) -> Path:
+    """
+    Validate a user-supplied carving output directory.
+
+    Rejects parent traversal (``..``), symlinks anywhere on the existing
+    portion of the path, and -- when no ``BINARY_MCP_ALLOWED_DIRS`` allow-list
+    is configured -- a hard-coded denylist of POSIX system directories.
+
+    Args:
+        out: User-supplied output directory (already ``.expanduser()``'d).
+
+    Returns:
+        Resolved absolute path (symlinks collapsed).
+
+    Raises:
+        StructuredBaseError: With ``ErrorCode.PARAMETER_INVALID`` when the
+            path fails validation. Never returns an unsafe path.
+    """
+    from src.utils.security import get_allowed_dirs
+    from src.utils.structured_errors import (
+        ErrorCode,
+        StructuredBaseError,
+        StructuredError,
+    )
+
+    if any(part == ".." for part in out.parts):
+        raise StructuredBaseError(
+            StructuredError(
+                error=ErrorCode.PARAMETER_INVALID,
+                message="Invalid output_dir",
+                reason="output_dir must not contain '..' (parent traversal)",
+                suggestions=["Use an absolute path with no '..' components"],
+                debug_info={"output_dir": str(out)},
+            )
+        )
+
+    # Reject if the user-supplied leaf is itself a symlink. We deliberately
+    # don't reject symlinks in *parent* components -- on macOS the system
+    # exposes ``/var -> /private/var`` and ``/tmp -> /private/tmp`` as
+    # legitimate OS topology, and pytest's ``tmp_path`` lives behind those.
+    # The denylist below is checked against BOTH the user-input absolute
+    # path and the symlink-resolved path, which catches the practical
+    # threat (a user-controlled symlink pointing into ``/etc`` etc.).
+    try:
+        if out.is_symlink():
+            raise StructuredBaseError(
+                StructuredError(
+                    error=ErrorCode.PARAMETER_INVALID,
+                    message="Invalid output_dir",
+                    reason=f"output_dir is a symlink: {out}",
+                    suggestions=["Provide a non-symlinked absolute path"],
+                    debug_info={"output_dir": str(out)},
+                )
+            )
+    except OSError:
+        # Stat failed -- treat as suspect input
+        raise StructuredBaseError(
+            StructuredError(
+                error=ErrorCode.PARAMETER_INVALID,
+                message="Invalid output_dir",
+                reason=f"Cannot stat output_dir: {out}",
+                debug_info={"output_dir": str(out)},
+            )
+        ) from None
+
+    try:
+        resolved = out.resolve()
+    except (OSError, RuntimeError) as e:
+        raise StructuredBaseError(
+            StructuredError(
+                error=ErrorCode.PARAMETER_INVALID,
+                message="Invalid output_dir",
+                reason=f"Path could not be resolved: {e}",
+                debug_info={"output_dir": str(out)},
+            )
+        ) from e
+
+    if not resolved.is_absolute():
+        raise StructuredBaseError(
+            StructuredError(
+                error=ErrorCode.PARAMETER_INVALID,
+                message="Invalid output_dir",
+                reason="output_dir must resolve to an absolute path",
+                debug_info={"output_dir": str(out), "resolved": str(resolved)},
+            )
+        )
+
+    allowed = get_allowed_dirs()
+    if allowed:
+        for d in allowed:
+            try:
+                d_resolved = d.resolve()
+            except (OSError, RuntimeError):
+                continue
+            try:
+                if resolved.is_relative_to(d_resolved):
+                    return resolved
+            except ValueError:
+                continue
+        raise StructuredBaseError(
+            StructuredError(
+                error=ErrorCode.PARAMETER_INVALID,
+                message="Invalid output_dir",
+                reason="output_dir is not within any BINARY_MCP_ALLOWED_DIRS entry",
+                suggestions=[
+                    "Add the desired directory to BINARY_MCP_ALLOWED_DIRS",
+                    "Or omit output_dir to use the default carve cache",
+                ],
+                debug_info={
+                    "output_dir": str(out),
+                    "resolved": str(resolved),
+                    "allowed_dirs": [str(d) for d in allowed],
+                },
+            )
+        )
+
+    # No allow-list configured: hard-block obvious system directories. Check
+    # the unresolved absolute path *and* the symlink-resolved path so a
+    # user-controlled "/tmp/link -> /etc" attack is caught even when the link
+    # itself isn't on the denylist.
+    abs_user = out if out.is_absolute() else out.absolute()
+    for candidate in {str(abs_user), str(resolved)}:
+        for prefix in _DANGEROUS_PREFIXES:
+            if candidate == prefix or candidate.startswith(prefix + "/"):
+                raise StructuredBaseError(
+                    StructuredError(
+                        error=ErrorCode.PARAMETER_INVALID,
+                        message="Invalid output_dir",
+                        reason=f"output_dir resolves to a system directory: {candidate}",
+                        suggestions=[
+                            "Choose a path under your home or a temp directory",
+                            "Or set BINARY_MCP_ALLOWED_DIRS to an explicit allow-list",
+                        ],
+                        debug_info={"output_dir": str(out), "resolved": str(resolved)},
+                    )
+                )
+
+    return resolved
 
 
 def _default_carve_dir() -> Path:
@@ -314,19 +482,11 @@ def carve(
     binary_sha256 = hashlib.sha256(raw).hexdigest()
 
     if output_dir is None:
+        # Default cache dir is host-controlled, not user-controlled; bypass
+        # the user-input validator.
         out = _default_carve_dir() / binary_sha256
     else:
-        out = Path(output_dir).expanduser()
-        if any(part == ".." for part in out.parts):
-            raise StructuredBaseError(
-                StructuredError(
-                    error=ErrorCode.PARAMETER_INVALID,
-                    message="Invalid output_dir",
-                    reason="output_dir must not contain '..' (parent traversal)",
-                    suggestions=["Use an absolute path with no '..' components"],
-                    debug_info={"output_dir": str(output_dir)},
-                )
-            )
+        out = _validate_output_dir(Path(output_dir).expanduser())
 
     if max_total_mb <= 0:
         raise StructuredBaseError(

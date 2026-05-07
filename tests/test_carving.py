@@ -502,6 +502,104 @@ class TestCarveIntegration:
 
 
 # ---------------------------------------------------------------------------
+# output_dir traversal hardening (T19 HIGH)
+# ---------------------------------------------------------------------------
+
+
+class TestOutputDirHardening:
+    """Reject system directories, symlinks, and respect BINARY_MCP_ALLOWED_DIRS."""
+
+    def test_rejects_etc(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        from src.utils.structured_errors import StructuredBaseError
+
+        monkeypatch.delenv("BINARY_MCP_ALLOWED_DIRS", raising=False)
+        pe_path = _write_pe(tmp_path, _build_pe_with_resources())
+        with pytest.raises(StructuredBaseError) as excinfo:
+            carve(pe_path, Path("/etc"))
+        msg = str(excinfo.value).lower()
+        assert "system directory" in msg or "output_dir" in msg
+
+    def test_rejects_var_spool_cron_subpath(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        from src.utils.structured_errors import StructuredBaseError
+
+        monkeypatch.delenv("BINARY_MCP_ALLOWED_DIRS", raising=False)
+        pe_path = _write_pe(tmp_path, _build_pe_with_resources())
+        with pytest.raises(StructuredBaseError) as excinfo:
+            carve(pe_path, Path("/var/spool/cron/tmp"))
+        assert "system directory" in str(excinfo.value).lower()
+
+    def test_rejects_symlink_as_output_dir(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """When output_dir itself is a symlink, reject regardless of target."""
+        from src.utils.structured_errors import StructuredBaseError
+
+        monkeypatch.delenv("BINARY_MCP_ALLOWED_DIRS", raising=False)
+        target_dir = tmp_path / "real"
+        target_dir.mkdir()
+        link = tmp_path / "link"
+        os.symlink(target_dir, link)
+        pe_path = _write_pe(tmp_path, _build_pe_with_resources())
+
+        with pytest.raises(StructuredBaseError) as excinfo:
+            carve(pe_path, link)
+        assert "symlink" in str(excinfo.value).lower()
+
+    def test_rejects_symlink_pointing_to_dangerous_dir(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A symlink whose target is a system dir is caught after resolve()."""
+        from src.utils.structured_errors import StructuredBaseError
+
+        monkeypatch.delenv("BINARY_MCP_ALLOWED_DIRS", raising=False)
+        link = tmp_path / "evil"
+        os.symlink("/etc", link)  # symlink target is a system directory
+        pe_path = _write_pe(tmp_path, _build_pe_with_resources())
+
+        with pytest.raises(StructuredBaseError) as excinfo:
+            # The leaf-symlink check fires first, before resolve(). Either
+            # rejection mechanism is acceptable as long as we don't carve into /etc.
+            carve(pe_path, link / "subdir")
+        msg = str(excinfo.value).lower()
+        assert "system directory" in msg or "symlink" in msg
+
+    def test_accepts_path_inside_allowed_dirs(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        # When BINARY_MCP_ALLOWED_DIRS is set and the output dir is inside it,
+        # the path is accepted (carve runs and produces a result).
+        sandbox = tmp_path / "sandbox"
+        sandbox.mkdir()
+        monkeypatch.setenv("BINARY_MCP_ALLOWED_DIRS", str(sandbox))
+
+        payload = b"MZ" + os.urandom(254)
+        pe_bytes = _build_pe_with_resources([(10, 700, 0, payload)])
+        pe_path = _write_pe(tmp_path, pe_bytes)
+
+        result = carve(pe_path, sandbox / "out")
+        # Should produce one carved blob without error
+        assert any(b.flagged for b in result.blobs)
+
+    def test_rejects_path_outside_allowed_dirs(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        from src.utils.structured_errors import StructuredBaseError
+
+        sandbox = tmp_path / "sandbox"
+        sandbox.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        monkeypatch.setenv("BINARY_MCP_ALLOWED_DIRS", str(sandbox))
+
+        pe_path = _write_pe(tmp_path, _build_pe_with_resources())
+        with pytest.raises(StructuredBaseError) as excinfo:
+            carve(pe_path, outside / "out")
+        assert "allowed" in str(excinfo.value).lower()
+
+
+# ---------------------------------------------------------------------------
 # Default cache-dir resolution
 # ---------------------------------------------------------------------------
 

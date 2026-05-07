@@ -379,6 +379,15 @@ class TestEarlyErrors:
         result = tool("/bin/test.sys", function_filter="(unclosed[")
         assert "invalid function_filter" in result
 
+    def test_safe_regex_compile_rejects_redos(self):
+        """ReDoS-shaped patterns are rejected by safe_regex_compile and
+        surface as a structured error rather than reaching the regex engine."""
+        f = _make_function(name="DriverDispatch")
+        tool, *_ = _register(_make_context(functions=[f]))
+        result = tool("/bin/test.sys", function_filter="(.+)+a")
+        assert "invalid function_filter" in result
+        assert "ReDoS" in result or "nested quantifiers" in result
+
 
 class TestFunctionFilter:
     def test_filter_restricts_results(self):

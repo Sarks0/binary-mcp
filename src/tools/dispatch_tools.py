@@ -292,6 +292,7 @@ def register_dispatch_tools(app, session_manager, cache, runner):
         FileSizeError,
         PathTraversalError,
         safe_error_message,
+        safe_regex_compile,
         sanitize_binary_path,
     )
 
@@ -346,10 +347,13 @@ def register_dispatch_tools(app, session_manager, cache, runner):
             if not functions:
                 return f"No functions found in {Path(binary_path).name}."
 
-            try:
-                name_re = re.compile(function_filter) if function_filter else None
-            except re.error as e:
-                return f"Error: invalid function_filter regex: {e}"
+            if function_filter:
+                try:
+                    name_re = safe_regex_compile(function_filter, max_length=200)
+                except ValueError as e:
+                    return f"Error: invalid function_filter regex: {e}"
+            else:
+                name_re = None
 
             addr_index = _build_addr_index(functions)
             jump_table_index = _build_jump_table_index(functions)

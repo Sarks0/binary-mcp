@@ -296,6 +296,12 @@ def register_dispatch_tools(app, session_manager, cache, runner):
         sanitize_binary_path,
     )
 
+    # ``runner`` is accepted for signature parity with sibling
+    # register_*_tools entrypoints; find_ioctl_handlers is strictly
+    # cache-only and never invokes it. ``del`` makes the intentional
+    # non-use explicit to static-analysis tools.
+    del runner
+
     @app.tool()
     def find_ioctl_handlers(
         binary_path: str,
@@ -417,7 +423,7 @@ def register_dispatch_tools(app, session_manager, cache, runner):
         except (PathTraversalError, FileSizeError) as e:
             return safe_error_message("find_ioctl_handlers", e)
         except Exception as e:
-            logger.error(f"find_ioctl_handlers failed: {e}")
+            logger.exception("find_ioctl_handlers failed")
             return safe_error_message("Failed to find IOCTL handlers", e)
 
     logger.info("Registered 1 dispatch tool")

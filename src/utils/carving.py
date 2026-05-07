@@ -573,35 +573,77 @@ def carve(
                                 )
                             ) from e
                     target = out / sha256
-                    if target.exists():
+                    sidecar = out / f"{sha256}.json"
+                    # Atomic create-or-fail: O_EXCL closes the TOCTOU window
+                    # in the previous "if target.exists(): ... else: write"
+                    # pattern. 0o600 keeps potentially-malicious payloads
+                    # readable only by the owning user.
+                    try:
+                        fd = os.open(
+                            str(target),
+                            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                            0o600,
+                        )
+                    except FileExistsError:
                         written_path = str(target)
                         skip_reason = "exists (no overwrite)"
                     else:
+                        wrote_blob = False
                         try:
-                            target.write_bytes(data)
+                            with os.fdopen(fd, "wb") as f:
+                                f.write(data)
+                            wrote_blob = True
                             written_path = str(target)
                             spent += len(data)
-                            sidecar = out / f"{sha256}.json"
-                            sidecar.write_text(
-                                json.dumps(
-                                    {
-                                        "source": source,
-                                        "resource_path": rpath,
-                                        "file_offset": foff,
-                                        "size": len(data),
-                                        "sha256": sha256,
-                                        "detected_type": detected_type,
-                                        "detected_description": description,
-                                        "entropy": round(entropy, 4),
-                                        "flag_reasons": list(reasons),
-                                        "parent_binary": str(sanitized),
-                                        "parent_sha256": binary_sha256,
-                                    },
-                                    indent=2,
-                                )
-                            )
                         except OSError as e:
                             skip_reason = f"write failed: {e}"
+                            try:
+                                target.unlink()
+                            except OSError:
+                                pass
+
+                        if wrote_blob:
+                            # Atomic sidecar create -- if a sidecar already
+                            # exists at this sha256, leave it alone (honours
+                            # the never-overwrite contract for both blob and
+                            # metadata).
+                            try:
+                                sfd = os.open(
+                                    str(sidecar),
+                                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                                    0o600,
+                                )
+                            except FileExistsError:
+                                logger.debug(
+                                    "sidecar already exists, leaving it: %s",
+                                    sidecar,
+                                )
+                            else:
+                                try:
+                                    with os.fdopen(sfd, "w") as f:
+                                        json.dump(
+                                            {
+                                                "source": source,
+                                                "resource_path": rpath,
+                                                "file_offset": foff,
+                                                "size": len(data),
+                                                "sha256": sha256,
+                                                "detected_type": detected_type,
+                                                "detected_description": description,
+                                                "entropy": round(entropy, 4),
+                                                "flag_reasons": list(reasons),
+                                                "parent_binary": str(sanitized),
+                                                "parent_sha256": binary_sha256,
+                                            },
+                                            f,
+                                            indent=2,
+                                        )
+                                except OSError as e:
+                                    logger.debug("sidecar write failed: %s", e)
+                                    try:
+                                        sidecar.unlink()
+                                    except OSError:
+                                        pass
 
             result.blobs.append(
                 CarvedBlob(

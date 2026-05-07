@@ -474,8 +474,33 @@ class TestCarveIntegration:
         result = carve(pe_path, out)
         b = result.blobs[0]
         assert b.write_skipped_reason == "exists (no overwrite)"
-        # Existing bytes must remain untouched
+        # Existing bytes must remain untouched (TOCTOU + O_EXCL guarantee)
         assert existing.read_bytes() == b"DO NOT OVERWRITE"
+
+    def test_no_overwrite_existing_sidecar(self, tmp_path: Path):
+        """A pre-existing sidecar JSON at the target path must NOT be overwritten."""
+        import hashlib
+
+        payload = b"MZ" + os.urandom(254)
+        pe_bytes = _build_pe_with_resources([(10, 600, 0, payload)])
+        pe_path = _write_pe(tmp_path, pe_bytes)
+        out = tmp_path / "out"
+        out.mkdir()
+
+        sha = hashlib.sha256(payload).hexdigest()
+        # Pre-create ONLY the sidecar (not the blob). The blob will be carved
+        # fresh, but the sidecar must be left alone.
+        existing_sidecar = out / f"{sha}.json"
+        existing_sidecar.write_text('{"reserved": "do not overwrite this manifest"}')
+
+        result = carve(pe_path, out)
+        b = result.blobs[0]
+        # Blob was created fresh
+        assert b.written_path is not None
+        assert (out / sha).read_bytes() == payload
+        # Sidecar bytes preserved verbatim
+        assert existing_sidecar.read_text() == \
+            '{"reserved": "do not overwrite this manifest"}'
 
     def test_invalid_output_dir_with_parent_traversal(self, tmp_path: Path):
         from src.utils.structured_errors import StructuredBaseError

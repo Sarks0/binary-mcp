@@ -1881,6 +1881,249 @@ def decompile_function(
 
 # --- Phase 2: Enhanced Analysis Tools (P1 - Important) ---
 
+
+@app.tool()
+@log_to_session
+def expand_callgraph(
+    binary_path: str,
+    root: str,
+    depth: int = 2,
+    exclude_imports: bool = True,
+    exclude_thunks: bool = True,
+    max_functions: int = 100,
+) -> str:
+    """
+    BFS the callee graph from a starting function and decompile what's missing.
+
+    Replaces the manual loop of "decompile X, copy each FUN_* address out
+    of the pseudocode, run analyze_binary on each range, repeat" with a
+    single call. Walks ``called_functions`` from the cache, identifies
+    callees that are uncached or lack pseudocode, and runs targeted
+    incremental decompiles for them. Stops when the frontier is empty,
+    the depth limit is hit, or ``max_functions`` decompiles have run.
+
+    The "completeness" question -- how do you know when the subtree is
+    fully resolved -- is answered explicitly: status reports
+    ``complete`` only when every reachable callee within ``depth`` is
+    either decompiled, external/imported, a thunk, or already cached
+    with pseudocode.
+
+    Args:
+        binary_path: Path to analyzed binary
+        root: Function name OR address to start from
+        depth: Number of callee hops to walk (default 2). Depth 0 is
+            just the root; depth 1 is root + its direct callees;
+            depth N is N hops out.
+        exclude_imports: Don't recurse into external/imported functions.
+        exclude_thunks: Don't recurse into Ghidra thunks.
+        max_functions: Hard cap on decompiles performed in one call.
+            Hitting this returns ``status=partial-cap`` so you know to
+            re-invoke (the previously-decompiled functions are now
+            cache-warm so the next call resumes cheaply).
+
+    Returns:
+        Per-depth tally + classification breakdown + status flag + next-
+        action hint when partial.
+    """
+    try:
+        depth = validate_numeric_range(depth, 0, 10, "depth")
+        max_functions = validate_numeric_range(
+            max_functions, 1, 1000, "max_functions"
+        )
+
+        context = get_analysis_context(binary_path)
+        functions = context.get("functions", [])
+        if not functions:
+            return f"No cached functions for {binary_path}. Run analyze_binary first."
+
+        # Resolve root: try name match first, then address match.
+        root_norm = _normalize_xref_addr(root)
+        root_fn = None
+        for fn in functions:
+            if fn.get("name") == root:
+                root_fn = fn
+                break
+        if root_fn is None and root_norm:
+            for fn in functions:
+                if _normalize_xref_addr(fn.get("address")) == root_norm:
+                    root_fn = fn
+                    break
+        if root_fn is None:
+            return (
+                f"Root function not found: {root!r}. Pass either a "
+                f"symbolic name (e.g. 'MpContainerOpen') or an address "
+                f"(e.g. '0x180447d30')."
+            )
+
+        root_addr = root_fn.get("address")
+        if not root_addr:
+            return f"Root function {root!r} has no address; cannot walk."
+
+        # Walk + decompile loop. Each iteration re-walks the current cache
+        # state so newly-decompiled functions reveal their callees on the
+        # next pass.
+        decompiled_this_run = 0
+        skipped_external = 0
+        skipped_thunk = 0
+        already_cached = 0
+        decompile_failures: list[str] = []
+        per_depth_count: dict[int, int] = {}
+        cap_hit = False
+
+        # Address index gets refreshed after each decompile batch.
+        def _build_addr_index(fn_list: list[dict]) -> dict[str, dict]:
+            return {
+                _normalize_xref_addr(f.get("address")): f
+                for f in fn_list
+                if f.get("address")
+            }
+
+        addr_index = _build_addr_index(functions)
+        visited: set[str] = set()
+
+        # Outer loop: keep walking until the frontier stops producing
+        # new decompile work or we hit a cap. Bounded iteration count
+        # protects against pathological cases.
+        for _iteration in range(max(depth + 2, 4)):
+            frontier: list[tuple[str, int]] = []
+            queue: list[tuple[str, int]] = [(_normalize_xref_addr(root_addr), 0)]
+            local_visited: set[str] = set()
+
+            while queue:
+                addr_norm, d = queue.pop(0)
+                if addr_norm in local_visited:
+                    continue
+                local_visited.add(addr_norm)
+
+                fn = addr_index.get(addr_norm)
+                if fn is None:
+                    if addr_norm not in visited:
+                        frontier.append((addr_norm, d))
+                    continue
+
+                per_depth_count[d] = per_depth_count.get(d, 0) + 1
+
+                if exclude_imports and fn.get("is_external"):
+                    if addr_norm not in visited:
+                        skipped_external += 1
+                        visited.add(addr_norm)
+                    continue
+                if exclude_thunks and fn.get("is_thunk"):
+                    if addr_norm not in visited:
+                        skipped_thunk += 1
+                        visited.add(addr_norm)
+                    continue
+
+                if not fn.get("pseudocode"):
+                    if addr_norm not in visited and d <= depth:
+                        frontier.append((addr_norm, d))
+                    continue
+
+                if addr_norm not in visited:
+                    visited.add(addr_norm)
+                    already_cached += 1
+
+                if d >= depth:
+                    continue
+                for callee in fn.get("called_functions", []) or []:
+                    callee_addr = _normalize_xref_addr(callee.get("address"))
+                    if callee_addr and callee_addr not in local_visited:
+                        queue.append((callee_addr, d + 1))
+
+            if not frontier:
+                break
+
+            # Decompile each frontier address (subprocess per call --
+            # slow but correct; future work could batch by proximity).
+            made_progress = False
+            for addr_norm, _d in frontier:
+                if decompiled_this_run >= max_functions:
+                    cap_hit = True
+                    break
+                # Use the original (un-normalised) address from cache when
+                # possible so Ghidra parses it cleanly. Fall back to 0x-prefixed
+                # normalized form for not-yet-cached functions.
+                fn_existing = addr_index.get(addr_norm)
+                target_addr = (
+                    fn_existing.get("address") if fn_existing else f"0x{addr_norm}"
+                )
+                try:
+                    new_context = get_analysis_context(
+                        binary_path,
+                        incremental=True,
+                        start_address=target_addr,
+                        max_functions=1,
+                    )
+                    functions = new_context.get("functions", [])
+                    addr_index = _build_addr_index(functions)
+                    decompiled_this_run += 1
+                    visited.add(addr_norm)
+                    made_progress = True
+                except Exception as e:
+                    logger.warning(
+                        f"expand_callgraph: decompile of {target_addr} failed: {e}"
+                    )
+                    decompile_failures.append(target_addr)
+                    visited.add(addr_norm)
+
+            if cap_hit or not made_progress:
+                break
+
+        # Status classification.
+        if cap_hit:
+            status = "partial-cap"
+            hint = (
+                f"\nHit max_functions cap of {max_functions}. Re-invoke "
+                f"expand_callgraph with the same root to resume; the "
+                f"already-decompiled functions are cache-warm so the "
+                f"next call picks up where this one stopped."
+            )
+        elif decompile_failures:
+            status = "partial-error"
+            hint = (
+                f"\n{len(decompile_failures)} decompile(s) failed. "
+                f"Failing addresses: "
+                f"{', '.join(decompile_failures[:5])}"
+                + (" ..." if len(decompile_failures) > 5 else "")
+            )
+        else:
+            status = "complete"
+            hint = (
+                "\nAll reachable callees within depth are either "
+                "decompiled, external, a thunk, or were already cached. "
+                "No further crawling needed in this subtree."
+            )
+
+        depth_lines = "\n".join(
+            f"  - depth {d}: {n} function(s)"
+            for d, n in sorted(per_depth_count.items())
+        ) or "  (none)"
+
+        return (
+            f"**expand_callgraph from `{root_fn.get('name', root)}` "
+            f"@ {root_addr}**\n"
+            f"\n"
+            f"Coverage by depth:\n{depth_lines}\n"
+            f"\n"
+            f"Run summary:\n"
+            f"- Functions decompiled this run: {decompiled_this_run}\n"
+            f"- Already cached with pseudocode: {already_cached}\n"
+            f"- Skipped (external/import): {skipped_external}\n"
+            f"- Skipped (thunk): {skipped_thunk}\n"
+            f"- Decompile failures: {len(decompile_failures)}\n"
+            f"\n"
+            f"Status: **{status}**{hint}"
+        )
+
+    except (PathTraversalError, FileSizeError) as e:
+        return safe_error_message("Invalid binary path", e)
+    except (UserFacingError, GhidraAnalysisError):
+        raise
+    except Exception as e:
+        logger.exception(f"expand_callgraph failed: {e}")
+        return safe_error_message("expand_callgraph failed", e)
+
+
 @app.tool()
 @log_to_session
 def get_call_graph(

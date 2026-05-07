@@ -1072,6 +1072,105 @@ def load_pdb(
 
 
 @app.tool()
+def clean_cache(
+    binary_path: str | None = None,
+    include_ghidra_projects: bool = False,
+) -> str:
+    """
+    Drop cached analysis artifacts from the cache directory.
+
+    Use this to free disk space, force a clean re-analyze, or recover
+    from a stuck cache state. The user-supplied notes side-car
+    (``<hash>.notes.json``) is preserved on per-binary invalidation so
+    annotations survive a re-analyze; a full wipe (no ``binary_path``)
+    drops them.
+
+    Args:
+        binary_path: Path to a specific binary to invalidate. Omit to
+            wipe the entire cache directory.
+        include_ghidra_projects: Also remove the matching Ghidra project
+            artifacts (``ghidra_projects/<name>.{gpr,lock,rep}``). Off by
+            default because Ghidra project state is the most expensive
+            thing to rebuild -- only include it when you genuinely want
+            to discard the project (e.g. corrupted lock file, switching
+            Ghidra versions).
+
+    Returns:
+        Summary of what was removed and how much space was freed.
+    """
+    try:
+        cache_dir = cache.cache_dir
+
+        def _dir_size(path: Path) -> int:
+            total = 0
+            try:
+                for p in path.rglob("*"):
+                    try:
+                        if p.is_file():
+                            total += p.stat().st_size
+                    except OSError:
+                        pass
+            except OSError:
+                pass
+            return total
+
+        before = _dir_size(cache_dir)
+
+        if binary_path is not None:
+            try:
+                binary_path = sanitize_binary_path(
+                    binary_path,
+                    allowed_dirs=get_allowed_dirs(),
+                )
+            except FileNotFoundError:
+                return (
+                    f"Binary not found: {binary_path}\n"
+                    f"To wipe a stale cache for a missing binary, call "
+                    f"clean_cache() with no arguments (full wipe), or "
+                    f"delete the relevant <hash>.* files manually from "
+                    f"{cache_dir}."
+                )
+
+            ok = cache.invalidate(
+                str(binary_path),
+                include_project=include_ghidra_projects,
+            )
+            if not ok:
+                return safe_error_message(
+                    "Cache invalidation failed",
+                    RuntimeError(f"invalidate returned False for {binary_path}"),
+                )
+
+            after = _dir_size(cache_dir)
+            freed = before - after
+            return (
+                f"**Cache invalidated for {Path(binary_path).name}**\n"
+                f"- Cache files removed (gz / legacy / meta / funcidx)\n"
+                f"- Notes side-car preserved\n"
+                f"- Ghidra project removed: "
+                f"{'yes' if include_ghidra_projects else 'no'}\n"
+                f"- Freed: {freed / (1024 * 1024):.2f} MB"
+            )
+
+        removed = cache.clear_all(include_projects=include_ghidra_projects)
+        after = _dir_size(cache_dir)
+        freed = before - after
+        return (
+            f"**Cache fully wiped**\n"
+            f"- Top-level entries removed: {removed}\n"
+            f"- ghidra_projects/ removed: "
+            f"{'yes' if include_ghidra_projects else 'no'}\n"
+            f"- Freed: {freed / (1024 * 1024):.2f} MB"
+        )
+
+    except (PathTraversalError, FileSizeError) as e:
+        return safe_error_message("Invalid binary path", e)
+    except Exception as e:
+        logger.exception(f"clean_cache failed: {e}")
+        return safe_error_message("Cache cleanup failed", e)
+
+
+@app.tool()
 @log_to_session
 def get_functions(
     binary_path: str,

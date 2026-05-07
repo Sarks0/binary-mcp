@@ -16,10 +16,16 @@ import gzip
 import hashlib
 import json
 import logging
+import re
+import shutil
 import time
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+# Side-car suffixes that share the <hash>.<suffix> stem with a cache file.
+# When auto-pruning legacy <hash>.json duplicates we must NOT touch these.
+_SIDECAR_SUFFIXES = (".meta.json", ".funcidx.json", ".notes.json")
 
 
 class ProjectCache:
@@ -38,7 +44,43 @@ class ProjectCache:
             self.cache_dir = Path(cache_dir)
 
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        logger.info(f"Project cache initialized: {self.cache_dir}")
+        pruned = self._prune_legacy_duplicates()
+        if pruned:
+            logger.info(
+                f"Project cache initialized: {self.cache_dir} "
+                f"(pruned {pruned} legacy .json duplicate(s))"
+            )
+        else:
+            logger.info(f"Project cache initialized: {self.cache_dir}")
+
+    def _prune_legacy_duplicates(self) -> int:
+        """Delete legacy <hash>.json files that have a matching <hash>.json.gz.
+
+        Pre-PR #113 caches were uncompressed JSON. After that PR every save
+        writes ``.json.gz``; the legacy reader survives but no migration ever
+        removes the now-redundant uncompressed copy. Over time these
+        accumulate (every binary you've ever analyzed leaves an 11-130 KB
+        file behind). On startup we drop any legacy .json that has a
+        matching .json.gz -- the side-cars (.meta.json, .funcidx.json,
+        .notes.json) are skipped because their stems include a sub-suffix.
+        """
+        pruned = 0
+        for gz in self.cache_dir.glob("*.json.gz"):
+            # gz.name == "<hash>.json.gz" -> stem of stem == "<hash>"
+            binary_hash = Path(gz.stem).stem
+            legacy = self.cache_dir / f"{binary_hash}.json"
+            if not legacy.exists():
+                continue
+            # Defence in depth: never touch a side-car even if a hash
+            # collision somehow produced one with this exact name.
+            if any(legacy.name.endswith(s) for s in _SIDECAR_SUFFIXES):
+                continue
+            try:
+                legacy.unlink()
+                pruned += 1
+            except OSError as e:
+                logger.warning(f"Could not prune legacy cache {legacy}: {e}")
+        return pruned
 
     def _get_binary_hash(self, binary_path: str) -> str:
         """Calculate SHA256 hash of binary file."""
@@ -231,13 +273,62 @@ class ProjectCache:
             logger.error(f"Error looking up function by address: {e}")
             return None
 
-    def invalidate(self, binary_path: str) -> bool:
+    def _get_project_name(self, binary_path: str) -> str:
+        """Mirror runner.py's project_name derivation from a binary path.
+
+        Must stay in sync with ``GhidraRunner.analyze`` so cache cleanup
+        targets the same ghidra_projects entries the runner created.
+        """
+        stem = Path(binary_path).stem
+        name = re.sub(r'[^a-zA-Z0-9_.\-]', '_', stem)
+        if name.startswith('-'):
+            name = f"proj_{name}"
+        return name
+
+    def _ghidra_project_paths(self, project_name: str) -> list[Path]:
+        """Return the .gpr / .lock / .rep paths for a project_name."""
+        project_dir = self.cache_dir / "ghidra_projects"
+        return [
+            project_dir / f"{project_name}.gpr",
+            project_dir / f"{project_name}.lock",
+            project_dir / f"{project_name}.rep",
+        ]
+
+    def _drop_ghidra_project(self, project_name: str) -> int:
+        """Remove a binary's Ghidra project artifacts.
+
+        Returns the number of paths removed (0-3).
+        """
+        removed = 0
+        for p in self._ghidra_project_paths(project_name):
+            if not p.exists():
+                continue
+            try:
+                if p.is_dir():
+                    shutil.rmtree(p, ignore_errors=False)
+                else:
+                    p.unlink()
+                removed += 1
+            except OSError as e:
+                logger.warning(f"Could not remove project artifact {p}: {e}")
+        return removed
+
+    def invalidate(self, binary_path: str, include_project: bool = False) -> bool:
         """Invalidate cached results for a binary (all formats + sidecars).
 
         The notes side-car (``<hash>.notes.json``) is intentionally
         preserved so that user-supplied annotations survive a
         ``force_reanalyze`` or ``load_pdb`` rebuild. Use :meth:`clear_all`
         for an explicit full wipe.
+
+        Args:
+            binary_path: Path to the binary whose cache should be dropped.
+            include_project: Also remove the matching
+                ``ghidra_projects/<name>.{gpr,lock,rep}`` artifacts. Use
+                this only when you genuinely want to discard the Ghidra
+                project state -- the next analyze on this binary will pay
+                the full auto-analysis cost again (~10-15 min for big
+                binaries).
         """
         try:
             binary_hash = self._get_binary_hash(binary_path)
@@ -251,6 +342,10 @@ class ProjectCache:
             for p in paths:
                 if p.exists():
                     p.unlink()
+
+            if include_project:
+                project_name = self._get_project_name(binary_path)
+                self._drop_ghidra_project(project_name)
 
             logger.info(f"Invalidated cache for {binary_path}")
             return True
@@ -289,11 +384,23 @@ class ProjectCache:
 
         return sorted(cached_binaries, key=lambda x: x.get("cached_at", 0), reverse=True)
 
-    def clear_all(self) -> int:
+    def clear_all(self, include_projects: bool = False) -> int:
         """Clear all cached data (gz, legacy json, meta, funcidx, notes).
 
         Unlike :meth:`invalidate`, this is a destructive full wipe and
         also drops user-supplied annotation side-cars.
+
+        Args:
+            include_projects: Also remove the entire ``ghidra_projects/``
+                directory. The next analyze on any binary will pay the
+                full auto-analysis cost again. Off by default because
+                Ghidra project state is the most expensive thing to
+                rebuild.
+
+        Returns:
+            Number of files removed at the cache-dir top level. The
+            ``ghidra_projects/`` directory removal (when requested) is
+            counted as a single entry regardless of its size.
         """
         count = 0
 
@@ -304,6 +411,15 @@ class ProjectCache:
                     count += 1
                 except Exception as e:
                     logger.error(f"Error deleting {cache_file}: {e}")
+
+        if include_projects:
+            project_dir = self.cache_dir / "ghidra_projects"
+            if project_dir.exists():
+                try:
+                    shutil.rmtree(project_dir)
+                    count += 1
+                except Exception as e:
+                    logger.error(f"Error deleting {project_dir}: {e}")
 
         logger.info(f"Cleared {count} cache entries")
         return count

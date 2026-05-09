@@ -986,6 +986,8 @@ def load_pdb(
     binary_path: str,
     pdb_path: str | None = None,
     symbol_path: str | None = None,
+    skip_decompile: bool = True,
+    analysis_depth: str = "structural",
 ) -> str:
     """
     Apply a Windows PDB to an analyzed binary.
@@ -999,6 +1001,15 @@ def load_pdb(
     Microsoft public symbol server, caching it under
     ``~/.binary_mcp_cache/symbols/``.
 
+    On big binaries (e.g. mpengine.dll, 47K functions) this runs in
+    structural mode by default -- auto-analyse + apply PDB symbols, but
+    skip the per-function decompile pass. That trims a 60-90 minute
+    wait down to ~10-15 min, and pseudocode is still available on
+    demand via ``decompile_function`` (each call decompiles one
+    function in seconds against the now-symbolic cache). If you
+    genuinely want a full decompile pass with the PDB applied, pass
+    ``skip_decompile=False`` and ``analysis_depth="full"``.
+
     Args:
         binary_path: Path to the binary
         pdb_path: Path to the PDB file, or None / "auto" to fetch from
@@ -1009,6 +1020,13 @@ def load_pdb(
                   ``_NT_SYMBOL_PATH`` env vars, then to the public
                   Microsoft server. Multiple servers can be chained
                   with ``;``.
+        skip_decompile: Skip per-function decompile during PDB
+                  application. Default True. Set False only when you
+                  explicitly want every function decompiled in the same
+                  pass as PDB application (very slow on big binaries).
+        analysis_depth: "structural" (default) applies PDB symbols + xrefs
+                  + memory map without decompile. "full" decompiles every
+                  function (slow). "shallow" skips most analysis.
 
     Returns:
         Summary comparing pre/post symbolic-function counts.
@@ -1038,6 +1056,8 @@ def load_pdb(
             binary_path,
             force_reanalyze=True,
             pdb_path=pdb_path,
+            skip_decompile=skip_decompile,
+            analysis_depth=analysis_depth,
         )
 
         post_functions = context.get("functions", [])

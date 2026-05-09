@@ -1055,11 +1055,46 @@ def load_pdb(
             f"- Gain: +{post_named - pre_named}",
         ]
         if post_named <= pre_named:
+            # Surface the most common silent-failure reasons so the user
+            # can diagnose without diving into ghidra_debug.log.
+            debug_log = cache.cache_dir / "ghidra_debug.log"
+            pdb_loaded_marker = False
+            untrusted_enabled_marker = False
+            if debug_log.exists():
+                try:
+                    log_text = debug_log.read_text(
+                        encoding="utf-8", errors="replace"
+                    )
+                    pdb_loaded_marker = (
+                        "PDB Universal" in log_text
+                        and "loaded" in log_text.lower()
+                    )
+                    untrusted_enabled_marker = (
+                        "Enabled PDB Universal.Search untrusted locations"
+                        in log_text
+                    )
+                except OSError:
+                    pass
+
+            lines.append("")
+            lines.append("⚠️  No gain detected. Likely causes:")
+            if not untrusted_enabled_marker:
+                lines.append(
+                    "  - Pre-script didn't run -- PdbUniversalAnalyzer's "
+                    "'Search untrusted locations' option may still be off. "
+                    "Confirm Ghidra >= 10.0."
+                )
+            if not pdb_loaded_marker:
+                lines.append(
+                    "  - PdbUniversalAnalyzer never reported a successful "
+                    "load. The PDB GUID/age may not match this binary, "
+                    "or the analyzer is disabled."
+                )
             lines.append(
-                "\n⚠️  No gain detected. The PDB may not match this binary, "
-                "or Ghidra's PdbUniversalAnalyzer did not run. Check the "
-                "debug log in the cache directory."
+                "  - Public PDBs from MS often contain only function names "
+                "(no types/locals); Gain reflects function-name count only."
             )
+            lines.append(f"  - Inspect {debug_log} for full Ghidra output.")
         return "\n".join(lines)
 
     except FileNotFoundError as e:

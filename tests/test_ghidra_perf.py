@@ -462,6 +462,70 @@ class TestRunnerEnvPlumbing:
         # Cleaned up after analyze returns
         assert not expected_staged.exists()
 
+    def test_pdb_path_adds_enable_pdb_load_prescript(self, runner, tmp_path):
+        """When pdb_path is supplied, runner must add ``-preScript
+        enable_pdb_load.py`` BEFORE ``-postScript``. Without the pre-script,
+        Ghidra's PdbUniversalAnalyzer silently refuses to load the staged
+        PDB (the binary's directory is treated as untrusted by default in
+        Ghidra 10.x+), and load_pdb returns Gain: +0."""
+        binary, script_dir, output = self._prepare(runner, tmp_path)
+
+        pdb_src = tmp_path / "external" / "my_binary.pdb"
+        pdb_src.parent.mkdir()
+        pdb_src.write_bytes(b"PDB fake")
+
+        captured = {}
+
+        def fake_run(cmd, env, **kwargs):
+            captured["cmd"] = list(cmd)
+            return _FakeRunResult()
+
+        with patch("subprocess.Popen", side_effect=fake_run):
+            runner.analyze(
+                binary_path=str(binary),
+                script_path=str(script_dir),
+                script_name="core_analysis.py",
+                output_path=str(output),
+                pdb_path=str(pdb_src),
+            )
+
+        cmd = captured["cmd"]
+        assert "-preScript" in cmd, (
+            "Missing -preScript flag when pdb_path supplied"
+        )
+        pre_idx = cmd.index("-preScript")
+        assert cmd[pre_idx + 1] == "enable_pdb_load.py", (
+            f"Expected pre-script 'enable_pdb_load.py', got {cmd[pre_idx + 1]!r}"
+        )
+        # Pre-script must come before post-script for analyzeHeadless to
+        # apply the option BEFORE auto-analysis fires the PDB analyzer.
+        post_idx = cmd.index("-postScript")
+        assert pre_idx < post_idx, (
+            "-preScript must precede -postScript on the cmd line"
+        )
+
+    def test_no_pdb_path_skips_prescript(self, runner, tmp_path):
+        """When pdb_path is not supplied, the pre-script must NOT be added.
+        Otherwise every analysis run would pay an extra Jython script
+        invocation for no benefit."""
+        binary, script_dir, output = self._prepare(runner, tmp_path)
+        captured = {}
+
+        def fake_run(cmd, env, **kwargs):
+            captured["cmd"] = list(cmd)
+            return _FakeRunResult()
+
+        with patch("subprocess.Popen", side_effect=fake_run):
+            runner.analyze(
+                binary_path=str(binary),
+                script_path=str(script_dir),
+                script_name="core_analysis.py",
+                output_path=str(output),
+            )
+
+        assert "-preScript" not in captured["cmd"]
+        assert "enable_pdb_load.py" not in captured["cmd"]
+
     def test_staged_pdb_cleaned_up_when_popen_raises(self, runner, tmp_path):
         """Regression: ultrareview bug_006. If subprocess.Popen raises before
         the try/finally block opens (missing analyzeHeadless, fd exhaustion,

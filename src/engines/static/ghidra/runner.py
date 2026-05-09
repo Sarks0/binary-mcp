@@ -532,6 +532,19 @@ class GhidraRunner:
         cmd.append("-overwrite")
         cmd.extend([
             "-scriptPath", str(script_path),
+        ])
+
+        # When a PDB is supplied, install a pre-script that enables
+        # PdbUniversalAnalyzer.SearchUntrustedLocations before auto-analysis
+        # runs. Without it, Ghidra 10.x+ refuses to load the PDB we just
+        # staged adjacent to the binary (the binary's directory is treated
+        # as untrusted by default), and load_pdb returns "Gain: +0" with
+        # no symbols applied. Pre-script must precede -postScript on the
+        # command line so analyzeHeadless runs them in the right order.
+        if pdb_path:
+            cmd.extend(["-preScript", "enable_pdb_load.py"])
+
+        cmd.extend([
             "-postScript", script_name,
         ])
 

@@ -1070,7 +1070,7 @@ def load_pdb(
                         and "loaded" in log_text.lower()
                     )
                     untrusted_enabled_marker = (
-                        "Enabled PDB Universal.Search untrusted locations"
+                        "Enabled PDB Universal.Search untrusted symbol servers"
                         in log_text
                     )
                 except OSError:

@@ -80,6 +80,13 @@ class AuthenticodeSignature:
     signer_not_after: datetime | None
     digest_algorithm: str
     embedded_message_digest: bytes
+    # Tri-state describing the embedded SpcIndirectDataContent message-digest
+    # extraction result:
+    #   "parsed"      -> embedded_message_digest holds the real digest bytes
+    #   "missing"     -> no SpcIndirectDataContent / no embedded digest present
+    #   "parse_error" -> a signature blob is present but the embedded digest
+    #                    could not be extracted (treated as tampered upstream)
+    digest_status: str = "parsed"
     chain: list[CertInfo] = field(default_factory=list)
     timestamp: TimestampInfo | None = None
 
@@ -267,10 +274,22 @@ def _ordered_chain(signer_cert: Any | None, all_certs: list[Any]) -> list[Any]:
     return chain
 
 
+class _MissingAuthenticodeDigestError(Exception):
+    """Raised when there is no SpcIndirectDataContent at all (vs malformed)."""
+
+
 def _extract_authenticode_message_digest(signed_data: Any) -> tuple[str, bytes]:
     """
     Extract the digest algorithm + Authentihash bytes embedded inside
     SpcIndirectDataContent. Returns (algo_name, digest_bytes).
+
+    Raises:
+        _MissingAuthenticodeDigestError: encapContentInfo does not carry the
+            Authenticode SpcIndirectDataContent OID -- there is no embedded
+            digest to extract. Callers should treat this as "missing" rather
+            than "parse_error".
+        Exception: any other failure (malformed inner ASN.1, etc.) bubbles
+            out as a normal exception and should be treated as "parse_error".
     """
     from asn1crypto import algos
     from asn1crypto.core import Any as Asn1Any
@@ -291,7 +310,7 @@ def _extract_authenticode_message_digest(signed_data: Any) -> tuple[str, bytes]:
     encap = signed_data["encap_content_info"]
     content_type = encap["content_type"].native
     if content_type != SPC_INDIRECT_DATA_OID:
-        raise ValueError(
+        raise _MissingAuthenticodeDigestError(
             f"unexpected encapContentInfo OID {content_type} (want SpcIndirectDataContent)"
         )
     content = encap["content"]
@@ -383,13 +402,27 @@ def _extract_timestamp(signer_info: Any, outer_certs: list[Any]) -> TimestampInf
         oid = attr["type"].dotted
         if oid == MS_RFC3161_COUNTERSIGNATURE_OID:
             try:
-                token_bytes = attr["values"][0].dump()
-                # First value is a ContentInfo; .dump() includes outer tag.
-                # asn1crypto.cms types are wrapped in Any; get contents.
+                # asn1crypto's .dump() returns the full DER-encoded value
+                # including the outer tag and length, which is what
+                # cms.ContentInfo.load() expects. Do NOT use .contents:
+                # for Any-wrapped CMS values .contents returns only the
+                # inner-value octets, stripping the outer tag, and the
+                # subsequent ContentInfo.load() silently fails (token is
+                # then discarded by the broad-except), losing RFC3161
+                # timestamps entirely.
                 value = attr["values"][0]
-                if hasattr(value, "contents"):
-                    token_bytes = value.contents
-                return _parse_rfc3161_timestamp(token_bytes)
+                token_bytes = value.dump()
+                ts = _parse_rfc3161_timestamp(token_bytes)
+                if ts is None and hasattr(value, "parsed") and value.parsed is not None:
+                    # Fallback: some asn1crypto versions wrap the token in an
+                    # Any whose .dump() is the wrapped form; .parsed.dump()
+                    # is the inner ContentInfo's DER.
+                    try:
+                        ts = _parse_rfc3161_timestamp(value.parsed.dump())
+                    except Exception as e:
+                        logger.debug("RFC3161 .parsed.dump() fallback failed: %s", e)
+                if ts is not None:
+                    return ts
             except Exception as e:
                 logger.debug("MS RFC3161 attr parse failed: %s", e)
         elif oid == PKCS9_COUNTERSIGNATURE_OID:
@@ -445,11 +478,23 @@ def parse_pkcs7(cert_table_blob: bytes) -> AuthenticodeSignature | None:
     signer_info = signer_infos[0]
 
     digest_algo = signed_data["digest_algorithms"][0]["algorithm"].native
+    digest_status: str
     try:
         spc_algo, embedded_md = _extract_authenticode_message_digest(signed_data)
+        digest_status = "parsed"
+    except _MissingAuthenticodeDigestError as e:
+        # No SpcIndirectDataContent at all -- nothing to compare against,
+        # so this is "no embedded Authenticode digest", NOT tampering.
+        logger.debug("No SpcIndirectDataContent present: %s", e)
+        spc_algo, embedded_md = digest_algo, b""
+        digest_status = "missing"
     except Exception as e:
+        # Something *was* present but we could not parse it. This is exactly
+        # the malicious-tamper case the broad-except used to silently swallow:
+        # report it explicitly so callers can flag tampered=True.
         logger.debug("Authenticode message-digest extraction failed: %s", e)
         spc_algo, embedded_md = digest_algo, b""
+        digest_status = "parse_error"
 
     signer_cert = _find_signer_cert(signer_info, certs)
     chain_certs = _ordered_chain(signer_cert, certs)
@@ -479,6 +524,7 @@ def parse_pkcs7(cert_table_blob: bytes) -> AuthenticodeSignature | None:
         signer_not_after=not_after,
         digest_algorithm=spc_algo or digest_algo,
         embedded_message_digest=bytes(embedded_md),
+        digest_status=digest_status,
         chain=chain,
         timestamp=timestamp,
     )
@@ -500,6 +546,7 @@ def inspect(binary_path: str | Path) -> dict[str, Any]:
     from src.utils.security import (
         FileSizeError,
         PathTraversalError,
+        get_allowed_dirs,
         sanitize_binary_path,
     )
     from src.utils.structured_errors import (
@@ -509,7 +556,9 @@ def inspect(binary_path: str | Path) -> dict[str, Any]:
     )
 
     try:
-        sanitized = sanitize_binary_path(str(binary_path))
+        sanitized = sanitize_binary_path(
+            str(binary_path), allowed_dirs=get_allowed_dirs()
+        )
     except (PathTraversalError, FileSizeError, FileNotFoundError, ValueError) as e:
         raise StructuredBaseError(
             StructuredError(
@@ -615,12 +664,27 @@ def inspect(binary_path: str | Path) -> dict[str, Any]:
             ) from e
 
         embedded = signature.embedded_message_digest
-        match = bool(embedded) and computed == embedded
+        status = signature.digest_status  # "parsed" | "missing" | "parse_error"
+        match = status == "parsed" and computed == embedded
+        # Tampered semantics:
+        #   "parsed"      -> tampered iff computed != embedded
+        #   "missing"     -> no embedded digest to compare; NOT tampered
+        #   "parse_error" -> signature blob exists but we couldn't extract the
+        #                    embedded digest -> treat as tampered (a malformed
+        #                    SpcIndirectDataContent is exactly how an attacker
+        #                    would try to make tampering "silently pass")
+        if status == "parsed":
+            tampered = not match
+        elif status == "parse_error":
+            tampered = True
+        else:  # "missing"
+            tampered = False
 
         return {
             "binary_path": str(sanitized),
             "signed": True,
             "parsed": True,
+            "signature_digest_status": status,
             "signature": {
                 "signer_cn": signature.signer_cn,
                 "signer_issuer_cn": signature.signer_issuer_cn,
@@ -636,7 +700,7 @@ def inspect(binary_path: str | Path) -> dict[str, Any]:
                 "computed_hex": computed.hex(),
                 "embedded_hex": embedded.hex(),
                 "match": match,
-                "tampered": (not match) and bool(embedded),
+                "tampered": tampered,
             },
         }
     finally:

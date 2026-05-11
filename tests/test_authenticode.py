@@ -569,3 +569,266 @@ def test_parse_pkcs7_returns_none_for_garbage():
     # Valid WIN_CERTIFICATE header, garbage PKCS#7 body
     bad = struct.pack("<IHH", 24, 0x0200, 0x0002) + b"\xff" * 16
     assert parse_pkcs7(bad) is None
+
+
+# ---------------------------------------------------------------------------
+# Tri-state digest-extraction (parsed / missing / parse_error)
+# ---------------------------------------------------------------------------
+
+
+def _der_len(n: int) -> bytes:
+    if n < 0x80:
+        return bytes([n])
+    out = b""
+    while n:
+        out = bytes([n & 0xFF]) + out
+        n >>= 8
+    return bytes([0x80 | len(out)]) + out
+
+
+def _der_tlv(tag: int, body: bytes) -> bytes:
+    return bytes([tag]) + _der_len(len(body)) + body
+
+
+def _der_seq(body: bytes) -> bytes:
+    return _der_tlv(0x30, body)
+
+
+def _der_set(body: bytes) -> bytes:
+    return _der_tlv(0x31, body)
+
+
+def _der_oid(oid_str: str) -> bytes:
+    parts = [int(p) for p in oid_str.split(".")]
+    first = 40 * parts[0] + parts[1]
+    out = bytes([first])
+    for p in parts[2:]:
+        chunks = []
+        while True:
+            chunks.insert(0, p & 0x7F)
+            p >>= 7
+            if not p:
+                break
+        for i in range(len(chunks) - 1):
+            chunks[i] |= 0x80
+        out += bytes(chunks)
+    return _der_tlv(0x06, out)
+
+
+def _der_integer(n: int) -> bytes:
+    if n == 0:
+        return _der_tlv(0x02, b"\x00")
+    bs: list[int] = []
+    while n:
+        bs.insert(0, n & 0xFF)
+        n >>= 8
+    if bs[0] & 0x80:
+        bs.insert(0, 0)
+    return _der_tlv(0x02, bytes(bs))
+
+
+def _der_explicit(tag_num: int, body: bytes) -> bytes:
+    return bytes([0xA0 | tag_num]) + _der_len(len(body)) + body
+
+
+def _der_null() -> bytes:
+    return b"\x05\x00"
+
+
+def _der_octet(b: bytes) -> bytes:
+    return _der_tlv(0x04, b)
+
+
+def _build_signed_data_blob(
+    *, encap_content_type_oid: str, encap_content_payload: bytes
+) -> bytes:
+    """
+    Build a minimal CMS SignedData ContentInfo carrying the given
+    encap_content_type OID and a [0] EXPLICIT-tagged inner payload.
+
+    Just enough to satisfy parse_pkcs7's "have at least one SignerInfo" check.
+    """
+    sha256_oid = "2.16.840.1.101.3.4.2.1"
+    digest_algo = _der_seq(_der_oid(sha256_oid) + _der_null())
+    issuer_name = _der_seq(
+        _der_set(_der_seq(_der_oid("2.5.4.3") + _der_tlv(0x13, b"test")))
+    )
+    issuer_and_sn = _der_seq(issuer_name + _der_integer(1))
+    signer_info = _der_seq(
+        _der_integer(1)  # version
+        + issuer_and_sn
+        + digest_algo
+        + _der_seq(_der_oid("1.2.840.113549.1.1.1") + _der_null())  # rsa
+        + _der_octet(b"\x00" * 4)  # signature
+    )
+    encap = _der_seq(
+        _der_oid(encap_content_type_oid)
+        + _der_explicit(0, encap_content_payload)
+    )
+    sd = _der_seq(
+        _der_integer(1)  # SignedData version = v1
+        + _der_set(digest_algo)
+        + encap
+        + _der_set(signer_info)
+    )
+    return _der_seq(_der_oid("1.2.840.113549.1.7.2") + _der_explicit(0, sd))
+
+
+def _wrap_win_certificate(pkcs7_blob: bytes) -> bytes:
+    return struct.pack("<IHH", 8 + len(pkcs7_blob), 0x0200, 0x0002) + pkcs7_blob
+
+
+class TestDigestStatusTriState:
+    """parse_pkcs7 must distinguish missing vs malformed vs parsed signatures."""
+
+    def test_parse_error_on_malformed_inner(self):
+        """
+        SpcIndirectDataContent OID present but inner ASN.1 is malformed.
+        Must yield digest_status='parse_error' and an empty embedded digest,
+        NOT silently fall through to a tampered=False clean bill of health.
+        """
+        # Encap OID is SpcIndirectDataContent, payload is garbage (just an OID,
+        # missing the required DigestInfo field of SpcIndirectDataContent).
+        spc_indirect_garbage = _der_seq(_der_seq(_der_oid("1.3.6.1.4.1.311.2.1.15")))
+        blob = _build_signed_data_blob(
+            encap_content_type_oid="1.3.6.1.4.1.311.2.1.4",
+            encap_content_payload=spc_indirect_garbage,
+        )
+        result = parse_pkcs7(_wrap_win_certificate(blob))
+        assert result is not None
+        assert result.digest_status == "parse_error"
+        assert result.embedded_message_digest == b""
+
+    def test_missing_on_non_spc_indirect_content_type(self):
+        """
+        encap_content_type is not Authenticode SpcIndirectDataContent.
+        Must yield digest_status='missing' (no embedded digest to compare),
+        NOT 'parse_error'.
+        """
+        # Use plain CMS 'data' OID for encap content_type.
+        blob = _build_signed_data_blob(
+            encap_content_type_oid="1.2.840.113549.1.7.1",  # pkcs7-data
+            encap_content_payload=_der_octet(b"\x00" * 4),
+        )
+        result = parse_pkcs7(_wrap_win_certificate(blob))
+        assert result is not None
+        assert result.digest_status == "missing"
+        assert result.embedded_message_digest == b""
+
+
+class TestInspectTamperedSemantics:
+    """
+    The whole point of `tampered`: a deliberately malformed signature must
+    NOT report tampered=False.
+    """
+
+    def test_malformed_signature_reports_parse_error_and_tampered_true(
+        self, tmp_path: Path
+    ):
+        """
+        Embed a CMS SignedData with SpcIndirectDataContent OID but malformed
+        inner DigestInfo in a real PE, then inspect() it. The bug being fixed:
+        previously tampered=False, defeating the tool's purpose. Now must be
+        signature_digest_status='parse_error' and tampered=True.
+        """
+        spc_indirect_garbage = _der_seq(_der_seq(_der_oid("1.3.6.1.4.1.311.2.1.15")))
+        pkcs7 = _build_signed_data_blob(
+            encap_content_type_oid="1.3.6.1.4.1.311.2.1.4",
+            encap_content_payload=spc_indirect_garbage,
+        )
+        cert_blob = _wrap_win_certificate(pkcs7)
+        pe_bytes = _build_minimal_pe(
+            security_va=0x800,
+            security_size=len(cert_blob),
+            cert_data=cert_blob,
+        )
+        pe_file = tmp_path / "malformed-spc.exe"
+        pe_file.write_bytes(pe_bytes)
+
+        result = inspect(pe_file)
+        assert result["signed"] is True
+        assert result["parsed"] is True
+        assert result["signature_digest_status"] == "parse_error"
+        ah = result["authentihash"]
+        assert ah["match"] is False
+        assert ah["tampered"] is True, (
+            "malformed SpcIndirectDataContent must be flagged as tampered, "
+            "not silently passed (this regression is the original bug)"
+        )
+
+    def test_unsigned_pe_is_not_tampered(self, tmp_path: Path):
+        """A PE with no signature at all must not be reported as tampered."""
+        pe_bytes = _build_minimal_pe(security_va=0, security_size=0)
+        pe_file = tmp_path / "unsigned.exe"
+        pe_file.write_bytes(pe_bytes)
+        result = inspect(pe_file)
+        # Unsigned path doesn't reach authentihash comparison; just ensure
+        # the result is explicitly "signed=False" and there's no false-positive.
+        assert result["signed"] is False
+        assert "authentihash" not in result
+
+    def test_non_spc_indirect_encap_reports_missing_not_tampered(
+        self, tmp_path: Path
+    ):
+        """
+        A WIN_CERTIFICATE that holds a valid CMS SignedData but whose encap
+        content_type is NOT Authenticode SpcIndirectDataContent has no
+        embedded Authentihash to compare. Must be signature_digest_status=
+        'missing' and tampered=False (not 'parse_error', not 'tampered').
+        """
+        pkcs7 = _build_signed_data_blob(
+            encap_content_type_oid="1.2.840.113549.1.7.1",  # pkcs7-data
+            encap_content_payload=_der_octet(b"\x00" * 4),
+        )
+        cert_blob = _wrap_win_certificate(pkcs7)
+        pe_bytes = _build_minimal_pe(
+            security_va=0x800,
+            security_size=len(cert_blob),
+            cert_data=cert_blob,
+        )
+        pe_file = tmp_path / "no-spc.exe"
+        pe_file.write_bytes(pe_bytes)
+
+        result = inspect(pe_file)
+        assert result["signed"] is True
+        assert result["parsed"] is True
+        assert result["signature_digest_status"] == "missing"
+        ah = result["authentihash"]
+        assert ah["match"] is False
+        assert ah["tampered"] is False
+
+
+class TestInspectAllowedDirs:
+    """`inspect()` must honor BINARY_MCP_ALLOWED_DIRS like every other tool."""
+
+    def test_rejects_binary_outside_allowed_dirs(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A PE outside the allowlist must raise StructuredBaseError."""
+        from src.utils.structured_errors import StructuredBaseError
+
+        # Build a valid (unsigned) PE so we don't error for an unrelated reason.
+        pe_bytes = _build_minimal_pe(security_va=0, security_size=0)
+        pe_file = tmp_path / "outside.exe"
+        pe_file.write_bytes(pe_bytes)
+
+        # Allow ONLY a sibling directory, so pe_file falls outside.
+        allowed_dir = tmp_path / "allowed_only"
+        allowed_dir.mkdir()
+        monkeypatch.setenv("BINARY_MCP_ALLOWED_DIRS", str(allowed_dir))
+
+        with pytest.raises(StructuredBaseError) as excinfo:
+            inspect(pe_file)
+        assert "Invalid binary path" in str(excinfo.value)
+
+    def test_accepts_binary_inside_allowed_dirs(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Sanity check: a PE inside the allowlist must inspect normally."""
+        pe_bytes = _build_minimal_pe(security_va=0, security_size=0)
+        pe_file = tmp_path / "inside.exe"
+        pe_file.write_bytes(pe_bytes)
+
+        monkeypatch.setenv("BINARY_MCP_ALLOWED_DIRS", str(tmp_path))
+        result = inspect(pe_file)
+        assert result["signed"] is False

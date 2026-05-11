@@ -472,6 +472,7 @@ def carve(
     from src.utils.security import (
         FileSizeError,
         PathTraversalError,
+        get_allowed_dirs,
         sanitize_binary_path,
     )
     from src.utils.structured_errors import (
@@ -481,7 +482,9 @@ def carve(
     )
 
     try:
-        sanitized = sanitize_binary_path(str(binary_path))
+        sanitized = sanitize_binary_path(
+            str(binary_path), allowed_dirs=get_allowed_dirs()
+        )
     except (PathTraversalError, FileSizeError, FileNotFoundError, ValueError) as e:
         raise StructuredBaseError(
             StructuredError(
@@ -635,7 +638,7 @@ def carve(
                                 )
                             else:
                                 try:
-                                    with os.fdopen(sfd, "w") as f:
+                                    with os.fdopen(sfd, "w", encoding="utf-8") as f:
                                         json.dump(
                                             {
                                                 "source": source,

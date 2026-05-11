@@ -163,6 +163,7 @@ def compute(binary_path: str | Path) -> SimilarityHashes:
     from src.utils.security import (
         FileSizeError,
         PathTraversalError,
+        get_allowed_dirs,
         sanitize_binary_path,
     )
     from src.utils.structured_errors import (
@@ -172,7 +173,9 @@ def compute(binary_path: str | Path) -> SimilarityHashes:
     )
 
     try:
-        sanitized = sanitize_binary_path(str(binary_path))
+        sanitized = sanitize_binary_path(
+            str(binary_path), allowed_dirs=get_allowed_dirs()
+        )
     except (PathTraversalError, FileSizeError, FileNotFoundError, ValueError) as e:
         raise StructuredBaseError(
             StructuredError(

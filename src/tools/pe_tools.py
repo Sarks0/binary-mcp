@@ -517,6 +517,7 @@ def register_pe_tools(app, session_manager=None):
     from src.utils.security import (
         FileSizeError,
         PathTraversalError,
+        get_allowed_dirs,
         safe_error_message,
         sanitize_binary_path,
     )
@@ -547,7 +548,9 @@ def register_pe_tools(app, session_manager=None):
             get_pe_info("/path/to/sample.dll", detail_level="full")
         """
         try:
-            binary_path = sanitize_binary_path(binary_path)
+            binary_path = sanitize_binary_path(
+                binary_path, allowed_dirs=get_allowed_dirs()
+            )
             path = Path(binary_path)
 
             if detail_level not in ("basic", "standard", "full"):

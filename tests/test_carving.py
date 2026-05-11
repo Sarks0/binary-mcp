@@ -601,15 +601,17 @@ class TestOutputDirHardening:
     def test_accepts_path_inside_allowed_dirs(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
-        # When BINARY_MCP_ALLOWED_DIRS is set and the output dir is inside it,
-        # the path is accepted (carve runs and produces a result).
+        # When BINARY_MCP_ALLOWED_DIRS is set and BOTH the binary and the
+        # output dir are inside it, the path is accepted (carve runs and
+        # produces a result).
         sandbox = tmp_path / "sandbox"
         sandbox.mkdir()
         monkeypatch.setenv("BINARY_MCP_ALLOWED_DIRS", str(sandbox))
 
         payload = b"MZ" + os.urandom(254)
         pe_bytes = _build_pe_with_resources([(10, 700, 0, payload)])
-        pe_path = _write_pe(tmp_path, pe_bytes)
+        # Binary must live inside the allowlist now that carve() enforces it.
+        pe_path = _write_pe(sandbox, pe_bytes)
 
         result = carve(pe_path, sandbox / "out")
         # Should produce one carved blob without error
@@ -630,6 +632,101 @@ class TestOutputDirHardening:
         with pytest.raises(StructuredBaseError) as excinfo:
             carve(pe_path, outside / "out")
         assert "allowed" in str(excinfo.value).lower()
+
+
+# ---------------------------------------------------------------------------
+# binary_path allowlist enforcement (BINARY_MCP_ALLOWED_DIRS)
+# ---------------------------------------------------------------------------
+
+
+class TestBinaryPathAllowlist:
+    """carve() must reject binary paths outside BINARY_MCP_ALLOWED_DIRS."""
+
+    def test_rejects_binary_outside_allowed_dirs(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        from src.utils.structured_errors import StructuredBaseError
+
+        sandbox = tmp_path / "sandbox"
+        sandbox.mkdir()
+        outside_dir = tmp_path / "outside"
+        outside_dir.mkdir()
+        monkeypatch.setenv("BINARY_MCP_ALLOWED_DIRS", str(sandbox))
+
+        # Binary lives OUTSIDE the allowlist
+        pe_path = _write_pe(outside_dir, _build_pe_with_resources(), name="rogue.exe")
+
+        with pytest.raises(StructuredBaseError) as excinfo:
+            carve(pe_path, sandbox / "out")
+        msg = str(excinfo.value).lower()
+        assert "binary path" in msg or "allowed" in msg or "access denied" in msg
+
+    def test_accepts_binary_inside_allowed_dirs(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        sandbox = tmp_path / "sandbox"
+        sandbox.mkdir()
+        monkeypatch.setenv("BINARY_MCP_ALLOWED_DIRS", str(sandbox))
+
+        payload = b"MZ" + os.urandom(254)
+        pe_bytes = _build_pe_with_resources([(10, 800, 0, payload)])
+        pe_path = _write_pe(sandbox, pe_bytes, name="allowed.exe")
+
+        # Should not raise; binary is inside the allowlist
+        result = carve(pe_path, sandbox / "out")
+        assert any(b.flagged for b in result.blobs)
+
+
+# ---------------------------------------------------------------------------
+# Sidecar serialisation with non-ASCII metadata
+# ---------------------------------------------------------------------------
+
+
+class TestSidecarNonAsciiMetadata:
+    """The sidecar JSON file must be writable when metadata contains
+    non-ASCII characters (PE resources can carry Chinese/Russian/Arabic
+    names). The fdopen() call must specify encoding=utf-8 so the write
+    doesn't fall back to cp1252 on Windows."""
+
+    def test_sidecar_writes_with_non_ascii_resource_name(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Inject a non-ASCII resource_path through carve() by stubbing
+        walk_resources. The sidecar JSON write should succeed regardless
+        of platform default codec."""
+        import src.utils.carving as carving_mod
+
+        non_ascii_name = "RT_RCDATA/资源/中文-Тест-عربي/1033"
+        payload = b"MZ" + os.urandom(512)
+
+        pe_bytes = _build_pe_with_resources([(10, 900, 0, payload)])
+        pe_path = _write_pe(tmp_path, pe_bytes, name="non_ascii.exe")
+        out = tmp_path / "out"
+
+        # Stub walk_resources so the carver sees a non-ASCII resource path
+        # but the underlying byte offsets/size still match the real PE.
+        real_walk = carving_mod.walk_resources
+
+        def stub_walk(pe, *, max_depth=8):
+            for _path, foff, size in real_walk(pe, max_depth=max_depth):
+                yield non_ascii_name, foff, size
+
+        monkeypatch.setattr(carving_mod, "walk_resources", stub_walk)
+
+        result = carving_mod.carve(pe_path, out)
+        flagged = [b for b in result.blobs if b.flagged and b.written_path]
+        assert len(flagged) == 1
+        b = flagged[0]
+        assert b.resource_path == non_ascii_name
+
+        # Sidecar must exist and be valid JSON (utf-8 round-trips cleanly
+        # regardless of host platform default codec).
+        sidecar = Path(b.written_path).parent / f"{b.sha256}.json"
+        assert sidecar.exists(), "sidecar JSON should have been written"
+        meta = json.loads(sidecar.read_text(encoding="utf-8"))
+        # json.dump defaults to ensure_ascii=True so the value is escaped
+        # as \uXXXX, but it should still decode back to the original.
+        assert meta["resource_path"] == non_ascii_name
 
 
 # ---------------------------------------------------------------------------
@@ -684,6 +781,74 @@ class TestExtractEmbeddedBinariesWrapper:
         tool = self._registered_tool()
         out = tool(str(pe_path), max_total_mb=10_000)  # > 4096 cap
         assert "PARAMETER_INVALID" in out
+
+
+# ---------------------------------------------------------------------------
+# get_pe_info wrapper: BINARY_MCP_ALLOWED_DIRS enforcement (pe_tools)
+# ---------------------------------------------------------------------------
+
+
+class TestGetPeInfoAllowlist:
+    """get_pe_info must call sanitize_binary_path with the allowlist."""
+
+    def _registered_get_pe_info(self):
+        from unittest.mock import MagicMock
+
+        from src.tools.pe_tools import register_pe_tools
+
+        registered: dict = {}
+
+        def tool_decorator(*_args, **_kwargs):
+            def _wrap(fn):
+                registered[fn.__name__] = fn
+                return fn
+            return _wrap
+
+        shim = MagicMock()
+        shim.tool = MagicMock(side_effect=tool_decorator)
+        register_pe_tools(shim, MagicMock())
+        return registered["get_pe_info"]
+
+    def test_rejects_binary_outside_allowed_dirs(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        sandbox = tmp_path / "sandbox"
+        sandbox.mkdir()
+        outside_dir = tmp_path / "outside"
+        outside_dir.mkdir()
+        monkeypatch.setenv("BINARY_MCP_ALLOWED_DIRS", str(sandbox))
+
+        pe_path = _write_pe(outside_dir, _build_pe_with_resources(), name="rogue.exe")
+
+        tool = self._registered_get_pe_info()
+        out = tool(str(pe_path))
+        # get_pe_info uses safe_error_message; the response should signal failure
+        # via the path-traversal / allowlist guard rather than continuing.
+        out_lower = out.lower()
+        assert (
+            "allowed" in out_lower
+            or "access denied" in out_lower
+            or "outside" in out_lower
+            or "path traversal" in out_lower
+            or "error" in out_lower
+        )
+        # And critically: it must NOT have proceeded to read the PE
+        assert "Machine:" not in out
+
+    def test_accepts_binary_inside_allowed_dirs(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        sandbox = tmp_path / "sandbox"
+        sandbox.mkdir()
+        monkeypatch.setenv("BINARY_MCP_ALLOWED_DIRS", str(sandbox))
+
+        pe_path = _write_pe(sandbox, _build_pe_with_resources(), name="ok.exe")
+
+        tool = self._registered_get_pe_info()
+        out = tool(str(pe_path))
+        # Should produce the normal PE structure report
+        assert "PE Structure Analysis" in out
+        assert "Machine:" in out
 
 
 # ---------------------------------------------------------------------------

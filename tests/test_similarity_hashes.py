@@ -274,6 +274,41 @@ class TestComputeIntegration:
         with pytest.raises(StructuredBaseError):
             compute(not_pe)
 
+    def test_rejects_binary_outside_allowed_dirs(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """compute() must honour BINARY_MCP_ALLOWED_DIRS via get_allowed_dirs."""
+        from src.utils.structured_errors import StructuredBaseError
+
+        sandbox = tmp_path / "sandbox"
+        sandbox.mkdir()
+        outside_dir = tmp_path / "outside"
+        outside_dir.mkdir()
+        monkeypatch.setenv("BINARY_MCP_ALLOWED_DIRS", str(sandbox))
+
+        # Binary lives OUTSIDE the allowlist
+        pe_path = outside_dir / "rogue.exe"
+        pe_path.write_bytes(_build_minimal_pe())
+
+        with pytest.raises(StructuredBaseError) as excinfo:
+            compute(pe_path)
+        msg = str(excinfo.value).lower()
+        assert "binary path" in msg or "allowed" in msg or "access denied" in msg
+
+    def test_accepts_binary_inside_allowed_dirs(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        sandbox = tmp_path / "sandbox"
+        sandbox.mkdir()
+        monkeypatch.setenv("BINARY_MCP_ALLOWED_DIRS", str(sandbox))
+
+        pe_path = sandbox / "allowed.exe"
+        pe_path.write_bytes(_build_minimal_pe())
+
+        # Should not raise; binary is inside the allowlist
+        result = compute(pe_path)
+        assert result.binary_size == len(_build_minimal_pe())
+
 
 # ---------------------------------------------------------------------------
 # Markdown rendering

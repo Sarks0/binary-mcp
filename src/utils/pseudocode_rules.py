@@ -1,29 +1,84 @@
 """
 Pseudocode vulnerability rule registry.
 
-Each rule runs as a regex against Ghidra-produced pseudocode (C-like text)
-and surfaces a structured finding. Rules are deliberately conservative on
-false negatives -- false positives are expected and are the point: this is
-triage, not proof. A finding says "look here", not "this is exploitable".
+Each rule runs as either a regex match or a context-aware callable against
+Ghidra-produced pseudocode (C-like text) and surfaces a structured finding.
+Rules are deliberately conservative on false negatives -- false positives
+are expected and are the point: this is triage, not proof. A finding says
+"look here", not "this is exploitable".
+
+Rule kinds:
+    REGEX   -- one ``re.Pattern`` per rule, optional negative pattern.
+               One match yields one finding (the historical model).
+    CONTEXT -- a callable receiving the full pseudocode plus a list of
+               ``Statement``s (split on ``;``/``{``/``}``) and returning
+               ``ContextFinding`` records that carry their own line range,
+               severity override, message, and confidence. Suitable for
+               multi-statement patterns like double-fetch and TOCTOU where
+               a single regex cannot express ordering.
 """
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
+from enum import Enum
 
 SEVERITY_ORDER = ("info", "low", "medium", "high", "critical")
+
+
+class RuleKind(str, Enum):
+    """Classifies how a ``PseudocodeRule`` is applied to pseudocode."""
+
+    REGEX = "regex"
+    CONTEXT = "context"
+
+
+@dataclass(frozen=True)
+class Statement:
+    """One pseudocode statement with 1-based line range it spans."""
+
+    text: str
+    start_line: int
+    end_line: int
+
+
+@dataclass(frozen=True)
+class ContextFinding:
+    """
+    Structured finding emitted by a context rule.
+
+    ``severity`` may be ``None`` to inherit the rule's baseline severity;
+    callers should set it only when the finding genuinely warrants
+    promoting or demoting the rule's default level.
+    """
+
+    message: str
+    confidence: int
+    start_line: int
+    end_line: int
+    severity: str | None = None
 
 
 @dataclass(frozen=True)
 class PseudocodeRule:
     """One vulnerability / anti-pattern rule applied to decompiled C."""
+
     id: str
     cwe: str
     severity: str
     confidence: int
     description: str
     recommendation: str
-    pattern: re.Pattern
+    pattern: re.Pattern | None = None
     negative_pattern: re.Pattern | None = None
+    kind: RuleKind = RuleKind.REGEX
+    context_fn: Callable[[str, list[Statement]], list[ContextFinding]] | None = None
+
+    def __post_init__(self) -> None:
+        if self.kind is RuleKind.REGEX and self.pattern is None:
+            raise ValueError(f"PseudocodeRule {self.id!r}: kind=regex requires a 'pattern'.")
+        if self.kind is RuleKind.CONTEXT and self.context_fn is None:
+            raise ValueError(f"PseudocodeRule {self.id!r}: kind=context requires a 'context_fn'.")
 
 
 # Heuristics applied across findings to nudge confidence.
@@ -34,8 +89,91 @@ SCANNER_HINTS = re.compile(
 )
 SINK_HINTS = re.compile(
     r"\b(memcpy|memmove|strcpy|strcat|wcscpy|wcscat|sprintf|system|popen|"
-    r"WinExec|ShellExecute|CreateProcess)\s*\(",
+    r"WinExec|ShellExecute|CreateProcess|"
+    # Windows kernel sinks worth correlating to user-derived inputs:
+    r"ProbeForRead|ProbeForWrite|MmMapLockedPagesSpecifyCache|"
+    r"RtlCopyMemory|IoAllocateMdl|ExAllocatePoolWithTag)\s*\(",
 )
+
+
+# ---------------------------------------------------------------------------
+# Wave 3C: KERNEL_DOUBLE_FETCH helper.
+# Implemented up here so PseudocodeRules._load_default_rules can register
+# the rule without relying on late-bound name resolution at class
+# definition time. The helper is module-private (leading underscore) but
+# unit-testable on its own.
+# ---------------------------------------------------------------------------
+
+# Probe-call extractor: ProbeForRead(arg, ...) / ProbeForWrite(arg, ...).
+_PROBE_RE = re.compile(r"\bProbeFor(?:Read|Write)\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def _kernel_double_fetch(pseudocode: str, statements: list) -> list:
+    """
+    Detect classic double-fetch shapes: Probe(arg) followed by ≥2 distinct
+    dereferences of arg without an intervening copy / callee capture.
+
+    See ``ContextFinding`` for the return shape; the dispatcher in
+    ``scan_text`` converts these to finding dicts.
+    """
+    findings: list[ContextFinding] = []
+    if not statements:
+        return findings
+
+    # Collect every probe site once.
+    probes: list[tuple[int, str, int]] = []
+    for idx, stmt in enumerate(statements):
+        for m in _PROBE_RE.finditer(stmt.text):
+            probes.append((idx, m.group(1), stmt.start_line))
+
+    for probe_idx, arg, probe_line in probes:
+        arg_re = re.escape(arg)
+        deref_member_re = re.compile(rf"\b{arg_re}\s*->\s*(\w+)")
+        deref_pointer_re = re.compile(rf"\*\s*{arg_re}\b")
+        # Copy capture: memcpy/RtlCopyMemory/memmove/RtlMoveMemory(_, &?arg, ...)
+        # where the second positional arg is the bare arg token (followed
+        # by `,` or `)`), NOT arg->field.
+        copy_capture_re = re.compile(
+            rf"\b(?:memcpy|RtlCopyMemory|memmove|RtlMoveMemory)\s*\("
+            rf"[^,]+,\s*&?\s*{arg_re}\s*[,)]"
+        )
+        # Callee capture: <non-param_local> = func(... arg ,/)) ...
+        callee_capture_re = re.compile(rf"^\s*(?!param_)\w+\s*=\s*\w+\s*\([^)]*\b{arg_re}\s*[,)]")
+
+        captured = False
+        seen_fields: set[str] = set()
+        derefs: list[dict] = []
+
+        for idx in range(probe_idx + 1, len(statements)):
+            text = statements[idx].text
+            if copy_capture_re.search(text) or callee_capture_re.search(text):
+                captured = True
+                break
+
+            for m in deref_member_re.finditer(text):
+                field = m.group(1)
+                if field not in seen_fields:
+                    seen_fields.add(field)
+                    derefs.append({"field": field, "line": statements[idx].start_line})
+            if deref_pointer_re.search(text) and "*deref*" not in seen_fields:
+                seen_fields.add("*deref*")
+                derefs.append({"field": "*deref*", "line": statements[idx].start_line})
+
+        if not captured and len(derefs) >= 2:
+            findings.append(
+                ContextFinding(
+                    message=(
+                        f"Possible double-fetch: ProbeFor* on `{arg}` "
+                        f"followed by {len(derefs)} dereferences without "
+                        f"capture into a stack-typed local."
+                    ),
+                    confidence=70,
+                    start_line=probe_line,
+                    end_line=derefs[-1]["line"],
+                )
+            )
+
+    return findings
 
 
 class PseudocodeRules:
@@ -87,91 +225,130 @@ class PseudocodeRules:
 
         raw: list[tuple] = [
             (
-                "CWE120_STRCPY", "CWE-120", "high", 60,
+                "CWE120_STRCPY",
+                "CWE-120",
+                "high",
+                60,
                 "Use of strcpy/strcat without explicit length bounds",
                 "Replace with strncpy_s/strlcpy or equivalent bounded variant.",
                 r"\b(strcpy|strcat|wcscpy|wcscat|lstrcpy[AW]?|lstrcat[AW]?)\s*\(",
                 None,
             ),
             (
-                "CWE120_SPRINTF_UNBOUNDED", "CWE-120", "high", 55,
+                "CWE120_SPRINTF_UNBOUNDED",
+                "CWE-120",
+                "high",
+                55,
                 "sprintf/wsprintf without length cap -- caller trusts format output size",
                 "Use snprintf/_snprintf_s with an explicit destination size.",
                 r"\b(sprintf|vsprintf|wsprintf[AW]?)\s*\(",
                 None,
             ),
             (
-                "CWE120_GETS", "CWE-120", "critical", 95,
+                "CWE120_GETS",
+                "CWE-120",
+                "critical",
+                95,
                 "gets() always reads unbounded input",
                 "Replace with fgets() or getline().",
                 r"\bgets\s*\(",
                 None,
             ),
             (
-                "CWE120_MEMCPY_SIGNED_LEN", "CWE-120", "medium", 50,
+                "CWE120_MEMCPY_SIGNED_LEN",
+                "CWE-120",
+                "medium",
+                50,
                 "memcpy/memmove with a signed/int-typed length -- possible negative-to-size_t wrap",
                 "Cast/validate length as size_t and bound-check against destination size.",
                 r"\b(memcpy|memmove|RtlCopyMemory)\s*\([^,]+,[^,]+,\s*\(?\s*(int|short|char|long)\b",
                 None,
             ),
             (
-                "CWE134_FORMAT_STRING", "CWE-134", "high", 65,
+                "CWE134_FORMAT_STRING",
+                "CWE-134",
+                "high",
+                65,
                 "printf-family call with a non-literal format argument -- classic format-string bug",
                 "Pass a literal format string; route user data through %s arguments.",
                 r"\b(printf|fprintf|vprintf|vfprintf|syslog)\s*\(\s*[a-zA-Z_][a-zA-Z0-9_]*\s*[,)]",
                 None,
             ),
             (
-                "CWE190_MALLOC_ARITHMETIC", "CWE-190", "medium", 40,
+                "CWE190_MALLOC_ARITHMETIC",
+                "CWE-190",
+                "medium",
+                40,
                 "Arithmetic inside malloc/calloc size argument -- potential integer overflow before allocation",
                 "Validate both operands against SIZE_MAX / desired bound before multiplying.",
                 r"\b(malloc|calloc|HeapAlloc|VirtualAlloc)\s*\([^)]*[*+][^)]*\)",
                 None,
             ),
             (
-                "CWE367_TOCTOU_ACCESS_OPEN", "CWE-367", "medium", 55,
+                "CWE367_TOCTOU_ACCESS_OPEN",
+                "CWE-367",
+                "medium",
+                55,
                 "access/stat followed by open -- time-of-check to time-of-use race",
                 "Open-then-check (fstat on the fd) instead of check-then-open.",
                 r"\b(access|stat|lstat)\s*\([^;]{1,200};[^;]{0,400}\b(open|fopen|CreateFile[AW]?)\s*\(",
                 None,
             ),
             (
-                "CWE415_DOUBLE_FREE", "CWE-415", "high", 70,
+                "CWE415_DOUBLE_FREE",
+                "CWE-415",
+                "high",
+                70,
                 "Same pointer freed twice in the visible window -- likely double-free",
                 "NULL the pointer immediately after free; add ownership discipline.",
                 r"\bfree\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)[^;]*;(?:[^;]{0,400};)?\s*free\s*\(\s*\1\s*\)",
                 None,
             ),
             (
-                "CWE476_NULL_DEREF_POST_MALLOC", "CWE-476", "medium", 50,
+                "CWE476_NULL_DEREF_POST_MALLOC",
+                "CWE-476",
+                "medium",
+                50,
                 "Pointer dereference immediately after malloc without a NULL check",
                 "Check the returned pointer against NULL before use.",
                 r"=\s*(malloc|calloc|realloc)\s*\([^;]{1,200};\s*\*",
                 None,
             ),
             (
-                "CWE78_COMMAND_INJECTION", "CWE-78", "critical", 75,
+                "CWE78_COMMAND_INJECTION",
+                "CWE-78",
+                "critical",
+                75,
                 "system/popen/exec/ShellExecute with non-literal command argument",
                 "Use execve with argv array; never pass concatenated user data to a shell.",
                 r"\b(system|popen|WinExec|ShellExecute[AW]?|_?execl[pe]?|_?execv[pe]?)\s*\(\s*[a-zA-Z_][a-zA-Z0-9_]*\s*[,)]",
                 None,
             ),
             (
-                "CWE78_CREATEPROCESS_NONLITERAL", "CWE-78", "high", 55,
+                "CWE78_CREATEPROCESS_NONLITERAL",
+                "CWE-78",
+                "high",
+                55,
                 "CreateProcess with non-literal command line -- suspect if command data is attacker-influenced",
                 "Pass a fully-qualified application name; audit command-line construction.",
                 r"\bCreateProcess[AW]?\s*\([^)]*,[^,]*[a-zA-Z_][a-zA-Z0-9_]*\s*,",
                 None,
             ),
             (
-                "CWE131_SIZEOF_TIMES_COUNT", "CWE-131", "low", 35,
+                "CWE131_SIZEOF_TIMES_COUNT",
+                "CWE-131",
+                "low",
+                35,
                 "Allocation of sizeof(T)*N -- verify N is bounded (overflow check missing)",
                 "Bound-check N against SIZE_MAX/sizeof(T).",
                 r"\b(malloc|calloc|HeapAlloc)\s*\([^)]*sizeof\s*\([^)]+\)\s*\*\s*[A-Za-z_][A-Za-z0-9_]*",
                 None,
             ),
             (
-                "CWE798_HARDCODED_PASSWORD", "CWE-798", "medium", 30,
+                "CWE798_HARDCODED_PASSWORD",
+                "CWE-798",
+                "medium",
+                30,
                 "String literal resembling a password/secret hardcoded in decompilation -- "
                 "this rule is noisy by design; corroborate before reporting",
                 "Load secrets from configuration/secret store, never embed in code.",
@@ -181,49 +358,70 @@ class PseudocodeRules:
                 regex_meta,
             ),
             (
-                "CWE798_AWS_ACCESS_KEY", "CWE-798", "critical", 90,
+                "CWE798_AWS_ACCESS_KEY",
+                "CWE-798",
+                "critical",
+                90,
                 "AWS access-key-shaped literal -- AKIA + 16 base32 characters",
                 "Rotate immediately; load credentials from IAM role / env / SSO.",
                 r'"AKIA[0-9A-Z]{16}"',
                 None,
             ),
             (
-                "CWE798_GITHUB_TOKEN", "CWE-798", "critical", 90,
+                "CWE798_GITHUB_TOKEN",
+                "CWE-798",
+                "critical",
+                90,
                 "GitHub-style PAT/OAuth token literal (ghp_/gho_/ghs_/ghu_)",
                 "Rotate the token via GitHub UI; never commit PATs to artifacts.",
                 r'"gh[opsu]_[A-Za-z0-9]{36,}"',
                 None,
             ),
             (
-                "CWE798_STRIPE_SECRET", "CWE-798", "critical", 90,
+                "CWE798_STRIPE_SECRET",
+                "CWE-798",
+                "critical",
+                90,
                 "Stripe live secret key literal (sk_live_)",
                 "Rotate via the Stripe dashboard; load from secret store.",
                 r'"sk_live_[A-Za-z0-9]{20,}"',
                 None,
             ),
             (
-                "CWE798_JWT_TOKEN", "CWE-798", "high", 80,
+                "CWE798_JWT_TOKEN",
+                "CWE-798",
+                "high",
+                80,
                 "JWT-shaped literal -- header.payload.signature with eyJ prefix",
                 "If genuine, rotate the signing key; do not embed bearer tokens in binaries.",
                 r'"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{6,}"',
                 None,
             ),
             (
-                "CWE121_STACK_COPY_NO_BOUNDS", "CWE-121", "medium", 50,
+                "CWE121_STACK_COPY_NO_BOUNDS",
+                "CWE-121",
+                "medium",
+                50,
                 "Stack-buffer copy without visible bound check (strncpy/memcpy of stack array)",
                 "Ensure source length ≤ destination size; prefer safer wrappers.",
                 r"\b(strncpy|memcpy|RtlCopyMemory)\s*\(\s*(local_|auStack|acStack|l?u?Stack)",
                 None,
             ),
             (
-                "CWE676_DANGEROUS_FN", "CWE-676", "low", 30,
+                "CWE676_DANGEROUS_FN",
+                "CWE-676",
+                "low",
+                30,
                 "Use of historically dangerous function family",
                 "Audit usage; prefer safer library equivalents where available.",
                 r"\b(scanf|sscanf|fscanf|alloca|_alloca|tmpnam|mktemp)\s*\(",
                 None,
             ),
             (
-                "CWE416_USE_AFTER_FREE", "CWE-416", "high", 65,
+                "CWE416_USE_AFTER_FREE",
+                "CWE-416",
+                "high",
+                65,
                 "Pointer used after free in the visible window",
                 "NULL the pointer at free; restructure ownership so freed memory is unreachable.",
                 r"\bfree\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)[^;]*;(?:[^;]{0,400};){0,4}"
@@ -231,7 +429,10 @@ class PseudocodeRules:
                 None,
             ),
             (
-                "CWE805_MEMCPY_HEADER_DRIVEN_LEN", "CWE-805", "high", 70,
+                "CWE805_MEMCPY_HEADER_DRIVEN_LEN",
+                "CWE-805",
+                "high",
+                70,
                 "memcpy/memmove length comes from a struct field or pointer deref -- "
                 "classic 'attacker-controlled size from packet' shape",
                 "Validate the size against the destination capacity AND the remaining input "
@@ -243,7 +444,10 @@ class PseudocodeRules:
                 None,
             ),
             (
-                "CWE190_HEADER_LEN_TO_ALLOC", "CWE-190", "high", 70,
+                "CWE190_HEADER_LEN_TO_ALLOC",
+                "CWE-190",
+                "high",
+                70,
                 "Allocation size derived from a struct/deref field with arithmetic -- "
                 "header-length integer overflow before alloc",
                 "Range-check the length field BEFORE arithmetic; reject sizes that would overflow size_t.",
@@ -254,7 +458,10 @@ class PseudocodeRules:
                 None,
             ),
             (
-                "CWE401_REALLOC_SHADOW", "CWE-401", "medium", 60,
+                "CWE401_REALLOC_SHADOW",
+                "CWE-401",
+                "medium",
+                60,
                 "realloc result assigned back to the same pointer -- on failure the original "
                 "pointer is leaked and may also be left dangling",
                 "Use a temporary: tmp = realloc(p, n); if (tmp) p = tmp; else handle_failure().",
@@ -262,14 +469,20 @@ class PseudocodeRules:
                 None,
             ),
             (
-                "CWE242_ALLOCA_VARIABLE", "CWE-242", "high", 60,
+                "CWE242_ALLOCA_VARIABLE",
+                "CWE-242",
+                "high",
+                60,
                 "Variable-size _alloca/alloca -- attacker-sized stack growth enables stack pivots and exhaustion",
                 "Replace with malloc + free, or cap the size with a hard-coded ceiling.",
                 r"\b_?alloca\s*\(\s*[A-Za-z_][A-Za-z0-9_]*\s*\)",
                 None,
             ),
             (
-                "CWE242_VIRTUALALLOC_RWX", "CWE-242", "high", 80,
+                "CWE242_VIRTUALALLOC_RWX",
+                "CWE-242",
+                "high",
+                80,
                 "Memory page allocated with PAGE_EXECUTE_READWRITE -- RWX is a strong code-injection signal",
                 "Allocate RW, then VirtualProtect to RX. Avoid RWX outside JIT engines.",
                 r"\b(VirtualAlloc(?:Ex)?|NtAllocateVirtualMemory|VirtualProtect(?:Ex)?)\s*\("
@@ -277,7 +490,10 @@ class PseudocodeRules:
                 None,
             ),
             (
-                "CWE193_NULL_TERM_OFF_BY_ONE", "CWE-193", "medium", 50,
+                "CWE193_NULL_TERM_OFF_BY_ONE",
+                "CWE-193",
+                "medium",
+                50,
                 "Null terminator written at index equal to a length variable -- classic off-by-one if buffer was sized exactly len",
                 "Allocate len+1 bytes, or write the terminator at len-1 after a bounded copy.",
                 r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\[\s*([A-Za-z_][A-Za-z0-9_]*(?:_len|len|Length|size|Size))\s*\]"
@@ -285,14 +501,20 @@ class PseudocodeRules:
                 None,
             ),
             (
-                "CWE822_DEREF_USER_OFFSET", "CWE-822", "medium", 35,
+                "CWE822_DEREF_USER_OFFSET",
+                "CWE-822",
+                "medium",
+                35,
                 "Pointer arithmetic with a non-constant offset followed by deref -- bounds may not be enforced",
                 "Verify the offset is within the buffer length before dereferencing.",
                 r"\*\s*\(\s*[A-Za-z_][A-Za-z0-9_]*\s*\+\s*[A-Za-z_][A-Za-z0-9_]*\s*\)",
                 None,
             ),
             (
-                "CWE125_STRLEN_UNTRUSTED_PTR", "CWE-125", "low", 40,
+                "CWE125_STRLEN_UNTRUSTED_PTR",
+                "CWE-125",
+                "low",
+                40,
                 "strlen on a pointer derived from input -- if the buffer isn't NUL-terminated this is an OOB read",
                 "Use strnlen with the known buffer length; never trust input to be terminated.",
                 r"\bstrlen\s*\(\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*->\s*|\*\s*)",
@@ -311,12 +533,30 @@ class PseudocodeRules:
                     description=desc,
                     recommendation=rec,
                     pattern=re.compile(regex, re.MULTILINE | re.DOTALL),
-                    negative_pattern=(
-                        re.compile(neg, re.MULTILINE | re.DOTALL)
-                        if neg else None
-                    ),
+                    negative_pattern=(re.compile(neg, re.MULTILINE | re.DOTALL) if neg else None),
                 )
             )
+
+        # Wave 3C: KERNEL_DOUBLE_FETCH context rule. Cannot be expressed
+        # by a single regex because it requires "after probe" ordering
+        # and "no intervening capture" suppression.
+        rules.append(
+            PseudocodeRule(
+                id="KERNEL_DOUBLE_FETCH",
+                cwe="CWE-367",
+                severity="high",
+                confidence=70,
+                description="Possible double-fetch of probed user-mode data",
+                recommendation=(
+                    "Capture the probed user struct into a stack-typed local "
+                    "with RtlCopyMemory before reading any field; do not "
+                    "dereference the original user pointer after Probe."
+                ),
+                kind=RuleKind.CONTEXT,
+                context_fn=_kernel_double_fetch,
+            )
+        )
+
         return rules
 
 
@@ -337,7 +577,120 @@ def find_line_excerpt(pseudocode: str, match: re.Match, context_chars: int = 120
     return excerpt
 
 
+def _excerpt_from_lines(
+    pseudocode: str,
+    start_line: int,
+    end_line: int,
+    max_chars: int = 240,
+) -> str:
+    """
+    Return a single-line excerpt covering ``start_line``..``end_line`` (1-based).
+
+    Mirrors ``find_line_excerpt`` formatting (collapsed whitespace, ellipsis
+    sentinels) so context findings render alongside regex findings without
+    surprises in the scan_pseudocode formatter.
+    """
+    if not pseudocode or start_line < 1 or end_line < start_line:
+        return ""
+    lines = pseudocode.splitlines()
+    if not lines:
+        return ""
+    lo = max(0, start_line - 1)
+    hi = min(len(lines), end_line)
+    chunk = "\n".join(lines[lo:hi])
+    excerpt = re.sub(r"\s+", " ", chunk).strip()
+    if len(excerpt) > max_chars:
+        excerpt = excerpt[: max_chars - 1] + "…"
+    if lo > 0:
+        excerpt = "…" + excerpt
+    if hi < len(lines):
+        excerpt = excerpt + "…"
+    return excerpt
+
+
+# Statement boundaries used by ``_split_statements``. Brace tokens are
+# treated as terminators but are not themselves emitted as statement text;
+# a balanced brace block becomes two empty terminators with the body
+# statements in between, which is exactly what context rules want.
+_STATEMENT_TERMINATORS = frozenset(";{}")
+
+
+def _split_statements(pseudocode: str | None) -> list[Statement]:
+    """
+    Split decompiled C-like pseudocode into ``Statement`` records.
+
+    Splits on ``;``, ``{``, and ``}`` only. No real C parser, no preprocessor
+    handling, no string-literal awareness -- this matches the project's
+    "triage not proof" stance and keeps context rules cheap. Empty
+    fragments (whitespace-only) are dropped. 1-based line numbers track the
+    original source lines a fragment spans.
+
+    Returns an empty list for ``None`` / empty / whitespace-only input.
+    """
+    if not pseudocode or not pseudocode.strip():
+        return []
+
+    statements: list[Statement] = []
+    buf: list[str] = []
+    line = 1
+    fragment_start_line = 1
+
+    def _flush(end_line: int) -> None:
+        text = "".join(buf).strip()
+        if text:
+            statements.append(
+                Statement(text=text, start_line=fragment_start_line, end_line=end_line)
+            )
+        buf.clear()
+
+    for ch in pseudocode:
+        if ch in _STATEMENT_TERMINATORS:
+            _flush(line)
+            fragment_start_line = line
+            continue
+        buf.append(ch)
+        if ch == "\n":
+            line += 1
+            # If the buffer is still pure whitespace, advance the fragment
+            # start so a leading blank line doesn't get attributed to the
+            # next real statement.
+            if not "".join(buf).strip():
+                fragment_start_line = line
+
+    _flush(line)
+    return statements
+
+
 NEGATIVE_PATTERN_PENALTY = 40
+
+
+def _build_regex_finding(rule: PseudocodeRule, pseudocode: str, match: re.Match) -> dict:
+    confidence = rule.confidence
+    if rule.negative_pattern and rule.negative_pattern.search(match.group(0)):
+        confidence = max(0, confidence - NEGATIVE_PATTERN_PENALTY)
+    return {
+        "rule_id": rule.id,
+        "cwe": rule.cwe,
+        "severity": rule.severity,
+        "confidence": confidence,
+        "description": rule.description,
+        "recommendation": rule.recommendation,
+        "excerpt": find_line_excerpt(pseudocode, match),
+    }
+
+
+def _build_context_finding(rule: PseudocodeRule, pseudocode: str, cf: ContextFinding) -> dict:
+    severity = cf.severity if cf.severity else rule.severity
+    confidence = max(0, min(100, cf.confidence))
+    return {
+        "rule_id": rule.id,
+        "cwe": rule.cwe,
+        "severity": severity,
+        "confidence": confidence,
+        "description": cf.message or rule.description,
+        "recommendation": rule.recommendation,
+        "excerpt": _excerpt_from_lines(pseudocode, cf.start_line, cf.end_line),
+    }
 
 
 def scan_text(pseudocode: str, rules: list[PseudocodeRule]) -> list[dict]:
@@ -345,28 +698,31 @@ def scan_text(pseudocode: str, rules: list[PseudocodeRule]) -> list[dict]:
     Apply a rule set to one pseudocode string, return a list of findings.
 
     Each finding has: rule_id, cwe, severity, confidence (rule baseline,
-    adjusted down if the rule's negative_pattern matched the literal),
-    description, recommendation, excerpt. Cross-rule corroboration and
-    function-shape adjustments happen in the caller.
+    adjusted down if the rule's negative_pattern matched the literal for
+    regex rules; clamped to 0..100 from the context rule for context
+    rules), description, recommendation, excerpt. Cross-rule corroboration
+    and function-shape adjustments happen in the caller.
+
+    Both regex and context rules are dispatched here so callers (notably
+    ``scan_pseudocode``) need not branch on ``rule.kind``.
     """
     findings: list[dict] = []
     if not pseudocode:
         return findings
 
+    statements: list[Statement] | None = None
+
     for rule in rules:
-        for match in rule.pattern.finditer(pseudocode):
-            confidence = rule.confidence
-            if rule.negative_pattern and rule.negative_pattern.search(match.group(0)):
-                confidence = max(0, confidence - NEGATIVE_PATTERN_PENALTY)
-            findings.append({
-                "rule_id": rule.id,
-                "cwe": rule.cwe,
-                "severity": rule.severity,
-                "confidence": confidence,
-                "description": rule.description,
-                "recommendation": rule.recommendation,
-                "excerpt": find_line_excerpt(pseudocode, match),
-            })
+        if rule.kind is RuleKind.REGEX:
+            assert rule.pattern is not None  # guaranteed by __post_init__
+            for match in rule.pattern.finditer(pseudocode):
+                findings.append(_build_regex_finding(rule, pseudocode, match))
+        elif rule.kind is RuleKind.CONTEXT:
+            assert rule.context_fn is not None  # guaranteed by __post_init__
+            if statements is None:
+                statements = _split_statements(pseudocode)
+            for cf in rule.context_fn(pseudocode, statements) or []:
+                findings.append(_build_context_finding(rule, pseudocode, cf))
     return findings
 
 

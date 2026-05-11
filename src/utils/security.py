@@ -345,7 +345,11 @@ def get_allowed_dirs() -> list[Path] | None:
     """
     Get allowed directories from configuration.
 
-    Reads BINARY_MCP_ALLOWED_DIRS environment variable (colon-separated paths).
+    Reads BINARY_MCP_ALLOWED_DIRS environment variable. Entries are
+    separated by ``os.pathsep`` (``:`` on POSIX, ``;`` on Windows) so
+    drive-letter paths like ``C:\\Users\\foo`` parse correctly on both
+    platforms.
+
     Returns None if not configured (allows any directory).
 
     Returns:
@@ -355,7 +359,7 @@ def get_allowed_dirs() -> list[Path] | None:
     dirs_config = os.environ.get("BINARY_MCP_ALLOWED_DIRS", "").strip()
     if not dirs_config:
         return None
-    return [Path(d.strip()) for d in dirs_config.split(":") if d.strip()]
+    return [Path(d.strip()) for d in dirs_config.split(os.pathsep) if d.strip()]
 
 
 class UserFacingError(Exception):

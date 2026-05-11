@@ -17,9 +17,26 @@ def _streaming_response(payload: bytes, status: int = 200):
     resp = MagicMock()
     resp.getcode.return_value = status
     resp.read = buf.read
+    resp.headers = {"Content-Length": str(len(payload))}
     resp.__enter__ = lambda self: self
     resp.__exit__ = lambda self, *a: False
     return resp
+
+
+def _opener_returning(*responses):
+    """Build a mock opener whose .open() returns each response in turn.
+
+    ``fetch_pdb`` constructs an opener via ``urllib.request.build_opener``
+    and then calls ``opener.open(req, timeout=...)``. Tests patch
+    ``build_opener`` to return this mock so they can simulate the network
+    without touching the real stack.
+    """
+    opener = MagicMock()
+    if len(responses) == 1:
+        opener.open.return_value = responses[0]
+    else:
+        opener.open.side_effect = responses
+    return opener
 
 
 def test_build_symbol_server_url():
@@ -153,9 +170,9 @@ def test_fetch_pdb_cache_hit(tmp_path):
     binary.write_bytes(b"MZ")
 
     with patch.object(mod, "extract_codeview_record", return_value=cv):
-        with patch("urllib.request.urlopen") as urlopen:
+        with patch.object(mod.urllib.request, "build_opener") as bo:
             result = mod.fetch_pdb(binary, cache_dir=cache_dir)
-            urlopen.assert_not_called()
+            bo.assert_not_called()
     assert result == cached
     assert result.read_bytes() == b"FAKE-PDB-CONTENT"
 
@@ -173,12 +190,13 @@ def test_fetch_pdb_downloads_when_not_cached(tmp_path):
     binary.write_bytes(b"MZ")
 
     fake_resp = _streaming_response(b"PDB-DOWNLOADED")
+    opener = _opener_returning(fake_resp)
 
     with patch.object(mod, "extract_codeview_record", return_value=cv):
-        with patch("urllib.request.urlopen", return_value=fake_resp) as urlopen:
+        with patch.object(mod.urllib.request, "build_opener", return_value=opener):
             result = mod.fetch_pdb(binary, cache_dir=cache_dir)
-            urlopen.assert_called_once()
-            req = urlopen.call_args[0][0]
+            opener.open.assert_called_once()
+            req = opener.open.call_args[0][0]
             assert "test.pdb/AAAA1111BBBB2222CCCC3333DDDD44442/test.pdb" in req.full_url
             assert req.headers["User-agent"].startswith("Microsoft-Symbol-Server")
 
@@ -292,14 +310,17 @@ def test_fetch_pdb_falls_back_to_second_server(tmp_path, monkeypatch):
 
     calls = []
 
-    def fake_urlopen(req, timeout=None):
+    def fake_open(req, timeout=None):
         calls.append(req.full_url)
         if "primary" in req.full_url:
             raise err
         return _streaming_response(b"FROM-FALLBACK")
 
+    opener = MagicMock()
+    opener.open.side_effect = fake_open
+
     with patch.object(mod, "extract_codeview_record", return_value=cv):
-        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        with patch.object(mod.urllib.request, "build_opener", return_value=opener):
             result = mod.fetch_pdb(
                 binary,
                 cache_dir=tmp_path / "cache",
@@ -332,8 +353,11 @@ def test_fetch_pdb_all_servers_fail(tmp_path, monkeypatch):
         url="http://x", code=404, msg="Not Found", hdrs=None, fp=None,
     )
 
+    opener = MagicMock()
+    opener.open.side_effect = err
+
     with patch.object(mod, "extract_codeview_record", return_value=cv):
-        with patch("urllib.request.urlopen", side_effect=err):
+        with patch.object(mod.urllib.request, "build_opener", return_value=opener):
             with pytest.raises(RuntimeError, match="All configured symbol servers failed"):
                 mod.fetch_pdb(
                     binary,
@@ -357,8 +381,10 @@ def test_fetch_pdb_http_error_wraps_as_runtime(tmp_path):
     err = urllib.error.HTTPError(
         url="http://x", code=404, msg="Not Found", hdrs=None, fp=None
     )
+    opener = MagicMock()
+    opener.open.side_effect = err
     with patch.object(mod, "extract_codeview_record", return_value=cv):
-        with patch("urllib.request.urlopen", side_effect=err):
+        with patch.object(mod.urllib.request, "build_opener", return_value=opener):
             with pytest.raises(RuntimeError, match="404"):
                 mod.fetch_pdb(
                     binary,
@@ -515,10 +541,11 @@ def test_fetch_pdb_writes_full_file_no_part_left(tmp_path):
     payload = b"X" * (256 * 1024 + 17)  # spans many chunks
 
     fake_resp = _streaming_response(payload)
+    opener = _opener_returning(fake_resp)
     cache_dir = tmp_path / "cache"
 
     with patch.object(mod, "extract_codeview_record", return_value=cv):
-        with patch("urllib.request.urlopen", return_value=fake_resp):
+        with patch.object(mod.urllib.request, "build_opener", return_value=opener):
             result = mod.fetch_pdb(binary, cache_dir=cache_dir)
 
     assert result.read_bytes() == payload
@@ -545,3 +572,258 @@ def test_fetch_pdb_raises_on_unwritable_cache(tmp_path, monkeypatch):
         with patch.object(Path, "write_bytes", boom):
             with pytest.raises(RuntimeError, match="not writable"):
                 mod.fetch_pdb(binary, cache_dir=tmp_path / "cache")
+
+
+# --- SSRF hardening tests ------------------------------------------------
+
+class TestIsSafeSymbolServerHost:
+    """Direct tests of the host-validation predicate.
+
+    The helper is exposed at module level so tests don't have to round-trip
+    through urlopen to exercise the policy.
+    """
+
+    def test_rejects_loopback_v4(self, monkeypatch):
+        from src.utils.pdb_fetcher import _is_safe_symbol_server_host
+
+        monkeypatch.delenv("BINARY_MCP_ALLOW_PRIVATE_SYMBOL_SERVERS", raising=False)
+        assert _is_safe_symbol_server_host("127.0.0.1") is False
+        assert _is_safe_symbol_server_host("127.5.6.7") is False
+
+    def test_rejects_loopback_v6(self, monkeypatch):
+        from src.utils.pdb_fetcher import _is_safe_symbol_server_host
+
+        monkeypatch.delenv("BINARY_MCP_ALLOW_PRIVATE_SYMBOL_SERVERS", raising=False)
+        assert _is_safe_symbol_server_host("::1") is False
+        # Hostname form (with brackets) should be tolerated by the caller,
+        # but the bare helper also accepts the bracketed form.
+        assert _is_safe_symbol_server_host("[::1]") is False
+
+    def test_rejects_rfc1918(self, monkeypatch):
+        from src.utils.pdb_fetcher import _is_safe_symbol_server_host
+
+        monkeypatch.delenv("BINARY_MCP_ALLOW_PRIVATE_SYMBOL_SERVERS", raising=False)
+        assert _is_safe_symbol_server_host("10.0.0.1") is False
+        assert _is_safe_symbol_server_host("172.16.5.5") is False
+        assert _is_safe_symbol_server_host("192.168.1.1") is False
+
+    def test_rejects_cloud_metadata(self, monkeypatch):
+        from src.utils.pdb_fetcher import _is_safe_symbol_server_host
+
+        monkeypatch.delenv("BINARY_MCP_ALLOW_PRIVATE_SYMBOL_SERVERS", raising=False)
+        # 169.254.169.254 is the AWS/Azure/GCP metadata service. It also
+        # falls inside the link-local /16 so the IPv6 fe80::/10 logic in
+        # the helper covers analogous cases.
+        assert _is_safe_symbol_server_host("169.254.169.254") is False
+
+    def test_rejects_dns_name_resolving_to_private(self, monkeypatch):
+        from src.utils import pdb_fetcher as mod
+
+        monkeypatch.delenv("BINARY_MCP_ALLOW_PRIVATE_SYMBOL_SERVERS", raising=False)
+
+        def fake_getaddrinfo(host, *_a, **_kw):
+            # (family, type, proto, canonname, sockaddr)
+            return [(0, 0, 0, "", ("10.0.0.5", 0))]
+
+        monkeypatch.setattr(mod.socket, "getaddrinfo", fake_getaddrinfo)
+        assert mod._is_safe_symbol_server_host("evil.example.com") is False
+
+    def test_rejects_dns_name_with_any_private_answer(self, monkeypatch):
+        """Even one private answer in a multi-record set must trip the gate."""
+        from src.utils import pdb_fetcher as mod
+
+        monkeypatch.delenv("BINARY_MCP_ALLOW_PRIVATE_SYMBOL_SERVERS", raising=False)
+
+        def fake_getaddrinfo(host, *_a, **_kw):
+            return [
+                (0, 0, 0, "", ("8.8.8.8", 0)),       # public
+                (0, 0, 0, "", ("127.0.0.1", 0)),     # loopback
+            ]
+
+        monkeypatch.setattr(mod.socket, "getaddrinfo", fake_getaddrinfo)
+        assert mod._is_safe_symbol_server_host("split.example.com") is False
+
+    def test_allows_public_ip(self, monkeypatch):
+        from src.utils.pdb_fetcher import _is_safe_symbol_server_host
+
+        monkeypatch.delenv("BINARY_MCP_ALLOW_PRIVATE_SYMBOL_SERVERS", raising=False)
+        assert _is_safe_symbol_server_host("8.8.8.8") is True
+
+    def test_allows_public_dns(self, monkeypatch):
+        from src.utils import pdb_fetcher as mod
+
+        monkeypatch.delenv("BINARY_MCP_ALLOW_PRIVATE_SYMBOL_SERVERS", raising=False)
+
+        def fake_getaddrinfo(host, *_a, **_kw):
+            return [(0, 0, 0, "", ("23.45.67.89", 0))]
+
+        monkeypatch.setattr(mod.socket, "getaddrinfo", fake_getaddrinfo)
+        assert mod._is_safe_symbol_server_host("msdl.microsoft.com") is True
+
+    def test_optin_env_var_allows_private(self, monkeypatch):
+        from src.utils.pdb_fetcher import _is_safe_symbol_server_host
+
+        monkeypatch.setenv("BINARY_MCP_ALLOW_PRIVATE_SYMBOL_SERVERS", "1")
+        assert _is_safe_symbol_server_host("127.0.0.1") is True
+        assert _is_safe_symbol_server_host("10.0.0.5") is True
+        assert _is_safe_symbol_server_host("169.254.169.254") is True
+
+
+class TestParseSymbolPathSsrf:
+    def test_private_server_dropped(self, monkeypatch, caplog):
+        import logging
+
+        from src.utils.pdb_fetcher import DEFAULT_SYMBOL_SERVER, parse_symbol_path
+
+        monkeypatch.delenv("BINARY_MCP_ALLOW_PRIVATE_SYMBOL_SERVERS", raising=False)
+        caplog.set_level(logging.WARNING, logger="src.utils.pdb_fetcher")
+        _, servers = parse_symbol_path("srv*https://127.0.0.1/sym")
+        # Falls back to the default since the configured server was dropped.
+        assert servers == [DEFAULT_SYMBOL_SERVER]
+        joined = " ".join(r.message for r in caplog.records)
+        assert "BINARY_MCP_ALLOW_PRIVATE_SYMBOL_SERVERS" in joined
+
+    def test_private_server_kept_with_optin(self, monkeypatch):
+        from src.utils.pdb_fetcher import parse_symbol_path
+
+        monkeypatch.setenv("BINARY_MCP_ALLOW_PRIVATE_SYMBOL_SERVERS", "1")
+        _, servers = parse_symbol_path("srv*https://10.0.0.1/sym")
+        assert servers == ["https://10.0.0.1/sym"]
+
+    def test_cloud_metadata_dropped(self, monkeypatch):
+        from src.utils.pdb_fetcher import DEFAULT_SYMBOL_SERVER, parse_symbol_path
+
+        monkeypatch.delenv("BINARY_MCP_ALLOW_PRIVATE_SYMBOL_SERVERS", raising=False)
+        _, servers = parse_symbol_path(
+            "srv*http://169.254.169.254/latest/meta-data/"
+        )
+        # Both the http-without-optin and the SSRF gate would reject this,
+        # but the result must not contain the metadata URL.
+        assert "169.254.169.254" not in " ".join(servers)
+        assert servers == [DEFAULT_SYMBOL_SERVER]
+
+
+class TestSafeRedirectHandler:
+    def test_redirect_to_private_ip_is_rejected(self, monkeypatch, tmp_path):
+        """A 302 pointing at 127.0.0.1 must fail the fetch loop."""
+        import urllib.error
+        import urllib.request
+
+        from src.utils import pdb_fetcher as mod
+
+        monkeypatch.delenv("BINARY_MCP_ALLOW_PRIVATE_SYMBOL_SERVERS", raising=False)
+
+        handler = mod._SafeRedirectHandler()
+        req = urllib.request.Request("https://msdl.microsoft.com/x")
+        fp = io.BytesIO(b"")
+        # Mimic urllib's call to redirect_request when handling a 302.
+        with pytest.raises(urllib.error.HTTPError):
+            handler.redirect_request(
+                req, fp, 302, "Found", {}, "http://127.0.0.1/leak"
+            )
+
+    def test_redirect_to_public_ip_is_allowed(self, monkeypatch):
+        """Redirect to a public host returns a new Request object."""
+        import urllib.request
+
+        from src.utils import pdb_fetcher as mod
+
+        monkeypatch.delenv("BINARY_MCP_ALLOW_PRIVATE_SYMBOL_SERVERS", raising=False)
+
+        # Force the DNS path to resolve to a public IP so we don't rely on
+        # real DNS during the test.
+        def fake_getaddrinfo(host, *_a, **_kw):
+            return [(0, 0, 0, "", ("23.45.67.89", 0))]
+
+        monkeypatch.setattr(mod.socket, "getaddrinfo", fake_getaddrinfo)
+
+        handler = mod._SafeRedirectHandler()
+        req = urllib.request.Request("https://msdl.microsoft.com/x")
+        fp = io.BytesIO(b"")
+        new_req = handler.redirect_request(
+            req, fp, 302, "Found",
+            {"location": "https://cdn.example.com/y"},
+            "https://cdn.example.com/y",
+        )
+        assert new_req is not None
+        assert new_req.full_url == "https://cdn.example.com/y"
+
+
+class TestDownloadSizeCap:
+    def test_rejects_oversized_content_length(self, tmp_path, monkeypatch):
+        """Server advertising > 256 MB Content-Length is dropped pre-stream."""
+        from src.utils import pdb_fetcher as mod
+
+        monkeypatch.delenv("BINARY_MCP_SYMBOL_PATH", raising=False)
+        monkeypatch.delenv("_NT_SYMBOL_PATH", raising=False)
+
+        cv = {
+            "guid": "AAAA" * 8,
+            "age": 1,
+            "pdb_filename": "huge.pdb",
+        }
+        binary = tmp_path / "huge.exe"
+        binary.write_bytes(b"MZ")
+
+        resp = MagicMock()
+        resp.getcode.return_value = 200
+        resp.headers = {"Content-Length": str(mod.MAX_PDB_DOWNLOAD_BYTES + 1)}
+        resp.read.return_value = b""
+        resp.__enter__ = lambda self: self
+        resp.__exit__ = lambda self, *a: False
+
+        fake_opener = MagicMock()
+        fake_opener.open.return_value = resp
+
+        with patch.object(mod, "extract_codeview_record", return_value=cv):
+            with patch.object(
+                mod.urllib.request, "build_opener", return_value=fake_opener
+            ):
+                with pytest.raises(RuntimeError, match="exceeds cap|exceeded size cap"):
+                    mod.fetch_pdb(binary, cache_dir=tmp_path / "cache")
+
+    def test_rejects_streamed_oversize(self, tmp_path, monkeypatch):
+        """No Content-Length, but the response keeps streaming past the cap."""
+        from src.utils import pdb_fetcher as mod
+
+        monkeypatch.delenv("BINARY_MCP_SYMBOL_PATH", raising=False)
+        monkeypatch.delenv("_NT_SYMBOL_PATH", raising=False)
+
+        # Patch the cap down so the test doesn't actually have to stream
+        # 256 MB through memory.
+        monkeypatch.setattr(mod, "MAX_PDB_DOWNLOAD_BYTES", 1024)
+
+        cv = {
+            "guid": "BBBB" * 8,
+            "age": 1,
+            "pdb_filename": "stream.pdb",
+        }
+        binary = tmp_path / "stream.exe"
+        binary.write_bytes(b"MZ")
+
+        chunks = [b"X" * 512, b"X" * 512, b"X" * 512, b""]
+        idx = {"i": 0}
+
+        def fake_read(n=-1):
+            i = idx["i"]
+            idx["i"] += 1
+            if i >= len(chunks):
+                return b""
+            return chunks[i]
+
+        resp = MagicMock()
+        resp.getcode.return_value = 200
+        resp.headers = {}
+        resp.read = fake_read
+        resp.__enter__ = lambda self: self
+        resp.__exit__ = lambda self, *a: False
+
+        fake_opener = MagicMock()
+        fake_opener.open.return_value = resp
+
+        with patch.object(mod, "extract_codeview_record", return_value=cv):
+            with patch.object(
+                mod.urllib.request, "build_opener", return_value=fake_opener
+            ):
+                with pytest.raises(RuntimeError, match="exceeded size cap"):
+                    mod.fetch_pdb(binary, cache_dir=tmp_path / "cache")

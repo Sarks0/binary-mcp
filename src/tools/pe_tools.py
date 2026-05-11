@@ -517,6 +517,7 @@ def register_pe_tools(app, session_manager=None):
     from src.utils.security import (
         FileSizeError,
         PathTraversalError,
+        get_allowed_dirs,
         safe_error_message,
         sanitize_binary_path,
     )
@@ -547,7 +548,9 @@ def register_pe_tools(app, session_manager=None):
             get_pe_info("/path/to/sample.dll", detail_level="full")
         """
         try:
-            binary_path = sanitize_binary_path(binary_path)
+            binary_path = sanitize_binary_path(
+                binary_path, allowed_dirs=get_allowed_dirs()
+            )
             path = Path(binary_path)
 
             if detail_level not in ("basic", "standard", "full"):
@@ -723,4 +726,142 @@ def register_pe_tools(app, session_manager=None):
             logger.error(f"get_pe_info failed: {e}")
             return safe_error_message("Failed to analyze PE file", e)
 
-    logger.info("Registered 1 PE structure tools")
+    @app.tool()
+    def inspect_authenticode(binary_path: str) -> str:
+        """
+        Inspect a PE file's Authenticode (PKCS#7) signature.
+
+        Parses the WIN_CERTIFICATE blob in DATA_DIRECTORY[4], surfaces the
+        signer CN, full issuer chain (with per-cert SHA-256 for VT / CT-log
+        pivoting), digest algorithm, validity window, and any embedded
+        RFC3161 / legacy counter-signature timestamp. Recomputes the
+        Authentihash per the Microsoft spec and compares it to the embedded
+        SpcIndirectDataContent.messageDigest -- a mismatch flags tampering.
+
+        Args:
+            binary_path: Path to a Windows PE file.
+
+        Returns:
+            Markdown report. For unsigned files: "Signed: no -- no security
+            data directory present". For signed files: signer / issuer /
+            timestamp / Authentihash with match status.
+
+        Example:
+            inspect_authenticode("/path/to/notepad.exe")
+        """
+        from src.utils.authenticode import inspect, render_markdown
+        from src.utils.structured_errors import StructuredBaseError
+
+        try:
+            result = inspect(binary_path)
+            return render_markdown(result)
+        except StructuredBaseError as e:
+            return e.structured_error.to_user_message()
+        except (PathTraversalError, FileSizeError) as e:
+            return safe_error_message("inspect_authenticode", e)
+        except Exception as e:
+            logger.error(f"inspect_authenticode failed: {e}")
+            return safe_error_message("Failed to inspect Authenticode signature", e)
+
+    @app.tool()
+    def extract_embedded_binaries(
+        binary_path: str,
+        output_dir: str | None = None,
+        max_total_mb: int = 64,
+    ) -> str:
+        """
+        Walk a PE's resources + overlay, flag/dump suspicious embedded blobs.
+
+        Each blob is classified by magic bytes (PE / ELF / Mach-O / OLE / MSI /
+        ZIP / PDF / .NET / 7z / RAR / gzip / bzip2 / xz) plus a Shannon-entropy
+        fallback (entropy > 7.2 with size > 2 KB). Shellcode prologues
+        (call/pop, cld;call, FS:[0x30] / GS:[0x60] PEB walks) are detected too.
+
+        Flagged blobs are written to ``<output_dir>/<sha256>`` with a sidecar
+        ``<sha256>.json`` describing source (resource type/ID or overlay) and
+        the parent binary's SHA-256. Existing files are never overwritten.
+
+        Args:
+            binary_path: Path to the PE file.
+            output_dir: Where to dump flagged blobs. Defaults to
+                ``~/.binary_mcp_cache/carved/<binary-sha256>/`` on Windows or
+                ``${XDG_CACHE_HOME:-~/.cache}/binary_mcp/carved/<sha256>/`` on
+                POSIX. Honors ``$BINARY_MCP_CARVE_DIR``.
+            max_total_mb: Total carved-byte budget (default 64). Resource-bombs
+                trip this and the remaining flagged blobs are listed but not
+                written.
+
+        Returns:
+            Markdown table of every blob found (resource path, offset, size,
+            SHA-256, detected type, entropy, flag reasons, write status).
+
+        Example:
+            extract_embedded_binaries("/path/to/dropper.exe")
+            extract_embedded_binaries("sample.exe", output_dir="/tmp/carved")
+        """
+        from src.utils.carving import carve, render_markdown
+        from src.utils.security import validate_numeric_range
+        from src.utils.structured_errors import StructuredBaseError
+
+        try:
+            try:
+                max_total_mb = validate_numeric_range(
+                    max_total_mb, 1, 4096, "max_total_mb"
+                )
+            except (TypeError, ValueError) as e:
+                return f"Error [PARAMETER_INVALID]: {e}"
+
+            out_path = Path(output_dir).expanduser() if output_dir else None
+            result = carve(binary_path, out_path, max_total_mb=max_total_mb)
+            return render_markdown(result)
+        except StructuredBaseError as e:
+            return e.structured_error.to_user_message()
+        except (PathTraversalError, FileSizeError) as e:
+            return safe_error_message("extract_embedded_binaries", e)
+        except Exception as e:
+            logger.error(f"extract_embedded_binaries failed: {e}")
+            return safe_error_message("Failed to extract embedded binaries", e)
+
+    @app.tool()
+    def compute_similarity_hashes(binary_path: str) -> str:
+        """
+        Compute every cheap similarity / clustering hash for a PE file.
+
+        Emits:
+        - imphash (toolchain + import-set cluster)
+        - rich_hash = md5(RICH_HEADER.clear_data) -- Mandiant / Yara standard
+          for VT pivots; un-XORed canonical bytes so the hash is consistent
+          across files built with the same compiler/linker version mix.
+        - authentihash (sha256, full file regardless of signing)
+        - per-section sha256
+        - ssdeep + tlsh (when their optional native deps are importable)
+
+        Each hash includes a "VT search:" pivot hint. Missing fuzzy libraries
+        cause a footer note rather than a failure -- imphash, rich_hash,
+        authentihash, and section hashes are always emitted.
+
+        Args:
+            binary_path: Path to the PE file.
+
+        Returns:
+            Markdown report. Pivot hints are formatted as
+            ``VT search: imphash:e87a45c...`` so they paste straight into
+            VirusTotal's intelligence search.
+
+        Example:
+            compute_similarity_hashes("/path/to/sample.exe")
+        """
+        from src.utils.similarity_hashes import compute, render_markdown
+        from src.utils.structured_errors import StructuredBaseError
+
+        try:
+            return render_markdown(compute(binary_path))
+        except StructuredBaseError as e:
+            return e.structured_error.to_user_message()
+        except (PathTraversalError, FileSizeError) as e:
+            return safe_error_message("compute_similarity_hashes", e)
+        except Exception as e:
+            logger.error(f"compute_similarity_hashes failed: {e}")
+            return safe_error_message("Failed to compute similarity hashes", e)
+
+    logger.info("Registered 4 PE structure tools")

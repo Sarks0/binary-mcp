@@ -15,6 +15,7 @@ from ghidra.app.decompiler import DecompInterface
 from ghidra.program.model.block import BasicBlockModel
 from ghidra.program.model.data import Enum as GhidraEnum
 from ghidra.program.model.data import Structure as GhidraStructure
+from ghidra.program.model.listing import CodeUnit
 from ghidra.util.task import ConsoleTaskMonitor
 from java.lang import InterruptedException, Thread
 from java.util.concurrent import Callable, Executors, TimeoutException, TimeUnit
@@ -79,6 +80,139 @@ def safe_format(fmt_string, *args, **kwargs):
             return result
         except Exception:
             return "<formatting_error>"
+
+
+def _operand_base_register(inst):
+    """Best-effort: pull the base register name out of an indirect
+    call's primary operand. Handles ``RAX``, ``[RAX]``, ``[RAX+0x10]``,
+    ``qword ptr [RAX+0x18]``, ``[RIP+0x100]``. Returns ``None`` when
+    the operand is a literal address (no register) or unparseable.
+    """
+    try:
+        operand = inst.getDefaultOperandRepresentation(0)
+    except Exception:
+        return None
+    if not operand:
+        return None
+    text = safe_unicode(operand).upper()
+    # Strip size hints: "QWORD PTR ", "DWORD PTR ", "PTR " -- they are
+    # presentation-only and never carry the register we care about.
+    for prefix in (u"QWORD PTR ", u"DWORD PTR ", u"WORD PTR ",
+                   u"BYTE PTR ", u"PTR "):
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+            break
+    inner = text.strip()
+    if inner.startswith(u"["):
+        end = inner.find(u"]")
+        if end < 0:
+            return None
+        inner = inner[1:end]
+    # ``RAX+0x10`` / ``RAX-0x4`` / ``RIP+0x100`` -- take the LHS token.
+    for sep in (u"+", u"-", u"*"):
+        idx = inner.find(sep)
+        if idx >= 0:
+            inner = inner[:idx]
+            break
+    inner = inner.strip()
+    # Reject hex literals masquerading as register names.
+    if not inner or inner.startswith(u"0X") or inner.isdigit():
+        return None
+    # Crude register-name shape check: 2-4 alphanumerics. Accepts
+    # x86/x64 (RAX, EAX, R8D), ARM64 (X0, W0, X29), and exotic regs
+    # without enumerating them.
+    if 1 <= len(inner) <= 4 and inner[0].isalpha():
+        return inner
+    return None
+
+
+def _extract_immediate(operand_text):
+    """Extract a single ``0xHEX`` literal from an operand string when
+    the operand is a direct or memory-indirect immediate. Returns the
+    canonical lowercase ``"0xHEX"`` form or ``None``.
+    """
+    if not operand_text:
+        return None
+    text = safe_unicode(operand_text).strip()
+    # Strip size hints.
+    for prefix in (u"qword ptr ", u"dword ptr ", u"word ptr ",
+                   u"byte ptr ", u"ptr ", u"QWORD PTR ", u"DWORD PTR ",
+                   u"WORD PTR ", u"BYTE PTR ", u"PTR "):
+        if text.startswith(prefix):
+            text = text[len(prefix):].strip()
+            break
+    if text.startswith(u"["):
+        end = text.find(u"]")
+        if end < 0:
+            return None
+        text = text[1:end].strip()
+    # Reject anything that contains operators (would be reg + imm).
+    for op in (u"+", u"-", u"*"):
+        if op in text:
+            return None
+    if text.lower().startswith(u"0x"):
+        body = text[2:]
+        if body and all(c in u"0123456789abcdefABCDEF" for c in body):
+            return u"0x" + body.lower()
+    return None
+
+
+def _resolve_loaded_from(inst, listing):
+    """Best-effort static resolver for indirect-call targets.
+
+    Walks back up to 5 instructions looking for a ``MOV`` or ``LEA``
+    whose destination is the same register the call dereferences and
+    whose source is a literal immediate (e.g. ``MOV RAX,
+    [0x140020000]``). Returns the immediate as a canonical
+    ``"0xHEX"`` string, or ``None`` when the target is not statically
+    determinable -- which is the common case for vtable dispatch
+    (``MOV RAX, [RCX]; CALL [RAX+0x18]``).
+    """
+    base_reg = _operand_base_register(inst)
+    if not base_reg:
+        return None
+    cur = inst
+    for _ in range(5):
+        try:
+            cur = listing.getInstructionBefore(cur.getAddress())
+        except Exception:
+            return None
+        if cur is None:
+            return None
+        try:
+            mn = safe_unicode(cur.getMnemonicString()).upper()
+        except Exception:
+            continue
+        if mn not in (u"MOV", u"LEA"):
+            continue
+        try:
+            dest = safe_unicode(
+                cur.getDefaultOperandRepresentation(0)
+            ).upper()
+            src = safe_unicode(cur.getDefaultOperandRepresentation(1))
+        except Exception:
+            continue
+        if dest != base_reg.upper():
+            continue
+        addr = _extract_immediate(src)
+        if addr:
+            return addr
+    return None
+
+
+def _normalize_addr_for_xref(raw):
+    """Normalize an address into the same canonical form server-side
+    ``_normalize_xref_addr`` produces (lowercase, no ``0x`` prefix, no
+    leading zeros, never empty). Keeps cache keys aligned with how
+    ``get_xrefs`` looks them up so the reverse index is a true O(1) hit.
+    """
+    if not raw:
+        return u""
+    s = safe_unicode(raw).lower()
+    if s.startswith(u"0x"):
+        s = s[2:]
+    s = s.lstrip(u"0")
+    return s if s else u"0"
 
 
 class DecompileCallable(Callable):
@@ -231,6 +365,157 @@ def _existing_has_pseudocode(existing):
     return False
 
 
+def _extract_comments(function, listing):
+    """Capture Ghidra-supplied comments for a function.
+
+    Returns a tuple of ``(plate_comment, instruction_comments)``:
+
+    * ``plate_comment`` is the function's plate comment as a unicode
+      string (empty when none).
+    * ``instruction_comments`` is a list of ``{addr, kind, text}`` dicts
+      capturing pre / post / EOL comments for every instruction in the
+      function body. Comments commonly arrive from PDB load or from
+      manual annotation in the Ghidra GUI.
+
+    All exceptions are swallowed -- comment extraction must never break
+    analysis. Cheap (no decompile) so it is safe to call from the
+    resume-mode backfill path too.
+    """
+    plate_comment = u""
+    try:
+        raw_plate = function.getComment()
+        if raw_plate:
+            plate_comment = safe_unicode(raw_plate)
+    except Exception:
+        plate_comment = u""
+
+    instruction_comments = []
+    try:
+        body = function.getBody()
+        if body is None:
+            return plate_comment, instruction_comments
+        instr_iter = listing.getInstructions(body, True)
+        # ``listing.getComment(int, Address)`` is the long-stable API
+        # across Ghidra 10/11. The newer ``getCommentAt`` alias is not
+        # present in every install we target, so we stick with the
+        # CodeUnit constants.
+        kind_pairs = (
+            (CodeUnit.PRE_COMMENT, u"pre"),
+            (CodeUnit.POST_COMMENT, u"post"),
+            (CodeUnit.EOL_COMMENT, u"eol"),
+        )
+        while instr_iter.hasNext():
+            inst = instr_iter.next()
+            for code, kind in kind_pairs:
+                try:
+                    txt = listing.getComment(code, inst.getAddress())
+                except Exception:
+                    txt = None
+                if txt:
+                    instruction_comments.append({
+                        "addr": safe_unicode(inst.getAddress()),
+                        "kind": kind,
+                        "text": safe_unicode(txt),
+                    })
+    except Exception as e:
+        print(safe_format("    Warning: Could not extract comments for {}: {}",
+                          safe_unicode(function.getName()), safe_unicode(e)))
+    return plate_comment, instruction_comments
+
+
+def _extract_call_sites(function, listing, function_manager):
+    """Walk a function's body and collect call-site information.
+
+    Returns a tuple ``(direct_calls, indirect_calls)``:
+
+    * ``direct_calls`` carries records with the call-site PC, the
+      resolved callee's entry-point address, the callee's name, and
+      whether the callee resolves to an external import (thunks
+      followed). These feed the Wave 1A reverse index.
+    * ``indirect_calls`` covers ``ft.isCall() and ft.isComputed()``
+      sites -- ``CALL [reg+N]``, vtable dispatch, fnptr loads --
+      capturing the call-site PC, the operand expression, and a
+      best-effort static ``loaded_from`` immediate when the prior
+      MOV/LEA is statically resolvable.
+
+    Cheap (no decompile) so it doubles as the resume-mode backfill.
+    """
+    direct = []
+    indirect = []
+    body = function.getBody()
+    if not body:
+        return direct, indirect
+    instr_iter = listing.getInstructions(body, True)
+    while instr_iter.hasNext():
+        inst = instr_iter.next()
+        ft = inst.getFlowType()
+        if ft is None or not ft.isCall():
+            continue
+
+        # --- Indirect calls (Wave 2) --------------------------------
+        if ft.isComputed():
+            try:
+                operand = safe_unicode(
+                    inst.getDefaultOperandRepresentation(0)
+                )
+            except Exception:
+                try:
+                    operand = safe_unicode(inst.toString())
+                except Exception:
+                    operand = u""
+            loaded_from = _resolve_loaded_from(inst, listing)
+            indirect.append({
+                "call_site": safe_unicode(inst.getAddress()),
+                "operand": operand,
+                "loaded_from": loaded_from,
+            })
+            continue
+
+        # --- Direct calls (Wave 1A) ---------------------------------
+        try:
+            targets = inst.getFlows()
+        except Exception:
+            targets = None
+        if not targets:
+            continue
+        call_site = safe_unicode(inst.getAddress())
+        for target_addr in targets:
+            try:
+                target_fn = function_manager.getFunctionAt(target_addr)
+            except Exception:
+                target_fn = None
+            if target_fn is None:
+                # Direct call into code Ghidra didn't tag as a function
+                # (rare; e.g. tail-call into an unrecognised stub).
+                # Record by address so the reverse index still resolves.
+                direct.append({
+                    "call_site": call_site,
+                    "callee_addr": safe_unicode(target_addr),
+                    "callee_name": safe_unicode(target_addr),
+                    "is_external": False,
+                })
+                continue
+            is_external = False
+            callee_name = safe_unicode(target_fn.getName())
+            try:
+                if target_fn.isExternal():
+                    is_external = True
+                elif target_fn.isThunk():
+                    thunked = target_fn.getThunkedFunction(True)
+                    if thunked is not None and thunked.isExternal():
+                        is_external = True
+                        callee_name = safe_unicode(thunked.getName())
+            except Exception:
+                pass
+            direct.append({
+                "call_site": call_site,
+                "callee_addr": safe_unicode(target_fn.getEntryPoint()),
+                "callee_name": callee_name,
+                "is_external": is_external,
+            })
+    return direct, indirect
+
+
 def _load_resume_manifest(path):
     """
     Load a small ``{"complete_addresses": [...]}`` sidecar.
@@ -366,6 +651,9 @@ def extract_comprehensive_analysis():
         context["memory_map"] = []
         context.setdefault("functions", [])
         context.setdefault("xrefs", {})
+        context.setdefault("xrefs_to_function", {})
+        context.setdefault("xrefs_to_import", {})
+        context.setdefault("xrefs_to_function_indirect", {})
         context.setdefault("data_types", {"structures": [], "enums": []})
         context.setdefault("skipped_functions", [])
         context["analysis_stats"] = {
@@ -390,6 +678,9 @@ def extract_comprehensive_analysis():
             "strings": [],
             "memory_map": [],
             "xrefs": {},
+            "xrefs_to_function": {},
+            "xrefs_to_import": {},
+            "xrefs_to_function_indirect": {},
             "data_types": {
                 "structures": [],
                 "enums": []
@@ -564,6 +855,29 @@ def extract_comprehensive_analysis():
                 # function, skip it. Otherwise fall through and re-process so the
                 # missing fields (typically pseudocode) get filled in.
                 if skip_decompile or _existing_has_pseudocode(existing_entry):
+                    # Backfill call-site data if missing. ``call_sites``
+                    # (Wave 1A) and ``indirect_calls`` (Wave 2) come from
+                    # the same instruction walk, so we always recompute
+                    # them together when either is absent.
+                    if ("call_sites" not in existing_entry
+                            or "indirect_calls" not in existing_entry):
+                        try:
+                            d_sites, i_sites = _extract_call_sites(
+                                function, listing, function_manager
+                            )
+                        except Exception:
+                            d_sites, i_sites = [], []
+                        existing_entry["call_sites"] = d_sites
+                        existing_entry["indirect_calls"] = i_sites
+                    # Same backfill for Wave 1B's Ghidra-supplied
+                    # comments. ``plate_comment`` and ``instruction_comments``
+                    # are added together so the absence of either is
+                    # treated as an upgrade trigger.
+                    if ("plate_comment" not in existing_entry
+                            or "instruction_comments" not in existing_entry):
+                        plate, instr_comments = _extract_comments(function, listing)
+                        existing_entry["plate_comment"] = plate
+                        existing_entry["instruction_comments"] = instr_comments
                     skipped_by_resume += 1
                     continue
 
@@ -619,10 +933,14 @@ def extract_comprehensive_analysis():
             "parameters": [],
             "local_variables": [],
             "called_functions": [],
+            "call_sites": [],
+            "indirect_calls": [],
             "pseudocode": None,
             "basic_blocks": [],
             "jump_tables": [],
             "fid_match": None,
+            "plate_comment": u"",
+            "instruction_comments": [],
             "decompile_status": "not_attempted"  # Track decompilation status
         }
 
@@ -694,6 +1012,28 @@ def extract_comprehensive_analysis():
         except Exception as e:
             print(safe_format("    Warning: Could not extract jump tables for {}: {}",
                               safe_unicode(function.getName()), safe_unicode(e)))
+
+        # Capture call sites with instruction-level precision. Direct
+        # calls feed the Wave 1A reverse index; indirect calls (Wave 2)
+        # carry operand text plus a best-effort ``loaded_from``
+        # resolution from the prior static MOV/LEA.
+        try:
+            direct_sites, indirect_sites = _extract_call_sites(
+                function, listing, function_manager
+            )
+            function_info["call_sites"] = direct_sites
+            function_info["indirect_calls"] = indirect_sites
+        except Exception as e:
+            print(safe_format("    Warning: Could not extract call sites for {}: {}",
+                              safe_unicode(function.getName()), safe_unicode(e)))
+
+        # Extract Ghidra-supplied comments (plate + per-instruction
+        # pre/post/eol). These commonly arrive from PDB load or from
+        # in-Ghidra-GUI annotations and are independent of the user
+        # notes side-car maintained server-side.
+        plate, instr_comments = _extract_comments(function, listing)
+        function_info["plate_comment"] = plate
+        function_info["instruction_comments"] = instr_comments
 
         # Optional: Function ID (FID) library match.
         # Iterates installed FID databases and picks the highest-scoring
@@ -886,6 +1226,54 @@ def extract_comprehensive_analysis():
 
             context["data_types"]["enums"].append(enum_info)
 
+    # Build reverse-xref indices from the per-function call-site lists
+    # we captured during the function loop. Inverting in one pass here
+    # turns ``get_xrefs(direction="to", ...)`` from an O(n*m) sweep over
+    # every caller's called_functions into an O(1) dict lookup.
+    #
+    # ``xrefs_to_function_indirect`` (Wave 2) covers the indirect-call
+    # arm: any indirect call whose ``loaded_from`` immediate was
+    # statically resolvable (typical of fnptr loads from .data /
+    # globals; vtable dispatch usually leaves loaded_from=None) is
+    # surfaced here so ``get_xrefs`` can answer "is this function
+    # reached via a static fnptr load?".
+    xrefs_to_function = {}
+    xrefs_to_import = {}
+    xrefs_to_function_indirect = {}
+    for fn in context["functions"]:
+        caller_addr = fn.get("address")
+        caller_name = fn.get("name")
+        for site in fn.get("call_sites") or []:
+            record = {
+                "from_func_addr": caller_addr,
+                "from_func_name": caller_name,
+                "from_call_site": site.get("call_site"),
+            }
+            if site.get("is_external"):
+                key = site.get("callee_name") or u""
+                if key:
+                    xrefs_to_import.setdefault(key, []).append(record)
+            else:
+                key = _normalize_addr_for_xref(site.get("callee_addr"))
+                if key:
+                    xrefs_to_function.setdefault(key, []).append(record)
+        for ic in fn.get("indirect_calls") or []:
+            loaded = ic.get("loaded_from")
+            if not loaded:
+                continue
+            key = _normalize_addr_for_xref(loaded)
+            if not key:
+                continue
+            xrefs_to_function_indirect.setdefault(key, []).append({
+                "from_func_addr": caller_addr,
+                "from_func_name": caller_name,
+                "from_call_site": ic.get("call_site"),
+                "operand": ic.get("operand"),
+            })
+    context["xrefs_to_function"] = xrefs_to_function
+    context["xrefs_to_import"] = xrefs_to_import
+    context["xrefs_to_function_indirect"] = xrefs_to_function_indirect
+
     print("[*] Extraction complete!")
     print(safe_format("    Functions: {}", len(context["functions"])))
     print(safe_format("    Imports: {}", len(context["imports"])))
@@ -893,6 +1281,8 @@ def extract_comprehensive_analysis():
     print(safe_format("    Strings: {}", len(context["strings"])))
     print(safe_format("    Structures: {}", len(context["data_types"]["structures"])))
     print(safe_format("    Enums: {}", len(context["data_types"]["enums"])))
+    print(safe_format("    Reverse-xref entries: {} func / {} import",
+                      len(xrefs_to_function), len(xrefs_to_import)))
 
     # Print analysis statistics
     stats = context["analysis_stats"]

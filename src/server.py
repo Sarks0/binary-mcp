@@ -27,10 +27,13 @@ from src.engines.session import AnalysisType, UnifiedSessionManager
 from src.engines.static.ghidra.project_cache import ProjectCache
 from src.engines.static.ghidra.runner import GhidraAnalysisError, GhidraRunner
 from src.tools.control_flow_tools import register_control_flow_tools
+from src.tools.diff_tools import register_diff_tools
+from src.tools.dispatch_tools import register_dispatch_tools
 from src.tools.dotnet_tools import register_dotnet_tools
 from src.tools.dynamic_tools import register_dynamic_tools
 from src.tools.fid_tools import register_fid_tools
 from src.tools.function_hash_tools import register_function_hash_tools
+from src.tools.indirect_call_tools import register_indirect_call_tools
 from src.tools.malware_tools import register_malware_tools
 from src.tools.pe_tools import register_pe_tools
 from src.tools.reporting import register_reporting_tools
@@ -447,7 +450,7 @@ def get_analysis_context(
     end_address: str | None = None,
     pdb_path: str | None = None,
     enable_fid: bool = False,
-    analysis_depth: str = "full",
+    analysis_depth: str = "structural",
 ) -> dict:
     """
     Get or create analysis context for a binary.
@@ -471,6 +474,13 @@ def get_analysis_context(
         pdb_path: Path to a PDB file. Staged next to the binary so Ghidra's
             PdbUniversalAnalyzer picks it up. Forces a fresh analysis if set.
         enable_fid: Run Ghidra's Function ID library matching per function.
+        analysis_depth: Cache-acceptance floor. Default ``"structural"`` so
+            tools that don't read pseudocode (get_strings, get_imports,
+            get_xrefs, etc.) hit a structural cache without forcing a fresh
+            full Ghidra run. ``analyze_binary`` keeps ``"full"`` as its
+            top-level default. Tools that genuinely need pseudocode either
+            request ``"full"`` explicitly or use the peek-and-upgrade
+            pattern in ``decompile_function``.
 
     Returns:
         Analysis context dict
@@ -701,6 +711,17 @@ def get_analysis_context(
 
         # Cache the results
         cache.save_cached(binary_path, context)
+
+        # Replay any user-supplied notes onto the freshly-built cache
+        # (the side-car survives invalidate, so this is what makes
+        # annotations persist across force_reanalyze / load_pdb). The
+        # second save is cheap and keeps the on-disk cache annotated
+        # so cache-direct readers see notes too.
+        try:
+            cache.apply_notes_overlay(binary_path, context)
+            cache.save_cached(binary_path, context)
+        except Exception as e:
+            logger.warning(f"Failed to apply notes overlay after analysis: {e}")
 
         # Clean up temp file
         output_path.unlink()
@@ -965,6 +986,8 @@ def load_pdb(
     binary_path: str,
     pdb_path: str | None = None,
     symbol_path: str | None = None,
+    skip_decompile: bool = True,
+    analysis_depth: str = "structural",
 ) -> str:
     """
     Apply a Windows PDB to an analyzed binary.
@@ -978,6 +1001,15 @@ def load_pdb(
     Microsoft public symbol server, caching it under
     ``~/.binary_mcp_cache/symbols/``.
 
+    On big binaries (e.g. mpengine.dll, 47K functions) this runs in
+    structural mode by default -- auto-analyse + apply PDB symbols, but
+    skip the per-function decompile pass. That trims a 60-90 minute
+    wait down to ~10-15 min, and pseudocode is still available on
+    demand via ``decompile_function`` (each call decompiles one
+    function in seconds against the now-symbolic cache). If you
+    genuinely want a full decompile pass with the PDB applied, pass
+    ``skip_decompile=False`` and ``analysis_depth="full"``.
+
     Args:
         binary_path: Path to the binary
         pdb_path: Path to the PDB file, or None / "auto" to fetch from
@@ -988,11 +1020,19 @@ def load_pdb(
                   ``_NT_SYMBOL_PATH`` env vars, then to the public
                   Microsoft server. Multiple servers can be chained
                   with ``;``.
+        skip_decompile: Skip per-function decompile during PDB
+                  application. Default True. Set False only when you
+                  explicitly want every function decompiled in the same
+                  pass as PDB application (very slow on big binaries).
+        analysis_depth: "structural" (default) applies PDB symbols + xrefs
+                  + memory map without decompile. "full" decompiles every
+                  function (slow). "shallow" skips most analysis.
 
     Returns:
         Summary comparing pre/post symbolic-function counts.
     """
     try:
+        pdb_was_fetched = False
         if pdb_path in (None, "", "auto"):
             from src.utils.pdb_fetcher import fetch_pdb
             try:
@@ -1002,6 +1042,30 @@ def load_pdb(
             except RuntimeError as e:
                 return f"Symbol server fetch failed: {e}"
             pdb_path = str(fetched)
+            pdb_was_fetched = True
+
+        # User-supplied pdb_path must clear the BINARY_MCP_ALLOWED_DIRS
+        # allowlist (it flows into _stage_pdb which symlinks dest -> src.resolve()
+        # next to the binary, and Ghidra reads the target). Server-fetched
+        # paths come from our own symbol cache and are trusted, so we skip
+        # the allowlist check for those but still normalise the path.
+        if not pdb_was_fetched:
+            try:
+                pdb_path = str(
+                    sanitize_binary_path(
+                        pdb_path,
+                        allowed_dirs=get_allowed_dirs(),
+                    )
+                )
+            except FileNotFoundError:
+                return f"PDB not found at {pdb_path}"
+            except PathTraversalError:
+                return (
+                    "PDB path is outside the allowed directories "
+                    "(BINARY_MCP_ALLOWED_DIRS)."
+                )
+            except (FileSizeError, ValueError) as e:
+                return safe_error_message("Invalid PDB path", e)
 
         # Capture pre-state for before/after comparison
         pre_cached = cache.get_cached(binary_path)
@@ -1017,6 +1081,8 @@ def load_pdb(
             binary_path,
             force_reanalyze=True,
             pdb_path=pdb_path,
+            skip_decompile=skip_decompile,
+            analysis_depth=analysis_depth,
         )
 
         post_functions = context.get("functions", [])
@@ -1034,11 +1100,46 @@ def load_pdb(
             f"- Gain: +{post_named - pre_named}",
         ]
         if post_named <= pre_named:
+            # Surface the most common silent-failure reasons so the user
+            # can diagnose without diving into ghidra_debug.log.
+            debug_log = cache.cache_dir / "ghidra_debug.log"
+            pdb_loaded_marker = False
+            untrusted_enabled_marker = False
+            if debug_log.exists():
+                try:
+                    log_text = debug_log.read_text(
+                        encoding="utf-8", errors="replace"
+                    )
+                    pdb_loaded_marker = (
+                        "PDB Universal" in log_text
+                        and "loaded" in log_text.lower()
+                    )
+                    untrusted_enabled_marker = (
+                        "Enabled PDB Universal.Search untrusted symbol servers"
+                        in log_text
+                    )
+                except OSError:
+                    pass
+
+            lines.append("")
+            lines.append("⚠️  No gain detected. Likely causes:")
+            if not untrusted_enabled_marker:
+                lines.append(
+                    "  - Pre-script didn't run -- PdbUniversalAnalyzer's "
+                    "'Search untrusted locations' option may still be off. "
+                    "Confirm Ghidra >= 10.0."
+                )
+            if not pdb_loaded_marker:
+                lines.append(
+                    "  - PdbUniversalAnalyzer never reported a successful "
+                    "load. The PDB GUID/age may not match this binary, "
+                    "or the analyzer is disabled."
+                )
             lines.append(
-                "\n⚠️  No gain detected. The PDB may not match this binary, "
-                "or Ghidra's PdbUniversalAnalyzer did not run. Check the "
-                "debug log in the cache directory."
+                "  - Public PDBs from MS often contain only function names "
+                "(no types/locals); Gain reflects function-name count only."
             )
+            lines.append(f"  - Inspect {debug_log} for full Ghidra output.")
         return "\n".join(lines)
 
     except FileNotFoundError as e:
@@ -1048,6 +1149,105 @@ def load_pdb(
     except Exception as e:
         logger.exception(f"load_pdb failed: {e}")
         return safe_error_message("Failed to apply PDB", e)
+
+
+@app.tool()
+def clean_cache(
+    binary_path: str | None = None,
+    include_ghidra_projects: bool = False,
+) -> str:
+    """
+    Drop cached analysis artifacts from the cache directory.
+
+    Use this to free disk space, force a clean re-analyze, or recover
+    from a stuck cache state. The user-supplied notes side-car
+    (``<hash>.notes.json``) is preserved on per-binary invalidation so
+    annotations survive a re-analyze; a full wipe (no ``binary_path``)
+    drops them.
+
+    Args:
+        binary_path: Path to a specific binary to invalidate. Omit to
+            wipe the entire cache directory.
+        include_ghidra_projects: Also remove the matching Ghidra project
+            artifacts (``ghidra_projects/<name>.{gpr,lock,rep}``). Off by
+            default because Ghidra project state is the most expensive
+            thing to rebuild -- only include it when you genuinely want
+            to discard the project (e.g. corrupted lock file, switching
+            Ghidra versions).
+
+    Returns:
+        Summary of what was removed and how much space was freed.
+    """
+    try:
+        cache_dir = cache.cache_dir
+
+        def _dir_size(path: Path) -> int:
+            total = 0
+            try:
+                for p in path.rglob("*"):
+                    try:
+                        if p.is_file():
+                            total += p.stat().st_size
+                    except OSError:
+                        pass
+            except OSError:
+                pass
+            return total
+
+        before = _dir_size(cache_dir)
+
+        if binary_path is not None:
+            try:
+                binary_path = sanitize_binary_path(
+                    binary_path,
+                    allowed_dirs=get_allowed_dirs(),
+                )
+            except FileNotFoundError:
+                return (
+                    f"Binary not found: {binary_path}\n"
+                    f"To wipe a stale cache for a missing binary, call "
+                    f"clean_cache() with no arguments (full wipe), or "
+                    f"delete the relevant <hash>.* files manually from "
+                    f"{cache_dir}."
+                )
+
+            ok = cache.invalidate(
+                str(binary_path),
+                include_project=include_ghidra_projects,
+            )
+            if not ok:
+                return safe_error_message(
+                    "Cache invalidation failed",
+                    RuntimeError(f"invalidate returned False for {binary_path}"),
+                )
+
+            after = _dir_size(cache_dir)
+            freed = before - after
+            return (
+                f"**Cache invalidated for {Path(binary_path).name}**\n"
+                f"- Cache files removed (gz / legacy / meta / funcidx)\n"
+                f"- Notes side-car preserved\n"
+                f"- Ghidra project removed: "
+                f"{'yes' if include_ghidra_projects else 'no'}\n"
+                f"- Freed: {freed / (1024 * 1024):.2f} MB"
+            )
+
+        removed = cache.clear_all(include_projects=include_ghidra_projects)
+        after = _dir_size(cache_dir)
+        freed = before - after
+        return (
+            f"**Cache fully wiped**\n"
+            f"- Top-level entries removed: {removed}\n"
+            f"- ghidra_projects/ removed: "
+            f"{'yes' if include_ghidra_projects else 'no'}\n"
+            f"- Freed: {freed / (1024 * 1024):.2f} MB"
+        )
+
+    except (PathTraversalError, FileSizeError) as e:
+        return safe_error_message("Invalid binary path", e)
+    except Exception as e:
+        logger.exception(f"clean_cache failed: {e}")
+        return safe_error_message("Cache cleanup failed", e)
 
 
 @app.tool()
@@ -1257,6 +1457,93 @@ def _normalize_xref_addr(raw: str | None) -> str:
     return str(raw).lower().replace("0x", "").lstrip("0") or "0"
 
 
+def _resolve_function_note_key(
+    context: dict, address: str
+) -> tuple[dict | None, str | None]:
+    """Resolve an address to ``(function_dict, function_key)``.
+
+    The returned key is the function's symbolic name when its
+    ``name_source`` is anything other than ``"DEFAULT"``, and
+    ``"rva:0xHEX"`` (computed against ``metadata.image_base``) otherwise
+    -- the same scheme :class:`ProjectCache` overlay uses, so notes
+    written under one rebuild reattach correctly after another.
+
+    Falls back to whichever key form is computable when only one is
+    available. Returns ``(None, None)`` if no function in the cache
+    contains the supplied address.
+    """
+    if not address:
+        return None, None
+    target_norm = _normalize_xref_addr(address)
+    functions = context.get("functions") or []
+    target_fn: dict | None = None
+    # First pass: entry-point exact match (cheap, common case for plate notes).
+    for fn in functions:
+        if _normalize_xref_addr(fn.get("address")) == target_norm:
+            target_fn = fn
+            break
+    # Second pass: body containment via basic_blocks. Required for pre/post
+    # notes pinned to internal instruction PCs -- the public docstring of
+    # add_note promises "the function it belongs to is resolved
+    # automatically" for those kinds.
+    if target_fn is None:
+        try:
+            target_int = int(target_norm, 16)
+        except (ValueError, TypeError):
+            target_int = None
+        if target_int is not None:
+            for fn in functions:
+                for bb in fn.get("basic_blocks") or []:
+                    bb_start_raw = bb.get("start")
+                    bb_end_raw = bb.get("end")
+                    if not bb_start_raw or not bb_end_raw:
+                        continue
+                    try:
+                        bb_start = int(
+                            str(bb_start_raw).lower().replace("0x", ""), 16
+                        )
+                        bb_end = int(
+                            str(bb_end_raw).lower().replace("0x", ""), 16
+                        )
+                    except (ValueError, TypeError):
+                        continue
+                    if bb_start <= target_int <= bb_end:
+                        target_fn = fn
+                        break
+                if target_fn is not None:
+                    break
+    if target_fn is None:
+        return None, None
+
+    name = target_fn.get("name") or ""
+    name_source = target_fn.get("name_source") or ""
+    if name and name_source and name_source != "DEFAULT":
+        return target_fn, name
+
+    metadata = context.get("metadata") or {}
+    raw_base = metadata.get("image_base") or ""
+    try:
+        image_base_int = int(str(raw_base).lower().replace("0x", ""), 16)
+    except (ValueError, TypeError):
+        # No usable image base and no symbolic name -- best effort: use
+        # the function's own address. This is only a fallback for
+        # synthetic test fixtures; real binaries always carry an
+        # image_base in metadata.
+        return target_fn, name or target_fn.get("address") or None
+
+    try:
+        addr_int = int(
+            str(target_fn.get("address") or "").lower().replace("0x", ""), 16
+        )
+    except (ValueError, TypeError):
+        return target_fn, name or target_fn.get("address") or None
+
+    rva = addr_int - image_base_int
+    if rva < 0:
+        return target_fn, name or target_fn.get("address") or None
+    return target_fn, f"rva:0x{rva:x}"
+
+
 @app.tool()
 @log_to_session
 def get_xrefs(
@@ -1316,20 +1603,40 @@ def get_xrefs(
         function_xrefs: list[dict] = []
         string_xrefs: list[dict] = []
         pseudocode_xrefs: list[dict] = []
+        indirect_xrefs: list[dict] = []
+        vtable_hits: list[dict] = []
 
         # --- function-to-function xrefs ---------------------------------
         if direction == "to":
-            # Who calls this address? Scan called_functions of every function.
-            for caller in functions:
-                for call in caller.get("called_functions") or []:
-                    if _normalize_xref_addr(call.get("address")) == target_norm:
-                        function_xrefs.append({
-                            "from": caller.get("address"),
-                            "from_name": caller.get("name"),
-                            "to": address,
-                            "type": "CALL",
-                        })
-                        break
+            # Prefer the precomputed reverse index (populated by
+            # core_analysis.py since Wave 1A): keys are normalized callee
+            # addresses, values are lists of caller records carrying the
+            # precise call-site PC. Falls back to the legacy linear scan
+            # over called_functions for caches built before the index
+            # existed.
+            xrefs_idx = context.get("xrefs_to_function")
+            if isinstance(xrefs_idx, dict):
+                for r in xrefs_idx.get(target_norm) or []:
+                    function_xrefs.append({
+                        "from": r.get("from_func_addr"),
+                        "from_name": r.get("from_func_name"),
+                        "to": address,
+                        "type": "CALL",
+                        "call_site": r.get("from_call_site"),
+                    })
+            else:
+                # Legacy cache (no reverse index): scan every function's
+                # called_functions list. Lacks call-site precision.
+                for caller in functions:
+                    for call in caller.get("called_functions") or []:
+                        if _normalize_xref_addr(call.get("address")) == target_norm:
+                            function_xrefs.append({
+                                "from": caller.get("address"),
+                                "from_name": caller.get("name"),
+                                "to": address,
+                                "type": "CALL",
+                            })
+                            break
         else:  # from
             if target_fn:
                 for call in target_fn.get("called_functions") or []:
@@ -1340,6 +1647,38 @@ def get_xrefs(
                         "to_name": call.get("name"),
                         "type": "CALL",
                     })
+
+        # --- indirect-call candidates (Wave 2) -------------------------
+        # Surfaces vtable slots and indirect-call sites whose static
+        # ``loaded_from`` immediate resolves to the target. Indirect
+        # calls have no direct caller in the call graph, so this block
+        # appears alongside direct callers (not only when direct is
+        # empty) -- the LLM should see all evidence.
+        if direction == "to":
+            iidx = context.get("xrefs_to_function_indirect")
+            if isinstance(iidx, dict):
+                for r in iidx.get(target_norm) or []:
+                    indirect_xrefs.append({
+                        "from": r.get("from_func_addr"),
+                        "from_name": r.get("from_func_name"),
+                        "to": address,
+                        "type": "INDIRECT_CALL",
+                        "call_site": r.get("from_call_site"),
+                        "operand": r.get("operand"),
+                    })
+
+            for vt in context.get("vtables") or []:
+                for tgt in vt.get("targets") or []:
+                    if (
+                        _normalize_xref_addr(tgt.get("address"))
+                        == target_norm
+                    ):
+                        vtable_hits.append({
+                            "table_address": vt.get("address"),
+                            "section": vt.get("section"),
+                            "slot": tgt.get("slot"),
+                            "tags": vt.get("tags") or [],
+                        })
 
         # --- string xrefs -----------------------------------------------
         for s in context.get("strings", []):
@@ -1379,7 +1718,13 @@ def get_xrefs(
                         "type": "PSEUDOCODE_MENTION",
                     })
 
-        total = len(function_xrefs) + len(string_xrefs) + len(pseudocode_xrefs)
+        total = (
+            len(function_xrefs)
+            + len(string_xrefs)
+            + len(pseudocode_xrefs)
+            + len(indirect_xrefs)
+            + len(vtable_hits)
+        )
         if total == 0:
             target_label = (
                 f"{target_fn.get('name')} @ {address}" if target_fn else address
@@ -1404,8 +1749,10 @@ def get_xrefs(
                 if shown >= limit:
                     break
                 if direction == "to":
+                    call_site = x.get("call_site")
+                    site_suffix = f" (call site: {call_site})" if call_site else ""
                     lines.append(
-                        f"- {x['from_name']} @ {x['from']}  [{x['type']}]"
+                        f"- {x['from_name']} @ {x['from']}{site_suffix}  [{x['type']}]"
                     )
                 else:
                     to_name = x.get("to_name") or "?"
@@ -1415,6 +1762,13 @@ def get_xrefs(
                     )
                 shown += 1
             lines.append("")
+            if direction == "to":
+                lines.append(
+                    "*Note: indirect calls (vtable / function pointer / "
+                    "`CALL [reg+N]`) are not represented in this index; "
+                    "results may be incomplete.*"
+                )
+                lines.append("")
 
         if string_xrefs and shown < limit:
             lines.append(f"### Data / string refs ({len(string_xrefs)})")
@@ -1441,6 +1795,46 @@ def get_xrefs(
                     break
                 lines.append(
                     f"- {x['from_name']} @ {x['from']}  [{x['type']}]"
+                )
+                shown += 1
+            lines.append("")
+
+        # --- indirect candidates (Wave 2) ------------------------------
+        indirect_total = len(indirect_xrefs) + len(vtable_hits)
+        if indirect_total and shown < limit:
+            lines.append(
+                f"### Indirect call candidates ({indirect_total})"
+            )
+            lines.append(
+                "_Inferred from static MOV/LEA loads and `.rdata`/`.data` "
+                "vtable scans. Run `find_vtables` to populate or refresh "
+                "the vtable hit list._"
+            )
+            for x in indirect_xrefs:
+                if shown >= limit:
+                    break
+                operand = x.get("operand") or ""
+                operand_text = f", operand: `{operand}`" if operand else ""
+                call_site = x.get("call_site") or ""
+                site_text = (
+                    f" (call site: {call_site}{operand_text})"
+                    if call_site
+                    else ""
+                )
+                lines.append(
+                    f"- {x['from_name']} @ {x['from']}{site_text}  "
+                    f"[{x['type']}]"
+                )
+                shown += 1
+            for vt in vtable_hits:
+                if shown >= limit:
+                    break
+                tag_text = (
+                    f" [{', '.join(vt['tags'])}]" if vt.get("tags") else ""
+                )
+                lines.append(
+                    f"- vtable @ {vt['table_address']} ({vt['section']}) "
+                    f"slot {vt['slot']}{tag_text}  [VTABLE]"
                 )
                 shown += 1
 
@@ -1566,6 +1960,249 @@ def decompile_function(
 
 
 # --- Phase 2: Enhanced Analysis Tools (P1 - Important) ---
+
+
+@app.tool()
+@log_to_session
+def expand_callgraph(
+    binary_path: str,
+    root: str,
+    depth: int = 2,
+    exclude_imports: bool = True,
+    exclude_thunks: bool = True,
+    max_functions: int = 100,
+) -> str:
+    """
+    BFS the callee graph from a starting function and decompile what's missing.
+
+    Replaces the manual loop of "decompile X, copy each FUN_* address out
+    of the pseudocode, run analyze_binary on each range, repeat" with a
+    single call. Walks ``called_functions`` from the cache, identifies
+    callees that are uncached or lack pseudocode, and runs targeted
+    incremental decompiles for them. Stops when the frontier is empty,
+    the depth limit is hit, or ``max_functions`` decompiles have run.
+
+    The "completeness" question -- how do you know when the subtree is
+    fully resolved -- is answered explicitly: status reports
+    ``complete`` only when every reachable callee within ``depth`` is
+    either decompiled, external/imported, a thunk, or already cached
+    with pseudocode.
+
+    Args:
+        binary_path: Path to analyzed binary
+        root: Function name OR address to start from
+        depth: Number of callee hops to walk (default 2). Depth 0 is
+            just the root; depth 1 is root + its direct callees;
+            depth N is N hops out.
+        exclude_imports: Don't recurse into external/imported functions.
+        exclude_thunks: Don't recurse into Ghidra thunks.
+        max_functions: Hard cap on decompiles performed in one call.
+            Hitting this returns ``status=partial-cap`` so you know to
+            re-invoke (the previously-decompiled functions are now
+            cache-warm so the next call resumes cheaply).
+
+    Returns:
+        Per-depth tally + classification breakdown + status flag + next-
+        action hint when partial.
+    """
+    try:
+        depth = validate_numeric_range(depth, 0, 10, "depth")
+        max_functions = validate_numeric_range(
+            max_functions, 1, 1000, "max_functions"
+        )
+
+        context = get_analysis_context(binary_path)
+        functions = context.get("functions", [])
+        if not functions:
+            return f"No cached functions for {binary_path}. Run analyze_binary first."
+
+        # Resolve root: try name match first, then address match.
+        root_norm = _normalize_xref_addr(root)
+        root_fn = None
+        for fn in functions:
+            if fn.get("name") == root:
+                root_fn = fn
+                break
+        if root_fn is None and root_norm:
+            for fn in functions:
+                if _normalize_xref_addr(fn.get("address")) == root_norm:
+                    root_fn = fn
+                    break
+        if root_fn is None:
+            return (
+                f"Root function not found: {root!r}. Pass either a "
+                f"symbolic name (e.g. 'MpContainerOpen') or an address "
+                f"(e.g. '0x180447d30')."
+            )
+
+        root_addr = root_fn.get("address")
+        if not root_addr:
+            return f"Root function {root!r} has no address; cannot walk."
+
+        # Walk + decompile loop. Each iteration re-walks the current cache
+        # state so newly-decompiled functions reveal their callees on the
+        # next pass.
+        decompiled_this_run = 0
+        skipped_external = 0
+        skipped_thunk = 0
+        already_cached = 0
+        decompile_failures: list[str] = []
+        per_depth_count: dict[int, int] = {}
+        cap_hit = False
+
+        # Address index gets refreshed after each decompile batch.
+        def _build_addr_index(fn_list: list[dict]) -> dict[str, dict]:
+            return {
+                _normalize_xref_addr(f.get("address")): f
+                for f in fn_list
+                if f.get("address")
+            }
+
+        addr_index = _build_addr_index(functions)
+        visited: set[str] = set()
+
+        # Outer loop: keep walking until the frontier stops producing
+        # new decompile work or we hit a cap. Bounded iteration count
+        # protects against pathological cases.
+        for _iteration in range(max(depth + 2, 4)):
+            frontier: list[tuple[str, int]] = []
+            queue: list[tuple[str, int]] = [(_normalize_xref_addr(root_addr), 0)]
+            local_visited: set[str] = set()
+
+            while queue:
+                addr_norm, d = queue.pop(0)
+                if addr_norm in local_visited:
+                    continue
+                local_visited.add(addr_norm)
+
+                fn = addr_index.get(addr_norm)
+                if fn is None:
+                    if addr_norm not in visited:
+                        frontier.append((addr_norm, d))
+                    continue
+
+                per_depth_count[d] = per_depth_count.get(d, 0) + 1
+
+                if exclude_imports and fn.get("is_external"):
+                    if addr_norm not in visited:
+                        skipped_external += 1
+                        visited.add(addr_norm)
+                    continue
+                if exclude_thunks and fn.get("is_thunk"):
+                    if addr_norm not in visited:
+                        skipped_thunk += 1
+                        visited.add(addr_norm)
+                    continue
+
+                if not fn.get("pseudocode"):
+                    if addr_norm not in visited and d <= depth:
+                        frontier.append((addr_norm, d))
+                    continue
+
+                if addr_norm not in visited:
+                    visited.add(addr_norm)
+                    already_cached += 1
+
+                if d >= depth:
+                    continue
+                for callee in fn.get("called_functions", []) or []:
+                    callee_addr = _normalize_xref_addr(callee.get("address"))
+                    if callee_addr and callee_addr not in local_visited:
+                        queue.append((callee_addr, d + 1))
+
+            if not frontier:
+                break
+
+            # Decompile each frontier address (subprocess per call --
+            # slow but correct; future work could batch by proximity).
+            made_progress = False
+            for addr_norm, _d in frontier:
+                if decompiled_this_run >= max_functions:
+                    cap_hit = True
+                    break
+                # Use the original (un-normalised) address from cache when
+                # possible so Ghidra parses it cleanly. Fall back to 0x-prefixed
+                # normalized form for not-yet-cached functions.
+                fn_existing = addr_index.get(addr_norm)
+                target_addr = (
+                    fn_existing.get("address") if fn_existing else f"0x{addr_norm}"
+                )
+                try:
+                    new_context = get_analysis_context(
+                        binary_path,
+                        incremental=True,
+                        start_address=target_addr,
+                        max_functions=1,
+                    )
+                    functions = new_context.get("functions", [])
+                    addr_index = _build_addr_index(functions)
+                    decompiled_this_run += 1
+                    visited.add(addr_norm)
+                    made_progress = True
+                except Exception as e:
+                    logger.warning(
+                        f"expand_callgraph: decompile of {target_addr} failed: {e}"
+                    )
+                    decompile_failures.append(target_addr)
+                    visited.add(addr_norm)
+
+            if cap_hit or not made_progress:
+                break
+
+        # Status classification.
+        if cap_hit:
+            status = "partial-cap"
+            hint = (
+                f"\nHit max_functions cap of {max_functions}. Re-invoke "
+                f"expand_callgraph with the same root to resume; the "
+                f"already-decompiled functions are cache-warm so the "
+                f"next call picks up where this one stopped."
+            )
+        elif decompile_failures:
+            status = "partial-error"
+            hint = (
+                f"\n{len(decompile_failures)} decompile(s) failed. "
+                f"Failing addresses: "
+                f"{', '.join(decompile_failures[:5])}"
+                + (" ..." if len(decompile_failures) > 5 else "")
+            )
+        else:
+            status = "complete"
+            hint = (
+                "\nAll reachable callees within depth are either "
+                "decompiled, external, a thunk, or were already cached. "
+                "No further crawling needed in this subtree."
+            )
+
+        depth_lines = "\n".join(
+            f"  - depth {d}: {n} function(s)"
+            for d, n in sorted(per_depth_count.items())
+        ) or "  (none)"
+
+        return (
+            f"**expand_callgraph from `{root_fn.get('name', root)}` "
+            f"@ {root_addr}**\n"
+            f"\n"
+            f"Coverage by depth:\n{depth_lines}\n"
+            f"\n"
+            f"Run summary:\n"
+            f"- Functions decompiled this run: {decompiled_this_run}\n"
+            f"- Already cached with pseudocode: {already_cached}\n"
+            f"- Skipped (external/import): {skipped_external}\n"
+            f"- Skipped (thunk): {skipped_thunk}\n"
+            f"- Decompile failures: {len(decompile_failures)}\n"
+            f"\n"
+            f"Status: **{status}**{hint}"
+        )
+
+    except (PathTraversalError, FileSizeError) as e:
+        return safe_error_message("Invalid binary path", e)
+    except (UserFacingError, GhidraAnalysisError):
+        raise
+    except Exception as e:
+        logger.exception(f"expand_callgraph failed: {e}")
+        return safe_error_message("expand_callgraph failed", e)
+
 
 @app.tool()
 @log_to_session
@@ -2394,6 +3031,289 @@ def rename_function(
 
     except Exception as e:
         logger.error(f"rename_function failed: {e}")
+        return f"Error: {e}"
+
+
+_NOTE_KIND_VALUES = ("plate", "pre", "post")
+_NOTE_TEXT_MAX = 4096
+
+
+def _matching_note_index(
+    notes: list[dict], function_key: str, kind: str, addr: str | None
+) -> int | None:
+    """Return the index of the existing note row matching the
+    ``(function_key, kind, addr)`` triple, or ``None`` if no row matches.
+    Used so ``add_note`` overwrites in place and ``delete_note`` knows
+    which row to drop.
+    """
+    norm_addr = (addr or "").lower()
+    for idx, row in enumerate(notes):
+        if not isinstance(row, dict):
+            continue
+        if row.get("function_key") != function_key:
+            continue
+        if row.get("kind") != kind:
+            continue
+        if kind == "plate":
+            if not row.get("addr"):
+                return idx
+        else:
+            row_addr = (row.get("addr") or "").lower()
+            if row_addr == norm_addr:
+                return idx
+    return None
+
+
+@app.tool()
+@log_to_session
+def add_note(
+    binary_path: str,
+    address: str,
+    note: str,
+    kind: str = "plate",
+) -> str:
+    """
+    Attach a free-text annotation to a function or specific instruction.
+
+    Notes are stored in a side-car file alongside the analysis cache and
+    survive ``analyze_binary(force_reanalyze=True)`` and ``load_pdb``. Use
+    them to record what a function does, what an instruction means, why
+    a branch matters -- anything you want carried forward across
+    re-analyses.
+
+    Args:
+        binary_path: Path to the analyzed binary
+        address: Hex address. For ``kind="plate"`` this is the function's
+            entry point. For ``kind="pre"`` / ``kind="post"`` this is the
+            instruction the comment is pinned to (the function it
+            belongs to is resolved automatically).
+        note: Free-text annotation (1..4096 chars)
+        kind: ``"plate"`` (function-level), ``"pre"`` (above an
+            instruction), or ``"post"`` (below an instruction)
+
+    Returns:
+        Confirmation including the resolved function_key.
+    """
+    try:
+        if kind not in _NOTE_KIND_VALUES:
+            return (
+                f"Error: kind must be one of {', '.join(_NOTE_KIND_VALUES)}; "
+                f"got '{kind}'"
+            )
+        if not address:
+            return "Error: 'address' is required"
+        text = (note or "").strip()
+        if not text:
+            return "Error: 'note' cannot be empty"
+        if len(text) > _NOTE_TEXT_MAX:
+            return (
+                f"Error: 'note' exceeds the {_NOTE_TEXT_MAX}-char limit "
+                f"({len(text)} given)"
+            )
+
+        context = get_analysis_context(binary_path)
+        target_fn, function_key = _resolve_function_note_key(context, address)
+        if target_fn is None or function_key is None:
+            return f"Error: No function contains address {address}"
+
+        notes = cache.read_notes(binary_path)
+        note_addr = None if kind == "plate" else address
+        existing_idx = _matching_note_index(notes, function_key, kind, note_addr)
+        new_row = {
+            "function_key": function_key,
+            "kind": kind,
+            "addr": note_addr,
+            "text": text,
+            "created_at": time.time(),
+        }
+        if existing_idx is None:
+            notes.append(new_row)
+            verb = "Added"
+        else:
+            notes[existing_idx] = new_row
+            verb = "Replaced"
+
+        if not cache.write_notes(binary_path, notes):
+            return "Error: Failed to persist notes side-car"
+
+        # Re-overlay so cache reads pick up the new note immediately
+        # without waiting for the next analysis run.
+        try:
+            cache.apply_notes_overlay(binary_path, context)
+            cache.save_cached(binary_path, context)
+        except Exception as e:
+            logger.warning(f"add_note overlay refresh failed: {e}")
+
+        result = "**Note Saved**\n\n"
+        result += f"- **Action:** {verb}\n"
+        result += f"- **Function key:** `{function_key}`\n"
+        result += f"- **Address:** `{address}`\n"
+        result += f"- **Kind:** `{kind}`\n"
+        result += f"- **Text:** {text}\n\n"
+        result += (
+            "*Stored in the per-binary side-car. Survives "
+            "force_reanalyze and load_pdb.*"
+        )
+        return result
+    except Exception as e:
+        logger.error(f"add_note failed: {e}")
+        return f"Error: {e}"
+
+
+@app.tool()
+@log_to_session
+def get_notes(
+    binary_path: str,
+    address: str | None = None,
+) -> str:
+    """
+    List user-supplied annotations for a binary.
+
+    With no ``address``, returns every note in the side-car. With an
+    ``address`` set, returns notes attached to that function (any kind)
+    plus any pre/post notes pinned exactly to that instruction.
+
+    Args:
+        binary_path: Path to the analyzed binary
+        address: Optional hex address to filter by
+
+    Returns:
+        Markdown listing grouped by function_key, or "No notes" when empty.
+    """
+    try:
+        notes = cache.read_notes(binary_path)
+        if not notes:
+            return f"**Notes for {Path(binary_path).name}:** *(none)*"
+
+        if address:
+            context = get_analysis_context(binary_path)
+            _target_fn, function_key = _resolve_function_note_key(
+                context, address
+            )
+            target_addr_norm = _normalize_xref_addr(address)
+            filtered = []
+            for row in notes:
+                if not isinstance(row, dict):
+                    continue
+                if function_key and row.get("function_key") == function_key:
+                    filtered.append(row)
+                    continue
+                row_addr = row.get("addr")
+                if row_addr and _normalize_xref_addr(row_addr) == target_addr_norm:
+                    filtered.append(row)
+            notes = filtered
+            if not notes:
+                return (
+                    f"**Notes for {Path(binary_path).name} @ {address}:** "
+                    f"*(none)*"
+                )
+
+        # Group by function_key for stable presentation.
+        grouped: dict[str, list[dict]] = {}
+        for row in notes:
+            if not isinstance(row, dict):
+                continue
+            grouped.setdefault(row.get("function_key") or "<unknown>", []).append(row)
+
+        lines = [f"**Notes for {Path(binary_path).name}:**", ""]
+        total = 0
+        for key in sorted(grouped):
+            rows = grouped[key]
+            lines.append(f"### `{key}` ({len(rows)})")
+            for row in rows:
+                kind = row.get("kind") or "?"
+                addr = row.get("addr") or ""
+                text = row.get("text") or ""
+                if kind == "plate":
+                    lines.append(f"- [plate] {text}")
+                else:
+                    lines.append(f"- [{kind} @ {addr}] {text}")
+                total += 1
+            lines.append("")
+        lines.append(f"_Total: {total}_")
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error(f"get_notes failed: {e}")
+        return f"Error: {e}"
+
+
+@app.tool()
+@log_to_session
+def delete_note(
+    binary_path: str,
+    address: str,
+    kind: str = "plate",
+) -> str:
+    """
+    Remove a user-supplied annotation.
+
+    Args:
+        binary_path: Path to the analyzed binary
+        address: Hex address used when the note was added (function
+            entry for plate, instruction PC for pre/post)
+        kind: ``"plate"``, ``"pre"``, or ``"post"`` -- must match the
+            kind given to ``add_note``
+
+    Returns:
+        Confirmation that the note was dropped, or an error if it was
+        not found.
+    """
+    try:
+        if kind not in _NOTE_KIND_VALUES:
+            return (
+                f"Error: kind must be one of {', '.join(_NOTE_KIND_VALUES)}; "
+                f"got '{kind}'"
+            )
+        if not address:
+            return "Error: 'address' is required"
+
+        context = get_analysis_context(binary_path)
+        target_fn, function_key = _resolve_function_note_key(context, address)
+        if target_fn is None or function_key is None:
+            return f"Error: No function contains address {address}"
+
+        notes = cache.read_notes(binary_path)
+        note_addr = None if kind == "plate" else address
+        existing_idx = _matching_note_index(notes, function_key, kind, note_addr)
+        if existing_idx is None:
+            return (
+                f"Error: No {kind} note for `{function_key}`"
+                + (f" at {address}" if note_addr else "")
+            )
+
+        removed = notes.pop(existing_idx)
+        if not cache.write_notes(binary_path, notes):
+            return "Error: Failed to persist notes side-car"
+
+        # Re-overlay onto the in-memory context. Because the deleted
+        # note's slot in ``notes[func]`` is no longer rewritten, we
+        # also drop it from the cache's func entry directly.
+        try:
+            target = next(
+                (
+                    f for f in context.get("functions") or []
+                    if f is target_fn
+                ),
+                None,
+            )
+            if target is not None and isinstance(target.get("notes"), dict):
+                bucket = target["notes"]
+                if kind == "plate":
+                    bucket["plate"] = ""
+                elif note_addr:
+                    bucket.get(kind, {}).pop(note_addr, None)
+            cache.save_cached(binary_path, context)
+        except Exception as e:
+            logger.warning(f"delete_note cache refresh failed: {e}")
+
+        result = "**Note Deleted**\n\n"
+        result += f"- **Function key:** `{function_key}`\n"
+        result += f"- **Address:** `{address}`\n"
+        result += f"- **Kind:** `{kind}`\n"
+        result += f"- **Text:** {removed.get('text', '')}\n"
+        return result
+    except Exception as e:
+        logger.error(f"delete_note failed: {e}")
         return f"Error: {e}"
 
 
@@ -3694,8 +4614,17 @@ def main():
     # Register function hash and cross-binary matching tools
     register_function_hash_tools(app, session_manager, cache, runner)
 
+    # Register dispatch / IOCTL recovery tools
+    register_dispatch_tools(app, session_manager, cache, runner)
+
+    # Register cross-binary patch-diff tool (Wave 5)
+    register_diff_tools(app, session_manager, cache, runner)
+
     # Register PE structure analysis tools
     register_pe_tools(app, session_manager)
+
+    # Register indirect-call / vtable enumeration tool (Wave 2)
+    register_indirect_call_tools(app, cache, runner)
 
     # Register pseudocode-review + caller-analysis tools
     register_review_tools(app, session_manager, cache, runner, api_patterns)

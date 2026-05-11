@@ -17,10 +17,11 @@ Example::
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
 import re
-import shutil
+import socket
 import struct
 import sys
 import urllib.error
@@ -29,6 +30,126 @@ import urllib.request
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+# Hard cap on PDB download size. Largest realistic PDB in the wild is the
+# Windows kernel at ~120 MB; 256 MB gives plenty of headroom while still
+# preventing a hostile/redirected server from filling the cache disk.
+MAX_PDB_DOWNLOAD_BYTES = 256 * 1024 * 1024
+
+# Env var that opts out of host validation. For users who legitimately host
+# an internal symbol server on RFC1918 / loopback (e.g. a corporate
+# symstore).
+ALLOW_PRIVATE_SERVERS_ENV = "BINARY_MCP_ALLOW_PRIVATE_SYMBOL_SERVERS"
+
+
+def _is_private_or_local_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Return True if the IP is non-routable/sensitive from the agent's POV.
+
+    Catches:
+      - Loopback (127.0.0.0/8, ::1)
+      - Link-local (169.254.0.0/16, fe80::/10) -- this also covers the
+        EC2/GCP/Azure cloud-metadata address 169.254.169.254
+      - RFC1918 private (10/8, 172.16/12, 192.168/16) and IPv6 ULA
+      - Unspecified (0.0.0.0, ::)
+      - Reserved / multicast (defence in depth)
+    """
+    # ``is_private`` covers RFC1918 + IPv6 ULA + loopback + link-local on
+    # modern Python, but we add explicit checks so the intent stays obvious
+    # if the stdlib semantics ever drift.
+    return (
+        ip.is_loopback
+        or ip.is_link_local        # covers 169.254.169.254 cloud metadata
+        or ip.is_private           # RFC1918 + ULA
+        or ip.is_unspecified
+        or ip.is_reserved
+        or ip.is_multicast
+    )
+
+
+def _is_safe_symbol_server_host(host: str) -> bool:
+    """Return True if ``host`` is safe to use as a symbol-server target.
+
+    Rejects loopback, link-local (incl. 169.254.169.254 cloud-metadata),
+    RFC1918, and DNS names that resolve to any of the above. Honours the
+    ``BINARY_MCP_ALLOW_PRIVATE_SYMBOL_SERVERS=1`` opt-out so users running
+    a corporate internal symstore can keep working.
+
+    Factored out as a module-level function so tests can exercise it
+    directly without monkeypatching urlopen.
+    """
+    if not host:
+        return False
+
+    if os.environ.get(ALLOW_PRIVATE_SERVERS_ENV) == "1":
+        return True
+
+    # Strip an optional bracketed IPv6 literal: ``[::1]`` -> ``::1``.
+    bare = host
+    if bare.startswith("[") and bare.endswith("]"):
+        bare = bare[1:-1]
+
+    # Direct IP literal? Validate without DNS.
+    try:
+        ip = ipaddress.ip_address(bare)
+        return not _is_private_or_local_ip(ip)
+    except ValueError:
+        pass  # Not a literal -- fall through to DNS resolution.
+
+    # DNS name -- resolve every A/AAAA and reject if ANY answer is private.
+    # An attacker controlling the DNS for a public-looking name could
+    # otherwise pin one record to a public IP and another to 127.0.0.1.
+    try:
+        infos = socket.getaddrinfo(bare, None)
+    except socket.gaierror as e:
+        # If we can't resolve, let the urlopen call surface the real
+        # network error rather than masquerading as a validation failure.
+        logger.debug("Could not resolve symbol-server host %r: %s", bare, e)
+        return True
+
+    for info in infos:
+        sockaddr = info[4]
+        if not sockaddr:
+            continue
+        try:
+            ip = ipaddress.ip_address(sockaddr[0])
+        except ValueError:
+            continue
+        if _is_private_or_local_ip(ip):
+            return False
+    return True
+
+
+def _host_from_url(url: str) -> str | None:
+    """Extract the hostname from a URL, lowercased. Returns None on parse failure."""
+    try:
+        parsed = urllib.parse.urlsplit(url)
+    except ValueError:
+        return None
+    host = parsed.hostname
+    return host.lower() if host else None
+
+
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """HTTPRedirectHandler that re-validates each redirect target.
+
+    Default urllib behaviour silently follows 30x redirects, which a
+    hostile public symbol server could exploit to bounce us at an internal
+    IP (169.254.169.254 / 127.0.0.1 / RFC1918). Validating on every hop
+    closes that hole.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
+        host = _host_from_url(newurl)
+        if host is None or not _is_safe_symbol_server_host(host):
+            raise urllib.error.HTTPError(
+                newurl,
+                code,
+                f"Refusing redirect to disallowed host: {host!r} "
+                f"(set {ALLOW_PRIVATE_SERVERS_ENV}=1 to opt in)",
+                headers,
+                fp,
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 def _default_symbol_cache() -> Path:
@@ -148,6 +269,19 @@ def parse_symbol_path(
             return
         if not (lower.startswith("http://") or lower.startswith("https://")):
             logger.warning("Ignoring non-http symbol-server entry: %r", url)
+            return
+        host = _host_from_url(url)
+        if host is None:
+            logger.warning("Ignoring symbol-server entry with unparseable host: %r", url)
+            return
+        if not _is_safe_symbol_server_host(host):
+            logger.warning(
+                "Symbol server %s resolves to a private/loopback/link-local "
+                "address and was dropped to prevent SSRF; set "
+                "'%s=1' to allow internal symbol servers.",
+                url,
+                ALLOW_PRIVATE_SERVERS_ENV,
+            )
             return
         servers.append(url)
 
@@ -395,6 +529,11 @@ def fetch_pdb(
 
     _ensure_writable(cache_path.parent)
 
+    # Build an opener that re-validates the host on every redirect hop.
+    # We avoid install_opener() so we don't mutate global state -- callers
+    # of urllib elsewhere in the process should remain unaffected.
+    opener = urllib.request.build_opener(_SafeRedirectHandler())
+
     errors: list[str] = []
     for srv in servers:
         url = build_symbol_server_url(cv, srv)
@@ -407,14 +546,50 @@ def fetch_pdb(
         )
         part_path = cache_path.with_suffix(cache_path.suffix + ".part")
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310
+            with opener.open(req, timeout=timeout) as resp:  # nosec B310
                 code = resp.getcode()
                 if code != 200:
                     errors.append(f"{url} -> HTTP {code}")
                     continue
+
+                # Reject before streaming if the server advertises a size
+                # that exceeds the cap. Saves disk + bandwidth on hostile
+                # responses.
+                content_length_raw = resp.headers.get("Content-Length")
+                if content_length_raw is not None:
+                    try:
+                        content_length = int(content_length_raw)
+                    except (TypeError, ValueError):
+                        content_length = None
+                    else:
+                        if content_length > MAX_PDB_DOWNLOAD_BYTES:
+                            errors.append(
+                                f"{url} -> Content-Length {content_length} "
+                                f"exceeds cap {MAX_PDB_DOWNLOAD_BYTES}"
+                            )
+                            continue
+
                 try:
+                    bytes_written = 0
+                    oversized = False
+                    chunk_size = 64 * 1024
                     with open(part_path, "wb") as f:
-                        shutil.copyfileobj(resp, f, length=64 * 1024)
+                        while True:
+                            chunk = resp.read(chunk_size)
+                            if not chunk:
+                                break
+                            bytes_written += len(chunk)
+                            if bytes_written > MAX_PDB_DOWNLOAD_BYTES:
+                                oversized = True
+                                break
+                            f.write(chunk)
+                    if oversized:
+                        errors.append(
+                            f"{url} -> response exceeded size cap "
+                            f"({MAX_PDB_DOWNLOAD_BYTES} bytes)"
+                        )
+                        # Cleanup happens in the finally below.
+                        continue
                     os.replace(part_path, cache_path)
                 finally:
                     try:

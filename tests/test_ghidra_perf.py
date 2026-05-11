@@ -150,15 +150,117 @@ class TestProjectCacheCompression:
         assert not (tmp_path / f"{h}.funcidx.json").exists()
         assert not (tmp_path / f"{h}.meta.json").exists()
 
+    def test_indirect_call_keys_round_trip_through_gzip(self, tmp_path):
+        # Wave 2: indirect_calls + xrefs_to_function_indirect + vtables
+        # are additive cache keys. They must survive the gzip cache
+        # round-trip cleanly (no schema-level rewriting / lossy
+        # serialisation).
+        cache = self._cache(tmp_path)
+        binary = self._make_binary(tmp_path)
+        payload = {
+            "metadata": {"name": "x", "image_base": "0x140000000"},
+            "functions": [
+                {
+                    "address": "0x140001000",
+                    "name": "dispatcher",
+                    "indirect_calls": [
+                        {
+                            "call_site": "0x14000204a",
+                            "operand": "[RAX+0x18]",
+                            "loaded_from": None,
+                        },
+                        {
+                            "call_site": "0x140002080",
+                            "operand": "[0x140030000]",
+                            "loaded_from": "0x140030000",
+                        },
+                    ],
+                },
+            ],
+            "xrefs_to_function_indirect": {
+                "140030000": [
+                    {
+                        "from_func_addr": "0x140001000",
+                        "from_func_name": "dispatcher",
+                        "from_call_site": "0x140002080",
+                        "operand": "[0x140030000]",
+                    },
+                ],
+            },
+            "vtables": [
+                {
+                    "section": ".rdata",
+                    "address": "0x140030000",
+                    "slot_count": 28,
+                    "stride": 8,
+                    "tags": ["DRIVER_DISPATCH_TABLE"],
+                    "targets": [
+                        {
+                            "slot": 0,
+                            "address": "0x140001000",
+                            "name": "DriverEntry",
+                        },
+                    ],
+                },
+            ],
+        }
+        cache.save_cached(str(binary), payload)
+        loaded = cache.get_cached(str(binary))
+        assert loaded == payload
+
+    def test_invalidate_keeps_notes_sidecar(self, tmp_path):
+        # Wave 1B: user-supplied notes must survive cache.invalidate so
+        # that force_reanalyze / load_pdb don't wipe annotations.
+        cache = self._cache(tmp_path)
+        binary = self._make_binary(tmp_path)
+        cache.save_cached(str(binary), {"functions": [{"address": "0x1", "name": "a"}]})
+        cache.write_notes(
+            str(binary),
+            [{"function_key": "a", "kind": "plate", "addr": None, "text": "n"}],
+        )
+
+        import hashlib
+        h = hashlib.sha256(binary.read_bytes()).hexdigest()
+        notes_path = tmp_path / f"{h}.notes.json"
+        assert notes_path.exists()
+
+        assert cache.invalidate(str(binary))
+
+        # Cache artefacts gone, side-car preserved.
+        assert not (tmp_path / f"{h}.json.gz").exists()
+        assert notes_path.exists()
+        assert cache.read_notes(str(binary)) == [
+            {"function_key": "a", "kind": "plate", "addr": None, "text": "n"}
+        ]
+
 
 # -- GhidraRunner env plumbing ----------------------------------------------
 
 
 class _FakeRunResult:
-    def __init__(self):
-        self.returncode = 0
-        self.stdout = ""
-        self.stderr = ""
+    """Popen-shaped stand-in for runner.analyze tests.
+
+    runner.analyze now uses subprocess.Popen + manual lifecycle (so timeout
+    cleanup can fan out to grandchildren). Tests patch subprocess.Popen and
+    return one of these to simulate a successful run.
+    """
+
+    def __init__(self, returncode=0, stdout="", stderr=""):
+        self.returncode = returncode
+        self.stdout = None
+        self.stderr = None
+        self.pid = 1
+        self._out = stdout
+        self._err = stderr
+
+    def communicate(self, timeout=None):
+        return (self._out, self._err)
+
+    def poll(self):
+        return self.returncode
+
+    def kill(self):
+        pass
 
 
 @pytest.fixture
@@ -190,7 +292,7 @@ class TestRunnerEnvPlumbing:
             captured["env"] = dict(env)
             return _FakeRunResult()
 
-        with patch("subprocess.run", side_effect=fake_run):
+        with patch("subprocess.Popen", side_effect=fake_run):
             runner.analyze(
                 binary_path=str(binary),
                 script_path=str(script_dir),
@@ -221,7 +323,7 @@ class TestRunnerEnvPlumbing:
             captured["env"] = dict(env)
             return _FakeRunResult()
 
-        with patch("subprocess.run", side_effect=fake_run):
+        with patch("subprocess.Popen", side_effect=fake_run):
             runner.analyze(
                 binary_path=str(binary),
                 script_path=str(script_dir),
@@ -244,7 +346,7 @@ class TestRunnerEnvPlumbing:
             captured["env"] = dict(env)
             return _FakeRunResult()
 
-        with patch("subprocess.run", side_effect=fake_run):
+        with patch("subprocess.Popen", side_effect=fake_run):
             runner.analyze(
                 binary_path=str(binary),
                 script_path=str(script_dir),
@@ -264,7 +366,7 @@ class TestRunnerEnvPlumbing:
             captured["env"] = dict(env)
             return _FakeRunResult()
 
-        with patch("subprocess.run", side_effect=fake_run):
+        with patch("subprocess.Popen", side_effect=fake_run):
             runner.analyze(
                 binary_path=str(binary),
                 script_path=str(script_dir),
@@ -285,7 +387,7 @@ class TestRunnerEnvPlumbing:
             captured["env"] = dict(env)
             return _FakeRunResult()
 
-        with patch("subprocess.run", side_effect=fake_run):
+        with patch("subprocess.Popen", side_effect=fake_run):
             runner.analyze(
                 binary_path=str(binary),
                 script_path=str(script_dir),
@@ -307,7 +409,7 @@ class TestRunnerEnvPlumbing:
             captured["env"] = dict(env)
             return _FakeRunResult()
 
-        with patch("subprocess.run", side_effect=fake_run):
+        with patch("subprocess.Popen", side_effect=fake_run):
             runner.analyze(
                 binary_path=str(binary),
                 script_path=str(script_dir),
@@ -347,7 +449,7 @@ class TestRunnerEnvPlumbing:
             saw_staged_during_run["ok"] = expected_staged.exists()
             return _FakeRunResult()
 
-        with patch("subprocess.run", side_effect=fake_run):
+        with patch("subprocess.Popen", side_effect=fake_run):
             runner.analyze(
                 binary_path=str(binary),
                 script_path=str(script_dir),
@@ -360,6 +462,102 @@ class TestRunnerEnvPlumbing:
         # Cleaned up after analyze returns
         assert not expected_staged.exists()
 
+    def test_pdb_path_adds_enable_pdb_load_prescript(self, runner, tmp_path):
+        """When pdb_path is supplied, runner must add ``-preScript
+        enable_pdb_load.py`` BEFORE ``-postScript``. Without the pre-script,
+        Ghidra's PdbUniversalAnalyzer silently refuses to load the staged
+        PDB (the binary's directory is treated as untrusted by default in
+        Ghidra 10.x+), and load_pdb returns Gain: +0."""
+        binary, script_dir, output = self._prepare(runner, tmp_path)
+
+        pdb_src = tmp_path / "external" / "my_binary.pdb"
+        pdb_src.parent.mkdir()
+        pdb_src.write_bytes(b"PDB fake")
+
+        captured = {}
+
+        def fake_run(cmd, env, **kwargs):
+            captured["cmd"] = list(cmd)
+            return _FakeRunResult()
+
+        with patch("subprocess.Popen", side_effect=fake_run):
+            runner.analyze(
+                binary_path=str(binary),
+                script_path=str(script_dir),
+                script_name="core_analysis.py",
+                output_path=str(output),
+                pdb_path=str(pdb_src),
+            )
+
+        cmd = captured["cmd"]
+        assert "-preScript" in cmd, (
+            "Missing -preScript flag when pdb_path supplied"
+        )
+        pre_idx = cmd.index("-preScript")
+        assert cmd[pre_idx + 1] == "enable_pdb_load.py", (
+            f"Expected pre-script 'enable_pdb_load.py', got {cmd[pre_idx + 1]!r}"
+        )
+        # Pre-script must come before post-script for analyzeHeadless to
+        # apply the option BEFORE auto-analysis fires the PDB analyzer.
+        post_idx = cmd.index("-postScript")
+        assert pre_idx < post_idx, (
+            "-preScript must precede -postScript on the cmd line"
+        )
+
+    def test_no_pdb_path_skips_prescript(self, runner, tmp_path):
+        """When pdb_path is not supplied, the pre-script must NOT be added.
+        Otherwise every analysis run would pay an extra Jython script
+        invocation for no benefit."""
+        binary, script_dir, output = self._prepare(runner, tmp_path)
+        captured = {}
+
+        def fake_run(cmd, env, **kwargs):
+            captured["cmd"] = list(cmd)
+            return _FakeRunResult()
+
+        with patch("subprocess.Popen", side_effect=fake_run):
+            runner.analyze(
+                binary_path=str(binary),
+                script_path=str(script_dir),
+                script_name="core_analysis.py",
+                output_path=str(output),
+            )
+
+        assert "-preScript" not in captured["cmd"]
+        assert "enable_pdb_load.py" not in captured["cmd"]
+
+    def test_staged_pdb_cleaned_up_when_popen_raises(self, runner, tmp_path):
+        """Regression: ultrareview bug_006. If subprocess.Popen raises before
+        the try/finally block opens (missing analyzeHeadless, fd exhaustion,
+        bad argv), the staged <binary>.pdb must STILL be removed -- otherwise
+        Ghidra's PdbUniversalAnalyzer auto-locates a stale PDB on subsequent
+        analysis runs of the same binary."""
+        binary, script_dir, output = self._prepare(runner, tmp_path)
+
+        pdb_src = tmp_path / "external" / "my_binary.pdb"
+        pdb_src.parent.mkdir()
+        pdb_src.write_bytes(b"PDB fake")
+
+        expected_staged = binary.parent / f"{binary.stem}.pdb"
+
+        def boom(*args, **kwargs):
+            raise FileNotFoundError(2, "analyzeHeadless not found")
+
+        with patch("subprocess.Popen", side_effect=boom):
+            with pytest.raises(FileNotFoundError):
+                runner.analyze(
+                    binary_path=str(binary),
+                    script_path=str(script_dir),
+                    script_name="core_analysis.py",
+                    output_path=str(output),
+                    pdb_path=str(pdb_src),
+                )
+
+        assert not expected_staged.exists(), (
+            "Staged PDB leaked when subprocess.Popen raised before the "
+            "try/finally block"
+        )
+
     def test_max_heap_sets_java_options(self, runner, tmp_path):
         binary, script_dir, output = self._prepare(runner, tmp_path)
         captured = {}
@@ -368,7 +566,7 @@ class TestRunnerEnvPlumbing:
             captured["env"] = dict(env)
             return _FakeRunResult()
 
-        with patch("subprocess.run", side_effect=fake_run):
+        with patch("subprocess.Popen", side_effect=fake_run):
             runner.analyze(
                 binary_path=str(binary),
                 script_path=str(script_dir),
@@ -388,7 +586,7 @@ class TestRunnerEnvPlumbing:
             captured["env"] = dict(env)
             return _FakeRunResult()
 
-        with patch("subprocess.run", side_effect=fake_run):
+        with patch("subprocess.Popen", side_effect=fake_run):
             runner.analyze(
                 binary_path=str(binary),
                 script_path=str(script_dir),
@@ -408,7 +606,7 @@ class TestRunnerEnvPlumbing:
             captured["env"] = dict(env)
             return _FakeRunResult()
 
-        with patch("subprocess.run", side_effect=fake_run):
+        with patch("subprocess.Popen", side_effect=fake_run):
             runner.analyze(
                 binary_path=str(binary),
                 script_path=str(script_dir),
@@ -428,7 +626,7 @@ class TestRunnerEnvPlumbing:
             captured["env"] = dict(env)
             return _FakeRunResult()
 
-        with patch("subprocess.run", side_effect=fake_run):
+        with patch("subprocess.Popen", side_effect=fake_run):
             runner.analyze(
                 binary_path=str(binary),
                 script_path=str(script_dir),
@@ -442,7 +640,7 @@ class TestRunnerEnvPlumbing:
     def test_pdb_missing_file_raises(self, runner, tmp_path):
         binary, script_dir, output = self._prepare(runner, tmp_path)
 
-        with patch("subprocess.run", return_value=_FakeRunResult()):
+        with patch("subprocess.Popen", return_value=_FakeRunResult()):
             try:
                 runner.analyze(
                     binary_path=str(binary),
@@ -454,6 +652,235 @@ class TestRunnerEnvPlumbing:
             except FileNotFoundError:
                 return
         raise AssertionError("Expected FileNotFoundError for missing PDB")
+
+    def test_stage_pdb_rejects_symlink_source(self, runner, tmp_path):
+        """Defence in depth: _stage_pdb must refuse a symlink as the source
+        even if the caller forgets to validate. Ghidra reads whatever the
+        staged PDB resolves to, so a symlink like /etc/shadow would leak."""
+        binary = tmp_path / "victim.exe"
+        binary.write_bytes(b"\x4d\x5a" + b"\x00" * 126)
+
+        real_pdb = tmp_path / "real.pdb"
+        real_pdb.write_bytes(b"PDB content")
+
+        symlink_pdb = tmp_path / "evil.pdb"
+        try:
+            symlink_pdb.symlink_to(real_pdb)
+        except (OSError, NotImplementedError):
+            pytest.skip("Cannot create symlinks on this platform")
+
+        with pytest.raises(ValueError, match="symlink"):
+            runner._stage_pdb(binary, str(symlink_pdb))
+
+    def test_stage_pdb_rejects_directory(self, runner, tmp_path):
+        """_stage_pdb must refuse a directory (or anything that isn't a
+        regular file)."""
+        binary = tmp_path / "victim.exe"
+        binary.write_bytes(b"\x4d\x5a" + b"\x00" * 126)
+
+        pdb_dir = tmp_path / "looks_like.pdb"
+        pdb_dir.mkdir()
+
+        with pytest.raises(ValueError, match="regular file"):
+            runner._stage_pdb(binary, str(pdb_dir))
+
+    def test_stage_pdb_accepts_regular_file(self, runner, tmp_path):
+        """Regression guard: the symlink/file-type checks must NOT break the
+        happy path of a plain on-disk PDB."""
+        binary = tmp_path / "victim.exe"
+        binary.write_bytes(b"\x4d\x5a" + b"\x00" * 126)
+
+        real_pdb = tmp_path / "external" / "real.pdb"
+        real_pdb.parent.mkdir()
+        real_pdb.write_bytes(b"PDB content")
+
+        staged = runner._stage_pdb(binary, str(real_pdb))
+        try:
+            assert staged.exists()
+            assert staged.name == "victim.pdb"
+        finally:
+            runner._cleanup_pdb(staged)
+
+
+# -- GhidraRunner timeout cleanup -------------------------------------------
+#
+# Regression: subprocess.run on Windows can hang indefinitely after timeout
+# fires because Ghidra's java.exe grandchildren survive the .bat kill and
+# keep the captured pipes open. runner.analyze now uses Popen + manual
+# lifecycle and calls _kill_process_tree on timeout (taskkill /F /T on
+# Windows, killpg(SIGKILL) on POSIX).
+
+
+class _StuckPopen:
+    """Popen stand-in whose first communicate() call raises TimeoutExpired."""
+
+    def __init__(self, *, drain_returns=("partial-stdout", "partial-stderr"),
+                 poll_after_kill=-9):
+        self.pid = 9999
+        self.returncode = None
+        self.stdout = None
+        self.stderr = None
+        self._communicate_calls = 0
+        self._drain_returns = drain_returns
+        self._poll_after_kill = poll_after_kill
+        self.kill_called = False
+
+    def communicate(self, timeout=None):
+        self._communicate_calls += 1
+        if self._communicate_calls == 1:
+            import subprocess as _subprocess
+            raise _subprocess.TimeoutExpired(
+                cmd=["fake-ghidra"], timeout=timeout, output="hang-stdout",
+                stderr="hang-stderr",
+            )
+        return self._drain_returns
+
+    def poll(self):
+        return self.returncode if self.kill_called else None
+
+    def kill(self):
+        self.kill_called = True
+        self.returncode = self._poll_after_kill
+
+
+class TestRunnerTimeoutCleanup:
+    def _prepare(self, runner, tmp_path):
+        binary = tmp_path / "sample.bin"
+        binary.write_bytes(b"\x00" * 128)
+        script_dir = tmp_path / "scripts"
+        script_dir.mkdir()
+        output = tmp_path / "out.json"
+        return binary, script_dir, output
+
+    def test_timeout_invokes_process_tree_kill(self, runner, tmp_path, monkeypatch):
+        """When communicate() times out, _kill_process_tree must be called
+        with the Popen instance so the whole java.exe tree gets torn down."""
+        from src.engines.static.ghidra import runner as runner_mod
+
+        binary, script_dir, output = self._prepare(runner, tmp_path)
+        stuck = _StuckPopen()
+
+        kill_calls = []
+
+        def fake_kill(proc):
+            kill_calls.append(proc)
+            proc.kill()
+
+        monkeypatch.setattr(runner_mod, "_kill_process_tree", fake_kill)
+
+        with patch("subprocess.Popen", return_value=stuck):
+            with pytest.raises(runner_mod.GhidraAnalysisError) as exc_info:
+                runner.analyze(
+                    binary_path=str(binary),
+                    script_path=str(script_dir),
+                    script_name="core_analysis.py",
+                    output_path=str(output),
+                    timeout=30,
+                )
+
+        assert kill_calls == [stuck], "tree-kill must run exactly once on timeout"
+        assert "timed out after 30s" in str(exc_info.value)
+        # Diagnostic should surface partial output so the user sees how far
+        # Ghidra got.
+        assert exc_info.value.diagnostic, "diagnostic must not be empty on timeout"
+
+    def test_drain_timeout_does_not_hang(self, runner, tmp_path, monkeypatch):
+        """If even the post-kill drain communicate() times out (descendant
+        still holding pipes), runner.analyze must still return promptly via
+        GhidraAnalysisError instead of blocking indefinitely."""
+        from src.engines.static.ghidra import runner as runner_mod
+
+        binary, script_dir, output = self._prepare(runner, tmp_path)
+
+        class _DoublyStuckPopen(_StuckPopen):
+            def communicate(self, timeout=None):
+                self._communicate_calls += 1
+                import subprocess as _subprocess
+                raise _subprocess.TimeoutExpired(
+                    cmd=["fake-ghidra"], timeout=timeout,
+                    output="hang", stderr="hang",
+                )
+
+        stuck = _DoublyStuckPopen()
+        monkeypatch.setattr(runner_mod, "_kill_process_tree",
+                            lambda p: setattr(p, "returncode", -9))
+
+        # Force-close the proc's pipes; runner code should swallow that.
+        with patch("subprocess.Popen", return_value=stuck):
+            with pytest.raises(runner_mod.GhidraAnalysisError):
+                runner.analyze(
+                    binary_path=str(binary),
+                    script_path=str(script_dir),
+                    script_name="core_analysis.py",
+                    output_path=str(output),
+                    timeout=10,
+                )
+
+    def test_kill_process_tree_uses_taskkill_on_windows(self, monkeypatch):
+        """_kill_process_tree on Windows must invoke taskkill /F /T."""
+        from src.engines.static.ghidra import runner as runner_mod
+
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = list(cmd)
+            captured["kwargs"] = kwargs
+            class R:
+                returncode = 0
+            return R()
+
+        # Pretend we're on Windows.
+        monkeypatch.setattr(runner_mod.os, "name", "nt")
+
+        proc = _StuckPopen()  # poll() returns None until kill()
+
+        with patch("subprocess.run", side_effect=fake_run):
+            runner_mod._kill_process_tree(proc)
+
+        assert captured["cmd"][0] == "taskkill"
+        assert "/F" in captured["cmd"]
+        assert "/T" in captured["cmd"]
+        assert str(proc.pid) in captured["cmd"]
+
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="os.killpg/os.getpgid are POSIX-only; the Windows path is "
+               "covered by test_kill_process_tree_uses_taskkill_on_windows.",
+    )
+    def test_kill_process_tree_uses_killpg_on_posix(self, monkeypatch):
+        """_kill_process_tree on POSIX must SIGKILL the child's process group."""
+        from src.engines.static.ghidra import runner as runner_mod
+
+        monkeypatch.setattr(runner_mod.os, "name", "posix")
+
+        killpg_calls = []
+
+        def fake_killpg(pgid, sig):
+            killpg_calls.append((pgid, sig))
+
+        monkeypatch.setattr(runner_mod.os, "killpg", fake_killpg)
+        monkeypatch.setattr(runner_mod.os, "getpgid", lambda pid: 12345)
+
+        proc = _StuckPopen()
+        runner_mod._kill_process_tree(proc)
+
+        assert killpg_calls, "killpg must be invoked on POSIX"
+        pgid, sig = killpg_calls[0]
+        assert pgid == 12345
+        assert sig == runner_mod.signal.SIGKILL
+
+    def test_kill_process_tree_skips_already_dead_proc(self):
+        """Don't bother killing if the process already exited."""
+        from src.engines.static.ghidra import runner as runner_mod
+
+        class _DeadPopen:
+            pid = 1
+            def poll(self):
+                return 0  # already exited
+
+        with patch("subprocess.run") as mock_run:
+            runner_mod._kill_process_tree(_DeadPopen())
+            assert not mock_run.called
 
 
 # -- get_analysis_context incremental wiring --------------------------------
@@ -993,3 +1420,163 @@ class TestDecompileOnDemand:
         assert captured.get("start_address") == "0x401000"
         assert captured.get("max_functions") == 1
         assert "FUN_401000(void) { return; }" in result
+
+
+# Regression for the cache depth-rejection bug introduced by PR #116:
+# tools that don't read pseudocode (get_strings, get_imports, ...) must
+# accept a cached structural analysis. Previously they inherited the "full"
+# default and forced a 30-min Ghidra reanalysis on every call.
+class TestDefaultDepthAcceptsStructuralCache:
+    def _seed(self, tmp_path, monkeypatch, server_module, cached_depth):
+        from src.engines.static.ghidra.project_cache import ProjectCache
+
+        binary = tmp_path / "target.bin"
+        binary.write_bytes(b"MZ" + b"\x00" * 128)
+
+        cache_obj = ProjectCache(cache_dir=str(tmp_path / "cache"))
+        cache_obj.save_cached(
+            str(binary),
+            {
+                "metadata": {"analysis_depth": cached_depth},
+                "functions": [
+                    {"address": "0x401000", "name": "main",
+                     "signature": "int main(void)", "pseudocode": None},
+                ],
+                "imports": [{"library": "kernel32.dll", "name": "CreateFileA"}],
+                "exports": [],
+                "strings": [
+                    {"address": "0x402000", "value": "ExclusionList",
+                     "length": 13, "type": "string", "xrefs": []},
+                ],
+                "memory_map": [{"name": ".text"}],
+            },
+        )
+        monkeypatch.setattr(server_module, "cache", cache_obj)
+        monkeypatch.setattr(server_module, "get_allowed_dirs", lambda: [tmp_path])
+        return binary
+
+    def test_get_strings_returns_from_structural_cache_without_running_ghidra(
+        self, tmp_path, monkeypatch, server_module
+    ):
+        binary = self._seed(tmp_path, monkeypatch, server_module, "structural")
+
+        def fail_if_called(**kwargs):
+            raise AssertionError(
+                "runner.analyze must NOT be invoked when a structural cache "
+                "satisfies the default-depth caller (regression: PR #116)."
+            )
+
+        monkeypatch.setattr(server_module.runner, "analyze", fail_if_called)
+
+        result = server_module.get_strings(str(binary))
+
+        assert "ExclusionList" in result
+
+    def test_get_imports_returns_from_structural_cache_without_running_ghidra(
+        self, tmp_path, monkeypatch, server_module
+    ):
+        binary = self._seed(tmp_path, monkeypatch, server_module, "structural")
+
+        def fail_if_called(**kwargs):
+            raise AssertionError(
+                "runner.analyze must NOT be invoked for get_imports on a "
+                "structural cache."
+            )
+
+        monkeypatch.setattr(server_module.runner, "analyze", fail_if_called)
+
+        result = server_module.get_imports(str(binary))
+
+        assert "CreateFileA" in result
+
+    def test_full_cache_also_satisfies_default_depth(
+        self, tmp_path, monkeypatch, server_module
+    ):
+        binary = self._seed(tmp_path, monkeypatch, server_module, "full")
+
+        def fail_if_called(**kwargs):
+            raise AssertionError(
+                "runner.analyze must NOT be invoked when a full cache is "
+                "available."
+            )
+
+        monkeypatch.setattr(server_module.runner, "analyze", fail_if_called)
+
+        result = server_module.get_strings(str(binary))
+
+        assert "ExclusionList" in result
+
+    def test_shallow_cache_still_forces_reanalysis(
+        self, tmp_path, monkeypatch, server_module
+    ):
+        """A shallow cache lacks auto-analyzer-derived strings; the depth
+        check must still upgrade it to structural."""
+        binary = self._seed(tmp_path, monkeypatch, server_module, "shallow")
+
+        captured = {}
+
+        def fake_analyze(**kwargs):
+            captured.update(kwargs)
+            output = Path(kwargs["output_path"])
+            output.write_text(json.dumps({
+                "metadata": {"analysis_depth": "structural"},
+                "functions": [
+                    {"address": "0x401000", "name": "main",
+                     "signature": "int main(void)", "pseudocode": None},
+                ],
+                "imports": [{"library": "kernel32.dll", "name": "CreateFileA"}],
+                "exports": [],
+                "strings": [
+                    {"address": "0x402000", "value": "FreshAfterReanalyze",
+                     "length": 19, "type": "string", "xrefs": []},
+                ],
+                "memory_map": [{"name": ".text"}],
+            }))
+            return {"elapsed_time": 1.0, "stdout": "", "stderr": ""}
+
+        monkeypatch.setattr(server_module.runner, "analyze", fake_analyze)
+
+        result = server_module.get_strings(str(binary))
+
+        assert captured, "runner.analyze should be invoked for shallow cache"
+        assert "FreshAfterReanalyze" in result
+
+    def test_analyze_binary_top_level_default_remains_full(
+        self, tmp_path, monkeypatch, server_module
+    ):
+        """analyze_binary is the user-facing entry point and must default to
+        analysis_depth='full' regardless of the lowered get_analysis_context
+        floor."""
+        binary = tmp_path / "target.bin"
+        binary.write_bytes(b"MZ" + b"\x00" * 128)
+
+        from src.engines.static.ghidra.project_cache import ProjectCache
+        cache_obj = ProjectCache(cache_dir=str(tmp_path / "cache"))
+        monkeypatch.setattr(server_module, "cache", cache_obj)
+        monkeypatch.setattr(server_module, "get_allowed_dirs", lambda: [tmp_path])
+
+        captured = {}
+
+        def fake_analyze(**kwargs):
+            captured.update(kwargs)
+            output = Path(kwargs["output_path"])
+            output.write_text(json.dumps({
+                "metadata": {"executable_format": "PE",
+                             "analysis_depth": "full"},
+                "functions": [
+                    {"address": "0x401000", "name": "main",
+                     "signature": "int main(void)",
+                     "pseudocode": "int main(void) { return 0; }"},
+                ],
+                "imports": [], "strings": [], "memory_map": [{"name": ".text"}],
+            }))
+            return {"elapsed_time": 1.0, "stdout": "", "stderr": ""}
+
+        monkeypatch.setattr(server_module.runner, "analyze", fake_analyze)
+
+        server_module.analyze_binary(str(binary), skip_compatibility_check=True)
+
+        assert captured.get("analysis_depth") == "full", (
+            "analyze_binary's top-level default must remain 'full'; "
+            f"got {captured.get('analysis_depth')!r}"
+        )

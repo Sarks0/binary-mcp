@@ -218,6 +218,7 @@ def _build_taint_aliases(statements, param_names: set[str]) -> dict[str, dict]:
         rhs_idents = set(_IDENT_RE.findall(rhs))
         # Skip self-references (``x = x + 1``) so we don't shadow an
         # earlier root binding.
+        propagated = False
         for name in rhs_idents:
             if name == lhs:
                 continue
@@ -227,7 +228,17 @@ def _build_taint_aliases(statements, param_names: set[str]) -> dict[str, dict]:
                     "defined_at": idx,
                     "expr": stmt.text,
                 }
+                propagated = True
                 break
+        if not propagated and lhs not in param_names:
+            # Reassignment from an expression containing no tainted
+            # identifiers (e.g. ``x = 0x100`` after ``x = param_1``) kills
+            # the binding. Without this, the stale taint survives and
+            # ``get_param_sinks`` reports false-positive findings on
+            # ``memcpy(dst, src, x)`` even though ``x`` has been
+            # overwritten with a constant. Roots themselves (param_names)
+            # are preserved — they are tainted unconditionally.
+            tainted.pop(lhs, None)
     return tainted
 
 

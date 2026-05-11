@@ -48,9 +48,13 @@ _DISPATCHER_PARAM_TYPES = {"ULONG", "DWORD", "ULONG_PTR", "ULONGLONG", "UINT", "
 _DISPATCHER_NAME_HINTS = ("dispatch", "ioctl", "handlerequest")
 
 # Comparison-style dispatch: ``param_2 == 0x222000``, ``IoControlCode > 0x10``.
+# Only real comparison operators are matched — bare ``=`` (assignment) must
+# never be treated as a dispatch comparison (``param_2 = 0x222000`` is a
+# store, not a branch). The selector uses ``\d+`` so ``param_10`` and beyond
+# match in functions with 10+ parameters.
 _COMPARE_RE = re.compile(
-    r"(?P<sel>\b(?:param_[1-9]|IoControlCode|ControlCode|IoCtl|IoCtlCode)\b)\s*"
-    r"(?:[=<>!]=?|<=|>=)\s*(?P<val>0x[0-9a-fA-F]+)"
+    r"(?P<sel>\b(?:param_\d+|IoControlCode|ControlCode|IoCtl|IoCtlCode)\b)\s*"
+    r"(?:==|!=|<=|>=|<|>)\s*(?P<val>0x[0-9a-fA-F]+)"
 )
 
 # Switch-case style: ``case 0x222000:``.

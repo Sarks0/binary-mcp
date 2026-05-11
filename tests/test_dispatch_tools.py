@@ -203,6 +203,39 @@ class TestConstantExtraction:
         assert values == {}
         assert selector is None
 
+    def test_bare_assignment_is_not_a_comparison(self):
+        """Regression: a bare ``=`` (assignment / store) must not be
+        treated as a dispatch comparison. The previous regex used
+        ``[=<>!]=?`` which accepted ``param_2 = 0x222000`` as a match."""
+        from src.tools.dispatch_tools import _extract_constants
+
+        pseudo = "param_2 = 0x222000;"
+        values, selector = _extract_constants(pseudo)
+        assert values == {}
+        assert selector is None
+
+    def test_param_10_is_matched(self):
+        """Regression: the previous ``param_[1-9]`` pattern silently
+        dropped ``param_10`` (and beyond) in functions with 10+ params.
+        ``\\d+`` now matches any digit run."""
+        from src.tools.dispatch_tools import _extract_constants
+
+        pseudo = "if (param_10 == 0x222000) { handle(); }"
+        values, selector = _extract_constants(pseudo)
+        assert 0x222000 in values
+        assert selector == "param_10"
+
+    def test_inequality_still_matches(self):
+        """Make sure the regex tightening didn't break existing
+        comparison operators (==, !=, <=, >=, <, >)."""
+        from src.tools.dispatch_tools import _extract_constants
+
+        for op in ("==", "!=", "<=", ">=", "<", ">"):
+            pseudo = f"if (param_2 {op} 0x10001) {{ a(); }}"
+            values, selector = _extract_constants(pseudo)
+            assert 0x10001 in values, f"operator {op!r} should still match"
+            assert selector == "param_2"
+
 
 class TestCtlCodeDecoding:
     def test_decode_textbook_buffered(self):

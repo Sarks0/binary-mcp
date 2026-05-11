@@ -449,7 +449,10 @@ class TestAslrShiftedAddresses:
 class TestPhase2HashRename:
     def test_unrelated_names_paired_via_hash(self, monkeypatch):
         # Both functions are FUN_-named so they fail PDB-name pairing,
-        # but their bodies hash identically -> phase-2 pairs them.
+        # but their bodies hash identically -> phase-2 pairs them. Because
+        # the opcode hashes are identical the bodies are functionally
+        # equivalent, so the pair belongs in the "Renamed (unchanged body)"
+        # bucket — NOT MODIFIED.
         old_ctx = _make_context(
             functions=[
                 _make_function(
@@ -475,8 +478,41 @@ class TestPhase2HashRename:
         tool, *_ = _register(monkeypatch, old_ctx, new_ctx, hash_table=hash_table)
         result = tool("/old.bin", "/new.bin")
 
-        assert "MODIFIED (1)" in result
-        assert "[renamed]" in result
+        assert "MODIFIED (0)" in result
+        assert "Renamed (unchanged body) (1)" in result
+        assert "[unchanged_renamed]" in result
+
+    def test_same_name_hash_match_is_unchanged_not_modified(self, monkeypatch):
+        """Hash-identical pair with the same name is fully unchanged —
+        it does not appear in MODIFIED or in the renamed bucket; just
+        bump the unchanged counter."""
+        old_ctx = _make_context(
+            functions=[
+                _make_function(
+                    name="FUN_00401000",
+                    address="0x401000",
+                    name_source="DEFAULT",
+                ),
+            ],
+        )
+        new_ctx = _make_context(
+            functions=[
+                _make_function(
+                    name="FUN_00401000",
+                    address="0x501000",
+                    name_source="DEFAULT",
+                ),
+            ],
+        )
+        hash_table = {
+            "FUN_00401000": "h_same",  # same name in both contexts maps to same hash
+        }
+        tool, *_ = _register(monkeypatch, old_ctx, new_ctx, hash_table=hash_table)
+        result = tool("/old.bin", "/new.bin")
+
+        assert "MODIFIED (0)" in result
+        assert "Renamed (unchanged body) (0)" in result
+        assert "Unchanged pairs: 1" in result
 
 
 class TestPhase3CalleeMatch:

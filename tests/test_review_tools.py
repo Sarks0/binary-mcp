@@ -1339,6 +1339,50 @@ class TestGetParamSinks:
         assert "force_reanalyze=True" in result
 
 
+class TestBuildTaintAliases:
+    """Direct unit tests for ``_build_taint_aliases`` covering the kill-on-
+    reassignment behaviour. Goes through ``_split_statements`` so the
+    Statement records carry realistic ``text`` / ``start_line`` values."""
+
+    def _aliases(self, pseudo: str, params: set[str]) -> dict:
+        from src.tools.review_tools import _build_taint_aliases
+        from src.utils.pseudocode_rules import _split_statements
+
+        return _build_taint_aliases(_split_statements(pseudo), params)
+
+    def test_reassignment_to_constant_kills_taint(self):
+        """``x = param_1`` taints ``x``; the next ``x = 0x100`` (no
+        tainted identifier on the rhs) must remove ``x`` from the map so
+        a later ``memcpy(dst, src, x)`` does not produce a false-positive
+        finding in ``get_param_sinks``."""
+        pseudo = "x = param_1; x = 0x100;"
+        tainted = self._aliases(pseudo, {"param_1"})
+        assert "param_1" in tainted  # root preserved
+        assert "x" not in tainted, "stale taint must be dropped on untainted reassignment"
+
+    def test_reassignment_to_tainted_keeps_taint(self):
+        """Sanity: a reassignment that still references a tainted ident
+        keeps ``x`` tainted (and re-roots if necessary)."""
+        pseudo = "x = param_1; x = param_2 + 1;"
+        tainted = self._aliases(pseudo, {"param_1", "param_2"})
+        assert "x" in tainted
+        assert tainted["x"]["root"] == "param_2"
+
+    def test_param_root_is_not_killed_by_reassignment(self):
+        """Roots themselves are tainted unconditionally — a synthetic
+        ``param_1 = 0x100`` in pseudocode must not strip the root."""
+        pseudo = "param_1 = 0x100;"
+        tainted = self._aliases(pseudo, {"param_1"})
+        assert "param_1" in tainted
+
+    def test_untouched_alias_persists(self):
+        """A tainted alias that is never reassigned stays in the map."""
+        pseudo = "x = param_1; y = 0x100;"
+        tainted = self._aliases(pseudo, {"param_1"})
+        assert "x" in tainted
+        assert "y" not in tainted  # never tainted in the first place
+
+
 def _double_fetch_rule():
     from src.utils.pseudocode_rules import PseudocodeRules
 

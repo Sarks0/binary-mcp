@@ -361,8 +361,10 @@ def _format_report(
     unchanged_count: int,
     mode: str,
     group_by: str,
+    unchanged_renamed: list[tuple[dict, dict]] | None = None,
 ) -> str:
     """Render the diff report; ``modified`` already carries score dicts."""
+    unchanged_renamed = unchanged_renamed or []
     lines = [
         "=" * 60,
         "BINARY DIFF",
@@ -382,6 +384,17 @@ def _format_report(
     lines.append(f"### REMOVED ({len(removed)})")
     for f in removed:
         lines.append(f"- {f.get('name')} @ {f.get('address')}")
+    lines.append("")
+
+    # Renamed-but-otherwise-unchanged: hash-identical phase-2 pairs whose
+    # names differ. Surfaced separately so they don't pollute the MODIFIED
+    # bucket (which is meant for actual body changes / security fixes).
+    lines.append(f"### Renamed (unchanged body) ({len(unchanged_renamed)})")
+    for of, nf in unchanged_renamed:
+        lines.append(
+            f"- {of.get('name')} ({of.get('address')})  →  "
+            f"{nf.get('name')} ({nf.get('address')})  [unchanged_renamed]"
+        )
     lines.append("")
 
     lines.append(f"### MODIFIED ({len(modified)})")
@@ -529,14 +542,25 @@ def register_diff_tools(app, session_manager, cache, runner):
             phase3_pairs, old_residue, new_residue = _pair_by_callees(old_residue, new_residue)
 
             # Build the modified set with kind labels.
+            #
+            # Phase-2 pairs match by normalized opcode hash — the function
+            # bodies are byte-for-byte equivalent after capstone
+            # normalization, so these are functionally unchanged. Same-name
+            # phase-2 pairs are pure "unchanged" (just bucket-count them);
+            # different-name pairs are "unchanged_renamed" and get their
+            # own section so reviewers can see the rename without being
+            # told to look for a security fix that isn't there.
             modified: list[tuple[dict, dict, str, dict]] = []
+            unchanged_renamed: list[tuple[dict, dict]] = []
+            unchanged_count = len(unchanged_phase1)
             for of, nf in modified_phase1:
                 deltas = _score_modified(of, nf, old_ctx, new_ctx, mode)
                 modified.append((of, nf, "modified", deltas))
             for of, nf in phase2_pairs:
-                kind = "renamed" if of.get("name") != nf.get("name") else "modified"
-                deltas = _score_modified(of, nf, old_ctx, new_ctx, mode)
-                modified.append((of, nf, kind, deltas))
+                if of.get("name") != nf.get("name"):
+                    unchanged_renamed.append((of, nf))
+                else:
+                    unchanged_count += 1
             for of, nf in phase3_pairs:
                 deltas = _score_modified(of, nf, old_ctx, new_ctx, mode)
                 modified.append((of, nf, "modified-renamed", deltas))
@@ -549,7 +573,8 @@ def register_diff_tools(app, session_manager, cache, runner):
                 added=new_residue,
                 removed=old_residue,
                 modified=modified,
-                unchanged_count=len(unchanged_phase1),
+                unchanged_count=unchanged_count,
+                unchanged_renamed=unchanged_renamed,
                 mode=mode,
                 group_by=group_by,
             )

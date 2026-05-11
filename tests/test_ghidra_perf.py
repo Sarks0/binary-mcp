@@ -653,6 +653,54 @@ class TestRunnerEnvPlumbing:
                 return
         raise AssertionError("Expected FileNotFoundError for missing PDB")
 
+    def test_stage_pdb_rejects_symlink_source(self, runner, tmp_path):
+        """Defence in depth: _stage_pdb must refuse a symlink as the source
+        even if the caller forgets to validate. Ghidra reads whatever the
+        staged PDB resolves to, so a symlink like /etc/shadow would leak."""
+        binary = tmp_path / "victim.exe"
+        binary.write_bytes(b"\x4d\x5a" + b"\x00" * 126)
+
+        real_pdb = tmp_path / "real.pdb"
+        real_pdb.write_bytes(b"PDB content")
+
+        symlink_pdb = tmp_path / "evil.pdb"
+        try:
+            symlink_pdb.symlink_to(real_pdb)
+        except (OSError, NotImplementedError):
+            pytest.skip("Cannot create symlinks on this platform")
+
+        with pytest.raises(ValueError, match="symlink"):
+            runner._stage_pdb(binary, str(symlink_pdb))
+
+    def test_stage_pdb_rejects_directory(self, runner, tmp_path):
+        """_stage_pdb must refuse a directory (or anything that isn't a
+        regular file)."""
+        binary = tmp_path / "victim.exe"
+        binary.write_bytes(b"\x4d\x5a" + b"\x00" * 126)
+
+        pdb_dir = tmp_path / "looks_like.pdb"
+        pdb_dir.mkdir()
+
+        with pytest.raises(ValueError, match="regular file"):
+            runner._stage_pdb(binary, str(pdb_dir))
+
+    def test_stage_pdb_accepts_regular_file(self, runner, tmp_path):
+        """Regression guard: the symlink/file-type checks must NOT break the
+        happy path of a plain on-disk PDB."""
+        binary = tmp_path / "victim.exe"
+        binary.write_bytes(b"\x4d\x5a" + b"\x00" * 126)
+
+        real_pdb = tmp_path / "external" / "real.pdb"
+        real_pdb.parent.mkdir()
+        real_pdb.write_bytes(b"PDB content")
+
+        staged = runner._stage_pdb(binary, str(real_pdb))
+        try:
+            assert staged.exists()
+            assert staged.name == "victim.pdb"
+        finally:
+            runner._cleanup_pdb(staged)
+
 
 # -- GhidraRunner timeout cleanup -------------------------------------------
 #

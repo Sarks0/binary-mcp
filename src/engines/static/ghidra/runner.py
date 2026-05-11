@@ -278,14 +278,31 @@ class GhidraRunner:
         auto-locates it. Symlinks on Unix, copies on Windows (where symlinks
         need admin privileges).
 
+        ``pdb_path`` is expected to be pre-validated by the caller -- it MUST
+        be a regular file and MUST NOT be a symlink. The staging step symlinks
+        ``dest`` to ``src.resolve()``, so accepting a user-supplied symlink
+        here would let a caller stage an arbitrary host file (e.g. /etc/shadow)
+        adjacent to the binary, which Ghidra then reads. We re-check here as
+        a defence-in-depth measure.
+
         Returns the staged path. Callers should pass it to ``_cleanup_pdb``
         once Ghidra has finished reading the binary.
         """
         import shutil
 
         src = Path(pdb_path)
+        # Reject symlinks BEFORE existence check so a dangling symlink also
+        # fails fast with the right error.
+        if src.is_symlink():
+            raise ValueError(
+                f"PDB path must not be a symlink: {pdb_path}"
+            )
         if not src.exists():
             raise FileNotFoundError(f"PDB not found: {pdb_path}")
+        if not src.is_file():
+            raise ValueError(
+                f"PDB path must be a regular file: {pdb_path}"
+            )
 
         binary = Path(binary_path)
         # Ghidra looks for <binary-with-suffix>.pdb adjacent to the binary
@@ -296,8 +313,16 @@ class GhidraRunner:
             # Already in the right place
             return dest
 
-        # Remove any prior artefact so staging is idempotent
+        # Remove any prior artefact so staging is idempotent. Since we've
+        # already rejected symlink-as-source and non-files above, the only
+        # path here is intentional re-staging of a new PDB next to the
+        # binary; a pre-existing <stem>.pdb adjacent to the binary is
+        # replaced. Log it so users can spot accidental clobbers.
         if dest.exists() or dest.is_symlink():
+            logger.debug(
+                "Replacing existing PDB at %s while staging %s",
+                dest, src,
+            )
             dest.unlink()
 
         if self.system == "Windows":

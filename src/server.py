@@ -1032,6 +1032,7 @@ def load_pdb(
         Summary comparing pre/post symbolic-function counts.
     """
     try:
+        pdb_was_fetched = False
         if pdb_path in (None, "", "auto"):
             from src.utils.pdb_fetcher import fetch_pdb
             try:
@@ -1041,6 +1042,30 @@ def load_pdb(
             except RuntimeError as e:
                 return f"Symbol server fetch failed: {e}"
             pdb_path = str(fetched)
+            pdb_was_fetched = True
+
+        # User-supplied pdb_path must clear the BINARY_MCP_ALLOWED_DIRS
+        # allowlist (it flows into _stage_pdb which symlinks dest -> src.resolve()
+        # next to the binary, and Ghidra reads the target). Server-fetched
+        # paths come from our own symbol cache and are trusted, so we skip
+        # the allowlist check for those but still normalise the path.
+        if not pdb_was_fetched:
+            try:
+                pdb_path = str(
+                    sanitize_binary_path(
+                        pdb_path,
+                        allowed_dirs=get_allowed_dirs(),
+                    )
+                )
+            except FileNotFoundError:
+                return f"PDB not found at {pdb_path}"
+            except PathTraversalError:
+                return (
+                    "PDB path is outside the allowed directories "
+                    "(BINARY_MCP_ALLOWED_DIRS)."
+                )
+            except (FileSizeError, ValueError) as e:
+                return safe_error_message("Invalid PDB path", e)
 
         # Capture pre-state for before/after comparison
         pre_cached = cache.get_cached(binary_path)

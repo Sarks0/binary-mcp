@@ -412,3 +412,120 @@ class TestServerToolsRoundTrip:
         )
         assert "Error" in bad
         assert "No function" in bad
+
+
+# --- load_pdb pdb_path allowlist --------------------------------------------
+#
+# Regression: pdb_path used to flow into runner._stage_pdb with NO validation,
+# which would symlink <binary-stem>.pdb -> arbitrary_host_path.resolve() and
+# let Ghidra read the target (e.g. /etc/shadow). The user-supplied branch
+# must clear BINARY_MCP_ALLOWED_DIRS; the auto-fetched branch must skip the
+# allowlist check (the fetcher writes into our own server-controlled symbol
+# cache, which the user may not have allowlisted).
+
+
+class TestLoadPdbAllowlist:
+    def test_user_supplied_pdb_outside_allowlist_rejected(
+        self, server_module, tmp_path, monkeypatch
+    ):
+        """load_pdb with a user-supplied pdb_path outside
+        BINARY_MCP_ALLOWED_DIRS must return a friendly error rather than
+        passing the path through to _stage_pdb."""
+        allowed = tmp_path / "allowed"
+        allowed.mkdir()
+        binary = allowed / "victim.exe"
+        binary.write_bytes(b"\x4d\x5a" + b"\x00" * 126)
+
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        pdb = outside / "evil.pdb"
+        pdb.write_bytes(b"PDB content")
+
+        monkeypatch.setenv("BINARY_MCP_ALLOWED_DIRS", str(allowed))
+
+        # Wire a get_analysis_context that would fail loudly if called --
+        # validation should reject before we ever reach analysis.
+        def _explode(*a, **kw):
+            raise AssertionError(
+                "get_analysis_context called for an out-of-allowlist PDB"
+            )
+
+        monkeypatch.setattr(
+            server_module, "get_analysis_context", _explode
+        )
+
+        result = server_module.load_pdb(str(binary), pdb_path=str(pdb))
+        assert (
+            "outside the allowed directories" in result
+            or "Invalid PDB path" in result
+        ), result
+
+    def test_user_supplied_missing_pdb_returns_friendly_error(
+        self, server_module, tmp_path, monkeypatch
+    ):
+        """A missing user-supplied pdb_path must return a 'PDB not found'
+        message, not crash."""
+        binary = tmp_path / "victim.exe"
+        binary.write_bytes(b"\x4d\x5a" + b"\x00" * 126)
+        missing = tmp_path / "nope.pdb"
+
+        # No allowlist => sanitize_binary_path skips the allowlist check
+        # but still raises FileNotFoundError for the missing file.
+        monkeypatch.delenv("BINARY_MCP_ALLOWED_DIRS", raising=False)
+
+        def _explode(*a, **kw):
+            raise AssertionError("get_analysis_context called for missing PDB")
+
+        monkeypatch.setattr(
+            server_module, "get_analysis_context", _explode
+        )
+
+        result = server_module.load_pdb(str(binary), pdb_path=str(missing))
+        assert "PDB not found" in result, result
+
+    def test_auto_fetched_pdb_bypasses_allowlist(
+        self, server_module, tmp_path, monkeypatch
+    ):
+        """When pdb_path is omitted (or 'auto'), the value returned by
+        fetch_pdb is INTRA-application data -- the server downloaded it
+        into its own symbol cache. It must NOT be re-checked against
+        BINARY_MCP_ALLOWED_DIRS (which the user may have set to only their
+        sample directory)."""
+        allowed = tmp_path / "samples"
+        allowed.mkdir()
+        binary = allowed / "victim.exe"
+        binary.write_bytes(b"\x4d\x5a" + b"\x00" * 126)
+
+        # Fetched PDB lives OUTSIDE the user's allowed dir, exactly as the
+        # real symbol cache would.
+        fetched_pdb = tmp_path / "symbol_cache" / "victim.pdb"
+        fetched_pdb.parent.mkdir()
+        fetched_pdb.write_bytes(b"PDB content")
+
+        monkeypatch.setenv("BINARY_MCP_ALLOWED_DIRS", str(allowed))
+
+        # Stub fetch_pdb so we don't hit the network.
+        import src.utils.pdb_fetcher as pdb_fetcher_mod
+        monkeypatch.setattr(
+            pdb_fetcher_mod, "fetch_pdb",
+            lambda *a, **kw: fetched_pdb,
+        )
+
+        # Stub get_analysis_context: capture the pdb_path that propagated
+        # through and return an empty context so load_pdb completes.
+        seen = {}
+
+        def _stub_ctx(binary_path, **kwargs):
+            seen["pdb_path"] = kwargs.get("pdb_path")
+            return {"functions": []}
+
+        monkeypatch.setattr(server_module, "get_analysis_context", _stub_ctx)
+        # The pre-cache fetch happens via the cache singleton. Wire a temp
+        # cache so the test can't pollute real ~/.binary_mcp_cache.
+        _wire_real_cache(server_module, monkeypatch, tmp_path / "cache")
+
+        result = server_module.load_pdb(str(binary), pdb_path="auto")
+
+        # The fetched PDB was used despite living outside the allowlist.
+        assert seen["pdb_path"] == str(fetched_pdb), seen
+        assert "PDB applied" in result, result

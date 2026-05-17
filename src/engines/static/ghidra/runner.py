@@ -12,9 +12,15 @@ import subprocess  # nosec B404 - Required for Ghidra headless execution
 import time
 from pathlib import Path
 
-from src.utils.security import validate_parameter_pattern
+from src.utils.security import UserFacingError, validate_parameter_pattern
 
 logger = logging.getLogger(__name__)
+
+# Ghidra 12.1 (release note GP-6754, May 2026) stopped bundling Jython; it now
+# ships as an installable extension. Both core_analysis.py and
+# enable_pdb_load.py are Jython scripts, so analyzeHeadless silently fails on
+# 12.1+ without the extension installed.
+_JYTHON_REQUIRED_MIN_VERSION = (12, 1)
 
 
 def _kill_process_tree(proc: subprocess.Popen) -> None:
@@ -163,6 +169,10 @@ class GhidraRunner:
                 self.ghidra_path = self._detect_ghidra()
 
         self.system = platform.system()
+        # Cache the jython precondition result so analyze() doesn't re-stat
+        # the install on every call. None = not yet checked, True = ok,
+        # False would imply we already raised; we never store False.
+        self._jython_check_done: bool = False
         logger.info(f"Initialized Ghidra runner: {self.ghidra_path} on {self.system}")
 
     def _detect_ghidra(self) -> Path:
@@ -376,6 +386,137 @@ class GhidraRunner:
         except Exception as e:
             logger.warning(f"Failed to cleanup project {project_name}: {e}")
 
+    def _read_version_string(self) -> str | None:
+        """
+        Read the raw ``application.version`` value from Ghidra's
+        ``application.properties``. Returns None if the file is missing or
+        unreadable -- callers must tolerate that (the test fixtures stub
+        Ghidra by creating just support/analyzeHeadless, so this is the
+        common case in CI).
+        """
+        version_file = self.ghidra_path / "application.properties"
+        if not version_file.exists():
+            return None
+        try:
+            with open(version_file, encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("application.version"):
+                        _, _, value = line.partition("=")
+                        value = value.strip()
+                        return value or None
+        except OSError as e:
+            logger.debug(f"Could not read {version_file}: {e}")
+        return None
+
+    def _get_ghidra_version(self) -> tuple[int, int] | None:
+        """
+        Parse Ghidra's ``application.version`` into a (major, minor) tuple.
+
+        Tolerates ``12.1``, ``12.1.0``, ``12.1_DEV``, ``11.4``, etc. Returns
+        None when the file is missing, the value is empty, or the leading
+        token doesn't look like ``major.minor``.
+        """
+        raw = self._read_version_string()
+        if not raw:
+            return None
+        # Strip suffix variants: 12.1_DEV, 12.1-RC1, 12.1+build.7 -> 12.1
+        head = re.split(r"[_\-+\s]", raw, maxsplit=1)[0]
+        match = re.match(r"^(\d+)\.(\d+)", head)
+        if not match:
+            logger.debug(f"Unparseable Ghidra version: {raw!r}")
+            return None
+        try:
+            return (int(match.group(1)), int(match.group(2)))
+        except ValueError:
+            return None
+
+    def _jython_extension_dir_has_jar(self, ext_dir: Path) -> bool:
+        """True iff ``ext_dir`` exists and contains at least one .jar."""
+        try:
+            if not ext_dir.is_dir():
+                return False
+            for entry in ext_dir.iterdir():
+                if entry.suffix == ".jar" and entry.is_file():
+                    return True
+            # Some extension layouts put jars under a lib/ subdir.
+            lib_dir = ext_dir / "lib"
+            if lib_dir.is_dir():
+                for entry in lib_dir.iterdir():
+                    if entry.suffix == ".jar" and entry.is_file():
+                        return True
+        except OSError as e:
+            logger.debug(f"Could not scan extension dir {ext_dir}: {e}")
+        return False
+
+    def _jython_available(self) -> bool:
+        """
+        Decide whether the Jython script engine is available to Ghidra.
+
+        Pre-12.1: Jython is bundled, so we return True without further
+        checks. 12.1+: look for an *installed* Jython extension. A zip
+        sitting under ``Extensions/Ghidra/`` (downloaded but not yet
+        installed) does NOT count -- analyzeHeadless can't load it until
+        the user activates it via Front End -> Install Extensions.
+
+        We check the install-dir extension path; user extension dirs vary
+        by platform and version and aren't worth over-engineering. If we
+        can't determine the version, assume Jython is available so we
+        don't block users on minimally-stubbed fixtures.
+        """
+        version = self._get_ghidra_version()
+        if version is None or version < _JYTHON_REQUIRED_MIN_VERSION:
+            return True
+
+        candidate_dirs = [
+            # Standard install-dir extension path Ghidra unpacks into when
+            # the user clicks "Install Extensions".
+            self.ghidra_path / "Ghidra" / "Extensions" / "Jython",
+            # Some installers/zip layouts drop it directly here.
+            self.ghidra_path / "Extensions" / "Jython",
+        ]
+        for d in candidate_dirs:
+            if self._jython_extension_dir_has_jar(d):
+                logger.debug(f"Found installed Jython extension at {d}")
+                return True
+
+        return False
+
+    def ensure_jython_available(self) -> None:
+        """
+        Gate that runs before the first analyzeHeadless invocation.
+
+        Raises ``UserFacingError`` on Ghidra >= 12.1 when no installed
+        Jython extension is found. On older Ghidra (or when the version
+        is unparseable) this is a no-op. Result is cached on the instance
+        so repeated analyze() calls don't re-stat the install.
+        """
+        if self._jython_check_done:
+            return
+
+        version = self._get_ghidra_version()
+        if version is None or version < _JYTHON_REQUIRED_MIN_VERSION:
+            self._jython_check_done = True
+            return
+
+        if self._jython_available():
+            self._jython_check_done = True
+            return
+
+        version_str = f"{version[0]}.{version[1]}"
+        raise UserFacingError(
+            f"Ghidra {version_str} requires the Jython extension to run "
+            "analysis scripts. Install it via the Ghidra Front End: "
+            'File -> Install Extensions -> check "Jython" -> restart '
+            "Ghidra. (Ghidra 12.1 unbundled Jython per release note "
+            "GP-6754.)",
+            internal_details=(
+                f"Jython extension not found under "
+                f"{self.ghidra_path}/Ghidra/Extensions/Jython or "
+                f"{self.ghidra_path}/Extensions/Jython on Ghidra "
+                f"{version_str}"
+            ),
+        )
+
     def analyze(
         self,
         binary_path: str,
@@ -440,6 +581,10 @@ class GhidraRunner:
             2. Set max_functions to limit analysis scope
             3. Set skip_decompile=True to skip decompilation entirely
         """
+        # Fail fast on Ghidra 12.1+ without the Jython extension installed.
+        # Cached on the instance, so subsequent analyze() calls are free.
+        self.ensure_jython_available()
+
         binary_path = self._normalize_binary_path(binary_path)
 
         if not binary_path.exists():
@@ -724,18 +869,20 @@ class GhidraRunner:
             diag["java_installed"] = False
             diag["java_version"] = None
 
-        # Check Ghidra version
-        version_file = self.ghidra_path / "application.properties"
-        if version_file.exists():
-            try:
-                with open(version_file, encoding="utf-8") as f:
-                    for line in f:
-                        if line.startswith("application.version"):
-                            diag["ghidra_version"] = line.split("=")[1].strip()
-                            break
-            except Exception as e:
-                diag["ghidra_version"] = f"Error reading version: {e}"
-        else:
-            diag["ghidra_version"] = "Unknown"
+        # Check Ghidra version via the shared parser so diagnose() and the
+        # Jython gate stay in sync on what counts as a parseable version.
+        raw_version = self._read_version_string()
+        diag["ghidra_version"] = raw_version if raw_version else "Unknown"
+
+        # Surface Jython status. jython_required is True only on >= 12.1,
+        # where Jython is no longer bundled. jython_available reflects
+        # whether we can actually run our Jython scripts; on older Ghidra
+        # (or when the version is unparseable) it's True by definition.
+        parsed_version = self._get_ghidra_version()
+        diag["jython_required"] = bool(
+            parsed_version is not None
+            and parsed_version >= _JYTHON_REQUIRED_MIN_VERSION
+        )
+        diag["jython_available"] = self._jython_available()
 
         return diag

@@ -621,10 +621,36 @@ def install_ghidra(ghidra_dir: Path, unattended: bool = False) -> bool:
         os.environ["GHIDRA_HOME"] = str(ghidra_dir)
 
         print_success(f"Ghidra installed to: {ghidra_dir}")
+
+        _activate_jython_extension(ghidra_dir)
         return True
     except Exception as e:
         print_error(f"Failed to install Ghidra: {e}")
         return False
+
+
+def _activate_jython_extension(ghidra_dir: Path) -> None:
+    """Extract Ghidra 12.1+ bundled Jython extension so analyzeHeadless can run our Jython scripts.
+
+    Ghidra 12.1 unbundled Jython into an inert zip under <GhidraDir>/Ghidra/Extensions/.
+    Earlier versions ship Jython built in. Failures here are non-fatal: the runtime
+    gate in src/engines/static/ghidra/runner.py will still surface a clear error.
+    """
+    try:
+        extensions_dir = ghidra_dir / "Ghidra" / "Extensions"
+        jython_dir = extensions_dir / "Jython"
+        matches = list(extensions_dir.glob("*Jython*.zip"))
+        if not matches:
+            print_info("No bundled Jython extension found (Ghidra < 12.1)")
+            return
+        if jython_dir.is_dir():
+            print_info("Jython extension already activated, skipping")
+            return
+        with zipfile.ZipFile(matches[0], 'r') as zf:
+            zf.extractall(extensions_dir)
+        print_success("Jython extension activated")
+    except Exception as e:
+        print_warning(f"Failed to activate Jython extension: {e}")
 
 
 def install_ilspycmd(status: SystemStatus, pkg_manager: str) -> bool:

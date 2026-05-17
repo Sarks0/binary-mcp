@@ -191,6 +191,22 @@ $env:GHIDRA_HOME = "C:\path\to\ghidra"
 export GHIDRA_HOME=/path/to/ghidra
 ```
 
+#### Ghidra 12.1+: Activate the Jython Extension
+
+Ghidra 12.1 unbundled Jython, which binary-mcp uses for its analysis scripts. The installer scripts do this automatically. If you installed Ghidra manually, activate the bundled Jython extension before first use — either via the Ghidra Front End (**File → Install Extensions → check Jython → restart**), or by extracting the bundled zip directly:
+
+**Windows:**
+```powershell
+Expand-Archive -Path "$env:GHIDRA_HOME\Ghidra\Extensions\*Jython*.zip" -DestinationPath "$env:GHIDRA_HOME\Ghidra\Extensions\"
+```
+
+**Linux/macOS:**
+```bash
+unzip "$GHIDRA_HOME"/Ghidra/Extensions/*Jython*.zip -d "$GHIDRA_HOME"/Ghidra/Extensions/
+```
+
+Ghidra 12.0.x and earlier ship with Jython built in — no extra step needed.
+
 ### 6. Install x64dbg (Windows Only, Optional)
 
 **Download:** https://github.com/x64dbg/x64dbg/releases/latest

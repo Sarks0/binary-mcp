@@ -156,6 +156,8 @@ Comprehensive PE header, section, import, export, resource, debug, TLS, and Rich
 | `WINDBG_PATH` | WinDbg/CDB installation path | Auto-detected |
 | `WINDBG_MODE` | Operating mode: `kernel`, `user`, `dump` | `kernel` |
 
+**Ghidra 12.1+ users:** Jython is no longer bundled with Ghidra and is required for analysis. Install it once from the Ghidra Front End: **File -> Install Extensions -> Jython**, then restart Ghidra. Ghidra 12.0.x and earlier ship with Jython built in and need no extra setup.
+
 ## Development
 
 ```bash

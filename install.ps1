@@ -595,6 +595,24 @@ function Install-Ghidra {
             return $false
         }
 
+        # Ghidra 12.1+ ships Jython as an inert bundled extension zip.
+        # Extract it so analyzeHeadless can run our Jython pre-scripts.
+        try {
+            $extensionsDir = Join-Path $GhidraDir "Ghidra\Extensions"
+            $jythonDir = Join-Path $extensionsDir "Jython"
+            $jythonZip = Get-ChildItem -Path $extensionsDir -Filter "*Jython*.zip" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($null -eq $jythonZip) {
+                Write-Info "No bundled Jython extension found (Ghidra < 12.1)"
+            } elseif (Test-Path $jythonDir -PathType Container) {
+                Write-Info "Jython extension already activated, skipping"
+            } else {
+                Expand-Archive -Path $jythonZip.FullName -DestinationPath $extensionsDir -Force
+                Write-Success "Jython extension activated"
+            }
+        } catch {
+            Write-Warn "Failed to activate Jython extension: $_"
+        }
+
         Remove-Item $ghidraZip -ErrorAction SilentlyContinue
         return $true
     } catch {

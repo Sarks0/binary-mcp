@@ -1,0 +1,1348 @@
+# Ghidra Jython script for comprehensive malware analysis extraction
+# This script runs inside Ghidra's JVM environment
+# @runtime Jython
+# @category MalwareAnalysis
+# ruff: noqa: F821
+# Note: currentProgram and other Ghidra globals are provided at runtime
+
+import codecs
+import gzip
+import json
+import os
+import time
+
+from ghidra.app.decompiler import DecompInterface
+from ghidra.program.model.block import BasicBlockModel
+from ghidra.program.model.data import Enum as GhidraEnum
+from ghidra.program.model.data import Structure as GhidraStructure
+from ghidra.program.model.listing import CodeUnit
+from ghidra.util.task import ConsoleTaskMonitor
+from java.lang import InterruptedException, Thread
+from java.util.concurrent import Callable, Executors, TimeoutException, TimeUnit
+
+
+def safe_unicode(value):
+    """
+    Safely convert a value to unicode string, handling non-ASCII characters.
+
+    In Jython/Python 2, str() fails on unicode strings with non-ASCII characters.
+    This function handles both str and unicode types safely.
+    """
+    if value is None:
+        return u""
+
+    # If it's already unicode, return it
+    if isinstance(value, unicode):
+        return value
+
+    # If it's a regular string (bytes), decode it
+    if isinstance(value, str):
+        try:
+            return value.decode('utf-8')
+        except (UnicodeDecodeError, AttributeError):
+            # If UTF-8 fails, try latin-1 (which accepts all byte values)
+            return value.decode('latin-1', 'replace')
+
+    # For other types (Java objects, numbers, etc), convert to unicode
+    try:
+        return unicode(value)
+    except UnicodeDecodeError:
+        # Last resort: convert to str first, then decode
+        try:
+            return str(value).decode('utf-8', 'replace')
+        except (UnicodeDecodeError, AttributeError, TypeError):
+            return u"<encoding_error>"
+
+
+def safe_format(fmt_string, *args, **kwargs):
+    """
+    Safely format and encode a string for printing, handling Unicode.
+
+    In Python 2/Jython, formatting with Unicode values creates a Unicode string,
+    which print() tries to encode with ASCII, causing UnicodeEncodeError.
+    This function formats and encodes to UTF-8 in one step.
+
+    Returns a UTF-8 encoded byte string safe for printing.
+    """
+    try:
+        # Format the string (may contain Unicode)
+        result = fmt_string.format(*args, **kwargs)
+        # If it's Unicode, encode to UTF-8; otherwise return as-is
+        if isinstance(result, unicode):
+            return result.encode('utf-8', 'replace')
+        return result
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        # Fallback: use ASCII with replacement chars
+        try:
+            result = fmt_string.format(*args, **kwargs)
+            if isinstance(result, unicode):
+                return result.encode('ascii', 'replace')
+            return result
+        except Exception:
+            return "<formatting_error>"
+
+
+def _operand_base_register(inst):
+    """Best-effort: pull the base register name out of an indirect
+    call's primary operand. Handles ``RAX``, ``[RAX]``, ``[RAX+0x10]``,
+    ``qword ptr [RAX+0x18]``, ``[RIP+0x100]``. Returns ``None`` when
+    the operand is a literal address (no register) or unparseable.
+    """
+    try:
+        operand = inst.getDefaultOperandRepresentation(0)
+    except Exception:
+        return None
+    if not operand:
+        return None
+    text = safe_unicode(operand).upper()
+    # Strip size hints: "QWORD PTR ", "DWORD PTR ", "PTR " -- they are
+    # presentation-only and never carry the register we care about.
+    for prefix in (u"QWORD PTR ", u"DWORD PTR ", u"WORD PTR ",
+                   u"BYTE PTR ", u"PTR "):
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+            break
+    inner = text.strip()
+    if inner.startswith(u"["):
+        end = inner.find(u"]")
+        if end < 0:
+            return None
+        inner = inner[1:end]
+    # ``RAX+0x10`` / ``RAX-0x4`` / ``RIP+0x100`` -- take the LHS token.
+    for sep in (u"+", u"-", u"*"):
+        idx = inner.find(sep)
+        if idx >= 0:
+            inner = inner[:idx]
+            break
+    inner = inner.strip()
+    # Reject hex literals masquerading as register names.
+    if not inner or inner.startswith(u"0X") or inner.isdigit():
+        return None
+    # Crude register-name shape check: 2-4 alphanumerics. Accepts
+    # x86/x64 (RAX, EAX, R8D), ARM64 (X0, W0, X29), and exotic regs
+    # without enumerating them.
+    if 1 <= len(inner) <= 4 and inner[0].isalpha():
+        return inner
+    return None
+
+
+def _extract_immediate(operand_text):
+    """Extract a single ``0xHEX`` literal from an operand string when
+    the operand is a direct or memory-indirect immediate. Returns the
+    canonical lowercase ``"0xHEX"`` form or ``None``.
+    """
+    if not operand_text:
+        return None
+    text = safe_unicode(operand_text).strip()
+    # Strip size hints.
+    for prefix in (u"qword ptr ", u"dword ptr ", u"word ptr ",
+                   u"byte ptr ", u"ptr ", u"QWORD PTR ", u"DWORD PTR ",
+                   u"WORD PTR ", u"BYTE PTR ", u"PTR "):
+        if text.startswith(prefix):
+            text = text[len(prefix):].strip()
+            break
+    if text.startswith(u"["):
+        end = text.find(u"]")
+        if end < 0:
+            return None
+        text = text[1:end].strip()
+    # Reject anything that contains operators (would be reg + imm).
+    for op in (u"+", u"-", u"*"):
+        if op in text:
+            return None
+    if text.lower().startswith(u"0x"):
+        body = text[2:]
+        if body and all(c in u"0123456789abcdefABCDEF" for c in body):
+            return u"0x" + body.lower()
+    return None
+
+
+def _resolve_loaded_from(inst, listing):
+    """Best-effort static resolver for indirect-call targets.
+
+    Walks back up to 5 instructions looking for a ``MOV`` or ``LEA``
+    whose destination is the same register the call dereferences and
+    whose source is a literal immediate (e.g. ``MOV RAX,
+    [0x140020000]``). Returns the immediate as a canonical
+    ``"0xHEX"`` string, or ``None`` when the target is not statically
+    determinable -- which is the common case for vtable dispatch
+    (``MOV RAX, [RCX]; CALL [RAX+0x18]``).
+    """
+    base_reg = _operand_base_register(inst)
+    if not base_reg:
+        return None
+    cur = inst
+    for _ in range(5):
+        try:
+            cur = listing.getInstructionBefore(cur.getAddress())
+        except Exception:
+            return None
+        if cur is None:
+            return None
+        try:
+            mn = safe_unicode(cur.getMnemonicString()).upper()
+        except Exception:
+            continue
+        if mn not in (u"MOV", u"LEA"):
+            continue
+        try:
+            dest = safe_unicode(
+                cur.getDefaultOperandRepresentation(0)
+            ).upper()
+            src = safe_unicode(cur.getDefaultOperandRepresentation(1))
+        except Exception:
+            continue
+        if dest != base_reg.upper():
+            continue
+        addr = _extract_immediate(src)
+        if addr:
+            return addr
+    return None
+
+
+def _normalize_addr_for_xref(raw):
+    """Normalize an address into the same canonical form server-side
+    ``_normalize_xref_addr`` produces (lowercase, no ``0x`` prefix, no
+    leading zeros, never empty). Keeps cache keys aligned with how
+    ``get_xrefs`` looks them up so the reverse index is a true O(1) hit.
+    """
+    if not raw:
+        return u""
+    s = safe_unicode(raw).lower()
+    if s.startswith(u"0x"):
+        s = s[2:]
+    s = s.lstrip(u"0")
+    return s if s else u"0"
+
+
+class DecompileCallable(Callable):
+    """
+    Java Callable wrapper for decompilation with thread-based timeout.
+
+    This allows us to enforce a hard timeout on decompilation that works
+    even when Ghidra's internal decompiler timeout fails to trigger
+    (which can happen with anti-analysis code that causes infinite loops).
+    """
+
+    def __init__(self, decompiler, function, timeout_seconds, monitor):
+        """
+        Initialize the callable.
+
+        Args:
+            decompiler: DecompInterface instance
+            function: Ghidra Function to decompile
+            timeout_seconds: Timeout in seconds for decompilation
+            monitor: TaskMonitor instance
+        """
+        self.decompiler = decompiler
+        self.function = function
+        self.timeout_seconds = timeout_seconds
+        self.monitor = monitor
+        self.result = None
+        self.error = None
+
+    def call(self):
+        """Execute decompilation - called by executor thread."""
+        try:
+            # Use the internal timeout as a first line of defense
+            self.result = self.decompiler.decompileFunction(
+                self.function, self.timeout_seconds, self.monitor
+            )
+            return self.result
+        except Exception as e:
+            self.error = e
+            return None
+
+
+def decompile_with_timeout(decompiler, function, timeout_seconds, monitor, executor):
+    """
+    Decompile a function with a hard thread-based timeout.
+
+    This provides a robust timeout mechanism that works even when Ghidra's
+    internal decompiler timeout fails (e.g., due to anti-analysis code).
+
+    Args:
+        decompiler: DecompInterface instance
+        function: Ghidra Function to decompile
+        timeout_seconds: Timeout in seconds
+        monitor: TaskMonitor instance
+        executor: ExecutorService for running the decompilation
+
+    Returns:
+        tuple: (result, status, error_message)
+            - result: DecompileResults or None
+            - status: "success", "timeout", "error", "interrupted"
+            - error_message: Error description or None
+    """
+    callable_task = DecompileCallable(decompiler, function, timeout_seconds, monitor)
+
+    try:
+        # Submit task and wait with timeout
+        future = executor.submit(callable_task)
+
+        try:
+            # Wait for result with timeout (add 5 seconds buffer for thread overhead)
+            result = future.get(timeout_seconds, TimeUnit.SECONDS)
+
+            if callable_task.error:
+                return (None, "error", safe_unicode(callable_task.error))
+
+            return (result, "success", None)
+
+        except TimeoutException:
+            # Hard timeout - cancel the future and return
+            future.cancel(True)  # True = may interrupt if running
+            return (None, "timeout", "Thread timeout exceeded")
+
+    except InterruptedException:
+        Thread.currentThread().interrupt()
+        return (None, "interrupted", "Decompilation interrupted")
+
+    except Exception as e:
+        return (None, "error", safe_unicode(e))
+
+
+def _parse_hex_addr(raw):
+    """Parse an address string ('0x1800', '1800') to int, or None."""
+    if not raw:
+        return None
+    try:
+        raw = raw.strip()
+        if raw.lower().startswith("0x"):
+            return int(raw, 16)
+        return int(raw, 16)
+    except (ValueError, AttributeError):
+        return None
+
+
+def _load_resume_cache(path):
+    """
+    Load a previous analysis cache for resumable analysis.
+
+    Returns ``(context_dict, addr_to_index)`` where ``addr_to_index`` maps each
+    cached function address to its position in ``context_dict["functions"]``.
+    Callers use the index for in-place replacement when re-processing a
+    function (e.g. extending pseudocode coverage onto a structural-only run).
+    Returns ``(None, {})`` if the cache cannot be loaded.
+    """
+    if not path or not os.path.exists(path):
+        return None, {}
+
+    try:
+        if path.endswith(".gz"):
+            f = gzip.open(path, "rb")
+            try:
+                data = json.loads(f.read().decode("utf-8"))
+            finally:
+                f.close()
+        else:
+            f = codecs.open(path, "r", encoding="utf-8")
+            try:
+                data = json.load(f)
+            finally:
+                f.close()
+
+        addr_to_index = {}
+        for idx, func in enumerate(data.get("functions", [])):
+            addr = func.get("address")
+            if addr:
+                addr_to_index[addr] = idx
+        return data, addr_to_index
+    except Exception as e:
+        print(safe_format("[!] Failed to load resume cache {}: {}", path, safe_unicode(e)))
+        return None, {}
+
+
+def _existing_has_pseudocode(existing):
+    """True iff a cached function entry already carries usable pseudocode."""
+    if not existing:
+        return False
+    if existing.get("pseudocode"):
+        return True
+    # Thunks / externals are intentionally never decompiled, treat as complete.
+    if existing.get("decompile_status") in ("skipped_thunk_or_external",):
+        return True
+    return False
+
+
+def _extract_comments(function, listing):
+    """Capture Ghidra-supplied comments for a function.
+
+    Returns a tuple of ``(plate_comment, instruction_comments)``:
+
+    * ``plate_comment`` is the function's plate comment as a unicode
+      string (empty when none).
+    * ``instruction_comments`` is a list of ``{addr, kind, text}`` dicts
+      capturing pre / post / EOL comments for every instruction in the
+      function body. Comments commonly arrive from PDB load or from
+      manual annotation in the Ghidra GUI.
+
+    All exceptions are swallowed -- comment extraction must never break
+    analysis. Cheap (no decompile) so it is safe to call from the
+    resume-mode backfill path too.
+    """
+    plate_comment = u""
+    try:
+        raw_plate = function.getComment()
+        if raw_plate:
+            plate_comment = safe_unicode(raw_plate)
+    except Exception:
+        plate_comment = u""
+
+    instruction_comments = []
+    try:
+        body = function.getBody()
+        if body is None:
+            return plate_comment, instruction_comments
+        instr_iter = listing.getInstructions(body, True)
+        # ``listing.getComment(int, Address)`` is the long-stable API
+        # across Ghidra 10/11. The newer ``getCommentAt`` alias is not
+        # present in every install we target, so we stick with the
+        # CodeUnit constants.
+        kind_pairs = (
+            (CodeUnit.PRE_COMMENT, u"pre"),
+            (CodeUnit.POST_COMMENT, u"post"),
+            (CodeUnit.EOL_COMMENT, u"eol"),
+        )
+        while instr_iter.hasNext():
+            inst = instr_iter.next()
+            for code, kind in kind_pairs:
+                try:
+                    txt = listing.getComment(code, inst.getAddress())
+                except Exception:
+                    txt = None
+                if txt:
+                    instruction_comments.append({
+                        "addr": safe_unicode(inst.getAddress()),
+                        "kind": kind,
+                        "text": safe_unicode(txt),
+                    })
+    except Exception as e:
+        print(safe_format("    Warning: Could not extract comments for {}: {}",
+                          safe_unicode(function.getName()), safe_unicode(e)))
+    return plate_comment, instruction_comments
+
+
+def _extract_call_sites(function, listing, function_manager):
+    """Walk a function's body and collect call-site information.
+
+    Returns a tuple ``(direct_calls, indirect_calls)``:
+
+    * ``direct_calls`` carries records with the call-site PC, the
+      resolved callee's entry-point address, the callee's name, and
+      whether the callee resolves to an external import (thunks
+      followed). These feed the Wave 1A reverse index.
+    * ``indirect_calls`` covers ``ft.isCall() and ft.isComputed()``
+      sites -- ``CALL [reg+N]``, vtable dispatch, fnptr loads --
+      capturing the call-site PC, the operand expression, and a
+      best-effort static ``loaded_from`` immediate when the prior
+      MOV/LEA is statically resolvable.
+
+    Cheap (no decompile) so it doubles as the resume-mode backfill.
+    """
+    direct = []
+    indirect = []
+    body = function.getBody()
+    if not body:
+        return direct, indirect
+    instr_iter = listing.getInstructions(body, True)
+    while instr_iter.hasNext():
+        inst = instr_iter.next()
+        ft = inst.getFlowType()
+        if ft is None or not ft.isCall():
+            continue
+
+        # Indirect calls (Wave 2)
+        if ft.isComputed():
+            try:
+                operand = safe_unicode(
+                    inst.getDefaultOperandRepresentation(0)
+                )
+            except Exception:
+                try:
+                    operand = safe_unicode(inst.toString())
+                except Exception:
+                    operand = u""
+            loaded_from = _resolve_loaded_from(inst, listing)
+            indirect.append({
+                "call_site": safe_unicode(inst.getAddress()),
+                "operand": operand,
+                "loaded_from": loaded_from,
+            })
+            continue
+
+        # Direct calls (Wave 1A)
+        try:
+            targets = inst.getFlows()
+        except Exception:
+            targets = None
+        if not targets:
+            continue
+        call_site = safe_unicode(inst.getAddress())
+        for target_addr in targets:
+            try:
+                target_fn = function_manager.getFunctionAt(target_addr)
+            except Exception:
+                target_fn = None
+            if target_fn is None:
+                # Direct call into code Ghidra didn't tag as a function
+                # (rare; e.g. tail-call into an unrecognised stub).
+                # Record by address so the reverse index still resolves.
+                direct.append({
+                    "call_site": call_site,
+                    "callee_addr": safe_unicode(target_addr),
+                    "callee_name": safe_unicode(target_addr),
+                    "is_external": False,
+                })
+                continue
+            is_external = False
+            callee_name = safe_unicode(target_fn.getName())
+            try:
+                if target_fn.isExternal():
+                    is_external = True
+                elif target_fn.isThunk():
+                    thunked = target_fn.getThunkedFunction(True)
+                    if thunked is not None and thunked.isExternal():
+                        is_external = True
+                        callee_name = safe_unicode(thunked.getName())
+            except Exception:
+                pass
+            direct.append({
+                "call_site": call_site,
+                "callee_addr": safe_unicode(target_fn.getEntryPoint()),
+                "callee_name": callee_name,
+                "is_external": is_external,
+            })
+    return direct, indirect
+
+
+def _load_resume_manifest(path):
+    """
+    Load a small ``{"complete_addresses": [...]}`` sidecar.
+
+    Returns ``set(addresses_to_skip)``. Empty set on missing or malformed
+    manifest (caller is expected to fall back to a full run in that case).
+    """
+    if not path or not os.path.exists(path):
+        return set()
+    try:
+        f = codecs.open(path, "r", encoding="utf-8")
+        try:
+            data = json.load(f)
+        finally:
+            f.close()
+        return set(data.get("complete_addresses", []) or [])
+    except Exception as e:
+        print(safe_format("[!] Failed to load resume manifest {}: {}",
+                          path, safe_unicode(e)))
+        return set()
+
+
+def extract_comprehensive_analysis():
+    """Extract comprehensive analysis data from the current program."""
+
+    monitor = ConsoleTaskMonitor()
+    program = currentProgram
+    listing = program.getListing()
+    function_manager = program.getFunctionManager()
+    symbol_table = program.getSymbolTable()
+    memory = program.getMemory()
+    reference_manager = program.getReferenceManager()
+    data_type_manager = program.getDataTypeManager()
+
+    # Configurable settings from environment variables
+    # GHIDRA_FUNCTION_TIMEOUT: Per-function decompilation timeout in seconds (default: 30)
+    # GHIDRA_MAX_FUNCTIONS: Maximum number of functions to analyze (default: unlimited)
+    # GHIDRA_SKIP_DECOMPILE: Skip decompilation entirely (faster, but no pseudocode)
+    # GHIDRA_RESUME_CACHE: Path to previous cache JSON; functions already in it are skipped
+    # GHIDRA_START_ADDRESS / GHIDRA_END_ADDRESS: Hex address bounds for chunked analysis
+    function_timeout = int(os.environ.get("GHIDRA_FUNCTION_TIMEOUT", "30"))
+    max_functions = int(os.environ.get("GHIDRA_MAX_FUNCTIONS", "0"))  # 0 = unlimited
+    skip_decompile = os.environ.get("GHIDRA_SKIP_DECOMPILE", "").lower() in ("1", "true", "yes")
+    total_budget = int(os.environ.get("GHIDRA_ANALYSIS_BUDGET", "540"))
+    # GHIDRA_RESUME_MANIFEST is preferred -- a tiny sidecar with just the
+    # complete-address list. GHIDRA_RESUME_CACHE remains for backward compat
+    # but loading the full multi-GB cache will OOM the JVM on large binaries.
+    resume_manifest_path = os.environ.get("GHIDRA_RESUME_MANIFEST", "") or None
+    resume_cache_path = os.environ.get("GHIDRA_RESUME_CACHE", "") or None
+    start_addr = _parse_hex_addr(os.environ.get("GHIDRA_START_ADDRESS"))
+    end_addr = _parse_hex_addr(os.environ.get("GHIDRA_END_ADDRESS"))
+    enable_fid = os.environ.get("GHIDRA_ENABLE_FID", "").lower() in ("1", "true", "yes")
+
+    print(safe_format("[*] Analysis settings:"))
+    print(safe_format("    Function timeout: {}s", function_timeout))
+    print(safe_format("    Max functions: {}", max_functions if max_functions > 0 else "unlimited"))
+    print(safe_format("    Skip decompile: {}", skip_decompile))
+    print(safe_format("    Wall-clock budget: {}s", total_budget))
+    if resume_manifest_path:
+        print(safe_format("    Resume manifest: {}", resume_manifest_path))
+    elif resume_cache_path:
+        print(safe_format("    Resume cache: {}", resume_cache_path))
+    if start_addr is not None:
+        print(safe_format("    Start address: 0x{:x}", start_addr))
+    if end_addr is not None:
+        print(safe_format("    End address: 0x{:x}", end_addr))
+    if enable_fid:
+        print(safe_format("    FID matching: enabled"))
+
+    # Lazy-initialise Ghidra's Function ID service. Wrapped because the FID
+    # APIs vary slightly across Ghidra versions -- failure here degrades to
+    # "no FID matches", never a hard error.
+    fid_service = None
+    fid_files = None
+    if enable_fid:
+        try:
+            from ghidra.feature.fid.db import FidFileManager
+            from ghidra.feature.fid.service import FidService
+            fid_service = FidService()
+            fm = FidFileManager.getInstance()
+            if fm is not None:
+                fid_files = fm.getFidFiles()
+            if fid_service.canProcess(program.getLanguage()) and fid_files:
+                print(safe_format("    FID databases available: {}", len(fid_files)))
+            else:
+                print("    [!] FID enabled but no FID databases / unsupported language; disabling.")
+                fid_service = None
+                fid_files = None
+        except Exception as fid_err:
+            print(safe_format("    [!] FID init failed ({}); continuing without FID", safe_unicode(fid_err)))
+            fid_service = None
+            fid_files = None
+
+    # Load resume state. Manifest (delta mode) is preferred -- it never loads
+    # the multi-GB cache into the JVM. Legacy GHIDRA_RESUME_CACHE remains for
+    # callers that have not been updated, but is OOM-prone on large binaries.
+    delta_mode = False
+    addr_to_index = {}
+    resume_context = None
+    skip_addresses = set()
+    if resume_manifest_path:
+        skip_addresses = _load_resume_manifest(resume_manifest_path)
+        delta_mode = True
+        if skip_addresses:
+            print(safe_format(
+                "[*] Delta mode: {} addresses marked complete in manifest",
+                len(skip_addresses),
+            ))
+    elif resume_cache_path:
+        resume_context, addr_to_index = _load_resume_cache(resume_cache_path)
+        if resume_context:
+            print(safe_format(
+                "[*] Resumed from cache: {} functions already analyzed",
+                len(addr_to_index),
+            ))
+
+    # Initialize decompiler
+    decompiler = DecompInterface()
+    decompiler.openProgram(program)
+
+    # Create a single-thread executor for timeout-controlled decompilation
+    # Tasks are submitted one at a time, so a single thread is sufficient
+    decompile_executor = Executors.newSingleThreadExecutor()
+
+    if resume_context:
+        # Start from the previous cache -- re-extract metadata/memory/imports/strings
+        # below, but preserve previously-decompiled functions.
+        context = resume_context
+        # Reset collections we re-extract every run
+        context["imports"] = []
+        context["exports"] = []
+        context["strings"] = []
+        context["memory_map"] = []
+        context.setdefault("functions", [])
+        context.setdefault("xrefs", {})
+        context.setdefault("xrefs_to_function", {})
+        context.setdefault("xrefs_to_import", {})
+        context.setdefault("xrefs_to_function_indirect", {})
+        context.setdefault("data_types", {"structures": [], "enums": []})
+        context.setdefault("skipped_functions", [])
+        context["analysis_stats"] = {
+            "functions_analyzed": 0,
+            "functions_skipped": 0,
+            "decompile_failures": 0,
+            "decompile_timeouts": 0,
+            "thread_timeouts": 0,
+            "internal_timeouts": 0,
+            "partial_results": False,
+            "function_timeout_setting": function_timeout,
+            "max_functions_setting": max_functions if max_functions > 0 else None,
+            "resumed": True,
+            "resumed_from_count": len(addr_to_index),
+        }
+    else:
+        context = {
+            "metadata": {},
+            "functions": [],
+            "imports": [],
+            "exports": [],
+            "strings": [],
+            "memory_map": [],
+            "xrefs": {},
+            "xrefs_to_function": {},
+            "xrefs_to_import": {},
+            "xrefs_to_function_indirect": {},
+            "data_types": {
+                "structures": [],
+                "enums": []
+            },
+            "analysis_stats": {
+                "functions_analyzed": 0,
+                "functions_skipped": 0,
+                "decompile_failures": 0,
+                "decompile_timeouts": 0,
+                "thread_timeouts": 0,  # Hard thread timeouts (anti-analysis code)
+                "internal_timeouts": 0,  # Ghidra's internal decompiler timeouts
+                "partial_results": False,
+                "function_timeout_setting": function_timeout,
+                "max_functions_setting": max_functions if max_functions > 0 else None,
+                "delta_run": delta_mode,
+            },
+            "skipped_functions": []  # Track functions that couldn't be analyzed
+        }
+
+    # Extract metadata
+    print("[*] Extracting metadata...")
+    # `language` must be the canonical colon-delimited Ghidra LanguageID
+    # (e.g. "x86:LE:64:default") so downstream tools like analyze_control_flow
+    # can parse architecture/bitness. The Language object's toString() is a
+    # human-readable description, which is NOT parseable -- capture it
+    # separately for display.
+    try:
+        language_id = safe_unicode(program.getLanguageID().getIdAsString())
+    except Exception:
+        # Fall back to whatever the Language object stringifies to
+        language_id = safe_unicode(program.getLanguage())
+    try:
+        language_desc = safe_unicode(program.getLanguage())
+    except Exception:
+        language_desc = language_id
+
+    context["metadata"] = {
+        "name": safe_unicode(program.getName()),
+        "executable_path": safe_unicode(program.getExecutablePath()),
+        "executable_format": safe_unicode(program.getExecutableFormat()),
+        "language": language_id,
+        "language_description": language_desc,
+        "compiler": safe_unicode(program.getCompilerSpec()),
+        "image_base": safe_unicode(program.getImageBase()),
+        "min_address": safe_unicode(program.getMinAddress()),
+        "max_address": safe_unicode(program.getMaxAddress()),
+        "creation_date": safe_unicode(program.getCreationDate()),
+    }
+
+    # Extract memory map
+    print("[*] Extracting memory map...")
+    for block in memory.getBlocks():
+        block_info = {
+            "name": safe_unicode(block.getName()),
+            "start": safe_unicode(block.getStart()),
+            "end": safe_unicode(block.getEnd()),
+            "size": block.getSize(),
+            "read": block.isRead(),
+            "write": block.isWrite(),
+            "execute": block.isExecute(),
+            "initialized": block.isInitialized(),
+            "comment": safe_unicode(block.getComment()) if block.getComment() else u""
+        }
+        context["memory_map"].append(block_info)
+
+    # Extract imports
+    print("[*] Extracting imports...")
+    external_manager = program.getExternalManager()
+    for external_name in external_manager.getExternalLibraryNames():
+        # Skip Ghidra's internal pseudo-library
+        if external_name == "<EXTERNAL>":
+            continue
+        ext_loc_iter = external_manager.getExternalLocations(external_name)
+        while ext_loc_iter.hasNext():
+            ext_loc = ext_loc_iter.next()
+            import_info = {
+                "library": safe_unicode(external_name),
+                "name": safe_unicode(ext_loc.getLabel()),
+                "address": safe_unicode(ext_loc.getAddress()) if ext_loc.getAddress() else None,
+                "is_function": ext_loc.isFunction(),
+                "ordinal": None
+            }
+            context["imports"].append(import_info)
+
+    # Extract exports
+    print("[*] Extracting exports...")
+    entry_points = symbol_table.getExternalEntryPointIterator()
+    while entry_points.hasNext():
+        address = entry_points.next()
+        # Get symbols at this address
+        symbols = symbol_table.getSymbols(address)
+        for symbol in symbols:
+            export_info = {
+                "name": safe_unicode(symbol.getName()),
+                "address": safe_unicode(address),
+                "type": safe_unicode(symbol.getSymbolType())
+            }
+            context["exports"].append(export_info)
+            break  # Usually only one export per address
+
+    # Extract strings
+    print("[*] Extracting strings...")
+    defined_data = listing.getDefinedData(True)
+    string_count = 0
+    while defined_data.hasNext() and string_count < 10000:  # Limit to prevent memory issues
+        data = defined_data.next()
+        if data.hasStringValue():
+            string_value = data.getValue()
+            # Use safe_unicode to handle non-ASCII characters (like copyright symbols)
+            unicode_value = safe_unicode(string_value)
+            if unicode_value and len(unicode_value) > 0:
+                # Get cross-references to this string
+                refs = []
+                for ref in reference_manager.getReferencesTo(data.getAddress()):
+                    refs.append({
+                        "from": safe_unicode(ref.getFromAddress()),
+                        "type": safe_unicode(ref.getReferenceType())
+                    })
+
+                string_info = {
+                    "address": safe_unicode(data.getAddress()),
+                    "value": unicode_value[:1000],  # Limit string length
+                    "length": len(unicode_value),
+                    "type": safe_unicode(data.getDataType()),
+                    "xrefs": refs[:50]  # Limit xrefs per string
+                }
+                context["strings"].append(string_info)
+                string_count += 1
+
+    # Extract functions
+    print("[*] Extracting functions...")
+    function_iterator = function_manager.getFunctions(True)
+    function_count = 0
+    decompile_timeout_count = 0
+    decompile_failure_count = 0
+    thread_timeout_count = 0  # Hard thread timeouts (likely anti-analysis)
+    internal_timeout_count = 0  # Ghidra's internal decompiler timeouts
+
+    # Initialize BasicBlockModel for extracting basic blocks
+    block_model = BasicBlockModel(program)
+
+    analysis_start = time.time()
+
+    skipped_by_resume = 0
+    skipped_by_range = 0
+    redecompiled_count = 0
+
+    # When ``existing_index`` is set on the loop, we are extending an already-
+    # cached entry rather than appending a new one. Used to fill in pseudocode
+    # for functions previously analyzed with skip_decompile=True.
+    while function_iterator.hasNext():
+        function = function_iterator.next()
+
+        entry_point = function.getEntryPoint()
+        entry_str = safe_unicode(entry_point)
+
+        # Delta mode: a tiny manifest tells us which addresses are already
+        # complete. We skip those and emit only NEW or RE-DECOMPILED entries;
+        # the Python side merges into the existing cache.
+        if delta_mode:
+            if entry_str in skip_addresses:
+                skipped_by_resume += 1
+                continue
+            existing_index = None
+        else:
+            existing_index = addr_to_index.get(entry_str) if addr_to_index else None
+            existing_entry = (
+                context["functions"][existing_index] if existing_index is not None else None
+            )
+            if existing_entry is not None:
+                # If the prior run already produced everything we need for this
+                # function, skip it. Otherwise fall through and re-process so the
+                # missing fields (typically pseudocode) get filled in.
+                if skip_decompile or _existing_has_pseudocode(existing_entry):
+                    # Backfill call-site data if missing. ``call_sites``
+                    # (Wave 1A) and ``indirect_calls`` (Wave 2) come from
+                    # the same instruction walk, so we always recompute
+                    # them together when either is absent.
+                    if ("call_sites" not in existing_entry
+                            or "indirect_calls" not in existing_entry):
+                        try:
+                            d_sites, i_sites = _extract_call_sites(
+                                function, listing, function_manager
+                            )
+                        except Exception:
+                            d_sites, i_sites = [], []
+                        existing_entry["call_sites"] = d_sites
+                        existing_entry["indirect_calls"] = i_sites
+                    # Same backfill for Wave 1B's Ghidra-supplied
+                    # comments. ``plate_comment`` and ``instruction_comments``
+                    # are added together so the absence of either is
+                    # treated as an upgrade trigger.
+                    if ("plate_comment" not in existing_entry
+                            or "instruction_comments" not in existing_entry):
+                        plate, instr_comments = _extract_comments(function, listing)
+                        existing_entry["plate_comment"] = plate
+                        existing_entry["instruction_comments"] = instr_comments
+                    skipped_by_resume += 1
+                    continue
+
+        # Apply address-range filter (chunked analysis)
+        if start_addr is not None or end_addr is not None:
+            try:
+                ep_int = int(entry_point.getOffset())
+            except Exception:
+                ep_int = None
+            if ep_int is not None:
+                if start_addr is not None and ep_int < start_addr:
+                    skipped_by_range += 1
+                    continue
+                if end_addr is not None and ep_int > end_addr:
+                    skipped_by_range += 1
+                    continue
+
+        function_count += 1
+
+        # Check max functions limit (counts functions analyzed this run only)
+        if max_functions > 0 and function_count > max_functions:
+            print(safe_format("[!] Reached max function limit ({}), stopping analysis", max_functions))
+            context["analysis_stats"]["partial_results"] = True
+            break
+
+        if function_count % 100 == 0:
+            print(safe_format("    Processed {} functions ({} timeouts, {} failures)...",
+                              function_count, decompile_timeout_count, decompile_failure_count))
+
+        # Get function signature
+        signature = function.getSignature()
+        body = function.getBody()
+
+        # Capture how the function name was assigned (USER_DEFINED / IMPORTED /
+        # ANALYSIS / DEFAULT). Analyzer-assigned non-default names are the
+        # signal that FID / demangler / stdlib-heuristic identified this as a
+        # known routine.
+        try:
+            sym = function.getSymbol()
+            name_source = safe_unicode(sym.getSource()) if sym else u"UNKNOWN"
+        except Exception:
+            name_source = u"UNKNOWN"
+
+        # Get basic info
+        function_info = {
+            "name": safe_unicode(function.getName()),
+            "address": safe_unicode(entry_point),
+            "size": body.getNumAddresses() if body else 0,
+            "signature": safe_unicode(signature),
+            "is_thunk": function.isThunk(),
+            "is_external": function.isExternal(),
+            "name_source": name_source,
+            "parameters": [],
+            "local_variables": [],
+            "called_functions": [],
+            "call_sites": [],
+            "indirect_calls": [],
+            "pseudocode": None,
+            "basic_blocks": [],
+            "jump_tables": [],
+            "fid_match": None,
+            "plate_comment": u"",
+            "instruction_comments": [],
+            "decompile_status": "not_attempted"  # Track decompilation status
+        }
+
+        # Get parameters
+        for param in function.getParameters():
+            param_info = {
+                "name": safe_unicode(param.getName()),
+                "datatype": safe_unicode(param.getDataType()),
+                "storage": safe_unicode(param.getVariableStorage()) if param.getVariableStorage() else None
+            }
+            function_info["parameters"].append(param_info)
+
+        # Get local variables
+        for var in function.getLocalVariables():
+            var_info = {
+                "name": safe_unicode(var.getName()),
+                "datatype": safe_unicode(var.getDataType()),
+                "storage": safe_unicode(var.getVariableStorage()) if var.getVariableStorage() else None
+            }
+            function_info["local_variables"].append(var_info)
+
+        # Get called functions (limited to direct calls)
+        try:
+            called_functions = function.getCalledFunctions(monitor)
+            for called in called_functions:
+                function_info["called_functions"].append({
+                    "name": safe_unicode(called.getName()),
+                    "address": safe_unicode(called.getEntryPoint())
+                })
+        except Exception as e:
+            print(safe_format("    Warning: Could not get called functions for {}: {}",
+                              safe_unicode(function.getName()), safe_unicode(e)))
+
+        # Get basic blocks using BasicBlockModel
+        try:
+            code_block_iterator = block_model.getCodeBlocksContaining(body, monitor)
+            while code_block_iterator.hasNext():
+                block = code_block_iterator.next()
+                block_info = {
+                    "start": safe_unicode(block.getMinAddress()),
+                    "end": safe_unicode(block.getMaxAddress()),
+                    "num_addresses": block.getNumAddresses()
+                }
+                function_info["basic_blocks"].append(block_info)
+        except Exception as e:
+            print(safe_format("    Warning: Could not extract basic blocks for {}: {}",
+                              safe_unicode(function.getName()), safe_unicode(e)))
+
+        # Extract jump / switch tables -- instructions whose flow type is a
+        # computed jump expose their resolved targets via getFlows(). Works
+        # without HighFunction/P-Code so it stays cheap and always available.
+        try:
+            if body:
+                instr_iter = listing.getInstructions(body, True)
+                while instr_iter.hasNext():
+                    inst = instr_iter.next()
+                    ft = inst.getFlowType()
+                    if ft is not None and ft.isComputed() and ft.isJump():
+                        try:
+                            targets = inst.getFlows()
+                        except Exception:
+                            targets = None
+                        if not targets:
+                            continue
+                        function_info["jump_tables"].append({
+                            "source_addr": safe_unicode(inst.getAddress()),
+                            "targets": [safe_unicode(t) for t in targets],
+                        })
+        except Exception as e:
+            print(safe_format("    Warning: Could not extract jump tables for {}: {}",
+                              safe_unicode(function.getName()), safe_unicode(e)))
+
+        # Capture call sites with instruction-level precision. Direct
+        # calls feed the Wave 1A reverse index; indirect calls (Wave 2)
+        # carry operand text plus a best-effort ``loaded_from``
+        # resolution from the prior static MOV/LEA.
+        try:
+            direct_sites, indirect_sites = _extract_call_sites(
+                function, listing, function_manager
+            )
+            function_info["call_sites"] = direct_sites
+            function_info["indirect_calls"] = indirect_sites
+        except Exception as e:
+            print(safe_format("    Warning: Could not extract call sites for {}: {}",
+                              safe_unicode(function.getName()), safe_unicode(e)))
+
+        # Extract Ghidra-supplied comments (plate + per-instruction
+        # pre/post/eol). These commonly arrive from PDB load or from
+        # in-Ghidra-GUI annotations and are independent of the user
+        # notes side-car maintained server-side.
+        plate, instr_comments = _extract_comments(function, listing)
+        function_info["plate_comment"] = plate
+        function_info["instruction_comments"] = instr_comments
+
+        # Optional: Function ID (FID) library match.
+        # Iterates installed FID databases and picks the highest-scoring
+        # match. Defensive: any API mismatch / version drift falls through
+        # to "no match" without interrupting analysis.
+        if fid_service is not None and fid_files:
+            try:
+                best = None
+                for fid_file in fid_files:
+                    try:
+                        matches = fid_service.processFunction(function, fid_file, monitor)
+                    except AttributeError:
+                        # Older Ghidra API -- different signature, skip silently
+                        matches = None
+                    except Exception:
+                        matches = None
+                    if not matches:
+                        continue
+                    for m in matches:
+                        try:
+                            score = float(m.getOverallScore())
+                        except Exception:
+                            score = 0.0
+                        if best is None or score > best[0]:
+                            best = (score, m, fid_file)
+                if best is not None:
+                    _, m, fid_file = best
+                    try:
+                        name_match = safe_unicode(m.getNameMatch())
+                    except Exception:
+                        name_match = u""
+                    try:
+                        library = safe_unicode(fid_file.getName())
+                    except Exception:
+                        library = u""
+                    function_info["fid_match"] = {
+                        "name": name_match,
+                        "library": library,
+                        "confidence": best[0],
+                    }
+            except Exception as e:
+                # Never let FID failures break per-function extraction
+                print(safe_format("    Warning: FID match failed for {}: {}",
+                                  safe_unicode(function.getName()), safe_unicode(e)))
+
+        # Decompile function (for non-thunk, non-external functions)
+        if skip_decompile:
+            function_info["decompile_status"] = "skipped"
+        elif not function.isThunk() and not function.isExternal():
+            # Use thread-based timeout for robust handling of anti-analysis code
+            # This catches cases where Ghidra's internal timeout fails
+            decompile_result, status, error_msg = decompile_with_timeout(
+                decompiler, function, function_timeout, monitor, decompile_executor
+            )
+
+            if status == "timeout":
+                # Hard thread timeout - function likely has anti-analysis code
+                function_info["decompile_status"] = "thread_timeout"
+                decompile_timeout_count += 1
+                thread_timeout_count += 1
+                context["skipped_functions"].append({
+                    "name": safe_unicode(function.getName()),
+                    "address": safe_unicode(entry_point),
+                    "reason": "thread_timeout",
+                    "detail": error_msg
+                })
+                print(safe_format("    [!] TIMEOUT: {} at {} (thread timeout after {}s)",
+                                  safe_unicode(function.getName()), safe_unicode(entry_point),
+                                  function_timeout))
+
+            elif status == "error":
+                function_info["decompile_status"] = "error"
+                decompile_failure_count += 1
+                context["skipped_functions"].append({
+                    "name": safe_unicode(function.getName()),
+                    "address": safe_unicode(entry_point),
+                    "reason": "decompile_error",
+                    "detail": error_msg
+                })
+                print(safe_format("    [!] Decompile error for {}: {}",
+                                  safe_unicode(function.getName()), error_msg))
+
+            elif status == "interrupted":
+                function_info["decompile_status"] = "interrupted"
+                decompile_failure_count += 1
+                context["skipped_functions"].append({
+                    "name": safe_unicode(function.getName()),
+                    "address": safe_unicode(entry_point),
+                    "reason": "interrupted"
+                })
+                print(safe_format("    [!] Decompilation interrupted for {}",
+                                  safe_unicode(function.getName())))
+
+            elif status == "success" and decompile_result:
+                # Check if decompilation actually completed
+                if decompile_result.decompileCompleted():
+                    pseudocode = decompile_result.getDecompiledFunction()
+                    if pseudocode:
+                        function_info["pseudocode"] = safe_unicode(pseudocode.getC())
+                        function_info["decompile_status"] = "success"
+                    else:
+                        function_info["decompile_status"] = "empty_result"
+                        decompile_failure_count += 1
+                else:
+                    # Ghidra's internal timeout triggered
+                    function_info["decompile_status"] = "internal_timeout"
+                    decompile_timeout_count += 1
+                    internal_timeout_count += 1
+                    context["skipped_functions"].append({
+                        "name": safe_unicode(function.getName()),
+                        "address": safe_unicode(entry_point),
+                        "reason": "ghidra_internal_timeout"
+                    })
+                    print(safe_format("    [!] Decompile timeout (internal) for {} at {}",
+                                      safe_unicode(function.getName()), safe_unicode(entry_point)))
+            else:
+                function_info["decompile_status"] = "no_result"
+                decompile_failure_count += 1
+        else:
+            function_info["decompile_status"] = "skipped_thunk_or_external"
+
+        if existing_index is not None:
+            # Extending a previously-cached entry (typically backfilling
+            # pseudocode onto a structural-only run). Replace in place.
+            context["functions"][existing_index] = function_info
+            redecompiled_count += 1
+        else:
+            context["functions"].append(function_info)
+
+        # Check wall-clock budget to prevent total data loss on process timeout
+        if time.time() - analysis_start > total_budget:
+            context["analysis_stats"]["partial_results"] = True
+            print(safe_format("[!] Wall-clock budget exceeded ({}s), stopping to preserve results", total_budget))
+            break
+
+    # Update analysis stats
+    context["analysis_stats"]["functions_analyzed"] = function_count
+    context["analysis_stats"]["decompile_timeouts"] = decompile_timeout_count
+    context["analysis_stats"]["thread_timeouts"] = thread_timeout_count
+    context["analysis_stats"]["internal_timeouts"] = internal_timeout_count
+    context["analysis_stats"]["decompile_failures"] = decompile_failure_count
+    context["analysis_stats"]["functions_skipped"] = len(context["skipped_functions"])
+    context["analysis_stats"]["skipped_by_resume"] = skipped_by_resume
+    context["analysis_stats"]["skipped_by_range"] = skipped_by_range
+    context["analysis_stats"]["redecompiled"] = redecompiled_count
+    context["analysis_stats"]["total_functions_in_cache"] = len(context["functions"])
+
+    # Extract data types (structures)
+    print("[*] Extracting data types...")
+    for data_type in data_type_manager.getAllDataTypes():
+        # Skip types from other data type managers (Ghidra built-ins)
+        if data_type.getDataTypeManager() != data_type_manager:
+            continue
+
+        if isinstance(data_type, GhidraStructure):
+            struct_info = {
+                "name": safe_unicode(data_type.getName()),
+                "length": data_type.getLength(),
+                "members": []
+            }
+
+            # Get structure members
+            if hasattr(data_type, 'getComponents'):
+                for component in data_type.getComponents():
+                    field_name = component.getFieldName() if component.getFieldName() else component.getDefaultFieldName()
+                    member_info = {
+                        "name": safe_unicode(field_name),
+                        "offset": component.getOffset(),
+                        "datatype": safe_unicode(component.getDataType()),
+                        "length": component.getLength()
+                    }
+                    struct_info["members"].append(member_info)
+
+            context["data_types"]["structures"].append(struct_info)
+
+        elif isinstance(data_type, GhidraEnum):
+            enum_info = {
+                "name": safe_unicode(data_type.getName()),
+                "length": data_type.getLength(),
+                "values": []
+            }
+
+            # Get enum values
+            if hasattr(data_type, 'getNames'):
+                for name in data_type.getNames():
+                    enum_info["values"].append({
+                        "name": safe_unicode(name),
+                        "value": data_type.getValue(name)
+                    })
+
+            context["data_types"]["enums"].append(enum_info)
+
+    # Build reverse-xref indices from the per-function call-site lists
+    # we captured during the function loop. Inverting in one pass here
+    # turns ``get_xrefs(direction="to", ...)`` from an O(n*m) sweep over
+    # every caller's called_functions into an O(1) dict lookup.
+    #
+    # ``xrefs_to_function_indirect`` (Wave 2) covers the indirect-call
+    # arm: any indirect call whose ``loaded_from`` immediate was
+    # statically resolvable (typical of fnptr loads from .data /
+    # globals; vtable dispatch usually leaves loaded_from=None) is
+    # surfaced here so ``get_xrefs`` can answer "is this function
+    # reached via a static fnptr load?".
+    xrefs_to_function = {}
+    xrefs_to_import = {}
+    xrefs_to_function_indirect = {}
+    for fn in context["functions"]:
+        caller_addr = fn.get("address")
+        caller_name = fn.get("name")
+        for site in fn.get("call_sites") or []:
+            record = {
+                "from_func_addr": caller_addr,
+                "from_func_name": caller_name,
+                "from_call_site": site.get("call_site"),
+            }
+            if site.get("is_external"):
+                key = site.get("callee_name") or u""
+                if key:
+                    xrefs_to_import.setdefault(key, []).append(record)
+            else:
+                key = _normalize_addr_for_xref(site.get("callee_addr"))
+                if key:
+                    xrefs_to_function.setdefault(key, []).append(record)
+        for ic in fn.get("indirect_calls") or []:
+            loaded = ic.get("loaded_from")
+            if not loaded:
+                continue
+            key = _normalize_addr_for_xref(loaded)
+            if not key:
+                continue
+            xrefs_to_function_indirect.setdefault(key, []).append({
+                "from_func_addr": caller_addr,
+                "from_func_name": caller_name,
+                "from_call_site": ic.get("call_site"),
+                "operand": ic.get("operand"),
+            })
+    context["xrefs_to_function"] = xrefs_to_function
+    context["xrefs_to_import"] = xrefs_to_import
+    context["xrefs_to_function_indirect"] = xrefs_to_function_indirect
+
+    print("[*] Extraction complete!")
+    print(safe_format("    Functions: {}", len(context["functions"])))
+    print(safe_format("    Imports: {}", len(context["imports"])))
+    print(safe_format("    Exports: {}", len(context["exports"])))
+    print(safe_format("    Strings: {}", len(context["strings"])))
+    print(safe_format("    Structures: {}", len(context["data_types"]["structures"])))
+    print(safe_format("    Enums: {}", len(context["data_types"]["enums"])))
+    print(safe_format("    Reverse-xref entries: {} func / {} import",
+                      len(xrefs_to_function), len(xrefs_to_import)))
+
+    # Print analysis statistics
+    stats = context["analysis_stats"]
+    print("[*] Analysis statistics:")
+    print(safe_format("    Functions analyzed: {}", stats["functions_analyzed"]))
+    print(safe_format("    Total decompile timeouts: {}", stats["decompile_timeouts"]))
+    if stats["thread_timeouts"] > 0:
+        print(safe_format("      - Thread timeouts (anti-analysis): {}", stats["thread_timeouts"]))
+    if stats["internal_timeouts"] > 0:
+        print(safe_format("      - Internal timeouts (Ghidra): {}", stats["internal_timeouts"]))
+    print(safe_format("    Decompile failures: {}", stats["decompile_failures"]))
+    if stats["partial_results"]:
+        print("    [!] PARTIAL RESULTS: Analysis was limited by max_functions setting")
+    if context["skipped_functions"]:
+        print(safe_format("    Skipped functions: {}", len(context["skipped_functions"])))
+
+    # Cleanup: shutdown the executor service
+    print("[*] Shutting down decompile executor...")
+    decompile_executor.shutdown()
+    try:
+        # Wait up to 10 seconds for tasks to complete
+        if not decompile_executor.awaitTermination(10, TimeUnit.SECONDS):
+            # Force shutdown if tasks don't complete
+            decompile_executor.shutdownNow()
+            print("    [!] Forced executor shutdown (some tasks may not have completed)")
+    except InterruptedException:
+        decompile_executor.shutdownNow()
+        Thread.currentThread().interrupt()
+
+    return context
+
+
+def main():
+    """Main execution function."""
+    try:
+        # Get output path from environment variable
+        output_path = os.environ.get("GHIDRA_CONTEXT_JSON")
+        if not output_path:
+            print("[!] ERROR: GHIDRA_CONTEXT_JSON environment variable not set")
+            return
+
+        print("[*] Starting comprehensive analysis extraction...")
+        print(safe_format("[*] Program: {}", safe_unicode(currentProgram.getName())))
+        print(safe_format("[*] Output: {}", output_path))
+
+        # Extract all analysis data
+        context = extract_comprehensive_analysis()
+
+        # Write to JSON file with UTF-8 encoding to handle Unicode characters
+        print(safe_format("[*] Writing output to {}...", output_path))
+        with codecs.open(output_path, 'w', encoding='utf-8') as f:
+            json.dump(context, f, indent=2, ensure_ascii=False)
+
+        print(safe_format("[+] Analysis complete! Output saved to: {}", output_path))
+
+    except Exception as e:
+        print(safe_format("[!] ERROR during analysis: {}", safe_unicode(e)))
+        import traceback
+        traceback.print_exc()
+
+
+if __name__ == "__main__":
+    main()

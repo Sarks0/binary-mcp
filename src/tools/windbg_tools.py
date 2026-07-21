@@ -1,0 +1,985 @@
+"""
+WinDbg kernel debugging MCP tools.
+
+Provides kernel-mode analysis capabilities through WinDbg/Pybag integration.
+"""
+
+from __future__ import annotations
+
+import functools
+import logging
+import os
+import platform
+import re
+
+from fastmcp import FastMCP
+
+from src.engines.dynamic.windbg.bridge import WinDbgBridge, WinDbgBridgeError
+from src.engines.dynamic.windbg.commands import WinDbgCommands
+from src.engines.session import AnalysisType, UnifiedSessionManager
+from src.utils.structured_errors import StructuredBaseError
+
+logger = logging.getLogger(__name__)
+
+# Session manager reference (set during registration)
+_session_manager: UnifiedSessionManager | None = None
+
+# Global WinDbg instances (initialized on first use)
+_windbg_bridge: WinDbgBridge | None = None
+_windbg_commands: WinDbgCommands | None = None
+
+_PLATFORM_MSG = (
+    "WinDbg tools require Windows with Pybag installed.\n"
+    "Install with: pip install binary-mcp[windbg]"
+)
+
+
+def _is_windows() -> bool:
+    return platform.system() == "Windows"
+
+
+# Input validation helpers for command-injection prevention
+
+_SAFE_ADDRESS_RE = re.compile(r'^[0-9a-fA-F`x]+$')  # Hex addresses with optional backticks and 0x prefix
+_SAFE_SYMBOL_RE = re.compile(r'^[a-zA-Z0-9_!.*+:]+$')  # Symbol names like nt!NtCreateFile or module!*
+_SAFE_CONDITION_RE = re.compile(r'^[a-zA-Z0-9_!=<>&|+\-*/()\s,]+$')  # WinDbg expressions
+# KDNET session key produced by `bcdedit /dbgsettings`: four dot-separated
+# alnum tokens. Loose enough to accept all real keys, strict enough to
+# reject empties / accidental whitespace / shell metacharacters.
+_KDNET_KEY_RE = re.compile(r'^[0-9a-z]+\.[0-9a-z]+\.[0-9a-z]+\.[0-9a-z]+$')
+
+
+def _validate_address(address: str) -> str:
+    """Validate address is a hex value or symbol name, not an injection payload."""
+    addr = address.strip()
+    if not addr:
+        return "Error: Address cannot be empty."
+    if _SAFE_ADDRESS_RE.match(addr) or _SAFE_SYMBOL_RE.match(addr):
+        return ""  # Valid
+    return f"Error: Invalid address format '{addr}'. Use hex (e.g. 0x401000) or symbol (e.g. nt!NtCreateFile)."
+
+
+def _validate_condition(condition: str) -> str:
+    """Validate breakpoint condition expression."""
+    cond = condition.strip()
+    if not cond:
+        return "Error: Condition cannot be empty."
+    if len(cond) > 200:
+        return "Error: Condition too long (max 200 characters)."
+    if not _SAFE_CONDITION_RE.match(cond):
+        return "Error: Invalid condition expression. Only comparison expressions are allowed (e.g. 'rcx==0x100')."
+    # Extra check for dangerous commands that might slip through
+    cond_lower = cond.lower()
+    blocked_in_condition = (
+        '.shell', '.create', '.script', '!runscript', '.writemem',
+        '.writevirtmem', '.dump', '.kill', '.restart', '.foreach',
+        '.block', '.printf', '.remote', '.sympath', '.load', '.call',
+        '.open', '.opendump',
+    )
+    for blocked in blocked_in_condition:
+        if blocked in cond_lower:
+            return f"Error: Condition contains blocked command '{blocked}'."
+    return ""  # Valid
+
+
+def get_windbg_bridge() -> WinDbgBridge:
+    """Get or create the WinDbg bridge singleton."""
+    global _windbg_bridge
+    if _windbg_bridge is None:
+        timeout = int(os.environ.get("WINDBG_TIMEOUT", "30"))
+        _windbg_bridge = WinDbgBridge(timeout=timeout)
+    return _windbg_bridge
+
+
+def get_windbg_commands() -> WinDbgCommands:
+    """Get or create the WinDbg commands wrapper."""
+    global _windbg_commands
+    if _windbg_commands is None:
+        _windbg_commands = WinDbgCommands(get_windbg_bridge())
+    return _windbg_commands
+
+
+def log_windbg_tool(func):
+    """Decorator to log WinDbg tool calls to the active session."""
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        result = func(*args, **kwargs)
+        if _session_manager and _session_manager.active_session_id:
+            _session_manager.log_tool_call(
+                tool_name=func.__name__,
+                arguments=kwargs,
+                output=result,
+                analysis_type=AnalysisType.KERNEL,
+            )
+        return result
+    return wrapper
+
+
+def register_windbg_tools(
+    app: FastMCP, session_manager: UnifiedSessionManager | None = None
+) -> None:
+    """Register all WinDbg kernel debugging tools with the MCP server.
+
+    Args:
+        app: FastMCP server instance.
+        session_manager: Optional session manager for logging tool calls.
+    """
+    global _session_manager
+    _session_manager = session_manager
+
+    # Connection tools (4)
+
+    @app.tool()
+    @log_windbg_tool
+    def windbg_status() -> str:
+        """Get WinDbg debugger status.
+
+        Returns the current debugger state, mode (user/kernel/dump), target
+        binary or dump path, and current instruction pointer.
+        """
+        if not _is_windows():
+            return _PLATFORM_MSG
+        try:
+            commands = get_windbg_commands()
+            return commands.get_status_summary()
+        except (WinDbgBridgeError, StructuredBaseError) as e:
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_windbg_tool
+    def windbg_connect_kernel(
+        port: int = 50000,
+        key: str = "",
+        timeout: int = 120,
+        ipversion: int = 4,
+    ) -> str:
+        """Connect to a kernel debug target via KDNET.
+
+        Opens the KDNET listening port and waits for the target to break in.
+        Only returns success once the debug engine has an active session and
+        commands can be executed.
+
+        IMPORTANT: Start this tool BEFORE rebooting the target machine.
+        The host must be listening when the target sends its initial break.
+
+        Args:
+            port: KDNET port number (default 50000).
+            key: KDNET session key in ``w.x.y.z`` format (four dot-separated
+                 alphanumeric tokens, as printed by ``bcdedit /dbgsettings``
+                 on the target). REQUIRED. To attach to the local kernel
+                 instead, use ``windbg_connect_local_kernel``.
+            timeout: Seconds to wait for target to break in (default 120).
+                     Set higher if the target has a slow boot.
+            ipversion: 4 (default) or 6. Use 6 only if the target advertises
+                       KDNET over IPv6 (Windows 11+).
+
+        Returns:
+            Connection status message.
+        """
+        if not _is_windows():
+            return _PLATFORM_MSG
+        if not key or not _KDNET_KEY_RE.match(key.strip()):
+            return (
+                "Error: KDNET key required (format w.x.y.z; example "
+                "1a2b3c.4d5e6f.7890ab.cdef01). Run `bcdedit /dbgsettings` "
+                "on the target to retrieve it. To attach to the local "
+                "kernel instead, call windbg_connect_local_kernel."
+            )
+        if ipversion not in (4, 6):
+            return f"Error: ipversion must be 4 or 6, got {ipversion!r}"
+        try:
+            bridge = get_windbg_bridge()
+            result = bridge.connect_kernel_net(
+                port=port, key=key, timeout=timeout, ipversion=ipversion
+            )
+            status = result.get("status", "connected")
+            v6 = " IPv6" if ipversion == 6 else ""
+            if status == "connected_target_running":
+                return (
+                    f"Connected to kernel target via KDNET{v6} (port={port}), "
+                    f"but target is running and did not break.\n"
+                    f"{result.get('advice', 'Call windbg_break() to interrupt.')}"
+                )
+            return f"Connected to kernel target via KDNET{v6} (port={port}, broken-in)"
+        except (WinDbgBridgeError, StructuredBaseError) as e:
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_windbg_tool
+    def windbg_connect_kernel_serial(
+        port: str,
+        baud: int = 115200,
+        pipe: bool = False,
+        reconnect: bool = True,
+        timeout: int = 120,
+    ) -> str:
+        """Connect to a kernel debug target over a serial transport (KDSERIAL).
+
+        Args:
+            port: COM port name (e.g. ``COM1``) or pipe path when
+                  ``pipe=True`` (e.g. ``\\\\.\\pipe\\com_1``).
+            baud: Serial baud rate. Default 115200.
+            pipe: True if the target is reached over a named pipe.
+            reconnect: True to retry on disconnect.
+            timeout: Seconds to wait for target to break in.
+        """
+        if not _is_windows():
+            return _PLATFORM_MSG
+        try:
+            bridge = get_windbg_bridge()
+            result = bridge.connect_kernel_serial(
+                port=port, baud=baud, pipe=pipe, reconnect=reconnect, timeout=timeout
+            )
+            status = result.get("status", "connected")
+            label = f"KDSERIAL port={port} baud={baud}"
+            if status == "connected_target_running":
+                return (
+                    f"Connected via {label}, but target was running and did "
+                    f"not break.\n{result.get('advice', 'Call windbg_break().')}"
+                )
+            return f"Connected via {label} (broken-in)"
+        except (WinDbgBridgeError, StructuredBaseError) as e:
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_windbg_tool
+    def windbg_connect_kernel_pipe(
+        pipe_name: str,
+        reconnect: bool = True,
+        timeout: int = 120,
+    ) -> str:
+        """Connect to a Hyper-V kernel target over a named pipe.
+
+        Args:
+            pipe_name: Pipe path (``\\\\.\\pipe\\com_1``) or bare pipe name.
+            reconnect: True to retry on disconnect.
+            timeout: Seconds to wait for target to break in.
+        """
+        if not _is_windows():
+            return _PLATFORM_MSG
+        try:
+            bridge = get_windbg_bridge()
+            result = bridge.connect_kernel_pipe(
+                pipe_name=pipe_name, reconnect=reconnect, timeout=timeout
+            )
+            status = result.get("status", "connected")
+            label = f"KDPIPE {pipe_name}"
+            if status == "connected_target_running":
+                return (
+                    f"Connected via {label}, but target was running and did "
+                    f"not break.\n{result.get('advice', 'Call windbg_break().')}"
+                )
+            return f"Connected via {label} (broken-in)"
+        except (WinDbgBridgeError, StructuredBaseError) as e:
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_windbg_tool
+    def windbg_connect_local_kernel() -> str:
+        """Attach to the LOCAL kernel for read-only inspection.
+
+        Equivalent to running ``kd -kl`` as Administrator. Provides read
+        access to memory, modules, and symbols when ``bcdedit -debug on``
+        is set. Registers and execution control (breakpoints, stepping,
+        halting) are NOT available - those require a remote KDNET
+        connection to a separate target machine via
+        ``windbg_connect_kernel``.
+
+        This tool is the explicit, intentional local-kernel attach. The
+        prior behaviour of ``windbg_connect_kernel`` silently falling
+        back to the local kernel when ``key`` was omitted has been
+        removed - too easy to confuse a missing key with intent.
+        """
+        if not _is_windows():
+            return _PLATFORM_MSG
+        try:
+            bridge = get_windbg_bridge()
+            bridge.connect_kernel_local()
+            return "Connected to local kernel (read-only)"
+        except (WinDbgBridgeError, StructuredBaseError) as e:
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_windbg_tool
+    def windbg_open_dump(dump_path: str) -> str:
+        """Open a Windows crash dump file for analysis.
+
+        Args:
+            dump_path: Path to a .dmp crash dump file.
+
+        Returns:
+            Status message with dump info.
+        """
+        if not _is_windows():
+            return _PLATFORM_MSG
+        try:
+            from pathlib import Path
+
+            bridge = get_windbg_bridge()
+            bridge.open_dump(Path(dump_path))
+            return f"Opened crash dump: {dump_path}\nMode: dump_analysis"
+        except (WinDbgBridgeError, StructuredBaseError) as e:
+            return f"Error opening dump: {e}"
+
+    @app.tool()
+    @log_windbg_tool
+    def windbg_disconnect() -> str:
+        """Disconnect from the current WinDbg session.
+
+        Cleans up Pybag connections and CDB subprocesses.
+        """
+        if not _is_windows():
+            return _PLATFORM_MSG
+        try:
+            bridge = get_windbg_bridge()
+            bridge.disconnect()
+            global _windbg_bridge, _windbg_commands
+            _windbg_bridge = None
+            _windbg_commands = None
+            return "Disconnected from WinDbg"
+        except Exception as e:
+            return f"Error: {e}"
+
+    # Execution tools (6)
+
+    @app.tool()
+    @log_windbg_tool
+    def windbg_run() -> str:
+        """Resume execution in the debugger.
+
+        Execution continues until a breakpoint, exception, or target termination.
+        """
+        if not _is_windows():
+            return _PLATFORM_MSG
+        try:
+            bridge = get_windbg_bridge()
+            state = bridge.run()
+            return f"Execution resumed. State: {state.value}"
+        except (WinDbgBridgeError, StructuredBaseError) as e:
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_windbg_tool
+    def windbg_pause() -> str:
+        """Break into the debugger, pausing execution."""
+        if not _is_windows():
+            return _PLATFORM_MSG
+        try:
+            bridge = get_windbg_bridge()
+            bridge.pause()
+            return "Execution paused"
+        except (WinDbgBridgeError, StructuredBaseError) as e:
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_windbg_tool
+    def windbg_break(timeout: int = 5) -> str:
+        """Force the target to break in and acquire a current thread/process.
+
+        Distinct from ``windbg_pause``: this also waits for the engine to
+        consume the resulting state-change packet, so commands like
+        ``vertarget``, ``.reload``, and ``!process`` will work after it
+        returns. Use this to recover from a KDNET half-handshake state
+        where ``windbg_connect_kernel`` reported success but commands
+        warn "debugger does not have a current process or thread".
+
+        Args:
+            timeout: Seconds to wait for the break to land (default 5).
+
+        Returns:
+            Status message including the post-break session snapshot.
+        """
+        if not _is_windows():
+            return _PLATFORM_MSG
+        try:
+            bridge = get_windbg_bridge()
+            bridge.break_in(timeout=timeout)
+            snap = bridge.get_session_state()
+            return f"Target broke in. Session: {snap}"
+        except (WinDbgBridgeError, StructuredBaseError) as e:
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_windbg_tool
+    def windbg_session_status() -> str:
+        """Return the live kernel-debug session state.
+
+        Reports state transitions observed via DbgEng's event callbacks:
+        ``listening`` / ``established`` / ``running`` / ``broken`` /
+        ``gone`` / ``bugcheck``. Use to poll after a target reboot or
+        when a connect call returns ``connected_target_running``.
+        """
+        if not _is_windows():
+            return _PLATFORM_MSG
+        try:
+            bridge = get_windbg_bridge()
+            return f"{bridge.get_session_state()}"
+        except (WinDbgBridgeError, StructuredBaseError) as e:
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_windbg_tool
+    def windbg_get_sympath() -> str:
+        """Return the engine's current ``_NT_SYMBOL_PATH``.
+
+        Reads ``IDebugSymbols::GetSymbolPath`` directly. Use to verify
+        which symbol cache + servers the engine is consulting before
+        kicking off `.reload` or symbol-resolving commands.
+        """
+        if not _is_windows():
+            return _PLATFORM_MSG
+        try:
+            bridge = get_windbg_bridge()
+            current = bridge.get_sympath()
+            if current is None:
+                return "Engine has no _NT_SYMBOL_PATH set."
+            return current
+        except (WinDbgBridgeError, StructuredBaseError) as e:
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_windbg_tool
+    def windbg_set_sympath(elements: list[str]) -> str:
+        """Set the engine's symbol path from a list of elements.
+
+        Each element is validated before being forwarded to
+        ``IDebugSymbols::SetSymbolPath``. Allowed forms:
+
+          - ``srv*<cache>*<https-url>`` - standard downstream-store entry.
+            ``<cache>`` must live under ``BINARY_MCP_SYMBOL_CACHE``.
+          - ``srv*<https-url>`` - server, default cache.
+          - ``cache*<path>`` - cache override (must live under our root).
+          - ``<https-url>`` - bare server.
+          - bare local path - private symbol store.
+
+        Rejected: UNC paths, http:// without ``BINARY_MCP_ALLOW_HTTP_SYMBOLS=1``,
+        any element containing shell metacharacters. The legacy
+        ``.sympath`` meta-command stays blocked: route all symbol-path
+        changes through this structured tool.
+
+        Args:
+            elements: List of symbol-path entries, in priority order.
+
+        Returns:
+            The new symbol path the engine is using.
+        """
+        if not _is_windows():
+            return _PLATFORM_MSG
+        try:
+            bridge = get_windbg_bridge()
+            return bridge.set_sympath(elements)
+        except (WinDbgBridgeError, StructuredBaseError) as e:
+            return f"Error: {e}"
+
+    # Structured kernel primitives (6)
+
+    @app.tool()
+    @log_windbg_tool
+    def windbg_get_stack(thread_id: int | None = None, frames: int = 32) -> str:
+        """Walk the current (or named) thread's call stack.
+
+        Wraps ``kn`` with structured frame parsing. If ``thread_id`` is
+        provided, switches context to that thread first via ``~<n>s``.
+
+        Args:
+            thread_id: Optional thread to inspect. None means current.
+            frames: Maximum frames to walk (default 32, capped 256).
+
+        Returns:
+            Newline-separated frames in the form
+            ``frame  child_sp  ret_addr  call_site``.
+        """
+        if not _is_windows():
+            return _PLATFORM_MSG
+        try:
+            bridge = get_windbg_bridge()
+            stack = bridge.get_stack(thread_id=thread_id, frames=frames)
+            if not stack:
+                return "Stack walk returned no frames."
+            return "\n".join(
+                f"{f['frame']}  {f['child_sp']}  {f['ret_addr']}  {f['call_site']}"
+                for f in stack
+            )
+        except (WinDbgBridgeError, StructuredBaseError) as e:
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_windbg_tool
+    def windbg_get_thread(thread: str = "") -> str:
+        """Inspect a kernel thread via ``!thread``.
+
+        Returns the engine's full ``!thread`` text - reliable structured
+        parsing across Windows versions is brittle, so the canonical
+        output is surfaced for direct inspection.
+
+        Args:
+            thread: Optional ETHREAD address (hex) or thread ID. Empty
+                    string means the current thread.
+        """
+        if not _is_windows():
+            return _PLATFORM_MSG
+        if thread:
+            err = _validate_address(thread)
+            if err:
+                return err
+        try:
+            bridge = get_windbg_bridge()
+            result = bridge.get_thread(thread=thread or None)
+            return f"$ {result['command']}\n\n{result['output']}"
+        except (WinDbgBridgeError, StructuredBaseError) as e:
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_windbg_tool
+    def windbg_get_process(process: str = "", flags: int = 7) -> str:
+        """Inspect a kernel process via ``!process``.
+
+        Args:
+            process: PID (hex) or EPROCESS address. Empty = current process.
+            flags: ``!process`` flag word (default 7 = full info incl.
+                   thread stacks; use 0 for one-line summary).
+        """
+        if not _is_windows():
+            return _PLATFORM_MSG
+        if process:
+            err = _validate_address(process)
+            if err:
+                return err
+        if flags < 0 or flags > 0xFF:
+            return "Error: flags must be 0..0xFF."
+        try:
+            bridge = get_windbg_bridge()
+            result = bridge.get_process(process=process or None, flags=flags)
+            return f"$ {result['command']}\n\n{result['output']}"
+        except (WinDbgBridgeError, StructuredBaseError) as e:
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_windbg_tool
+    def windbg_dt(type_name: str, address: str = "", depth: int = 1) -> str:
+        """Dump a typed structure with ``dt -r<depth> <type> [addr]``.
+
+        Returns a structured field list (offset, name, value) plus the
+        full raw text. Top-level fields parse cleanly; nested fields
+        from the ``-r`` recursion stay in the raw output.
+
+        Args:
+            type_name: e.g. ``nt!_EPROCESS`` or ``module!_STRUCT``.
+            address: Optional address to overlay the type on.
+            depth: Recursion depth 0..3 (default 1).
+        """
+        if not _is_windows():
+            return _PLATFORM_MSG
+        # Tighter validation than _validate_address - dt accepts
+        # module!type with !, *, _, and . characters only.
+        if not type_name or not _SAFE_SYMBOL_RE.match(type_name):
+            return f"Error: invalid type_name {type_name!r}."
+        if address:
+            err = _validate_address(address)
+            if err:
+                return err
+        try:
+            bridge = get_windbg_bridge()
+            result = bridge.dump_type(
+                type_name=type_name,
+                address=address or None,
+                depth=depth,
+            )
+            lines = [f"$ {result['command']}", ""]
+            for f in result["fields"]:
+                lines.append(f"  {f['offset']}  {f['name']:<32} {f['value']}")
+            if not result["fields"]:
+                lines.append("(no top-level fields parsed)")
+            lines.append("")
+            lines.append("--- raw ---")
+            lines.append(result["raw"])
+            return "\n".join(lines)
+        except (WinDbgBridgeError, StructuredBaseError) as e:
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_windbg_tool
+    def windbg_set_hardware_breakpoint(
+        address: str, kind: str = "e", size: int = 1
+    ) -> str:
+        """Set a hardware data/exec breakpoint via ``ba``.
+
+        Hardware breakpoints use debug registers (DR0-DR3) - max 4
+        simultaneous - and break on read/write/exec without modifying
+        target memory. Use this to watch a kernel structure field for
+        unauthorised writes (e.g. EPROCESS.Token).
+
+        Args:
+            address: Hex address or symbol.
+            kind: ``e`` (execute) | ``r`` (read) | ``w`` (write) | ``i`` (i/o).
+            size: Watch width in bytes (1, 2, 4, or 8).
+        """
+        if not _is_windows():
+            return _PLATFORM_MSG
+        err = _validate_address(address)
+        if err:
+            return err
+        try:
+            bridge = get_windbg_bridge()
+            bridge.set_hardware_breakpoint(address=address, kind=kind, size=size)
+            return f"Hardware breakpoint armed: ba {kind} {size} {address}"
+        except (WinDbgBridgeError, StructuredBaseError) as e:
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_windbg_tool
+    def windbg_switch_thread(thread_id: int) -> str:
+        """Switch the engine's current thread context via ``~<n>s``.
+
+        Subsequent inspection commands (``windbg_get_stack``,
+        ``windbg_get_thread``, register reads) will operate against the
+        new thread. Use ``windbg_session_status`` to confirm the change.
+        """
+        if not _is_windows():
+            return _PLATFORM_MSG
+        try:
+            bridge = get_windbg_bridge()
+            result = bridge.switch_thread(thread_id=thread_id)
+            return f"Switched to thread {result['thread_id']}.\n{result['output']}"
+        except (WinDbgBridgeError, StructuredBaseError) as e:
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_windbg_tool
+    def windbg_step_into() -> str:
+        """Single-step into the next instruction.
+
+        Returns the new instruction pointer and disassembly.
+        """
+        if not _is_windows():
+            return _PLATFORM_MSG
+        try:
+            bridge = get_windbg_bridge()
+            loc = bridge.step_into()
+            parts = [f"Address: 0x{loc.get('address', '?')}"]
+            if loc.get("instruction"):
+                parts.append(f"Instruction: {loc['instruction']}")
+            return "\n".join(parts)
+        except (WinDbgBridgeError, StructuredBaseError) as e:
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_windbg_tool
+    def windbg_step_over() -> str:
+        """Step over the next instruction (skip into calls).
+
+        Returns the new instruction pointer and disassembly.
+        """
+        if not _is_windows():
+            return _PLATFORM_MSG
+        try:
+            bridge = get_windbg_bridge()
+            loc = bridge.step_over()
+            parts = [f"Address: 0x{loc.get('address', '?')}"]
+            if loc.get("instruction"):
+                parts.append(f"Instruction: {loc['instruction']}")
+            return "\n".join(parts)
+        except (WinDbgBridgeError, StructuredBaseError) as e:
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_windbg_tool
+    def windbg_run_and_wait(timeout: int = 30) -> str:
+        """Resume execution and wait for the target to break.
+
+        Args:
+            timeout: Maximum seconds to wait for a break event.
+
+        Returns:
+            Status after break or timeout.
+        """
+        if not _is_windows():
+            return _PLATFORM_MSG
+        try:
+            from src.engines.dynamic.base import DebuggerState
+            from src.engines.dynamic.windbg.kernel_types import WinDbgMode
+
+            bridge = get_windbg_bridge()
+            bridge.run()
+            # Live kernel targets require INFINITE timeout per MS docs
+            wait_ms = 0xFFFFFFFF if bridge._mode == WinDbgMode.KERNEL_MODE else timeout * 1000
+            try:
+                bridge._dbg.wait(wait_ms)
+                bridge._state = DebuggerState.PAUSED
+                loc = bridge.get_current_location()
+                return f"Break at 0x{loc.get('address', '?')}"
+            except Exception:
+                return f"Timeout after {timeout}s -- target still running"
+        except (WinDbgBridgeError, StructuredBaseError) as e:
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_windbg_tool
+    def windbg_wait_paused(timeout: int = 30) -> str:
+        """Wait for the target to reach a paused state.
+
+        Args:
+            timeout: Maximum seconds to wait.
+
+        Returns:
+            Current location when paused, or timeout message.
+        """
+        if not _is_windows():
+            return _PLATFORM_MSG
+        try:
+            from src.engines.dynamic.base import DebuggerState
+            from src.engines.dynamic.windbg.kernel_types import WinDbgMode
+
+            bridge = get_windbg_bridge()
+            # Live kernel targets require INFINITE timeout per MS docs
+            wait_ms = 0xFFFFFFFF if bridge._mode == WinDbgMode.KERNEL_MODE else timeout * 1000
+            try:
+                bridge._dbg.wait(wait_ms)
+                bridge._state = DebuggerState.PAUSED
+                loc = bridge.get_current_location()
+                return f"Paused at 0x{loc.get('address', '?')}"
+            except Exception:
+                return f"Timeout after {timeout}s -- target not paused"
+        except (WinDbgBridgeError, StructuredBaseError) as e:
+            return f"Error: {e}"
+
+    # Breakpoint tools (4)
+
+    @app.tool()
+    @log_windbg_tool
+    def windbg_set_breakpoint(address: str) -> str:
+        """Set a software breakpoint at the given address.
+
+        Args:
+            address: Hex address or symbol (e.g. "0x401000" or "nt!NtCreateFile").
+        """
+        if not _is_windows():
+            return _PLATFORM_MSG
+        addr_err = _validate_address(address)
+        if addr_err:
+            return addr_err
+        try:
+            bridge = get_windbg_bridge()
+            bridge.set_breakpoint(address)
+            return f"Breakpoint set at {address}"
+        except (WinDbgBridgeError, StructuredBaseError) as e:
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_windbg_tool
+    def windbg_delete_breakpoint(address: str) -> str:
+        """Delete a breakpoint at the given address.
+
+        Args:
+            address: Hex address of the breakpoint to remove.
+        """
+        if not _is_windows():
+            return _PLATFORM_MSG
+        addr_err = _validate_address(address)
+        if addr_err:
+            return addr_err
+        try:
+            bridge = get_windbg_bridge()
+            bridge.delete_breakpoint(address)
+            return f"Breakpoint deleted at {address}"
+        except (WinDbgBridgeError, StructuredBaseError) as e:
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_windbg_tool
+    def windbg_list_breakpoints() -> str:
+        """List all active breakpoints.
+
+        Returns:
+            Formatted list of breakpoints from 'bl' command output.
+        """
+        if not _is_windows():
+            return _PLATFORM_MSG
+        try:
+            bridge = get_windbg_bridge()
+            output = bridge.execute_command("bl")
+            return output or "No breakpoints set"
+        except (WinDbgBridgeError, StructuredBaseError) as e:
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_windbg_tool
+    def windbg_set_conditional_breakpoint(address: str, condition: str) -> str:
+        """Set a conditional breakpoint using a WinDbg expression.
+
+        Args:
+            address: Hex address for the breakpoint.
+            condition: WinDbg condition expression (e.g. "rcx==0x100").
+        """
+        if not _is_windows():
+            return _PLATFORM_MSG
+        addr_err = _validate_address(address)
+        if addr_err:
+            return addr_err
+        cond_err = _validate_condition(condition)
+        if cond_err:
+            return cond_err
+        try:
+            bridge = get_windbg_bridge()
+            cmd = f'bp {address} ".if ({condition}) {{}} .else {{gc}}"'
+            bridge.execute_command(cmd)
+            return f"Conditional breakpoint set at {address} when {condition}"
+        except (WinDbgBridgeError, StructuredBaseError) as e:
+            return f"Error: {e}"
+
+    # Inspection tools (6)
+
+    @app.tool()
+    @log_windbg_tool
+    def windbg_get_registers() -> str:
+        """Get current CPU register values.
+
+        Returns:
+            Formatted register dump with general-purpose and extended registers.
+        """
+        if not _is_windows():
+            return _PLATFORM_MSG
+        try:
+            commands = get_windbg_commands()
+            return commands.dump_registers()
+        except (WinDbgBridgeError, StructuredBaseError) as e:
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_windbg_tool
+    def windbg_read_memory(address: str, size: int = 64) -> str:
+        """Read memory from the target address space.
+
+        Args:
+            address: Hex address to read from.
+            size: Number of bytes to read (default 64, max 4096).
+
+        Returns:
+            Hex dump of memory contents.
+        """
+        if not _is_windows():
+            return _PLATFORM_MSG
+        addr_err = _validate_address(address)
+        if addr_err:
+            return addr_err
+        try:
+            size = min(size, 4096)
+            bridge = get_windbg_bridge()
+            # Strip backtick separators (WinDbg uses fffff800`12340000 format)
+            clean_addr = address.replace("`", "")
+            data = bridge.read_memory(clean_addr, size)
+            base_addr = int(clean_addr, 16)
+            lines = []
+            for i in range(0, len(data), 16):
+                chunk = data[i:i + 16]
+                hex_part = " ".join(f"{b:02x}" for b in chunk)
+                ascii_part = "".join(
+                    chr(b) if 32 <= b < 127 else "." for b in chunk
+                )
+                lines.append(f"{base_addr + i:016x}  {hex_part:<48}  {ascii_part}")
+            return "\n".join(lines)
+        except (WinDbgBridgeError, StructuredBaseError) as e:
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_windbg_tool
+    def windbg_write_memory(address: str, data: str) -> str:
+        """Write hex bytes to the target address space.
+
+        Args:
+            address: Hex address to write to.
+            data: Hex string of bytes to write (e.g. "90 90 cc").
+
+        Returns:
+            Confirmation of bytes written.
+        """
+        if not _is_windows():
+            return _PLATFORM_MSG
+        addr_err = _validate_address(address)
+        if addr_err:
+            return addr_err
+        try:
+            raw = bytes.fromhex(data.replace(" ", ""))
+            bridge = get_windbg_bridge()
+            bridge.write_memory(address, raw)
+            return f"Wrote {len(raw)} bytes to {address}"
+        except (WinDbgBridgeError, StructuredBaseError) as e:
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_windbg_tool
+    def windbg_disassemble(address: str, count: int = 10) -> str:
+        """Disassemble instructions at the given address.
+
+        Args:
+            address: Hex address to start disassembly.
+            count: Number of instructions to disassemble (default 10).
+
+        Returns:
+            Disassembly listing.
+        """
+        if not _is_windows():
+            return _PLATFORM_MSG
+        addr_err = _validate_address(address)
+        if addr_err:
+            return addr_err
+        try:
+            bridge = get_windbg_bridge()
+            output = bridge.execute_command(f"u {address} L{count}")
+            return output
+        except (WinDbgBridgeError, StructuredBaseError) as e:
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_windbg_tool
+    def windbg_get_modules() -> str:
+        """List all loaded modules.
+
+        Returns:
+            Module list with base addresses, sizes, and symbol status.
+        """
+        if not _is_windows():
+            return _PLATFORM_MSG
+        try:
+            bridge = get_windbg_bridge()
+            modules = bridge.get_loaded_drivers()
+            if not modules:
+                return "No modules loaded"
+            lines = [f"{'Start':<20} {'End':<20} {'Name':<20} {'Symbols'}"]
+            for mod in modules:
+                lines.append(
+                    f"{mod['start']:<20} {mod['end']:<20} "
+                    f"{mod['name']:<20} {mod['symbol_status']}"
+                )
+            return "\n".join(lines)
+        except (WinDbgBridgeError, StructuredBaseError) as e:
+            return f"Error: {e}"
+
+    @app.tool()
+    @log_windbg_tool
+    def windbg_execute_command(command: str) -> str:
+        """Execute a raw WinDbg command.
+
+        Supports both regular commands (lm, r, k) and extension commands
+        (!analyze, !process, !drvobj). Use this for any WinDbg command not
+        covered by the dedicated tools.
+
+        Args:
+            command: WinDbg command string.
+
+        Returns:
+            Raw command output text.
+        """
+        if not _is_windows():
+            return _PLATFORM_MSG
+        # Tool-layer blocklist for dangerous WinDbg meta-commands
+        cmd_lower = command.strip().lower()
+        from src.engines.dynamic.windbg.bridge import _BLOCKED_COMMANDS
+        for blocked in _BLOCKED_COMMANDS:
+            if blocked in cmd_lower:
+                return f"Error: Command '{blocked}' is blocked for security reasons."
+        try:
+            bridge = get_windbg_bridge()
+            return bridge.execute_command(command)
+        except (WinDbgBridgeError, StructuredBaseError) as e:
+            return f"Error: {e}"

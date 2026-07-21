@@ -1,0 +1,60 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+
+# Python files
+*.py text eol=lf
+
+# Shell scripts
+*.sh text eol=lf
+
+# Markdown files
+*.md text eol=lf
+
+# JSON files
+*.json text eol=lf
+
+# TOML files
+*.toml text eol=lf
+
+# YAML files
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# C source files
+*.c text eol=lf
+*.h text eol=lf
+
+# Makefiles
+Makefile text eol=lf
+
+# Documents
+*.txt text eol=lf
+LICENSE text eol=lf
+
+# Binary files
+*.exe binary
+*.dll binary
+*.so binary
+*.dylib binary
+*.o binary
+*.a binary
+*.bin binary
+
+# Archives
+*.zip binary
+*.tar binary
+*.gz binary
+*.7z binary
+
+# Images
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+
+# Git attributes for linguist (GitHub language stats)
+*.md linguist-documentation
+*.c linguist-detectable=false
+samples/* linguist-vendored
+tests/* linguist-documentation

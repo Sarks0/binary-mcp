@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "binary-mcp": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "C:\\Users\\YourUsername\\Documents\\codeProjects\\binary-mcp",
+        "run",
+        "python",
+        "-m",
+        "src.server"
+      ],
+      "env": {
+        "GHIDRA_HOME": "C:\\ghidra_11.2.1_PUBLIC"
+      }
+    }
+  }
+}

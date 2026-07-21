@@ -1,0 +1,91 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environments
+venv/
+ENV/
+env/
+.venv
+
+# Secrets and configs (use .env.example as template)
+.env
+.env.local
+.env.*.local
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.hypothesis/
+
+# Linting
+.ruff_cache/
+
+# MCP and Ghidra
+.ghidra_mcp_cache/
+ghidra_projects/
+*.gpr
+*.rep/
+
+# Compiled binaries
+samples/*.exe
+samples/*.elf
+samples/test_malware
+samples/a.out
+
+# Logs and errors
+*.log
+logs/
+errors/
+
+# Temporary files
+*.tmp
+*.temp
+*.json.bak
+temp_analysis_*.json
+
+# Backups
+*.md.bak
+
+# uv
+.python-version
+
+# Claude
+.claude/
+
+# Security reviews (internal only)
+security/
+DEVELOPMENT_ROADMAP.md
+WINDBG_INTEGRATION_PLAN.md

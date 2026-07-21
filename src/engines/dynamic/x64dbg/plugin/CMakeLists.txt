@@ -82,7 +82,7 @@ set_target_properties(obsidian PROPERTIES
 
 if(MSVC)
     # Use DYNAMIC runtime to match x64dbg
-    set_property(TARGET obsidian PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreadedDLL$<$<CONFIG:Debug>:Debug>")
+    set_property(TARGET obsidian PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
     message(STATUS "Plugin: Using DYNAMIC runtime library (/MD)")
 endif()
 

@@ -22,7 +22,7 @@ jobs:
     - name: Setup CMake
       uses: jwlawson/actions-setup-cmake@v2
       with:
-        cmake-version: '3.27.x'
+        cmake-version: 'latest'
 
     - name: Download x64dbg Plugin SDK
       shell: pwsh
@@ -54,6 +54,7 @@ jobs:
     - name: Build x64 Plugin
       shell: pwsh
       run: |
+        $ErrorActionPreference = 'Stop'
         Write-Host "Building 64-bit plugin..."
         $sdkPath = "$env:GITHUB_WORKSPACE/extern/x64dbg_sdk"
         cd src/engines/dynamic/x64dbg/plugin
@@ -61,17 +62,20 @@ jobs:
         New-Item -ItemType Directory -Force -Path build-x64
         cd build-x64
 
-        cmake .. -G "Visual Studio 17 2022" -A x64 `
+        cmake .. -A x64 `
           -DX64DBG_SDK_PATH="$sdkPath" `
           -DCMAKE_BUILD_TYPE=Release
+        if ($LASTEXITCODE -ne 0) { throw "CMake configure failed for x64" }
 
         cmake --build . --config Release
+        if ($LASTEXITCODE -ne 0) { throw "CMake build failed for x64" }
 
         Write-Host "x64 plugin built successfully"
 
     - name: Build x32 Plugin
       shell: pwsh
       run: |
+        $ErrorActionPreference = 'Stop'
         Write-Host "Building 32-bit plugin..."
         $sdkPath = "$env:GITHUB_WORKSPACE/extern/x64dbg_sdk"
         cd src/engines/dynamic/x64dbg/plugin
@@ -79,11 +83,13 @@ jobs:
         New-Item -ItemType Directory -Force -Path build-x32
         cd build-x32
 
-        cmake .. -G "Visual Studio 17 2022" -A Win32 `
+        cmake .. -A Win32 `
           -DX64DBG_SDK_PATH="$sdkPath" `
           -DCMAKE_BUILD_TYPE=Release
+        if ($LASTEXITCODE -ne 0) { throw "CMake configure failed for x32" }
 
         cmake --build . --config Release
+        if ($LASTEXITCODE -ne 0) { throw "CMake build failed for x32" }
 
         Write-Host "x32 plugin built successfully"
 

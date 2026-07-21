@@ -278,6 +278,9 @@ jobs:
         body_path: release_notes.md
         files: |
           binary-mcp-${{ steps.version.outputs.version }}.zip
+          release/obsidian-plugins/obsidian.dp64
+          release/obsidian-plugins/obsidian.dp32
+          release/obsidian-plugins/obsidian_server.exe
         draft: false
         prerelease: ${{ contains(github.ref, '-rc') }}
       env:

@@ -1417,6 +1417,14 @@ class WinDbgBridge(Debugger):
         try:
             result = subprocess.run(
                 cmd_args,
+                # One-shot invocation: the command is fully specified via
+                # `-c "cmd; q"` and cdb/kd quits immediately, so it never
+                # legitimately reads stdin. Detach it anyway -- an inherited
+                # stdin (the stdio MCP server's JSON-RPC pipe) would let any
+                # command that triggers a prompt block on, and consume, the
+                # protocol stream. NOTE: a future *interactive* bridge that
+                # drives a persistent cdb over stdin=PIPE must NOT use DEVNULL.
+                stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True, encoding="utf-8", errors="replace",
                 timeout=self._timeout,

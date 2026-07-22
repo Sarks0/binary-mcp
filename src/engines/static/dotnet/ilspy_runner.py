@@ -234,6 +234,7 @@ class ILSpyRunner:
         try:
             result = subprocess.run(
                 [ilspycmd, "--version"],
+                stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True, encoding="utf-8", errors="replace",
                 timeout=10
@@ -343,6 +344,7 @@ class ILSpyRunner:
             for filter_code, type_kind in type_filters.items():
                 result = subprocess.run(
                     [ilspycmd, "-l", filter_code, str(assembly_path)],
+                    stdin=subprocess.DEVNULL,
                     capture_output=True,
                     text=True, encoding="utf-8", errors="replace",
                     timeout=120
@@ -375,6 +377,7 @@ class ILSpyRunner:
                 # Fallback: try decompiling to stdout for basic info
                 result = subprocess.run(
                     [ilspycmd, str(assembly_path)],
+                    stdin=subprocess.DEVNULL,
                     capture_output=True,
                     text=True, encoding="utf-8", errors="replace",
                     timeout=120
@@ -558,6 +561,7 @@ class ILSpyRunner:
 
             result = subprocess.run(
                 [ilspycmd, str(assembly_path), "-o", str(output_dir)],
+                stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True, encoding="utf-8", errors="replace",
                 timeout=300  # 5 minute timeout
@@ -616,6 +620,7 @@ class ILSpyRunner:
         try:
             result = subprocess.run(
                 [ilspycmd, str(assembly_path), "-t", validated_type_name],
+                stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True, encoding="utf-8", errors="replace",
                 timeout=60
@@ -675,6 +680,7 @@ class ILSpyRunner:
 
             result = subprocess.run(
                 cmd,
+                stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True, encoding="utf-8", errors="replace",
                 timeout=120
@@ -752,6 +758,7 @@ class ILSpyRunner:
             try:
                 result = subprocess.run(
                     [dotnet, "--version"],
+                    stdin=subprocess.DEVNULL,
                     capture_output=True,
                     text=True, encoding="utf-8", errors="replace",
                     timeout=10

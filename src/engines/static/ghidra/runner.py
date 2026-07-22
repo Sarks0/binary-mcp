@@ -42,6 +42,7 @@ def _kill_process_tree(proc: subprocess.Popen) -> None:
         if os.name == "nt":
             subprocess.run(  # nosec B603 B607 - tear down stuck Ghidra tree
                 ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 timeout=10,
@@ -945,6 +946,7 @@ class GhidraRunner:
         try:
             java_result = subprocess.run(  # nosec B603 B607 - Safe diagnostic check for Java
                 ["java", "-version"],
+                stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",

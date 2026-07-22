@@ -280,7 +280,11 @@ class ProjectCache:
         targets the same ghidra_projects entries the runner created.
         """
         stem = Path(binary_path).stem
-        name = re.sub(r'[^a-zA-Z0-9_.\-]', '_', stem)
+        # Flatten dots as well as the illegal set -- MUST match the identical
+        # sanitiser in GhidraRunner.analyze so cache cleanup targets the same
+        # ghidra_projects entries the runner actually created. See the comment
+        # there for why a dotted project name orphans the .lock file.
+        name = re.sub(r'[^a-zA-Z0-9_\-]', '_', stem)
         if name.startswith('-'):
             name = f"proj_{name}"
         return name

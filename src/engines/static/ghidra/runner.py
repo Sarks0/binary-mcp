@@ -152,21 +152,9 @@ class GhidraRunner:
         if ghidra_path:
             self.ghidra_path = Path(ghidra_path)
         else:
-            # Check GHIDRA_HOME environment variable first (fast path)
-            ghidra_home = os.environ.get("GHIDRA_HOME")
-            if ghidra_home:
-                ghidra_home_path = Path(ghidra_home)
-                if self._is_valid_ghidra_installation(ghidra_home_path):
-                    logger.info(f"Using GHIDRA_HOME: {ghidra_home}")
-                    self.ghidra_path = ghidra_home_path
-                else:
-                    logger.warning(
-                        f"GHIDRA_HOME set but not a valid Ghidra installation: {ghidra_home}"
-                    )
-                    self.ghidra_path = self._detect_ghidra()
-            else:
-                # Fall back to auto-detection (slow path)
-                self.ghidra_path = self._detect_ghidra()
+            # Check env vars first (fast path), then auto-detect. An invalid
+            # value in one env var must not mask a valid value in the other.
+            self.ghidra_path = self._resolve_from_env() or self._detect_ghidra()
 
         self.system = platform.system()
         # Cache the jython precondition result so analyze() doesn't re-stat
@@ -174,6 +162,31 @@ class GhidraRunner:
         # False would imply we already raised; we never store False.
         self._jython_check_done: bool = False
         logger.info(f"Initialized Ghidra runner: {self.ghidra_path} on {self.system}")
+
+    def _resolve_from_env(self) -> Path | None:
+        """
+        Resolve a valid Ghidra install from environment variables.
+
+        Checks ``GHIDRA_HOME`` (our historical name) then
+        ``GHIDRA_INSTALL_DIR`` (the name Ghidra's own tooling and most install
+        guides use). Returns the first that points at a valid installation, or
+        None if neither does. An invalid value in one variable never masks a
+        valid value in the other -- previously only GHIDRA_HOME was read, so
+        anyone who set only the canonical GHIDRA_INSTALL_DIR fell through to
+        slow auto-detection, and a bad GHIDRA_HOME hid a good install entirely.
+        """
+        for var in ("GHIDRA_HOME", "GHIDRA_INSTALL_DIR"):
+            value = os.environ.get(var)
+            if not value:
+                continue
+            candidate = Path(value)
+            if self._is_valid_ghidra_installation(candidate):
+                logger.info(f"Using {var}: {value}")
+                return candidate
+            logger.warning(
+                f"{var} set but not a valid Ghidra installation: {value}"
+            )
+        return None
 
     def _detect_ghidra(self) -> Path:
         """
@@ -394,18 +407,30 @@ class GhidraRunner:
         Ghidra by creating just support/analyzeHeadless, so this is the
         common case in CI).
         """
-        version_file = self.ghidra_path / "application.properties"
-        if not version_file.exists():
-            return None
-        try:
-            with open(version_file, encoding="utf-8") as f:
-                for line in f:
-                    if line.startswith("application.version"):
-                        _, _, value = line.partition("=")
-                        value = value.strip()
-                        return value or None
-        except OSError as e:
-            logger.debug(f"Could not read {version_file}: {e}")
+        # A real Ghidra install ships application.properties under Ghidra/.
+        # The historical single-path lookup checked only the install root --
+        # which exists on NO real install -- so it silently returned None on
+        # every genuine installation. The Jython version gate treats an unknown
+        # version as "assume fine" and no-ops, so this bug silently disabled
+        # the guard. Check both, root first so the minimal test fixtures that
+        # write to the root still resolve.
+        candidates = [
+            self.ghidra_path / "application.properties",
+            self.ghidra_path / "Ghidra" / "application.properties",
+        ]
+        for version_file in candidates:
+            if not version_file.exists():
+                continue
+            try:
+                with open(version_file, encoding="utf-8") as f:
+                    for line in f:
+                        if line.startswith("application.version"):
+                            _, _, value = line.partition("=")
+                            value = value.strip()
+                            if value:
+                                return value
+            except OSError as e:
+                logger.debug(f"Could not read {version_file}: {e}")
         return None
 
     def _get_ghidra_version(self) -> tuple[int, int] | None:
@@ -636,8 +661,14 @@ class GhidraRunner:
 
         if project_name is None:
             project_name = binary_path.stem
-        # Sanitize project name to prevent parameter injection
-        project_name = re.sub(r'[^a-zA-Z0-9_.\-]', '_', project_name)
+        # Sanitize project name to prevent parameter injection. Dots are
+        # flattened too (not just the illegal set): Ghidra treats a trailing
+        # dotted segment as an extension when it creates <name>.gpr/.rep/.lock,
+        # so a dotted name (e.g. "okular.stage2") diverges from what
+        # _cleanup_project() and ProjectCache reconstruct by concatenation,
+        # leaving an orphaned .lock that fails every later run. Keep this in
+        # sync with ProjectCache._get_project_name.
+        project_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', project_name)
         if project_name.startswith('-'):
             project_name = f"proj_{project_name}"
 
@@ -785,6 +816,19 @@ class GhidraRunner:
             proc = subprocess.Popen(  # nosec B603 - cmd built from validated args
                 cmd,
                 env=env,
+                # Detach stdin. This is load-bearing, NOT hygiene. On Windows,
+                # subprocess launches analyzeHeadless.bat as `cmd.exe /c <bat>`.
+                # Ghidra's support/launch.bat inspects %cmdcmdline%: token 2
+                # being "/c" makes it set DOUBLE_CLICKED=y, and on a nonzero
+                # exit a "double-clicked" launcher runs `pause`. Without this
+                # redirection the child inherits our stdin -- which, for a
+                # stdio MCP server, IS the JSON-RPC pipe from the client. That
+                # `pause` would then block forever waiting for a keystroke that
+                # never comes AND consume protocol bytes, corrupting the
+                # transport for the rest of the session (one Ghidra failure
+                # bricks every later tool call, Ghidra-backed or not). DEVNULL
+                # makes `pause` read EOF and return immediately.
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,

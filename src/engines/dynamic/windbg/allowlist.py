@@ -19,12 +19,14 @@ Reference: https://learn.microsoft.com/en-us/windows-hardware/drivers/debugger/s
 
 The validator works in two passes:
 
-  1. ``parse_compound`` splits a user-supplied string on ``;`` outside
-     quoted regions and curly-brace blocks (so ``.foreach (a {!process})
-     {!handle ${a}}`` is one entry, not two).
-  2. ``validate_command`` checks each subcommand against deny-tokens
-     (matched on first whitespace token, case-insensitive) and
-     write-primitive regexes (matched anywhere).
+  1. ``parse_compound`` splits a user-supplied string on every separator
+     WinDbg honours -- ``;`` AND raw newlines -- outside quoted regions and
+     curly-brace blocks (so ``.foreach (a {!process}) {!handle ${a}}`` is one
+     entry, not two, while ``k\n.shell`` is two, not one).
+  2. ``validate_command`` checks each subcommand against deny-tokens (matched
+     on first whitespace token, case-insensitive, including the alias-defining
+     family that WinDbg pre-expands) and write/execute-primitive regexes
+     (matched anywhere, including the ``$<`` script-file include operators).
 
 Non-write meta-commands that have a structured replacement (e.g.
 ``.sympath`` -> :func:`windbg_set_sympath`) stay denied here so callers
@@ -85,6 +87,13 @@ _DENY_FIRST_TOKEN = frozenset({
     "eb", "ed", "ew", "eq", "ep", "eu", "ea", "eza", "ezu",
     # Assembler - emits machine code into target memory
     "a",
+    # Alias definition/deletion. WinDbg expands aliases BEFORE command-name
+    # resolution, so 'aS x .shell' then 'x' would smuggle a denied command
+    # past first-token validation (audit H3). _first_token lowercases, so
+    # 'as' also covers 'aS'. 'al' (list) is denied too for a clean surface.
+    "as", "al", "ad",
+    # .cmdtree loads a command-tree definition from a file (execution vector).
+    ".cmdtree",
 })
 
 # Argument-form deny rules. Each entry is (regex, reason) and is matched
@@ -92,6 +101,16 @@ _DENY_FIRST_TOKEN = frozenset({
 # patterns where the first token alone cannot decide (e.g. ``r`` is read,
 # ``r @rip = 0x1`` is write).
 _DENY_ARGFORM: tuple[tuple[re.Pattern[str], str], ...] = (
+    (
+        # Script-file include operators: $<, $><, $$<, $$><, $$>a< all run an
+        # arbitrary debugger command file from disk (audit H2). The optional
+        # '$', '>' and 'a' between the leading '$' and '<' cover every form.
+        # Anchored at the subcommand start so it never matches a legitimate
+        # pseudo-register/alias use like '@$teb' or '${x}'.
+        re.compile(r"^\s*\$\$?>?a?<", re.IGNORECASE),
+        "script-file include ($<, $$<, $$>a< ...) is forbidden; "
+        "it runs an arbitrary debugger command file",
+    ),
     (
         re.compile(r"^\s*r\s+[^\s,]+\s*=\s*\S", re.IGNORECASE),
         "register write via 'r' is forbidden; use a structured tool",
@@ -172,8 +191,15 @@ def parse_compound(command: str) -> list[str]:
         elif not in_dq and not in_sq and ch == "}":
             depth = max(0, depth - 1)
             current.append(ch)
-        elif not in_dq and not in_sq and depth == 0 and ch == ";":
-            parts.append("".join(current).strip())
+        elif not in_dq and not in_sq and depth == 0 and ch in ";\n\r":
+            # WinDbg honours BOTH ';' and raw newlines as command separators.
+            # Splitting on newlines too closes the injection where 'k\n.shell'
+            # was validated as a single 'k' subcommand (audit H1). Empty pieces
+            # (e.g. from '\r\n' or ';;') are dropped so a separator run does not
+            # manufacture an "empty subcommand" rejection.
+            piece = "".join(current).strip()
+            if piece:
+                parts.append(piece)
             current = []
         else:
             current.append(ch)

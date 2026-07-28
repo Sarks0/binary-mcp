@@ -17,7 +17,7 @@ class WinDbgErrorLogger(BaseErrorLogger):
     """
     Error logger for WinDbg operations.
 
-    Stores errors in `~/.ghidra_mcp_cache/windbg_errors/` with:
+    Stores errors in `~/ghidra_mcp_cache/windbg_errors/` with:
     - Individual JSON files per error
     - Manifest file for quick browsing
     - Statistics for error analysis

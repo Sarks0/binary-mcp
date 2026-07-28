@@ -20,6 +20,7 @@ import traceback
 from pathlib import Path
 from typing import Any
 
+from src.utils.config import get_cache_dir
 from src.utils.structured_errors import (
     StructuredBaseError,
     create_debugger_not_connected_error,
@@ -134,7 +135,7 @@ def _setup_debug_log() -> logging.Logger:
     """Configure file logging when WINDBG_DEBUG env var is set."""
     debug_logger = logging.getLogger("windbg.trace")
     if os.environ.get("WINDBG_DEBUG"):
-        log_path = Path.home() / ".ghidra_mcp_cache" / "windbg_debug.log"
+        log_path = get_cache_dir() / "windbg_debug.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
         handler = logging.FileHandler(log_path, encoding="utf-8")
         handler.setFormatter(logging.Formatter(

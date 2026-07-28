@@ -246,8 +246,20 @@ class BinaryReader:
             return offset
         return None
 
-    def read_full(self) -> bytes:
-        """Read the entire binary file. Used for byte-pattern scanning."""
+    def read_full(self, max_bytes: int = 512 * 1024 * 1024) -> bytes:
+        """Read the entire binary file, up to ``max_bytes``.
+
+        Used for byte-pattern scanning. Rejects files larger than the cap
+        rather than truncating: a silent truncation would drop matches past
+        the cap and report a clean scan (audit H8). The default mirrors the
+        500 MB ceiling ``sanitize_binary_path`` already enforces upstream.
+        """
+        size = self._path.stat().st_size
+        if size > max_bytes:
+            raise ValueError(
+                f"File too large to read fully: {size} bytes (max {max_bytes}). "
+                "Narrow the scan range or raise the cap."
+            )
         with open(self._path, "rb") as f:
             return f.read()
 

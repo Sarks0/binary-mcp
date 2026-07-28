@@ -10,6 +10,7 @@ import time
 import uuid
 from pathlib import Path
 
+from src.utils.config import get_cache_dir
 from src.utils.security import safe_regex_compile
 
 logger = logging.getLogger(__name__)
@@ -23,10 +24,12 @@ class AnalysisSession:
         Initialize analysis session manager.
 
         Args:
-            store_dir: Directory for session storage. Defaults to ~/.ghidra_mcp_cache/sessions
+            store_dir: Directory for session storage. Defaults to the
+                ``sessions/`` subdir of the shared cache root (see
+                ``get_cache_dir``), keeping sessions beside the analysis cache.
         """
         if store_dir is None:
-            self.store_dir = Path.home() / ".ghidra_mcp_cache" / "sessions"
+            self.store_dir = get_cache_dir() / "sessions"
         else:
             self.store_dir = Path(store_dir)
 

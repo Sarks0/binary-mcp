@@ -134,6 +134,23 @@ def get_config(key: str, default: str | None = None) -> str | None:
     return _config_cache.get(key, default)
 
 
+def get_cache_dir() -> Path:
+    """Resolve the shared base directory for all on-disk state.
+
+    The analysis cache, Ghidra projects, saved sessions, and per-engine error
+    logs all live under this one root so they stay co-located and can be
+    inspected or cleared together -- keeping them in agreement is why every
+    module resolves the base here instead of hardcoding its own path.
+
+    Resolution order: ``$BINARY_CACHE_DIR``, then ``~/ghidra_mcp_cache``
+    (no leading dot, so the directory is visible for inspection and cleanup).
+    """
+    configured = get_config("BINARY_CACHE_DIR")
+    if configured:
+        return Path(configured)
+    return Path.home() / "ghidra_mcp_cache"
+
+
 def get_config_bool(key: str, default: bool = False) -> bool:
     """Get a boolean configuration value."""
     value = get_config(key)

@@ -1,6 +1,5 @@
 # Binary MCP Server - Windows Installer
 # Interactive installation script with component selection
-# By Rhys Downing
 
 #Requires -RunAsAdministrator
 

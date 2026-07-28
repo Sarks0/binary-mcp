@@ -5,6 +5,7 @@
 #include <cstdarg>
 #include <string>
 #include <vector>
+#include <exception>
 #include <sstream>
 #include <iomanip>
 #include <set>
@@ -2452,9 +2453,12 @@ std::string HandleFindStrings(const std::string& request) {
     bool searchAscii = ExtractIntField(request, "ascii", 1) != 0;
     bool searchUnicode = ExtractIntField(request, "unicode", 1) != 0;
 
-    // Validate
-    if (size > 10 * 1024 * 1024) {
-        return BuildJsonResponse(false, "\"error\":\"Size too large (max 10MB)\"");
+    // Validate. The lower bound is load-bearing: ExtractIntField uses sscanf
+    // %d and accepts negatives, and a negative size would convert to a huge
+    // size_t in std::vector<unsigned char> buffer(size) below, throwing
+    // std::length_error. With no exception boundary that terminates x64dbg.
+    if (size <= 0 || size > 10 * 1024 * 1024) {
+        return BuildJsonResponse(false, "\"error\":\"Invalid size (must be 1 to 10MB)\"");
     }
     if (minLength < 2) minLength = 2;
     if (minLength > 100) minLength = 100;
@@ -2560,9 +2564,11 @@ std::string HandlePatternScan(const std::string& request) {
         return BuildJsonResponse(false, "\"error\":\"Missing pattern\"");
     }
 
-    // Validate size
-    if (size > 100 * 1024 * 1024) {
-        return BuildJsonResponse(false, "\"error\":\"Size too large (max 100MB)\"");
+    // Validate size. Lower bound is load-bearing -- a negative size reaches
+    // std::vector<unsigned char> buffer(size) below and throws
+    // std::length_error, which with no exception boundary crashes x64dbg.
+    if (size <= 0 || size > 100 * 1024 * 1024) {
+        return BuildJsonResponse(false, "\"error\":\"Invalid size (must be 1 to 100MB)\"");
     }
 
     // Parse pattern - format: "90 ?? E8 ?? ?? ?? ??" or "90??E8??????"
@@ -3786,7 +3792,14 @@ static DWORD WINAPI PipeServerThread(LPVOID lpParam) {
             } else {
                 LogInfo("Request type: %d", requestType);
 
-                // Route to appropriate handler
+                // Route to appropriate handler. Wrapped in try/catch because a
+                // handler that throws -- e.g. std::length_error / std::bad_alloc
+                // from a std::vector sized by attacker-controlled input -- would
+                // otherwise unwind out of PipeServerThread and terminate the
+                // entire x64dbg process, killing the debugging session. A bad
+                // request must cost one error reply, not the whole session.
+                // (audit P2: the exception boundary the plugin lacked.)
+                try {
                 switch (requestType) {
                     // Core debugger state
                     case GET_STATE:
@@ -4049,6 +4062,13 @@ static DWORD WINAPI PipeServerThread(LPVOID lpParam) {
                         LogError("Unknown request type: %d", requestType);
                         response = BuildJsonResponse(false, "\"error\":\"Unknown request type\"");
                         break;
+                }
+                } catch (const std::exception& e) {
+                    LogError("Handler threw exception: %s", e.what());
+                    response = BuildJsonResponse(false, "\"error\":\"Internal handler error\"");
+                } catch (...) {
+                    LogError("Handler threw unknown exception");
+                    response = BuildJsonResponse(false, "\"error\":\"Internal handler error\"");
                 }
             }
 

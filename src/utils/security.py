@@ -1,11 +1,43 @@
 """Security utilities for input validation and sanitization."""
 
 import logging
+import os
 import re
 import uuid
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+# Sentinel distinguishing "caller did not specify allowed_dirs" (resolve the
+# configured allow-list from BINARY_MCP_ALLOWED_DIRS) from an explicit
+# allowed_dirs=None. Almost every tool entry point omits the argument, so this
+# is what lets confinement apply uniformly without touching every call site.
+_UNSET: object = object()
+
+# The "confinement disabled" warning is emitted once per process, not per call.
+_confinement_warning_emitted = False
+
+
+def _confinement_required() -> bool:
+    """True if the operator demands a configured allow-list (fail closed)."""
+    return os.environ.get(
+        "BINARY_MCP_REQUIRE_CONFINEMENT", ""
+    ).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _warn_confinement_disabled_once(binary_path: str) -> None:
+    """Warn (once) that binary paths are not restricted to any directory."""
+    global _confinement_warning_emitted
+    if _confinement_warning_emitted:
+        return
+    _confinement_warning_emitted = True
+    logger.warning(
+        "Path confinement is DISABLED: BINARY_MCP_ALLOWED_DIRS is not set, so "
+        "binary paths are not restricted to any directory. Set it to a "
+        "quarantine directory, or set BINARY_MCP_REQUIRE_CONFINEMENT=1 to "
+        "refuse unconfined paths. (first unconfined access: %s)",
+        binary_path,
+    )
 
 
 class SecurityError(Exception):
@@ -25,7 +57,7 @@ class FileSizeError(SecurityError):
 
 def sanitize_binary_path(
     binary_path: str,
-    allowed_dirs: list[Path] | None = None,
+    allowed_dirs: "list[Path] | None" = _UNSET,
     max_size_bytes: int = 500 * 1024 * 1024  # 500MB default
 ) -> Path:
     """
@@ -33,18 +65,46 @@ def sanitize_binary_path(
 
     Args:
         binary_path: User-supplied path to binary file
-        allowed_dirs: List of allowed base directories (None = allow any)
+        allowed_dirs: List of allowed base directories. Omit it (the default)
+            to have the configured ``BINARY_MCP_ALLOWED_DIRS`` allow-list
+            applied automatically -- this is what confines every tool entry
+            point without each one having to pass the list. Pass an explicit
+            list to override, or ``None`` to opt out of confinement for this
+            one call.
         max_size_bytes: Maximum allowed file size in bytes
 
     Returns:
         Validated absolute path
 
     Raises:
-        PathTraversalError: If path is invalid or outside allowed directories
+        PathTraversalError: If path is invalid, outside allowed directories,
+            or confinement is required but unconfigured
         FileSizeError: If file exceeds size limit
         FileNotFoundError: If file does not exist
         ValueError: If path validation fails
     """
+    # Resolve the confinement policy centrally so every caller is confined
+    # uniformly. Historically most call sites passed no allowed_dirs and thus
+    # silently skipped confinement even when the operator had set
+    # BINARY_MCP_ALLOWED_DIRS (audit H9/P4).
+    if allowed_dirs is _UNSET:
+        allowed_dirs = get_allowed_dirs()
+
+    if not allowed_dirs:
+        # Confinement is off: unconfigured, or an explicit None/empty list.
+        # Default-open is a foot-gun -- an operator may believe analysis is
+        # sandboxed to a quarantine dir when it is not (audit M13). Fail
+        # closed if demanded; otherwise warn once and proceed unrestricted.
+        if _confinement_required():
+            raise PathTraversalError(
+                "Path confinement is required "
+                "(BINARY_MCP_REQUIRE_CONFINEMENT is set) but "
+                "BINARY_MCP_ALLOWED_DIRS is not configured; refusing to open "
+                f"{binary_path}."
+            )
+        _warn_confinement_disabled_once(binary_path)
+        allowed_dirs = None  # normalise [] -> None for the checks below
+
     # Check for symlinks BEFORE resolving (prevent TOCTOU race)
     raw_path = Path(binary_path)
 

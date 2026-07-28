@@ -2527,6 +2527,12 @@ def search_bytes(
     try:
         from src.utils.binary_reader import BinaryReader
 
+        # search_bytes was the only file-reading tool that skipped this, so it
+        # bypassed BINARY_MCP_ALLOWED_DIRS confinement and the size ceiling
+        # entirely (audit H8). Validate up front; the except handlers below
+        # already turn PathTraversalError/FileSizeError into a safe message.
+        binary_path = str(sanitize_binary_path(binary_path))
+
         max_results = validate_numeric_range(max_results, 1, 1000, "max_results")
 
         parsed = _parse_byte_pattern(pattern)

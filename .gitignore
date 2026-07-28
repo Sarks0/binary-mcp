@@ -89,3 +89,4 @@ temp_analysis_*.json
 security/
 DEVELOPMENT_ROADMAP.md
 WINDBG_INTEGRATION_PLAN.md
+AUDIT.md

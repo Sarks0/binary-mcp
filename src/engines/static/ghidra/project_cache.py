@@ -21,6 +21,8 @@ import shutil
 import time
 from pathlib import Path
 
+from src.utils.config import get_cache_dir
+
 logger = logging.getLogger(__name__)
 
 # Side-car suffixes that share the <hash>.<suffix> stem with a cache file.
@@ -36,10 +38,13 @@ class ProjectCache:
         Initialize project cache.
 
         Args:
-            cache_dir: Directory for cache storage. Defaults to ~/.ghidra_mcp_cache
+            cache_dir: Directory for cache storage. When omitted, resolves via
+                ``get_cache_dir()`` ($BINARY_CACHE_DIR, then ~/ghidra_mcp_cache)
+                -- the same root sessions and error logs use, so runner.py's
+                ghidra_projects/ subdir stays co-located with everything else.
         """
         if cache_dir is None:
-            self.cache_dir = Path.home() / ".ghidra_mcp_cache"
+            self.cache_dir = get_cache_dir()
         else:
             self.cache_dir = Path(cache_dir)
 

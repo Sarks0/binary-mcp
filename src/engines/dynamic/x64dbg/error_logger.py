@@ -17,7 +17,7 @@ class X64DbgErrorLogger(BaseErrorLogger):
     """
     Error logger for x64dbg operations.
 
-    Stores errors in `~/.ghidra_mcp_cache/x64dbg_errors/` with:
+    Stores errors in `~/ghidra_mcp_cache/x64dbg_errors/` with:
     - Individual JSON files per error
     - Manifest file for quick browsing
     - Statistics for error analysis

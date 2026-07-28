@@ -193,7 +193,7 @@ Examples:
     parser.add_argument(
         "--error-dir",
         metavar="DIR",
-        help="Custom error directory (default: ~/.ghidra_mcp_cache/x64dbg_errors/)"
+        help="Custom error directory (default: ~/ghidra_mcp_cache/x64dbg_errors/)"
     )
 
     args = parser.parse_args()

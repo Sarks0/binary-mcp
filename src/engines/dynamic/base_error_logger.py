@@ -13,6 +13,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from src.utils.config import get_cache_dir
+
 logger = logging.getLogger(__name__)
 
 
@@ -56,7 +58,7 @@ class BaseErrorLogger:
     """
     Base error logger for dynamic analysis engines.
 
-    Stores errors in `~/.ghidra_mcp_cache/<error_dir_name>/` with:
+    Stores errors in `~/ghidra_mcp_cache/<engine>_errors/` with:
     - Individual JSON files per error
     - Manifest file for quick browsing
     - Statistics for error analysis
@@ -77,13 +79,13 @@ class BaseErrorLogger:
         Initialize error logger.
 
         Args:
-            error_dir: Directory for error storage
-                       (defaults to ~/.ghidra_mcp_cache/<engine>_errors/)
+            error_dir: Directory for error storage (defaults to the
+                       ``<engine>_errors/`` subdir of the shared cache root;
+                       see ``get_cache_dir``)
             max_errors: Maximum number of errors to keep (oldest removed first)
         """
         if error_dir is None:
-            cache_dir = Path.home() / ".ghidra_mcp_cache"
-            self.error_dir = cache_dir / self._error_dir_name
+            self.error_dir = get_cache_dir() / self._error_dir_name
         else:
             self.error_dir = Path(error_dir)
 

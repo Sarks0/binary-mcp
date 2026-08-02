@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cctype>
 #include <wincrypt.h>  // For CryptGenRandom
+#include <sddl.h>      // For ConvertSidToStringSid / SDDL security descriptors
 
 // x64dbg SDK headers
 #include "pluginsdk/_plugins.h"
@@ -3597,24 +3598,130 @@ void OnSystemBreakpoint(CBTYPE cbType, PLUG_CB_SYSTEMBREAKPOINT* info) {
     );
 }
 
-// Defense-in-depth: server-side allowlist for EXECUTE_COMMAND.
-// Blocks commands that could load external code, write arbitrary files,
-// or compromise the debugger/analyst host. The Python layer has its own
-// allowlist; this is a safety net in case it is bypassed.
-static const char* BLOCKED_COMMAND_PREFIXES[] = {
-    "scriptdll", "scriptload", "scriptrun",
-    "loadlib", "freelib",
-    "savedata", "savefile",
-    "quit", "stop", "exit",
-    "detach", "attach", "init",
-    "exec", "execute",
-    "createthread",
-    "tracesetcommand", "tracesetlog", "tracesetlogfile",
+// ---------------------------------------------------------------------------
+// EXECUTE_COMMAND gate -- AUTHORITATIVE. Allowlist, fails closed.
+//
+// What this used to be, and why it was replaced (audit findings F-4 / F-9):
+//
+// F-4: this was a ~19-entry DENYLIST (BLOCKED_COMMAND_PREFIXES) that was
+// byte-identical to _BLOCKED_COMMANDS in bridge.py, matched the same way
+// (exact compare against the lowercased first token). The comment here claimed
+// it was "a safety net in case the Python layer is bypassed", but a copy of a
+// list is not a second control: every command absent from the Python list was
+// absent from this one too. One control, described as two.
+//
+// F-9: worse, a denylist cannot work against this command language at all.
+// x64dbg registers MULTIPLE ALIASES per command handler and the list named
+// exactly one spelling of each, so any other spelling walked straight through.
+// The command that STARTS a debuggee is `init` -- HandleLoadBinary below
+// builds `init "<path>"` for exactly that purpose -- so one missed alias turns
+// EXECUTE_COMMAND into an arbitrary-process-launch primitive on the analyst's
+// own host. For a malware-analysis tool that is a cardinal-rule violation, and
+// it is not fixable by adding more entries: the alias set is defined by
+// x64dbg, not by us, and grows with every x64dbg release.
+//
+// So the gate is INVERTED. Only the commands below are executable; anything
+// unrecognised is refused, including aliases nobody here has heard of. An
+// unknown alias of a dangerous command now fails closed instead of open.
+//
+// Relationship to the Python layer: bridge.py keeps a small denylist, but it
+// is NOT this control. It is a cheap early reject that produces a clear local
+// error before a request crosses the pipe. It denies by name; this allows by
+// name. They are deliberately different in direction and in contents, and when
+// they disagree THIS list decides, because this is the last thing standing
+// between a request and DbgCmdExec. Never widen this list because the Python
+// list happens to permit something.
+//
+// Contents are derived from what this project actually issues on the command
+// endpoint: the commands built by src/engines/dynamic/x64dbg/bridge.py, the
+// tool-level allowlist in src/tools/dynamic_tools.py (allowed_command_prefixes),
+// and the examples in x64dbg_execute_command's docstring (dis.prev, findall,
+// log). Keep it tight -- every entry added here is granted to every MCP client
+// and to anything that can reach the local HTTP port. In particular the trace
+// CONFIGURATION commands (tracesetcommand / tracesetlog / tracesetlogfile) are
+// intentionally absent: their arguments are themselves commands and file
+// paths, so allowing them would re-open the hole this table closes. The trace
+// EXECUTION commands (ticnd/tocnd/tibt/tobt) are present because the bridge's
+// conditional-tracing methods issue them and they only resume the debuggee,
+// which the dedicated run/step tools already permit.
+// ---------------------------------------------------------------------------
+static const char* ALLOWED_COMMANDS[] = {
+    // Disassembly navigation and instruction queries (read-only)
+    "dis", "disasm", "dis.prev", "dis.next", "dis.iscall", "dis.isbranch",
+    "graph", "graphit",
+    "dump", "sdump",
+
+    // Search: memory, patterns, assembly, GUIDs (read-only)
+    "find", "findall", "findmem", "findallmem",
+    "findasm", "findguid",
+
+    // Cross-references and module call discovery (read-only)
+    "ref", "refstr", "refsearch", "refinfo", "reffindrange",
+    "modcallfind",
+
+    // Static analysis passes over the loaded module (read-only)
+    "cfanalyze", "analxrefs", "analrecur", "analadv", "analyse",
+    "exhandlers", "exinfo",
+
+    // Expression evaluation and logging (read-only / output-only)
+    "eval", "log", "msg",
+
+    // Annotations: labels, comments, bookmarks. These mutate the analysis
+    // database only -- never the debuggee and never the host filesystem.
+    "lbl", "lblset", "lbldel", "lbllist",
+    "cmt", "cmtset", "cmtdel", "cmtlist",
+    "bm", "bmset", "bmdel", "bmlist",
+
+    // Breakpoint listing / DLL breakpoints. Setting execution breakpoints goes
+    // through the dedicated SET_BREAKPOINT handlers, not through here.
+    "bplist", "bphitcount",
+    "bpdll", "bcdll", "bpedll", "bpddll",
+
+    // Watch expressions (bridge: add_watch / delete_watch / set_watch_*)
+    "addwatch", "delwatch", "setwatchdog",
+    "setwatchexpression", "setwatchname",
+
+    // Type system (bridge: add_struct / add_type / visit_type / ...)
+    "addstruct", "addunion", "addmember", "addtype",
+    "visittype", "sizeoftype", "removetype",
+    "enumtypes", "cleartypes", "loadtypes", "parsetypes",
+
+    // Debugger variables (bridge: set_variable / delete_variable / list_variables)
+    "var", "vardel", "varlist",
+
+    // Debuggee privilege toggles (bridge: enable_privilege / disable_privilege).
+    // These act on the DEBUGGEE's token, not on the debugger, and are exposed
+    // by dedicated tools already.
+    "enableprivilege", "disableprivilege",
+
+    // Execution control that the bridge issues on this endpoint: run-to-user
+    // code, single-instruction undo, and conditional/record tracing.
+    "rtu", "instrundo",
+    "ticnd", "tocnd", "tibt", "tobt",
+    "tracesetcondition",
+
     nullptr  // sentinel
 };
 
-static bool IsCommandBlocked(const std::string& command) {
-    // Extract first word, lowercased
+// Returns true only if the command's first token is on ALLOWED_COMMANDS.
+// Every other input -- unknown command, unknown alias, empty string, anything
+// carrying an embedded line break -- is refused.
+static bool IsCommandAllowed(const std::string& command) {
+    // Only the FIRST token is matched against the table, so nothing that could
+    // smuggle a second command past that check may survive. x64dbg's script
+    // engine is line-oriented, and a CR/LF or NUL inside a single command
+    // string is never legitimate here -- reject outright rather than trying to
+    // parse what the rest of the line would mean.
+    for (size_t i = 0; i < command.size(); i++) {
+        unsigned char c = (unsigned char)command[i];
+        if (c == '\n' || c == '\r' || c == '\0') {
+            return false;
+        }
+    }
+
+    // Extract first word, lowercased. The terminator set matches x64dbg's
+    // argument syntax so that both "findall 0, E8" and the function-call form
+    // "dis.prev(rip, 5)" reduce to their command name.
     std::string firstWord;
     for (size_t i = 0; i < command.size(); i++) {
         char c = command[i];
@@ -3622,8 +3729,13 @@ static bool IsCommandBlocked(const std::string& command) {
         firstWord += (char)tolower((unsigned char)c);
     }
 
-    for (int i = 0; BLOCKED_COMMAND_PREFIXES[i] != nullptr; i++) {
-        if (firstWord == BLOCKED_COMMAND_PREFIXES[i]) {
+    // Fail closed: an empty token is not "no command", it is an unparsed one.
+    if (firstWord.empty()) {
+        return false;
+    }
+
+    for (int i = 0; ALLOWED_COMMANDS[i] != nullptr; i++) {
+        if (firstWord == ALLOWED_COMMANDS[i]) {
             return true;
         }
     }
@@ -3641,10 +3753,15 @@ std::string HandleExecuteCommand(const std::string& request) {
         return BuildJsonResponse(false, "\"error\":\"Not debugging - load a binary first\"");
     }
 
-    // Defense-in-depth: reject dangerous commands at the plugin level
-    if (IsCommandBlocked(command)) {
-        LogInfo("Blocked dangerous command: %s", command.c_str());
-        return BuildJsonResponse(false, "\"error\":\"Command blocked by security policy\"");
+    // Authoritative gate (findings F-4 / F-9): allowlist, fails closed.
+    // Refuse with a JSON error rather than throwing or aborting -- the pipe
+    // server expects a well-formed response for every request, and a refused
+    // command is a normal outcome, not a fault.
+    if (!IsCommandAllowed(command)) {
+        LogInfo("Blocked command (not on allowlist): %s", command.c_str());
+        return BuildJsonResponse(false,
+            "\"error\":\"Command blocked by security policy: not on the allowlist "
+            "of permitted analysis commands\"");
     }
 
     LogInfo("Executing command: %s", command.c_str());
@@ -4368,6 +4485,79 @@ static bool GenerateSecureToken(char* outToken, size_t tokenLength) {
     return true;
 }
 
+// Build a SECURITY_ATTRIBUTES whose DACL grants access to the current user
+// only, for the auth-token file.
+//
+// Audit finding F-15: the token file was created with nullptr security
+// attributes, i.e. the process default DACL. On a normal desktop that already
+// resolves to roughly "this user + SYSTEM + Administrators" and the file lives
+// in the per-user %TEMP%, so the exposure was limited -- but the file contains
+// the bearer token that drives this debugger, and "limited by default policy"
+// is not the same as "restricted on purpose". A default DACL also inherits
+// whatever the token's default owner/group happens to be, which is not
+// something this plugin should be relying on.
+//
+// Threat that remains regardless: a sample detonated as the analyst's own user
+// can read this file (and the OBSIDIAN_AUTH_TOKEN environment variable) and
+// then drive x64dbg through the local HTTP API. An explicit user-only DACL
+// does not stop that -- same user, same access. Detonate untrusted samples as
+// a separate low-privilege principal or in a disposable VM; do not treat this
+// token as a boundary against the sample itself.
+//
+// On success the caller owns *outSd and must LocalFree it after the file is
+// created. On failure sa is left usable as "no explicit descriptor".
+static bool BuildCurrentUserOnlySecurity(SECURITY_ATTRIBUTES& sa, PSECURITY_DESCRIPTOR& outSd) {
+    outSd = nullptr;
+    sa.nLength = sizeof(SECURITY_ATTRIBUTES);
+    sa.lpSecurityDescriptor = nullptr;
+    sa.bInheritHandle = FALSE;
+
+    HANDLE hToken = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
+        return false;
+    }
+
+    DWORD len = 0;
+    GetTokenInformation(hToken, TokenUser, nullptr, 0, &len);  // expected to fail, sizes the buffer
+    if (len == 0) {
+        CloseHandle(hToken);
+        return false;
+    }
+
+    std::vector<char> buffer(len);
+    if (!GetTokenInformation(hToken, TokenUser, buffer.data(), len, &len)) {
+        CloseHandle(hToken);
+        return false;
+    }
+    CloseHandle(hToken);
+
+    TOKEN_USER* tokenUser = reinterpret_cast<TOKEN_USER*>(buffer.data());
+    LPSTR sidString = nullptr;
+    if (!ConvertSidToStringSidA(tokenUser->User.Sid, &sidString)) {
+        return false;
+    }
+
+    // D:P              -> DACL, protected: block inherited ACEs from %TEMP%.
+    // (A;;FA;;;<sid>)  -> allow FILE_ALL_ACCESS to this user's SID and nobody
+    //                     else. Administrators and SYSTEM are deliberately not
+    //                     listed; they can take ownership anyway, so naming
+    //                     them would only widen the ACL for no gain.
+    std::string sddl = "D:P(A;;FA;;;";
+    sddl += sidString;
+    sddl += ")";
+    LocalFree(sidString);
+
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorA(
+            sddl.c_str(), SDDL_REVISION_1, &sd, nullptr)) {
+        return false;
+    }
+
+    outSd = sd;
+    sa.lpSecurityDescriptor = sd;
+    return true;
+}
+
 void pluginSetup() {
     LogInfo("Setting up plugin");
 
@@ -4394,16 +4584,43 @@ void pluginSetup() {
         char tokenPath[MAX_PATH];
         snprintf(tokenPath, MAX_PATH, "%sx64dbg_mcp_token.txt", tempPath);
 
-        // Create file with default security (no custom SDDL)
+        // F-15: create the token file with an explicit DACL naming only the
+        // current user, instead of relying on the process default DACL.
+        SECURITY_ATTRIBUTES sa;
+        PSECURITY_DESCRIPTOR sd = nullptr;
+        bool haveSecurity = BuildCurrentUserOnlySecurity(sa, sd);
+        if (!haveSecurity) {
+            // Non-fatal: fall back to the default DACL (the previous
+            // behaviour) rather than leaving the bridge with no token file.
+            LogError("Could not build restrictive DACL for token file: %d "
+                     "(falling back to default security)", GetLastError());
+        }
+
+        // A security descriptor passed to CreateFileA applies only when the
+        // file is CREATED. With CREATE_ALWAYS an existing file is truncated
+        // and KEEPS ITS OLD DACL, so a stale token file from an earlier run
+        // (or one pre-created by someone else) would silently defeat the ACL
+        // above. Remove it first; a failure here is only interesting if the
+        // file actually exists.
+        if (!DeleteFileA(tokenPath) && GetLastError() != ERROR_FILE_NOT_FOUND) {
+            LogError("Could not remove stale token file before recreate: %d", GetLastError());
+        }
+
         HANDLE hFile = CreateFileA(
             tokenPath,
             GENERIC_WRITE,
             FILE_SHARE_READ,
-            nullptr,       // Default security - same user, same access
+            haveSecurity ? &sa : nullptr,   // explicit user-only DACL
             CREATE_ALWAYS,
             FILE_ATTRIBUTE_NORMAL,
             nullptr
         );
+
+        // The descriptor is consumed at creation time; the file keeps its ACL.
+        if (sd) {
+            LocalFree(sd);
+            sd = nullptr;
+        }
 
         if (hFile != INVALID_HANDLE_VALUE) {
             DWORD bytesWritten;

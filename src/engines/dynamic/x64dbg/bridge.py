@@ -1992,10 +1992,30 @@ class X64DbgBridge(Debugger):
             "message": result.get("message", "Instruction undone"),
         }
 
-    # Commands that must never reach DbgCmdExec -- they load external code,
-    # write arbitrary files, or compromise the debugging session.
-    # Trace configuration commands are also blocked here because their
-    # arguments (arbitrary commands, file paths) bypass validation -- use
+    # Fast-fail denylist -- NOT the authoritative command gate.
+    #
+    # Audit finding F-4: this list used to be byte-identical to the C++
+    # BLOCKED_COMMAND_PREFIXES table in plugin.cpp, and both used the same
+    # exact-first-token match. Two copies of one list is one control described
+    # as two: any command missing here was missing there as well, so the
+    # "defense-in-depth" claim was false. The plugin gate has since been
+    # INVERTED to an allowlist (see ALLOWED_COMMANDS in plugin.cpp) and is now
+    # the authoritative decision point -- it fails CLOSED on any command it
+    # does not recognise, which is the only structure robust to x64dbg's
+    # alias-rich command language (finding F-9: x64dbg registers several
+    # spellings per handler, e.g. init/initdbg/InitDebug all start a process).
+    #
+    # This list survives only as a cheap early reject: it turns the obvious
+    # dangerous cases into a clear local ValueError with an actionable message
+    # instead of paying a round trip to the plugin for a generic refusal. It is
+    # deliberately a DIFFERENT control from the plugin's: different direction
+    # (deny vs allow), different contents (it names alias spellings the plugin
+    # does not need to enumerate, because the plugin rejects unknown tokens by
+    # default). Do not treat an omission here as permission -- the plugin
+    # decides. Never relax the plugin allowlist on the strength of this list.
+    #
+    # Trace configuration commands are denied here because their arguments are
+    # themselves commands and file paths, which would bypass validation -- use
     # the dedicated set_trace_command / set_trace_log_file methods instead.
     _BLOCKED_COMMANDS = frozenset({
         "scriptdll", "scriptload", "scriptrun",
@@ -2006,16 +2026,45 @@ class X64DbgBridge(Debugger):
         "exec", "execute",
         "createthread",
         "tracesetcommand", "tracesetlog", "tracesetlogfile",
+        # Known alias spellings of the above handlers. x64dbg registers
+        # multiple names per command callback, so blocking one spelling blocks
+        # nothing (F-9). These are the process-control and code-loading aliases
+        # worth naming explicitly at this layer; the plugin allowlist is what
+        # actually catches the ones nobody thought of.
+        "initdbg", "initdebug", "startdebug",
+        "attachdebugger", "detachdebugger",
+        "stopdebug", "dbgstop",
+        "plugload", "pluginload", "plugunload", "pluginunload",
+        "threadcreate", "newthread", "killthread", "threadkill",
+        "setjit", "restartadmin",
+        "scylla", "startscylla", "imprec",
+        "chd",
     })
 
     def _validate_command(self, command: str) -> None:
         """
-        Validate a command against the blocked commands list.
+        Early-reject a command against the fast-fail denylist.
+
+        This is not the authoritative gate -- the plugin's ALLOWED_COMMANDS
+        allowlist is (see the comment on _BLOCKED_COMMANDS). Passing this
+        check does not mean the command will be executed.
 
         Raises:
-            ValueError: If the command is blocked for security reasons
+            ValueError: If the command is empty or is denied by this layer
         """
-        first_token = command.strip().split()[0].split("(")[0].lower()
+        # Audit finding F-12: this previously did command.strip().split()[0],
+        # which raises IndexError on an empty or whitespace-only command.
+        # Callers of execute_command() catch ValueError as "rejected input";
+        # an IndexError escapes as an opaque internal error. Reject empty input
+        # up front, the same way windbg/allowlist.py::validate_command does.
+        stripped = (command or "").strip()
+        if not stripped:
+            raise ValueError("Command cannot be empty")
+
+        # Split on the argument separators x64dbg itself accepts so the token
+        # we test is the command name: "dis.prev(rip, 5)" -> "dis.prev" and
+        # "init,\"C:\\evil.exe\"" -> "init" rather than the whole blob.
+        first_token = stripped.split()[0].split("(")[0].split(",")[0].lower()
         if first_token in self._BLOCKED_COMMANDS:
             raise ValueError(
                 f"Command '{first_token}' is blocked by security policy. "

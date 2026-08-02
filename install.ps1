@@ -10,7 +10,10 @@ param(
     [string]$WinDbgDir = "",  # Auto-detected from Windows SDK
     [ValidateSet("", "full", "static", "dynamic", "kernel", "custom", "repair")]
     [string]$InstallProfile = "",  # full, static, dynamic, kernel, custom, repair
-    [switch]$Unattended
+    [switch]$Unattended,
+    # Turn every "could not verify this download" warning into a hard failure.
+    # See the supply-chain integrity section below (audit finding F-3).
+    [switch]$StrictIntegrity
 )
 
 $ErrorActionPreference = "Stop"
@@ -41,6 +44,335 @@ function Test-Command {
 
 function Test-WingetAvailable {
     return (Test-Command winget)
+}
+
+# Supply-Chain Integrity Helpers (audit finding F-3)
+#
+# This installer runs elevated (#Requires -RunAsAdministrator) and drops code
+# onto a malware analyst's machine - including obsidian.dp64, which x64dbg
+# loads into the same process that debugs live malware. Downloading over TLS
+# proves only *who served* the bytes, never *which* bytes were served: a
+# tampered CDN copy, a swapped GitHub release asset, or an interception proxy
+# whose root the machine trusts all still yield code execution as
+# Administrator. So every artifact fetched below is hash-checked before it is
+# used, and PE artifacts that ought to be signed also get an Authenticode
+# check.
+#
+# An expected SHA-256 is resolved in this order:
+#   1. a checksum manifest published alongside the artifact's GitHub release
+#      (SHA256SUMS / <asset>.sha256) - this is what binary-mcp's own release
+#      assets should ship, and it is the hash the maintainer actually controls;
+#   2. a best-effort scrape of the release notes for a digest next to the asset
+#      name (Ghidra publishes checksums this way);
+#   3. a value pinned in $script:PinnedSha256 below;
+#   4. the BINARY_MCP_SHA256_<KEY> environment variable, so an operator can pin
+#      a third-party artifact (Ghidra, the x64dbg snapshot build, the Windows
+#      SDK bootstrapper) whose upstream publishes no stable digest we could
+#      hard-code here.
+#
+# Note what each of those does and does not buy: a manifest fetched from the
+# same release defeats tampering with an individual asset or its CDN copy, but
+# not a takeover of the release itself. A pinned/operator-supplied hash is the
+# only thing that defends against that, which is why pinning is offered for
+# every artifact rather than only the unusual ones.
+#
+# When none of those yields a hash the install no longer continues silently as
+# it did before this finding: it prints a loud, unmissable warning naming the
+# artifact, the URL, and the digest that was actually downloaded, so the
+# operator can pin it for next time. -StrictIntegrity (or
+# BINARY_MCP_STRICT_INTEGRITY=1) turns those warnings into hard failures.
+
+# Known-good digests. Deliberately empty by default: a wrong pinned hash breaks
+# every install, and these upstreams publish new builds faster than this file
+# can track them. Populate an entry (or set the matching env var) to pin.
+$script:PinnedSha256 = @{
+    'uv-installer-ps1'  = ''
+    'ghidra-zip'        = ''
+    'x64dbg-snapshot'   = ''
+    'windows-sdk-setup' = ''
+    'repo-zip'          = ''
+}
+
+function Get-IntegrityEnvName {
+    param([Parameter(Mandatory = $true)][string]$HashKey)
+    return "BINARY_MCP_SHA256_" + (($HashKey -replace '[^A-Za-z0-9]', '_').ToUpperInvariant())
+}
+
+function Test-StrictIntegrity {
+    if ($StrictIntegrity) { return $true }
+    $flag = [System.Environment]::GetEnvironmentVariable("BINARY_MCP_STRICT_INTEGRITY")
+    if ($flag -and @('1', 'true', 'yes', 'on') -contains $flag.Trim().ToLowerInvariant()) {
+        return $true
+    }
+    return $false
+}
+
+function Get-PinnedSha256 {
+    # Operator-supplied env var wins over the in-script table so an analyst can
+    # pin today's Ghidra build without editing (and re-signing) the installer.
+    param([Parameter(Mandatory = $true)][string]$HashKey)
+    $fromEnv = [System.Environment]::GetEnvironmentVariable((Get-IntegrityEnvName $HashKey))
+    if ($fromEnv -and $fromEnv.Trim()) { return $fromEnv.Trim() }
+    if ($script:PinnedSha256.ContainsKey($HashKey) -and $script:PinnedSha256[$HashKey]) {
+        return $script:PinnedSha256[$HashKey].Trim()
+    }
+    return $null
+}
+
+function Get-FileSha256 {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
+}
+
+function Assert-FileHash {
+    <#
+        Verify a downloaded file against an expected SHA-256, and on mismatch
+        DELETE it before throwing. Deleting matters: a rejected artifact left
+        in %TEMP% is one retry, one stale path, or one curious double-click
+        away from being executed anyway - and this script runs as Administrator.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$ExpectedSha256,
+        [string]$Description = "file"
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "Integrity check failed: $Description is missing from $Path"
+    }
+
+    $expected = $ExpectedSha256.Trim()
+    if ($expected -notmatch '^[0-9a-fA-F]{64}$') {
+        Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+        throw "Integrity check failed: expected SHA-256 for $Description is not a 64-character hex digest (got '$expected')"
+    }
+
+    # Get-FileHash returns uppercase; published manifests are usually lowercase.
+    # Compare case-insensitively instead of normalising one side and hoping.
+    $actual = Get-FileSha256 -Path $Path
+    if (-not [string]::Equals($actual, $expected, [System.StringComparison]::OrdinalIgnoreCase)) {
+        Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+        $message = "SHA-256 mismatch for ${Description}: expected $($expected.ToLowerInvariant()), got $($actual.ToLowerInvariant()). " +
+                   "The downloaded file has been deleted. Either the artifact was republished upstream " +
+                   "(in which case update the pinned hash) or the download was tampered with - do not " +
+                   "install it by hand without establishing which."
+        throw $message
+    }
+
+    Write-Success "Verified SHA-256 of $Description"
+    return $true
+}
+
+function Write-UnverifiedArtifactWarning {
+    <#
+        Reached when no expected digest could be resolved. The old behaviour was
+        to install the bytes without comment; the point of this warning is that
+        the analyst finds out at the moment it happens, and is handed the exact
+        command to pin the artifact next time.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Description,
+        [Parameter(Mandatory = $true)][string]$HashKey,
+        [string]$Uri = ""
+    )
+
+    $actual = (Get-FileSha256 -Path $Path).ToLowerInvariant()
+    $envName = Get-IntegrityEnvName $HashKey
+
+    Write-Host ""
+    Write-Warn "======================================================================"
+    Write-Warn " UNVERIFIED DOWNLOAD - integrity could NOT be checked"
+    Write-Warn "======================================================================"
+    Write-Warn "  Artifact : $Description"
+    if ($Uri) { Write-Warn "  Source   : $Uri" }
+    Write-Warn "  SHA-256  : $actual"
+    Write-Warn "  No publisher checksum was available and no hash is pinned, so this"
+    Write-Warn "  file is trusted purely because TLS said it came from that host."
+    Write-Warn "  To pin this exact copy for future installs, run before installing:"
+    Write-Warn "      `$env:$envName = '$actual'"
+    Write-Warn "  Re-run with -StrictIntegrity to make unverified downloads fatal."
+    Write-Warn "======================================================================"
+    Write-Host ""
+
+    if (Test-StrictIntegrity) {
+        Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+        throw "StrictIntegrity: refusing to use unverified download '$Description'. Pin it with `$env:$envName = '$actual'."
+    }
+}
+
+function Invoke-VerifiedDownload {
+    <#
+        The only place in this script that writes a remote file to disk.
+        Downloads, then verifies - or warns loudly when there is nothing to
+        verify against. Callers get the same throw-on-failure semantics they
+        already handle in their try/catch blocks.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Uri,
+        [Parameter(Mandatory = $true)][string]$OutFile,
+        [Parameter(Mandatory = $true)][string]$Description,
+        [Parameter(Mandatory = $true)][string]$HashKey,
+        [string]$ExpectedSha256 = ""
+    )
+
+    Invoke-WebRequest -Uri $Uri -OutFile $OutFile -UseBasicParsing
+
+    $expected = $ExpectedSha256
+    if (-not $expected) { $expected = Get-PinnedSha256 -HashKey $HashKey }
+
+    if ($expected) {
+        Assert-FileHash -Path $OutFile -ExpectedSha256 $expected -Description $Description | Out-Null
+    } else {
+        Write-UnverifiedArtifactWarning -Path $OutFile -Description $Description -HashKey $HashKey -Uri $Uri
+    }
+
+    return $true
+}
+
+function Get-ReleaseChecksumMap {
+    <#
+        Parse a checksum manifest published as a GitHub release asset into
+        @{ 'asset-name' = 'sha256' }. Handles both the coreutils layout
+        ("<hash>  <name>", '*' for binary mode) and single-digest "<asset>.sha256"
+        files. Failures are non-fatal: the caller falls back to a pinned hash or
+        to the loud unverified warning.
+    #>
+    param($Release)
+
+    $map = @{}
+    if ($null -eq $Release -or $null -eq $Release.assets) { return $map }
+
+    $sumAssets = @($Release.assets | Where-Object {
+        $_.name -match '^(sha256sums?|checksums?)(\.txt)?$' -or $_.name -match '\.sha256$'
+    })
+
+    foreach ($sumAsset in $sumAssets) {
+        $tempSums = Join-Path $env:TEMP ("binary-mcp-sums-" + [guid]::NewGuid().ToString("N") + ".txt")
+        try {
+            # Downloaded to disk (not piped) and only ever parsed as text - it is
+            # never executed, so it does not need its own integrity check; its
+            # authority is that of the release it is published in.
+            Invoke-WebRequest -Uri $sumAsset.browser_download_url -OutFile $tempSums -UseBasicParsing
+            foreach ($line in (Get-Content -LiteralPath $tempSums)) {
+                $trimmed = $line.Trim()
+                if (-not $trimmed -or $trimmed.StartsWith("#")) { continue }
+                if ($trimmed -match '^([0-9a-fA-F]{64})[\s\*]+(.+)$') {
+                    $name = [System.IO.Path]::GetFileName($matches[2].Trim().TrimStart('*'))
+                    if ($name) { $map[$name] = $matches[1] }
+                } elseif ($trimmed -match '^([0-9a-fA-F]{64})$' -and $sumAsset.name -match '\.sha256$') {
+                    $map[($sumAsset.name -replace '\.sha256$', '')] = $matches[1]
+                }
+            }
+        } catch {
+            Write-Warn "Could not read checksum manifest $($sumAsset.name): $_"
+        } finally {
+            Remove-Item -LiteralPath $tempSums -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    return $map
+}
+
+function Get-ChecksumFromReleaseNotes {
+    <#
+        Best-effort scrape of a release body for a digest published next to the
+        asset name (how Ghidra ships its SHA-256). Only accepts a digest found
+        on, or within two lines of, a line naming the asset, so an unrelated
+        hash elsewhere in the notes cannot be mistaken for this asset's.
+    #>
+    param($Release, [Parameter(Mandatory = $true)][string]$AssetName)
+
+    if ($null -eq $Release -or -not $Release.body) { return $null }
+
+    $lines = @($Release.body -split "`r?`n")
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -notmatch [regex]::Escape($AssetName)) { continue }
+        $upper = [Math]::Min($i + 2, $lines.Count - 1)
+        for ($j = $i; $j -le $upper; $j++) {
+            if ($lines[$j] -match '([0-9a-fA-F]{64})') { return $matches[1] }
+        }
+    }
+    return $null
+}
+
+function Get-ReleaseAssetChecksum {
+    # Convenience wrapper: manifest asset first, release notes second, $null if
+    # neither yields a digest for this asset.
+    param($Release, [Parameter(Mandatory = $true)][string]$AssetName, $ChecksumMap = $null)
+
+    try {
+        if ($null -eq $ChecksumMap) { $ChecksumMap = Get-ReleaseChecksumMap -Release $Release }
+        if ($ChecksumMap -and $ChecksumMap.ContainsKey($AssetName)) { return $ChecksumMap[$AssetName] }
+        return (Get-ChecksumFromReleaseNotes -Release $Release -AssetName $AssetName)
+    } catch {
+        Write-Warn "Could not resolve a published checksum for ${AssetName}: $_"
+        return $null
+    }
+}
+
+function Assert-AuthenticodeValid {
+    <#
+        Authenticode check for PE artifacts. Complements the hash check: a hash
+        pins one exact build, a valid signature says the publisher stands behind
+        whatever build this is.
+
+        Warning, not fatal, by default - binary-mcp's own release assets are not
+        code-signed yet, and failing the install over that would be worse than
+        the status quo. -StrictIntegrity escalates a *bad* signature to fatal,
+        while -AllowUnsigned keeps a plainly unsigned artifact non-fatal even
+        then (unsigned is the expected state for our own assets today; a broken
+        or mismatched signature never is).
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [string]$Description = "file",
+        [string]$ExpectedSubjectMatch = "",
+        [switch]$AllowUnsigned
+    )
+
+    $sig = $null
+    try {
+        $sig = Get-AuthenticodeSignature -FilePath $Path -ErrorAction Stop
+    } catch {
+        Write-Warn "Could not read the Authenticode signature of ${Description}: $_"
+        return $false
+    }
+
+    if ($null -eq $sig) {
+        Write-Warn "Could not read the Authenticode signature of $Description"
+        return $false
+    }
+
+    if ($sig.Status -eq 'Valid') {
+        $subject = ""
+        if ($sig.SignerCertificate) { $subject = $sig.SignerCertificate.Subject }
+        if ($ExpectedSubjectMatch -and ($subject -notmatch [regex]::Escape($ExpectedSubjectMatch))) {
+            Write-Warn "$Description carries a VALID signature from an UNEXPECTED publisher:"
+            Write-Warn "  signer   : $subject"
+            Write-Warn "  expected : subject containing '$ExpectedSubjectMatch'"
+            if (Test-StrictIntegrity) {
+                Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+                throw "StrictIntegrity: unexpected Authenticode signer for $Description ($subject)"
+            }
+            return $false
+        }
+        Write-Success "Authenticode signature valid for $Description"
+        return $true
+    }
+
+    if ($sig.Status -eq 'NotSigned' -and $AllowUnsigned) {
+        Write-Warn "$Description is not Authenticode-signed; its integrity rests on the SHA-256 check alone."
+        return $false
+    }
+
+    Write-Warn "Authenticode verification FAILED for ${Description}: status '$($sig.Status)'"
+    Write-Warn "  This file is about to be installed on a machine that debugs live malware."
+    if (Test-StrictIntegrity) {
+        Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+        throw "StrictIntegrity: Authenticode verification failed for $Description (status: $($sig.Status))"
+    }
+    return $false
 }
 
 function Find-WinDbgPath {
@@ -558,8 +890,31 @@ function Get-UserSelection {
 
 function Install-UV {
     Write-Info "Installing uv package manager..."
+    $uvInstaller = Join-Path $env:TEMP "uv-install.ps1"
     try {
-        Invoke-RestMethod https://astral.sh/uv/install.ps1 | Invoke-Expression
+        # F-3: this used to be `Invoke-RestMethod ... | Invoke-Expression` - a
+        # nested curl|iex inside an installer that itself runs as Administrator.
+        # Whatever bytes came back from the network were executed immediately,
+        # with no copy on disk to inspect and no opportunity to check anything.
+        # Download to a file, verify it, then execute the verified copy.
+        Invoke-VerifiedDownload -Uri "https://astral.sh/uv/install.ps1" -OutFile $uvInstaller `
+            -Description "uv installer script (astral.sh)" -HashKey "uv-installer-ps1" | Out-Null
+
+        # The download carries a Mark-of-the-Web that the execution policy would
+        # otherwise block. Clearing it is safe only *after* verification above.
+        Unblock-File -LiteralPath $uvInstaller -ErrorAction SilentlyContinue
+
+        # Run the verified script in a child PowerShell rather than dot-sourcing
+        # it: same effect (uv's installer persists PATH via the user
+        # environment, which the refresh below picks up) without the execution
+        # policy of this session getting in the way.
+        $psExeName = if ($PSVersionTable.PSEdition -eq 'Core') { 'pwsh' } else { 'powershell' }
+        & $psExeName -NoProfile -ExecutionPolicy Bypass -File $uvInstaller
+        if ($LASTEXITCODE -ne 0) {
+            throw "uv installer exited with code $LASTEXITCODE"
+        }
+        Remove-Item -LiteralPath $uvInstaller -Force -ErrorAction SilentlyContinue
+
         # Refresh PATH: Machine PATH first, then User PATH (standard Windows order)
         $machinePath = [System.Environment]::GetEnvironmentVariable("Path", "Machine")
         $userPath = [System.Environment]::GetEnvironmentVariable("Path", "User")
@@ -616,7 +971,14 @@ function Install-Ghidra {
 
         Write-Info "Downloading Ghidra $($ghidraRelease.tag_name)..."
         $ghidraZip = "$env:TEMP\ghidra.zip"
-        Invoke-WebRequest -Uri $ghidraAsset.browser_download_url -OutFile $ghidraZip -UseBasicParsing
+        # Ghidra ships a new build far more often than this file can track, so
+        # there is no digest to hard-code. Try the checksum published with the
+        # release; failing that the operator can pin BINARY_MCP_SHA256_GHIDRA_ZIP,
+        # and failing that the download is called out loudly as unverified.
+        $ghidraExpected = Get-ReleaseAssetChecksum -Release $ghidraRelease -AssetName $ghidraAsset.name
+        Invoke-VerifiedDownload -Uri $ghidraAsset.browser_download_url -OutFile $ghidraZip `
+            -Description "Ghidra $($ghidraRelease.tag_name) ($($ghidraAsset.name))" `
+            -HashKey "ghidra-zip" -ExpectedSha256 $ghidraExpected | Out-Null
         Write-Success "Downloaded Ghidra"
 
         Write-Info "Extracting Ghidra..."
@@ -796,7 +1158,14 @@ function Install-X64Dbg {
         }
 
         Write-Info "Downloading x64dbg ($($snapshotAsset.name))..."
-        Invoke-WebRequest -Uri $snapshotAsset.browser_download_url -OutFile $x64dbgZip -UseBasicParsing
+        # The x64dbg "snapshot" tag is a rolling release: the asset behind it is
+        # replaced without warning, so a hard-coded digest here would break every
+        # install within days. Use whatever checksum the release publishes, or an
+        # operator pin (BINARY_MCP_SHA256_X64DBG_SNAPSHOT), else warn loudly.
+        $x64dbgExpected = Get-ReleaseAssetChecksum -Release $snapshotRelease -AssetName $snapshotAsset.name
+        Invoke-VerifiedDownload -Uri $snapshotAsset.browser_download_url -OutFile $x64dbgZip `
+            -Description "x64dbg snapshot ($($snapshotAsset.name))" `
+            -HashKey "x64dbg-snapshot" -ExpectedSha256 $x64dbgExpected | Out-Null
         Write-Success "Downloaded x64dbg"
 
         Write-Info "Extracting x64dbg..."
@@ -830,17 +1199,64 @@ function Install-X64Dbg {
                 New-Item -ItemType Directory -Force -Path $plugin64Dir | Out-Null
                 New-Item -ItemType Directory -Force -Path $plugin32Dir | Out-Null
 
-                Invoke-WebRequest -Uri $plugin64.browser_download_url -OutFile "$plugin64Dir\obsidian.dp64" -UseBasicParsing
-                Invoke-WebRequest -Uri $server.browser_download_url -OutFile "$plugin64Dir\obsidian_server.exe" -UseBasicParsing
-                Invoke-WebRequest -Uri $plugin32.browser_download_url -OutFile "$plugin32Dir\obsidian.dp32" -UseBasicParsing
-                Invoke-WebRequest -Uri $server.browser_download_url -OutFile "$plugin32Dir\obsidian_server.exe" -UseBasicParsing
-                Write-Success "Obsidian plugins installed"
+                # F-3, the most load-bearing check in this script: obsidian.dp64
+                # is loaded by x64dbg into the process that debugs live malware,
+                # on an analyst box, installed by an elevated script. These are
+                # OUR release assets, so their digests are ones the maintainer
+                # actually controls - publish a SHA256SUMS file with the release
+                # and every install verifies against it.
+                #
+                # Download to a staging directory first and only copy into the
+                # x64dbg plugins directory after the checks pass, so an artifact
+                # that fails verification is never even momentarily present
+                # somewhere x64dbg would load it from.
+                $checksums = Get-ReleaseChecksumMap -Release $pluginRelease
+                if ($checksums.Count -eq 0) {
+                    Write-Warn "This binary-mcp release publishes no SHA256SUMS manifest -"
+                    Write-Warn "plugin binaries below cannot be verified against a published digest."
+                }
+
+                $stagingDir = Join-Path $env:TEMP ("binary-mcp-plugins-" + [guid]::NewGuid().ToString("N"))
+                New-Item -ItemType Directory -Force -Path $stagingDir | Out-Null
+                try {
+                    $stagedFiles = @{}
+                    foreach ($asset in @($plugin64, $plugin32, $server)) {
+                        $staged = Join-Path $stagingDir $asset.name
+                        $expected = $null
+                        if ($checksums.ContainsKey($asset.name)) { $expected = $checksums[$asset.name] }
+
+                        Invoke-VerifiedDownload -Uri $asset.browser_download_url -OutFile $staged `
+                            -Description "binary-mcp release asset $($asset.name)" `
+                            -HashKey ("binary-mcp-" + $asset.name) -ExpectedSha256 $expected | Out-Null
+
+                        # Wired up now so signing the release later needs no
+                        # installer change. -AllowUnsigned because the assets are
+                        # not code-signed today; a *broken* signature still warns
+                        # (and is fatal under -StrictIntegrity).
+                        Assert-AuthenticodeValid -Path $staged -Description $asset.name -AllowUnsigned | Out-Null
+
+                        $stagedFiles[$asset.name] = $staged
+                    }
+
+                    Copy-Item -LiteralPath $stagedFiles[$plugin64.name] -Destination "$plugin64Dir\obsidian.dp64" -Force
+                    Copy-Item -LiteralPath $stagedFiles[$server.name] -Destination "$plugin64Dir\obsidian_server.exe" -Force
+                    Copy-Item -LiteralPath $stagedFiles[$plugin32.name] -Destination "$plugin32Dir\obsidian.dp32" -Force
+                    Copy-Item -LiteralPath $stagedFiles[$server.name] -Destination "$plugin32Dir\obsidian_server.exe" -Force
+                    Write-Success "Obsidian plugins installed"
+                } finally {
+                    Remove-Item -LiteralPath $stagingDir -Recurse -Force -ErrorAction SilentlyContinue
+                }
             } else {
                 Write-Warn "Pre-built Obsidian plugins not found in latest release"
                 Write-Info "Build manually: src/engines/dynamic/x64dbg/plugin/README.md"
             }
         } catch {
-            Write-Warn "Failed to install Obsidian plugins: $_"
+            # An integrity failure lands here. Not installing the plugins is the
+            # safe outcome, but say so unambiguously rather than leaving a
+            # one-line warning about a DLL x64dbg would load next to live malware.
+            Write-Err "Obsidian plugin installation ABORTED: $_"
+            Write-Warn "x64dbg is installed, but the MCP bridge plugins are not."
+            Write-Info "Build them from source instead: src/engines/dynamic/x64dbg/plugin/README.md"
         }
 
         return $true
@@ -891,7 +1307,15 @@ function Install-WinDbg {
             try {
                 $sdkSetup = "$env:TEMP\winsdksetup.exe"
                 Write-Info "Downloading Windows SDK installer..."
-                Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/?linkid=2173743" -OutFile $sdkSetup -UseBasicParsing
+                # A go.microsoft.com fwlink resolves to whatever build Microsoft
+                # currently serves, so no digest can be pinned in-tree
+                # (BINARY_MCP_SHA256_WINDOWS_SDK_SETUP if an operator wants to).
+                # The bootstrapper is Microsoft-signed, though, so Authenticode
+                # is the real check here - and it runs elevated moments later.
+                Invoke-VerifiedDownload -Uri "https://go.microsoft.com/fwlink/?linkid=2173743" -OutFile $sdkSetup `
+                    -Description "Windows SDK bootstrapper (winsdksetup.exe)" -HashKey "windows-sdk-setup" | Out-Null
+                Assert-AuthenticodeValid -Path $sdkSetup -Description "Windows SDK bootstrapper" `
+                    -ExpectedSubjectMatch "Microsoft Corporation" | Out-Null
 
                 Write-Info "Installing Debugging Tools for Windows (silent)..."
                 $proc = Start-Process -FilePath $sdkSetup -ArgumentList "/features OptionId.WindowsDesktopDebuggers /quiet" -Wait -PassThru
@@ -1045,7 +1469,13 @@ function Install-BinaryMCP {
                 Write-Warn "Git not found. Downloading as ZIP..."
                 $zipUrl = "https://github.com/Sarks0/binary-mcp/archive/refs/heads/main.zip"
                 $zipFile = "$env:TEMP\binary-mcp.zip"
-                Invoke-WebRequest -Uri $zipUrl -OutFile $zipFile -UseBasicParsing
+                # A branch archive has no stable digest by construction - it
+                # changes with every push, and GitHub does not publish checksums
+                # for it. That is exactly why the git clone path above is
+                # preferred (it at least verifies commit contents against the
+                # remote); this fallback says out loud that it cannot verify.
+                Invoke-VerifiedDownload -Uri $zipUrl -OutFile $zipFile `
+                    -Description "binary-mcp source archive (main branch)" -HashKey "repo-zip" | Out-Null
                 Expand-Archive -Path $zipFile -DestinationPath "$env:TEMP\binary-mcp-extract" -Force
                 Move-Item "$env:TEMP\binary-mcp-extract\binary-mcp-main\*" $InstallDir -Force
                 Remove-Item "$env:TEMP\binary-mcp-extract" -Recurse -Force

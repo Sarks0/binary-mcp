@@ -99,9 +99,20 @@ downloaded script into an interpreter.
 
 ### What the installers verify
 
+> **Status — read this before relying on the table below.** The verification
+> machinery is implemented, but for binary-mcp's own release assets it is
+> currently **inert**: `.github/workflows/release.yml` does not yet publish a
+> `SHA256SUMS` manifest, and no digests ship pinned in the installer. Until that
+> workflow is updated, `obsidian.dp64`, `obsidian.dp32` and `obsidian_server.exe`
+> are downloaded, reported with the SHA-256 that was actually received, and
+> installed **without** their integrity being confirmed against a trusted value.
+> Treat the plugin install as unverified today, and pin the digests manually
+> (see "Pinning a hash") if you need assurance now. Publishing `SHA256SUMS` from
+> the release workflow is the fix, and is tracked as follow-up work.
+
 | Artifact | How it is verified |
 |---|---|
-| binary-mcp release assets (`obsidian.dp64`, `obsidian.dp32`, `obsidian_server.exe`) | SHA-256 against the `SHA256SUMS` manifest published with the GitHub release, plus an Authenticode check on Windows |
+| binary-mcp release assets (`obsidian.dp64`, `obsidian.dp32`, `obsidian_server.exe`) | SHA-256 against a `SHA256SUMS` manifest published with the GitHub release, or an operator-pinned hash. **Neither exists yet — see the status note above; unverified in practice today** |
 | Ghidra release zip | SHA-256 from the checksum published with the Ghidra release, or an operator-pinned hash |
 | x64dbg snapshot zip | Operator-pinned hash (the `snapshot` tag is a rolling build with no fixed digest) |
 | uv / .NET install scripts | Operator-pinned hash; downloaded to disk and verified before execution, never piped |

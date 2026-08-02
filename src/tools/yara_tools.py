@@ -262,19 +262,27 @@ def register_yara_tools(app, session_manager):
         output_path: str = "",
     ) -> str:
         """
-        Generate a Yara rule from analysis session data.
+        Generate Yara rule TEXT from analysis session data.
 
         Creates detection rules based on unique strings, imports,
         and other indicators collected during analysis.
+
+        This server generates rules only -- it does not compile or run them.
+        There is no Yara scanning tool here and the yara-python library is not
+        imported anywhere in src/ (audit finding F-11, which found the README
+        advertising "rule scanning"). Take the emitted text to your own Yara
+        installation to actually match it against files.
 
         Args:
             session_id: Session ID (uses active session if empty)
             rule_name: Name for the rule (auto-generated if empty)
             strictness: Rule strictness - "low" (more FPs), "medium", "high" (fewer FPs)
-            output_path: Optional path to save rule
+            output_path: Optional path to save rule. Confined to
+                ~/.binary_mcp_output/yara -- a relative name lands inside that
+                directory; absolute paths and ".."/symlink escapes are refused.
 
         Returns:
-            Generated Yara rule
+            Generated Yara rule text
 
         Example:
             generate_yara_rule_from_session()
@@ -368,23 +376,29 @@ def register_yara_tools(app, session_manager):
         output_path: str = "",
     ) -> str:
         """
-        Generate a Yara rule by extracting strings from a binary.
+        Generate Yara rule TEXT by extracting strings from a binary.
 
-        Analyzes the binary directly to find unique, high-value strings
-        suitable for detection.
+        Reads the binary and picks unique, high-value strings suitable for
+        detection. The file is only read, never executed.
+
+        As with generate_yara_rule_from_session, this produces rule text and
+        nothing more -- no rule is compiled or run against anything (F-11).
 
         Args:
-            binary_path: Path to binary file
+            binary_path: Path to binary file. Subject to the same path
+                confinement as every other analysis tool (BINARY_MCP_ALLOWED_DIRS,
+                defaulting to the quarantine directories -- see README).
             rule_name: Name for the rule (auto-generated if empty)
             strictness: Rule strictness - "low", "medium", "high"
-            output_path: Optional path to save rule
+            output_path: Optional path to save rule. Confined to
+                ~/.binary_mcp_output/yara; give a bare filename.
 
         Returns:
-            Generated Yara rule
+            Generated Yara rule text
 
         Example:
-            generate_yara_rule_from_strings("malware.exe")
-            generate_yara_rule_from_strings("malware.exe", strictness="high")
+            generate_yara_rule_from_strings("/tmp/samples/malware.exe")
+            generate_yara_rule_from_strings("/tmp/samples/malware.exe", strictness="high")
         """
         try:
             binary_path = sanitize_binary_path(binary_path)

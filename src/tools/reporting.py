@@ -367,7 +367,11 @@ def register_reporting_tools(app, session_manager):
 
         Args:
             session_id: Session ID to generate report for (uses active session if empty)
-            output_path: Optional path to save report to file
+            output_path: Optional path to save report to file. Confined to
+                ~/.binary_mcp_output/reports -- a relative name is interpreted
+                inside that directory, and an absolute path or one that escapes
+                it via ".." or a symlink is refused. This tool cannot write
+                anywhere else on the host.
             format: Report format (currently only "markdown" supported)
             sections: Comma-separated list of sections to include
                       (executive_summary,iocs,mitre_attack,technical_details,timeline,recommendations)
@@ -435,7 +439,9 @@ def register_reporting_tools(app, session_manager):
         Args:
             session_id: Session ID (uses active session if empty)
             format: Export format (text, csv, json)
-            output_path: Optional path to save IOCs
+            output_path: Optional path to save IOCs. Confined to
+                ~/.binary_mcp_output/reports, same as generate_report -- give a
+                bare filename; absolute or escaping paths are refused.
 
         Returns:
             Exported IOCs

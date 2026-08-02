@@ -1,13 +1,23 @@
 """
 Binary MCP Server for comprehensive binary analysis.
 
-Provides 245 tools for static and dynamic binary analysis:
+Provides 279 tools for static and dynamic binary analysis:
 - Static analysis via Ghidra (headless mode) for native binaries
 - Static analysis via ILSpyCmd for .NET assemblies
 - Dynamic analysis via x64dbg (native plugin)
+- Kernel and crash-dump debugging via WinDbg/CDB (Windows only)
 - Control flow analysis (CFG, cyclomatic complexity, loops, dead code)
 - Malware behavior detection (10 categories, anti-analysis, API call chains)
 - Function hashing and cross-binary matching
+
+The tool count above is asserted by tests/test_docs_accuracy.py against the
+tools actually registered by main(), so it cannot silently drift (audit
+finding F-11: this said "245" while 279 were registered, and a documented
+capability count that overstates reality is a claim a caller may act on).
+
+Samples are never executed by this server and never uploaded anywhere: no
+tool can launch a binary (see README, "Operational safety"), and the
+VirusTotal integration is lookup-only.
 """
 
 import contextlib

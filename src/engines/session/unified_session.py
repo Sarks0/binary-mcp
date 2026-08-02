@@ -12,6 +12,7 @@ import gzip
 import hashlib
 import json
 import logging
+import re
 import time
 import uuid
 from enum import Enum
@@ -20,6 +21,62 @@ from pathlib import Path
 from src.utils.security import safe_regex_compile
 
 logger = logging.getLogger(__name__)
+
+
+# Canonical RFC 4122 version-4 UUID, lowercase hex. The version nibble is pinned
+# to '4' and the variant nibble to [89ab] because that is exactly what
+# uuid.uuid4() emits - which is the ONLY way session IDs are ever minted (see
+# start_session()). Anything else is by definition not a session ID this manager
+# created.
+_SESSION_ID_RE = re.compile(
+    r'^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+)
+
+
+def _validate_session_id(session_id: str) -> str:
+    """
+    Validate a session ID to prevent path traversal.
+
+    Audit finding F-5 (MEDIUM): session IDs arrive straight from MCP tool
+    arguments (save_session, get_session_summary, load_session_section,
+    load_full_session, delete_session, generate_report(session_id=),
+    export_iocs, generate_yara_rule_from_session) and were interpolated
+    directly into a filename under the session store:
+
+        self.store_dir / f"{session_id}.session.json.gz"
+
+    A session_id of '../../../../tmp/pwned' therefore escaped the store
+    directory entirely, giving a caller read/write/unlink on any path ending in
+    '.session.json.gz' or '.meta.json'. Because session IDs are generated
+    exclusively by uuid.uuid4() (unified_session.py start_session), restricting
+    them to a canonical UUIDv4 is both complete and lossless - no legitimate ID
+    is ever rejected.
+
+    This mirrors validate_state_id() in src/utils/security.py (which pins
+    x64dbg debug state IDs to hex SHA256 prefixes for the same reason); the two
+    validators are deliberately the same shape so the pattern is recognisable.
+
+    Args:
+        session_id: Session identifier string
+
+    Returns:
+        Validated session ID, normalised to lowercase
+
+    Raises:
+        ValueError: If session_id is not a canonical UUIDv4
+    """
+    if not session_id or not isinstance(session_id, str):
+        raise ValueError("Session ID cannot be empty")
+    # strip() before matching mirrors validate_state_id(); the anchored regex
+    # below still rejects embedded whitespace, NUL bytes and path separators
+    # because none of them can appear inside a UUID character class.
+    session_id = session_id.strip().lower()
+    if not _SESSION_ID_RE.match(session_id):
+        raise ValueError(
+            "Invalid session ID format: must be a UUID "
+            "(e.g. 123e4567-e89b-42d3-a456-426614174000)"
+        )
+    return session_id
 
 
 class AnalysisType(Enum):
@@ -69,11 +126,30 @@ class UnifiedSessionManager:
         self._current_binary_hash: str | None = None
 
     def _get_session_path(self, session_id: str) -> Path:
-        """Get compressed session data file path."""
+        """
+        Get compressed session data file path.
+
+        Validation happens HERE rather than at each of the ~8 MCP tool entry
+        points (F-5): every read, write and unlink of session data funnels
+        through this method and _get_metadata_path, so validating at the
+        chokepoint means a future caller cannot forget to validate.
+
+        Raises:
+            ValueError: If session_id is not a canonical UUIDv4
+        """
+        session_id = _validate_session_id(session_id)
         return self.store_dir / f"{session_id}.session.json.gz"
 
     def _get_metadata_path(self, session_id: str) -> Path:
-        """Get session metadata file path."""
+        """
+        Get session metadata file path.
+
+        Same chokepoint validation as _get_session_path (F-5).
+
+        Raises:
+            ValueError: If session_id is not a canonical UUIDv4
+        """
+        session_id = _validate_session_id(session_id)
         return self.store_dir / f"{session_id}.meta.json"
 
     def _compute_binary_hash(self, binary_path: str) -> str:
@@ -116,8 +192,23 @@ class UnifiedSessionManager:
 
                     updated_at = metadata.get("updated_at", 0)
                     if updated_at > best_updated_at:
-                        best_updated_at = updated_at
-                        best_session_id = metadata.get("session_id")
+                        # The session_id here comes back OUT of a JSON file on
+                        # disk and goes straight back INTO _get_session_path()
+                        # via _resume_session(). Re-validate it rather than
+                        # trusting file content (F-5): a metadata file whose
+                        # "session_id" field disagrees with its filename would
+                        # otherwise steer auto-resume at an attacker-chosen
+                        # path. Invalid entries are skipped, not fatal - the
+                        # caller simply starts a fresh session.
+                        candidate = metadata.get("session_id")
+                        try:
+                            best_session_id = _validate_session_id(candidate)
+                            best_updated_at = updated_at
+                        except ValueError:
+                            logger.warning(
+                                f"Skipping session metadata with invalid "
+                                f"session_id: {meta_file.name}"
+                            )
 
             except (json.JSONDecodeError, OSError) as e:
                 logger.debug(f"Error reading {meta_file}: {e}")

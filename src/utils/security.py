@@ -69,7 +69,18 @@ def default_quarantine_dirs() -> list[Path]:
         ``~/ghidra_mcp_cache``) -- Ghidra projects, saved sessions, carved
         output;
       * the symbol/carve caches (``~/.binary_mcp_cache`` on Windows,
-        ``~/.cache/binary_mcp`` on POSIX).
+        ``$XDG_CACHE_HOME``/``~/.cache`` + ``/binary_mcp`` on POSIX -- the XDG
+        variable must be honoured here because carving._default_carve_dir and
+        pdb_fetcher._default_symbol_cache both honour it, and a hardcoded
+        ``~/.cache`` silently breaks carve -> analyse whenever it is set;
+      * this server's OUTPUT root (``~/.binary_mcp_output``) -- memory dumps,
+        module dumps, minidumps, carved/decrypted files and reports. Omitting
+        it broke the project's own unpack -> dump -> re-analyse loop:
+        x64dbg_dump_memory / x64dbg_dump_module / x64dbg_create_minidump write
+        there, and the very next analyze_binary on what they produced was
+        refused. Artifacts this server itself wrote are exactly as trustworthy
+        as the sample they came from, so confining to them changes nothing
+        about the threat model.
 
     That keeps the common "download a sample to /tmp and analyse it" workflow
     working while blocking the paths that make F-8 a security problem
@@ -105,7 +116,26 @@ def default_quarantine_dirs() -> list[Path]:
 
     if home is not None:
         candidates.append(home / ".binary_mcp_cache")
+        # Honour XDG_CACHE_HOME so this stays in agreement with
+        # carving._default_carve_dir() and pdb_fetcher._default_symbol_cache(),
+        # which both consult it. Hardcoding ~/.cache made carve -> analyse fail
+        # whenever the operator had XDG_CACHE_HOME set.
+        xdg_cache = os.environ.get("XDG_CACHE_HOME", "").strip()
+        if xdg_cache:
+            candidates.append(Path(xdg_cache) / "binary_mcp")
         candidates.append(home / ".cache" / "binary_mcp")
+        # Output root: dumps, carved/decrypted files, reports, YARA rules.
+        # Written by this server, and routinely fed straight back into
+        # analyze_binary.
+        candidates.append(home / ".binary_mcp_output")
+
+    # Explicit relocations of the same caches. Same bug class as the XDG drift
+    # above: if the operator moves the carve or symbol cache and we do not
+    # follow, this server writes artifacts it then refuses to read back.
+    for override in ("BINARY_MCP_CARVE_DIR", "BINARY_MCP_SYMBOL_CACHE"):
+        value = os.environ.get(override, "").strip()
+        if value:
+            candidates.append(Path(value).expanduser())
 
     deduped: list[Path] = []
     seen: set[str] = set()

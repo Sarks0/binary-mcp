@@ -114,6 +114,21 @@ _BLOCKED_COMMANDS = (
     ".foreach",
     ".block",
     ".printf",
+    # Script-file include operators (audit F-1/H2).  '$<', '$><', '$$<',
+    # '$$><' and '$$>a<' each run an arbitrary debugger command file from
+    # disk, which chains straight to '.shell' and therefore to RCE on the
+    # analyst host.  The token-aware allowlist denies them via _DENY_ARGFORM,
+    # but this tool-layer list is a second, independent gate and both were
+    # blind to them.  They stay substrings -- that is what this layer is --
+    # and they contain no command name that could appear in benign argument
+    # text, so the usual substring over-blocking concern does not apply.
+    # Listed in full rather than relying on one form being a substring of
+    # another so the rejection message names the operator the caller used.
+    "$$>a<",
+    "$$><",
+    "$$<",
+    "$><",
+    "$<",
     # Module loading
     ".load",
     ".loadby",

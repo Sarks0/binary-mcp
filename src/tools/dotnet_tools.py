@@ -155,7 +155,11 @@ After installation, restart your MCP client.
             return result
 
         except FileNotFoundError as e:
-            return f"Error: {e}"
+            # Audit F-10: the assembly path itself is already validated and
+            # reported above; a FileNotFoundError escaping this far comes from
+            # the ILSpy runner (missing ilspycmd, missing cached output) and
+            # its message contains the runner's own host paths.
+            return safe_error_message("Failed to analyze .NET assembly", e)
         except Exception as e:
             logger.error(f"analyze_dotnet failed: {e}")
             return safe_error_message("Failed to analyze .NET assembly", e)

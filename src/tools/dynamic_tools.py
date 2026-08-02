@@ -7,6 +7,7 @@ Provides debugger-based analysis capabilities with session logging.
 from __future__ import annotations
 
 import functools
+import json
 import logging
 import os
 import re
@@ -21,6 +22,7 @@ from src.engines.dynamic.x64dbg.bridge import (
 from src.engines.dynamic.x64dbg.commands import X64DbgCommands
 from src.engines.session import AnalysisType, UnifiedSessionManager
 from src.engines.static.ghidra.project_cache import ProjectCache
+from src.tools.error_hygiene import curated_structured_text, safe_tool_error
 from src.utils.security import (
     PathTraversalError,
     safe_error_message,
@@ -151,7 +153,12 @@ def _format_log_template(bridge, template: str) -> str:
         return re.sub(pattern, replace_match, template)
 
     except Exception as e:
-        return f"<format error: {e}>"
+        # Audit F-10: this marker is embedded verbatim in breakpoint log
+        # output, which ends up in reports. The exception comes from the
+        # bridge (register read / memory deref), so log it rather than
+        # inlining whatever the debugger said.
+        logger.error(f"_format_log_template failed: {e}")
+        return "<format error>"
 
 
 def _convert_log_template_to_x64dbg(template: str) -> str:
@@ -300,13 +307,20 @@ def format_structured_error(error: StructuredBaseError) -> str:
 
     Provides rich, actionable error messages with suggestions for users.
 
+    Audit F-10: this used to call ``to_user_message()``, which appends a
+    "Debug information" block built from ``StructuredError.debug_info``. That
+    dict is where verbatim external-tool text lands (``create_api_error``
+    stores the raw x64dbg plugin message under ``api_message``), so it is now
+    rendered by ``curated_structured_text`` instead, which keeps the code,
+    message, reason, and suggestions and drops only that block.
+
     Args:
         error: A StructuredBaseError (includes AddressValidationError, X64DbgAPIError)
 
     Returns:
         Formatted error string suitable for tool output
     """
-    return error.structured_error.to_user_message()
+    return curated_structured_text(error)
 
 
 def format_error_response(
@@ -319,6 +333,12 @@ def format_error_response(
 
     Handles both structured errors and generic exceptions.
 
+    Audit F-10: the non-structured branch used to be ``f"Error: {error}"``,
+    which put whatever the x64dbg bridge, the socket layer, or the filesystem
+    raised straight into model context -- including absolute paths under
+    ``Path.home()``. Unstructured exceptions now go through
+    ``safe_tool_error``, which logs the detail against a reference ID.
+
     Args:
         error: The exception to format
         operation: Optional operation name for context
@@ -328,13 +348,17 @@ def format_error_response(
         Formatted error string
     """
     if isinstance(error, StructuredBaseError):
-        message = format_structured_error(error)
+        message = safe_tool_error(operation, error)
         if include_json:
-            message += f"\n\n--- JSON ---\n{error.to_json()}"
+            # Only the curated fields are serialised -- debug_info is
+            # deliberately excluded for the same reason it is excluded from
+            # the rendered text.
+            curated = dict(error.structured_error.to_dict())
+            curated.pop("debug_info", None)
+            message += f"\n\n--- JSON ---\n{json.dumps(curated, indent=2)}"
         return message
-    else:
-        # Legacy error format for non-structured errors
-        return f"Error: {error}"
+
+    return safe_tool_error(operation, error)
 
 
 def log_dynamic_tool(func):
@@ -616,7 +640,13 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             return commands.get_status_summary()
         except Exception as e:
             logger.error(f"x64dbg_status failed: {e}")
-            return f"Error: {e}\n\nNote: Ensure x64dbg is running with the MCP plugin loaded."
+            # Audit F-10: the actionable half of this message is the note, not
+            # the socket/HTTP exception text -- keep the note, log the rest.
+            return safe_error_message(
+                "x64dbg_status failed. Ensure x64dbg is running with the MCP "
+                "plugin loaded.",
+                e,
+            )
 
     @app.tool()
     @log_dynamic_tool
@@ -645,9 +675,12 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_connect failed: {e}")
-            return (
-                f"Error: {e}\n"
-                f"Ensure x64dbg is running with the MCP plugin loaded and port {port} reachable."
+            # Audit F-10: connection failures surface urllib/socket exceptions
+            # whose text can include local paths and proxy configuration.
+            return safe_error_message(
+                f"x64dbg_connect failed. Ensure x64dbg is running with the MCP "
+                f"plugin loaded and port {port} reachable.",
+                e,
             )
 
     @app.tool()
@@ -689,10 +722,12 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_attach failed: {e}")
-            return (
-                f"Error: {e}\n"
-                f"Ensure x64dbg is running with the MCP plugin and PID {pid} is accessible "
-                f"(not already attached by another debugger)."
+            # Audit F-10: keep the actionable guidance, drop the raw bridge text.
+            return safe_error_message(
+                f"x64dbg_attach failed. Ensure x64dbg is running with the MCP "
+                f"plugin and PID {pid} is accessible (not already attached by "
+                f"another debugger).",
+                e,
             )
 
     @app.tool()
@@ -716,7 +751,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_detach failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_detach failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -761,10 +796,15 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
         except PathTraversalError as e:
             return f"Error: Invalid output path - {e}"
         except ValueError as e:
-            return f"Error: Invalid path - {e}"
+            # Audit F-10: unlike the PathTraversalError above -- whose text is
+            # the deliberate "output must be within <dump dir>" hint the model
+            # needs -- this branch only fires when sanitize_output_path cannot
+            # resolve the path at all. Its message is a wrapped OSError that
+            # quotes the resolved DUMP_OUTPUT_DIR, i.e. Path.home().
+            return safe_error_message("Invalid output path", e)
         except Exception as e:
             logger.error(f"x64dbg_create_minidump failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_create_minidump failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -784,7 +824,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             return "Debugger running...\nUse x64dbg_pause to pause or x64dbg_wait_paused to wait for breakpoint."
         except Exception as e:
             logger.error(f"x64dbg_run failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_run failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -831,7 +871,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_wait_paused failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_wait_paused failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -865,7 +905,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_wait_running failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_wait_running failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -901,7 +941,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_wait_debugging failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_wait_debugging failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -951,7 +991,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_run_and_wait failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_run_and_wait failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -971,7 +1011,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_pause failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_pause failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -1005,7 +1045,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_step_into failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_step_into failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -1032,7 +1072,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_step_over failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_step_over failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -1056,7 +1096,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_get_registers failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_get_registers failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -1194,7 +1234,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_set_breakpoints failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_set_breakpoints failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -1242,7 +1282,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_delete_breakpoints failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_delete_breakpoints failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -1268,7 +1308,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_list_breakpoints failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_list_breakpoints failed", e)
 
     # Exception handling control tools
 
@@ -1361,7 +1401,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_list_exception_breakpoints failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_list_exception_breakpoints failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -1426,7 +1466,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_read_memory failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_read_memory failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -1514,7 +1554,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_trace_execution failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_trace_execution failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -1671,7 +1711,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_trace_api_calls failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_trace_api_calls failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -1725,7 +1765,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             return format_error_response(e, "start_trace")
         except Exception as e:
             logger.error(f"x64dbg_start_trace failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_start_trace failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -1754,7 +1794,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             return format_error_response(e, "stop_trace")
         except Exception as e:
             logger.error(f"x64dbg_stop_trace failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_stop_trace failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -1808,7 +1848,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             return format_error_response(e, "get_trace")
         except Exception as e:
             logger.error(f"x64dbg_get_trace failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_get_trace failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -1832,7 +1872,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             return format_error_response(e, "clear_trace")
         except Exception as e:
             logger.error(f"x64dbg_clear_trace failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_clear_trace failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -1986,7 +2026,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_get_api_params failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_get_api_params failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -2010,7 +2050,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_run_to_address failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_run_to_address failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -2034,7 +2074,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_step_out failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_step_out failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -2085,7 +2125,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_get_stack failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_get_stack failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -2136,7 +2176,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_get_modules failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_get_modules failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -2184,7 +2224,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_get_threads failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_get_threads failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -2223,7 +2263,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_switch_thread failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_switch_thread failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -2247,7 +2287,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_suspend_thread failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_suspend_thread failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -2271,7 +2311,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_resume_thread failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_resume_thread failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -2293,7 +2333,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_suspend_all_threads failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_suspend_all_threads failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -2315,7 +2355,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_resume_all_threads failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_resume_all_threads failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -2354,7 +2394,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             return f"Error: Invalid hex data format. Use format like '90 90 90' or '909090'\nDetails: {e}"
         except Exception as e:
             logger.error(f"x64dbg_write_memory failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_write_memory failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -2403,7 +2443,12 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
         except PathTraversalError as e:
             return f"Error: Invalid output path - {e}"
         except ValueError as e:
-            return f"Error: Invalid path - {e}"
+            # Audit F-10: unlike the PathTraversalError above -- whose text is
+            # the deliberate "output must be within <dump dir>" hint the model
+            # needs -- this branch only fires when sanitize_output_path cannot
+            # resolve the path at all. Its message is a wrapped OSError that
+            # quotes the resolved DUMP_OUTPUT_DIR, i.e. Path.home().
+            return safe_error_message("Invalid output path", e)
 
         try:
             bridge = get_x64dbg_bridge()
@@ -2418,7 +2463,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_dump_memory failed: {e}")
             if "Not yet implemented" in str(e):
                 return "Not available: Memory dump is not yet implemented in the x64dbg plugin."
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_dump_memory failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -2477,7 +2522,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_search_memory failed: {e}")
             if "Not yet implemented" in str(e):
                 return "Not available: Memory search is not yet implemented in the x64dbg plugin."
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_search_memory failed", e)
 
     # Advanced search tools
 
@@ -2528,7 +2573,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_find_assembly failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_find_assembly failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -2574,7 +2619,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_find_guid failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_find_guid failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -2621,7 +2666,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_find_module_calls failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_find_module_calls failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -2677,7 +2722,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_find_references_range failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_find_references_range failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -2723,7 +2768,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_find_string_references failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_find_string_references failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -2781,7 +2826,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_get_memory_map failed: {e}")
             if "Not yet implemented" in str(e):
                 return "Not available: Memory map is not yet implemented in the x64dbg plugin."
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_get_memory_map failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -2829,7 +2874,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_get_memory_info failed: {e}")
             if "Not yet implemented" in str(e):
                 return "Not available: Memory info is not yet implemented in the x64dbg plugin."
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_get_memory_info failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -2882,7 +2927,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_get_instruction failed: {e}")
             if "Not yet implemented" in str(e):
                 return "Not available: Get instruction is not yet implemented in the x64dbg plugin."
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_get_instruction failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -2931,7 +2976,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_evaluate_expression failed: {e}")
             if "Not yet implemented" in str(e):
                 return "Not available: Expression evaluation is not yet implemented in the x64dbg plugin."
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_evaluate_expression failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -2970,7 +3015,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_set_comment failed: {e}")
             if "Not yet implemented" in str(e):
                 return "Not available: Set comment is not yet implemented in the x64dbg plugin."
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_set_comment failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -3001,7 +3046,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_get_comment failed: {e}")
             if "Not yet implemented" in str(e):
                 return "Not available: Get comment is not yet implemented in the x64dbg plugin."
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_get_comment failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -3038,7 +3083,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_set_bookmark failed: {e}")
             if "Not yet implemented" in str(e):
                 return "Not available: Set bookmark is not yet implemented in the x64dbg plugin."
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_set_bookmark failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -3066,7 +3111,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_delete_bookmark failed: {e}")
             if "Not yet implemented" in str(e):
                 return "Not available: Delete bookmark is not yet implemented in the x64dbg plugin."
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_delete_bookmark failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -3108,7 +3153,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_list_bookmarks failed: {e}")
             if "Not yet implemented" in str(e):
                 return "Not available: List bookmarks is not yet implemented in the x64dbg plugin."
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_list_bookmarks failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -3147,7 +3192,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_add_function failed: {e}")
             if "Not yet implemented" in str(e):
                 return "Not available: Add function is not yet implemented in the x64dbg plugin."
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_add_function failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -3175,7 +3220,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_delete_function failed: {e}")
             if "Not yet implemented" in str(e):
                 return "Not available: Delete function is not yet implemented in the x64dbg plugin."
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_delete_function failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -3218,7 +3263,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_list_functions failed: {e}")
             if "Not yet implemented" in str(e):
                 return "Not available: List functions is not yet implemented in the x64dbg plugin."
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_list_functions failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -3283,7 +3328,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_get_module_imports failed: {e}")
             if "Not yet implemented" in str(e):
                 return "Not available: Module imports is not yet implemented in the x64dbg plugin."
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_get_module_imports failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -3331,7 +3376,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_get_module_exports failed: {e}")
             if "Not yet implemented" in str(e):
                 return "Not available: Module exports is not yet implemented in the x64dbg plugin."
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_get_module_exports failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -3400,7 +3445,12 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
         except PathTraversalError as e:
             return f"Error: Invalid output path - {e}"
         except ValueError as e:
-            return f"Error: Invalid path - {e}"
+            # Audit F-10: unlike the PathTraversalError above -- whose text is
+            # the deliberate "output must be within <dump dir>" hint the model
+            # needs -- this branch only fires when sanitize_output_path cannot
+            # resolve the path at all. Its message is a wrapped OSError that
+            # quotes the resolved DUMP_OUTPUT_DIR, i.e. Path.home().
+            return safe_error_message("Invalid output path", e)
 
         try:
             bridge = get_x64dbg_bridge()
@@ -3460,11 +3510,15 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             return "\n".join(output)
 
         except RuntimeError as e:
+            # Audit F-10: RuntimeError here comes out of the bridge's PE
+            # reconstruction, not out of a validator -- its text carries
+            # dump paths under DUMP_OUTPUT_DIR (rooted at Path.home()) and
+            # x64dbg plugin internals, so it is logged rather than returned.
             logger.error(f"x64dbg_dump_module failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_dump_module failed", e)
         except Exception as e:
             logger.error(f"x64dbg_dump_module failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_dump_module failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -3559,7 +3613,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_set_register failed: {e}")
             if "Not yet implemented" in str(e):
                 return "Not available: Set register is not yet implemented in the x64dbg plugin."
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_set_register failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -3598,7 +3652,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_skip failed: {e}")
             if "Not yet implemented" in str(e):
                 return "Not available: Skip instruction is not yet implemented in the x64dbg plugin."
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_skip failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -3628,7 +3682,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_run_until_return failed: {e}")
             if "Not yet implemented" in str(e):
                 return "Not available: Run until return is not yet implemented in the x64dbg plugin."
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_run_until_return failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -3665,7 +3719,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_run_to_user_code failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_run_to_user_code failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -3699,7 +3753,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_undo_instruction failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_undo_instruction failed", e)
 
     # Security: allowlist of safe x64dbg command prefixes.
     # Only commands starting with these words are permitted through execute_command.
@@ -3754,19 +3808,68 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
     @log_dynamic_tool
     def x64dbg_execute_command(command: str) -> str:
         """
-        Execute a generic x64dbg command.
+        Execute a generic x64dbg command against the live debuggee.
 
-        Sends a command string to x64dbg for execution. Only commands from
-        a curated allowlist of safe analysis/navigation commands are permitted.
-        Commands that could load external code (ScriptDll, loadlib), write
-        arbitrary files (savedata), or disrupt the session (quit, detach)
-        are rejected.
+        SECURITY MODEL -- read this before treating the tool as a sandbox.
+        Audit finding F-6: this docstring used to claim a "curated allowlist of
+        safe analysis/navigation commands" and stop there, which invited the
+        caller to read it as "whatever I send is safe". Only one of the three
+        gates below was actually an allowlist at the time, and none of them
+        look past the command's first word. The description now matches the
+        code, because a docstring is the only view a model has of a tool's
+        contract.
+
+        Three gates sit between this argument and x64dbg's DbgCmdExec, and
+        EVERY ONE of them decides on the FIRST TOKEN alone:
+
+          1. This tool matches the first token against
+             ``allowed_command_prefixes`` (defined just above). That is a real
+             allowlist: an unrecognised token is refused here and the string
+             never leaves this process.
+          2. ``bridge.execute_command`` then applies ``_BLOCKED_COMMANDS``, a
+             small DENYLIST. It is a fast-fail that turns obvious cases into a
+             clear local error -- it is NOT a gate, and a command's absence
+             from it is not approval.
+          3. The C++ plugin applies ``ALLOWED_COMMANDS`` (plugin.cpp) and is
+             the authoritative decision point. It fails closed on any token it
+             does not recognise and rejects strings containing CR, LF or NUL.
+             Its list is a strict superset of (1), so anything this tool lets
+             through the plugin also accepts; the tool-layer list is the one
+             that actually bounds this tool.
+
+        What that buys, and what it does not:
+
+          - REFUSED: starting or stopping a process (init / initdbg / attach /
+            detach / quit), loading code (ScriptDll, loadlib, plugload),
+            writing files (savedata, savefile), and trace CONFIGURATION
+            (tracesetcommand / tracesetlog / tracesetlogfile, whose arguments
+            are themselves commands and file paths -- use
+            x64dbg_set_trace_command / x64dbg_set_trace_log_file instead).
+            Unknown ALIASES of those handlers are refused as well: x64dbg
+            registers several spellings per handler, so both allowlists deny
+            by default rather than trying to enumerate spellings to block.
+          - NOT REFUSED AND NOT VALIDATED: everything after the first token.
+            Arguments are forwarded to x64dbg verbatim and evaluated by its
+            expression engine. A permitted command can therefore read
+            arbitrary debuggee memory ("dump", "find", "eval"), and any path
+            argument a permitted command accepts is unchecked by this server.
+          - NOT READ-ONLY: permitted commands include ones that change state.
+            "rtu" resumes the debuggee, "instrundo" reverses an instruction,
+            the bpdll/bcdll family arms DLL-load breakpoints, and the
+            label/comment/bookmark/type/watch/variable commands mutate the
+            x64dbg analysis database.
+
+        In short: this restricts WHICH x64dbg command runs, not what that
+        command is then allowed to touch. Prefer the dedicated tools
+        (x64dbg_set_breakpoint, x64dbg_read_memory, ...) wherever one exists;
+        reach for this only for analysis commands nothing else covers.
 
         Args:
-            command: x64dbg command string (e.g. "dis.prev(rip, 5)", "findall 0, E8")
+            command: x64dbg command string (e.g. "dis.prev(rip, 5)", "findall 0, E8").
+                Rejected unless its first token is on the tool-layer allowlist.
 
         Returns:
-            Command execution result
+            Command execution result, or an error string naming the refused token.
 
         Use Cases:
             - Run analysis commands not covered by other tools
@@ -3811,7 +3914,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_execute_command failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_execute_command failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -3963,7 +4066,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_hide_debugger failed: {e}")
             if "Not yet implemented" in str(e):
                 return "Not available: Hide debugger is not yet implemented in the x64dbg plugin."
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_hide_debugger failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -4080,7 +4183,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_apply_antidebug_bypass failed: {e}")
             if "Not yet implemented" in str(e):
                 return "Not available: Anti-debug bypass is not yet implemented in the x64dbg plugin."
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_apply_antidebug_bypass failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -4133,7 +4236,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_get_antidebug_status failed: {e}")
             if "Not yet implemented" in str(e):
                 return "Not available: Anti-debug status is not yet implemented in the x64dbg plugin."
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_get_antidebug_status failed", e)
 
     # Event System Tools
 
@@ -4209,7 +4312,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_get_events failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_get_events failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -4229,7 +4332,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_clear_events failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_clear_events failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -4259,7 +4362,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_event_status failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_event_status failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -4324,7 +4427,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_run_until_event failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_run_until_event failed", e)
 
     # Memory Allocation Tools (Phase 3)
 
@@ -4374,7 +4477,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_alloc_memory failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_alloc_memory failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -4402,7 +4505,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_free_memory failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_free_memory failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -4458,7 +4561,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_protect_memory failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_protect_memory failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -4511,7 +4614,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_memset failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_memset failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -4543,7 +4646,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_check_memory failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_check_memory failed", e)
 
     # Enhanced Breakpoint Tools (Phase 3)
 
@@ -4581,7 +4684,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_toggle_breakpoint failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_toggle_breakpoint failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -4608,7 +4711,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_delete_hardware_bp failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_delete_hardware_bp failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -4635,7 +4738,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_toggle_hardware_bp failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_toggle_hardware_bp failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -4662,7 +4765,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_toggle_memory_bp failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_toggle_memory_bp failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -4746,7 +4849,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_list_all_breakpoints failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_list_all_breakpoints failed", e)
 
     # P2: Conditional Breakpoint Logging
 
@@ -4971,7 +5074,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_check_conditional_breakpoint failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_check_conditional_breakpoint failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -5045,7 +5148,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_get_breakpoint_logs failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_get_breakpoint_logs failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -5082,7 +5185,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_clear_breakpoint_logs failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_clear_breakpoint_logs failed", e)
 
     # P2: Native Conditional Breakpoint with Logging (Enhanced)
 
@@ -5571,7 +5674,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_get_bp_logs failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_get_bp_logs failed", e)
 
     # P2: Static/Dynamic Cross-Reference
 
@@ -5704,7 +5807,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_resolve_static_address failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_resolve_static_address failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -5913,7 +6016,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_goto_address failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_goto_address failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -5994,7 +6097,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_get_runtime_function_address failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_get_runtime_function_address failed", e)
 
     # Static/Dynamic Cross-Reference (Ghidra Cache Integration)
 
@@ -6077,7 +6180,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_resolve_function failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_resolve_function failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -6134,7 +6237,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             return format_error_response(e, "set_breakpoint_by_function")
         except Exception as e:
             logger.error(f"x64dbg_set_breakpoint_by_function failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_set_breakpoint_by_function failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -6188,7 +6291,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_goto_function failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_goto_function failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -6274,7 +6377,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_list_function_mappings failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_list_function_mappings failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -6337,7 +6440,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_search_function failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_search_function failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -6396,7 +6499,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_bulk_resolve_functions failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_bulk_resolve_functions failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -6458,7 +6561,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_set_breakpoints_by_functions failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_set_breakpoints_by_functions failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -6490,7 +6593,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             )
         except Exception as e:
             logger.error(f"x64dbg_refresh_function_cache failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_refresh_function_cache failed", e)
 
     # P2: Session State Persistence
 
@@ -6751,7 +6854,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_restore_debug_state failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_restore_debug_state failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -7030,7 +7133,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_detect_hooks failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_detect_hooks failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -7151,7 +7254,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_check_function_hook failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_check_function_hook failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -7259,7 +7362,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_unhook_function failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_unhook_function failed", e)
 
     # P2: Memory Watch and Diff
 
@@ -7354,7 +7457,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_watch_memory failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_watch_memory failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -7502,7 +7605,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_memory_diff failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_memory_diff failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -7718,7 +7821,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 bridge.pause()
             except Exception:
                 pass
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_run_until_memory_changed failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -7790,7 +7893,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_update_memory_snapshot failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_update_memory_snapshot failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -7832,7 +7935,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_list_memory_watches failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_list_memory_watches failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -7862,7 +7965,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_delete_memory_watch failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_delete_memory_watch failed", e)
 
     # Watch expression tools
 
@@ -8104,7 +8207,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_analyze_control_flow failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_analyze_control_flow failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -8134,7 +8237,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_analyze_xrefs failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_analyze_xrefs failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -8164,7 +8267,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_analyze_recursive failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_analyze_recursive failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -8193,7 +8296,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_get_exception_handlers failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_get_exception_handlers failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -8222,7 +8325,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_get_exception_info failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_get_exception_info failed", e)
 
     # Variable management tools
 
@@ -8260,10 +8363,14 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             return "\n".join(lines)
 
         except ValueError as e:
+            # Audit F-10: left verbatim. The only ValueErrors reaching here
+            # come from this project's own bridge-side validators (empty
+            # name, non-identifier name, bad enum value); the model needs
+            # that text to correct its call, and it carries no host detail.
             return f"Error: {e}"
         except Exception as e:
             logger.error(f"x64dbg_set_variable failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_set_variable failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -8292,10 +8399,14 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             return "\n".join(lines)
 
         except ValueError as e:
+            # Audit F-10: left verbatim. The only ValueErrors reaching here
+            # come from this project's own bridge-side validators (empty
+            # name, non-identifier name, bad enum value); the model needs
+            # that text to correct its call, and it carries no host detail.
             return f"Error: {e}"
         except Exception as e:
             logger.error(f"x64dbg_delete_variable failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_delete_variable failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -8329,7 +8440,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_list_variables failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_list_variables failed", e)
 
     # GUI navigation tools
 
@@ -8363,7 +8474,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_navigate_disasm failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_navigate_disasm failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -8394,7 +8505,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_navigate_dump failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_navigate_dump failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -8430,7 +8541,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_show_graph failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_show_graph failed", e)
 
     # Privilege management tools
 
@@ -8463,10 +8574,14 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             return f"Privilege enabled: {name}"
 
         except ValueError as e:
+            # Audit F-10: left verbatim. The only ValueErrors reaching here
+            # come from this project's own bridge-side validators (empty
+            # name, non-identifier name, bad enum value); the model needs
+            # that text to correct its call, and it carries no host detail.
             return f"Error: {e}"
         except Exception as e:
             logger.error(f"x64dbg_enable_privilege failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_enable_privilege failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -8496,10 +8611,14 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             return f"Privilege disabled: {name}"
 
         except ValueError as e:
+            # Audit F-10: left verbatim. The only ValueErrors reaching here
+            # come from this project's own bridge-side validators (empty
+            # name, non-identifier name, bad enum value); the model needs
+            # that text to correct its call, and it carries no host detail.
             return f"Error: {e}"
         except Exception as e:
             logger.error(f"x64dbg_disable_privilege failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_disable_privilege failed", e)
 
     # Type System Tools
 
@@ -8528,10 +8647,14 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return f"Struct '{name}' created successfully."
             return f"Failed to create struct '{name}': {result.get('message', 'unknown error')}"
         except ValueError as e:
+            # Audit F-10: left verbatim. The only ValueErrors reaching here
+            # come from this project's own bridge-side validators (empty
+            # name, non-identifier name, bad enum value); the model needs
+            # that text to correct its call, and it carries no host detail.
             return f"Error: {e}"
         except Exception as e:
             logger.error(f"x64dbg_add_struct failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_add_struct failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -8559,10 +8682,14 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return f"Union '{name}' created successfully."
             return f"Failed to create union '{name}': {result.get('message', 'unknown error')}"
         except ValueError as e:
+            # Audit F-10: left verbatim. The only ValueErrors reaching here
+            # come from this project's own bridge-side validators (empty
+            # name, non-identifier name, bad enum value); the model needs
+            # that text to correct its call, and it carries no host detail.
             return f"Error: {e}"
         except Exception as e:
             logger.error(f"x64dbg_add_union failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_add_union failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -8594,10 +8721,14 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return f"Member '{member_name}' ({type_name}) added to '{parent}'."
             return f"Failed to add member: {result.get('message', 'unknown error')}"
         except ValueError as e:
+            # Audit F-10: left verbatim. The only ValueErrors reaching here
+            # come from this project's own bridge-side validators (empty
+            # name, non-identifier name, bad enum value); the model needs
+            # that text to correct its call, and it carries no host detail.
             return f"Error: {e}"
         except Exception as e:
             logger.error(f"x64dbg_add_member failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_add_member failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -8637,11 +8768,18 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             else:
                 lines.append(f"Error: {result.get('message', 'unknown error')}")
             return "\n".join(lines)
-        except (ValueError, StructuredBaseError) as e:
+        except ValueError as e:
+            # Audit F-10: kept verbatim. bridge.visit_type raises ValueError
+            # only from its own identifier/address validators ("Invalid
+            # type_name 'x y': must be a valid C identifier"), which is
+            # exactly what the model needs to fix its next call.
             return f"Error: {e}"
+        except StructuredBaseError as e:
+            # Curated envelope survives; debug_info (raw plugin text) does not.
+            return format_error_response(e, "x64dbg_view_type")
         except Exception as e:
             logger.error(f"x64dbg_view_type failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_view_type failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -8668,10 +8806,14 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return f"sizeof({type_name}) = {msg}"
             return f"Failed to get size of '{type_name}': {result.get('message', 'unknown error')}"
         except ValueError as e:
+            # Audit F-10: left verbatim. The only ValueErrors reaching here
+            # come from this project's own bridge-side validators (empty
+            # name, non-identifier name, bad enum value); the model needs
+            # that text to correct its call, and it carries no host detail.
             return f"Error: {e}"
         except Exception as e:
             logger.error(f"x64dbg_sizeof_type failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_sizeof_type failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -8696,10 +8838,14 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return f"Type '{type_name}' removed."
             return f"Failed to remove type '{type_name}': {result.get('message', 'unknown error')}"
         except ValueError as e:
+            # Audit F-10: left verbatim. The only ValueErrors reaching here
+            # come from this project's own bridge-side validators (empty
+            # name, non-identifier name, bad enum value); the model needs
+            # that text to correct its call, and it carries no host detail.
             return f"Error: {e}"
         except Exception as e:
             logger.error(f"x64dbg_remove_type failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_remove_type failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -8730,7 +8876,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             return "\n".join(lines)
         except Exception as e:
             logger.error(f"x64dbg_list_types failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_list_types failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -8756,7 +8902,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             return f"Failed to clear types: {result.get('message', 'unknown error')}"
         except Exception as e:
             logger.error(f"x64dbg_clear_types failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_clear_types failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -8784,8 +8930,16 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             if not filename or not filename.strip():
                 return "Error: Filename cannot be empty"
 
-            # Security: validate path is within allowed directory
-            safe_path = sanitize_output_path(Path(filename.strip()), DUMP_OUTPUT_DIR)
+            # Security: validate path is within allowed directory.
+            # Audit F-10: scoped to its own try so the ValueError that
+            # sanitize_output_path raises for an unresolvable path ("Invalid
+            # path: <OSError>", which embeds the resolved DUMP_OUTPUT_DIR and
+            # therefore Path.home()) is not confused with the bridge's own
+            # validator messages caught further down.
+            try:
+                safe_path = sanitize_output_path(Path(filename.strip()), DUMP_OUTPUT_DIR)
+            except ValueError as e:
+                return safe_error_message("Invalid file path", e)
             resolved_path = str(safe_path)
 
             bridge = get_x64dbg_bridge()
@@ -8797,10 +8951,14 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
         except PathTraversalError as e:
             return f"Error: Invalid file path - {e}"
         except ValueError as e:
+            # Audit F-10: left verbatim. The only ValueErrors reaching here
+            # come from this project's own bridge-side validators (empty
+            # name, non-identifier name, bad enum value); the model needs
+            # that text to correct its call, and it carries no host detail.
             return f"Error: {e}"
         except Exception as e:
             logger.error(f"x64dbg_load_types failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_load_types failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -8836,10 +8994,14 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return "Types parsed successfully."
             return f"Failed to parse types: {result.get('message', 'unknown error')}"
         except ValueError as e:
+            # Audit F-10: left verbatim. The only ValueErrors reaching here
+            # come from this project's own bridge-side validators (empty
+            # name, non-identifier name, bad enum value); the model needs
+            # that text to correct its call, and it carries no host detail.
             return f"Error: {e}"
         except Exception as e:
             logger.error(f"x64dbg_parse_types failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_parse_types failed", e)
 
     # Conditional Tracing Tools
 
@@ -8900,7 +9062,9 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 except PathTraversalError as e:
                     return f"Error: Invalid log file path - {e}"
                 except ValueError as e:
-                    return f"Error: Invalid path - {e}"
+                    # Audit F-10: wrapped OSError from sanitize_output_path,
+                    # quoting the resolved DUMP_OUTPUT_DIR (Path.home()).
+                    return safe_error_message("Invalid log file path", e)
 
             bridge = get_x64dbg_bridge()
             result = bridge.trace_into_conditional(
@@ -8934,10 +9098,14 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 )
 
         except ValueError as e:
+            # Audit F-10: left verbatim. The only ValueErrors reaching here
+            # come from this project's own bridge-side validators (empty
+            # name, non-identifier name, bad enum value); the model needs
+            # that text to correct its call, and it carries no host detail.
             return f"Error: {e}"
         except Exception as e:
             logger.error(f"x64dbg_trace_into_conditional failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_trace_into_conditional failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -8994,7 +9162,9 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 except PathTraversalError as e:
                     return f"Error: Invalid log file path - {e}"
                 except ValueError as e:
-                    return f"Error: Invalid path - {e}"
+                    # Audit F-10: wrapped OSError from sanitize_output_path,
+                    # quoting the resolved DUMP_OUTPUT_DIR (Path.home()).
+                    return safe_error_message("Invalid log file path", e)
 
             bridge = get_x64dbg_bridge()
             result = bridge.trace_over_conditional(
@@ -9028,10 +9198,14 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 )
 
         except ValueError as e:
+            # Audit F-10: left verbatim. The only ValueErrors reaching here
+            # come from this project's own bridge-side validators (empty
+            # name, non-identifier name, bad enum value); the model needs
+            # that text to correct its call, and it carries no host detail.
             return f"Error: {e}"
         except Exception as e:
             logger.error(f"x64dbg_trace_over_conditional failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_trace_over_conditional failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -9080,7 +9254,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_trace_to_oep failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_trace_to_oep failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -9122,10 +9296,14 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             return msg
 
         except ValueError as e:
+            # Audit F-10: left verbatim. The only ValueErrors reaching here
+            # come from this project's own bridge-side validators (empty
+            # name, non-identifier name, bad enum value); the model needs
+            # that text to correct its call, and it carries no host detail.
             return f"Error: {e}"
         except Exception as e:
             logger.error(f"x64dbg_set_trace_log failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_set_trace_log failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -9160,10 +9338,14 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             return msg
 
         except ValueError as e:
+            # Audit F-10: left verbatim. The only ValueErrors reaching here
+            # come from this project's own bridge-side validators (empty
+            # name, non-identifier name, bad enum value); the model needs
+            # that text to correct its call, and it carries no host detail.
             return f"Error: {e}"
         except Exception as e:
             logger.error(f"x64dbg_set_trace_command failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_set_trace_command failed", e)
 
     @app.tool()
     @log_dynamic_tool
@@ -9192,7 +9374,14 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             log_path = Path(path)
             if not log_path.is_absolute():
                 log_path = DUMP_OUTPUT_DIR / log_path
-            safe_path = sanitize_output_path(log_path, DUMP_OUTPUT_DIR)
+            # Audit F-10: scoped try -- sanitize_output_path's ValueError
+            # ("Invalid path: <OSError>") embeds the resolved
+            # DUMP_OUTPUT_DIR, and therefore Path.home(), so it must not
+            # share a handler with the bridge's validator messages.
+            try:
+                safe_path = sanitize_output_path(log_path, DUMP_OUTPUT_DIR)
+            except ValueError as e:
+                return safe_error_message("Invalid trace log path", e)
 
             bridge = get_x64dbg_bridge()
             bridge.set_trace_log_file(str(safe_path))
@@ -9202,9 +9391,13 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
         except PathTraversalError as e:
             return f"Error: Invalid path - {e}"
         except ValueError as e:
+            # Audit F-10: left verbatim. The only ValueErrors reaching here
+            # come from this project's own bridge-side validators (empty
+            # name, non-identifier name, bad enum value); the model needs
+            # that text to correct its call, and it carries no host detail.
             return f"Error: {e}"
         except Exception as e:
             logger.error(f"x64dbg_set_trace_log_file failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("x64dbg_set_trace_log_file failed", e)
 
     logger.info("Registered 112 dynamic analysis tools")

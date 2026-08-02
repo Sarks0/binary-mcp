@@ -511,6 +511,11 @@ def register_control_flow_tools(app, session_manager=None, cache=None, runner=No
                 with BinaryReader(binary_path) as reader:
                     blocks, edges, entry_addr = _build_cfg(func, reader, metadata)
             except RuntimeError as e:
+                # Audit F-10: left verbatim. _build_cfg raises RuntimeError
+                # only with its own curated text ("Unsupported architecture
+                # for disassembly...", "...has no basic blocks in the cached
+                # analysis"), which tells the model what to do next and
+                # names no host paths.
                 return f"Error building CFG for '{func_name}': {e}"
 
             num_blocks = len(blocks)
@@ -653,6 +658,11 @@ def register_control_flow_tools(app, session_manager=None, cache=None, runner=No
                 with BinaryReader(binary_path) as reader:
                     blocks, edges, entry_addr = _build_cfg(func, reader, metadata)
             except RuntimeError as e:
+                # Audit F-10: left verbatim. _build_cfg raises RuntimeError
+                # only with its own curated text ("Unsupported architecture
+                # for disassembly...", "...has no basic blocks in the cached
+                # analysis"), which tells the model what to do next and
+                # names no host paths.
                 return f"Error building CFG for '{func_name}': {e}"
 
             loops = _find_loops(blocks, edges, entry_addr)

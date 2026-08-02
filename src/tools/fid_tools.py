@@ -14,6 +14,7 @@ import logging
 from src.utils.security import (
     FileSizeError,
     PathTraversalError,
+    safe_error_message,
     sanitize_binary_path,
     validate_numeric_range,
 )
@@ -116,7 +117,10 @@ def register_fid_tools(app, session_manager, cache, runner):
         except (PathTraversalError, FileSizeError, FileNotFoundError) as e:
             return f"Invalid binary path: {e}"
         except Exception as e:
+            # Audit F-10: an unexpected failure here comes from the cache or
+            # from Ghidra, and its text carries project paths under the
+            # operator's home directory. Log it, hand back a reference ID.
             logger.exception(f"fid_match failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("fid_match failed", e)
 
     return (fid_match,)

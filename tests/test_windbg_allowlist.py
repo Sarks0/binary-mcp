@@ -56,6 +56,14 @@ class TestDenyFirstToken:
         "ed 0x1000 deadbeef",
         "eq 0x1000 0xfeedface",
         "a 0x1000",
+        # Rest of the Enter/Fill/Move write family (audit F-2)
+        "e 0x1000 90",
+        "ef 0x1000 1.5",
+        "f 0x1000 L100 90",
+        "m 0x1000 0x1100 0x2000",
+        # Single-quote-delimited control flow (audit F-1)
+        "j 1 '.shell calc'",
+        "z '.shell calc'",
     ])
     def test_blocks(self, cmd):
         ok, reason = validate_command(cmd)

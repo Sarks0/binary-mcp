@@ -5,9 +5,11 @@ Interactive installation script for Linux and macOS with full tooling support.
 """
 
 import argparse
+import hashlib
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -118,8 +120,234 @@ def fetch_github_release(repo: str) -> dict:
         raise
 
 
-def download_file(url: str, dest: Path, description: str = "file") -> bool:
-    """Download a file with progress indication."""
+# Supply-Chain Integrity (audit finding F-3)
+#
+# This installer downloads third-party code and then runs it, so TLS alone is
+# not enough: urlopen() verifies the certificate, which proves *who served* the
+# bytes, never *which* bytes were served. A tampered mirror, a swapped release
+# asset, or an interception proxy whose root the machine trusts all still end
+# up executing attacker-chosen code on an analyst's machine (and on Windows the
+# sibling installer runs as Administrator).
+#
+# So: nothing downloaded here is executed before it has been hash-checked, and
+# where no digest can be resolved the installer says so loudly instead of
+# proceeding in silence.
+#
+# Expected digests are resolved from, in order:
+#   1. a checksum manifest published with the artifact's GitHub release
+#      (SHA256SUMS / <asset>.sha256) - the digest the maintainer controls;
+#   2. a digest scraped from the release notes next to the asset name (how
+#      Ghidra publishes its checksums);
+#   3. PINNED_SHA256 below;
+#   4. the BINARY_MCP_SHA256_<KEY> environment variable, which lets an operator
+#      pin an artifact whose upstream (astral.sh, dot.net) publishes no stable
+#      digest we could hard-code.
+# Set BINARY_MCP_STRICT_INTEGRITY=1 to turn "could not verify" into a hard
+# failure rather than a warning.
+
+# Deliberately empty by default: a stale pinned hash breaks every install, and
+# these upstreams republish faster than this file can track. Fill an entry (or
+# set the matching env var) to pin.
+PINNED_SHA256: dict[str, str] = {
+    "uv-installer-sh": "",
+    "dotnet-installer-sh": "",
+    "ghidra-zip": "",
+    "repo-zip": "",
+}
+
+
+def integrity_env_name(hash_key: str) -> str:
+    """Environment variable an operator can set to pin `hash_key`."""
+    normalised = "".join(c if c.isalnum() else "_" for c in hash_key)
+    return f"BINARY_MCP_SHA256_{normalised.upper()}"
+
+
+def strict_integrity() -> bool:
+    """True when unverifiable downloads should be fatal instead of warned about."""
+    return os.environ.get("BINARY_MCP_STRICT_INTEGRITY", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def pinned_sha256(hash_key: str) -> Optional[str]:
+    """Operator env var wins over the in-script table, so pinning today's build
+    does not require editing the installer."""
+    from_env = os.environ.get(integrity_env_name(hash_key), "").strip()
+    if from_env:
+        return from_env
+    return PINNED_SHA256.get(hash_key) or None
+
+
+def sha256_file(path: Path) -> str:
+    """SHA-256 of a file, lowercase hex, read in chunks (Ghidra's zip is ~400MB)."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def verify_sha256(path: Path, expected: str, description: str = "file") -> None:
+    """Verify `path` against `expected`, deleting it and raising on mismatch.
+
+    Deleting matters: a rejected artifact left in /tmp is one retry or one
+    stale path away from being executed anyway.
+    """
+    expected_norm = expected.strip().lower()
+    if len(expected_norm) != 64 or any(c not in "0123456789abcdef" for c in expected_norm):
+        path.unlink(missing_ok=True)
+        raise ValueError(
+            f"Integrity check failed: expected SHA-256 for {description} is not a "
+            f"64-character hex digest (got '{expected.strip()}')"
+        )
+
+    actual = sha256_file(path)
+    if actual != expected_norm:
+        path.unlink(missing_ok=True)
+        raise ValueError(
+            f"SHA-256 mismatch for {description}: expected {expected_norm}, got {actual}. "
+            "The downloaded file has been deleted. Either the artifact was republished "
+            "upstream (update the pinned hash) or the download was tampered with - do not "
+            "install it by hand without establishing which."
+        )
+
+    print_success(f"Verified SHA-256 of {description}")
+
+
+def warn_unverified(path: Path, description: str, hash_key: str, url: str = "") -> None:
+    """Loudly report that an artifact could not be verified, and show the exact
+    digest so the operator can pin it next time."""
+    actual = sha256_file(path)
+    env_name = integrity_env_name(hash_key)
+
+    print()
+    print_warning("=" * 70)
+    print_warning(" UNVERIFIED DOWNLOAD - integrity could NOT be checked")
+    print_warning("=" * 70)
+    print_warning(f"  Artifact : {description}")
+    if url:
+        print_warning(f"  Source   : {url}")
+    print_warning(f"  SHA-256  : {actual}")
+    print_warning("  No publisher checksum was available and no hash is pinned, so this")
+    print_warning("  file is trusted purely because TLS said it came from that host.")
+    print_warning("  To pin this exact copy for future installs, run before installing:")
+    print_warning(f"      export {env_name}={actual}")
+    print_warning("  Set BINARY_MCP_STRICT_INTEGRITY=1 to make this fatal instead.")
+    print_warning("=" * 70)
+    print()
+
+    if strict_integrity():
+        path.unlink(missing_ok=True)
+        raise ValueError(
+            f"BINARY_MCP_STRICT_INTEGRITY: refusing to use unverified download "
+            f"'{description}'. Pin it with {env_name}={actual}."
+        )
+
+
+def release_checksum_map(release: dict) -> dict[str, str]:
+    """Parse checksum manifests published as release assets into {name: sha256}.
+
+    Handles the coreutils layout ("<hash>  <name>", '*' marks binary mode) and
+    single-digest "<asset>.sha256" files. A manifest fetched from the same
+    release defeats tampering with an individual asset or its CDN copy; it does
+    not defend against a takeover of the release itself, which is what pinning
+    is for. Failures are non-fatal - the caller falls back to a pin or to the
+    loud unverified warning.
+    """
+    checksums: dict[str, str] = {}
+    for asset in release.get("assets", []) or []:
+        name = asset.get("name", "")
+        lowered = name.lower()
+        is_manifest = lowered in (
+            "sha256sums", "sha256sum", "sha256sums.txt", "checksums", "checksums.txt",
+        ) or lowered.endswith(".sha256")
+        if not is_manifest:
+            continue
+        try:
+            req = Request(
+                asset["browser_download_url"],
+                headers={"User-Agent": "binary-mcp-installer"},
+            )
+            with urlopen(req, timeout=60) as response:
+                # Manifests are only ever parsed as text, never executed, so
+                # they need no integrity check of their own; their authority is
+                # that of the release they are published in.
+                text = response.read(1024 * 1024).decode("utf-8", errors="replace")
+        except Exception as e:  # noqa: BLE001 - best effort, never fatal
+            print_warning(f"Could not read checksum manifest {name}: {e}")
+            continue
+
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) >= 2 and _is_sha256(parts[0]):
+                checksums[os.path.basename(parts[-1].lstrip("*"))] = parts[0].lower()
+            elif len(parts) == 1 and _is_sha256(parts[0]) and lowered.endswith(".sha256"):
+                checksums[name[: -len(".sha256")]] = parts[0].lower()
+
+    return checksums
+
+
+def _is_sha256(token: str) -> bool:
+    token = token.strip().lower()
+    return len(token) == 64 and all(c in "0123456789abcdef" for c in token)
+
+
+def checksum_from_release_notes(release: dict, asset_name: str) -> Optional[str]:
+    """Best-effort scrape of a release body for a digest published next to the
+    asset name (how Ghidra ships its SHA-256).
+
+    Only accepts a digest on, or within two lines of, a line naming the asset,
+    so an unrelated hash elsewhere in the notes cannot be mistaken for this
+    asset's.
+    """
+    body = release.get("body") or ""
+    if not body or not asset_name:
+        return None
+
+    lines = body.splitlines()
+    for i, line in enumerate(lines):
+        if asset_name not in line:
+            continue
+        for candidate_line in lines[i:i + 3]:
+            for token in re.findall(r"[0-9a-fA-F]{64}", candidate_line):
+                return token.lower()
+    return None
+
+
+def release_asset_checksum(
+    release: dict,
+    asset_name: str,
+    checksums: Optional[dict[str, str]] = None,
+) -> Optional[str]:
+    """Manifest asset first, release notes second, None if neither has a digest."""
+    try:
+        if checksums is None:
+            checksums = release_checksum_map(release)
+        if asset_name in checksums:
+            return checksums[asset_name]
+        return checksum_from_release_notes(release, asset_name)
+    except Exception as e:  # noqa: BLE001 - integrity hints are best effort
+        print_warning(f"Could not resolve a published checksum for {asset_name}: {e}")
+        return None
+
+
+def download_file(
+    url: str,
+    dest: Path,
+    description: str = "file",
+    expected_sha256: Optional[str] = None,
+    hash_key: Optional[str] = None,
+) -> bool:
+    """Download a file with progress indication, then verify its SHA-256.
+
+    Returns False (as before) when the download itself fails. An integrity
+    failure raises instead of returning False: callers already treat a False
+    return as "skip this component", which is the wrong response to bytes that
+    failed verification - that deserves an unmissable error.
+    """
     print_info(f"Downloading {description}...")
 
     try:
@@ -140,10 +368,45 @@ def download_file(url: str, dest: Path, description: str = "file") -> bool:
             print()
 
         print_success(f"Downloaded {description}")
-        return True
     except Exception as e:
         print_error(f"Download failed: {e}")
         return False
+
+    expected = expected_sha256 or (pinned_sha256(hash_key) if hash_key else None)
+    if expected:
+        verify_sha256(dest, expected, description)
+    else:
+        warn_unverified(dest, description, hash_key or description, url)
+
+    return True
+
+
+def download_and_verify_script(url: str, description: str, hash_key: str) -> Path:
+    """Download a remote shell script to a temp file and verify it.
+
+    F-3: the alternative pattern - piping a freshly fetched URL straight into
+    sh/bash - executes whatever the network returned with no copy on disk to
+    inspect and no chance to check anything. Callers run the returned path only
+    after this function has verified it (or loudly flagged it as unverifiable).
+    """
+    with tempfile.NamedTemporaryFile(mode='wb', suffix='.sh', delete=False) as f:
+        script_path = Path(f.name)
+
+    req = Request(url, headers={"User-Agent": "binary-mcp-installer"})
+    try:
+        with urlopen(req, timeout=30) as response:
+            script_path.write_bytes(response.read())
+    except Exception:
+        script_path.unlink(missing_ok=True)
+        raise
+
+    expected = pinned_sha256(hash_key)
+    if expected:
+        verify_sha256(script_path, expected, description)
+    else:
+        warn_unverified(script_path, description, hash_key, url)
+
+    return script_path
 
 
 # System Status Detection
@@ -479,11 +742,16 @@ def install_dotnet_sdk(pkg_manager: str) -> bool:
             # Try using the Microsoft install script
             script_url = "https://dot.net/v1/dotnet-install.sh"
 
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.sh', delete=False) as f:
-                req = Request(script_url, headers={"User-Agent": "binary-mcp-installer"})
-                with urlopen(req, timeout=30) as response:
-                    f.write(response.read().decode())
-                script_path = f.name
+            # F-3: download, verify, *then* run - never hand an unverified
+            # remote script to bash. Microsoft publishes no stable digest for
+            # this endpoint, so an operator pins it via
+            # BINARY_MCP_SHA256_DOTNET_INSTALLER_SH; without a pin the download
+            # is flagged loudly rather than run silently.
+            script_path = str(download_and_verify_script(
+                script_url,
+                ".NET install script (dot.net)",
+                "dotnet-installer-sh",
+            ))
 
             os.chmod(script_path, 0o755)
             subprocess.run(["bash", script_path, "--channel", "8.0"], check=True)
@@ -531,11 +799,15 @@ def install_uv() -> bool:
     try:
         script_url = "https://astral.sh/uv/install.sh"
 
-        with tempfile.NamedTemporaryFile(mode='wb', suffix='.sh', delete=False) as f:
-            req = Request(script_url, headers={"User-Agent": "binary-mcp-installer"})
-            with urlopen(req, timeout=30) as response:
-                f.write(response.read())
-            script_path = f.name
+        # F-3: download, verify, then run. astral.sh serves a new installer with
+        # every uv release, so there is no digest to hard-code here - pin the
+        # copy you trust via BINARY_MCP_SHA256_UV_INSTALLER_SH, or accept the
+        # loud warning that the script could not be verified.
+        script_path = str(download_and_verify_script(
+            script_url,
+            "uv installer script (astral.sh)",
+            "uv-installer-sh",
+        ))
 
         os.chmod(script_path, 0o755)
         subprocess.run(["sh", script_path], check=True)
@@ -588,7 +860,17 @@ def install_ghidra(ghidra_dir: Path, unattended: bool = False) -> bool:
         with tempfile.NamedTemporaryFile(suffix='.zip', delete=False) as f:
             temp_zip = Path(f.name)
 
-        if not download_file(asset["browser_download_url"], temp_zip, f"Ghidra {version}"):
+        # Ghidra ships a new build far more often than this file can track, so
+        # no digest is hard-coded: use the one published with the release, or
+        # an operator pin (BINARY_MCP_SHA256_GHIDRA_ZIP), or warn loudly.
+        expected = release_asset_checksum(release, asset["name"])
+        if not download_file(
+            asset["browser_download_url"],
+            temp_zip,
+            f"Ghidra {version}",
+            expected_sha256=expected,
+            hash_key="ghidra-zip",
+        ):
             return False
 
         # Extract
@@ -782,7 +1064,11 @@ def download_repo_zip(install_dir: Path) -> None:
         temp_zip = Path(f.name)
 
     with tempfile.TemporaryDirectory() as temp_dir:
-        if download_file(url, temp_zip, "project source"):
+        # A branch archive has no stable digest by construction - it changes
+        # with every push and GitHub publishes no checksum for it. That is why
+        # the git clone path is preferred; this fallback states out loud that
+        # it cannot verify what it just fetched.
+        if download_file(url, temp_zip, "project source", hash_key="repo-zip"):
             print_info("Extracting...")
             with zipfile.ZipFile(temp_zip, 'r') as zf:
                 zf.extractall(temp_dir)
@@ -943,8 +1229,20 @@ def main() -> int:
         action="store_true",
         help="Run in unattended mode (no prompts)"
     )
+    parser.add_argument(
+        "--strict-integrity",
+        action="store_true",
+        help="Fail instead of warning when a download cannot be verified "
+             "(same as BINARY_MCP_STRICT_INTEGRITY=1)"
+    )
 
     args = parser.parse_args()
+
+    # The flag is exported rather than threaded through every call site: the
+    # integrity helpers read it from the environment, so a strict install stays
+    # strict for anything the installer shells out to as well.
+    if args.strict_integrity:
+        os.environ["BINARY_MCP_STRICT_INTEGRITY"] = "1"
 
     # Check if running from repo
     current_dir = Path.cwd()

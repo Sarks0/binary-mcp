@@ -123,6 +123,101 @@ bool LoadAuthToken() {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// HTTP header lookup (CWE-20)
+//
+// Both header consumers here used to do a bare request.find("Content-Length:")
+// / find("Authorization:") with a single lowercase fallback. That is wrong in
+// two independent ways:
+//
+//   * UNANCHORED. "Content-Length:" is a SUBSTRING of "X-My-Content-Length:",
+//     and std::string::find returns the EARLIEST match, so a header the client
+//     invented could beat the real one. Reached before authentication, so an
+//     unauthenticated peer could steer the body length the server waits for.
+//   * CASE-BRITTLE. RFC 9110 header names are case-insensitive, but only the
+//     two hard-coded spellings matched: "Content-length:" (lowercase L) hit
+//     neither branch, so the body was silently never read and the handler saw
+//     a bodyless request. Latent only because the shipped client is Python
+//     requests, which happens to send the exact casing this matched.
+//
+// This helper fixes both: it walks the header SECTION line by line, anchors the
+// name at the start of a line, and compares it case-insensitively up to the
+// colon. Header values may not span lines here (obs-fold is deprecated by
+// RFC 9110 and this API never emits it), so a per-line scan is complete.
+// ---------------------------------------------------------------------------
+// ASCII-only case-insensitive compare. Deliberately not tolower()/_stricmp:
+// those honour the C locale, and in a Turkish locale 'I' does not fold to 'i'
+// -- a locale-dependent header parser is a bug waiting for a non-English host.
+// HTTP field names are ASCII, so folding only A-Z is both correct and total.
+static bool AsciiEqualsIgnoreCase(const char* a, const char* b, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        unsigned char ca = (unsigned char)a[i];
+        unsigned char cb = (unsigned char)b[i];
+        if (ca >= 'A' && ca <= 'Z') ca = (unsigned char)(ca - 'A' + 'a');
+        if (cb >= 'A' && cb <= 'Z') cb = (unsigned char)(cb - 'A' + 'a');
+        if (ca != cb) return false;
+    }
+    return true;
+}
+
+static bool FindHeaderValue(const std::string& request, const char* name,
+                            std::string& outValue) {
+    outValue.clear();
+
+    const size_t nameLen = strlen(name);
+
+    // Bound the scan to the header section. Without this a body that happens to
+    // contain "Content-Length: 5" would be parsed as a header.
+    size_t limit = request.find("\r\n\r\n");
+    if (limit == std::string::npos) {
+        limit = request.size();
+    }
+
+    // Skip the request line; headers begin after the first CRLF.
+    size_t lineStart = request.find("\r\n");
+    if (lineStart == std::string::npos || lineStart >= limit) {
+        return false;
+    }
+    lineStart += 2;
+
+    while (lineStart < limit) {
+        size_t lineEnd = request.find("\r\n", lineStart);
+        if (lineEnd == std::string::npos || lineEnd > limit) {
+            lineEnd = limit;
+        }
+        if (lineEnd == lineStart) {
+            break;  // blank line: end of the header section
+        }
+
+        size_t colon = request.find(':', lineStart);
+        if (colon != std::string::npos && colon < lineEnd) {
+            size_t thisNameLen = colon - lineStart;
+            if (thisNameLen == nameLen &&
+                AsciiEqualsIgnoreCase(request.c_str() + lineStart, name, nameLen)) {
+                size_t valStart = colon + 1;
+                while (valStart < lineEnd &&
+                       (request[valStart] == ' ' || request[valStart] == '\t')) {
+                    valStart++;
+                }
+                size_t valEnd = lineEnd;
+                while (valEnd > valStart &&
+                       (request[valEnd - 1] == ' ' || request[valEnd - 1] == '\t')) {
+                    valEnd--;
+                }
+                outValue = request.substr(valStart, valEnd - valStart);
+                return true;
+            }
+        }
+
+        if (lineEnd == limit) {
+            break;
+        }
+        lineStart = lineEnd + 2;
+    }
+
+    return false;
+}
+
 // Validate Authorization header
 bool ValidateAuthHeader(const std::string& request) {
     // SECURITY: Require authentication - fail closed if no token configured
@@ -131,31 +226,28 @@ bool ValidateAuthHeader(const std::string& request) {
         return false;
     }
 
-    // Find Authorization header
-    size_t authPos = request.find("Authorization:");
-    if (authPos == std::string::npos) {
-        authPos = request.find("authorization:");  // case-insensitive
-    }
-
-    if (authPos == std::string::npos) {
+    // Find the Authorization header by name, anchored and case-insensitively.
+    // The old substring search would also have matched a header the client
+    // invented ("X-Not-Authorization:") and, being earliest-match, could pick
+    // that one over the genuine header.
+    std::string authValue;
+    if (!FindHeaderValue(request, "Authorization", authValue)) {
         Log("Missing Authorization header");
         return false;
     }
 
-    // Extract token from "Authorization: Bearer <token>"
-    size_t bearerPos = request.find("Bearer ", authPos);
-    if (bearerPos == std::string::npos) {
+    // Expect "Bearer <token>". The scheme name is case-insensitive per RFC 9110
+    // and must be at the START of the value -- searching for "Bearer " anywhere
+    // would accept it appearing inside the token itself.
+    const char* kBearer = "Bearer ";
+    const size_t kBearerLen = 7;
+    if (authValue.size() <= kBearerLen ||
+        !AsciiEqualsIgnoreCase(authValue.c_str(), kBearer, kBearerLen)) {
         Log("Invalid Authorization format (expected 'Bearer <token>')");
         return false;
     }
 
-    bearerPos += 7;  // Skip "Bearer "
-    size_t tokenEnd = request.find('\r', bearerPos);
-    if (tokenEnd == std::string::npos) {
-        tokenEnd = request.find('\n', bearerPos);
-    }
-
-    std::string providedToken = request.substr(bearerPos, tokenEnd - bearerPos);
+    std::string providedToken = authValue.substr(kBearerLen);
 
     // Constant-time comparison to prevent timing attacks
     if (providedToken.length() != g_authToken.length()) {
@@ -320,31 +412,34 @@ static bool ParseContentLength(const std::string& request, bool& found, size_t& 
     found = false;
     outLength = 0;
 
-    std::string clHeader = "Content-Length:";
-    size_t clPos = request.find(clHeader);
-    if (clPos == std::string::npos) {
-        clHeader = "content-length:";
-        clPos = request.find(clHeader);
-    }
-    if (clPos == std::string::npos) {
+    // Anchored, case-insensitive lookup -- see FindHeaderValue for why the old
+    // substring search was both spoofable and case-brittle.
+    std::string value_str;
+    if (!FindHeaderValue(request, "Content-Length", value_str)) {
         return true;  // no body declared -- not an error
     }
 
     found = true;
 
-    size_t valStart = clPos + clHeader.length();
-    while (valStart < request.length() &&
-           (request[valStart] == ' ' || request[valStart] == '\t')) {
-        valStart++;
+    if (value_str.empty()) {
+        Log("Rejecting request: Content-Length is empty");
+        return false;
     }
 
-    const char* begin = request.c_str() + valStart;
+    const char* begin = value_str.c_str();
     char* end = nullptr;
     errno = 0;
     long long value = strtoll(begin, &end, 10);
 
     if (end == begin) {
         Log("Rejecting request: Content-Length is not a number");
+        return false;
+    }
+    // Reject trailing garbage ("10abc", "5 7"). strtoll stops at the first
+    // non-digit and would otherwise report success on a value the peer and this
+    // server disagree about.
+    if (*end != '\0') {
+        Log("Rejecting request: Content-Length has trailing characters");
         return false;
     }
     if (errno == ERANGE || value < 0) {
@@ -813,13 +908,16 @@ bool StartHTTPServer(int port) {
                 } else if (haveContentLength) {
                     const size_t bodyStart = headerEnd + 4;
                     // All size_t: no signed comparison that can flip past 2 GiB.
+                    //
+                    // There is deliberately NO second body-size check in this
+                    // loop. ParseContentLength already refused anything above
+                    // MAX_CONTENT_LENGTH, and the recv below never reads past
+                    // contentLength, so a check here could not fire -- it was
+                    // dead code advertising a bound it did not enforce, which
+                    // is the same "guard reporting coverage it does not have"
+                    // problem fixed elsewhere in this branch. The cap lives in
+                    // ParseContentLength; that is the single place to change it.
                     while (request.size() - bodyStart < contentLength) {
-                        if (request.size() - bodyStart > MAX_CONTENT_LENGTH) {
-                            Log("Rejecting request: body exceeded the %zu byte cap", MAX_CONTENT_LENGTH);
-                            earlyReject = BuildHTTPResponse(413, "Payload Too Large", "application/json",
-                                                            "{\"error\":\"Request body too large\"}");
-                            break;
-                        }
                         if (GetTickCount64() >= deadline) {
                             Log("Rejecting request: deadline expired while reading body");
                             earlyReject = BuildHTTPResponse(408, "Request Timeout", "application/json",

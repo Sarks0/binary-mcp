@@ -116,6 +116,7 @@ def tools(tmp_path):
             self.next = app.tools["get_next_unreviewed"]
             self.index = app.tools["coverage_index"]
             self.mark = app.tools["mark_function_reviewed"]
+            self.reset = app.tools["reset_coverage"]
 
         def analyze(self, functions, exports=None):
             self.cache.save_cached(self.path, _context(functions, exports))
@@ -402,6 +403,104 @@ class TestMarkTool:
     def test_mark_before_analysis_is_an_error(self, tools):
         payload = _payload(tools.mark(functions="0x140002000", binary_id=tools.binary_id))
         assert "error" in payload
+
+
+class TestResetTool:
+    """The undo for a contaminated ledger.
+
+    Marks that don't reflect anyone reading the code are worse than no marks:
+    the next campaign reads "fully reviewed" and stops. Operators need a
+    documented way to correct that without deleting files out of the cache.
+    """
+
+    def test_reset_clears_every_mark(self, tools):
+        tools.three_functions()
+        tools.status(binary_id=tools.binary_id)
+        tools.store.mark_reviewed(
+            tools.binary_id, ["0x140001000", "0x140002000"], tool="t", note="bogus"
+        )
+        assert tools.store.counts(tools.store.read(tools.binary_id))["reviewed"] == 2
+
+        payload = _payload(tools.reset(binary_id=tools.binary_id))
+
+        assert payload["cleared"] == 2
+        assert payload["reviewed"] == 0
+        assert payload["reviewed_in_scope"] == 0
+        assert payload["remaining"] == payload["total"]
+        _assert_contract_invariants(payload)
+
+    def test_reset_clears_findings_notes_too(self, tools):
+        tools.three_functions()
+        tools.status(binary_id=tools.binary_id)
+        tools.store.mark_reviewed(
+            tools.binary_id, ["0x140002000"], tool="t", note="bogus finding"
+        )
+        tools.reset(binary_id=tools.binary_id)
+        entry = tools.store.read(tools.binary_id)["functions"]["0x140002000"]
+        assert entry["findings_note"] is None
+        assert entry["reviewed_at"] is None
+        assert entry["reviewed_by"] is None
+
+    def test_reset_keeps_the_index_and_scope(self, tools):
+        tools.three_functions()
+        tools.status(binary_id=tools.binary_id)
+        tools.store.mark_reviewed(tools.binary_id, ["0x140002000"], tool="t")
+        payload = _payload(tools.reset(binary_id=tools.binary_id))
+        assert payload["status"] == "ready"
+        assert payload["total"] == 3
+        assert payload["in_scope_total"] == 2
+        assert payload["dropped"] is False
+
+    def test_reset_is_idempotent(self, tools):
+        tools.three_functions()
+        tools.status(binary_id=tools.binary_id)
+        tools.store.mark_reviewed(tools.binary_id, ["0x140002000"], tool="t")
+        tools.reset(binary_id=tools.binary_id)
+        payload = _payload(tools.reset(binary_id=tools.binary_id))
+        assert payload["cleared"] == 0
+        assert payload["reviewed"] == 0
+
+    def test_drop_index_rebuilds_from_the_analysis_cache(self, tools):
+        tools.three_functions()
+        tools.status(binary_id=tools.binary_id)
+        tools.store.mark_reviewed(tools.binary_id, ["0x140002000"], tool="t")
+        payload = _payload(tools.reset(binary_id=tools.binary_id, drop_index=True))
+        assert payload["dropped"] is True
+        assert payload["status"] == "ready"
+        assert payload["total"] == 3
+        assert payload["reviewed"] == 0
+
+    def test_reset_without_a_record_is_an_error_not_a_silent_success(self, tools):
+        tools.three_functions()
+        payload = _payload(tools.reset(binary_id=tools.binary_id))
+        assert "error" in payload
+        assert payload["status"] == "not_indexed"
+
+    def test_reset_by_path(self, tools):
+        tools.three_functions()
+        tools.status(binary_id=tools.binary_id)
+        tools.store.mark_reviewed(tools.binary_id, ["0x140002000"], tool="t")
+        payload = _payload(tools.reset(binary_path=tools.path))
+        assert payload["cleared"] == 1
+
+    def test_reset_does_not_touch_the_analysis_cache(self, tools):
+        tools.three_functions()
+        tools.status(binary_id=tools.binary_id)
+        tools.reset(binary_id=tools.binary_id, drop_index=True)
+        assert (tools.cache.cache_dir / f"{tools.binary_id}.json.gz").exists()
+
+    def test_worklist_is_full_again_after_a_reset(self, tools):
+        """The point of the reset: the loop must have work to do again."""
+        tools.three_functions()
+        tools.status(binary_id=tools.binary_id)
+        tools.store.mark_reviewed(
+            tools.binary_id, ["0x140001000", "0x140002000"], tool="t"
+        )
+        assert _payload(tools.next(binary_id=tools.binary_id))["functions"] == []
+        tools.reset(binary_id=tools.binary_id)
+        after = _payload(tools.next(binary_id=tools.binary_id))
+        assert len(after["functions"]) == 2
+        assert after["remaining_after"] == 0
 
 
 class TestAutoMarkingSet:

@@ -17,8 +17,9 @@ unfalsifiable. With one it is arithmetic.
 | `get_next_unreviewed` | deterministic worklist, ascending address |
 | `coverage_index` | explicit (re)index; normally automatic |
 | `mark_function_reviewed` | manual mark / unmark, optional findings note |
+| `reset_coverage` | clear every mark for a binary, or drop the record entirely |
 
-These four return a **flat JSON object**, unlike the rest of the server, because
+These five return a **flat JSON object**, unlike the rest of the server, because
 consumers bind to the field names and assert invariants on the counts.
 
 They return a `dict`, not a serialized string, and that is load-bearing: FastMCP
@@ -190,3 +191,38 @@ query for a binary that was analyzed before coverage existed. The index rebuilds
 itself when the analysis cache grows (an incremental run) or when
 `scope_version` changes — **review marks, timestamps and notes are preserved
 across a rebuild.**
+
+## Resetting a contaminated denominator
+
+Marks are preserved aggressively, and auto-marking is silent. Together those
+make one accident easy: a scripted sweep, a bulk `mark_function_reviewed`, or a
+tool run against the wrong path leaves a binary recorded as reviewed that nobody
+read. That record is worse than having none — the next campaign polls it, sees
+`remaining_in_scope: 0`, and stops.
+
+`reset_coverage` is the way out. It is deliberately a tool and not a documented
+`rm`: a glob delete in the cache directory is unreviewable and takes the
+neighbouring binaries with it.
+
+| Call | Effect |
+|---|---|
+| `reset_coverage(binary_path=...)` | clears every mark; keeps the stored function list and scope exactly as built. |
+| `reset_coverage(binary_path=..., drop_index=True)` | deletes the side-car, then rebuilds it from the current analysis cache under current scope logic. |
+
+Both return `status: "ready"` with `reviewed: 0` and the denominator intact.
+**`drop_index=True` does not leave the binary unindexed** — the record is
+rebuilt on the spot, and even if it were not, the next status query re-indexes
+automatically. You only see `not_indexed` with null counts if the *analysis*
+cache is gone too, which `reset_coverage` never touches.
+
+So the difference is not "how much is deleted", it is **which scope survives**.
+The default keeps the scope as it was computed, whenever that was; the drop
+recomputes it under the current `scope_version` and the current contents of the
+analysis cache. Prefer the default: clearing marks unlearns the claim that
+functions were read while keeping the denominator you already trust. Reach for
+`drop_index=True` when the index itself is suspect — built under scope logic you
+no longer trust, or predating an incremental re-analysis that added functions.
+
+The response reports `cleared` (how many marks were removed) so the operator
+sees the size of what was undone. Resetting a binary with no record is an error,
+not a silent no-op — it usually means the wrong `binary_id`.

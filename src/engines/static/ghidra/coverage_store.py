@@ -599,6 +599,50 @@ class CoverageStore:
 
     # marking
 
+    def reset_marks(self, binary_id: str) -> int:
+        """Clear every review mark, keeping the index and the scope.
+
+        The recovery path for a contaminated ledger -- a scripted sweep, a
+        verification run against the wrong file, a pass that was retracted.
+        Without it the only remedy is deleting files out of the cache
+        directory by hand, and a denominator nobody can correct is worse than
+        no denominator: the next campaign reads "fully reviewed" and stops.
+
+        Returns the number of functions whose mark or note was cleared.
+        """
+        record = self.read(binary_id)
+        if record is None:
+            return 0
+        cleared = 0
+        for entry in (record.get("functions") or {}).values():
+            if entry.get("reviewed") or entry.get("findings_note"):
+                cleared += 1
+            entry["reviewed"] = False
+            entry["reviewed_at"] = None
+            entry["reviewed_by"] = None
+            entry["findings_note"] = None
+        if cleared:
+            self.write(record)
+        return cleared
+
+    def drop(self, binary_id: str) -> bool:
+        """Delete the coverage record entirely.
+
+        The next status query re-indexes from the analysis cache with every
+        function unreviewed. Stronger than :meth:`reset_marks` because it also
+        discards the stored scope, so it is the right call when the index
+        itself is suspect rather than only the marks.
+        """
+        path = self._coverage_path(binary_id)
+        if not path.exists():
+            return False
+        try:
+            path.unlink()
+            return True
+        except OSError as exc:
+            logger.error("Could not drop coverage side-car %s: %s", path, exc)
+            return False
+
     def mark_reviewed(
         self,
         binary_id: str,

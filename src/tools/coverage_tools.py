@@ -13,6 +13,7 @@ Tools
 ``get_next_unreviewed``  -- deterministic worklist, ascending address.
 ``coverage_index``       -- explicit (re)index; normally automatic.
 ``mark_function_reviewed`` -- manual mark / unmark, optional findings note.
+``reset_coverage``       -- clear the marks; the undo for a contaminated ledger.
 
 Auto-marking
 ------------
@@ -410,4 +411,72 @@ def register_coverage_tools(app, session_manager, cache, runner=None):
         payload.update(store.counts(refreshed))
         return payload
 
-    logger.info("Registered 4 coverage tools")
+    @app.tool()
+    def reset_coverage(
+        binary_id: str | None = None,
+        binary_path: str | None = None,
+        drop_index: bool = False,
+    ) -> dict:
+        """
+        Clear the review marks for a binary. The undo for a contaminated ledger.
+
+        Use when marks landed that do not reflect anyone actually reading the
+        code -- a scripted sweep, a verification run pointed at the wrong file,
+        a pass that was retracted. An inflated denominator is worse than none:
+        the next campaign reads "fully reviewed" and stops on a binary nobody
+        read, which is the exact failure coverage exists to prevent.
+
+        This is destructive and takes effect immediately. It does not touch the
+        Ghidra analysis cache. To clear specific functions rather than all of
+        them, use ``mark_function_reviewed(..., reviewed=False)``.
+
+        Args:
+            binary_id: Lowercase sha256 hexdigest of the binary's bytes.
+            binary_path: Optional path alternative to ``binary_id``.
+            drop_index: Also discard the function list and stored scope, so the
+                next query re-indexes from the analysis cache. Use when the
+                index itself is suspect, not just the marks.
+
+        Returns:
+            JSON with ``cleared`` (how many functions had a mark or note),
+            ``dropped`` (whether the record was deleted) and the refreshed
+            counts. Clearing an already-clean ledger reports ``cleared: 0``
+            rather than failing.
+        """
+        try:
+            resolved_id, resolved_path = _resolve(binary_id, binary_path)
+        except ValueError as exc:
+            return _error(str(exc))
+        except (PathTraversalError, FileSizeError, FileNotFoundError) as exc:
+            return _error(f"Invalid binary path: {exc}")
+
+        if not resolved_id:
+            return _error("No binary resolved. Pass binary_id or binary_path.")
+
+        try:
+            existing = store.read(resolved_id)
+            if existing is None:
+                return _error(
+                    "No coverage record for this binary; nothing to reset.",
+                    binary_id=resolved_id,
+                    status="not_indexed",
+                )
+            cleared = store.reset_marks(resolved_id)
+            dropped = store.drop(resolved_id) if drop_index else False
+            record, status = store.ensure_indexed(resolved_id, resolved_path)
+        except Exception as exc:
+            logger.exception("reset_coverage failed")
+            return _error(f"Reset failed: {exc}")
+
+        payload = {
+            "binary_id": resolved_id,
+            "binary_path": (record or {}).get("binary_path") or resolved_path,
+            "cleared": cleared,
+            "dropped": dropped,
+            "status": status if record is not None else "not_indexed",
+        }
+        if record is not None:
+            payload.update(store.counts(record))
+        return payload
+
+    logger.info("Registered 5 coverage tools")

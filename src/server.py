@@ -1,7 +1,7 @@
 """
 Binary MCP Server for comprehensive binary analysis.
 
-Provides 249 tools for static and dynamic binary analysis:
+Provides 250 tools for static and dynamic binary analysis:
 - Static analysis via Ghidra (headless mode) for native binaries
 - Static analysis via ILSpyCmd for .NET assemblies
 - Dynamic analysis via x64dbg (native plugin)

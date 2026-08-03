@@ -66,6 +66,14 @@ else()
 endif()
 
 # Link x64bridge.lib (provides Bridge_* functions)
+# advapi32: the plugin builds an explicit DACL for the auth-token file and the
+# named pipe (ConvertStringSecurityDescriptorToSecurityDescriptorA,
+# ConvertSidToStringSidA). MSVC's default library set usually pulls advapi32 in,
+# so this may be redundant -- but relying on a default for a symbol we now call
+# directly is how a link break ships unnoticed. NOTE: none of this plugin is
+# compiled by CI or in the review environment.
+target_link_libraries(obsidian PRIVATE advapi32)
+
 if(EXISTS "${BRIDGE_LIB}")
     target_link_libraries(obsidian PRIVATE "${BRIDGE_LIB}")
     message(STATUS "Plugin: Linking bridge library: ${BRIDGE_LIB}")

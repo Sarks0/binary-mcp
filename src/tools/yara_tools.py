@@ -191,6 +191,12 @@ def generate_yara_rule(
         lines.append(f'        date = "{datetime.now().strftime("%Y-%m-%d")}"')
 
     # Strings section
+    #
+    # `selected` must exist before this block: the condition section below
+    # reads it unconditionally for the "medium" and "high" strictness levels,
+    # so generate_yara_rule(strings=[]) raised UnboundLocalError for both --
+    # only "low" survived, because its condition branch never mentions it.
+    selected: list[str] = []
     if strings:
         lines.append("")
         lines.append("    strings:")
@@ -243,7 +249,17 @@ def generate_yara_rule(
     lines.append("")
     lines.append("    condition:")
 
-    if strictness == "high":
+    if not selected and not imports:
+        # No strings survived scoring and no imports were supplied, so there is
+        # no "strings:" section. Every branch below references "them" or "$s*",
+        # and a condition referencing string identifiers that were never
+        # declared does not COMPILE in yara -- the tool would hand back a rule
+        # that looks fine and fails the moment anyone tries to use it. Emit the
+        # one meaningful strings-free condition instead, and say why.
+        lines.append("        // No strings met the scoring threshold for this")
+        lines.append("        // strictness level; matching on PE header only.")
+        lines.append("        uint16(0) == 0x5A4D")
+    elif strictness == "high":
         # Require PE and multiple matches
         if len(selected) >= 3:
             lines.append("        uint16(0) == 0x5A4D and")

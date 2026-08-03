@@ -684,3 +684,110 @@ def test_operator_allowlist_still_excludes_everything_else(tmp_path, monkeypatch
     inside = quarantine / "sample.bin"
     inside.write_bytes(b"MZ")
     assert sanitize_binary_path(str(inside)) == inside.resolve()
+
+
+# ---------------------------------------------------------------------------
+# F-8 ordering: the Ghidra cache read a raw, unvalidated path
+# ---------------------------------------------------------------------------
+#
+# Ten x64dbg tools in src/tools/dynamic_tools.py take a binary_path straight
+# from the model and reach ProjectCache via _load_function_mappings /
+# has_cached / get_cached without ever calling sanitize_binary_path.
+# ProjectCache._get_binary_hash then did open(binary_path, "rb") and read to
+# EOF -- outside the allow-list that governs every other read here, and with no
+# size cap at all, so a path naming an endless file span forever inside a tool
+# call. The digest only names a cache file that will not exist, so nothing was
+# disclosed; it was a read plus a resource-exhaustion primitive.
+#
+# Fixed at the chokepoint, not in the ten tools: every public ProjectCache
+# method routes through _get_binary_hash.
+
+
+class TestGhidraCacheConfinement:
+    def test_hash_refuses_a_path_outside_the_allow_list(self, tmp_path, monkeypatch):
+        from src.engines.static.ghidra.project_cache import ProjectCache
+
+        quarantine = tmp_path / "quarantine"
+        quarantine.mkdir()
+        monkeypatch.setenv("BINARY_MCP_ALLOWED_DIRS", str(quarantine))
+        monkeypatch.delenv("BINARY_MCP_ALLOW_ANY_PATH", raising=False)
+
+        outside = tmp_path / "secret.bin"
+        outside.write_bytes(b"MZ" + b"\x00" * 32)
+
+        with pytest.raises(PathTraversalError):
+            ProjectCache()._get_binary_hash(str(outside))
+
+    def test_in_bounds_path_still_hashes(self, tmp_path, monkeypatch):
+        """Confinement must not break the cache for legitimate samples."""
+        import hashlib
+
+        from src.engines.static.ghidra.project_cache import ProjectCache
+
+        quarantine = tmp_path / "quarantine"
+        quarantine.mkdir()
+        monkeypatch.setenv("BINARY_MCP_ALLOWED_DIRS", str(quarantine))
+        monkeypatch.delenv("BINARY_MCP_ALLOW_ANY_PATH", raising=False)
+
+        sample = quarantine / "sample.bin"
+        payload = b"MZ" + b"\x90" * 128
+        sample.write_bytes(payload)
+
+        assert (
+            ProjectCache()._get_binary_hash(str(sample))
+            == hashlib.sha256(payload).hexdigest()
+        )
+
+    def test_public_readers_do_not_open_an_out_of_bounds_path(
+        self, tmp_path, monkeypatch
+    ):
+        """has_cached/get_cached swallow the refusal into 'not cached'.
+
+        That is fail-closed and matches their existing broad handlers -- what
+        matters is that the file is never opened.
+        """
+        from src.engines.static.ghidra.project_cache import ProjectCache
+
+        quarantine = tmp_path / "quarantine"
+        quarantine.mkdir()
+        monkeypatch.setenv("BINARY_MCP_ALLOWED_DIRS", str(quarantine))
+        monkeypatch.delenv("BINARY_MCP_ALLOW_ANY_PATH", raising=False)
+
+        outside = tmp_path / "secret.bin"
+        outside.write_bytes(b"MZ")
+
+        cache = ProjectCache()
+        assert cache.has_cached(str(outside)) is False
+        assert cache.get_cached(str(outside)) is None
+
+    def test_hash_is_the_only_place_the_cache_opens_a_binary(self):
+        """Guard the chokepoint property the fix depends on.
+
+        If a future ProjectCache method opens binary_path directly instead of
+        going through _get_binary_hash, confinement is bypassed again.
+        """
+        import ast
+        import inspect
+
+        from src.engines.static.ghidra import project_cache as module
+
+        tree = ast.parse(inspect.getsource(module))
+        offenders = []
+        for func in ast.walk(tree):
+            if not isinstance(func, ast.FunctionDef) or func.name == "_get_binary_hash":
+                continue
+            for node in ast.walk(func):
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "open"
+                    and node.args
+                    and "binary_path" in ast.unparse(node.args[0])
+                ):
+                    offenders.append(f"{func.name}:{node.lineno}")
+
+        assert not offenders, (
+            "ProjectCache opens a caller-supplied binary_path outside "
+            "_get_binary_hash, bypassing confinement (audit F-8):\n  "
+            + "\n  ".join(offenders)
+        )

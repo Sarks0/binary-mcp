@@ -34,6 +34,213 @@ logger = logging.getLogger(__name__)
 MAX_DUMP_SIZE = 100 * 1024 * 1024
 
 
+# ---------------------------------------------------------------------------
+# x64dbg command-string structure (audit findings F-9 / F-16)
+# ---------------------------------------------------------------------------
+#
+# WHY THIS EXISTS: every gate this project had between a caller and x64dbg's
+# DbgCmdExec decided on the FIRST TOKEN of the WHOLE string. x64dbg does not
+# dispatch the whole string. ``cmdsplit`` (x64dbg src/dbg/command.cpp:207-253)
+# chops the string on ';' first, and ``cmddirectexec`` then trims and dispatches
+# EACH resulting segment independently. So "log x" passed every allowlist while
+# "log x;init C:/evil.exe" passed them too -- and x64dbg then ran the ``init``,
+# which STARTS the sample. That is a static-analysis server executing malware:
+# the cardinal-rule violation, and the reason every layer below now validates
+# every segment rather than the first word of the blob.
+#
+# The functions below mirror cmdsplit's state machine EXACTLY, because a
+# splitter that disagrees with x64dbg's is itself a bypass: any segment we fail
+# to see is a segment we fail to validate. Verified against the upstream source
+# (x64dbg/x64dbg, src/dbg/command.cpp):
+#
+#   * '"' toggles quote state unless the previous character escaped it;
+#     '\\' toggles an escape flag; anything else clears it.
+#   * ';' inside quotes is literal -- x64dbg is genuinely quote-aware, so
+#     'log "a;b"' really is ONE command and rejecting it would be a false
+#     positive (see _has_unbalanced_quotes for the one case we still refuse).
+#   * empty segments are dropped, surviving segments are Trim()'d.
+#
+# A leading '$' is refused outright rather than parsed: cmdsplit runs
+# ``stringformatinline`` over a '$'-prefixed command BEFORE splitting
+# (command.cpp:211-218), so the expansion result -- which we cannot evaluate
+# here, it depends on live debuggee state -- is what gets split on ';'. A
+# format expression that expands to a ';' would smuggle in a command no gate
+# ever saw.
+
+
+def _has_unbalanced_quotes(command: str) -> bool:
+    """
+    Report whether ``command`` ends inside a quote (or a dangling escape).
+
+    F-16: x64dbg's own splitter would treat the trailing remainder as quoted
+    and therefore as a single command, which is the same conclusion our mirror
+    reaches -- so this is not itself a bypass. It is refused anyway because an
+    unterminated quote is the one input where our mirror and x64dbg's parser
+    are most likely to drift apart across versions, and drift here is measured
+    in "the sample got launched". Malformed input is not worth that risk.
+    """
+    inquote = False
+    inescape = False
+    for ch in command:
+        if ch == '"':
+            if not inescape:
+                inquote = not inquote
+            inescape = False
+        elif ch == "\\":
+            inescape = not inescape
+        else:
+            inescape = False
+    return inquote or inescape
+
+
+def split_x64dbg_command(command: str) -> list[str]:
+    """
+    Split a command string the way x64dbg's ``cmdsplit`` does.
+
+    F-9/F-16: this is the function that makes per-segment validation possible.
+    See the module comment above for the upstream reference and for why the
+    state machine is copied character for character instead of approximated
+    with ``str.split(";")``.
+
+    Args:
+        command: Raw command string as it would be handed to DbgCmdExec.
+
+    Returns:
+        The trimmed, non-empty segments x64dbg would dispatch, in order.
+    """
+    segments: list[str] = []
+    current: list[str] = []
+    inquote = False
+    inescape = False
+
+    for ch in command:
+        if ch == '"':
+            if not inescape:
+                inquote = not inquote
+            inescape = False
+        elif ch == "\\":
+            inescape = not inescape
+        else:
+            inescape = False
+
+        if ch == ";" and not inquote:
+            # x64dbg drops empty segments here (`if(!split.empty())`).
+            if current:
+                segments.append("".join(current))
+                current = []
+        else:
+            current.append(ch)
+
+    if current:
+        segments.append("".join(current))
+
+    # cmddirectexec/cmdloop trim each segment and skip the ones that are empty
+    # afterwards, so a ";  ;" run yields no extra dispatch.
+    return [segment.strip() for segment in segments if segment.strip()]
+
+
+def x64dbg_command_segments(command: str | None) -> list[str]:
+    """
+    Structurally validate a command string and return its dispatchable segments.
+
+    This performs the checks that are about the SHAPE of the string, before any
+    allowlist sees it (F-9/F-16). Every caller that is about to hand a string to
+    x64dbg must route it through here and then validate each returned segment,
+    because each segment is an independent command as far as x64dbg is
+    concerned.
+
+    Args:
+        command: Raw command string (``None`` is treated as empty).
+
+    Returns:
+        List of trimmed, non-empty segments to validate individually.
+
+    Raises:
+        ValueError: If the string is empty or structurally unsafe. ValueError
+            specifically -- callers treat it as "rejected input", while an
+            IndexError/AttributeError escapes as an opaque internal error
+            (finding F-12).
+    """
+    text = command or ""
+    if not isinstance(text, str):
+        raise ValueError("Command must be a string")
+
+    if not text.strip():
+        raise ValueError("Command cannot be empty")
+
+    # A NUL truncates the string at the C boundary: everything the Python gate
+    # inspected past the NUL is invisible to x64dbg, and everything x64dbg runs
+    # past it would be invisible to us. Refuse rather than reason about it.
+    if "\x00" in text:
+        raise ValueError(
+            "Command contains a NUL byte and is blocked by security policy."
+        )
+
+    # x64dbg's script engine and log-redirection commands are line-oriented, so
+    # an embedded CR/LF is a second command by another name. The C++ plugin
+    # rejects these too; doing it here as well means the string never leaves
+    # this process.
+    if "\n" in text or "\r" in text:
+        raise ValueError(
+            "Command contains an embedded line break and is blocked by "
+            "security policy."
+        )
+
+    # See the module comment: '$' makes cmdsplit run stringformatinline BEFORE
+    # splitting, so the text that actually gets split is not the text we
+    # validated. Refuse the prefix instead of trying to predict the expansion.
+    if text.lstrip().startswith("$"):
+        raise ValueError(
+            "Command starts with '$' (inline string formatting) and is blocked "
+            "by security policy: x64dbg expands it before splitting on ';', so "
+            "the commands that would actually run cannot be validated here."
+        )
+
+    if _has_unbalanced_quotes(text):
+        raise ValueError(
+            "Command has an unterminated quote or a dangling escape and is "
+            "blocked by security policy: its ';' separators cannot be located "
+            "unambiguously."
+        )
+
+    segments = split_x64dbg_command(text)
+    if not segments:
+        raise ValueError("Command cannot be empty")
+
+    for segment in segments:
+        # cmdsplit only strips '$' from the head of the WHOLE string, but a
+        # per-segment '$' is refused as well: it costs nothing, and it keeps
+        # this rule from depending on where in the string the caller put it.
+        if segment.startswith("$"):
+            raise ValueError(
+                "Command segment starts with '$' (inline string formatting) "
+                "and is blocked by security policy."
+            )
+
+    return segments
+
+
+def x64dbg_command_name(segment: str) -> str:
+    """
+    Extract the command name from one already-split, already-trimmed segment.
+
+    Splitting on space, '(' and ',' is deliberately STRICTER than x64dbg's
+    ``cmdget``, which truncates at the first space only. A name containing '('
+    or ',' can never match a registered command (x64dbg comma-splits the
+    registration string), so anything this shortens is something x64dbg would
+    hand to its expression parser rather than to a command handler -- shrinking
+    the token can only make the allowlist harder to satisfy, never easier.
+
+    Args:
+        segment: A single command segment.
+
+    Returns:
+        The lowercased command name, or "" if the segment has no name-like head.
+    """
+    head = segment.strip().split(" ")[0].split("\t")[0]
+    return head.split("(")[0].split(",")[0].lower()
+
+
 class AddressValidationError(StructuredBaseError):
     """
     Raised when an address parameter is invalid or missing.
@@ -2011,8 +2218,24 @@ class X64DbgBridge(Debugger):
     # deliberately a DIFFERENT control from the plugin's: different direction
     # (deny vs allow), different contents (it names alias spellings the plugin
     # does not need to enumerate, because the plugin rejects unknown tokens by
-    # default). Do not treat an omission here as permission -- the plugin
-    # decides. Never relax the plugin allowlist on the strength of this list.
+    # default). Do not treat an omission here as permission.
+    #
+    # WHY THE ALLOWLIST IS AUTHORITATIVE AND THIS LIST NEVER CAN BE (F-9):
+    # x64dbg registers commands with dbgcmdnew("InitDebug,init,initdbg", ...)
+    # -- COMMA-SEPARATED aliases, matched with _stricmp. One handler answers to
+    # several names, new aliases arrive with new releases, and a denylist has to
+    # name every spelling of every dangerous handler to be worth anything, while
+    # an allowlist has to name only the handful of commands we actually want.
+    # A missing entry here is a missed block; a missing entry on the allowlist
+    # is only a missing feature. That asymmetry is the whole argument, and it is
+    # why _ALLOWED_COMMANDS below -- not this set -- is the gate.
+    #
+    # Finding F-16 audit note: five former entries ("savefile", "quit", "exit",
+    # "exec", "execute") matched NO command registered by x64dbg's
+    # registercommands() and were removed. They blocked nothing while making the
+    # list look more comprehensive than it was, which is exactly the illusion
+    # that let alias-reachable commands through. They stay rejected -- by
+    # _ALLOWED_COMMANDS, which refuses everything it does not recognise.
     #
     # Trace configuration commands are denied here because their arguments are
     # themselves commands and file paths, which would bypass validation -- use
@@ -2020,64 +2243,151 @@ class X64DbgBridge(Debugger):
     _BLOCKED_COMMANDS = frozenset({
         "scriptdll", "scriptload", "scriptrun",
         "loadlib", "freelib",
-        "savedata", "savefile",
-        "quit", "stop", "exit",
+        "savedata",
+        "stop",
         "detach", "attach", "init",
-        "exec", "execute",
         "createthread",
         "tracesetcommand", "tracesetlog", "tracesetlogfile",
         # Known alias spellings of the above handlers. x64dbg registers
         # multiple names per command callback, so blocking one spelling blocks
         # nothing (F-9). These are the process-control and code-loading aliases
-        # worth naming explicitly at this layer; the plugin allowlist is what
-        # actually catches the ones nobody thought of.
+        # worth naming explicitly at this layer; the allowlist is what actually
+        # catches the ones nobody thought of.
         "initdbg", "initdebug", "startdebug",
         "attachdebugger", "detachdebugger",
         "stopdebug", "dbgstop",
-        "plugload", "pluginload", "plugunload", "pluginunload",
-        "threadcreate", "newthread", "killthread", "threadkill",
-        "setjit", "restartadmin",
+        "plugload", "pluginload", "loadplugin", "plugunload", "pluginunload",
+        "threadcreate", "newthread", "threadnew", "killthread", "threadkill",
+        "setjit", "restartadmin", "runas", "adminrestart",
         "scylla", "startscylla", "imprec",
         "chd",
+        # F-16: commands the first remediation pass never named, each of which
+        # reaches something a static-analysis server must never reach.
+        # "scriptcmd"/"scriptexec" are the worst of them -- scriptcmd routes
+        # through ScriptCmdExecAwait -> cmddirectexec, i.e. the FULL dispatcher,
+        # so allowing it once would re-open every hole at once.
+        "scriptcmd", "scriptexec", "dllscript",
+        # Arbitrary code staging inside the debuggee: alloc defaults to
+        # PAGE_EXECUTE_READWRITE, and memcpy/fill/copystr/asm write to it.
+        "alloc", "free", "memcpy", "fill", "memset", "copystr", "strcpy",
+        "asm", "setpagerights",
+        # Arbitrary file writes / log redirection on the ANALYST's host.
+        "minidump", "savelog", "logsave", "redirectlog", "logredirect",
+        # Stores a command string that x64dbg later runs via cmddirectexec.
+        "setbreakpointcommand", "bpcommand",
+        "settracelog", "settracecommand", "settracelogfile",
+        # Persist a command into the x64dbg UI for later one-click execution.
+        "addfavouritetool", "addfavouritecommand",
+    })
+
+    # Bridge-layer command allowlist -- the authoritative Python-side gate.
+    #
+    # F-16: the C++ plugin's ALLOWED_COMMANDS is documented as the authoritative
+    # decision point, but it too matches only the first word of the string it is
+    # handed, so it accepts "log x;init C:/evil.exe" and passes the whole thing
+    # to DbgCmdExec, which splits and runs the init. Until the plugin validates
+    # per segment, the last gate that actually bounds what x64dbg executes is
+    # this one, in Python. It therefore has to be an allowlist and it has to be
+    # applied to EVERY segment.
+    #
+    # Contents: exactly the plugin's ALLOWED_COMMANDS set. That is deliberate --
+    # the bridge must not send anything the plugin will refuse, so the sets are
+    # kept identical on purpose and a test asserts it. It is a superset of the
+    # tool-layer allowlist in dynamic_tools.py (which is what bounds
+    # x64dbg_execute_command) because the bridge also issues commands on its own
+    # behalf for the dedicated tools: findasm, findguid, reffindrange, ticnd,
+    # tocnd, tibt, tobt and friends are here for that reason, not because
+    # callers may ask for them.
+    #
+    # Anything not named here is refused. Adding an entry means "x64dbg may run
+    # this against a live sample" -- weigh it accordingly, and update
+    # ALLOWED_COMMANDS in plugin.cpp at the same time.
+    _ALLOWED_COMMANDS = frozenset({
+        # Disassembly and navigation
+        "dis", "dis.prev", "dis.next", "dis.iscall", "dis.isbranch",
+        "disasm", "graph", "graphit",
+        # Search
+        "find", "findall", "findmem", "findallmem", "findasm", "findguid",
+        "modcallfind", "reffindrange",
+        "ref", "refstr", "refsearch", "refinfo",
+        # Analysis
+        "cfanalyze", "analxrefs", "analrecur", "analadv", "analyse",
+        "exhandlers", "exinfo",
+        # Execution control the dedicated tools rely on
+        "rtu", "instrundo",
+        "ticnd", "tocnd", "tibt", "tobt", "tracesetcondition",
+        # Breakpoint listing / DLL breakpoints
+        "bplist", "bphitcount", "bpdll", "bcdll", "bpedll", "bpddll",
+        # Output and evaluation
+        "log", "msg", "eval",
+        "dump", "sdump",
+        # Annotations
+        "lbl", "lblset", "lbldel", "lbllist",
+        "cmt", "cmtset", "cmtdel", "cmtlist",
+        "bm", "bmset", "bmdel", "bmlist",
+        # Variables and watches
+        "var", "vardel", "varlist",
+        "addwatch", "delwatch", "setwatchdog",
+        "setwatchexpression", "setwatchname",
+        # Type system
+        "addstruct", "addunion", "addmember", "addtype",
+        "visittype", "sizeoftype", "removetype",
+        "enumtypes", "cleartypes", "loadtypes", "parsetypes",
+        # Privilege toggles used by the dedicated privilege tools
+        "enableprivilege", "disableprivilege",
     })
 
     def _validate_command(self, command: str) -> None:
         """
-        Early-reject a command against the fast-fail denylist.
+        Validate every command x64dbg would dispatch from this string.
 
-        This is not the authoritative gate -- the plugin's ALLOWED_COMMANDS
-        allowlist is (see the comment on _BLOCKED_COMMANDS). Passing this
-        check does not mean the command will be executed.
+        F-9/F-16: this used to inspect the first token of the whole string.
+        x64dbg splits on ';' and dispatches each segment separately, so
+        ``log x;init C:/evil.exe`` sailed through on the strength of the ``log``
+        and then STARTED THE SAMPLE. Each segment is now validated in its own
+        right, against a deny-then-allow pair, and the string is rejected if any
+        one of them fails.
 
         Raises:
-            ValueError: If the command is empty or is denied by this layer
+            ValueError: If the command is empty, structurally unsafe, or any of
+                its segments is not permitted.
         """
-        # Audit finding F-12: this previously did command.strip().split()[0],
-        # which raises IndexError on an empty or whitespace-only command.
-        # Callers of execute_command() catch ValueError as "rejected input";
-        # an IndexError escapes as an opaque internal error. Reject empty input
-        # up front, the same way windbg/allowlist.py::validate_command does.
-        stripped = (command or "").strip()
-        if not stripped:
-            raise ValueError("Command cannot be empty")
+        # Structural checks first (empty / NUL / CR-LF / '$' / unbalanced
+        # quotes) -- see x64dbg_command_segments. Finding F-12: this must raise
+        # ValueError, never IndexError, because callers of execute_command()
+        # treat ValueError as "rejected input".
+        segments = x64dbg_command_segments(command)
 
-        # Split on the argument separators x64dbg itself accepts so the token
-        # we test is the command name: "dis.prev(rip, 5)" -> "dis.prev" and
-        # "init,\"C:\\evil.exe\"" -> "init" rather than the whole blob.
-        first_token = stripped.split()[0].split("(")[0].split(",")[0].lower()
-        if first_token in self._BLOCKED_COMMANDS:
-            raise ValueError(
-                f"Command '{first_token}' is blocked by security policy. "
-                f"This command could load external code or compromise the session."
-            )
+        for segment in segments:
+            name = x64dbg_command_name(segment)
+
+            # Fast-fail denylist: a specific, actionable message for the cases
+            # people actually try. Not the gate -- the allowlist below is.
+            if name in self._BLOCKED_COMMANDS:
+                raise ValueError(
+                    f"Command '{name}' is blocked by security policy. "
+                    f"This command could load external code or compromise the session."
+                )
+
+            # The gate. Fails closed on anything unrecognised, which is the only
+            # structure that survives x64dbg's alias-rich command language.
+            if name not in self._ALLOWED_COMMANDS:
+                raise ValueError(
+                    f"Command '{name}' is blocked by security policy: it is not "
+                    f"on the x64dbg bridge allowlist. Use a dedicated tool for "
+                    f"operations this list does not cover."
+                )
 
     def execute_command(self, command: str) -> dict[str, Any]:
         """
         Execute an x64dbg command via the command API.
 
-        Commands are validated against a blocklist of dangerous operations
-        (ScriptDll, loadlib, savedata, etc.) before being sent. The plugin
-        also enforces its own server-side blocklist as defense-in-depth.
+        Every ';'-separated segment of the string is validated independently
+        (F-9/F-16) against a fast-fail denylist and then against
+        ``_ALLOWED_COMMANDS``; the whole string is refused if any segment fails.
+        The plugin enforces its own allowlist as well, but only on the first
+        token of the string it receives, so this is the layer that bounds what
+        DbgCmdExec ends up dispatching.
 
         Args:
             command: The x64dbg command string to execute

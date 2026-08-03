@@ -99,35 +99,89 @@ downloaded script into an interpreter.
 
 ### What the installers verify
 
-> **Status — read this before relying on the table below.** The verification
-> machinery is implemented, but for binary-mcp's own release assets it is
-> currently **inert**: `.github/workflows/release.yml` does not yet publish a
-> `SHA256SUMS` manifest, and no digests ship pinned in the installer. Until that
-> workflow is updated, `obsidian.dp64`, `obsidian.dp32` and `obsidian_server.exe`
-> are downloaded, reported with the SHA-256 that was actually received, and
-> installed **without** their integrity being confirmed against a trusted value.
-> Treat the plugin install as unverified today, and pin the digests manually
-> (see "Pinning a hash") if you need assurance now. Publishing `SHA256SUMS` from
-> the release workflow is the fix, and is tracked as follow-up work.
+> **Status — what is and is not actually checked.** `.github/workflows/release.yml`
+> now generates a `SHA256SUMS` manifest in the same job that uploads the release
+> assets, and publishes it as a release asset. `install.ps1` reads that manifest
+> and verifies `obsidian.dp64`, `obsidian.dp32` and `obsidian_server.exe`
+> against it before copying anything into the x64dbg plugins directory; if the
+> manifest is present but does not list an asset, the plugin install **aborts**
+> rather than falling back to installing it unchecked.
+>
+> Two limits are worth stating plainly:
+>
+> - **Releases published before that workflow change carry no `SHA256SUMS`.**
+>   Installing plugins from one of those releases still prints the loud
+>   unverified-download warning and installs them without a trusted digest. Pin
+>   the digests yourself (see "Pinning a hash") or build the plugins from source
+>   if you need assurance on an older release.
+> - **A manifest published in the same release as the assets does not survive a
+>   takeover of the release itself.** It defeats tampering with an individual
+>   asset or its CDN copy. Only a pinned digest — one you obtained out of band —
+>   defends against a compromised release.
+>
+> The plugin binaries are also **not code-signed**, so the Authenticode check on
+> them is informational (see the note under the table).
 
 | Artifact | How it is verified |
 |---|---|
-| binary-mcp release assets (`obsidian.dp64`, `obsidian.dp32`, `obsidian_server.exe`) | SHA-256 against a `SHA256SUMS` manifest published with the GitHub release, or an operator-pinned hash. **Neither exists yet — see the status note above; unverified in practice today** |
+| binary-mcp release assets (`obsidian.dp64`, `obsidian.dp32`, `obsidian_server.exe`) | SHA-256 against the `SHA256SUMS` manifest published with the GitHub release, or an operator-pinned hash. Fails closed if the manifest exists but omits the asset. Releases predating the manifest are installed unverified, with a warning |
 | Ghidra release zip | SHA-256 from the checksum published with the Ghidra release, or an operator-pinned hash |
 | x64dbg snapshot zip | Operator-pinned hash (the `snapshot` tag is a rolling build with no fixed digest) |
-| uv / .NET install scripts | Operator-pinned hash; downloaded to disk and verified before execution, never piped |
-| Windows SDK bootstrapper | Authenticode signature (Microsoft-signed); operator-pinned hash optional |
+| uv / .NET install scripts | Operator-pinned hash only — astral.sh and dot.net publish no stable digest. Without a pin the script is written to disk, flagged loudly as unverified, and then run (refused under strict mode); it is never piped into an interpreter. On Windows its Mark-of-the-Web is left intact unless the hash verified |
+| Windows SDK bootstrapper | Authenticode signature, required to be valid and issued to Microsoft Corporation. A bad or missing signature **aborts** — the bootstrapper is otherwise run with Administrator rights. An operator-pinned hash is optional and additional |
 | `main` branch source zip | Cannot be verified — a branch archive changes with every push. Prefer the `git clone` path, which the installer already uses when git is present |
 
 Anything that cannot be verified produces a loud, explicit warning naming the
 artifact, the URL, and the SHA-256 that was actually downloaded — the installer
 does not skip the check quietly.
 
+**About the Authenticode check on the plugins.** `install.ps1` runs
+`Get-AuthenticodeSignature` over each staged plugin binary, but Windows
+dispatches signature checks by file *extension* and does not recognise
+`.dp64`/`.dp32`, so it reports `UnknownError` — "cannot evaluate", not "bad
+signature". The installer treats that (and a plain unsigned `.exe`) as *no
+signature information*, and does not fail on it. **The plugins' integrity rests
+entirely on the SHA-256 check**, which is why the `SHA256SUMS` manifest matters.
+
+### Verifying a release yourself
+
+Releases built by the current workflow publish a `SHA256SUMS` asset covering the
+three plugin binaries and the release zip. (Releases predating that change do
+not have one — check the asset list.)
+
+```bash
+# download SHA256SUMS plus the assets you want, into the same directory
+sha256sum -c SHA256SUMS
+```
+
+```powershell
+Get-FileHash .\obsidian.dp64 -Algorithm SHA256    # compare against SHA256SUMS
+```
+
 ### Pinning a hash
 
 Set `BINARY_MCP_SHA256_<KEY>` before running the installer to require an exact
-digest for an artifact. The warning printed for an unverified download tells you
-the variable name and the digest to use. For example:
+digest for an artifact, overriding whatever the publisher's manifest says. The
+warning printed for an unverified download tells you the variable name and the
+digest to use. The full set:
+
+| Artifact | Environment variable | Installer |
+|---|---|---|
+| `obsidian.dp64` (x64dbg plugin) | `BINARY_MCP_SHA256_BINARY_MCP_OBSIDIAN_DP64` | `install.ps1` |
+| `obsidian.dp32` (x64dbg plugin) | `BINARY_MCP_SHA256_BINARY_MCP_OBSIDIAN_DP32` | `install.ps1` |
+| `obsidian_server.exe` | `BINARY_MCP_SHA256_BINARY_MCP_OBSIDIAN_SERVER_EXE` | `install.ps1` |
+| Ghidra release zip | `BINARY_MCP_SHA256_GHIDRA_ZIP` | both |
+| x64dbg snapshot zip | `BINARY_MCP_SHA256_X64DBG_SNAPSHOT` | `install.ps1` |
+| uv installer (`install.ps1` flavour) | `BINARY_MCP_SHA256_UV_INSTALLER_PS1` | `install.ps1` |
+| uv installer (`install.sh` flavour) | `BINARY_MCP_SHA256_UV_INSTALLER_SH` | `install.py` |
+| .NET install script | `BINARY_MCP_SHA256_DOTNET_INSTALLER_SH` | `install.py` |
+| Windows SDK bootstrapper | `BINARY_MCP_SHA256_WINDOWS_SDK_SETUP` | `install.ps1` |
+| `main` branch source zip | `BINARY_MCP_SHA256_REPO_ZIP` | both |
+
+The three `obsidian` entries are the only pins that override this project's own
+published `SHA256SUMS`. Use them when you want a digest you obtained out of band
+to win over the release — that is the only thing that survives a takeover of the
+release itself.
 
 **Linux / macOS:**
 ```bash
@@ -140,6 +194,7 @@ python3 install.py
 ```powershell
 $env:BINARY_MCP_SHA256_GHIDRA_ZIP = "<64-hex-digest>"
 $env:BINARY_MCP_SHA256_X64DBG_SNAPSHOT = "<64-hex-digest>"
+$env:BINARY_MCP_SHA256_BINARY_MCP_OBSIDIAN_DP64 = "<64-hex-digest>"
 .\install.ps1
 ```
 

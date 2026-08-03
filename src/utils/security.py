@@ -21,9 +21,20 @@ _UNSET: object = object()
 ENV_ALLOWED_DIRS = "BINARY_MCP_ALLOWED_DIRS"
 ENV_REQUIRE_CONFINEMENT = "BINARY_MCP_REQUIRE_CONFINEMENT"
 ENV_ALLOW_ANY_PATH = "BINARY_MCP_ALLOW_ANY_PATH"
+# Opt-out for the hard-link rejection below. Narrower than ENV_ALLOW_ANY_PATH:
+# it keeps directory confinement fully in force and only re-permits multiply
+# linked regular files, which is what a de-duplicated sample corpus looks like.
+ENV_ALLOW_HARDLINKS = "BINARY_MCP_ALLOW_HARDLINKS"
 
 # The "confinement disabled" warning is emitted once per process, not per call.
 _confinement_warning_emitted = False
+
+# Canonical RFC 4122 version-4 UUID, lowercase hex. The version nibble is pinned
+# to '4' and the variant nibble to [89ab] because that is exactly what
+# uuid.uuid4() emits -- the only way session IDs are ever minted (F-5).
+_SESSION_ID_RE = re.compile(
+    r'^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+)
 
 
 def _env_flag(name: str) -> bool:
@@ -39,6 +50,11 @@ def _confinement_required() -> bool:
 def _unrestricted_access_requested() -> bool:
     """True if the operator explicitly opted out of confinement entirely."""
     return _env_flag(ENV_ALLOW_ANY_PATH)
+
+
+def _hardlinks_allowed() -> bool:
+    """True if the operator opted out of the hard-link rejection."""
+    return _env_flag(ENV_ALLOW_HARDLINKS)
 
 
 def reset_confinement_warning() -> None:
@@ -220,6 +236,75 @@ class FileSizeError(SecurityError):
     pass
 
 
+def _reject_hardlinked_file(path: Path, binary_path: str) -> None:
+    """
+    Refuse a confined read of a regular file that has more than one name.
+
+    Audit (hard-link bypass of the F-8 quarantine posture): confinement is
+    enforced with ``resolve()`` + ``is_relative_to()``, and ``resolve()`` sees
+    through *symlinks* only. A hard link has no target to follow -- it IS the
+    inode, under a second name -- so
+
+        os.link("/etc/hostname", "/tmp/sample.bin")
+        sanitize_binary_path("/tmp/sample.bin")
+
+    passed every check and handed the caller the contents of /etc/hostname.
+    Anything with write access to a quarantine directory (which, by default,
+    includes the system temp dir that every local user can write to) could
+    therefore republish an arbitrary same-filesystem file under an in-bounds
+    name. That defeats the entire point of the allow-list.
+
+    There is no way to ask the kernel "which other names does this inode have",
+    so the only available answer is to refuse regular files with
+    ``st_nlink > 1`` while confinement is active. The trade-off:
+
+      * FALSE POSITIVES are real but narrow. A hard-linked corpus (``cp -l``,
+        ``rsync --link-dest`` backups, content-addressed sample stores that
+        de-duplicate with links) will be refused even though it is legitimate.
+        Those setups get :data:`ENV_ALLOW_HARDLINKS`, which re-permits multiply
+        linked files *without* weakening directory confinement -- deliberately
+        a much smaller hammer than ``BINARY_MCP_ALLOW_ANY_PATH``.
+      * NOTHING THIS SERVER WRITES trips it: cache entries, carved output,
+        dumps and extracted files are all created fresh with one link.
+      * Directories are exempt: ``st_nlink`` counts subdirectory ``..``
+        entries, so any non-empty directory has nlink > 1. Only regular files
+        are checked. Symlinks never reach here as themselves (the caller has
+        already resolved them, and out-of-bounds targets were rejected above).
+      * POSIX ONLY. On Windows ``os.stat`` fills ``st_nlink`` from a different
+        API path and reports 0 or 1 for files that do have multiple NTFS hard
+        links, so the check would be simultaneously unreliable and unable to
+        catch the equivalent attack. Rather than pretend, it is skipped there
+        and the limitation is stated here.
+
+    Args:
+        path: Resolved, in-bounds path that is known to exist and be a file.
+        binary_path: The caller's original argument, for the error message.
+
+    Raises:
+        PathTraversalError: If ``path`` is a regular file with several links.
+    """
+    if os.name == "nt" or _hardlinks_allowed():
+        return
+
+    try:
+        st = path.stat()
+    except OSError:
+        # Let the caller's own stat() below produce the error; a failure here
+        # must not turn into a confusing security denial.
+        return
+
+    if st.st_nlink > 1:
+        raise PathTraversalError(
+            f"Access denied: {binary_path} is a hard link (it has "
+            f"{st.st_nlink} names). Directory confinement resolves symlinks "
+            f"but cannot see through a hard link, so a multiply-linked file "
+            f"inside an allowed directory may be the same inode as a file "
+            f"outside it. Copy the sample instead of linking it, or set "
+            f"{ENV_ALLOW_HARDLINKS}=1 if this corpus is intentionally "
+            f"de-duplicated with hard links."
+        )
+
+
 def sanitize_binary_path(
     binary_path: str,
     allowed_dirs: "list[Path] | None" = _UNSET,
@@ -362,6 +447,14 @@ def sanitize_binary_path(
     # Must be a file, not directory
     if not path.is_file():
         raise ValueError(f"Path is not a file: {binary_path}")
+
+    # Hard-link check. Only meaningful while confinement is active: with
+    # BINARY_MCP_ALLOW_ANY_PATH set there is no boundary left to bypass, so
+    # refusing a multiply-linked file would be pure false positive. See
+    # _reject_hardlinked_file for why resolve() cannot cover this case and what
+    # the false-positive trade-off is.
+    if allowed_dirs:
+        _reject_hardlinked_file(path, binary_path)
 
     # Check file size to prevent DoS
     try:
@@ -551,6 +644,82 @@ def sanitize_output_path(output_path: Path, allowed_dir: Path) -> Path:
     return abs_path
 
 
+def sanitize_output_dir(output_dir: str | Path, allowed_dir: Path) -> Path:
+    """
+    Confine a caller-supplied *directory* to ``allowed_dir``, then create it.
+
+    Audit F-18 (HIGH): ``extract_python_packed`` passed ``output_dir`` through
+    completely unvalidated to ``PythonPackerAnalyzer.extract_pyinstaller``,
+    which did ``Path(output_dir).mkdir(parents=True, exist_ok=True)`` and then
+    wrote archive members into it. Only traversal *within* ``output_dir`` was
+    blocked (the Zip Slip guard), so the destination itself was arbitrary: the
+    model chose the directory (a Startup folder, ``~/.ssh``, a cron drop-in)
+    and the SAMPLE chose the filenames and the bytes. That is an
+    attacker-controlled write primitive with a model-controlled target -- the
+    worst half of each.
+
+    Why this is not just :func:`sanitize_output_path`: that function requires
+    the parent to already exist, because it validates a *file* about to be
+    written into an existing tree. An extraction root legitimately needs
+    directories created. Creation is what makes ordering critical here, so the
+    order is fixed and must not be rearranged:
+
+      1. anchor a relative path under ``allowed_dir`` (never the process CWD --
+         see the F-13 note in :func:`sanitize_output_path`);
+      2. resolve and prove containment;
+      3. reject symlinked components below ``allowed_dir`` (F-14) -- otherwise
+         a pre-planted link inside the root redirects the whole extraction;
+      4. only THEN mkdir.
+
+    Args:
+        output_dir: Requested directory. Absolute, or relative to
+            ``allowed_dir``.
+        allowed_dir: Root the output directory must live under. Created if
+            missing so containment can be evaluated against a real path.
+
+    Returns:
+        Validated, existing absolute directory inside ``allowed_dir``.
+
+    Raises:
+        PathTraversalError: If the path escapes ``allowed_dir`` or a
+            user-supplied component below it is a symlink.
+        ValueError: If the path is invalid or is not a directory.
+    """
+    try:
+        allowed_dir.mkdir(parents=True, exist_ok=True)
+        abs_allowed = allowed_dir.resolve()
+    except (OSError, RuntimeError) as e:
+        raise ValueError(f"Invalid output root: {e}")
+
+    requested = Path(output_dir) if not isinstance(output_dir, Path) else output_dir
+    raw_path = requested if requested.is_absolute() else allowed_dir / requested
+
+    try:
+        abs_path = raw_path.resolve()
+    except (OSError, RuntimeError) as e:
+        raise ValueError(f"Invalid path: {e}")
+
+    if not abs_path.is_relative_to(abs_allowed):
+        raise PathTraversalError(
+            f"Output directory must be within {abs_allowed} (requested: "
+            f"{output_dir}). Extraction writes sample-controlled bytes under "
+            f"sample-controlled filenames, so it is confined to this server's "
+            f"own output root."
+        )
+
+    _reject_symlinked_components(raw_path, abs_allowed)
+
+    if abs_path.exists() and not abs_path.is_dir():
+        raise ValueError(f"Output path exists and is not a directory: {abs_path}")
+
+    try:
+        abs_path.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise ValueError(f"Cannot create output directory: {e}")
+
+    return abs_path
+
+
 def safe_regex_compile(pattern: str, max_length: int = 100, timeout_ms: int = 1000):
     """
     Safely compile regex pattern with complexity limits.
@@ -639,6 +808,52 @@ def validate_state_id(state_id: str) -> str:
             "Invalid state ID format: must be 1-64 hex characters"
         )
     return state_id
+
+
+def validate_session_id(session_id: str) -> str:
+    """
+    Validate an analysis session ID to prevent path traversal.
+
+    Audit finding F-5 (MEDIUM): session IDs arrive straight from MCP tool
+    arguments and get interpolated into a filename under the session store::
+
+        self.store_dir / f"{session_id}.session.json.gz"
+
+    A ``session_id`` of ``'../../../../tmp/pwned'`` therefore escaped the store
+    directory entirely, giving a caller read/write/unlink on any path ending in
+    ``.session.json.gz`` or ``.meta.json``. Session IDs are minted exclusively
+    by ``uuid.uuid4()``, so pinning them to a canonical RFC 4122 version-4 UUID
+    is both complete and lossless -- no legitimate ID is ever rejected.
+
+    The first remediation pass fixed this at the chokepoint in
+    ``src/engines/session/unified_session.py`` but left the second, identical
+    construction in ``engines/static/ghidra/analysis_session.py`` untouched.
+    That is why the validator now lives here: a shared helper cannot be fixed in
+    one copy and forgotten in the other. ``unified_session._validate_session_id``
+    still carries its own private copy of the same regex (that module is owned
+    elsewhere); the two are deliberately identical in shape and behaviour.
+
+    Args:
+        session_id: Session identifier string
+
+    Returns:
+        Validated session ID, normalised to lowercase
+
+    Raises:
+        ValueError: If session_id is not a canonical UUIDv4
+    """
+    if not session_id or not isinstance(session_id, str):
+        raise ValueError("Session ID cannot be empty")
+    # strip() before matching mirrors validate_state_id(); the anchored regex
+    # still rejects embedded whitespace, NUL bytes and path separators because
+    # none of them can appear inside a UUID character class.
+    session_id = session_id.strip().lower()
+    if not _SESSION_ID_RE.match(session_id):
+        raise ValueError(
+            "Invalid session ID format: must be a UUID "
+            "(e.g. 123e4567-e89b-42d3-a456-426614174000)"
+        )
+    return session_id
 
 
 def validate_parameter_pattern(value: str, param_name: str, pattern: str = r'^[a-zA-Z0-9:_.\-]+$', max_length: int = 200) -> str:

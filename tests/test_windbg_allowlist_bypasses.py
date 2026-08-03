@@ -140,27 +140,42 @@ class TestQuotedSubcommandBody:
         assert "denied" in reason
 
     def test_quoted_body_denied_even_when_driver_token_is_unrecognised(self):
-        # The structural fix must not depend on naming the outer command:
-        # 'j(1)' does not match the 'j' deny token (the expression is glued to
-        # the command name), so only the recursion into the quoted body can
-        # catch this one.
+        # The fix must not depend on naming the outer command: 'j(1)' does not
+        # match a 'j' deny token (the expression is glued to the command name).
+        # Under the allowlist that variation is exactly what fails closed --
+        # an unrecognised command name is refused before its body matters.
         ok, reason = validate_command("j(1) '.shell calc'")
         assert ok is False
-        assert "quoted subcommand" in reason
-        assert ".shell" in reason
+        assert "allowlist" in reason
 
     def test_quoted_body_reason_is_prefixed(self):
         ok, reason = validate_command("bp X '.dvalloc 1000'")
         assert ok is False
         assert reason.startswith("in quoted subcommand: ")
 
-    def test_unterminated_quote_body_is_still_validated(self):
-        # parse_compound stops splitting on ';' once a quote opens, so this is
-        # a single subcommand whose first token is the harmless 'bp'. The
-        # quoted-body recursion must fail closed on the unterminated tail.
-        ok, reason = validate_command("bp X 'foo ; .shell calc")
+    @pytest.mark.parametrize("cmd", [
+        "bp X 'foo ; .shell calc",     # single quote never closes
+        'bp X ".shell calc',           # double quote never closes
+        "lm 'foo ; .shell calc",       # ... behind a NON-carrier, so nothing
+        'lm "foo ; .shell calc',       #     would have recursed into the tail
+    ])
+    def test_unterminated_quoted_region_fails_closed(self, cmd):
+        # parse_compound stops splitting on ';' once a quote opens, so each of
+        # these is a single subcommand behind a harmless first token. The
+        # validator refuses structurally malformed input rather than guessing
+        # where cdb would resume splitting.
+        ok, reason = validate_command(cmd)
+        assert ok is False, f"{cmd!r} slipped through"
+        assert "unterminated" in reason
+
+    def test_unterminated_block_fails_closed(self):
+        # Same hole with a brace: the block never closes, so the block
+        # extractor never sees the payload and the splitter never separates it.
+        ok, reason = validate_command(
+            ".foreach (a {!process 0 0}) {!handle ${a} ; .shell calc"
+        )
         assert ok is False
-        assert ".shell" in reason
+        assert "unterminated" in reason
 
     def test_quoted_body_inside_foreach_block_denied(self):
         ok, reason = validate_command(
@@ -190,9 +205,21 @@ class TestRecursionDepth:
     def test_deeply_nested_block_rejected_not_crashed(self):
         # ~1500 levels of nesting inside the 4096-char limit. Without a depth
         # cap this recursed once per level and raised RecursionError out of
-        # the validator instead of returning a verdict.
+        # the validator instead of returning a verdict. Under the allowlist
+        # the bare '{{{...' token is refused before any recursion happens;
+        # either way the requirement is a verdict, not an exception.
         cmd = "{" * 1500 + ".shell calc" + "}" * 1500
         ok, reason = validate_command(cmd)
+        assert ok is False
+        assert reason
+
+    def test_depth_cap_fires_on_a_legitimate_carrier_chain(self):
+        # Nesting through an ALLOWED carrier is the case that actually
+        # recurses, so this is where the cap has to hold.
+        payload = "!process 0 0"
+        for _ in range(40):
+            payload = ".if (1) {" + payload + "}"
+        ok, reason = validate_command(payload)
         assert ok is False
         assert "too deep" in reason
 
@@ -255,17 +282,28 @@ class TestMemoryWriteFamily:
         assert ok is True, f"{cmd!r} should still be allowed; got: {reason}"
 
 
-# -- Tool-layer substring list also covers the include operators --
+# -- The include operators are refused by the one authoritative gate --
 
 
-class TestBridgeBlocklistCoversScriptIncludes:
+class TestScriptIncludeRefusedByTheAuthoritativeGate:
+    """The tool-layer substring scan is gone; the allowlist must stand alone.
+
+    ``_BLOCKED_COMMANDS`` used to be scanned by ``windbg_execute_command`` as a
+    second gate. It is no longer consulted by any code path (a denylist in
+    front of an allowlist can only add false refusals), so the include
+    operators have to be refused by the validator itself -- in every position a
+    compound command can put them.
+    """
+
     @pytest.mark.parametrize("op", ["$<", "$><", "$$<", "$$><", "$$>a<"])
-    def test_include_operator_present_as_substring(self, op):
-        # windbg_execute_command gates on a plain substring scan of this
-        # tuple; both layers were previously blind to the include operators.
-        from src.engines.dynamic.windbg.bridge import _BLOCKED_COMMANDS
-
-        cmd_lower = f"k; {op}c:\\evil.wds".lower()
-        assert any(b in cmd_lower for b in _BLOCKED_COMMANDS), (
-            f"{op!r} not covered by the tool-layer blocklist"
-        )
+    @pytest.mark.parametrize("template", [
+        "{op}c:\\evil.wds",
+        "k; {op}c:\\evil.wds",
+        "k\n{op}c:\\evil.wds",
+        "bp X \"{op}c:\\evil.wds\"",
+        ".foreach (a {{!process 0 0}}) {{{op}c:\\evil.wds}}",
+    ])
+    def test_include_operator_refused_in_every_position(self, op, template):
+        ok, reason = validate_command(template.format(op=op))
+        assert ok is False, f"{template.format(op=op)!r} slipped through"
+        assert reason

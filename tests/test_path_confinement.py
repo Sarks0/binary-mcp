@@ -632,3 +632,55 @@ def test_read_full_rejects_oversized(tmp_path):
     with BinaryReader(str(f)) as reader:
         with pytest.raises(ValueError, match="too large"):
             reader.read_full(max_bytes=1024)
+
+
+# -- Regression: a configured allow-list must not break the server's own
+#    write-then-read loops. This bug class shipped three times (the quarantine
+#    default omitting ~/.binary_mcp_output, the XDG_CACHE_HOME drift, and then
+#    BINARY_MCP_ALLOWED_DIRS replacing the defaults outright), so it is pinned
+#    here for both postures. --
+
+
+@pytest.mark.parametrize(
+    "artifact",
+    [
+        Path(".binary_mcp_output") / "extracted" / "a.pyc",
+        Path(".binary_mcp_output") / "dumps" / "d.bin",
+        Path(".binary_mcp_output") / "reports" / "r.md",
+        Path("ghidra_mcp_cache") / "c.bin",
+    ],
+)
+def test_server_artifacts_readable_with_operator_allowlist(
+    artifact, tmp_path, monkeypatch
+):
+    """Setting BINARY_MCP_ALLOWED_DIRS is the posture every confinement denial
+    recommends. It must not make the server unable to analyse what it wrote."""
+    quarantine = tmp_path / "quarantine"
+    quarantine.mkdir()
+    monkeypatch.setenv("BINARY_MCP_ALLOWED_DIRS", str(quarantine))
+    monkeypatch.delenv("BINARY_MCP_ALLOW_ANY_PATH", raising=False)
+
+    target = Path.home() / artifact
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"MZ\x90\x00")
+
+    assert sanitize_binary_path(str(target)) == target.resolve()
+
+
+def test_operator_allowlist_still_excludes_everything_else(tmp_path, monkeypatch):
+    """The union above must add only server-owned artifact dirs. The system
+    temp dir is a sample DROP location, not a server artifact dir -- unioning
+    it would silently negate an allow-list set specifically to exclude it."""
+    quarantine = tmp_path / "quarantine"
+    quarantine.mkdir()
+    monkeypatch.setenv("BINARY_MCP_ALLOWED_DIRS", str(quarantine))
+    monkeypatch.delenv("BINARY_MCP_ALLOW_ANY_PATH", raising=False)
+
+    outside = tmp_path / "outside.bin"
+    outside.write_bytes(b"MZ")
+    with pytest.raises(PathTraversalError):
+        sanitize_binary_path(str(outside))
+
+    inside = quarantine / "sample.bin"
+    inside.write_bytes(b"MZ")
+    assert sanitize_binary_path(str(inside)) == inside.resolve()

@@ -116,6 +116,47 @@ def default_quarantine_dirs() -> list[Path]:
     except (OSError, RuntimeError):  # pragma: no cover - platform specific
         pass
 
+    candidates.extend(server_artifact_dirs())
+
+    deduped: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key not in seen:
+            seen.add(key)
+            deduped.append(candidate)
+    return deduped
+
+
+def server_artifact_dirs() -> list[Path]:
+    """
+    Directories THIS SERVER ITSELF writes, and must always be able to read back.
+
+    Split out of :func:`default_quarantine_dirs` because these are unioned into
+    the allow-list unconditionally -- including when the operator has configured
+    ``BINARY_MCP_ALLOWED_DIRS``.
+
+    Without that union, setting an allow-list (the posture every confinement
+    denial message tells the operator to adopt) silently broke every
+    write-then-read loop the server has: ``extract_python_packed`` wrote to
+    ``~/.binary_mcp_output/extracted`` and then refused to analyse what it had
+    just produced, and the same held for memory/module dumps, carved and
+    decrypted files, reports and the Ghidra cache. That is the third time this
+    bug class has shipped, so the invariant is stated once, here: an artifact
+    this server wrote is exactly as trustworthy as the sample it came from, and
+    refusing to read it back buys no security while breaking core workflows.
+
+    Deliberately EXCLUDES the system temp directory. Temp is a sample *drop*
+    location, not a server artifact directory; unioning it in would let any
+    file under /tmp bypass an allow-list the operator set specifically to
+    exclude it. Temp stays in :func:`default_quarantine_dirs` only, which
+    applies when no allow-list is configured at all.
+
+    Returns:
+        Ordered, de-duplicated list of server-owned artifact directories.
+    """
+    candidates: list[Path] = []
+
     # Read the cache root from the environment directly rather than importing
     # src.utils.config: security.py is imported by nearly every module and must
     # stay free of intra-package imports (and of config's .env side effects).
@@ -347,6 +388,14 @@ def sanitize_binary_path(
     # (pe_tools, authenticode, similarity_hashes, carving, server).
     if allowed_dirs is _UNSET or not allowed_dirs:
         allowed_dirs = get_allowed_dirs()
+        if allowed_dirs:
+            # Union the server's own artifact directories into the operator's
+            # allow-list. Setting BINARY_MCP_ALLOWED_DIRS previously REPLACED
+            # the defaults outright, which meant the recommended posture broke
+            # every write-then-read loop in the server -- see the rationale on
+            # server_artifact_dirs(). Temp is deliberately not included, so the
+            # operator's restriction still means what they intended.
+            allowed_dirs = list(allowed_dirs) + server_artifact_dirs()
 
     confined_by_default = False
     if not allowed_dirs:

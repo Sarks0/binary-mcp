@@ -696,15 +696,33 @@ class TestCarveOutputDirAnchoring:
 
     @pytest.mark.parametrize(
         "target",
-        [".ssh", ".config/autostart", ".local/bin"],
+        [".ssh", ".config/autostart", ".local/bin", "Desktop", ""],
     )
-    def test_sensitive_home_paths_are_still_refused(self, target, monkeypatch):
+    def test_sensitive_home_paths_are_refused(self, target, monkeypatch):
+        """A NON-ROOT home, which is what exposed this.
+
+        The first version of this test used the real Path.home(). It passed on
+        Linux for an incidental reason -- CI and local runs are root, so home
+        is /root, which happened to sit on the old system-directory denylist.
+        On the macOS runner home is /Users/runner and all three of these were
+        ALLOWED: the tool would write bytes carved out of a sample into
+        ~/.config/autostart (login persistence), ~/.local/bin (on PATH) or
+        ~/.ssh. Pinning a synthetic home makes the check mean the same thing
+        on every platform and as any user.
+        """
         from src.utils.carving import _validate_output_dir
         from src.utils.structured_errors import StructuredBaseError
 
         self._clean_env(monkeypatch)
+        # Deliberately NOT under tmp_path: the system temp directory is the one
+        # location this validator permits without an allow-list, so a fake home
+        # inside it would be allowed for the right reason and prove nothing.
+        fake_home = Path("/synthetic-home/analyst")
+        monkeypatch.setenv("HOME", str(fake_home))
+        monkeypatch.setenv("USERPROFILE", str(fake_home))
+
         with pytest.raises(StructuredBaseError):
-            _validate_output_dir(Path.home() / target)
+            _validate_output_dir(fake_home / target if target else fake_home)
 
     @pytest.mark.parametrize("target", ["/etc", "/usr/local/bin"])
     def test_system_dirs_are_still_refused(self, target, monkeypatch):

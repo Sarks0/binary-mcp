@@ -19,6 +19,7 @@ import os
 import re
 import struct  # noqa: F401  (re-exported for tests; kept for parity with other utils)
 import sys
+import tempfile
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -427,28 +428,57 @@ def _validate_output_dir(out: Path) -> Path:
         except (OSError, RuntimeError, ValueError):
             continue
 
-    # No allow-list configured: hard-block obvious system directories. Check
-    # the unresolved absolute path *and* the symlink-resolved path so a
-    # user-controlled "/tmp/link -> /etc" attack is caught even when the link
-    # itself isn't on the denylist.
-    abs_user = out if out.is_absolute() else out.absolute()
-    for candidate in {str(abs_user), str(resolved)}:
-        for prefix in _DANGEROUS_PREFIXES:
-            if candidate == prefix or candidate.startswith(prefix + "/"):
-                raise StructuredBaseError(
-                    StructuredError(
-                        error=ErrorCode.PARAMETER_INVALID,
-                        message="Invalid output_dir",
-                        reason=f"output_dir resolves to a system directory: {candidate}",
-                        suggestions=[
-                            "Choose a path under your home or a temp directory",
-                            "Or set BINARY_MCP_ALLOWED_DIRS to an explicit allow-list",
-                        ],
-                        debug_info={"output_dir": str(out), "resolved": str(resolved)},
-                    )
-                )
+    # No allow-list configured. Permit the system temp directory and nothing
+    # else -- the server's own artifact dirs already returned above.
+    #
+    # This used to be a DENYLIST of system prefixes, and it was unsound for the
+    # case that matters. It caught /etc, /usr/bin and friends, but nothing
+    # under the operator's home, so with no allow-list configured this tool
+    # would write bytes CARVED OUT OF A SAMPLE into ~/.config/autostart (login
+    # persistence), ~/.local/bin (on PATH) or ~/.ssh.
+    #
+    # That gap was invisible on the Linux CI runner and in local testing
+    # because both run as root, where Path.home() is /root -- which happens to
+    # be on the denylist. It only surfaced on the macOS runner, where home is
+    # /Users/runner. Worth recording: a denylist that looked comprehensive
+    # against every path tried was passing for an incidental reason.
+    #
+    # Enumerating sensitive home subdirectories instead would be the same
+    # whack-a-mole that failed for the confusable brackets and the WinDbg
+    # command twins. An allow-list is the shape that holds, and it matches
+    # what sanitize_binary_path already does for READS -- writes and reads now
+    # agree on where analysis is confined when nothing is configured.
+    temp_roots: list[Path] = []
+    try:
+        temp_roots.append(Path(tempfile.gettempdir()))
+    except (OSError, RuntimeError):  # pragma: no cover - platform specific
+        pass
 
-    return resolved
+    for temp_root in temp_roots:
+        try:
+            if _is_within(resolved, temp_root.resolve()):
+                return resolved
+        except (OSError, RuntimeError, ValueError):
+            continue
+
+    raise StructuredBaseError(
+        StructuredError(
+            error=ErrorCode.PARAMETER_INVALID,
+            message="Invalid output_dir",
+            reason=(
+                "output_dir is outside this server's own output directories "
+                "and the system temp directory, and no BINARY_MCP_ALLOWED_DIRS "
+                "allow-list is configured"
+            ),
+            suggestions=[
+                "Omit output_dir to use the server's carve cache",
+                "Or pass a path under the system temp directory",
+                "Or set BINARY_MCP_ALLOWED_DIRS to an explicit allow-list "
+                "and pass a path inside it",
+            ],
+            debug_info={"output_dir": str(out), "resolved": str(resolved)},
+        )
+    )
 
 
 def _default_carve_dir() -> Path:

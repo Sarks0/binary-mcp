@@ -606,7 +606,18 @@ static bool ResolveConfinedOutputPath(const std::string& requested,
     // letters ("C:\\...") and alternate data streams ("out.csv:hidden").
     for (size_t i = 0; i < requested.size(); i++) {
         unsigned char c = (unsigned char)requested[i];
-        if (c < 0x20 || c == 0x7F || c == ':' || c == '"' ||
+        // ':' is by far the most likely rejection in practice -- every real
+        // Windows path a caller types has a drive letter -- so it gets its own
+        // message. "File path contains an illegal character" told the analyst
+        // nothing about what to do instead, which made a deliberate
+        // confinement rule look like a malfunction.
+        if (c == ':') {
+            outError = "Drive letters and alternate data streams are not "
+                       "permitted; give a name relative to the plugin output "
+                       "directory, e.g. \"trace.csv\"";
+            return false;
+        }
+        if (c < 0x20 || c == 0x7F || c == '"' ||
             c == '<' || c == '>' || c == '|' || c == '*' || c == '?') {
             outError = "File path contains an illegal character";
             return false;

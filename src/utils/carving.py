@@ -319,6 +319,19 @@ def _validate_output_dir(out: Path) -> Path:
             )
         )
 
+    # Anchor a RELATIVE output_dir to the carve cache, not the process CWD.
+    #
+    # Path.absolute() below resolves a relative path against the CWD, which for
+    # a stdio MCP server is the directory the client launched it from -- in the
+    # documented configs, the binary-mcp install tree itself. So
+    # extract_embedded_binaries(output_dir="out") wrote bytes CARVED OUT OF THE
+    # SAMPLE into the server's own source directory, and the denylist below
+    # never saw a system prefix to object to. Anchoring to the carve cache
+    # keeps the convenient short form working while putting the output
+    # somewhere the confinement layer already recognises as ours.
+    if not out.is_absolute():
+        out = _default_carve_dir() / out
+
     # Reject if the user-supplied leaf is itself a symlink. We deliberately
     # don't reject symlinks in *parent* components -- on macOS the system
     # exposes ``/var -> /private/var`` and ``/tmp -> /private/tmp`` as
@@ -395,6 +408,24 @@ def _validate_output_dir(out: Path) -> Path:
                 },
             )
         )
+
+    # This server's own artifact directories are always permitted.
+    #
+    # The denylist below blocks $HOME wholesale, which includes the carve
+    # cache, the symbol cache and the output root -- the very places this
+    # server writes. Without this exemption the tool's own DEFAULT output
+    # location was refused (anchoring a relative output_dir to the carve cache
+    # made that immediately visible), which is the same write-then-refuse
+    # failure the confinement layer already had to fix twice. An artifact this
+    # server wrote is exactly as trustworthy as the sample it came from.
+    from src.utils.security import server_artifact_dirs
+
+    for artifact_dir in server_artifact_dirs():
+        try:
+            if _is_within(resolved, artifact_dir.expanduser().resolve()):
+                return resolved
+        except (OSError, RuntimeError, ValueError):
+            continue
 
     # No allow-list configured: hard-block obvious system directories. Check
     # the unresolved absolute path *and* the symlink-resolved path so a

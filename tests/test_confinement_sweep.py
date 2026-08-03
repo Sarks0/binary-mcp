@@ -655,3 +655,95 @@ def test_valid_but_absent_session_id_still_says_not_found(server):
     result = server.delete_session(session_id="123e4567-e89b-42d3-a456-426614174000")
     assert "not found" in result
     assert "Invalid session ID format" not in result
+
+
+class TestCarveOutputDirAnchoring:
+    """A relative output_dir must not land in the server's install tree.
+
+    Path.absolute() resolves a relative path against the process CWD, which
+    for a stdio MCP server is the directory the client launched it from -- in
+    the documented configs, the binary-mcp install tree. So
+    extract_embedded_binaries(output_dir="out") wrote bytes CARVED OUT OF THE
+    SAMPLE into the server's own source directory, and the system-directory
+    denylist never saw a prefix to object to.
+    """
+
+    def _clean_env(self, monkeypatch):
+        for var in (
+            "BINARY_MCP_ALLOWED_DIRS",
+            "BINARY_MCP_ALLOW_ANY_PATH",
+            "BINARY_MCP_CARVE_DIR",
+        ):
+            monkeypatch.delenv(var, raising=False)
+
+    def test_relative_dir_anchors_to_the_carve_cache(self, monkeypatch):
+        from src.utils.carving import _default_carve_dir, _validate_output_dir
+
+        self._clean_env(monkeypatch)
+        resolved = _validate_output_dir(Path("extracted"))
+
+        assert str(resolved).startswith(str(_default_carve_dir()))
+        assert str(Path.cwd()) not in str(resolved)
+
+    def test_server_artifact_dirs_are_not_blocked_by_the_denylist(self, monkeypatch):
+        """The denylist blocks $HOME wholesale, which contains the carve cache.
+        Without the artifact-dir exemption the tool's own DEFAULT output
+        location was refused -- the write-then-refuse class again."""
+        from src.utils.carving import _default_carve_dir, _validate_output_dir
+
+        self._clean_env(monkeypatch)
+        assert _validate_output_dir(_default_carve_dir())
+
+    @pytest.mark.parametrize(
+        "target",
+        [".ssh", ".config/autostart", ".local/bin"],
+    )
+    def test_sensitive_home_paths_are_still_refused(self, target, monkeypatch):
+        from src.utils.carving import _validate_output_dir
+        from src.utils.structured_errors import StructuredBaseError
+
+        self._clean_env(monkeypatch)
+        with pytest.raises(StructuredBaseError):
+            _validate_output_dir(Path.home() / target)
+
+    @pytest.mark.parametrize("target", ["/etc", "/usr/local/bin"])
+    def test_system_dirs_are_still_refused(self, target, monkeypatch):
+        from src.utils.carving import _validate_output_dir
+        from src.utils.structured_errors import StructuredBaseError
+
+        self._clean_env(monkeypatch)
+        with pytest.raises(StructuredBaseError):
+            _validate_output_dir(Path(target))
+
+
+class TestSymbolCacheTildeExpansion:
+    """The three cache resolvers must agree on '~'.
+
+    security.default_quarantine_dirs() and carving._default_carve_dir() both
+    expand it; pdb_fetcher._default_symbol_cache() did not, so
+    BINARY_MCP_SYMBOL_CACHE=~/symbols created a LITERAL '~' directory under the
+    CWD while confinement allowed $HOME/symbols -- download a PDB, then refuse
+    to read it back.
+    """
+
+    def test_tilde_is_expanded(self, monkeypatch):
+        from src.utils.pdb_fetcher import _default_symbol_cache
+
+        monkeypatch.setenv("BINARY_MCP_SYMBOL_CACHE", "~/sym-relocated")
+        resolved = _default_symbol_cache()
+
+        assert "~" not in str(resolved)
+        assert resolved == Path.home() / "sym-relocated"
+
+    def test_relocated_cache_is_readable_back(self, monkeypatch, tmp_path):
+        from src.utils.security import sanitize_binary_path
+
+        monkeypatch.setenv("BINARY_MCP_SYMBOL_CACHE", str(tmp_path / "syms"))
+        monkeypatch.setenv("BINARY_MCP_ALLOWED_DIRS", str(tmp_path / "quarantine"))
+        (tmp_path / "quarantine").mkdir()
+        cache = tmp_path / "syms"
+        cache.mkdir()
+        pdb = cache / "x.pdb"
+        pdb.write_bytes(b"MZ")
+
+        assert sanitize_binary_path(str(pdb)) == pdb.resolve()

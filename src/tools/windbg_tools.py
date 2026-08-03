@@ -18,6 +18,7 @@ from src.engines.dynamic.windbg.bridge import WinDbgBridge, WinDbgBridgeError
 from src.engines.dynamic.windbg.commands import WinDbgCommands
 from src.engines.session import AnalysisType, UnifiedSessionManager
 from src.tools.error_hygiene import safe_tool_error
+from src.utils.formatters import wrap_untrusted
 from src.utils.structured_errors import StructuredBaseError
 
 logger = logging.getLogger(__name__)
@@ -79,6 +80,29 @@ def _raw_windbg_enabled() -> bool:
     return os.environ.get(_RAW_WINDBG_ENV, "").strip().lower() in (
         "1", "true", "yes", "on",
     )
+
+
+def _fence(text: str, kind: str) -> str:
+    """Fence debugger output that reflects the analysed target (audit F-7).
+
+    Everything WinDbg prints about a live kernel target or a crash dump --
+    disassembly, memory bytes and their ASCII column, module names and paths,
+    stack symbols, structure contents, raw command output -- originates in the
+    thing under analysis, which for this server is hostile by definition. A
+    sample can put text into any of them (a crafted module name, a string in
+    memory that lands in the ASCII column) and it arrives in model context
+    looking exactly like server-authored analysis.
+
+    This module previously had ZERO fences across all of its tools, and the
+    F-7 coverage guard did not catch it because windbg_tools was never added
+    to the module set the guard checks. Both halves are fixed together; fixing
+    only the fences would have left the guard still blind to the next module.
+
+    Empty output is returned unchanged: an empty fence is pure noise.
+    """
+    if not text or not text.strip():
+        return text
+    return wrap_untrusted(text, kind=kind)
 
 
 def _is_windows() -> bool:
@@ -582,7 +606,7 @@ def register_windbg_tools(
         try:
             bridge = get_windbg_bridge()
             result = bridge.get_thread(thread=thread or None)
-            return f"$ {result['command']}\n\n{result['output']}"
+            return f"$ {result['command']}\n\n" + _fence(result["output"], "WinDbg thread output")
         except (WinDbgBridgeError, StructuredBaseError) as e:
             return safe_tool_error("windbg_get_thread", e)
 
@@ -607,7 +631,7 @@ def register_windbg_tools(
         try:
             bridge = get_windbg_bridge()
             result = bridge.get_process(process=process or None, flags=flags)
-            return f"$ {result['command']}\n\n{result['output']}"
+            return f"$ {result['command']}\n\n" + _fence(result["output"], "WinDbg process output")
         except (WinDbgBridgeError, StructuredBaseError) as e:
             return safe_tool_error("windbg_get_process", e)
 
@@ -650,7 +674,7 @@ def register_windbg_tools(
             lines.append("")
             lines.append("--- raw ---")
             lines.append(result["raw"])
-            return "\n".join(lines)
+            return _fence("\n".join(lines), "target structure contents")
         except (WinDbgBridgeError, StructuredBaseError) as e:
             return safe_tool_error("windbg_dt", e)
 
@@ -855,7 +879,7 @@ def register_windbg_tools(
         try:
             bridge = get_windbg_bridge()
             output = bridge.execute_command("bl")
-            return output or "No breakpoints set"
+            return _fence(output, "WinDbg breakpoint list") or "No breakpoints set"
         except (WinDbgBridgeError, StructuredBaseError) as e:
             return safe_tool_error("windbg_list_breakpoints", e)
 
@@ -898,7 +922,7 @@ def register_windbg_tools(
             return _PLATFORM_MSG
         try:
             commands = get_windbg_commands()
-            return commands.dump_registers()
+            return _fence(commands.dump_registers(), "target register state")
         except (WinDbgBridgeError, StructuredBaseError) as e:
             return safe_tool_error("windbg_get_registers", e)
 
@@ -934,7 +958,7 @@ def register_windbg_tools(
                     chr(b) if 32 <= b < 127 else "." for b in chunk
                 )
                 lines.append(f"{base_addr + i:016x}  {hex_part:<48}  {ascii_part}")
-            return "\n".join(lines)
+            return _fence("\n".join(lines), "target memory contents")
         except (WinDbgBridgeError, StructuredBaseError) as e:
             return safe_tool_error("windbg_read_memory", e)
 
@@ -983,7 +1007,7 @@ def register_windbg_tools(
         try:
             bridge = get_windbg_bridge()
             output = bridge.execute_command(f"u {address} L{count}")
-            return output
+            return _fence(output, "target disassembly")
         except (WinDbgBridgeError, StructuredBaseError) as e:
             return safe_tool_error("windbg_disassemble", e)
 
@@ -1008,7 +1032,7 @@ def register_windbg_tools(
                     f"{mod['start']:<20} {mod['end']:<20} "
                     f"{mod['name']:<20} {mod['symbol_status']}"
                 )
-            return "\n".join(lines)
+            return _fence("\n".join(lines), "loaded module names and paths")
         except (WinDbgBridgeError, StructuredBaseError) as e:
             return safe_tool_error("windbg_get_modules", e)
 
@@ -1107,6 +1131,6 @@ def register_windbg_tools(
             return _PLATFORM_MSG
         try:
             bridge = get_windbg_bridge()
-            return bridge.execute_command(command)
+            return _fence(bridge.execute_command(command), "raw WinDbg command output")
         except (WinDbgBridgeError, StructuredBaseError) as e:
             return safe_tool_error("windbg_execute_command", e)

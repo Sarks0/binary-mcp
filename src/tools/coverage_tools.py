@@ -58,6 +58,25 @@ def _error(message: str, **extra) -> dict:
     return {"error": message, **extra}
 
 
+def _null_counts() -> dict:
+    """The six counts, explicitly null.
+
+    Every payload that reports counts starts from this, so a key is never
+    merely absent. A consumer reading `payload.get("total", 0)` off a response
+    that omitted the key lands on 0, and 0 reads as "complete" -- the same
+    false-completion failure the null-not-zero rule exists to prevent, arrived
+    at through the client's default instead of the server's value.
+    """
+    return {
+        "total": None,
+        "in_scope_total": None,
+        "reviewed": None,
+        "reviewed_in_scope": None,
+        "remaining": None,
+        "remaining_in_scope": None,
+    }
+
+
 def register_coverage_tools(app, session_manager, cache, runner=None):
     """
     Register the coverage tools with the MCP app.
@@ -125,6 +144,12 @@ def register_coverage_tools(app, session_manager, cache, runner=None):
             ``remaining_in_scope == 0`` means the in-scope worklist is finished,
             not that the binary is. Indirect calls are invisible to a forward
             call-graph walk, so full closure still consults ``remaining``.
+
+            ``dropped_address_count`` is how many functions the analysis cache
+            listed that are missing from ``total`` because their address could
+            not be parsed. It is 0 on every binary seen so far; a non-zero value
+            means ``total`` under-counts the binary by that much and no
+            completion claim should be made on it.
         """
         try:
             resolved_id, resolved_path = _resolve(binary_id, binary_path)
@@ -144,12 +169,8 @@ def register_coverage_tools(app, session_manager, cache, runner=None):
             "binary_path": resolved_path,
             "module_name": None,
             "image_base": None,
-            "total": None,
-            "in_scope_total": None,
-            "reviewed": None,
-            "reviewed_in_scope": None,
-            "remaining": None,
-            "remaining_in_scope": None,
+            **_null_counts(),
+            "dropped_address_count": None,
             "scope_description": None,
             "scope_version": SCOPE_VERSION,
             "indexed_at": None,
@@ -179,6 +200,7 @@ def register_coverage_tools(app, session_manager, cache, runner=None):
                 "scope_description": record.get("scope_description"),
                 "scope_version": record.get("scope_version"),
                 "indexed_at": record.get("indexed_at"),
+                "dropped_address_count": record.get("dropped_address_count"),
                 "status": status,
             }
         )
@@ -330,6 +352,7 @@ def register_coverage_tools(app, session_manager, cache, runner=None):
             "scope_description": record.get("scope_description"),
             "scope_version": record.get("scope_version"),
             "indexed_at": record.get("indexed_at"),
+            "dropped_address_count": record.get("dropped_address_count"),
             "status": "ready",
         }
         payload.update(store.counts(record))
@@ -435,13 +458,15 @@ def register_coverage_tools(app, session_manager, cache, runner=None):
             binary_path: Optional path alternative to ``binary_id``.
             drop_index: Also discard the function list and stored scope, so the
                 next query re-indexes from the analysis cache. Use when the
-                index itself is suspect, not just the marks.
+                index itself is suspect, not just the marks. Refused when the
+                analysis cache is gone, because then nothing can rebuild it.
 
         Returns:
             JSON with ``cleared`` (how many functions had a mark or note),
             ``dropped`` (whether the record was deleted) and the refreshed
             counts. Clearing an already-clean ledger reports ``cleared: 0``
-            rather than failing.
+            rather than failing. The six count keys are always present, null
+            when no record could be read.
         """
         try:
             resolved_id, resolved_path = _resolve(binary_id, binary_path)
@@ -460,19 +485,43 @@ def register_coverage_tools(app, session_manager, cache, runner=None):
                     "No coverage record for this binary; nothing to reset.",
                     binary_id=resolved_id,
                     status="not_indexed",
+                    **_null_counts(),
+                )
+            if drop_index and not store.has_analysis_cache(resolved_id):
+                # Dropping is only survivable because the analysis cache can
+                # rebuild the record. Without it the delete is final, and the
+                # record being deleted is the last surviving account of what
+                # was reviewed -- `ProjectCache.invalidate` evicts the analysis
+                # and deliberately spares this side-car, so a `stale` ledger is
+                # exactly the recoverable state this would destroy. Refuse
+                # rather than trade a stale denominator for no denominator.
+                return _error(
+                    "Refusing drop_index: the analysis cache for this binary is "
+                    "gone, so the record cannot be rebuilt and this coverage "
+                    "record is the last surviving account of what was reviewed. "
+                    "Re-run analyze_binary to restore the rebuild source, or "
+                    "call reset_coverage without drop_index to clear the marks "
+                    "while keeping the denominator.",
+                    binary_id=resolved_id,
+                    binary_path=existing.get("binary_path") or resolved_path,
+                    cleared=0,
+                    dropped=False,
+                    status="stale",
+                    **_null_counts(),
                 )
             cleared = store.reset_marks(resolved_id)
             dropped = store.drop(resolved_id) if drop_index else False
             record, status = store.ensure_indexed(resolved_id, resolved_path)
         except Exception as exc:
             logger.exception("reset_coverage failed")
-            return _error(f"Reset failed: {exc}")
+            return _error(f"Reset failed: {exc}", **_null_counts())
 
         payload = {
             "binary_id": resolved_id,
             "binary_path": (record or {}).get("binary_path") or resolved_path,
             "cleared": cleared,
             "dropped": dropped,
+            **_null_counts(),
             "status": status if record is not None else "not_indexed",
         }
         if record is not None:

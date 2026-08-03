@@ -470,6 +470,65 @@ class TestResetTool:
         assert payload["total"] == 3
         assert payload["reviewed"] == 0
 
+    def test_drop_index_is_refused_when_nothing_can_rebuild_the_record(self, tools):
+        """`ProjectCache.invalidate` evicts the analysis and deliberately spares
+        the coverage side-car, so `stale` is a routine state -- and it is the
+        state where the record is the ONLY surviving account of what was
+        reviewed. Dropping it there is unrecoverable, and reset_coverage is
+        reached exactly when the ledger is already known-bad.
+        """
+        tools.three_functions()
+        tools.status(binary_id=tools.binary_id)
+        tools.store.mark_reviewed(tools.binary_id, ["0x140002000"], tool="t")
+        (tools.cache.cache_dir / f"{tools.binary_id}.json.gz").unlink()
+
+        payload = _payload(tools.reset(binary_id=tools.binary_id, drop_index=True))
+
+        assert "error" in payload
+        assert payload["dropped"] is False
+        assert payload["cleared"] == 0
+        # The refusal has to leave the record intact, or it is not a refusal.
+        record = tools.store.read(tools.binary_id)
+        assert record is not None
+        assert record["functions"]["0x140002000"]["reviewed"] is True
+
+    def test_refused_drop_still_leaves_clearing_marks_available(self, tools):
+        """The refusal must not strand the operator: the safe half of the
+        operation still works."""
+        tools.three_functions()
+        tools.status(binary_id=tools.binary_id)
+        tools.store.mark_reviewed(tools.binary_id, ["0x140002000"], tool="t")
+        (tools.cache.cache_dir / f"{tools.binary_id}.json.gz").unlink()
+        tools.reset(binary_id=tools.binary_id, drop_index=True)
+
+        payload = _payload(tools.reset(binary_id=tools.binary_id))
+        assert payload["cleared"] == 1
+        assert payload["reviewed"] == 0
+        assert payload["total"] == 3  # denominator survives
+
+    @pytest.mark.parametrize(
+        "call",
+        [
+            # refused drop, no record at all, and the ordinary success path
+            lambda t: t.reset(binary_id=t.binary_id, drop_index=True),
+            lambda t: t.reset(binary_id="f" * 64),
+            lambda t: t.reset(binary_id=t.binary_id),
+        ],
+    )
+    def test_every_reset_payload_carries_all_six_count_keys(self, tools, call):
+        """An omitted key is not a null. A consumer reading
+        `payload.get("total", 0)` off a response that dropped the key lands on
+        0, and 0 reads as "complete" -- the same false completion the
+        null-not-zero rule exists to prevent, reached through the client's
+        default instead of the server's value.
+        """
+        tools.three_functions()
+        tools.status(binary_id=tools.binary_id)
+        (tools.cache.cache_dir / f"{tools.binary_id}.json.gz").unlink()
+        payload = _payload(call(tools))
+        for field in COUNT_FIELDS:
+            assert field in payload, f"{field} missing from {sorted(payload)}"
+
     def test_reset_without_a_record_is_an_error_not_a_silent_success(self, tools):
         tools.three_functions()
         payload = _payload(tools.reset(binary_id=tools.binary_id))
@@ -501,6 +560,51 @@ class TestResetTool:
         after = _payload(tools.next(binary_id=tools.binary_id))
         assert len(after["functions"]) == 2
         assert after["remaining_after"] == 0
+
+
+class TestUnparseableAddresses:
+    """A binary whose addresses `canon_addr` rejects must not report a finished
+    worklist. `ready` with six zeros is the documented terminal condition."""
+
+    def test_all_unparseable_reports_not_indexed_with_null_counts(self, tools):
+        tools.analyze(
+            [_func("a", "EXTERNAL:1"), _func("b", "EXTERNAL:2"), _func("c", "EXTERNAL:3")]
+        )
+        payload = _payload(tools.status(binary_id=tools.binary_id))
+        assert payload["status"] == "not_indexed"
+        for field in COUNT_FIELDS:
+            assert payload[field] is None, f"{field}={payload[field]!r}"
+
+    def test_all_unparseable_worklist_is_not_terminal(self, tools):
+        tools.analyze([_func("a", "EXTERNAL:1"), _func("b", "EXTERNAL:2")])
+        payload = _payload(tools.next(binary_id=tools.binary_id))
+        assert payload["status"] == "not_indexed"
+        assert payload["functions"] == []
+        assert payload["remaining_after"] is None
+
+    def test_partial_drop_is_visible_in_the_status_payload(self, tools):
+        """`total` still under-counts here -- the point is that the consumer can
+        see it rather than having to infer it."""
+        tools.analyze(
+            [
+                _func("a", "140001000"),
+                _func("b", "140002000"),
+                _func("x", "EXTERNAL:1"),
+            ]
+        )
+        payload = _payload(tools.status(binary_id=tools.binary_id))
+        assert payload["status"] == "ready"
+        assert payload["total"] == 2
+        assert payload["dropped_address_count"] == 1
+
+    def test_dropped_address_count_is_present_on_a_clean_binary(self, tools):
+        tools.three_functions()
+        payload = _payload(tools.status(binary_id=tools.binary_id))
+        assert payload["dropped_address_count"] == 0
+
+    def test_dropped_address_count_is_null_when_not_indexed(self, tools):
+        payload = _payload(tools.status(binary_id="f" * 64))
+        assert payload["dropped_address_count"] is None
 
 
 class TestAutoMarkingSet:
@@ -578,6 +682,26 @@ class TestAutoMarkingSet:
         )
         # The package is still returned -- callers/blocks stay useful.
         assert out and "0x140001000" in out.lower() or out
+        assert self._reviewed(tools) == set()
+
+    def test_comment_only_body_does_not_mark(self, analysis_tools):
+        """Ghidra emits a banner comment instead of code when it declines to
+        decompile. Showing a remark about a function is not showing the
+        function, so it must not advance the denominator."""
+        tools, api = analysis_tools
+        record = tools.cache.get_cached(tools.path)
+        for func in record["functions"]:
+            if func["address"] == "140002000":
+                func["pseudocode"] = (
+                    "/* WARNING: Globals starting with '_' overlap smaller symbols */\n"
+                )
+        tools.cache.save_cached(tools.path, record)
+
+        api["batch_decompile"](binary_path=tools.path, functions="0x140002000")
+        api["get_review_package"](
+            binary_path=tools.path, function_name_or_address="0x140002000"
+        )
+        api["get_param_sinks"](binary_path=tools.path, function="0x140002000")
         assert self._reviewed(tools) == set()
 
     def test_get_param_sinks_marks(self, analysis_tools):

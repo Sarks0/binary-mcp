@@ -549,7 +549,15 @@ class TestOutputDirHardening:
         pe_path = _write_pe(tmp_path, _build_pe_with_resources())
         with pytest.raises(StructuredBaseError) as excinfo:
             carve(pe_path, Path("/var/spool/cron/tmp"))
-        assert "system directory" in str(excinfo.value).lower()
+        # The refusal is what matters, not the wording. The validator moved
+        # from a system-directory DENYLIST to an allow-list (temp + the
+        # server's own artifact dirs), because the denylist let every path
+        # under a non-root $HOME through -- so the message no longer says
+        # "system directory". Assert the property instead: refused, and the
+        # message tells the operator how to permit it deliberately.
+        msg = str(excinfo.value).lower()
+        assert "output_dir" in msg
+        assert "binary_mcp_allowed_dirs" in msg
 
     def test_rejects_symlink_as_output_dir(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

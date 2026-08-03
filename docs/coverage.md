@@ -150,6 +150,18 @@ every function with no direct caller is treated as a root: it over-approximates
 reachability, and over-approximating is the safe direction. Under-counting
 scope shrinks the denominator and manufactures false completion.
 
+"No direct caller" is not sufficient on its own, and the first implementation
+got this wrong. Every member of a call cycle has a direct caller — itself, or
+its partner — so a cycle reached only indirectly was never promoted, the walk
+could not enter, and the entire subtree below it fell out as
+`excluded:unreachable`. That is a shrink. On the cached corpus it was dropping
+`HttppParseUtf16Sequence` and `UxDuoParseUnknownFragment` from http.sys and the
+whole chakra garbage collector — and 100% of that bucket was a false exclusion,
+not one genuine orphan across 10 binaries. After the layered walk settles the
+residual is now promoted to roots (`reachable:cycle_root`) until a fixpoint.
+`excluded:unreachable` should be empty on any real binary; a non-zero count is
+a bug signal, and `scope_description` says so explicitly.
+
 The practical consequence on driver-shaped binaries, where the only export is
 `entry`: scope leans almost entirely on the address-taken roots, so
 `in_scope_total` lands close to `total` and the only real reduction is the

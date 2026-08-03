@@ -716,14 +716,19 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
             if not target:
                 return f"Function not found: {function_name_or_address}."
 
-            # Coverage side effect: a review package is the full-context read
-            # of one function, so it counts as reviewed.
-            auto_mark(
-                cache, binary_path, [target.get("address")],
-                tool="get_review_package", context=context,
-            )
-
             pseudo = target.get("pseudocode") or ""
+
+            # Coverage side effect: a review package is the full-context read of
+            # one function, so it counts as reviewed -- but ONLY once pseudocode
+            # is confirmed present. The package is still returned without it
+            # (callers, blocks and xrefs remain useful), yet a body nobody can
+            # read was not reviewed. Marking here regardless would drive a
+            # structural-depth cache to remaining==0 having shown zero code.
+            if pseudo.strip():
+                auto_mark(
+                    cache, binary_path, [target.get("address")],
+                    tool="get_review_package", context=context,
+                )
             signature = target.get("signature") or ""
             params = target.get("parameters") or []
             locals_ = target.get("local_variables") or []

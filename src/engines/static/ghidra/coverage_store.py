@@ -227,6 +227,50 @@ def compute_scope(context: dict) -> tuple[dict[str, dict], str]:
                     reasons[c_addr] = "reachable:callee"
                     frontier.append(c_addr)
 
+    # The layered walk above cannot enter a call cycle that is only reachable
+    # indirectly. `reachable:indirect_root` means "no direct caller anywhere",
+    # and every member of a cycle has one -- itself, or its partner -- so no
+    # cycle member is ever promoted, the walk never enters, and the entire
+    # subtree below it drops out as `excluded:unreachable`. That SHRINKS the
+    # denominator, the one direction this scope must never move: on the cached
+    # corpus it was silently dropping http.sys parsers and the chakra GC.
+    #
+    # Promote the residual to roots until a fixpoint. Prefer genuine sources --
+    # residual functions with no caller inside the residual -- so provenance
+    # stays meaningful; a pure cycle with no source is broken at its lowest
+    # address, which keeps the result deterministic for a resuming client.
+    while True:
+        residual = {
+            a for a in by_addr
+            if a not in reasons and _excluded_reason(by_addr[a]) is None
+        }
+        if not residual:
+            break
+        called_within = set()
+        for a in residual:
+            for callee in by_addr[a].get("called_functions") or []:
+                c_addr = canon_addr(callee.get("address"))
+                if c_addr and c_addr in residual:
+                    called_within.add(c_addr)
+        sources = sorted(residual - called_within, key=lambda x: int(x, 16))
+        if not sources:
+            sources = [min(residual, key=lambda x: int(x, 16))]
+        for root in sources:
+            if root in reasons:
+                continue
+            reasons[root] = "reachable:cycle_root"
+            frontier = [root]
+            while frontier:
+                addr = frontier.pop()
+                func = by_addr.get(addr)
+                if func is None:
+                    continue
+                for callee in func.get("called_functions") or []:
+                    c_addr = canon_addr(callee.get("address"))
+                    if c_addr and c_addr in by_addr and c_addr not in reasons:
+                        reasons[c_addr] = "reachable:callee"
+                        frontier.append(c_addr)
+
     records: dict[str, dict] = {}
     excluded_count = 0
     unreached_count = 0
@@ -259,13 +303,25 @@ def compute_scope(context: dict) -> tuple[dict[str, dict], str]:
         f"{entry_counts.get('reachable:export', 0)} export(s), "
         f"{entry_counts.get('reachable:ioctl_dispatch', 0)} dispatch entr(ies) and "
         f"{entry_counts.get('reachable:indirect_root', 0)} address-taken root(s) "
-        f"with no direct caller; minus {excluded_count} thunk/external/library "
-        f"function(s)"
+        f"with no direct caller"
     )
+    if entry_counts.get("reachable:cycle_root"):
+        description += (
+            f" and {entry_counts['reachable:cycle_root']} cycle root(s) promoted "
+            f"after the walk settled"
+        )
+    description += f"; minus {excluded_count} thunk/external/library function(s)"
     if unreached_count:
-        description += f"; {unreached_count} function(s) unreachable from any root"
-    description += ". Indirect calls are invisible to a forward walk -- scope is "
-    description += "deliberately over-approximated so the denominator never shrinks on a guess."
+        description += (
+            f"; {unreached_count} function(s) still unreachable from any root "
+            f"(expected 0 -- a non-zero count here means the fixpoint failed to "
+            f"converge and the denominator is under-counted)"
+        )
+    description += ". Indirect calls are invisible to a forward walk, so scope is "
+    description += (
+        "over-approximated on purpose: unreached functions are promoted to roots "
+        "until nothing is left, and the denominator never shrinks on a guess."
+    )
 
     return records, description
 

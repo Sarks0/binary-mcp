@@ -562,6 +562,24 @@ class TestAutoMarkingSet:
         )
         assert self._reviewed(tools) == {"0x140002000"}
 
+    def test_get_review_package_does_not_mark_without_pseudocode(
+        self, analysis_tools
+    ):
+        """A package with no body reviewed nothing.
+
+        The negative twin of test_get_review_package_marks. Without this,
+        driving the documented loop against a structural-depth cache reaches
+        remaining==0 having shown zero bytes of pseudocode.
+        """
+        tools, api = analysis_tools
+        # 0x140001000 has no pseudocode in this fixture.
+        out = api["get_review_package"](
+            binary_path=tools.path, function_name_or_address="0x140001000"
+        )
+        # The package is still returned -- callers/blocks stay useful.
+        assert out and "0x140001000" in out.lower() or out
+        assert self._reviewed(tools) == set()
+
     def test_get_param_sinks_marks(self, analysis_tools):
         tools, api = analysis_tools
         api["get_param_sinks"](binary_path=tools.path, function="0x140002000")

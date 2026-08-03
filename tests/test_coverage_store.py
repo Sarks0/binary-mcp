@@ -157,6 +157,51 @@ class TestComputeScope:
         assert records["0x140002000"]["scope_reason"] == "reachable:callee"
         assert all(r["in_scope"] for r in records.values())
 
+    def test_cycle_reachable_subtree_stays_in_scope(self):
+        """A callback that recurses must not drop its whole subtree.
+
+        `reachable:indirect_root` means "no direct caller anywhere", and every
+        member of a call cycle has one -- so before the fixpoint promotion the
+        walk could not enter, and everything below fell out as
+        excluded:unreachable. On the real corpus that was silently dropping
+        http.sys parsers. Under-counting scope is the dangerous direction.
+        """
+        ctx = _context(
+            [
+                _func("entry", "140001000"),
+                # DoCollect <-> FinishConcurrent is a cycle reached only
+                # indirectly; MarkInterior hangs below it.
+                _func("DoCollect", "140002000", called=["140003000"]),
+                _func("FinishConcurrent", "140003000",
+                      called=["140002000", "140004000"]),
+                _func("MarkInterior", "140004000"),
+            ],
+            exports=[{"address": "140001000", "name": "entry", "type": "Function"}],
+        )
+        records, desc = compute_scope(ctx)
+        assert all(
+            r["scope_reason"] != "excluded:unreachable" for r in records.values()
+        ), records
+        assert records["0x140004000"]["in_scope"]
+        assert "unreachable from any root" not in desc
+
+    def test_self_recursive_root_still_in_scope(self):
+        """The one-line mutation that used to flip a root out of scope."""
+        ctx = _context(
+            [
+                _func("entry", "140001000"),
+                # Self-loop: has a direct caller (itself), so never an
+                # indirect_root under the old rule.
+                _func("BfPreClose", "140002000",
+                      called=["140002000", "140003000"]),
+                _func("deep", "140003000"),
+            ],
+            exports=[{"address": "140001000", "name": "entry", "type": "Function"}],
+        )
+        records, _ = compute_scope(ctx)
+        assert records["0x140002000"]["in_scope"]
+        assert records["0x140003000"]["in_scope"]
+
     def test_address_taken_function_is_a_root(self):
         """A registered callback has no direct caller; it must stay in scope.
 

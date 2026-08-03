@@ -17,9 +17,25 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from src.tools.error_hygiene import safe_path_error
 from src.utils.formatters import wrap_untrusted
 
 logger = logging.getLogger(__name__)
+
+
+class VirusTotalError(RuntimeError):
+    """
+    A VirusTotal API failure whose message this module wrote itself.
+
+    Audit F-10: the vt_* handlers return ``f"VirusTotal error: {e}"``
+    verbatim, which is right for the curated sentences raised below ("Hash not
+    found in VirusTotal database", "rate limit exceeded", the HTTP status
+    line) and wrong for anything else that happens to be a ``RuntimeError``
+    inside the same try block -- urllib, json and the hashing helpers all live
+    in there. Raising and catching a dedicated subclass makes the passthrough
+    apply to exactly the strings this module authored; everything else drops
+    through to ``safe_error_message``.
+    """
 
 # VirusTotal API configuration
 VT_API_BASE = "https://www.virustotal.com/api/v3"
@@ -71,15 +87,15 @@ def _vt_request(endpoint: str, method: str = "GET", data: bytes | None = None) -
             return json.loads(response.read().decode("utf-8"))
     except HTTPError as e:
         if e.code == 404:
-            raise RuntimeError("Hash not found in VirusTotal database")
+            raise VirusTotalError("Hash not found in VirusTotal database")
         elif e.code == 401:
-            raise RuntimeError("Invalid VirusTotal API key")
+            raise VirusTotalError("Invalid VirusTotal API key")
         elif e.code == 429:
-            raise RuntimeError("VirusTotal API rate limit exceeded. Try again later.")
+            raise VirusTotalError("VirusTotal API rate limit exceeded. Try again later.")
         else:
-            raise RuntimeError(f"VirusTotal API error: {e.code} {e.reason}")
+            raise VirusTotalError(f"VirusTotal API error: {e.code} {e.reason}")
     except URLError as e:
-        raise RuntimeError(f"Network error connecting to VirusTotal: {e.reason}")
+        raise VirusTotalError(f"Network error connecting to VirusTotal: {e.reason}")
 
 
 def calculate_file_hashes(file_path: str) -> dict:
@@ -383,10 +399,15 @@ def register_vt_tools(app, session_manager=None):
             return safe_error_message("vt_lookup", e)
         except ValueError as e:
             return f"Configuration error: {e}"
-        except RuntimeError as e:
+        except VirusTotalError as e:
+            # Audit F-10: curated, host-free text raised by this module.
             return f"VirusTotal error: {e}"
         except FileNotFoundError as e:
-            return f"File not found: {e}"
+            # Audit F-10: compute_file_hashes is handed the SANITIZED absolute
+            # path, so its "File not found: <path>" message quotes a resolved
+            # host path -- under the default quarantine policy, one rooted at
+            # Path.home(). The category survives; the path does not.
+            return safe_path_error("vt_lookup", e, "file path")
         except Exception as e:
             logger.error(f"vt_lookup failed: {e}")
             return safe_error_message("Failed to look up file", e)
@@ -532,7 +553,8 @@ def register_vt_tools(app, session_manager=None):
 
         except ValueError as e:
             return f"Configuration error: {e}"
-        except RuntimeError as e:
+        except VirusTotalError as e:
+            # Audit F-10: curated, host-free text raised by this module.
             return f"VirusTotal error: {e}"
         except Exception as e:
             logger.error(f"vt_behavior failed: {e}")
@@ -615,7 +637,8 @@ def register_vt_tools(app, session_manager=None):
 
         except ValueError as e:
             return f"Configuration error: {e}"
-        except RuntimeError as e:
+        except VirusTotalError as e:
+            # Audit F-10: curated, host-free text raised by this module.
             return f"VirusTotal error: {e}"
         except Exception as e:
             logger.error(f"vt_search failed: {e}")
@@ -664,7 +687,7 @@ def register_vt_tools(app, session_manager=None):
                 output.append("Test lookup (EICAR test file):")
                 summary = format_detection_summary(result)
                 output.append(f"  Detection: {summary['detection_ratio']}")
-            except RuntimeError as e:
+            except VirusTotalError as e:
                 if "rate limit" in str(e).lower():
                     output.append("API rate limit reached")
                 else:

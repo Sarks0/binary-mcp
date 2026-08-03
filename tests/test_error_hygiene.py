@@ -784,3 +784,151 @@ def test_widened_guard_does_not_flag_the_sanctioned_fix(label, body, tmp_path):
     """Handing the exception to an audited helper IS the fix; flagging it would
     make the guard unusable and push people to suppress it."""
     assert not _guard_flags(body, tmp_path), f"{label} wrongly flagged: {body}"
+
+
+# ---------------------------------------------------------------------------
+# AST guard: exception text forwarded through StructuredError.reason
+# ---------------------------------------------------------------------------
+#
+# Both guards above glob src/tools/ ONLY, and both key on RETURNED strings. The
+# src/utils/ producers that raise StructuredBaseError from a path failure are
+# outside that scope on both counts, and they leaked the same host detail
+# through a different door:
+#
+#     except (PathTraversalError, FileSizeError, ...) as e:
+#         raise StructuredBaseError(StructuredError(..., reason=str(e), ...))
+#
+# curated_structured_text drops debug_info but deliberately KEEPS reason, so the
+# confinement denial -- which interpolates the quarantine directory list and
+# Path.home() -- reached the model verbatim from carving.carve,
+# similarity_hashes.compute and authenticode.inspect. That is the same finding
+# the tool handlers were fixed for, re-entering through the structured path.
+#
+# The fix is security.safe_path_reason(); this guard keeps it that way.
+
+_SRC_DIR = Path(__file__).resolve().parent.parent / "src"
+
+
+# Helpers that exist precisely to render a caught exception safely. Passing the
+# exception to one of these IS the fix, so the guard must not flag it -- the
+# same reasoning as _SAFE_SPELLINGS for the returned-string guard.
+_SANCTIONED_REASON_HELPERS = {"safe_path_reason", "path_error_guidance"}
+
+# Exception types whose message describes the FILE FORMAT or this project's own
+# internal state, never the host's directory layout: pefile's "DOS Header magic
+# not found", a KeyError on a digest algorithm. The model needs those to tell a
+# malformed sample from a bad path, and they carry nothing to disclose. A
+# handler that catches only these may echo the exception.
+_NON_DISCLOSING_HANDLERS = {"PEFormatError", "ValueError", "KeyError"}
+
+
+def _handler_types(handler: ast.ExceptHandler) -> set[str]:
+    """Bare type names caught by an except clause (``pefile.PEFormatError`` -> ...)."""
+    if handler.type is None:
+        return {"BaseException"}
+    nodes = (
+        handler.type.elts if isinstance(handler.type, ast.Tuple) else [handler.type]
+    )
+    names: set[str] = set()
+    for node in nodes:
+        if isinstance(node, ast.Attribute):
+            names.add(node.attr)
+        elif isinstance(node, ast.Name):
+            names.add(node.id)
+        else:  # pragma: no cover - defensive
+            names.add(ast.unparse(node))
+    return names
+
+
+def _reason_kwargs_echoing_exception(path: Path) -> list[tuple[int, str]]:
+    """Find ``reason=`` keyword arguments that interpolate a caught exception."""
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+    except SyntaxError:  # pragma: no cover - not expected in-repo
+        return []
+
+    offenders: list[tuple[int, str]] = []
+    for handler in ast.walk(tree):
+        if not isinstance(handler, ast.ExceptHandler) or not handler.name:
+            continue
+        if _handler_types(handler) <= _NON_DISCLOSING_HANDLERS:
+            continue
+        for node in ast.walk(handler):
+            if not isinstance(node, ast.keyword) or node.arg != "reason":
+                continue
+            names = {
+                child.id
+                for child in ast.walk(node.value)
+                if isinstance(child, ast.Name)
+            }
+            if handler.name not in names:
+                continue
+            if (
+                isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Name)
+                and node.value.func.id in _SANCTIONED_REASON_HELPERS
+            ):
+                continue
+            offenders.append((node.value.lineno, ast.unparse(node.value)))
+    return offenders
+
+
+def test_structured_error_reason_never_echoes_a_caught_exception():
+    """
+    ``StructuredError.reason`` is forwarded to the model verbatim by
+    ``curated_structured_text``, so it must never carry exception text. Put the
+    original in ``debug_info`` (dropped by that renderer, kept by the log) and
+    use ``security.safe_path_reason`` for the model-facing half.
+    """
+    offenders = [
+        f"{path.relative_to(_SRC_DIR.parent)}:{line_no}  reason={expr}"
+        for path in sorted(_SRC_DIR.rglob("*.py"))
+        for line_no, expr in _reason_kwargs_echoing_exception(path)
+    ]
+
+    assert not offenders, (
+        "caught-exception text forwarded through StructuredError.reason; it "
+        "reaches the model via curated_structured_text (audit F-10):\n  "
+        + "\n  ".join(offenders)
+    )
+
+
+_LEAKY_REASONS = {
+    "str": "        raise E(S(reason=str(e), debug_info={}))",
+    "fstring": '        raise E(S(reason=f"could not resolve: {e}"))',
+    "concat": '        raise E(S(reason="failed: " + str(e)))',
+    "bare": "        raise E(S(reason=e.args[0]))",
+}
+
+_SAFE_REASONS = {
+    "sanctioned helper": "        raise E(S(reason=safe_path_reason(e)))",
+    "literal": '        raise E(S(reason="the path is outside the allow-list"))',
+    "detail in debug_info": (
+        '        raise E(S(reason="generic", debug_info={"detail": str(e)}))'
+    ),
+}
+
+
+def _reason_guard_flags(body: str, tmp_path: Path, clause: str = "OSError") -> bool:
+    source = f"try:\n    pass\nexcept {clause} as e:\n{body}\n"
+    path = tmp_path / "sample_reason.py"
+    path.write_text(source, encoding="utf-8")
+    return bool(_reason_kwargs_echoing_exception(path))
+
+
+@pytest.mark.parametrize("label,body", sorted(_LEAKY_REASONS.items()))
+def test_reason_guard_catches_leaky_spellings(label, body, tmp_path):
+    """A guard that passes because it recognises nothing is worse than none."""
+    assert _reason_guard_flags(body, tmp_path), f"{label} not flagged: {body}"
+
+
+@pytest.mark.parametrize("label,body", sorted(_SAFE_REASONS.items()))
+def test_reason_guard_allows_the_sanctioned_fix(label, body, tmp_path):
+    assert not _reason_guard_flags(body, tmp_path), f"{label} wrongly flagged: {body}"
+
+
+@pytest.mark.parametrize("clause", ["pefile.PEFormatError", "ValueError", "KeyError"])
+def test_reason_guard_allows_format_only_handlers(clause, tmp_path):
+    """PE-parser and internal-state messages name no host path -- and the model
+    needs them to tell a malformed sample from a bad path."""
+    assert not _reason_guard_flags("        raise E(S(reason=str(e)))", tmp_path, clause)

@@ -238,32 +238,6 @@ def classify_blob(data: bytes) -> tuple[str, str, float, list[str]]:
 # Output dir defaulting + validation
 
 
-# Hard denylist of POSIX system directories that no carver output should
-# ever land in. Used when no BINARY_MCP_ALLOWED_DIRS allow-list is
-# configured; otherwise the allow-list is authoritative. The ``/private/...``
-# entries cover macOS, where ``/etc`` is a symlink to ``/private/etc`` and
-# ``Path.resolve()`` returns the latter form.
-_DANGEROUS_PREFIXES: tuple[str, ...] = (
-    "/etc",
-    "/private/etc",
-    "/sys",
-    "/proc",
-    "/boot",
-    "/usr/bin",
-    "/usr/sbin",
-    "/usr/local/bin",
-    "/usr/local/sbin",
-    "/sbin",
-    "/bin",
-    "/var/spool",
-    "/private/var/spool",
-    "/var/log",
-    "/private/var/log",
-    "/var/lib",
-    "/private/var/lib",
-    "/root",
-    "/private/var/root",
-)
 
 
 def _is_within(child: Path, parent: Path) -> bool:
@@ -288,9 +262,14 @@ def _validate_output_dir(out: Path) -> Path:
     """
     Validate a user-supplied carving output directory.
 
-    Rejects parent traversal (``..``), symlinks anywhere on the existing
-    portion of the path, and -- when no ``BINARY_MCP_ALLOWED_DIRS`` allow-list
-    is configured -- a hard-coded denylist of POSIX system directories.
+    Rejects parent traversal (``..``) and a symlinked leaf, then requires the
+    resolved path to sit inside an ALLOW-LIST: ``BINARY_MCP_ALLOWED_DIRS`` when
+    the operator configured one, otherwise this server's own artifact
+    directories plus the system temp directory.
+
+    This was a denylist of POSIX system prefixes until it was found unsound --
+    see the comment at the fallback below for why, and for why the replacement
+    is an allow-list rather than a longer denylist.
 
     Args:
         out: User-supplied output directory (already ``.expanduser()``'d).
@@ -326,8 +305,8 @@ def _validate_output_dir(out: Path) -> Path:
     # a stdio MCP server is the directory the client launched it from -- in the
     # documented configs, the binary-mcp install tree itself. So
     # extract_embedded_binaries(output_dir="out") wrote bytes CARVED OUT OF THE
-    # SAMPLE into the server's own source directory, and the denylist below
-    # never saw a system prefix to object to. Anchoring to the carve cache
+    # SAMPLE into the server's own source directory, which the old denylist had
+    # no system prefix to object to. Anchoring to the carve cache
     # keeps the convenient short form working while putting the output
     # somewhere the confinement layer already recognises as ours.
     if not out.is_absolute():
@@ -337,9 +316,9 @@ def _validate_output_dir(out: Path) -> Path:
     # don't reject symlinks in *parent* components -- on macOS the system
     # exposes ``/var -> /private/var`` and ``/tmp -> /private/tmp`` as
     # legitimate OS topology, and pytest's ``tmp_path`` lives behind those.
-    # The denylist below is checked against BOTH the user-input absolute
-    # path and the symlink-resolved path, which catches the practical
-    # threat (a user-controlled symlink pointing into ``/etc`` etc.).
+    # Containment below is then evaluated on the RESOLVED path, so a
+    # user-controlled symlink pointing out of the allow-list is caught by the
+    # allow-list test itself rather than by inspecting the link.
     try:
         if out.is_symlink():
             raise StructuredBaseError(
@@ -369,8 +348,14 @@ def _validate_output_dir(out: Path) -> Path:
             StructuredError(
                 error=ErrorCode.PARAMETER_INVALID,
                 message="Invalid output_dir",
-                reason=f"Path could not be resolved: {e}",
-                debug_info={"output_dir": str(out)},
+                # str(e) on a path OSError carries the path itself
+                # ("[Errno 40] Too many levels of symbolic links: '/home/...'"),
+                # and reason reaches the model. Detail goes to debug_info.
+                reason=(
+                    "output_dir could not be resolved. Check that every "
+                    "component exists and is not a broken or looping symlink."
+                ),
+                debug_info={"output_dir": str(out), "detail": str(e)},
             )
         ) from e
 
@@ -412,8 +397,8 @@ def _validate_output_dir(out: Path) -> Path:
 
     # This server's own artifact directories are always permitted.
     #
-    # The denylist below blocks $HOME wholesale, which includes the carve
-    # cache, the symbol cache and the output root -- the very places this
+    # The denylist this replaced blocked $HOME wholesale, which includes the
+    # carve cache, the symbol cache and the output root -- the very places this
     # server writes. Without this exemption the tool's own DEFAULT output
     # location was refused (anchoring a relative output_dir to the carve cache
     # made that immediately visible), which is the same write-then-refuse
@@ -534,6 +519,7 @@ def carve(
         FileSizeError,
         PathTraversalError,
         get_allowed_dirs,
+        safe_path_reason,
         sanitize_binary_path,
     )
     from src.utils.structured_errors import (
@@ -551,9 +537,13 @@ def carve(
             StructuredError(
                 error=ErrorCode.PARAMETER_INVALID,
                 message="Invalid binary path",
-                reason=str(e),
+                # NOT str(e): a confinement denial names the quarantine
+                # directories and Path.home(), and reason IS forwarded to the
+                # model by curated_structured_text. The raw text goes to
+                # debug_info, which that renderer drops and the log keeps.
+                reason=safe_path_reason(e),
                 suggestions=["Provide an absolute path to an existing PE file"],
-                debug_info={"binary_path": str(binary_path)},
+                debug_info={"binary_path": str(binary_path), "detail": str(e)},
             )
         ) from e
 
@@ -647,8 +637,17 @@ def carve(
                                 StructuredError(
                                     error=ErrorCode.OPERATION_FAILED,
                                     message="Failed to create output_dir",
-                                    reason=str(e),
-                                    debug_info={"output_dir": str(out)},
+                                    # As above: a mkdir OSError names the path
+                                    # ("[Errno 13] Permission denied: '/home/...'").
+                                    reason=(
+                                        "the output directory could not be "
+                                        "created. Check that the parent exists "
+                                        "and is writable by this server."
+                                    ),
+                                    debug_info={
+                                        "output_dir": str(out),
+                                        "detail": str(e),
+                                    },
                                 )
                             ) from e
                     target = out / sha256

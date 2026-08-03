@@ -17,9 +17,7 @@ import tempfile
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
-from urllib.request import urlopen, Request
-
+from urllib.request import Request, urlopen
 
 # Terminal Colors and Output Helpers
 
@@ -62,7 +60,7 @@ def print_banner() -> None:
     print(f"{Colors.MAGENTA} |____/|_|_| |_|\\__,_|_|   \\__, | |_|  |_|\\____|_|    {Colors.RESET}")
     print(f"{Colors.MAGENTA}                           |___/                      {Colors.RESET}")
     print()
-    print(f"  Binary Analysis MCP Server - Automated Installer")
+    print("  Binary Analysis MCP Server - Automated Installer")
     print(f"{Colors.DIM}  https://github.com/Sarks0/binary-mcp{Colors.RESET}")
     print()
     print(f"{Colors.DIM}  ================================================{Colors.RESET}")
@@ -76,7 +74,7 @@ def command_exists(cmd: str) -> bool:
     return shutil.which(cmd) is not None
 
 
-def get_command_version(cmd: str, version_arg: str = "--version") -> Optional[str]:
+def get_command_version(cmd: str, version_arg: str = "--version") -> str | None:
     """Get version string from a command."""
     try:
         result = subprocess.run(
@@ -169,7 +167,7 @@ def strict_integrity() -> bool:
     )
 
 
-def pinned_sha256(hash_key: str) -> Optional[str]:
+def pinned_sha256(hash_key: str) -> str | None:
     """Operator env var wins over the in-script table, so pinning today's build
     does not require editing the installer."""
     from_env = os.environ.get(integrity_env_name(hash_key), "").strip()
@@ -295,7 +293,7 @@ def _is_sha256(token: str) -> bool:
     return len(token) == 64 and all(c in "0123456789abcdef" for c in token)
 
 
-def checksum_from_release_notes(release: dict, asset_name: str) -> Optional[str]:
+def checksum_from_release_notes(release: dict, asset_name: str) -> str | None:
     """Best-effort scrape of a release body for a digest published next to the
     asset name (how Ghidra ships its SHA-256).
 
@@ -320,8 +318,8 @@ def checksum_from_release_notes(release: dict, asset_name: str) -> Optional[str]
 def release_asset_checksum(
     release: dict,
     asset_name: str,
-    checksums: Optional[dict[str, str]] = None,
-) -> Optional[str]:
+    checksums: dict[str, str] | None = None,
+) -> str | None:
     """Manifest asset first, release notes second, None if neither has a digest."""
     try:
         if checksums is None:
@@ -338,8 +336,8 @@ def download_file(
     url: str,
     dest: Path,
     description: str = "file",
-    expected_sha256: Optional[str] = None,
-    hash_key: Optional[str] = None,
+    expected_sha256: str | None = None,
+    hash_key: str | None = None,
 ) -> bool:
     """Download a file with progress indication, then verify its SHA-256.
 
@@ -541,14 +539,14 @@ def show_system_status(status: SystemStatus) -> None:
     print()
 
     # Package Manager
-    print(f"  Package Manager:")
+    print("  Package Manager:")
     if status.package_manager:
         print(f"    [{Colors.GREEN}OK{Colors.RESET}] {status.package_manager} (can auto-install prerequisites)")
     else:
         print(f"    [{Colors.YELLOW}--{Colors.RESET}] No supported package manager found")
 
     print()
-    print(f"  Core Requirements:")
+    print("  Core Requirements:")
 
     # Python
     py_ver = tuple(map(int, status.python.version.split('.')[:2]))
@@ -570,7 +568,7 @@ def show_system_status(status: SystemStatus) -> None:
         print(f"    [{Colors.DIM}--{Colors.RESET}] Git (optional, for updates)")
 
     print()
-    print(f"  Analysis Components:")
+    print("  Analysis Components:")
 
     # Ghidra
     if status.ghidra.installed:
@@ -603,7 +601,7 @@ def show_system_status(status: SystemStatus) -> None:
         print(f"    [{Colors.YELLOW}!!{Colors.RESET}] .NET 8 Runtime (required for ILSpyCmd)")
 
     print()
-    print(f"  Binary MCP Server:")
+    print("  Binary MCP Server:")
     if status.binary_mcp.installed:
         print(f"    [{Colors.GREEN}OK{Colors.RESET}] Installed at {status.binary_mcp.path}")
     else:
@@ -619,19 +617,19 @@ def show_install_menu() -> None:
     print(f"  {Colors.YELLOW}INSTALLATION OPTIONS{Colors.RESET}")
     print(f"  {Colors.YELLOW}--------------------{Colors.RESET}")
     print()
-    print(f"  [1] Full Installation")
+    print("  [1] Full Installation")
     print(f"{Colors.DIM}      Everything: Ghidra + .NET Tools + Claude Config{Colors.RESET}")
     print()
-    print(f"  [2] Static Analysis Only")
+    print("  [2] Static Analysis Only")
     print(f"{Colors.DIM}      Ghidra (native) + ILSpyCmd (.NET){Colors.RESET}")
     print()
-    print(f"  [3] Minimal Installation")
+    print("  [3] Minimal Installation")
     print(f"{Colors.DIM}      Just Binary MCP + Claude Config (bring your own tools){Colors.RESET}")
     print()
-    print(f"  [4] Custom Installation")
+    print("  [4] Custom Installation")
     print(f"{Colors.DIM}      Choose individual components to install{Colors.RESET}")
     print()
-    print(f"  [5] Repair/Update Existing")
+    print("  [5] Repair/Update Existing")
     print(f"{Colors.DIM}      Reinstall or update specific components{Colors.RESET}")
     print()
     print(f"{Colors.DIM}  [Q] Quit{Colors.RESET}")
@@ -643,7 +641,7 @@ def show_custom_menu(status: SystemStatus) -> None:
     print(f"  {Colors.YELLOW}CUSTOM INSTALLATION{Colors.RESET}")
     print(f"  {Colors.YELLOW}-------------------{Colors.RESET}")
     print()
-    print(f"  Select components (enter numbers separated by commas, e.g., 1,2,4):")
+    print("  Select components (enter numbers separated by commas, e.g., 1,2,4):")
     print()
 
     ghidra_status = "[Installed]" if status.ghidra.installed else ""
@@ -658,8 +656,8 @@ def show_custom_menu(status: SystemStatus) -> None:
     if dotnet_note:
         print(f"      {dotnet_note}")
 
-    print(f"  [3] Configure Claude Desktop")
-    print(f"  [4] Configure Claude Code")
+    print("  [3] Configure Claude Desktop")
+    print("  [4] Configure Claude Code")
     print()
     print(f"  [{Colors.CYAN}A{Colors.RESET}] All components")
     print(f"{Colors.DIM}  [B] Back to main menu{Colors.RESET}")

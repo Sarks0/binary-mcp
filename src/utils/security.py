@@ -959,6 +959,105 @@ def get_allowed_dirs() -> list[Path] | None:
     return [Path(d.strip()) for d in dirs_config.split(os.pathsep) if d.strip()]
 
 
+# ---------------------------------------------------------------------------
+# Non-disclosing text for path-validation failures (audit F-10)
+# ---------------------------------------------------------------------------
+#
+# The MESSAGE of a confinement failure is itself host state. _default_confinement
+# _denied() interpolates the resolved quarantine directory list and
+# _confinement_setup_hint() prints ``Path.home() / "quarantine"`` as its worked
+# example, so ``str(PathTraversalError)`` carries the operator's username and
+# directory layout. Anything that forwards that text to the model leaks it into
+# the transcript, and from there into generated reports.
+#
+# This mapping lives HERE rather than in src/tools/error_hygiene.py because both
+# layers need it and src/utils/ cannot import from src/tools/ (error_hygiene
+# already imports this module). Keeping one copy is the point: the first
+# remediation pass fixed the tool handlers and left the src/utils/ producers --
+# carving.carve, similarity_hashes.compute, authenticode.inspect -- forwarding
+# the same text through StructuredError.reason, which curated_structured_text
+# deliberately preserves. A second copy is how that happened.
+PATH_ERROR_GUIDANCE: "dict[type, str]" = {
+    PathTraversalError: (
+        "the path is outside the directories this server is allowed to read. "
+        f"Analyse files from a directory the operator exposed via "
+        f"{ENV_ALLOWED_DIRS} (or the default quarantine directories). The "
+        f"configured directories are intentionally not listed here; ask the "
+        f"operator, or have them set {ENV_ALLOWED_DIRS} / "
+        f"{ENV_ALLOW_ANY_PATH}. Output paths must likewise stay inside this "
+        "server's own output directory -- pass a bare filename rather than "
+        "an absolute path."
+    ),
+    FileSizeError: (
+        "the file is larger than this server's analysis size limit. Carve "
+        "out the region of interest and analyse that instead."
+    ),
+    FileNotFoundError: (
+        "no file exists at the path supplied. Check the name and extension, "
+        "and confirm the sample was copied onto this host."
+    ),
+    IsADirectoryError: "the path names a directory, not a file.",
+    NotADirectoryError: "a component of the path is not a directory.",
+    PermissionError: (
+        "this server does not have permission to read the path supplied."
+    ),
+}
+
+
+def path_error_guidance(error: Exception) -> "str | None":
+    """
+    Return non-disclosing guidance for a path-validation error, or None.
+
+    None means the exception type is not one whose category can be described
+    without echoing its text -- callers decide their own fallback. Iteration
+    order is irrelevant: the mapped types are siblings, never subclasses of one
+    another.
+
+    Args:
+        error: The caught path-validation exception.
+
+    Returns:
+        Guidance text safe to show the model, or None if unmapped.
+    """
+    for exc_type, text in PATH_ERROR_GUIDANCE.items():
+        if isinstance(error, exc_type):
+            return text
+    return None
+
+
+def safe_path_reason(error: Exception) -> str:
+    """
+    Non-disclosing ``StructuredError.reason`` text for a path failure.
+
+    For library code in ``src/utils/`` that raises ``StructuredBaseError`` from
+    a :func:`sanitize_binary_path` failure. Unlike
+    :func:`path_error_guidance` this ALWAYS returns a safe string, because the
+    unmapped cases leak too: ``sanitize_binary_path`` raises ``ValueError("Path
+    is not a file: <resolved path>")``, which interpolates the resolved
+    absolute path.
+
+    Put the original text in ``debug_info`` instead -- that field is dropped
+    from model-facing output by ``error_hygiene.curated_structured_text`` and
+    written to the server log, where the operator can already see the host.
+
+    Args:
+        error: The caught path-validation exception.
+
+    Returns:
+        Guidance text safe to show the model. Never echoes ``error``.
+    """
+    guidance = path_error_guidance(error)
+    if guidance is not None:
+        return guidance
+    return (
+        "the path could not be validated against this server's confinement "
+        f"policy. Supply a path to an existing file inside a directory the "
+        f"operator exposed via {ENV_ALLOWED_DIRS} (or the default quarantine "
+        f"directories). The specific reason and the configured directories are "
+        f"recorded in the server log rather than here."
+    )
+
+
 class UserFacingError(Exception):
     """
     Exception with separate user-facing and internal error messages.

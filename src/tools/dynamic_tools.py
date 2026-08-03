@@ -1764,7 +1764,12 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
         Args:
             trace_into: If True, trace into function calls. If False, trace over.
             max_entries: Maximum trace entries to keep in memory (default: 100000)
-            log_file: Optional file path to write trace log (for large traces)
+            log_file: Optional trace-log filename (for large traces). Must be a
+                RELATIVE name such as "trace.csv" or "run1/trace.csv" -- the
+                plugin writes it inside its own output directory and refuses
+                absolute paths, drive letters, UNC paths and "..", so "C:\\t.log"
+                and "/tmp/trace.log" are both rejected. The response reports the
+                absolute path the log was actually written to.
 
         Returns:
             Trace configuration summary
@@ -1777,7 +1782,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
         """
         try:
             bridge = get_x64dbg_bridge()
-            bridge.start_trace(
+            result = bridge.start_trace(
                 trace_into=trace_into,
                 max_entries=max_entries,
                 log_file=log_file if log_file else None,
@@ -1790,7 +1795,25 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 f"  Max entries: {max_entries}"
             )
             if log_file:
-                output += f"\n  Log file: {log_file}"
+                # Report where the log ACTUALLY landed, not what was asked for.
+                #
+                # The plugin confines trace logs to its own output directory
+                # (F-27) and returns the resolved absolute path in the response.
+                # This used to echo the REQUESTED name instead, so an analyst
+                # who passed "trace.csv" was told "Log file: trace.csv" while
+                # the file was written under the plugin's output root -- the
+                # server reporting a location it had not used, which is the
+                # same "cannot find what was just written" failure that has bit
+                # this codebase repeatedly. Fall back to the requested name only
+                # if the plugin did not tell us (older plugin build).
+                resolved = ""
+                if isinstance(result, dict):
+                    resolved = str(
+                        result.get("log_file")
+                        or (result.get("data") or {}).get("log_file")
+                        or ""
+                    )
+                output += f"\n  Log file: {resolved or log_file}"
 
             return output
 

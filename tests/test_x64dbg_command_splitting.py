@@ -42,6 +42,7 @@ here is measured in "the sample got launched". Malformed input is refused.
 from __future__ import annotations
 
 import ast
+import contextlib
 import re
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -682,3 +683,60 @@ class TestParseTypesSemicolonLimitation:
         message = str(excinfo.value)
         assert "load_types" in message, message
         assert "splits every command" in message, message
+
+
+class TestStartTraceReportsResolvedLogPath:
+    """x64dbg_start_trace must report where the log ACTUALLY landed.
+
+    The plugin confines trace logs to its own output directory (F-27) and
+    returns the resolved absolute path. The tool echoed the REQUESTED name
+    instead, so an analyst who passed "trace.csv" was told "Log file:
+    trace.csv" while the file was written under the plugin output root -- the
+    same "cannot find what was just written" failure this codebase has hit
+    repeatedly, reported rather than enforced.
+    """
+
+    @contextlib.contextmanager
+    def _tool(self, start_trace_result):
+        from unittest.mock import MagicMock
+
+        import src.tools.dynamic_tools as dynamic_tools
+
+        bridge = MagicMock()
+        bridge.start_trace.return_value = start_trace_result
+        captured = {}
+
+        class App:
+            def tool(self, *a, **k):
+                def deco(fn):
+                    captured[fn.__name__] = fn
+                    return fn
+
+                return deco
+
+        with patch.object(dynamic_tools, "get_x64dbg_bridge", lambda: bridge):
+            dynamic_tools.register_dynamic_tools(App(), MagicMock())
+            yield captured["x64dbg_start_trace"]
+
+    def test_resolved_path_is_reported(self):
+        resolved = r"C:\Users\a\AppData\Local\Temp\obsidian_x64dbg\output\trace.csv"
+        with self._tool({"log_file": resolved}) as tool:
+            out = tool(log_file="trace.csv")
+        assert resolved in out, out
+
+    def test_resolved_path_read_from_nested_data(self):
+        resolved = r"C:\out\trace.csv"
+        with self._tool({"data": {"log_file": resolved}}) as tool:
+            out = tool(log_file="trace.csv")
+        assert resolved in out, out
+
+    def test_falls_back_to_requested_name_when_plugin_is_silent(self):
+        """An older plugin build returns no log_file; do not print nothing."""
+        with self._tool({}) as tool:
+            out = tool(log_file="trace.csv")
+        assert "trace.csv" in out, out
+
+    def test_no_log_file_means_no_log_line(self):
+        with self._tool({}) as tool:
+            out = tool()
+        assert "Log file" not in out, out

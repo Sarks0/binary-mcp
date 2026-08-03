@@ -21,6 +21,7 @@ the tool is leaking.
 
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -425,3 +426,198 @@ def test_no_catch_all_handler_echoes_raw_exception_text():
         "raw exception text returned to the model (audit F-10):\n  "
         + "\n  ".join(offenders)
     )
+
+
+# ---------------------------------------------------------------------------
+# AST guard: ANY returned f-string that interpolates a caught exception
+# ---------------------------------------------------------------------------
+#
+# The line-matching guard above only ever recognised ONE spelling -- the exact
+# source line ``return f"Error: {e}"``. An adversarial review of the first
+# remediation pass found that every leak it was supposed to catch was written
+# in some other spelling and sailed straight through it:
+#
+#     return f"Invalid binary path: {e}"          # review_tools x5, fid_tools
+#     return f"Error: Invalid output path - {e}"  # dynamic_tools
+#     return f"File not found: {e}"               # vt_tools
+#
+# All of those interpolate a caught exception whose message is built from a
+# resolved absolute path -- the quarantine allow-list, the dump directory, the
+# sanitized sample path -- i.e. exactly the ``Path.home()`` disclosure F-10 is
+# about. A guard that a one-word rename defeats is not a guard, so the check
+# below is structural: parse the module, find every ``except ... as <name>``,
+# and flag any ``return`` inside it whose f-string interpolates <name>.
+#
+# The old line-based test is deliberately KEPT rather than replaced. It pins
+# the single most common spelling with a very precise message, and the two
+# tests failing together on a regression is cheap.
+
+_AST_ALLOWED_HANDLERS = {
+    # This project's own validators. "Invalid hash length: 33", "address must
+    # be hex", enum/range errors: the model needs these to repair its own
+    # call, and they quote the model's own arguments, not the host.
+    "ValueError",
+    "TypeError",
+    # Dedicated, module-private exception types introduced precisely so that
+    # a verbatim passthrough is bounded by construction rather than by
+    # inspection. Both are raised ONLY with sentences written in this repo:
+    #   * CfgBuildError  (src/tools/control_flow_tools.py) -- "Unsupported
+    #     architecture for disassembly...", "...has no basic blocks in the
+    #     cached analysis", "Ghidra did not produce output."
+    #   * VirusTotalError (src/tools/vt_tools.py) -- "Hash not found in
+    #     VirusTotal database", "rate limit exceeded", the HTTP status line.
+    # Neither can carry a filesystem path, because neither is ever raised
+    # with one. Widening this set requires the same audit.
+    "CfgBuildError",
+    "VirusTotalError",
+    # Third-party, reviewed: pefile raises PEFormatError with a fixed set of
+    # structural descriptions ("DOS Header magic not found.", "Invalid NT
+    # Headers signature.") and never interpolates the file path -- pefile is
+    # handed a file object / bytes by the time these fire. The text is the
+    # only thing that tells a user their "PE" is actually a script or a
+    # truncated download, so it is worth keeping.
+    "pefile.PEFormatError",
+}
+
+
+def _handler_clause_names(handler: ast.ExceptHandler) -> list[str]:
+    """Names of the exception types a handler catches, as written in source."""
+    if handler.type is None:
+        return ["<bare except>"]
+    if isinstance(handler.type, ast.Tuple):
+        return [ast.unparse(element) for element in handler.type.elts]
+    return [ast.unparse(handler.type)]
+
+
+def _interpolated_names(node: ast.AST) -> set[str]:
+    """Every bare name interpolated by an f-string anywhere under ``node``."""
+    names: set[str] = set()
+    for formatted in ast.walk(node):
+        if not isinstance(formatted, ast.FormattedValue):
+            continue
+        for inner in ast.walk(formatted.value):
+            if isinstance(inner, ast.Name):
+                names.add(inner.id)
+    return names
+
+
+def _exception_echoing_returns(path: Path) -> list[tuple[int, str, str]]:
+    """
+    Find ``return f"...{e}..."`` statements governed by ``except ... as e``.
+
+    Returns ``(line_number, clause_text, source_text)`` for each offender,
+    skipping handlers whose caught types are all on the allow-list.
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    offenders: list[tuple[int, str, str]] = []
+
+    for handler in ast.walk(tree):
+        if not isinstance(handler, ast.ExceptHandler) or handler.name is None:
+            continue
+
+        clauses = _handler_clause_names(handler)
+        if set(clauses) <= _AST_ALLOWED_HANDLERS:
+            continue
+
+        # ast.walk descends into nested handlers too. That is intentional: a
+        # `return f"...{e}..."` inside an inner try still leaks the OUTER
+        # exception if it names it, and the inner handler is visited on its
+        # own turn for its own binding.
+        for node in ast.walk(handler):
+            if not isinstance(node, ast.Return) or node.value is None:
+                continue
+            if handler.name in _interpolated_names(node.value):
+                offenders.append(
+                    (node.lineno, ", ".join(clauses), ast.unparse(node)[:120])
+                )
+
+    return offenders
+
+
+def test_no_returned_fstring_interpolates_a_caught_exception():
+    """
+    Audit F-10 guard, structural form.
+
+    Any exception a tool handler catches may carry host detail -- an absolute
+    path under ``Path.home()``, the operator's username, CDB stdout, Pybag COM
+    internals -- and interpolating it into the returned string puts that
+    detail in the model's context and then in generated reports. Route it
+    through ``safe_error_message`` / ``safe_tool_error`` / ``safe_path_error``,
+    which log the detail against a reference ID, or narrow the handler to one
+    of the audited types in ``_AST_ALLOWED_HANDLERS``.
+    """
+    offenders = []
+    for path in sorted(_TOOLS_DIR.glob("*.py")):
+        for line_no, clause, source in _exception_echoing_returns(path):
+            offenders.append(f"{path.name}:{line_no} (except {clause}) -> {source}")
+
+    assert not offenders, (
+        "returned f-string interpolates a caught exception (audit F-10):\n  "
+        + "\n  ".join(offenders)
+    )
+
+
+def test_ast_guard_actually_catches_the_spellings_the_line_guard_missed():
+    """
+    Meta-test: prove the new guard would have failed the FIRST pass.
+
+    Without this, a future refactor could quietly reduce the AST check to the
+    same literal match as the old one and nothing would notice. Each snippet
+    below is a real leak that shipped in pass one and that
+    ``_raw_error_returns`` scores as clean.
+    """
+    leaks = [
+        # review_tools.py / fid_tools.py, pass one.
+        'def f():\n'
+        '    try:\n'
+        '        pass\n'
+        '    except (PathTraversalError, FileSizeError) as e:\n'
+        '        return f"Invalid binary path: {e}"\n',
+        # dynamic_tools.py, pass one.
+        'def f():\n'
+        '    try:\n'
+        '        pass\n'
+        '    except PathTraversalError as e:\n'
+        '        return f"Error: Invalid output path - {e}"\n',
+        # vt_tools.py, pass one.
+        'def f():\n'
+        '    try:\n'
+        '        pass\n'
+        '    except FileNotFoundError as e:\n'
+        '        return f"File not found: {e}"\n',
+        # Interpolation nested in an expression rather than bare.
+        'def f():\n'
+        '    try:\n'
+        '        pass\n'
+        '    except OSError as e:\n'
+        '        return f"failed: {str(e).strip()}"\n',
+    ]
+
+    for source in leaks:
+        tree = ast.parse(source)
+        handler = next(
+            node for node in ast.walk(tree) if isinstance(node, ast.ExceptHandler)
+        )
+        assert set(_handler_clause_names(handler)) - _AST_ALLOWED_HANDLERS, source
+        returns = [
+            node
+            for node in ast.walk(handler)
+            if isinstance(node, ast.Return)
+            and node.value is not None
+            and handler.name in _interpolated_names(node.value)
+        ]
+        assert returns, f"AST guard missed a known pass-one leak:\n{source}"
+
+    # ... and the allow-listed shape stays clean, so the guard is not simply
+    # flagging everything.
+    tree = ast.parse(
+        'def f():\n'
+        '    try:\n'
+        '        pass\n'
+        '    except ValueError as e:\n'
+        '        return f"Invalid limit: {e}"\n'
+    )
+    handler = next(
+        node for node in ast.walk(tree) if isinstance(node, ast.ExceptHandler)
+    )
+    assert set(_handler_clause_names(handler)) <= _AST_ALLOWED_HANDLERS

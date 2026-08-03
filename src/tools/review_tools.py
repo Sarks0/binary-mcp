@@ -13,6 +13,7 @@ import logging
 import re
 from pathlib import Path
 
+from src.tools.error_hygiene import safe_path_error
 from src.utils.formatters import wrap_untrusted
 from src.utils.pseudocode_rules import (
     SINK_HINTS,
@@ -418,12 +419,27 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
                     "...)` for combined direct + indirect candidates."
                 )
             else:
-                for caller in shown:
-                    lines.append(f"- {caller.get('name')} @ {caller.get('address')}")
+                # Audit F-7: caller names are symbol/PDB/export strings the
+                # sample author chose. The counts and the indirect-call caveat
+                # are ours and stay outside the fence.
+                lines.append(
+                    wrap_untrusted(
+                        "\n".join(
+                            f"- {caller.get('name')} @ {caller.get('address')}"
+                            for caller in shown
+                        ),
+                        kind="caller names recovered from the sample",
+                    )
+                )
             return "\n".join(lines)
 
         except (PathTraversalError, FileSizeError, FileNotFoundError) as e:
-            return f"Invalid binary path: {e}"
+            # Audit F-10: forwarding this exception verbatim leaked the
+            # host layout -- a confinement denial names the resolved
+            # quarantine directories and ends with a Path.home()-derived
+            # worked example. The category and the remedy survive; the
+            # directory listing goes to the server log instead.
+            return safe_path_error("get_function_callers", e, "binary path")
         except Exception as e:
             logger.exception(f"get_function_callers failed: {e}")
             return safe_error_message("get_function_callers failed", e)
@@ -697,7 +713,12 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
             return "\n".join(lines)
 
         except (PathTraversalError, FileSizeError, FileNotFoundError) as e:
-            return f"Invalid binary path: {e}"
+            # Audit F-10: forwarding this exception verbatim leaked the
+            # host layout -- a confinement denial names the resolved
+            # quarantine directories and ends with a Path.home()-derived
+            # worked example. The category and the remedy survive; the
+            # directory listing goes to the server log instead.
+            return safe_path_error("scan_pseudocode", e, "binary path")
         except Exception as e:
             logger.exception(f"scan_pseudocode failed: {e}")
             return safe_error_message("scan_pseudocode failed", e)
@@ -916,7 +937,12 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
             return "\n".join(lines)
 
         except (PathTraversalError, FileSizeError, FileNotFoundError) as e:
-            return f"Invalid binary path: {e}"
+            # Audit F-10: forwarding this exception verbatim leaked the
+            # host layout -- a confinement denial names the resolved
+            # quarantine directories and ends with a Path.home()-derived
+            # worked example. The category and the remedy survive; the
+            # directory listing goes to the server log instead.
+            return safe_path_error("get_review_package", e, "binary path")
         except Exception as e:
             logger.exception(f"get_review_package failed: {e}")
             return safe_error_message("get_review_package failed", e)
@@ -979,20 +1005,35 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
                 return "No jump/switch tables found."
 
             lines = [f"**Jump tables: {total} total ({len(tables)} shown)**", ""]
+            # Audit F-7: function names and jump-table target labels come out
+            # of the analysed binary, so the listing goes inside the fence
+            # while the "N total (M shown)" header stays outside it.
+            body: list[str] = []
             for func, jt in tables:
                 targets = jt.get("targets") or []
-                lines.append(
+                body.append(
                     f"- {func.get('name')} @ {func.get('address')} -- "
                     f"switch @ {jt.get('source_addr')} -> {len(targets)} cases"
                 )
                 for t in targets[:12]:
-                    lines.append(f"    -> {t}")
+                    body.append(f"    -> {t}")
                 if len(targets) > 12:
-                    lines.append(f"    ... and {len(targets) - 12} more")
+                    body.append(f"    ... and {len(targets) - 12} more")
+            lines.append(
+                wrap_untrusted(
+                    "\n".join(body),
+                    kind="jump-table targets recovered from the sample",
+                )
+            )
             return "\n".join(lines)
 
         except (PathTraversalError, FileSizeError, FileNotFoundError) as e:
-            return f"Invalid binary path: {e}"
+            # Audit F-10: forwarding this exception verbatim leaked the
+            # host layout -- a confinement denial names the resolved
+            # quarantine directories and ends with a Path.home()-derived
+            # worked example. The category and the remedy survive; the
+            # directory listing goes to the server log instead.
+            return safe_path_error("get_switch_tables", e, "binary path")
         except Exception as e:
             logger.exception(f"get_switch_tables failed: {e}")
             return safe_error_message("get_switch_tables failed", e)
@@ -1105,7 +1146,12 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
             return "\n".join(lines)
 
         except (PathTraversalError, FileSizeError, FileNotFoundError) as e:
-            return f"Invalid binary path: {e}"
+            # Audit F-10: forwarding this exception verbatim leaked the
+            # host layout -- a confinement denial names the resolved
+            # quarantine directories and ends with a Path.home()-derived
+            # worked example. The category and the remedy survive; the
+            # directory listing goes to the server log instead.
+            return safe_path_error("get_param_sinks", e, "binary path")
         except Exception as e:
             logger.error(f"get_param_sinks failed: {e}")
             return safe_error_message("Failed to trace parameter sinks", e)

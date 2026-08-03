@@ -10,7 +10,26 @@ import logging
 from collections import defaultdict
 from pathlib import Path
 
+from src.utils.formatters import wrap_untrusted
+
 logger = logging.getLogger(__name__)
+
+
+class CfgBuildError(RuntimeError):
+    """
+    A CFG could not be built, with a message that is safe to show the model.
+
+    Audit F-10: the two ``except RuntimeError`` handlers in this module echo
+    the exception text verbatim, on the grounds that ``_build_cfg`` and
+    ``_get_or_run_analysis`` raise only curated, host-free sentences
+    ("Unsupported architecture for disassembly...", "...has no basic blocks in
+    the cached analysis"). That reasoning was only ever true by inspection:
+    ``RuntimeError`` is the base class of a great deal of third-party
+    breakage, and anything else raising it inside those try blocks would have
+    been echoed too. Narrowing the raises and the catches to this type makes
+    the guarantee structural instead of aspirational -- an unrelated
+    RuntimeError now falls through to ``safe_error_message``.
+    """
 
 
 # Internal helpers
@@ -61,7 +80,7 @@ def _get_or_run_analysis(binary_path: str, cache, runner) -> dict:
     )
 
     if not output_path.exists():
-        raise RuntimeError(
+        raise CfgBuildError(
             "Ghidra did not produce output. The binary format may be unsupported."
         )
 
@@ -239,7 +258,7 @@ def _build_cfg(func: dict, reader, metadata: dict):
 
     cs_arch, cs_mode = _parse_capstone_arch(metadata)
     if cs_arch is None:
-        raise RuntimeError(
+        raise CfgBuildError(
             "Unsupported architecture for disassembly. "
             f"Ghidra language: {metadata.get('language', 'unknown')}"
         )
@@ -249,7 +268,7 @@ def _build_cfg(func: dict, reader, metadata: dict):
 
     basic_blocks = func.get("basic_blocks", [])
     if not basic_blocks:
-        raise RuntimeError(
+        raise CfgBuildError(
             f"Function '{func.get('name')}' has no basic blocks in the cached analysis."
         )
 
@@ -510,7 +529,7 @@ def register_control_flow_tools(app, session_manager=None, cache=None, runner=No
             try:
                 with BinaryReader(binary_path) as reader:
                     blocks, edges, entry_addr = _build_cfg(func, reader, metadata)
-            except RuntimeError as e:
+            except CfgBuildError as e:
                 # Audit F-10: left verbatim. _build_cfg raises RuntimeError
                 # only with its own curated text ("Unsupported architecture
                 # for disassembly...", "...has no basic blocks in the cached
@@ -657,7 +676,7 @@ def register_control_flow_tools(app, session_manager=None, cache=None, runner=No
             try:
                 with BinaryReader(binary_path) as reader:
                     blocks, edges, entry_addr = _build_cfg(func, reader, metadata)
-            except RuntimeError as e:
+            except CfgBuildError as e:
                 # Audit F-10: left verbatim. _build_cfg raises RuntimeError
                 # only with its own curated text ("Unsupported architecture
                 # for disassembly...", "...has no basic blocks in the cached
@@ -830,10 +849,16 @@ def register_control_flow_tools(app, session_manager=None, cache=None, runner=No
             # Sort by address
             orphans.sort(key=lambda f: f.get("address", ""))
 
+            # Audit F-7: orphan rows name functions, and a function name is a
+            # symbol string the sample author supplied (PDB, export table, or
+            # a name Ghidra lifted from the binary's own data). The totals,
+            # the orphan percentage and the interpretation notes are the
+            # server's analysis and stay outside the fence.
             out.append(f"Orphan Functions ({len(orphans)}):")
+            listing: list[str] = []
             for i, f in enumerate(orphans):
                 if i >= 100:
-                    out.append(f"  ... and {len(orphans) - 100} more orphan functions")
+                    listing.append(f"  ... and {len(orphans) - 100} more orphan functions")
                     break
 
                 name = f.get("name", "unknown")
@@ -842,11 +867,17 @@ def register_control_flow_tools(app, session_manager=None, cache=None, runner=No
                 num_calls = len(f.get("called_functions", []))
                 has_pseudo = bool(f.get("pseudocode"))
 
-                out.append(f"  {name} @ {addr}")
-                out.append(
+                listing.append(f"  {name} @ {addr}")
+                listing.append(
                     f"    blocks={num_blocks}  calls={num_calls}  "
                     f"decompiled={'yes' if has_pseudo else 'no'}"
                 )
+            out.append(
+                wrap_untrusted(
+                    "\n".join(listing),
+                    kind="function names recovered from the sample",
+                )
+            )
 
             out.append("")
             out.append("These functions have no detected callers and may represent:")
@@ -1004,13 +1035,22 @@ def register_control_flow_tools(app, session_manager=None, cache=None, runner=No
 
             # Called functions
             if called_funcs:
+                # Audit F-7: callee names come out of the analysed binary.
+                # The complexity metrics and the score breakdown above are
+                # computed here and stay outside the fence.
                 out.append(f"Called Functions ({num_calls}):")
-                for callee in called_funcs[:20]:
-                    c_name = callee.get("name", "unknown")
-                    c_addr = callee.get("address", "?")
-                    out.append(f"  {c_name} @ {c_addr}")
+                callee_rows = [
+                    f"  {callee.get('name', 'unknown')} @ {callee.get('address', '?')}"
+                    for callee in called_funcs[:20]
+                ]
                 if num_calls > 20:
-                    out.append(f"  ... and {num_calls - 20} more")
+                    callee_rows.append(f"  ... and {num_calls - 20} more")
+                out.append(
+                    wrap_untrusted(
+                        "\n".join(callee_rows),
+                        kind="callee names recovered from the sample",
+                    )
+                )
                 out.append("")
 
             return "\n".join(out)

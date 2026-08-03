@@ -19,6 +19,7 @@ import re
 from pathlib import Path
 
 from src.tools.function_hash_tools import _compute_function_hash, _get_capstone_mode
+from src.utils.formatters import wrap_untrusted
 
 logger = logging.getLogger(__name__)
 
@@ -376,25 +377,43 @@ def _format_report(
         "",
     ]
 
+    # Audit F-7: every row below names a function in one of the two binaries
+    # under comparison, and those names come from the binaries' own symbol /
+    # PDB data -- attacker-authored for a malware sample, and equally so for
+    # the "patched" side when both inputs are untrusted. The bucket counts are
+    # this tool's own arithmetic and stay outside the fence.
     lines.append(f"### ADDED ({len(added)})")
-    for f in added:
-        lines.append(f"- {f.get('name')} @ {f.get('address')}")
+    lines.append(
+        wrap_untrusted(
+            "\n".join(f"- {f.get('name')} @ {f.get('address')}" for f in added),
+            kind="function names from the new binary",
+        )
+    )
     lines.append("")
 
     lines.append(f"### REMOVED ({len(removed)})")
-    for f in removed:
-        lines.append(f"- {f.get('name')} @ {f.get('address')}")
+    lines.append(
+        wrap_untrusted(
+            "\n".join(f"- {f.get('name')} @ {f.get('address')}" for f in removed),
+            kind="function names from the old binary",
+        )
+    )
     lines.append("")
 
     # Renamed-but-otherwise-unchanged: hash-identical phase-2 pairs whose
     # names differ. Surfaced separately so they don't pollute the MODIFIED
     # bucket (which is meant for actual body changes / security fixes).
     lines.append(f"### Renamed (unchanged body) ({len(unchanged_renamed)})")
-    for of, nf in unchanged_renamed:
-        lines.append(
-            f"- {of.get('name')} ({of.get('address')})  ->  "
-            f"{nf.get('name')} ({nf.get('address')})  [unchanged_renamed]"
+    lines.append(
+        wrap_untrusted(
+            "\n".join(
+                f"- {of.get('name')} ({of.get('address')})  ->  "
+                f"{nf.get('name')} ({nf.get('address')})  [unchanged_renamed]"
+                for of, nf in unchanged_renamed
+            ),
+            kind="function names from both binaries",
         )
+    )
     lines.append("")
 
     lines.append(f"### MODIFIED ({len(modified)})")
@@ -404,19 +423,31 @@ def _format_report(
     else:
         modified_sorted = list(modified)
 
+    # Audit F-7: the MODIFIED bucket is the richest sample-derived block in
+    # this report -- besides the names it prints the first changed line of
+    # decompiled pseudocode from BOTH binaries. The "-- module:" sub-headings
+    # are derived from those names too (``A::B::method`` -> ``A::B``), so they
+    # belong inside the fence rather than framing it.
+    body: list[str] = []
     if group_by == "module":
         groups: dict[str, list[tuple[dict, dict, str, dict]]] = {}
         for entry in modified_sorted:
             old_func, _, _, _ = entry
             groups.setdefault(_module_prefix(old_func.get("name") or ""), []).append(entry)
         for module, entries in sorted(groups.items()):
-            lines.append(f"-- module: {module} ({len(entries)})")
+            body.append(f"-- module: {module} ({len(entries)})")
             for entry in entries:
-                lines.extend(_format_modified_entry(entry, old_ctx, new_ctx))
-            lines.append("")
+                body.extend(_format_modified_entry(entry, old_ctx, new_ctx))
+            body.append("")
     else:
         for entry in modified_sorted:
-            lines.extend(_format_modified_entry(entry, old_ctx, new_ctx))
+            body.extend(_format_modified_entry(entry, old_ctx, new_ctx))
+    lines.append(
+        wrap_untrusted(
+            "\n".join(body).rstrip("\n"),
+            kind="function names and decompiled excerpts from both binaries",
+        )
+    )
 
     return "\n".join(lines)
 

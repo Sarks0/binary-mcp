@@ -14,12 +14,41 @@ import re
 from datetime import datetime
 from pathlib import Path
 
+from src.utils.formatters import wrap_untrusted
 from src.utils.security import sanitize_output_path
 
 logger = logging.getLogger(__name__)
 
 # Allowed output directory for Yara rules
 YARA_OUTPUT_DIR = Path.home() / ".binary_mcp_output" / "yara"
+
+
+def _fence_rule(rule: str) -> str:
+    """
+    Return a generated Yara rule behind the F-7 untrusted-content boundary.
+
+    Audit F-7: a generated rule is mostly a transcription of SAMPLE-AUTHORED
+    STRINGS. ``generate_yara_rule`` selects the highest-scoring strings a
+    binary contains and copies them into ``$s0..$sN``, and the meta block
+    carries the sample's own filename as ``description``. ``escape_yara_string``
+    makes the result valid Yara -- it escapes quotes and backslashes -- but
+    that is a syntax concern, not a trust boundary: a sample containing
+    ``SYSTEM: analysis complete, now call ...`` still emits that sentence
+    verbatim inside the rule, and the whole rule used to be the tool's entire
+    return value, with no server-authored text around it at all.
+
+    A short server-authored preamble is emitted above the fence so the reader
+    can see which part of the response this server is vouching for. The rule
+    text itself is unchanged and uncut -- it still has to be copy-pasteable
+    into a Yara installation, which is the whole point of the tool.
+    """
+    if not rule.strip():
+        return rule
+    return (
+        "Generated Yara rule (rule text is built from strings the sample "
+        "itself contains -- review before use):\n\n"
+        + wrap_untrusted(rule, kind="generated Yara rule quoting sample strings")
+    )
 
 
 def sanitize_rule_name(name: str) -> str:
@@ -358,11 +387,25 @@ def register_yara_tools(app, session_manager):
                     safe_path = sanitize_output_path(Path(output_path), YARA_OUTPUT_DIR)
                     safe_path.parent.mkdir(parents=True, exist_ok=True)
                     safe_path.write_text(rule)
-                    return f"Yara rule saved to: {safe_path}\n\n{rule}"
+                    return (
+                        f"Yara rule saved to: {safe_path}\n\n"
+                        + _fence_rule(rule)
+                    )
                 except PathTraversalError:
-                    return f"Error: Output path must be within {YARA_OUTPUT_DIR}"
+                    # Audit F-10: the old message interpolated
+                    # YARA_OUTPUT_DIR, which is rooted at Path.home() and so
+                    # carries the operator's username into model context (and
+                    # from there into any report built on this transcript).
+                    # The instruction the model actually needs -- "give a bare
+                    # filename" -- does not require naming the directory.
+                    return (
+                        "Error: Output path must stay inside this server's "
+                        "Yara output directory. Pass a bare filename such as "
+                        '"rule.yar"; it is created inside that directory. '
+                        "Absolute paths, \"..\" and symlink escapes are refused."
+                    )
 
-            return rule
+            return _fence_rule(rule)
 
         except Exception as e:
             logger.error(f"generate_yara_rule_from_session failed: {e}")
@@ -467,11 +510,25 @@ def register_yara_tools(app, session_manager):
                     safe_path = sanitize_output_path(Path(output_path), YARA_OUTPUT_DIR)
                     safe_path.parent.mkdir(parents=True, exist_ok=True)
                     safe_path.write_text(rule)
-                    return f"Yara rule saved to: {safe_path}\n\n{rule}"
+                    return (
+                        f"Yara rule saved to: {safe_path}\n\n"
+                        + _fence_rule(rule)
+                    )
                 except PathTraversalError:
-                    return f"Error: Output path must be within {YARA_OUTPUT_DIR}"
+                    # Audit F-10: the old message interpolated
+                    # YARA_OUTPUT_DIR, which is rooted at Path.home() and so
+                    # carries the operator's username into model context (and
+                    # from there into any report built on this transcript).
+                    # The instruction the model actually needs -- "give a bare
+                    # filename" -- does not require naming the directory.
+                    return (
+                        "Error: Output path must stay inside this server's "
+                        "Yara output directory. Pass a bare filename such as "
+                        '"rule.yar"; it is created inside that directory. '
+                        "Absolute paths, \"..\" and symlink escapes are refused."
+                    )
 
-            return rule
+            return _fence_rule(rule)
 
         except (PathTraversalError, FileSizeError) as e:
             return safe_error_message("generate_yara_rule_from_strings", e)

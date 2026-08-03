@@ -60,7 +60,20 @@ jobs:
   # This job deliberately BUILDS ONLY. Packaging, SHA256SUMS and artifact upload
   # stay in release.yml; duplicating them here would mean two places to keep
   # correct. Both architectures are built because the 32-bit target has caught
-  # size-assumption bugs that x64 alone does not.
+  # size-assumption bugs that x64 alone does not -- its first run flagged 21
+  # C4477 format defects that were invisible on x64.
+  #
+  # WARNINGS ARE ERRORS here, via CMAKE_COMPILE_WARNING_AS_ERROR (CMake 3.24+,
+  # which maps to /WX for MSVC). Not -DCMAKE_CXX_FLAGS="/WX": that REPLACES the
+  # cache default rather than appending, dropping /EHsc among others, and
+  # plugin.cpp uses try/catch.
+  #
+  # This is the ONE deliberate difference from release.yml's otherwise identical
+  # build steps, so do not "fix" the divergence. The asymmetry is the point:
+  # a new warning (from an MSVC upgrade, say) should fail a PR, where someone
+  # can look at it, and NOT block cutting a release when you need to ship. If a
+  # toolchain bump ever reddens this job on an unrelated PR, that is this flag
+  # working as intended -- fix the warning, do not delete the gate.
   build-plugin:
     name: Build x64dbg Plugin (compile check)
     runs-on: windows-latest
@@ -125,7 +138,8 @@ jobs:
 
         cmake .. -A x64 `
           -DX64DBG_SDK_PATH="$sdkPath" `
-          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_BUILD_TYPE=Release `
+          -DCMAKE_COMPILE_WARNING_AS_ERROR=ON
         if ($LASTEXITCODE -ne 0) { throw "CMake configure failed for x64" }
 
         cmake --build . --config Release
@@ -146,7 +160,8 @@ jobs:
 
         cmake .. -A Win32 `
           -DX64DBG_SDK_PATH="$sdkPath" `
-          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_BUILD_TYPE=Release `
+          -DCMAKE_COMPILE_WARNING_AS_ERROR=ON
         if ($LASTEXITCODE -ne 0) { throw "CMake configure failed for x32" }
 
         cmake --build . --config Release

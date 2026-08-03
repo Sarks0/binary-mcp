@@ -3,6 +3,7 @@ Output formatting utilities for analysis results.
 """
 
 import re
+import unicodedata
 
 # Untrusted-content envelope (audit finding F-7)
 # ---------------------------------------------------------------------------
@@ -181,6 +182,31 @@ def neutralise_untrusted_delimiters(text: str) -> str:
     """
     for sentinel, escape in _SENTINEL_ESCAPES.items():
         text = text.replace(sentinel, escape)
+
+    # Categorical sweep for every OTHER bracket form.
+    #
+    # _SENTINEL_ESCAPES is hand-maintained, and a hand-maintained list of
+    # confusables is never finished: the first pass listed 2 pairs, the second
+    # added 5 more, and an adversarial reader immediately found 5 the second
+    # pass had still missed (U+27EC/ED, U+3016/17, U+FF5F/60, U+2983/84,
+    # U+2E57/58). Enumerating look-alikes one at a time cannot converge, and
+    # while it is incomplete the in-band notice's claim that "look-alike
+    # bracket characters are escaped" is FALSE -- a false claim in text the
+    # model reads, which is worse than making no claim.
+    #
+    # Unicode already classifies these: Ps (open punctuation) and Pe (close
+    # punctuation) are exactly the bracket-shaped characters. Escaping every
+    # non-ASCII member of those categories covers the whole class, including
+    # forms nobody has thought of yet, and makes the notice's claim true.
+    # ASCII brackets are left alone -- they are ordinary content in
+    # disassembly, C source and JSON, and they look nothing like the sentinel.
+    if not text.isascii():
+        text = "".join(
+            ch
+            if ch.isascii() or unicodedata.category(ch) not in ("Ps", "Pe")
+            else f"<U+{ord(ch):04X}>"
+            for ch in text
+        )
     return _BARE_TERMINATOR_RE.sub(_escape_bare_terminator, text)
 
 

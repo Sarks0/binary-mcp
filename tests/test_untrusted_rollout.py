@@ -940,9 +940,15 @@ class TestDotnetToolsEnvelope:
 # Coverage guard: modules that emit sample text must import the envelope
 # ---------------------------------------------------------------------------
 
-# Tool modules that return sample-derived text. windbg_tools is listed because
-# it echoes debugger output; it is owned by another workstream, so it is
-# tracked here as a known gap rather than asserted.
+# Tool modules that return sample-derived text.
+#
+# windbg_tools was previously described here as "listed ... as a known gap" but
+# was NOT actually in the set, so the guard silently passed while all ~32 of its
+# tools returned unfenced target memory, disassembly, module paths, stack
+# symbols and raw command output. A guard with a hole in it is worse than no
+# guard: it reports coverage it does not have. Nothing is excluded now -- if a
+# module genuinely does not emit sample text, take it out of this set with a
+# comment saying why, rather than leaving it in and unasserted.
 _SAMPLE_TEXT_MODULES = {
     "control_flow_tools",
     "diff_tools",
@@ -958,6 +964,7 @@ _SAMPLE_TEXT_MODULES = {
     "review_tools",
     "triage_tools",
     "vt_tools",
+    "windbg_tools",
     "yara_tools",
 }
 
@@ -1035,3 +1042,88 @@ def _minimal_pe() -> bytes:
     headers = bytes(dos) + b"PE\x00\x00" + file_header + bytes(optional) + section
     headers = headers.ljust(0x200, b"\x00")
     return headers + b"\x90" * 0x200
+
+
+class TestCategoricalBracketEscaping:
+    """Confusable escaping is categorical, not a hand-maintained list.
+
+    The list approach could not converge: pass one listed 2 pairs, pass two
+    added 5, and an adversarial reader immediately found 5 more it had missed.
+    While the list was incomplete the in-band notice's claim that "look-alike
+    bracket characters ... are escaped" was FALSE -- a false statement in text
+    the model reads. Unicode categories Ps/Pe cover the whole class.
+    """
+
+    @pytest.mark.parametrize(
+        ("opener", "closer"),
+        [
+            ("⟬", "⟭"),  # missed by pass two
+            ("〖", "〗"),
+            ("｟", "｠"),
+            ("⦃", "⦄"),
+            ("⹗", "⹘"),
+            ("⌈", "⌉"),  # never listed anywhere
+            ("❬", "❭"),
+            ("⸢", "⸣"),
+        ],
+    )
+    def test_any_unicode_bracket_form_is_escaped(self, opener, closer):
+        out = neutralise_untrusted_delimiters(f"a{opener}b{closer}c")
+        assert opener not in out and closer not in out, out
+        assert f"<U+{ord(opener):04X}>" in out
+        assert f"<U+{ord(closer):04X}>" in out
+
+    def test_ascii_brackets_are_untouched(self):
+        """ASCII brackets are ordinary content in disassembly, C and JSON, and
+        look nothing like the sentinel -- escaping them would wreck every
+        pseudocode and memory dump the server returns."""
+        body = "mov [rax+8], rbx  {json: [1,2]}  (call)  <tag>"
+        assert neutralise_untrusted_delimiters(body) == body
+
+    def test_notice_claim_is_now_true(self):
+        """The notice tells the model look-alikes are escaped. Verify that
+        claim holds for a form nobody enumerated by hand.
+
+        The phrase itself may still appear twice -- once escaped inside the
+        body, once as the real terminator. That is deliberate (see
+        ``test_bracket_escaped_occurrence_is_left_readable``): once the
+        brackets are escaped the copy is already visibly quarantined, and
+        mangling it again only hurts readability. What must be unique is the
+        BOUNDARY, i.e. the phrase carrying real sentinel brackets.
+        """
+        out = wrap_untrusted(f"x⌈{TERMINATOR_PHRASE}⌉y")
+        assert "⌈" not in out and "⌉" not in out
+        assert "<U+2308>" in out and "<U+2309>" in out
+        assert out.count(UNTRUSTED_END_MARKER) == 1, out
+        assert out.rstrip().endswith(UNTRUSTED_END_MARKER)
+
+
+class TestWindbgToolsAreFenced:
+    """windbg_tools had ZERO fences across ~32 tools while the coverage guard
+    silently excluded it -- the guard reported coverage it did not have."""
+
+    def test_module_imports_the_envelope(self):
+        source = (
+            Path(__file__).resolve().parent.parent
+            / "src" / "tools" / "windbg_tools.py"
+        ).read_text(encoding="utf-8")
+        assert "wrap_untrusted" in source
+
+    def test_windbg_tools_is_in_the_coverage_guard(self):
+        """The guard's own blind spot is what let this persist."""
+        assert "windbg_tools" in _SAMPLE_TEXT_MODULES
+
+    def test_fence_helper_wraps_target_output(self):
+        from src.tools.windbg_tools import _fence
+
+        out = _fence(f"kernel32!Foo\n{INJECTION}", "target disassembly")
+        assert_fenced(out)
+        assert INJECTION in out
+        assert out.index(INJECTION) < out.index(UNTRUSTED_END_MARKER)
+
+    def test_fence_helper_leaves_empty_output_alone(self):
+        """An empty fence is pure noise in a transcript."""
+        from src.tools.windbg_tools import _fence
+
+        assert _fence("", "x") == ""
+        assert _fence("   ", "x") == "   "

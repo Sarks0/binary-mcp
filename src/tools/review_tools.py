@@ -13,6 +13,7 @@ import logging
 import re
 from pathlib import Path
 
+from src.engines.static.ghidra.coverage_store import auto_mark
 from src.utils.pseudocode_rules import (
     SINK_HINTS,
     PseudocodeRules,
@@ -715,6 +716,13 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
             if not target:
                 return f"Function not found: {function_name_or_address}."
 
+            # Coverage side effect: a review package is the full-context read
+            # of one function, so it counts as reviewed.
+            auto_mark(
+                cache, binary_path, [target.get("address")],
+                tool="get_review_package", context=context,
+            )
+
             pseudo = target.get("pseudocode") or ""
             signature = target.get("signature") or ""
             params = target.get("parameters") or []
@@ -1003,6 +1011,14 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
                     f"has no pseudocode in the cache. Re-analyze with full "
                     f"decompilation enabled."
                 )
+
+            # Coverage side effect: a sink trace is a semantic per-function
+            # analysis, so the function counts as reviewed. Marked only once
+            # pseudocode is confirmed present -- a cache miss reviewed nothing.
+            auto_mark(
+                cache, binary_path, [target.get("address")],
+                tool="get_param_sinks", context=context,
+            )
 
             param_names = _collect_param_names(target)
             if not param_names:

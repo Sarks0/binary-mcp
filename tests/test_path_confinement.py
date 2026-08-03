@@ -24,6 +24,7 @@ runs on the pre-resolution path so it can actually fire.
 oversized files.
 """
 
+import os
 import tempfile
 from pathlib import Path
 
@@ -32,13 +33,20 @@ import pytest
 from src.utils.binary_reader import BinaryReader
 from src.utils.security import (
     ENV_ALLOW_ANY_PATH,
+    ENV_ALLOW_HARDLINKS,
     ENV_ALLOWED_DIRS,
     ENV_REQUIRE_CONFINEMENT,
     PathTraversalError,
     default_quarantine_dirs,
     reset_confinement_warning,
     sanitize_binary_path,
+    sanitize_output_dir,
     sanitize_output_path,
+)
+
+posix_only = pytest.mark.skipif(
+    os.name == "nt",
+    reason="st_nlink is not a reliable hard-link signal on Windows",
 )
 
 
@@ -64,6 +72,7 @@ def quarantine(tmp_path, monkeypatch):
     monkeypatch.delenv(ENV_ALLOWED_DIRS, raising=False)
     monkeypatch.delenv(ENV_REQUIRE_CONFINEMENT, raising=False)
     monkeypatch.delenv(ENV_ALLOW_ANY_PATH, raising=False)
+    monkeypatch.delenv(ENV_ALLOW_HARDLINKS, raising=False)
     reset_confinement_warning()
     return q
 
@@ -411,6 +420,200 @@ def test_output_parent_must_exist(tmp_path):
     allowed.mkdir()
     with pytest.raises(ValueError):
         sanitize_output_path(Path("nope/report.md"), allowed)
+
+
+# -- Hard-link bypass: resolve() cannot see through a second directory entry --
+
+
+@posix_only
+def test_hardlinked_file_in_quarantine_is_rejected(tmp_path, quarantine):
+    """
+    The headline bypass: a hard link republishes an out-of-bounds inode.
+
+    ``resolve()`` follows symlinks, and a symlink out of the quarantine dir is
+    already refused. A hard link has no target to follow -- it IS the inode
+    under a second name -- so this construction passed every containment check
+    and read back the real contents of the outside file.
+    """
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    secret = outside_dir / "secret"
+    secret.write_bytes(b"TOPSECRET")
+
+    link = quarantine / "innocent.bin"
+    os.link(secret, link)
+
+    # Sanity: the payload really does read back the outside file's content,
+    # so this is a content-disclosure bypass and not a theoretical one.
+    assert link.read_bytes() == b"TOPSECRET"
+    assert link.resolve() == link  # resolve() is blind to it
+
+    with pytest.raises(PathTraversalError) as exc:
+        sanitize_binary_path(str(link))
+    assert "hard link" in str(exc.value)
+
+
+@posix_only
+def test_hardlink_denial_names_the_narrow_escape_hatch(tmp_path, quarantine):
+    """
+    The false-positive escape hatch must be in the error, and must be the
+    NARROW one: a de-duplicated corpus should not have to disable confinement
+    entirely (BINARY_MCP_ALLOW_ANY_PATH) to be analysable.
+    """
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    secret = outside_dir / "secret"
+    secret.write_bytes(b"x")
+    link = quarantine / "sample.bin"
+    os.link(secret, link)
+
+    with pytest.raises(PathTraversalError) as exc:
+        sanitize_binary_path(str(link))
+    assert ENV_ALLOW_HARDLINKS in str(exc.value)
+
+
+@posix_only
+def test_hardlink_opt_out_restores_access_without_widening_confinement(
+    tmp_path, quarantine, monkeypatch
+):
+    """
+    ``cp -l`` corpora and ``rsync --link-dest`` stores are legitimate.
+
+    With the opt-out set the linked sample is analysable again -- but directory
+    confinement is untouched, so an outside path is still denied.
+    """
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    secret = outside_dir / "secret"
+    secret.write_bytes(b"MZ\x00\x00")
+    link = quarantine / "sample.bin"
+    os.link(secret, link)
+
+    monkeypatch.setenv(ENV_ALLOW_HARDLINKS, "1")
+    assert sanitize_binary_path(str(link)) == link.resolve()
+    # The opt-out is hard-link-specific, not a confinement kill switch.
+    with pytest.raises(PathTraversalError):
+        sanitize_binary_path(str(secret))
+
+
+@posix_only
+def test_singly_linked_file_is_unaffected(quarantine):
+    """Control: the overwhelmingly common case must not regress."""
+    f = quarantine / "ordinary.bin"
+    f.write_bytes(b"MZ\x00\x00")
+    assert f.stat().st_nlink == 1
+    assert sanitize_binary_path(str(f)) == f.resolve()
+
+
+@posix_only
+def test_hardlink_check_is_skipped_when_confinement_is_disabled(
+    tmp_path, quarantine, monkeypatch
+):
+    """
+    With BINARY_MCP_ALLOW_ANY_PATH there is no boundary left to bypass.
+
+    Rejecting a multiply-linked file in that mode would be a pure false
+    positive: the operator has already said every readable file is fair game.
+    """
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    secret = outside_dir / "secret"
+    secret.write_bytes(b"MZ\x00\x00")
+    link = quarantine / "sample.bin"
+    os.link(secret, link)
+
+    monkeypatch.setenv(ENV_ALLOW_ANY_PATH, "1")
+    assert sanitize_binary_path(str(link)) == link.resolve()
+
+
+@posix_only
+def test_directories_are_not_hardlink_checked(quarantine):
+    """
+    ``st_nlink`` counts '..' entries, so every directory with a subdirectory
+    has nlink > 1. Only regular files are checked -- otherwise a sample sitting
+    in any normal directory tree would be refused.
+    """
+    parent = quarantine / "corpus"
+    (parent / "sub1").mkdir(parents=True)
+    (parent / "sub2").mkdir(parents=True)
+    assert parent.stat().st_nlink > 1
+
+    sample = parent / "sample.bin"
+    sample.write_bytes(b"MZ\x00\x00")
+    assert sanitize_binary_path(str(sample)) == sample.resolve()
+
+
+# -- F-18: sanitize_output_dir confines an extraction destination --
+
+
+def test_output_dir_relative_is_created_under_root(tmp_path):
+    root = tmp_path / "extracted"
+    result = sanitize_output_dir("sample1", root)
+    assert result == (root / "sample1").resolve()
+    assert result.is_dir()
+
+
+def test_output_dir_absolute_outside_root_rejected(tmp_path):
+    root = tmp_path / "extracted"
+    evil = tmp_path / "startup"
+    with pytest.raises(PathTraversalError):
+        sanitize_output_dir(str(evil), root)
+    assert not evil.exists(), "rejected destination must not be created"
+
+
+def test_output_dir_traversal_rejected(tmp_path):
+    root = tmp_path / "extracted"
+    for evil in ("../escape", "../../../../etc/cron.d", "a/../../escape"):
+        with pytest.raises(PathTraversalError):
+            sanitize_output_dir(evil, root)
+    assert not (tmp_path / "escape").exists()
+
+
+def test_output_dir_symlinked_component_rejected(tmp_path):
+    """
+    F-14 applies here too: a pre-planted link inside the root would redirect
+    the whole extraction, and it can be repointed between check and write.
+
+    The link here points back *inside* the root, so containment passes and only
+    the pre-resolution symlink test can catch it -- exactly the case that
+    matters, since whoever controls the link can repoint it at any moment.
+    """
+    root = tmp_path / "extracted"
+    real = root / "real"
+    real.mkdir(parents=True)
+    (root / "link").symlink_to(real)
+
+    with pytest.raises(PathTraversalError, match="Symlinks not allowed"):
+        sanitize_output_dir("link/sub", root)
+
+
+def test_output_dir_symlink_out_of_root_rejected(tmp_path):
+    """A link that leaves the root is caught by the containment test itself."""
+    root = tmp_path / "extracted"
+    root.mkdir()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (root / "link").symlink_to(elsewhere)
+
+    with pytest.raises(PathTraversalError):
+        sanitize_output_dir("link/sub", root)
+    assert not (elsewhere / "sub").exists()
+
+
+def test_output_dir_rejects_existing_non_directory(tmp_path):
+    root = tmp_path / "extracted"
+    root.mkdir()
+    (root / "taken").write_text("x")
+    with pytest.raises(ValueError):
+        sanitize_output_dir("taken", root)
+
+
+def test_output_dir_nested_relative_path_is_created(tmp_path):
+    """Nested relative destinations work -- parents do not have to pre-exist."""
+    root = tmp_path / "extracted"
+    result = sanitize_output_dir("a/b/c", root)
+    assert result == (root / "a" / "b" / "c").resolve()
+    assert result.is_dir()
 
 
 # -- H8: read_full must not slurp an unbounded file into memory --

@@ -42,6 +42,44 @@ _PLATFORM_MSG = (
     "Install with: pip install binary-mcp[windbg]"
 )
 
+# Opt-in switch for the raw command tool. windbg_execute_command is the entry
+# point behind every critical WinDbg finding in this audit: it is the only tool
+# that takes an attacker-influenceable command string (prompt-injected sample
+# output, an LLM's own improvisation) and hands it to a debugger attached to a
+# live kernel. The 32 structured tools cover the analysis workflows and build
+# their own command strings from validated parameters, so the raw tool is now
+# DISABLED unless the operator explicitly turns it on.
+#
+# Note the gate is on the TOOL, not on WinDbgBridge.execute_command: the
+# structured tools call the bridge directly (windbg_list_breakpoints ->
+# "bl", windbg_disassemble -> "u <addr> L<n>", the conditional-breakpoint
+# string, ...) and must keep working with this variable unset.
+_RAW_WINDBG_ENV = "BINARY_MCP_ENABLE_RAW_WINDBG"
+
+_RAW_WINDBG_DISABLED_MSG = (
+    "windbg_execute_command is disabled by default.\n"
+    f"Set {_RAW_WINDBG_ENV}=1 in the server environment to enable raw WinDbg "
+    "command execution.\n"
+    "The 32 structured WinDbg tools are unaffected and are the supported way "
+    "to drive the debugger: windbg_status, windbg_get_stack, windbg_get_thread, "
+    "windbg_get_process, windbg_dt, windbg_get_registers, windbg_read_memory, "
+    "windbg_disassemble, windbg_get_modules, windbg_list_breakpoints, "
+    "windbg_set_breakpoint, windbg_set_conditional_breakpoint, "
+    "windbg_set_hardware_breakpoint, windbg_switch_thread, windbg_step_into, "
+    "windbg_step_over and the connection/session tools."
+)
+
+
+def _raw_windbg_enabled() -> bool:
+    """True if the operator opted in to the raw WinDbg command tool.
+
+    Read at call time rather than at import time so the setting can be changed
+    (and tested) without re-importing the server.
+    """
+    return os.environ.get(_RAW_WINDBG_ENV, "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
 
 def _is_windows() -> bool:
     return platform.system() == "Windows"
@@ -77,11 +115,21 @@ def _validate_condition(condition: str) -> str:
         return "Error: Condition too long (max 200 characters)."
     if not _SAFE_CONDITION_RE.match(cond):
         return "Error: Invalid condition expression. Only comparison expressions are allowed (e.g. 'rcx==0x100')."
-    # Extra check for dangerous commands that might slip through
+    # Belt and braces. _SAFE_CONDITION_RE already excludes '.', ';', quotes,
+    # braces and newlines, so no command name can appear here at all and the
+    # substring scan below can never fire on the real syntax. It stays as a
+    # tripwire in case the charset is ever widened. The authoritative check
+    # happens further down: the assembled
+    # ``bp <addr> ".if (<cond>) {} .else {gc}"`` string goes through the bridge
+    # allowlist like every other command, which re-validates the quoted
+    # breakpoint command list as a command in its own right.
+    # ('.writevirtmem' used to head this list. It is not a command in current
+    #  WinDbg at all, so it protected against nothing; naming it made the
+    #  control look broader than it was. Dropped.)
     cond_lower = cond.lower()
     blocked_in_condition = (
         '.shell', '.create', '.script', '!runscript', '.writemem',
-        '.writevirtmem', '.dump', '.kill', '.restart', '.foreach',
+        '.dump', '.kill', '.restart', '.foreach',
         '.block', '.printf', '.remote', '.sympath', '.load', '.call',
         '.open', '.opendump',
     )
@@ -973,72 +1021,90 @@ def register_windbg_tools(
         extension commands (!analyze, !process, !drvobj). Use this for any
         WinDbg command not covered by the dedicated tools.
 
-        SECURITY MODEL -- audit finding F-6. This docstring previously
-        described no restrictions at all, even though this is the entry point
-        behind the critical WinDbg findings and commands ARE validated. What
-        the code actually does:
+        DISABLED BY DEFAULT. This tool returns a refusal unless the operator
+        sets ``BINARY_MCP_ENABLE_RAW_WINDBG=1`` in the server environment. The
+        32 structured windbg_* tools do NOT need that variable and are the
+        supported way to drive the debugger.
 
-          1. Tool layer (here): a case-insensitive SUBSTRING blocklist
-             (``_BLOCKED_COMMANDS`` in the WinDbg bridge) matched against the
-             whole command. Being a substring match it also refuses otherwise
-             benign commands whose ARGUMENT text happens to contain a blocked
-             token, and it refuses ``.printf``, ``.foreach``, ``.outmask``,
-             ``.formats``, ``.tlist`` and ``.bugcheck`` outright.
-          2. Bridge layer (``allowlist.validate_command``): a token-aware
-             DENY validator -- despite the module name it denies by name, it
-             does not allow by name. It splits compound commands on ``;`` and
-             on raw newlines outside quotes and ``{...}`` blocks, checks each
-             subcommand's first token against a deny set, applies argument-form
-             regexes, and recurses into nested ``{...}`` and ``'...'`` bodies
-             (depth-capped). Commands over 4096 chars, or with more than 16
-             compound subcommands, are rejected.
+        SECURITY MODEL -- audit finding F-6, second remediation pass.
 
-        Refused classes (non-exhaustive; the deny set in
-        ``src/engines/dynamic/windbg/allowlist.py`` is authoritative):
+        ONE LAYER IS AUTHORITATIVE: ``allowlist.validate_command`` in
+        ``src/engines/dynamic/windbg/allowlist.py``, applied by
+        ``WinDbgBridge._validate_command_safety`` to every command that reaches
+        the engine (structured tools included). It is a FAIL-CLOSED ALLOWLIST:
+        each subcommand's command name must appear in a curated set of
+        read-only/inspection verbs, in an allowed argument form, or the command
+        is refused. It splits compound commands on ``;`` and on raw newlines
+        outside quoted regions and ``{...}`` blocks, refuses extension tokens
+        that name a module path (``!c:\\tmp\\evil.dll.export`` would make dbgeng
+        LoadLibrary that path into the debugger process), and recurses into the
+        command-string arguments of the breakpoint and control-flow carriers --
+        both ``'...'`` and ``"..."`` bodies -- so a breakpoint command list
+        cannot smuggle a refused command. Commands over 4096 chars, with more
+        than 16 subcommands, or nested more than 8 levels deep are rejected.
+
+        The tool layer no longer runs a second gate. It used to apply a
+        case-insensitive SUBSTRING scan of ``_BLOCKED_COMMANDS`` (still present
+        in the bridge module, no longer consulted), which disagreed with the
+        validator in both directions: it refused ``.printf`` / ``.foreach`` /
+        ``.outmask`` / ``.formats`` / ``.tlist`` / ``.bugcheck``, and refused
+        benign commands whose argument text merely contained one of those
+        words, while being blind to every token only the bridge knew about. A
+        denylist in front of an allowlist can only add false refusals.
+
+        Refused classes (non-exhaustive -- refusal is by ABSENCE from the
+        allowlist, so this list can never be complete and does not need to be):
 
           - Process/session control: .shell, .create, .kill, .restart,
-            .detach, .attach, .abandon, .reboot, .crash
-          - Host file I/O: .dump, .writemem, .writevirtmem, .logopen,
-            .logclose, .open, .opendump
+            .detach, .attach, .abandon, .reboot, .crash, q / qq / qd
+          - Host file I/O: .dump, .writemem, .readmem, .logopen, .logappend,
+            .write_cmd_hist, .open, .opendump, .dumpcab, .send_file, .copysym
           - Scripting / command-file execution: .script, .scriptrun,
-            .scriptload, !runscript, .call, .block, .cmdtree, the ``$<`` /
-            ``$$<`` / ``$$><`` / ``$$>a<`` include operators, and the
-            quoted-body drivers ``j`` and ``z``
-          - Module loading: .load, .loadby, .cordll
-          - Network / symbol path: .remote, .netsyms, .sympath, .symfix
-            (use windbg_set_sympath / windbg_get_sympath instead)
-          - Target writes and code injection: the e/eb/ed/ew/eq/ep/eu/ea/eza/
-            ezu/ef Enter family, f (fill), m (move), a (assemble), register
-            writes via ``r <reg> = ...``, ``s -b|-d|-w|-q`` search-and-write,
-            .dvalloc / .dvfree (RWX in the target), .pagein, ``!chkimg /f``,
-            ``.process /i``, ``.bugcheck <code>``
-          - Alias definition, which WinDbg expands before command resolution
-            and would otherwise smuggle a denied command past the first-token
-            check: as, al, ad
+            .scriptload, .scriptdebug, !runscript, .call, .block, .cmdtree,
+            .pcmd, .idle_cmd, .ocommand, .browse, dx (the object model exposes
+            ExecuteCommand and the file system), and the ``$<`` / ``$$<`` /
+            ``$$><`` / ``$$>a<`` include operators
+          - Module loading: .load, .loadby, .cordll, .setdll, .extpath, and
+            any ``!<path-or-dotted-module>.<export>`` form
+          - Network / symbol path: .remote, .server, .netsyms, .netuse,
+            .sympath, .symfix, .settings (use windbg_set_sympath /
+            windbg_get_sympath instead)
+          - Target writes and code injection: the e/eb/ed/ew/eq/ep/eu/ea
+            Enter family, f/fp (fill), m (move), a (assemble), wrmsr,
+            ob/ow/od (I/O ports), !eb/!ed (physical memory), !ecb/!ecd/!ecw
+            (PCI config), register writes in every spelling (``r @rip=..``,
+            ``r@rip=..``, ``rrax=..``, ``rF``/``rM``/``rX``, ``r$.u0=..``),
+            .dvalloc / .dvfree (RWX in the target), .pagein, .fiximports,
+            .closehandle, .allow_exec_cmds, .apply_dbp, .thread, .trap,
+            ``!chkimg -f``, ``.process /i``, ``.cxr /w``
+          - Execution redirects and command-string carriers: ``g =Address``,
+            the trailing Command argument of p/t/pa/pc/ph/pt/ta/tb/tc/th/tt/wt,
+            ``~*e`` and ``~0 e`` (the command string is the rest of the line),
+            sxe/sxd/sxi/sxn ``-c``/``-c2``, !list ``-x``, the !for_each_*
+            family, and j / z
+          - Alias definition, which WinDbg expands before command resolution:
+            as, aS, al, ad
 
-        This is a DENYLIST, not an allowlist: anything not named above reaches
-        the debugger. That is deliberate -- kernel analysis needs the long tail
-        of read-only inspection commands -- but it means this tool is not a
-        sandbox. Permitted commands still run against the live target with the
-        debugger's full read access (kernel memory included when connected in
-        kernel mode), and argument text beyond the checks above is not
-        validated. Prefer the dedicated tools where one exists.
+        NOT A SANDBOX. Permitted commands still run against the live target
+        with the debugger's full read access (kernel memory included in kernel
+        mode), argument text beyond the rules above is not interpreted, and
+        anything the debugger prints is untrusted sample-derived data. Prefer
+        the dedicated tools where one exists.
 
         Args:
-            command: WinDbg command string. Rejected if it matches any blocked
-                token or write/execute primitive described above.
+            command: WinDbg command string. Refused unless every subcommand is
+                on the allowlist in an allowed argument form.
 
         Returns:
             Raw command output text, or an error string naming what was blocked.
         """
+        if not _raw_windbg_enabled():
+            # Checked before the platform check on purpose: the answer to
+            # "is this tool available?" is a policy decision, not an OS one,
+            # and the message must be the same everywhere.
+            return _RAW_WINDBG_DISABLED_MSG
         if not _is_windows():
             return _PLATFORM_MSG
-        # Tool-layer blocklist for dangerous WinDbg meta-commands
-        cmd_lower = command.strip().lower()
-        from src.engines.dynamic.windbg.bridge import _BLOCKED_COMMANDS
-        for blocked in _BLOCKED_COMMANDS:
-            if blocked in cmd_lower:
-                return f"Error: Command '{blocked}' is blocked for security reasons."
         try:
             bridge = get_windbg_bridge()
             return bridge.execute_command(command)

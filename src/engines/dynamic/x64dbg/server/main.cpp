@@ -7,7 +7,9 @@
 #include <atomic>
 #include <thread>
 #include <cstdarg>  // for va_list, va_start, va_end
-#include <cstdlib>  // for getenv
+#include <cstdlib>  // for getenv, strtoll
+#include <cerrno>   // for errno / ERANGE (F-19 Content-Length bounds check)
+#include <cstring>  // for strrchr
 #include "../pipe_protocol.h"
 
 // Global authentication token
@@ -269,6 +271,121 @@ public:
 
 // Global pipe client
 static PipeClient g_pipeClient;
+
+// ---------------------------------------------------------------------------
+// Finding F-19 -- pre-authentication unbounded request read.
+//
+// The old read path had three separate problems, all of them reachable BEFORE
+// ValidateAuthHeader ever runs, i.e. by an unauthenticated client:
+//
+//  1. Content-Length was parsed with atoi() and used with no upper bound, so a
+//     client could announce any size and the server would keep appending to a
+//     std::string until the process ran out of address space.
+//  2. The loop guard was `(int)bodyReceived < contentLength` -- a SIGNED
+//     comparison against a size_t cast to int. Past 2 GiB that cast goes
+//     NEGATIVE, so the guard flips to permanently true and the loop can never
+//     terminate on length. It could only ever end on a recv error.
+//  3. There is one accept loop and no threads, so a client that connects and
+//     then trickles bytes (or simply never finishes its headers) blocks every
+//     other client. Classic slowloris; the 5-second SO_RCVTIMEO bounds each
+//     individual recv but nothing bounded the request as a whole, so a peer
+//     sending one byte every four seconds held the server forever.
+//
+// The bounds below fix all three: a cap on the header section, a cap on the
+// declared and actual body size, size_t comparisons throughout, and a
+// wall-clock deadline for the entire request regardless of how it is paced.
+// A violation is answered with 413 / 431 / 408 as appropriate and the
+// connection is closed WITHOUT the request ever reaching HandleHTTPRequest.
+// ---------------------------------------------------------------------------
+
+// Largest header section (request line + headers + the blank line) accepted.
+// 16 KiB is well above any legitimate request this API receives and is the
+// conventional limit for HTTP servers.
+static const size_t MAX_HEADER_SIZE = 16 * 1024;
+
+// Largest request body accepted. Matched to the pipe's message ceiling: a body
+// larger than that cannot be forwarded to the plugin anyway, so accepting it
+// would only mean buffering memory in order to fail later.
+static const size_t MAX_CONTENT_LENGTH = Protocol::MAX_MESSAGE_SIZE;
+
+// Wall-clock budget for reading one complete request, independent of the
+// per-recv socket timeout. This is the part that actually stops slowloris.
+static const unsigned long long REQUEST_DEADLINE_MS = 15000;
+
+// Parse a Content-Length header value. Returns false if the value is absent-
+// but-present-looking, malformed, negative, or above MAX_CONTENT_LENGTH.
+// strtoll rather than atoi: atoi has no way to report failure and no way to
+// report overflow, and "no way to report failure" is how unbounded reads start.
+static bool ParseContentLength(const std::string& request, bool& found, size_t& outLength) {
+    found = false;
+    outLength = 0;
+
+    std::string clHeader = "Content-Length:";
+    size_t clPos = request.find(clHeader);
+    if (clPos == std::string::npos) {
+        clHeader = "content-length:";
+        clPos = request.find(clHeader);
+    }
+    if (clPos == std::string::npos) {
+        return true;  // no body declared -- not an error
+    }
+
+    found = true;
+
+    size_t valStart = clPos + clHeader.length();
+    while (valStart < request.length() &&
+           (request[valStart] == ' ' || request[valStart] == '\t')) {
+        valStart++;
+    }
+
+    const char* begin = request.c_str() + valStart;
+    char* end = nullptr;
+    errno = 0;
+    long long value = strtoll(begin, &end, 10);
+
+    if (end == begin) {
+        Log("Rejecting request: Content-Length is not a number");
+        return false;
+    }
+    if (errno == ERANGE || value < 0) {
+        Log("Rejecting request: Content-Length out of range");
+        return false;
+    }
+    if ((unsigned long long)value > (unsigned long long)MAX_CONTENT_LENGTH) {
+        Log("Rejecting request: Content-Length %lld exceeds the %zu byte cap",
+            value, MAX_CONTENT_LENGTH);
+        return false;
+    }
+
+    outLength = (size_t)value;
+    return true;
+}
+
+// send() returns how many bytes it actually queued, which for a large response
+// (a READ_MEMORY dump, say) is routinely LESS than asked for. The old code
+// ignored the return value entirely, so an oversized response was silently
+// truncated on the wire: the client had a Content-Length promising more than it
+// would ever receive and sat there until its own read timeout expired. Loop
+// until everything is written or the socket fails.
+static bool SendAll(SOCKET sock, const char* data, size_t length) {
+    size_t sent = 0;
+    while (sent < length) {
+        size_t remaining = length - sent;
+        const size_t sendMax = (size_t)0x7FFFFFFF;  // send() takes an int length
+        int chunk = (remaining > sendMax) ? (int)sendMax : (int)remaining;
+        int written = send(sock, data + sent, chunk, 0);
+        if (written == SOCKET_ERROR) {
+            Log("Send failed after %zu/%zu bytes: %d", sent, length, WSAGetLastError());
+            return false;
+        }
+        if (written <= 0) {
+            Log("Send made no progress after %zu/%zu bytes", sent, length);
+            return false;
+        }
+        sent += (size_t)written;
+    }
+    return true;
+}
 
 // Simple HTTP response builder
 std::string BuildHTTPResponse(int statusCode, const std::string& statusText,
@@ -645,54 +762,95 @@ bool StartHTTPServer(int port) {
         int sendTimeout = 5000;
         setsockopt(clientSocket, SOL_SOCKET, SO_SNDTIMEO, (const char*)&sendTimeout, sizeof(sendTimeout));
 
-        // Read HTTP request - loop until we have the full body
+        // Read HTTP request - loop until we have the full body.
+        // See the F-19 block above for what each bound here is defending.
         std::string request;
+        std::string earlyReject;  // non-empty => respond with this and close
         {
+            const unsigned long long deadline = GetTickCount64() + REQUEST_DEADLINE_MS;
             char buffer[8192];
-            int bytesRead = recv(clientSocket, buffer, sizeof(buffer) - 1, 0);
 
-            if (bytesRead > 0) {
-                request.assign(buffer, bytesRead);
+            // Phase 1: read until the header terminator, bounded by
+            // MAX_HEADER_SIZE and by the wall-clock deadline.
+            size_t headerEnd = std::string::npos;
+            while (true) {
+                headerEnd = request.find("\r\n\r\n");
+                if (headerEnd != std::string::npos) break;
 
-                // For POST requests, ensure we receive the full body
-                // by checking Content-Length against actual body received
-                size_t headerEnd = request.find("\r\n\r\n");
-                if (headerEnd != std::string::npos) {
-                    // Extract Content-Length from headers
-                    int contentLength = 0;
-                    std::string clHeader = "Content-Length:";
-                    size_t clPos = request.find(clHeader);
-                    if (clPos == std::string::npos) {
-                        clHeader = "content-length:";
-                        clPos = request.find(clHeader);
-                    }
-                    if (clPos != std::string::npos) {
-                        size_t valStart = clPos + clHeader.length();
-                        while (valStart < request.length() && request[valStart] == ' ') valStart++;
-                        contentLength = atoi(request.c_str() + valStart);
-                    }
+                if (request.size() > MAX_HEADER_SIZE) {
+                    Log("Rejecting request: header section exceeds %zu bytes", MAX_HEADER_SIZE);
+                    earlyReject = BuildHTTPResponse(431, "Request Header Fields Too Large",
+                                                    "application/json",
+                                                    "{\"error\":\"Header section too large\"}");
+                    break;
+                }
+                if (GetTickCount64() >= deadline) {
+                    Log("Rejecting request: deadline expired while reading headers");
+                    earlyReject = BuildHTTPResponse(408, "Request Timeout", "application/json",
+                                                    "{\"error\":\"Request timed out\"}");
+                    break;
+                }
 
-                    // Calculate how much body we've received so far
-                    size_t bodyStart = headerEnd + 4;
-                    size_t bodyReceived = request.length() - bodyStart;
+                int bytesRead = recv(clientSocket, buffer, sizeof(buffer), 0);
+                if (bytesRead == 0) {
+                    break;  // peer closed; request stays incomplete and is dropped
+                }
+                if (bytesRead == SOCKET_ERROR) {
+                    Log("Recv failed: %d", WSAGetLastError());
+                    break;
+                }
+                request.append(buffer, bytesRead);
+            }
 
-                    // Keep reading until we have the full body
-                    while (contentLength > 0 && (int)bodyReceived < contentLength) {
-                        bytesRead = recv(clientSocket, buffer, sizeof(buffer) - 1, 0);
-                        if (bytesRead <= 0) break;
+            // Phase 2: read exactly as much body as the (now bounded)
+            // Content-Length declares.
+            if (earlyReject.empty() && headerEnd != std::string::npos) {
+                bool haveContentLength = false;
+                size_t contentLength = 0;
+                if (!ParseContentLength(request, haveContentLength, contentLength)) {
+                    earlyReject = BuildHTTPResponse(413, "Payload Too Large", "application/json",
+                                                    "{\"error\":\"Invalid or oversized Content-Length\"}");
+                } else if (haveContentLength) {
+                    const size_t bodyStart = headerEnd + 4;
+                    // All size_t: no signed comparison that can flip past 2 GiB.
+                    while (request.size() - bodyStart < contentLength) {
+                        if (request.size() - bodyStart > MAX_CONTENT_LENGTH) {
+                            Log("Rejecting request: body exceeded the %zu byte cap", MAX_CONTENT_LENGTH);
+                            earlyReject = BuildHTTPResponse(413, "Payload Too Large", "application/json",
+                                                            "{\"error\":\"Request body too large\"}");
+                            break;
+                        }
+                        if (GetTickCount64() >= deadline) {
+                            Log("Rejecting request: deadline expired while reading body");
+                            earlyReject = BuildHTTPResponse(408, "Request Timeout", "application/json",
+                                                            "{\"error\":\"Request timed out\"}");
+                            break;
+                        }
+
+                        size_t remaining = contentLength - (request.size() - bodyStart);
+                        int want = (remaining < sizeof(buffer)) ? (int)remaining : (int)sizeof(buffer);
+                        int bytesRead = recv(clientSocket, buffer, want, 0);
+                        if (bytesRead == 0) {
+                            break;  // peer closed mid-body
+                        }
+                        if (bytesRead == SOCKET_ERROR) {
+                            Log("Recv failed: %d", WSAGetLastError());
+                            break;
+                        }
                         request.append(buffer, bytesRead);
-                        bodyReceived += bytesRead;
                     }
                 }
-            } else if (bytesRead == SOCKET_ERROR) {
-                Log("Recv failed: %d", WSAGetLastError());
             }
         }
 
-        if (!request.empty()) {
+        if (!earlyReject.empty()) {
+            // Rejected before authentication and before any parsing of the
+            // request. Answer, then close -- never fall through to the handler.
+            SendAll(clientSocket, earlyReject.c_str(), earlyReject.size());
+        } else if (!request.empty()) {
             // Handle request and send response
             std::string response = HandleHTTPRequest(request);
-            send(clientSocket, response.c_str(), (int)response.size(), 0);
+            SendAll(clientSocket, response.c_str(), response.size());
         }
 
         closesocket(clientSocket);

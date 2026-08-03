@@ -18,10 +18,44 @@ class TestParseCompound:
         assert parse_compound("g; k") == ["g", "k"]
 
     def test_quoted_semicolon_kept(self):
-        # ;.shell calc inside double quotes must not split.
-        result = parse_compound('bp X ".printf \\"a;b\\""')
+        # ';' inside a double-quoted region must not split.
+        result = parse_compound('.printf "a;b"')
         assert len(result) == 1
         assert "a;b" in result[0]
+
+    def test_backslash_does_not_escape_a_separator(self):
+        # There is no backslash escape in WinDbg's sequencer. The tokenizer
+        # used to invent one, which desynchronised this split from the
+        # debugger's: 'dt nt!_EPROCESS\\;.dvalloc 1000' was ONE harmless dt
+        # subcommand here and TWO subcommands in cdb, the second allocating
+        # RWX memory in the target.
+        assert parse_compound("dt nt!_EPROCESS\\;.dvalloc 1000") == [
+            "dt nt!_EPROCESS\\",
+            ".dvalloc 1000",
+        ]
+        ok, reason = validate_command("dt nt!_EPROCESS\\;.dvalloc 1000")
+        assert ok is False
+        assert ".dvalloc" in reason
+
+    def test_backslash_before_a_quote_errs_towards_more_splitting(self):
+        # Consequence of dropping the invented escape: a '\\"' closes the
+        # quoted region for this tokenizer. That direction is safe -- it
+        # yields MORE subcommands to validate, never fewer -- so the command
+        # is refused rather than silently under-validated.
+        result = parse_compound('bp X ".printf \\"a;b\\""')
+        assert len(result) == 2
+        ok, _ = validate_command('bp X ".printf \\"a;b\\""')
+        assert ok is False
+
+    def test_unbalanced_interpolation_does_not_swallow_the_tail(self):
+        # An unbalanced '${' used to make the tokenizer copy the entire rest
+        # of the line into the current part, hiding a payload behind a
+        # harmless leading token.
+        parts = parse_compound("k ${ ; .shell calc")
+        assert ".shell calc" in parts
+        ok, reason = validate_command("k ${ ; .shell calc")
+        assert ok is False
+        assert "unbalanced" in reason
 
     def test_braced_block_kept(self):
         # The whole .foreach is one subcommand even with ; inside braces.
@@ -127,14 +161,18 @@ class TestArgFormDeny:
         ok, _ = validate_command("!chkimg -d nt")
         assert ok is True
 
-    def test_search_write_variants_blocked(self):
-        ok, reason = validate_command("s -b 0x1000 L100 90 90")
-        assert ok is False
-        assert "search-and-write" in reason
-
-    def test_search_readonly_allowed(self):
-        ok, _ = validate_command("s 0x1000 L100 90 90")
-        assert ok is True
+    def test_search_is_refused_by_absence_not_by_a_false_write_claim(self):
+        # The old rule refused "s -[bdwq]" as a "search-and-write variant".
+        # There is no write form of 's': it is Search Memory and -b/-w/-d/-q
+        # are the pattern TYPE specifiers for the bytes searched FOR. The rule
+        # was a pure over-block and is gone; 's' is now refused because it is
+        # not on the allowlist, and the reason says so instead of asserting a
+        # write form that does not exist.
+        for cmd in ("s -b 0x1000 L100 90 90", "s 0x1000 L100 90 90"):
+            ok, reason = validate_command(cmd)
+            assert ok is False
+            assert "search-and-write" not in reason
+            assert "allowlist" in reason
 
     def test_bugcheck_simulator_blocked(self):
         ok, reason = validate_command(".bugcheck 0x7E")

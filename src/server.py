@@ -66,12 +66,19 @@ from src.utils.security import (
     safe_error_message,
     safe_regex_compile,
     sanitize_binary_path,
+    sanitize_output_dir,
     sanitize_output_path,
     validate_numeric_range,
+    validate_session_id,
 )
 
 # Allowed output directory for decrypted/decoded files
 CRYPTO_OUTPUT_DIR = Path.home() / ".binary_mcp_output" / "crypto"
+
+# Allowed output root for unpackers. Everything written here comes from a
+# sample: sample-chosen bytes under sample-chosen filenames (audit F-18). The
+# destination therefore cannot be caller-chosen -- see sanitize_output_dir.
+EXTRACTION_OUTPUT_DIR = Path.home() / ".binary_mcp_output" / "extracted"
 
 # Configure logging
 logging.basicConfig(
@@ -91,6 +98,37 @@ compatibility_checker = BinaryCompatibilityChecker()
 
 
 # Helper Functions
+
+def confine_binary_path(binary_path: str) -> str:
+    """
+    Resolve and confine a caller-supplied binary path.
+
+    Audit F-8 (ordering): confinement is only worth anything if it happens
+    BEFORE anything else touches the path. The first remediation pass validated
+    inside ``get_analysis_context``, but several tools read, hashed or
+    stat()-ed the raw argument on the way there -- ``analyze_binary`` asked the
+    cache and the compatibility checker about it, ``load_pdb`` handed it to the
+    symbol fetcher, ``check_binary`` parsed its headers outright, and the
+    ``log_to_session`` decorator hashed the file before the tool body even ran.
+    Each of those is a read of an unconfined path, and each answer (a hash, a
+    "PE32+ .NET assembly" verdict, a FileNotFoundError) is an oracle over files
+    the caller was never allowed to open.
+
+    Every tool that accepts a path now calls this as its first statement.
+
+    Args:
+        binary_path: Caller-supplied path.
+
+    Returns:
+        Validated absolute path, as a string (the rest of the codebase passes
+        paths around as strings).
+
+    Raises:
+        PathTraversalError, FileSizeError, FileNotFoundError, ValueError:
+            As raised by :func:`sanitize_binary_path`.
+    """
+    return str(sanitize_binary_path(binary_path, allowed_dirs=get_allowed_dirs()))
+
 
 def log_to_session(func=None, *, analysis_type: AnalysisType = AnalysisType.STATIC):
     """
@@ -112,10 +150,28 @@ def log_to_session(func=None, *, analysis_type: AnalysisType = AnalysisType.STAT
 
             # Auto-ensure session if we have a binary path and auto-session is enabled
             if binary_path and session_manager.auto_session_enabled:
-                session_manager.ensure_session(
-                    binary_path=binary_path,
-                    analysis_type=analysis_type
-                )
+                # F-8 (ordering): ensure_session() OPENS AND HASHES the file to
+                # correlate sessions by SHA256. That ran before the tool body --
+                # i.e. before any confinement check -- so a decorated tool
+                # called with /etc/shadow read and hashed it, then recorded the
+                # path and hash in session metadata on disk, and only afterwards
+                # refused the analysis. The refusal was worthless: the read had
+                # already happened and the hash was already persisted.
+                #
+                # Validate here and simply SKIP auto-session when the path is
+                # out of bounds. The tool body runs anyway and produces the
+                # real, specific error; swallowing it here would replace a
+                # precise confinement message with a session-manager one.
+                try:
+                    binary_path = confine_binary_path(binary_path)
+                except (PathTraversalError, FileSizeError, FileNotFoundError, ValueError):
+                    binary_path = None
+
+                if binary_path:
+                    session_manager.ensure_session(
+                        binary_path=binary_path,
+                        analysis_type=analysis_type
+                    )
 
             # Call the original function
             result = fn(*args, **kwargs)
@@ -841,6 +897,15 @@ def analyze_binary(
     compat_warning = None
 
     try:
+        # Confinement FIRST -- before the cache lookup and the compatibility
+        # check below (audit F-8, ordering). Both of those took the raw
+        # argument: cache.get_cached() hashes the file, and
+        # check_compatibility() opens it and parses its headers. Validation
+        # only happened later, inside get_analysis_context(), so
+        # analyze_binary("/etc/shadow") read the file twice and reported its
+        # format before announcing that the path was denied.
+        binary_path = confine_binary_path(binary_path)
+
         # Pre-analysis compatibility check (unless skipped or using cache)
         if not skip_compatibility_check and not cache.get_cached(binary_path):
             try:
@@ -1042,6 +1107,17 @@ def load_pdb(
         Summary comparing pre/post symbolic-function counts.
     """
     try:
+        # F-8 (ordering): binary_path used to reach fetch_pdb() -- which opens
+        # the file, parses its CodeView (RSDS) debug record and then makes a
+        # NETWORK REQUEST derived from what it read -- and cache.get_cached()
+        # below, all before any confinement check. Validate first.
+        try:
+            binary_path = confine_binary_path(binary_path)
+        except FileNotFoundError:
+            return f"Binary not found: {binary_path}"
+        except PathTraversalError as e:
+            return safe_error_message("Invalid binary path", e)
+
         pdb_was_fetched = False
         if pdb_path in (None, "", "auto"):
             from src.utils.pdb_fetcher import fetch_pdb
@@ -1887,6 +1963,11 @@ def decompile_function(
         Decompiled C pseudocode
     """
     try:
+        # F-8 (ordering): the cache peek below hashes the file, so it must not
+        # see an unconfined path -- get_analysis_context's own validation runs
+        # too late to help when the peek short-circuits past it entirely.
+        binary_path = confine_binary_path(binary_path)
+
         # Peek at the existing cache first. If it was produced shallow/structural,
         # do NOT trigger get_analysis_context's depth-upgrade path -- that would
         # re-analyze the whole binary. Instead we'll do a targeted single-function
@@ -1964,6 +2045,8 @@ def decompile_function(
 
         return result
 
+    except (PathTraversalError, FileSizeError) as e:
+        return safe_error_message("Invalid binary path", e)
     except Exception as e:
         logger.error(f"decompile_function failed: {e}")
         return f"Error: {e}"
@@ -2827,12 +2910,15 @@ def check_binary(binary_path: str) -> str:
         -> Returns format detection, compatibility level, and tool recommendations
     """
     try:
-        # Validate path exists
-        path = Path(binary_path)
-        if not path.exists():
-            return f"Error: File not found: {binary_path}"
-        if not path.is_file():
-            return f"Error: Path is not a file: {binary_path}"
+        # F-8: this tool never had ANY confinement -- it did a bare
+        # Path(binary_path).exists() and then handed the raw path to the
+        # compatibility checker, which opens the file and parses its headers.
+        # That made check_binary the cheapest oracle in the server: it reports
+        # existence, file-vs-directory, format, bitness and .NET-ness for any
+        # path readable by the process. Confine before touching it, and let the
+        # single confinement error cover the existence answer too (an
+        # out-of-bounds path must not distinguish "missing" from "present").
+        binary_path = confine_binary_path(binary_path)
 
         # Run compatibility check
         info = compatibility_checker.check_compatibility(binary_path)
@@ -2859,6 +2945,8 @@ def check_binary(binary_path: str) -> str:
 
         return report + guidance
 
+    except (PathTraversalError, FileSizeError) as e:
+        return safe_error_message("Invalid binary file or path", e)
     except FileNotFoundError as e:
         return f"Error: {e}"
     except Exception as e:
@@ -3197,6 +3285,12 @@ def get_notes(
         Markdown listing grouped by function_key, or "No notes" when empty.
     """
     try:
+        # F-8 (ordering): read_notes() hashes the binary to locate its notes
+        # side-car, i.e. it opens the file. Confine before that happens --
+        # get_analysis_context is only reached on the `address` branch, so the
+        # common call path had no validation at all.
+        binary_path = confine_binary_path(binary_path)
+
         notes = cache.read_notes(binary_path)
         if not notes:
             return f"**Notes for {Path(binary_path).name}:** *(none)*"
@@ -3248,6 +3342,8 @@ def get_notes(
             lines.append("")
         lines.append(f"_Total: {total}_")
         return "\n".join(lines)
+    except (PathTraversalError, FileSizeError) as e:
+        return safe_error_message("Invalid binary path", e)
     except Exception as e:
         logger.error(f"get_notes failed: {e}")
         return f"Error: {e}"
@@ -3358,6 +3454,11 @@ def start_analysis_session(
         Session ID and instructions
     """
     try:
+        # F-8 (ordering): start_session() hashes the file to correlate sessions
+        # by content, so an unconfined path was read and its SHA256 written to
+        # the session store. Confine before anything opens it.
+        binary_path = confine_binary_path(binary_path)
+
         # Handle tags: accept either list or JSON string (for MCP client compatibility)
         parsed_tags: list[str] = []
         if tags:
@@ -3405,6 +3506,8 @@ def start_analysis_session(
 
         return result
 
+    except (PathTraversalError, FileSizeError) as e:
+        return safe_error_message("Invalid binary path", e)
     except Exception as e:
         logger.error(f"start_analysis_session failed: {e}")
         return f"Error: {e}"
@@ -3430,6 +3533,18 @@ def save_session(session_id: str | None = None) -> str:
             if not session_manager.active_session_id:
                 return "Error: No active session. Start a session first with start_analysis_session() or run an analysis tool."
             session_id = session_manager.active_session_id
+
+        # F-5 (UX): the session manager validates the ID at its path
+        # chokepoint, but its save/delete methods wrap everything in a broad
+        # "except Exception -> return False", so the ValueError never reaches
+        # the caller and the tool answered "Failed to save session" -- which
+        # reads as an I/O or disk problem. Validate here too so the real
+        # reason is what the user sees. The manager's own validation stays
+        # authoritative; this only surfaces it earlier.
+        try:
+            session_id = validate_session_id(session_id)
+        except ValueError as e:
+            return f"Error: {e}"
 
         success = session_manager.save_session(session_id)
 
@@ -3568,6 +3683,13 @@ def get_session_summary(session_id: str) -> str:
         Session summary with tools used and metadata
     """
     try:
+        # F-5 (UX): a malformed session ID must say so rather than being
+        # reported as a missing session -- see delete_session.
+        try:
+            session_id = validate_session_id(session_id)
+        except ValueError as e:
+            return f"Error: {e}"
+
         summary = session_manager.get_section(session_id, "summary")
 
         if not summary:
@@ -3657,6 +3779,13 @@ def load_session_section(
         Requested section data
     """
     try:
+        # F-5 (UX): a malformed session ID must say so rather than being
+        # reported as a missing session -- see delete_session.
+        try:
+            session_id = validate_session_id(session_id)
+        except ValueError as e:
+            return f"Error: {e}"
+
         section_data = session_manager.get_section(
             session_id=session_id,
             section_type=section,
@@ -3749,6 +3878,13 @@ def load_full_session(session_id: str) -> str:
         Complete session data with all tool outputs
     """
     try:
+        # F-5 (UX): a malformed session ID must say so rather than being
+        # reported as a missing session -- see delete_session.
+        try:
+            session_id = validate_session_id(session_id)
+        except ValueError as e:
+            return f"Error: {e}"
+
         session_data = session_manager.get_session(session_id)
 
         if not session_data:
@@ -3803,6 +3939,15 @@ def delete_session(session_id: str) -> str:
         Success/failure message
     """
     try:
+        # F-5 (UX): without this, a malformed ID took the "not found" branch
+        # below (get_metadata swallows the ValueError and returns None), so a
+        # traversal payload and a typo both reported "Session not found" and
+        # a caller had no way to tell a bad ID from a missing one.
+        try:
+            session_id = validate_session_id(session_id)
+        except ValueError as e:
+            return f"Error: {e}"
+
         # Get metadata first for confirmation message
         metadata = session_manager.get_metadata(session_id)
         if metadata:
@@ -3844,6 +3989,12 @@ def find_related_sessions(binary_path: str, limit: int = 10) -> str:
         List of related sessions sorted by most recent first
     """
     try:
+        # F-8 (ordering): find_sessions_for_binary() hashes the file to match
+        # sessions by content. Same unconfined-read problem as
+        # start_analysis_session, plus it answers "does this host have a
+        # session for the file at <path>?" -- confine first.
+        binary_path = confine_binary_path(binary_path)
+
         sessions = session_manager.find_sessions_for_binary(
             binary_path=binary_path,
             limit=limit
@@ -3872,6 +4023,8 @@ def find_related_sessions(binary_path: str, limit: int = 10) -> str:
 
         return result
 
+    except (PathTraversalError, FileSizeError) as e:
+        return safe_error_message("Invalid binary path", e)
     except Exception as e:
         logger.error(f"find_related_sessions failed: {e}")
         return f"Error: {e}"
@@ -4323,7 +4476,9 @@ def detect_python_packer(binary_path: str) -> str:
         # Returns: Packer: pyinstaller, Confidence: 95%, Python: 3.11
     """
     try:
-        binary_path = sanitize_binary_path(binary_path)
+        # Confinement is the first thing this tool does (F-8 ordering): the
+        # analyzer reads the whole file into memory on the very next line.
+        binary_path = confine_binary_path(binary_path)
 
         from src.engines.static.python.analyzer import PythonPackerAnalyzer
         analyzer = PythonPackerAnalyzer()
@@ -4387,18 +4542,49 @@ def extract_python_packed(
 
     Args:
         binary_path: Path to the packed executable
-        output_dir: Directory to extract files to
+        output_dir: Directory to extract files to. Confined to this server's
+            extraction root (``~/.binary_mcp_output/extracted``): a relative
+            value is created underneath it, and an absolute value outside it is
+            refused. Extraction writes sample-controlled bytes under
+            sample-controlled filenames, so the destination is not
+            caller-choosable (audit F-18).
         packer_type: Packer type (auto, pyinstaller, py2exe) - default: auto
 
     Returns:
         Extraction result with list of extracted files
 
     Example:
-        extract_python_packed("packed.exe", "/tmp/extracted/")
-        extract_python_packed("packed.exe", "/tmp/extracted/", packer_type="py2exe")
+        extract_python_packed("packed.exe", "sample1")
+        extract_python_packed("packed.exe", "sample1", packer_type="py2exe")
     """
     try:
-        binary_path = sanitize_binary_path(binary_path)
+        binary_path = confine_binary_path(binary_path)
+
+        # Audit F-18 (HIGH): output_dir used to be passed through COMPLETELY
+        # UNVALIDATED to analyzer.extract_pyinstaller(), which does
+        # Path(output_dir).mkdir(parents=True, exist_ok=True) and then writes
+        # every archive member into it. The Zip Slip guard in the analyzer only
+        # stops traversal *within* output_dir; the destination itself was
+        # whatever the caller asked for. So the model picked the directory (a
+        # Startup folder, ~/.config/autostart, a shell rc directory) and the
+        # SAMPLE picked the filenames and the bytes -- an arbitrary write of
+        # attacker-controlled content. Confine it to this server's own
+        # extraction root; relative paths anchor inside that root, which keeps
+        # the ergonomic `output_dir="sample1"` form working.
+        #
+        # The denial is surfaced verbatim rather than through
+        # safe_error_message(): "Reference ID: 4e6349b3" tells the caller
+        # nothing actionable, whereas the rule ("must be within <root>") is
+        # exactly what they need to retry correctly, and the root is this
+        # server's own directory -- no host information is disclosed by naming
+        # it. decode_base64_file/decrypt_xor already report their output-path
+        # rule the same way.
+        try:
+            safe_output_dir = sanitize_output_dir(output_dir, EXTRACTION_OUTPUT_DIR)
+        except PathTraversalError as e:
+            return f"Error: {e}"
+        except ValueError as e:
+            return f"Error: invalid output directory: {e}"
 
         from src.engines.static.python.analyzer import PythonPackerAnalyzer
         analyzer = PythonPackerAnalyzer()
@@ -4414,14 +4600,14 @@ def extract_python_packed(
         output.append("PYTHON PACKED EXTRACTION")
         output.append(f"File: {binary_path}")
         output.append(f"Packer: {packer_type}")
-        output.append(f"Output: {output_dir}")
+        output.append(f"Output: {safe_output_dir}")
         output.append("")
 
         # Extract based on packer type
         if packer_type == "pyinstaller":
-            result = analyzer.extract_pyinstaller(binary_path, output_dir)
+            result = analyzer.extract_pyinstaller(binary_path, str(safe_output_dir))
         elif packer_type == "py2exe":
-            result = analyzer.extract_py2exe(binary_path, output_dir)
+            result = analyzer.extract_py2exe(binary_path, str(safe_output_dir))
         else:
             return f"Unsupported packer type for extraction: {packer_type}"
 
@@ -4473,7 +4659,8 @@ def analyze_pyc_file(pyc_path: str) -> str:
         # Returns: Python 3.11, magic 0x7B0D, compiled 2024-01-15
     """
     try:
-        pyc_path = sanitize_binary_path(pyc_path)
+        # Confinement first (F-8 ordering) -- analyze_pyc() reads the file.
+        pyc_path = confine_binary_path(pyc_path)
 
         from src.engines.static.python.analyzer import PythonPackerAnalyzer
         analyzer = PythonPackerAnalyzer()
@@ -4534,7 +4721,9 @@ def list_python_archive_contents(binary_path: str) -> str:
         # Returns: 15 files including main.pyc, library.zip, etc.
     """
     try:
-        binary_path = sanitize_binary_path(binary_path)
+        # Confinement is the first thing this tool does (F-8 ordering): the
+        # analyzer reads the whole file into memory on the very next line.
+        binary_path = confine_binary_path(binary_path)
 
         from src.engines.static.python.analyzer import PythonPackerAnalyzer
         analyzer = PythonPackerAnalyzer()

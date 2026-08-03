@@ -10,17 +10,46 @@ MCP server that gives AI assistants the ability to analyze binaries, debug proce
 
 ### Install
 
+Clone, or download the installer and read it before running it. The installers
+pull down Ghidra, x64dbg, the Windows debuggers and this project's own x64dbg
+plugins, and `install.ps1` requires Administrator.
+
 ```bash
-# Windows (as Administrator)
-irm https://raw.githubusercontent.com/Sarks0/binary-mcp/main/install.ps1 | iex
+# Recommended: clone, then run the installer from the checkout
+git clone https://github.com/Sarks0/binary-mcp.git
+cd binary-mcp
+python3 install.py          # Windows: .\install.ps1  (as Administrator)
 
-# Linux / macOS
-curl -sSL https://raw.githubusercontent.com/Sarks0/binary-mcp/main/install.py | python3 -
-
-# Manual
+# Or just the dependencies, no installer
 git clone https://github.com/Sarks0/binary-mcp.git
 cd binary-mcp && uv sync
 ```
+
+Without git — download, check what you got, look at it, then run it:
+
+```bash
+# Linux / macOS
+curl -fsSLO https://raw.githubusercontent.com/Sarks0/binary-mcp/main/install.py
+sha256sum install.py
+less install.py
+python3 install.py
+```
+
+```powershell
+# Windows (as Administrator)
+Invoke-WebRequest -Uri https://raw.githubusercontent.com/Sarks0/binary-mcp/main/install.ps1 -OutFile install.ps1
+Get-FileHash .\install.ps1 -Algorithm SHA256
+notepad .\install.ps1
+.\install.ps1
+```
+
+> **No `| iex` / `| python3 -` one-liner is offered on purpose.** Piping a fresh
+> download into an interpreter runs whatever the network returned, with no copy
+> on disk to inspect, nothing to compare a digest against, and no record of what
+> ran — and on Windows it runs elevated. The extra command above is the whole
+> difference. See [INSTALL.md → Supply-Chain
+> Integrity](INSTALL.md#supply-chain-integrity) for what the installers verify
+> and how to pin a digest.
 
 ### Connect to Claude
 

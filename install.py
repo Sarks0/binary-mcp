@@ -753,16 +753,25 @@ def install_dotnet_sdk(pkg_manager: str) -> bool:
                 "dotnet-installer-sh",
             ))
 
-            os.chmod(script_path, 0o755)
-            subprocess.run(["bash", script_path, "--channel", "8.0"], check=True)
+            # F-3 (second pass): the unlink used to sit on the success path
+            # only, so a CalledProcessError from bash - or anything else raising
+            # in between - left an executable, network-sourced shell script in
+            # the temp directory. When no digest could be resolved that script
+            # is also *unverified*, and /tmp is world-readable: leaving it there
+            # is a second chance for it to be run. Remove it however this block
+            # exits.
+            try:
+                os.chmod(script_path, 0o755)
+                subprocess.run(["bash", script_path, "--channel", "8.0"], check=True)
 
-            # Add to PATH and set DOTNET_ROOT so tools can find the runtime
-            dotnet_dir = Path.home() / ".dotnet"
-            if str(dotnet_dir) not in os.environ.get("PATH", ""):
-                os.environ["PATH"] = f"{dotnet_dir}:{os.environ.get('PATH', '')}"
-            os.environ["DOTNET_ROOT"] = str(dotnet_dir)
+                # Add to PATH and set DOTNET_ROOT so tools can find the runtime
+                dotnet_dir = Path.home() / ".dotnet"
+                if str(dotnet_dir) not in os.environ.get("PATH", ""):
+                    os.environ["PATH"] = f"{dotnet_dir}:{os.environ.get('PATH', '')}"
+                os.environ["DOTNET_ROOT"] = str(dotnet_dir)
+            finally:
+                Path(script_path).unlink(missing_ok=True)
 
-            os.unlink(script_path)
             print_success(".NET SDK installed successfully")
             return True
         except Exception as e:
@@ -809,15 +818,21 @@ def install_uv() -> bool:
             "uv-installer-sh",
         ))
 
-        os.chmod(script_path, 0o755)
-        subprocess.run(["sh", script_path], check=True)
+        # F-3 (second pass): same defect as install_dotnet_sdk() - the unlink
+        # was only reached when sh exited 0, so a failing (or tampered, or
+        # merely unverifiable) uv installer script survived in the temp
+        # directory instead of being destroyed. Clean up on every path.
+        try:
+            os.chmod(script_path, 0o755)
+            subprocess.run(["sh", script_path], check=True)
 
-        # Update PATH
-        uv_bin = Path.home() / ".local" / "bin"
-        if str(uv_bin) not in os.environ.get("PATH", ""):
-            os.environ["PATH"] = f"{uv_bin}:{os.environ.get('PATH', '')}"
+            # Update PATH
+            uv_bin = Path.home() / ".local" / "bin"
+            if str(uv_bin) not in os.environ.get("PATH", ""):
+                os.environ["PATH"] = f"{uv_bin}:{os.environ.get('PATH', '')}"
+        finally:
+            Path(script_path).unlink(missing_ok=True)
 
-        os.unlink(script_path)
         print_success("uv installed successfully")
         return True
     except Exception as e:
@@ -1063,21 +1078,26 @@ def download_repo_zip(install_dir: Path) -> None:
     with tempfile.NamedTemporaryFile(suffix='.zip', delete=False) as f:
         temp_zip = Path(f.name)
 
-    with tempfile.TemporaryDirectory() as temp_dir:
-        # A branch archive has no stable digest by construction - it changes
-        # with every push and GitHub publishes no checksum for it. That is why
-        # the git clone path is preferred; this fallback states out loud that
-        # it cannot verify what it just fetched.
-        if download_file(url, temp_zip, "project source", hash_key="repo-zip"):
-            print_info("Extracting...")
-            with zipfile.ZipFile(temp_zip, 'r') as zf:
-                zf.extractall(temp_dir)
+    try:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # A branch archive has no stable digest by construction - it changes
+            # with every push and GitHub publishes no checksum for it. That is why
+            # the git clone path is preferred; this fallback states out loud that
+            # it cannot verify what it just fetched.
+            if download_file(url, temp_zip, "project source", hash_key="repo-zip"):
+                print_info("Extracting...")
+                with zipfile.ZipFile(temp_zip, 'r') as zf:
+                    zf.extractall(temp_dir)
 
-            extracted = Path(temp_dir) / "binary-mcp-main"
-            for item in extracted.iterdir():
-                shutil.move(str(item), str(install_dir / item.name))
-
-    temp_zip.unlink(missing_ok=True)
+                extracted = Path(temp_dir) / "binary-mcp-main"
+                for item in extracted.iterdir():
+                    shutil.move(str(item), str(install_dir / item.name))
+    finally:
+        # F-3 (second pass): the unlink used to be unreachable when the download
+        # raised (strict mode) or the zip failed to extract, leaving an
+        # unverifiable archive of this project's own source in the temp
+        # directory for whatever ran next to pick up.
+        temp_zip.unlink(missing_ok=True)
 
 
 def configure_claude_desktop(install_dir: Path) -> bool:

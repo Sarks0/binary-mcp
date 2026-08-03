@@ -85,12 +85,23 @@ function Test-WingetAvailable {
 # Known-good digests. Deliberately empty by default: a wrong pinned hash breaks
 # every install, and these upstreams publish new builds faster than this file
 # can track them. Populate an entry (or set the matching env var) to pin.
+#
+# The 'binary-mcp-*' keys are listed for discoverability (F-3, second pass):
+# they name the artifacts this project publishes itself, and spell out the
+# BINARY_MCP_SHA256_BINARY_MCP_OBSIDIAN_DP64 style env var an operator sets to
+# pin one. Their normal source of truth is the SHA256SUMS manifest published
+# with each release by .github/workflows/release.yml; a pin here (or in the
+# environment) overrides that, and is the only defence against a takeover of
+# the release itself.
 $script:PinnedSha256 = @{
-    'uv-installer-ps1'  = ''
-    'ghidra-zip'        = ''
-    'x64dbg-snapshot'   = ''
-    'windows-sdk-setup' = ''
-    'repo-zip'          = ''
+    'uv-installer-ps1'             = ''
+    'ghidra-zip'                   = ''
+    'x64dbg-snapshot'              = ''
+    'windows-sdk-setup'            = ''
+    'repo-zip'                     = ''
+    'binary-mcp-obsidian.dp64'     = ''
+    'binary-mcp-obsidian.dp32'     = ''
+    'binary-mcp-obsidian_server.exe' = ''
 }
 
 function Get-IntegrityEnvName {
@@ -207,6 +218,15 @@ function Invoke-VerifiedDownload {
         Downloads, then verifies - or warns loudly when there is nothing to
         verify against. Callers get the same throw-on-failure semantics they
         already handle in their try/catch blocks.
+
+        Returns $true only when the bytes were actually checked against an
+        expected digest, and $false when the download completed but nothing
+        could be verified. F-3: that distinction matters to callers that do
+        something irreversible with the file afterwards - Install-UV must not
+        strip the Mark-of-the-Web from a script it never verified - so the
+        return value is a verification result, NOT a success flag. A caller that
+        ignores it is no worse off than before; a caller that treats $false as
+        "verified" is the bug this return value exists to prevent.
     #>
     param(
         [Parameter(Mandatory = $true)][string]$Uri,
@@ -223,11 +243,29 @@ function Invoke-VerifiedDownload {
 
     if ($expected) {
         Assert-FileHash -Path $OutFile -ExpectedSha256 $expected -Description $Description | Out-Null
-    } else {
-        Write-UnverifiedArtifactWarning -Path $OutFile -Description $Description -HashKey $HashKey -Uri $Uri
+        return $true
     }
 
-    return $true
+    Write-UnverifiedArtifactWarning -Path $OutFile -Description $Description -HashKey $HashKey -Uri $Uri
+    return $false
+}
+
+function Test-VerificationResult {
+    <#
+        F-3: normalise the result of a verification helper
+        (Invoke-VerifiedDownload, Assert-AuthenticodeValid) into a strict
+        boolean, failing CLOSED on anything unexpected.
+
+        PowerShell functions return everything left on the output stream, so if
+        a future edit inside one of those helpers emits a stray object the
+        caller receives an array rather than the boolean it asked for - and
+        `if ($array)` is $true for any non-empty array, which would silently
+        turn "could not verify" into "verified". Requiring an actual [bool] $true
+        means such an edit degrades to "treat as unverified" instead, which is
+        the direction a security check should fail in.
+    #>
+    param($Result)
+    return ($Result -is [bool]) -and $Result
 }
 
 function Get-ReleaseChecksumMap {
@@ -363,6 +401,26 @@ function Assert-AuthenticodeValid {
 
     if ($sig.Status -eq 'NotSigned' -and $AllowUnsigned) {
         Write-Warn "$Description is not Authenticode-signed; its integrity rests on the SHA-256 check alone."
+        return $false
+    }
+
+    # F-3 (second pass): 'UnknownError' is NOT a bad signature - it is Windows
+    # saying "I do not know how to evaluate this file type". WinVerifyTrust
+    # dispatches on file EXTENSION, and .dp64/.dp32 (x64dbg's names for plain
+    # PE DLLs) are not in the subject-type table, so Get-AuthenticodeSignature
+    # returns UnknownError for a perfectly good plugin. Lumping that in with
+    # the genuine-failure branch below meant -StrictIntegrity DELETED a
+    # legitimate, already hash-verified obsidian.dp64 and aborted the install -
+    # a self-inflicted denial of service dressed up as a security control.
+    # Treat it as "no signature information available", exactly like NotSigned,
+    # but only where the caller has already said unsigned is acceptable
+    # (-AllowUnsigned). Callers that require a real signature - the elevated
+    # Windows SDK bootstrapper - do not pass it and still fail on UnknownError.
+    if ($sig.Status -eq 'UnknownError' -and $AllowUnsigned) {
+        Write-Warn "$Description could not be Authenticode-evaluated (status 'UnknownError')."
+        Write-Warn "  Windows dispatches signature checks by file extension and does not"
+        Write-Warn "  recognise this one, so this is 'unknown', not 'invalid'. Its integrity"
+        Write-Warn "  rests on the SHA-256 check alone."
         return $false
     }
 
@@ -897,12 +955,29 @@ function Install-UV {
         # Whatever bytes came back from the network were executed immediately,
         # with no copy on disk to inspect and no opportunity to check anything.
         # Download to a file, verify it, then execute the verified copy.
-        Invoke-VerifiedDownload -Uri "https://astral.sh/uv/install.ps1" -OutFile $uvInstaller `
-            -Description "uv installer script (astral.sh)" -HashKey "uv-installer-ps1" | Out-Null
+        $uvDownload = Invoke-VerifiedDownload -Uri "https://astral.sh/uv/install.ps1" -OutFile $uvInstaller `
+            -Description "uv installer script (astral.sh)" -HashKey "uv-installer-ps1"
+        $uvVerified = Test-VerificationResult -Result $uvDownload
 
-        # The download carries a Mark-of-the-Web that the execution policy would
-        # otherwise block. Clearing it is safe only *after* verification above.
-        Unblock-File -LiteralPath $uvInstaller -ErrorAction SilentlyContinue
+        # F-3 (second pass): the Mark-of-the-Web is the record that these bytes
+        # came off the internet. Defender/SmartScreen, AMSI and any EDR on the
+        # box key off it, and so does anyone doing forensics afterwards.
+        # Stripping it from a file whose hash was NEVER checked - which is the
+        # default state here, because $script:PinnedSha256['uv-installer-ps1']
+        # ships empty and astral.sh publishes no digest - actively destroys
+        # evidence about unverified attacker-influenceable content, which is
+        # strictly worse than the pre-F-3 code that never touched MotW at all.
+        # So: clear it only on the verified path.
+        if ($uvVerified) {
+            # Verified bytes: clearing MotW here removes a prompt about content
+            # we have already proven matches the expected digest.
+            Unblock-File -LiteralPath $uvInstaller -ErrorAction SilentlyContinue
+        } else {
+            Write-Warn "uv installer could not be verified - leaving its Mark-of-the-Web intact"
+            Write-Warn "  so Defender/SmartScreen still treat it as downloaded content."
+            Write-Warn "  Pin it with `$env:BINARY_MCP_SHA256_UV_INSTALLER_PS1, or re-run with"
+            Write-Warn "  -StrictIntegrity to refuse unverified installers outright."
+        }
 
         # Run the verified script in a child PowerShell rather than dot-sourcing
         # it: same effect (uv's installer persists PATH via the user
@@ -913,7 +988,6 @@ function Install-UV {
         if ($LASTEXITCODE -ne 0) {
             throw "uv installer exited with code $LASTEXITCODE"
         }
-        Remove-Item -LiteralPath $uvInstaller -Force -ErrorAction SilentlyContinue
 
         # Refresh PATH: Machine PATH first, then User PATH (standard Windows order)
         $machinePath = [System.Environment]::GetEnvironmentVariable("Path", "Machine")
@@ -924,6 +998,14 @@ function Install-UV {
     } catch {
         Write-Err "Failed to install uv: $_"
         return $false
+    } finally {
+        # F-3 (second pass): the previous code deleted the installer only on the
+        # success path, so a hash mismatch, a non-zero exit, or any throw in
+        # between left a downloaded - possibly unverified - PowerShell script
+        # sitting at a predictable path in %TEMP%. That is one retry or one
+        # double-click away from running, on a box that just ran an elevated
+        # installer. Clean up on every exit path, including the throwing ones.
+        Remove-Item -LiteralPath $uvInstaller -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -1210,10 +1292,19 @@ function Install-X64Dbg {
                 # x64dbg plugins directory after the checks pass, so an artifact
                 # that fails verification is never even momentarily present
                 # somewhere x64dbg would load it from.
+                #
+                # .github/workflows/release.yml now generates SHA256SUMS in the
+                # same job that uploads these assets, so for any release built
+                # after that change the manifest lookup below resolves a real
+                # digest and the verification is no longer inert.
                 $checksums = Get-ReleaseChecksumMap -Release $pluginRelease
                 if ($checksums.Count -eq 0) {
-                    Write-Warn "This binary-mcp release publishes no SHA256SUMS manifest -"
-                    Write-Warn "plugin binaries below cannot be verified against a published digest."
+                    Write-Warn "This binary-mcp release publishes no SHA256SUMS manifest."
+                    Write-Warn "  Releases built by .github/workflows/release.yml do publish one, so this is"
+                    Write-Warn "  either a release predating that change or a release whose manifest was removed."
+                    Write-Warn "  The plugin binaries below cannot be verified against a published digest;"
+                    Write-Warn "  pin them with `$env:BINARY_MCP_SHA256_BINARY_MCP_OBSIDIAN_DP64 (and _DP32,"
+                    Write-Warn "  _OBSIDIAN_SERVER_EXE), or re-run with -StrictIntegrity to refuse them."
                 }
 
                 $stagingDir = Join-Path $env:TEMP ("binary-mcp-plugins-" + [guid]::NewGuid().ToString("N"))
@@ -1223,7 +1314,28 @@ function Install-X64Dbg {
                     foreach ($asset in @($plugin64, $plugin32, $server)) {
                         $staged = Join-Path $stagingDir $asset.name
                         $expected = $null
-                        if ($checksums.ContainsKey($asset.name)) { $expected = $checksums[$asset.name] }
+                        $assetHashKey = "binary-mcp-" + $asset.name
+                        if ($checksums.ContainsKey($asset.name)) {
+                            $expected = $checksums[$asset.name]
+                        } elseif (Get-PinnedSha256 -HashKey $assetHashKey) {
+                            # An operator pin still wins: it is a stronger claim
+                            # than the manifest (it survives a release takeover).
+                            $expected = Get-PinnedSha256 -HashKey $assetHashKey
+                        } elseif ($checksums.Count -gt 0) {
+                            # F-3: fail CLOSED when the manifest exists but does
+                            # not cover this asset. release.yml refuses to
+                            # publish a partial SHA256SUMS, so a manifest that
+                            # lists some assets and not obsidian.dp64 is not a
+                            # packaging slip - it is what an asset swapped in
+                            # after the manifest was generated looks like.
+                            # Falling through to the "unverified" warning here
+                            # would let exactly that case install a DLL x64dbg
+                            # loads next to live malware.
+                            throw ("$($asset.name) is not listed in this release's SHA256SUMS manifest, " +
+                                   "but other assets are. Refusing to install an unlisted plugin binary. " +
+                                   "Build the plugins from source (src/engines/dynamic/x64dbg/plugin/README.md), " +
+                                   "or pin the digest you trust in `$env:$(Get-IntegrityEnvName $assetHashKey).")
+                        }
 
                         Invoke-VerifiedDownload -Uri $asset.browser_download_url -OutFile $staged `
                             -Description "binary-mcp release asset $($asset.name)" `
@@ -1233,6 +1345,12 @@ function Install-X64Dbg {
                         # installer change. -AllowUnsigned because the assets are
                         # not code-signed today; a *broken* signature still warns
                         # (and is fatal under -StrictIntegrity).
+                        #
+                        # For .dp64/.dp32 this always reports 'UnknownError' -
+                        # Windows dispatches signature checks by extension and
+                        # does not know these - so the result is informational
+                        # only and the SHA-256 above is the real control. See the
+                        # UnknownError branch in Assert-AuthenticodeValid.
                         Assert-AuthenticodeValid -Path $staged -Description $asset.name -AllowUnsigned | Out-Null
 
                         $stagedFiles[$asset.name] = $staged
@@ -1304,8 +1422,10 @@ function Install-WinDbg {
         # Method 3: Download Windows SDK installer and install just the debuggers
         if (-not $installed) {
             Write-Info "Attempting Windows SDK Debugging Tools standalone install..."
+            # Declared outside the try so the finally below can always clean it
+            # up, including when the download or the signature check throws.
+            $sdkSetup = "$env:TEMP\winsdksetup.exe"
             try {
-                $sdkSetup = "$env:TEMP\winsdksetup.exe"
                 Write-Info "Downloading Windows SDK installer..."
                 # A go.microsoft.com fwlink resolves to whatever build Microsoft
                 # currently serves, so no digest can be pinned in-tree
@@ -1314,8 +1434,28 @@ function Install-WinDbg {
                 # is the real check here - and it runs elevated moments later.
                 Invoke-VerifiedDownload -Uri "https://go.microsoft.com/fwlink/?linkid=2173743" -OutFile $sdkSetup `
                     -Description "Windows SDK bootstrapper (winsdksetup.exe)" -HashKey "windows-sdk-setup" | Out-Null
-                Assert-AuthenticodeValid -Path $sdkSetup -Description "Windows SDK bootstrapper" `
-                    -ExpectedSubjectMatch "Microsoft Corporation" | Out-Null
+                # F-3 (second pass): this result used to be piped to Out-Null,
+                # which threw away the only thing it computes. A BAD signature -
+                # a bootstrapper signed by someone other than Microsoft, or one
+                # whose signature does not match its bytes - printed a warning
+                # and then fell straight through to the Start-Process below,
+                # which runs it with the Administrator token this whole script
+                # already holds. An unsigned/mis-signed elevated installer is
+                # precisely the outcome the check exists to prevent, so a
+                # non-Valid result must abort. Note -AllowUnsigned is
+                # deliberately NOT passed here: unlike our own plugin assets,
+                # winsdksetup.exe is always Microsoft-signed, so "no signature"
+                # is itself a red flag rather than the expected state.
+                $sdkSigOk = Assert-AuthenticodeValid -Path $sdkSetup -Description "Windows SDK bootstrapper" `
+                    -ExpectedSubjectMatch "Microsoft Corporation"
+                if (-not (Test-VerificationResult -Result $sdkSigOk)) {
+                    throw ("Refusing to run the Windows SDK bootstrapper: it is not validly " +
+                           "Authenticode-signed by Microsoft Corporation. It would have been executed " +
+                           "with Administrator rights. Install the debuggers instead with " +
+                           "'winget install Microsoft.WindowsSDK.10.0.26100', or download the SDK by hand " +
+                           "from https://developer.microsoft.com/windows/downloads/windows-sdk/ and check " +
+                           "its signature before running it.")
+                }
 
                 Write-Info "Installing Debugging Tools for Windows (silent)..."
                 $proc = Start-Process -FilePath $sdkSetup -ArgumentList "/features OptionId.WindowsDesktopDebuggers /quiet" -Wait -PassThru
@@ -1325,9 +1465,14 @@ function Install-WinDbg {
                 } else {
                     Write-Warn "SDK installer exited with code: $($proc.ExitCode)"
                 }
-                Remove-Item $sdkSetup -ErrorAction SilentlyContinue
             } catch {
                 Write-Warn "Failed to install via SDK: $_"
+            } finally {
+                # F-3 (second pass): previously deleted only on the success path,
+                # so a failed signature check or a throwing download left an
+                # unverified elevated-installer .exe at a predictable %TEMP%
+                # path. Remove it however this block exits.
+                Remove-Item -LiteralPath $sdkSetup -Force -ErrorAction SilentlyContinue
             }
         }
 

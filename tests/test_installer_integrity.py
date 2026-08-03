@@ -608,3 +608,457 @@ def test_install_md_no_longer_advertises_a_bare_pipe_to_interpreter_install():
             f"INSTALL.md still recommends piping this project's installer into an "
             f"interpreter ({pattern})"
         )
+
+
+# ---------------------------------------------------------------------------
+# F-3, second pass.
+#
+# The first remediation pass left the finding only partly closed. The tests
+# below pin the specific things that were still broken afterwards, so each one
+# fails if that exact regression comes back:
+#
+#   * release.yml published no checksum manifest, which made every "verify the
+#     plugin against SHA256SUMS" code path in install.ps1 dead code;
+#   * README.md still led with `irm ... | iex` / `curl ... | python3 -`;
+#   * Install-UV stripped the Mark-of-the-Web from an *unverified* download;
+#   * the Authenticode result on the elevated Windows SDK bootstrapper was
+#     discarded with `| Out-Null`, so a bad signature did not stop it running;
+#   * failure paths left downloaded scripts/installers on disk.
+# ---------------------------------------------------------------------------
+
+RELEASE_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "release.yml"
+README_PATH = REPO_ROOT / "README.md"
+
+PROJECT_OWNED_ASSETS = ("obsidian.dp64", "obsidian.dp32", "obsidian_server.exe")
+
+# A download command whose output is piped straight into an interpreter. Only
+# matches when a URL is on the same line, so prose *about* the anti-pattern
+# ("no `| iex` one-liner is offered") does not trip it.
+PIPE_TO_INTERPRETER = re.compile(
+    r"(curl|wget|irm|iwr|Invoke-RestMethod|Invoke-WebRequest)\b[^\n|]*https?://[^\n|]*\|"
+    r"\s*(iex|Invoke-Expression|sh|bash|zsh|python3?|pwsh|powershell)\b",
+    re.IGNORECASE,
+)
+
+
+def test_release_workflow_publishes_a_sha256sums_manifest():
+    """Without this step the whole SHA256SUMS code path in install.ps1 is dead
+    code: the installer looks for a manifest that is never published, finds
+    nothing, and installs obsidian.dp64 unverified. This is the step that makes
+    the verification real."""
+    text = RELEASE_WORKFLOW_PATH.read_text(encoding="utf-8")
+
+    assert "sha256sum" in text, "release.yml computes no SHA-256 for its assets"
+    assert "SHA256SUMS" in text, "release.yml publishes no SHA256SUMS manifest"
+
+    # The manifest has to cover every project-owned asset the installers fetch,
+    # and be uploaded with the release - computing it and not shipping it would
+    # be just as inert.
+    manifest_step = text[text.index("Generate SHA256SUMS Manifest"):]
+    for asset in PROJECT_OWNED_ASSETS:
+        assert asset in manifest_step, (
+            f"the SHA256SUMS step does not hash {asset}, so install.ps1 cannot "
+            f"verify it"
+        )
+
+    upload = text[text.index("softprops/action-gh-release"):]
+    assert "SHA256SUMS" in upload, (
+        "SHA256SUMS is generated but never uploaded as a release asset, so the "
+        "installers can never fetch it"
+    )
+    for asset in PROJECT_OWNED_ASSETS:
+        assert asset in upload, f"{asset} is no longer published with the release"
+
+
+def test_release_workflow_manifest_is_named_and_shaped_so_installers_read_it(workdir):
+    """A manifest the installers do not recognise is published but never read -
+    which looks like a fix and behaves like the bug. Check the published name
+    against the real parser, and check the format the workflow writes against it
+    too."""
+    text = RELEASE_WORKFLOW_PATH.read_text(encoding="utf-8")
+
+    uploaded = text[text.index("softprops/action-gh-release"):]
+    # Only the bare path entries under `files:`, not prose in a comment.
+    names = {
+        line.strip().split("/")[-1]
+        for line in uploaded.splitlines()
+        if re.match(r"^\s*\S*SHA256SUMS\S*\s*$", line)
+    }
+    assert names, "no SHA256SUMS asset is uploaded with the release"
+
+    # The file the step writes and the file the release uploads must be the same
+    # one: writing checksums.json and uploading SHA256SUMS ships nothing.
+    step = text[text.index("Generate SHA256SUMS Manifest"):text.index("- name: Create Release Notes")]
+    written = set(re.findall(r">\s*(\S+)", step)) | set(re.findall(r"sha256sum -c (\S+)", step))
+    assert names & written, (
+        f"release.yml uploads {sorted(names)} but the manifest step writes "
+        f"{sorted(written)} - the published asset is not the file that was generated"
+    )
+
+    # Reproduce what release.yml writes: a '#' comment header followed by
+    # coreutils "<hash>  <name>" lines, using bare basenames.
+    digests = {name: f"{i:02x}" * 32 for i, name in enumerate(PROJECT_OWNED_ASSETS, start=1)}
+    manifest = workdir / "manifest.txt"
+    manifest.write_text(
+        "# binary-mcp v1.2.3 release checksums (SHA-256)\n"
+        "# Verify with: sha256sum -c SHA256SUMS\n"
+        + "".join(f"{d}  {n}\n" for n, d in digests.items())
+    )
+
+    for name in names:
+        parsed = install.release_checksum_map(
+            {"assets": [{"name": name, "browser_download_url": manifest.as_uri()}]}
+        )
+        assert parsed == digests, (
+            f"release.yml publishes the manifest as {name!r}; install.py's parser "
+            f"read {parsed!r} from it instead of the expected digests"
+        )
+        # install.ps1's asset-name filter is a regex in PowerShell; mirror it
+        # exactly so a rename that only one installer tolerates is caught.
+        assert re.match(r"^(sha256sums?|checksums?)(\.txt)?$", name, re.IGNORECASE) or re.search(
+            r"\.sha256$", name, re.IGNORECASE
+        ), f"install.ps1 would not recognise {name!r} as a checksum manifest"
+
+
+def test_release_workflow_fails_rather_than_publishing_a_partial_manifest():
+    """install.ps1 aborts the plugin install when a manifest exists but omits an
+    asset. A workflow that could publish a partial manifest would therefore
+    break every install - and a missing entry is what a swapped asset looks
+    like, so this must not be relaxed by silently tolerating it either."""
+    text = RELEASE_WORKFLOW_PATH.read_text(encoding="utf-8")
+    manifest_step = text[text.index("Generate SHA256SUMS Manifest"):]
+    manifest_step = manifest_step[: manifest_step.index("- name: Create Release Notes")]
+
+    assert "exit 1" in manifest_step, (
+        "the SHA256SUMS step never fails, so an asset missing from the manifest "
+        "would ship anyway"
+    )
+    assert "sha256sum -c" in manifest_step, (
+        "the workflow should verify the manifest it just wrote against the files "
+        "it is about to upload"
+    )
+
+
+def test_no_doc_pipes_a_project_installer_into_an_interpreter():
+    """README.md:15/:18 kept leading the Quick Start with `irm ... | iex` and
+    `curl ... | python3 -` after the first pass, and release.yml's release notes
+    said the same thing - so every release told users to do the exact thing the
+    installers were hardened against."""
+    for path in (README_PATH, INSTALL_MD_PATH, RELEASE_WORKFLOW_PATH):
+        text = path.read_text(encoding="utf-8")
+        offenders = [
+            line.strip()
+            for line in text.splitlines()
+            if PIPE_TO_INTERPRETER.search(line) and not line.lstrip().startswith("# Instead of")
+        ]
+        assert not offenders, (
+            f"{path.name} pipes a fresh download into an interpreter: " + "; ".join(offenders)
+        )
+
+
+def test_readme_leads_with_download_inspect_run():
+    """Not enough to delete the one-liner: the replacement has to actually show
+    the inspect step, or users will reinvent the one-liner."""
+    text = README_PATH.read_text(encoding="utf-8")
+    quick_start = text[text.index("## Quick Start"):]
+
+    assert "git clone" in quick_start
+    assert "-OutFile" in quick_start, "no download-to-disk form for Windows"
+    assert "sha256sum install.py" in quick_start or "Get-FileHash" in quick_start, (
+        "README shows no way to record what was downloaded"
+    )
+    # The risk is stated where the reader is, not only behind a link.
+    assert re.search(r"elevated|Administrator", quick_start)
+    assert "INSTALL.md" in quick_start
+
+
+def test_ps1_does_not_clear_mark_of_the_web_before_verification():
+    """Unblock-File strips the Mark-of-the-Web, the flag Defender/SmartScreen and
+    any EDR key off. Pass 1 called it unconditionally on the uv installer - a
+    download that, with the pin table empty, was never verified - and then ran it
+    via `powershell -ExecutionPolicy Bypass -File`. Destroying provenance on
+    unverified, attacker-influenceable content is worse than never touching it.
+    """
+    text = read_ps1()
+    body = strip_ps1_comments(ps1_function_body(text, "Install-UV"))
+
+    assert "Unblock-File" in body, (
+        "test out of date: Install-UV no longer calls Unblock-File at all"
+    )
+
+    lines = body.splitlines()
+    unblock_idx = next(i for i, ln in enumerate(lines) if "Unblock-File" in ln)
+
+    # The call must be guarded, and the guard must be the verification result -
+    # not merely 'the download succeeded'.
+    guard_window = "\n".join(lines[max(0, unblock_idx - 6):unblock_idx])
+    assert re.search(r"if\s*\(\s*\$\w*[Vv]erified\s*\)", guard_window), (
+        "Unblock-File is not guarded by an 'if (<verified>)' check; it would run "
+        "on an unverified download"
+    )
+
+    # And that flag has to come from the verification helper, not be a local
+    # $true someone set optimistically.
+    assert re.search(r"\$\w*[Vv]erified\s*=\s*Test-VerificationResult", body), (
+        "the guard flag does not come from Test-VerificationResult"
+    )
+
+    # Whole-file: no other unguarded Unblock-File crept in.
+    all_unblocks = [ln for ln in strip_ps1_comments(text).splitlines() if "Unblock-File" in ln]
+    assert len(all_unblocks) == 1, (
+        "Unblock-File appears outside Install-UV; every call site needs the same "
+        "verified-first guard: " + "; ".join(x.strip() for x in all_unblocks)
+    )
+
+
+def test_ps1_verified_download_reports_whether_it_actually_verified():
+    """The guard above is only meaningful if Invoke-VerifiedDownload distinguishes
+    'hash checked' from 'warned and carried on'. Pass 1 returned $true either
+    way."""
+    body = ps1_function_body(read_ps1(), "Invoke-VerifiedDownload")
+
+    verified_branch = body[body.index("Assert-FileHash"):body.index("Write-UnverifiedArtifactWarning")]
+    assert "return $true" in verified_branch, "the verified path must return $true"
+
+    warned_branch = body[body.index("Write-UnverifiedArtifactWarning"):]
+    assert "return $false" in warned_branch, (
+        "the unverified path still reports success, so callers cannot tell "
+        "whether anything was actually checked"
+    )
+    assert "return $true" not in warned_branch
+
+
+def test_ps1_verification_result_helper_fails_closed():
+    """Test-VerificationResult exists so a stray pipeline object cannot be
+    mistaken for a boolean $true (any non-empty array is truthy in PowerShell)."""
+    body = ps1_function_body(read_ps1(), "Test-VerificationResult")
+
+    assert re.search(r"-is\s+\[bool\]", body), (
+        "Test-VerificationResult does not require an actual [bool], so an "
+        "unexpected pipeline object would read as 'verified'"
+    )
+    assert "-and" in body
+
+
+def test_ps1_bad_authenticode_on_the_sdk_bootstrapper_aborts():
+    """install.ps1:1317 piped Assert-AuthenticodeValid to Out-Null and then ran
+    the bootstrapper elevated at :1321 regardless. A signature that is BAD (not
+    merely absent) must stop Start-Process."""
+    body = strip_ps1_comments(ps1_function_body(read_ps1(), "Install-WinDbg"))
+
+    assert "Assert-AuthenticodeValid" in body
+    assert not re.search(r"Assert-AuthenticodeValid[^\n]*\|\s*Out-Null", body), (
+        "the Authenticode result on the elevated SDK bootstrapper is discarded "
+        "again, so a bad signature does not stop the install"
+    )
+
+    lines = body.splitlines()
+    sig_idx = next(i for i, ln in enumerate(lines) if "Assert-AuthenticodeValid" in ln)
+    start_idx = next(i for i, ln in enumerate(lines) if "Start-Process" in ln)
+    assert sig_idx < start_idx, "the signature check must precede execution"
+
+    between = "\n".join(lines[sig_idx:start_idx])
+    assert "throw" in between, (
+        "nothing between the signature check and Start-Process aborts, so a bad "
+        "signature still reaches an elevated execution"
+    )
+    assert "Test-VerificationResult" in between, (
+        "the abort must be driven by the check's result, fail-closed"
+    )
+
+    # -AllowUnsigned must NOT be used here: winsdksetup.exe is always
+    # Microsoft-signed, so 'no signature' is itself the anomaly.
+    sig_call = "\n".join(lines[sig_idx:sig_idx + 3])
+    assert "AllowUnsigned" not in sig_call, (
+        "the Windows SDK bootstrapper is always Microsoft-signed; accepting an "
+        "unsigned one defeats the check"
+    )
+
+
+def test_ps1_authenticode_treats_unknown_status_as_unknown_not_bad():
+    """Get-AuthenticodeSignature dispatches on file extension and returns
+    'UnknownError' for .dp64/.dp32 - meaning 'cannot evaluate', not 'invalid'.
+    Pass 1 only exempted 'NotSigned', so under -StrictIntegrity the generic
+    failure branch deleted a legitimate, hash-verified plugin and aborted."""
+    # Comments stripped: a prose mention of UnknownError is not a code path.
+    body = strip_ps1_comments(ps1_function_body(read_ps1(), "Assert-AuthenticodeValid"))
+
+    guard = re.search(
+        r"if\s*\([^)]*\$sig\.Status\s+-eq\s+'UnknownError'[^)]*\)", body
+    )
+    assert guard, (
+        "Assert-AuthenticodeValid does not test for the 'UnknownError' status "
+        "that .dp64/.dp32 always produce; -StrictIntegrity would delete a good, "
+        "already hash-verified plugin"
+    )
+    assert "AllowUnsigned" in guard.group(0), (
+        "'UnknownError' must only be tolerated where the caller already accepts "
+        "an unsigned artifact - never for the elevated SDK bootstrapper"
+    )
+
+    # The exemption must return, i.e. skip the delete-and-throw branch below.
+    exemption = body[guard.end():]
+    tail = exemption[: exemption.index('Write-Warn "Authenticode verification FAILED')]
+    assert "return $false" in tail, "the UnknownError branch falls through to the failure branch"
+    assert "throw" not in tail and "Remove-Item" not in tail, (
+        "the UnknownError branch deletes or aborts; it must be non-fatal"
+    )
+
+
+def test_ps1_temp_downloads_are_cleaned_up_on_failure_paths():
+    """Pass 1 deleted the uv installer and the SDK bootstrapper only on their
+    success paths, so a hash mismatch or a non-zero exit left an unverified,
+    executable download at a predictable %TEMP% path on a box that had just run
+    an elevated installer."""
+    text = read_ps1()
+
+    uv = ps1_function_body(text, "Install-UV")
+    assert re.search(r"\}\s*finally\s*\{", uv), "Install-UV has no finally block"
+    finally_body = uv[uv.rindex("finally"):]
+    assert "Remove-Item" in finally_body and "uvInstaller" in finally_body, (
+        "Install-UV's finally does not delete the downloaded installer"
+    )
+
+    windbg = ps1_function_body(text, "Install-WinDbg")
+    assert re.search(r"\}\s*finally\s*\{", windbg), (
+        "Install-WinDbg has no finally block, so a failed signature check leaves "
+        "winsdksetup.exe in %TEMP%"
+    )
+    sdk_finally = windbg[windbg.rindex("finally"):]
+    assert "Remove-Item" in sdk_finally and "sdkSetup" in sdk_finally
+
+    # The staging directory for the plugin binaries was already cleaned up in
+    # pass 1; keep it that way.
+    x64dbg = ps1_function_body(text, "Install-X64Dbg")
+    assert re.search(r"finally\s*\{[^}]*Remove-Item[^}]*stagingDir", x64dbg, re.DOTALL)
+
+
+def test_ps1_fails_closed_when_the_manifest_omits_a_plugin_asset():
+    """A release that publishes SHA256SUMS but does not list obsidian.dp64 is not
+    a packaging slip - release.yml refuses to publish a partial manifest - it is
+    what an asset swapped in after the manifest was generated looks like.
+    Falling back to the 'unverified' warning there would install an unlisted DLL
+    into the x64dbg plugins directory."""
+    body = strip_ps1_comments(ps1_function_body(read_ps1(), "Install-X64Dbg"))
+
+    assert "Get-ReleaseChecksumMap" in body
+    # Guard: manifest non-empty but this asset absent -> throw.
+    assert re.search(r"\$checksums\.Count\s+-gt\s+0", body), (
+        "no fail-closed branch for 'manifest exists but omits this asset'"
+    )
+    count_idx = body.index("$checksums.Count -gt 0")
+    assert "throw" in body[count_idx:count_idx + 700], (
+        "the manifest-omits-asset case does not abort the plugin install"
+    )
+    # The operator escape hatch must still work, or the fail-closed branch makes
+    # a pinned digest unusable.
+    assert "Get-PinnedSha256" in body, (
+        "an operator-pinned digest can no longer override the release manifest"
+    )
+
+
+def test_ps1_every_project_owned_asset_download_is_verified():
+    """Structural: each of our own release assets is downloaded through the
+    verifying wrapper with an expected digest supplied, and reaches the plugins
+    directory only by a copy from staging."""
+    body = strip_ps1_comments(ps1_function_body(read_ps1(), "Install-X64Dbg"))
+
+    download_calls = [ln for ln in body.splitlines() if "Invoke-VerifiedDownload" in ln]
+    assert download_calls, "Install-X64Dbg no longer downloads through the wrapper"
+
+    assert re.search(r"-ExpectedSha256\s+\$expected", body), (
+        "the plugin download does not pass the manifest digest through"
+    )
+    for name in PROJECT_OWNED_ASSETS:
+        assert name in body
+        assert re.search(rf"Copy-Item[^\n]*{re.escape(name)}", body)
+
+
+def test_py_downloaded_scripts_are_removed_on_failure_paths():
+    """install.py:757-767 / :813-820 unlinked the downloaded installer script
+    only after subprocess.run succeeded, so a CalledProcessError left an
+    executable network-sourced script in a world-readable temp directory."""
+    tree = _py_tree()
+
+    for name in ("install_uv", "install_dotnet_sdk", "download_repo_zip"):
+        func = next(
+            f for f in ast.walk(tree)
+            if isinstance(f, ast.FunctionDef) and f.name == name
+        )
+        tries = [n for n in ast.walk(func) if isinstance(n, ast.Try) and n.finalbody]
+        assert tries, f"{name}() has no try/finally, so failures leak the download"
+
+        cleaned = False
+        for node in tries:
+            for stmt in node.finalbody:
+                called = _called_names(stmt)
+                if called & {"unlink", "remove", "rmtree", "unlink_missing_ok"}:
+                    cleaned = True
+        assert cleaned, f"{name}()'s finally block does not delete the download"
+
+
+def test_py_download_and_verify_script_cleans_up_when_verification_fails(workdir, monkeypatch):
+    """Behavioural counterpart to the static check above: nothing is left behind
+    for a retry to pick up. (verify_sha256 deletes; assert it end to end.)"""
+    source = workdir / "install.sh"
+    source.write_text("#!/bin/sh\necho tampered\n")
+    monkeypatch.setenv("BINARY_MCP_SHA256_UV_INSTALLER_SH", "ab" * 32)
+    monkeypatch.setattr(tempfile, "tempdir", str(workdir))
+
+    with pytest.raises(ValueError):
+        install.download_and_verify_script(source.as_uri(), "uv installer", "uv-installer-sh")
+
+    assert [p.name for p in workdir.iterdir()] == ["install.sh"], (
+        "a rejected script survived in the temp directory"
+    )
+
+
+def test_install_md_documents_the_pin_env_var_for_every_project_owned_asset():
+    """The pin tables in both installers carry no key for a binary-mcp-owned
+    asset by default, so the only way an operator learns the variable name is
+    from the docs (or from triggering the warning)."""
+    text = INSTALL_MD_PATH.read_text(encoding="utf-8")
+
+    for asset in PROJECT_OWNED_ASSETS:
+        env_name = install.integrity_env_name(f"binary-mcp-{asset}")
+        assert env_name in text, (
+            f"INSTALL.md does not document {env_name}, the only way to pin {asset}"
+        )
+
+    for env_name in (
+        "BINARY_MCP_SHA256_GHIDRA_ZIP",
+        "BINARY_MCP_SHA256_X64DBG_SNAPSHOT",
+        "BINARY_MCP_SHA256_UV_INSTALLER_PS1",
+        "BINARY_MCP_SHA256_UV_INSTALLER_SH",
+        "BINARY_MCP_SHA256_DOTNET_INSTALLER_SH",
+        "BINARY_MCP_SHA256_WINDOWS_SDK_SETUP",
+        "BINARY_MCP_SHA256_REPO_ZIP",
+    ):
+        assert env_name in text, f"INSTALL.md does not document {env_name}"
+
+
+def test_install_md_status_note_matches_what_the_code_does():
+    """The note must describe reality in both directions: it may not claim the
+    plugins are verified while release.yml publishes nothing, and it may not
+    keep claiming verification is inert once the manifest ships."""
+    text = INSTALL_MD_PATH.read_text(encoding="utf-8")
+    workflow = RELEASE_WORKFLOW_PATH.read_text(encoding="utf-8")
+
+    publishes_manifest = "SHA256SUMS" in workflow and "sha256sum" in workflow
+
+    if publishes_manifest:
+        assert "currently **inert**" not in text, (
+            "INSTALL.md still says verification is inert after release.yml "
+            "started publishing SHA256SUMS"
+        )
+        assert "does not yet publish" not in text
+        assert "SHA256SUMS" in text
+    else:  # pragma: no cover - guards against the workflow step being deleted
+        assert "inert" in text or "unverified" in text
+
+    # Whatever the state, the residual risks stay documented: an unsigned
+    # plugin, and a manifest that cannot survive a takeover of the release.
+    assert "not code-signed" in text
+    assert "takeover of the release" in text
+    # And the pre-manifest releases are still called out honestly.
+    assert re.search(r"predating|before that workflow|older release", text)

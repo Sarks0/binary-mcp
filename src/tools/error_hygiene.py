@@ -34,7 +34,13 @@ from __future__ import annotations
 import logging
 import uuid
 
-from src.utils.security import safe_error_message
+from src.utils.security import (
+    ENV_ALLOW_ANY_PATH,
+    ENV_ALLOWED_DIRS,
+    FileSizeError,
+    PathTraversalError,
+    safe_error_message,
+)
 from src.utils.structured_errors import StructuredBaseError
 
 logger = logging.getLogger(__name__)
@@ -99,4 +105,104 @@ def safe_tool_error(operation: str, error: Exception) -> str:
 
     return safe_error_message(
         f"{operation} failed" if operation else "Tool call failed", error
+    )
+
+
+# ---------------------------------------------------------------------------
+# Path-validation errors (audit F-10, second pass)
+# ---------------------------------------------------------------------------
+#
+# The first remediation pass routed catch-all handlers through
+# safe_tool_error, but left ~12 handlers doing
+#
+#     except (PathTraversalError, FileSizeError, FileNotFoundError) as e:
+#         return f"Invalid binary path: {e}"
+#
+# That reads like a validation message the model needs, and half of it is --
+# but the *text* of a confinement denial is built by
+# security._default_confinement_denied(), which interpolates the resolved
+# quarantine directory list, and security._confinement_setup_hint(), which
+# prints ``Path.home() / "quarantine"`` as its worked example. So the "safe"
+# branch leaked the operator's username on every out-of-bounds path, and
+# sanitize_output_path's PathTraversalError leaked the resolved dump directory
+# the same way ("Output path must be within /home/<user>/...").
+#
+# The fix keeps the half the model needs and drops the half it does not. The
+# CATEGORY of the failure -- outside the allow-list / missing / too large /
+# wrong type -- plus what to do about it is reconstructed here from the
+# exception type, so the message stays actionable enough for the model to
+# repair its own call, while the host's directory layout is written only to
+# the server log against a reference ID.
+#
+# Note the deliberate asymmetry: the caller-supplied path is NOT echoed back
+# either. It is usually the model's own argument, so echoing it adds nothing,
+# and when it is not (a path taken from a session record or a cached context)
+# echoing it is another way host layout re-enters the transcript.
+
+_PATH_ERROR_GUIDANCE: dict[type, str] = {
+    PathTraversalError: (
+        "the path is outside the directories this server is allowed to read. "
+        f"Analyse files from a directory the operator exposed via "
+        f"{ENV_ALLOWED_DIRS} (or the default quarantine directories). The "
+        f"configured directories are intentionally not listed here; ask the "
+        f"operator, or have them set {ENV_ALLOWED_DIRS} / "
+        f"{ENV_ALLOW_ANY_PATH}. Output paths must likewise stay inside this "
+        "server's own output directory -- pass a bare filename rather than "
+        "an absolute path."
+    ),
+    FileSizeError: (
+        "the file is larger than this server's analysis size limit. Carve "
+        "out the region of interest and analyse that instead."
+    ),
+    FileNotFoundError: (
+        "no file exists at the path supplied. Check the name and extension, "
+        "and confirm the sample was copied onto this host."
+    ),
+    IsADirectoryError: "the path names a directory, not a file.",
+    NotADirectoryError: "a component of the path is not a directory.",
+    PermissionError: (
+        "this server does not have permission to read the path supplied."
+    ),
+}
+
+
+def safe_path_error(operation: str, error: Exception, subject: str = "path") -> str:
+    """
+    Format a path-validation failure without disclosing host layout (F-10).
+
+    Args:
+        operation: Short description of what failed -- normally the tool name.
+        error: The caught path-validation exception.
+        subject: What was being validated, e.g. ``"binary path"`` or
+            ``"output path"``. Used in the first line so the model can tell
+            which of its arguments to fix.
+
+    Returns:
+        Safe, still-actionable error string carrying a reference ID.
+    """
+    guidance = None
+    for exc_type, text in _PATH_ERROR_GUIDANCE.items():
+        if isinstance(error, exc_type):
+            guidance = text
+            break
+
+    if guidance is None:
+        # A ValueError from sanitize_binary_path ("Path is not a file: ...")
+        # or the wrapped OSError from sanitize_output_path ("Invalid path:
+        # ...") -- both interpolate a resolved absolute path, so neither text
+        # can be forwarded. Fall back to the generic safe envelope.
+        return safe_error_message(f"Invalid {subject} for {operation}", error)
+
+    error_id = str(uuid.uuid4())[:8]
+    logger.warning(
+        "Error %s: %s rejected %s: %s: %s",
+        error_id,
+        operation or "tool call",
+        subject,
+        type(error).__name__,
+        error,
+    )
+    return (
+        f"Error: Invalid {subject} -- {guidance}\n"
+        f"Reference ID: {error_id}"
     )

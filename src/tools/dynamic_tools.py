@@ -3755,11 +3755,33 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_undo_instruction failed: {e}")
             return safe_error_message("x64dbg_undo_instruction failed", e)
 
-    # Security: allowlist of safe x64dbg command prefixes.
-    # Only commands starting with these words are permitted through execute_command.
-    # This prevents arbitrary code execution via ScriptDll, loadlib, savedata, etc.
-    # Internal bridge methods (watches, types, trace, etc.) bypass this check since
-    # they construct commands from validated parameters with known-safe prefixes.
+    # Security: allowlist of safe x64dbg command names.
+    #
+    # Every ';'-separated segment of the string must name a command on this
+    # list. Finding F-9/F-16: this used to be checked against the first token of
+    # the WHOLE string, but x64dbg's cmdsplit() chops on ';' and dispatches each
+    # piece separately, so "log x;init C:/evil.exe" passed on the strength of
+    # the "log" and then STARTED THE SAMPLE. See x64dbg_command_segments in
+    # src/engines/dynamic/x64dbg/bridge.py for the splitter and the structural
+    # rules ('$' prefix, CR/LF, NUL) that go with it.
+    #
+    # Internal bridge methods (watches, types, trace, etc.) do not come through
+    # here; they are bounded by the bridge's own _ALLOWED_COMMANDS, which is a
+    # superset of this list.
+    #
+    # NEVER ADD, in particular:
+    #   * "scriptcmd" -- ScriptCmdExecAwait() hands the argument to
+    #     cmddirectexec(), x64dbg's FULL command dispatcher. One entry would
+    #     make every other entry on this list decorative, because
+    #     "scriptcmd init C:/evil.exe" is then a legal command. This is a
+    #     universal bypass, not a rough edge.
+    #   * "scriptexec" -- same reach by way of the script engine.
+    #   * "init"/"initdbg"/"InitDebug", "attach", "createthread"/"threadcreate",
+    #     "alloc", "memcpy", "asm", "plugload", "restartadmin", "minidump",
+    #     "SetBreakpointCommand"/"bpcommand", "scriptdll".
+    # Allowlist semantics already exclude all of these -- an unlisted command is
+    # refused -- so this note exists for the future editor who is about to add
+    # one because a workflow "just needs it". It does not need it.
     allowed_command_prefixes = frozenset({
         # Analysis & navigation
         "dis", "dis.prev", "dis.next", "dis.iscall", "dis.isbranch",
@@ -3819,38 +3841,55 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
         code, because a docstring is the only view a model has of a tool's
         contract.
 
-        Three gates sit between this argument and x64dbg's DbgCmdExec, and
-        EVERY ONE of them decides on the FIRST TOKEN alone:
+        A STRING MAY CONTAIN SEVERAL COMMANDS. Finding F-9/F-16: x64dbg's
+        ``cmdsplit`` (src/dbg/command.cpp) chops the string on ';' -- outside
+        quotes -- and dispatches each piece as its own command. Every gate here
+        used to test the first token of the whole blob, so
+        ``log x;init C:/evil.exe`` was accepted on the strength of the ``log``
+        and x64dbg then ran the ``init``, which LAUNCHES THE SAMPLE. Each
+        segment is now checked in its own right and the whole string is refused
+        if any one of them fails.
 
-          1. This tool matches the first token against
+        Three gates sit between this argument and x64dbg's DbgCmdExec:
+
+          1. This tool splits the string exactly the way cmdsplit does and
+             matches the first token OF EVERY SEGMENT against
              ``allowed_command_prefixes`` (defined just above). That is a real
              allowlist: an unrecognised token is refused here and the string
-             never leaves this process.
-          2. ``bridge.execute_command`` then applies ``_BLOCKED_COMMANDS``, a
-             small DENYLIST. It is a fast-fail that turns obvious cases into a
-             clear local error -- it is NOT a gate, and a command's absence
-             from it is not approval.
-          3. The C++ plugin applies ``ALLOWED_COMMANDS`` (plugin.cpp) and is
-             the authoritative decision point. It fails closed on any token it
-             does not recognise and rejects strings containing CR, LF or NUL.
-             Its list is a strict superset of (1), so anything this tool lets
-             through the plugin also accepts; the tool-layer list is the one
-             that actually bounds this tool.
+             never leaves this process. Strings carrying a NUL, a CR/LF, a
+             leading '$' (x64dbg expands ``$`` commands via stringformatinline
+             BEFORE splitting, so what runs is not what we validated) or an
+             unterminated quote are refused outright.
+          2. ``bridge.execute_command`` re-splits and re-validates. It applies
+             ``_BLOCKED_COMMANDS``, a small DENYLIST kept only as a fast-fail
+             with a specific message -- a command's absence from it is not
+             approval -- and then the bridge's own ``_ALLOWED_COMMANDS``, which
+             fails closed. That allowlist is a superset of this tool's because
+             the bridge also issues commands for the dedicated tools.
+          3. The C++ plugin applies ``ALLOWED_COMMANDS`` (plugin.cpp), which
+             fails closed on any token it does not recognise and rejects CR, LF
+             and NUL. NOTE: it matches only the FIRST TOKEN of the string it
+             receives, so it does NOT see past a ';'. It is therefore the last
+             line of defence, not the one that bounds this tool -- gates (1)
+             and (2) are.
 
         What that buys, and what it does not:
 
-          - REFUSED: starting or stopping a process (init / initdbg / attach /
-            detach / quit), loading code (ScriptDll, loadlib, plugload),
-            writing files (savedata, savefile), and trace CONFIGURATION
-            (tracesetcommand / tracesetlog / tracesetlogfile, whose arguments
-            are themselves commands and file paths -- use
+          - REFUSED: starting or stopping a process (init / initdbg / InitDebug
+            / attach / detach), loading code (ScriptDll, loadlib, plugload),
+            handing a string back to the full dispatcher (scriptcmd,
+            scriptexec), staging code in the debuggee (alloc, memcpy, asm,
+            createthread), writing files (savedata, minidump), and trace
+            CONFIGURATION (tracesetcommand / tracesetlog / tracesetlogfile,
+            whose arguments are themselves commands and file paths -- use
             x64dbg_set_trace_command / x64dbg_set_trace_log_file instead).
             Unknown ALIASES of those handlers are refused as well: x64dbg
-            registers several spellings per handler, so both allowlists deny
-            by default rather than trying to enumerate spellings to block.
-          - NOT REFUSED AND NOT VALIDATED: everything after the first token.
-            Arguments are forwarded to x64dbg verbatim and evaluated by its
-            expression engine. A permitted command can therefore read
+            registers several comma-separated spellings per handler and matches
+            them case-insensitively, so both allowlists deny by default rather
+            than trying to enumerate spellings to block.
+          - NOT REFUSED AND NOT VALIDATED: everything after the first token of
+            a segment. Arguments are forwarded to x64dbg verbatim and evaluated
+            by its expression engine. A permitted command can therefore read
             arbitrary debuggee memory ("dump", "find", "eval"), and any path
             argument a permitted command accepts is unchecked by this server.
           - NOT READ-ONLY: permitted commands include ones that change state.
@@ -3859,14 +3898,15 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             label/comment/bookmark/type/watch/variable commands mutate the
             x64dbg analysis database.
 
-        In short: this restricts WHICH x64dbg command runs, not what that
-        command is then allowed to touch. Prefer the dedicated tools
+        In short: this restricts WHICH x64dbg commands run, not what those
+        commands are then allowed to touch. Prefer the dedicated tools
         (x64dbg_set_breakpoint, x64dbg_read_memory, ...) wherever one exists;
         reach for this only for analysis commands nothing else covers.
 
         Args:
             command: x64dbg command string (e.g. "dis.prev(rip, 5)", "findall 0, E8").
-                Rejected unless its first token is on the tool-layer allowlist.
+                Rejected unless the first token of every ';'-separated segment
+                is on the tool-layer allowlist.
 
         Returns:
             Command execution result, or an error string naming the refused token.
@@ -3885,18 +3925,37 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             if not command or not command.strip():
                 return "Error: Command cannot be empty"
 
-            # Security: only allow commands from the curated safe allowlist.
-            # Extract the command name (first word, before any space/paren/comma).
-            cmd_stripped = command.strip()
-            # Handle commands like "dis.prev(rip, 5)" -> "dis.prev"
-            first_token = cmd_stripped.split()[0].split("(")[0].split(",")[0].lower()
-            if first_token not in allowed_command_prefixes:
-                return (
-                    f"Error: Command '{first_token}' is not in the allowed command list. "
-                    f"Only safe analysis and navigation commands are permitted. "
-                    f"Use dedicated tools (x64dbg_set_breakpoint, x64dbg_read_memory, etc.) "
-                    f"for other operations."
-                )
+            # F-9/F-16: validate what x64dbg will actually DISPATCH, not what
+            # the caller typed. x64dbg_command_segments applies the structural
+            # rules (NUL, CR/LF, leading '$', unterminated quote) and returns
+            # the segments cmdsplit() would produce, mirroring its quote/escape
+            # state machine character for character. A splitter that disagreed
+            # with x64dbg's would itself be a bypass: a segment we do not see is
+            # a segment we do not check. Imported locally so the security helper
+            # lives in one place -- next to the bridge that also uses it.
+            from src.engines.dynamic.x64dbg.bridge import (
+                x64dbg_command_name,
+                x64dbg_command_segments,
+            )
+
+            try:
+                segments = x64dbg_command_segments(command)
+            except ValueError as parse_error:
+                return f"Error: {parse_error}"
+
+            # Security: EVERY segment must name an allowlisted command. One bad
+            # segment refuses the whole string -- partial execution of a
+            # multi-command string is not a thing we can offer, since x64dbg
+            # would already have run the earlier segments by the time we knew.
+            for segment in segments:
+                first_token = x64dbg_command_name(segment)
+                if first_token not in allowed_command_prefixes:
+                    return (
+                        f"Error: Command '{first_token}' is not in the allowed command list. "
+                        f"Only safe analysis and navigation commands are permitted. "
+                        f"Use dedicated tools (x64dbg_set_breakpoint, x64dbg_read_memory, etc.) "
+                        f"for other operations."
+                    )
 
             bridge = get_x64dbg_bridge()
             result = bridge.execute_command(command.strip())

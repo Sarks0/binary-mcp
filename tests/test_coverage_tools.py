@@ -72,6 +72,15 @@ def _context(functions, exports=None):
     }
 
 
+def _payload(result):
+    """Tools return a plain dict; FastMCP serializes it at the boundary.
+
+    Accepting either shape keeps these assertions honest whichever side of the
+    protocol they are read from.
+    """
+    return json.loads(result) if isinstance(result, str) else result
+
+
 class _App:
     """Minimal FastMCP stand-in that captures the registered callables."""
 
@@ -137,24 +146,49 @@ def _assert_contract_invariants(payload):
     assert payload["reviewed_in_scope"] <= payload["reviewed"]
 
 
+class TestWireShape:
+    """The tools must return a dict, not a JSON string.
+
+    FastMCP puts a ``str`` return under ``structuredContent.result`` *as a
+    string*, so a consumer that peels one envelope layer lands on a string and
+    its flat-object assumption breaks. Returning the object itself keeps every
+    transport path flat.
+    """
+
+    @pytest.mark.parametrize(
+        "call",
+        [
+            lambda t: t.status(binary_id="f" * 64),
+            lambda t: t.next(binary_id="f" * 64),
+            lambda t: t.index(binary_path=t.path),
+            lambda t: t.mark(functions="0x1", binary_id="f" * 64),
+        ],
+    )
+    def test_tools_return_flat_objects(self, tools, call):
+        result = call(tools)
+        assert isinstance(result, dict), f"got {type(result).__name__}"
+        assert "result" not in result
+        assert "data" not in result
+
+
 class TestColdStart:
     def test_unindexed_binary_returns_null_counts_not_zero(self, tools):
         """Zero here reads as 'complete' and would terminate a review loop on a
         binary nobody has looked at -- the exact bug this store exists to fix.
         """
-        payload = json.loads(tools.status(binary_id="f" * 64))
+        payload = _payload(tools.status(binary_id="f" * 64))
         assert payload["status"] == "not_indexed"
         for field in COUNT_FIELDS:
             assert payload[field] is None, f"{field} must be null, got {payload[field]!r}"
 
     def test_unindexed_response_is_still_well_formed(self, tools):
-        payload = json.loads(tools.status(binary_id="f" * 64))
+        payload = _payload(tools.status(binary_id="f" * 64))
         assert STATUS_FIELDS <= set(payload)
         assert payload["binary_id"] == "f" * 64
         assert payload["scope_version"] == SCOPE_VERSION
 
     def test_worklist_on_unindexed_binary_is_not_terminal(self, tools):
-        payload = json.loads(tools.next(binary_id="f" * 64))
+        payload = _payload(tools.next(binary_id="f" * 64))
         assert payload["status"] == "not_indexed"
         assert payload["functions"] == []
         assert payload["remaining_after"] is None
@@ -163,7 +197,7 @@ class TestColdStart:
         """Reporting not_indexed for a binary that is already fully analyzed
         would strand every previously-cached target."""
         tools.three_functions()
-        payload = json.loads(tools.status(binary_id=tools.binary_id))
+        payload = _payload(tools.status(binary_id=tools.binary_id))
         assert payload["status"] == "ready"
         assert payload["total"] == 3
 
@@ -171,7 +205,7 @@ class TestColdStart:
 class TestStatusShape:
     def test_field_names_and_invariants(self, tools):
         tools.three_functions()
-        payload = json.loads(tools.status(binary_id=tools.binary_id))
+        payload = _payload(tools.status(binary_id=tools.binary_id))
         assert STATUS_FIELDS <= set(payload)
         _assert_contract_invariants(payload)
         assert payload["total"] == 3
@@ -182,39 +216,39 @@ class TestStatusShape:
 
     def test_image_base_is_prefixed_hex(self, tools):
         tools.three_functions()
-        payload = json.loads(tools.status(binary_id=tools.binary_id))
+        payload = _payload(tools.status(binary_id=tools.binary_id))
         assert payload["image_base"] == "0x140000000"
 
     def test_scope_version_is_reported(self, tools):
         tools.three_functions()
-        payload = json.loads(tools.status(binary_id=tools.binary_id))
+        payload = _payload(tools.status(binary_id=tools.binary_id))
         assert payload["scope_version"] == SCOPE_VERSION
 
     def test_binary_path_resolution(self, tools):
         tools.three_functions()
-        payload = json.loads(tools.status(binary_path=tools.path))
+        payload = _payload(tools.status(binary_path=tools.path))
         assert payload["binary_id"] == tools.binary_id
         assert payload["status"] == "ready"
 
     def test_active_session_binary_is_the_fallback(self, tools):
         tools.three_functions()
         tools.sessions._current_binary_path = tools.path
-        payload = json.loads(tools.status())
+        payload = _payload(tools.status())
         assert payload["binary_id"] == tools.binary_id
 
     def test_no_resolvable_binary_is_an_error(self, tools):
-        payload = json.loads(tools.status())
+        payload = _payload(tools.status())
         assert "error" in payload
 
     def test_malformed_binary_id_is_an_error(self, tools):
-        payload = json.loads(tools.status(binary_id="not-a-sha"))
+        payload = _payload(tools.status(binary_id="not-a-sha"))
         assert "error" in payload
 
     def test_counts_track_marks(self, tools):
         tools.three_functions()
         tools.status(binary_id=tools.binary_id)
         tools.store.mark_reviewed(tools.binary_id, ["0x140002000"], tool="t")
-        payload = json.loads(tools.status(binary_id=tools.binary_id))
+        payload = _payload(tools.status(binary_id=tools.binary_id))
         _assert_contract_invariants(payload)
         assert payload["reviewed"] == 1
         assert payload["reviewed_in_scope"] == 1
@@ -231,7 +265,7 @@ class TestWorklist:
                 _func("b", "140002000"),
             ]
         )
-        payload = json.loads(tools.next(binary_id=tools.binary_id, count=10))
+        payload = _payload(tools.next(binary_id=tools.binary_id, count=10))
         addresses = [f["address"] for f in payload["functions"]]
         assert addresses == ["0x140001000", "0x140002000", "0x140003000"]
 
@@ -239,16 +273,16 @@ class TestWorklist:
         """A client that crashes mid-batch and re-calls must get the same head
         of the queue."""
         tools.three_functions()
-        first = json.loads(tools.next(binary_id=tools.binary_id, count=2))
-        second = json.loads(tools.next(binary_id=tools.binary_id, count=2))
+        first = _payload(tools.next(binary_id=tools.binary_id, count=2))
+        second = _payload(tools.next(binary_id=tools.binary_id, count=2))
         assert first["functions"] == second["functions"]
 
     def test_marking_makes_forward_progress(self, tools):
         tools.three_functions()
-        first = json.loads(tools.next(binary_id=tools.binary_id, count=1))
+        first = _payload(tools.next(binary_id=tools.binary_id, count=1))
         head = first["functions"][0]["address"]
         tools.store.mark_reviewed(tools.binary_id, [head], tool="t")
-        second = json.loads(tools.next(binary_id=tools.binary_id, count=1))
+        second = _payload(tools.next(binary_id=tools.binary_id, count=1))
         assert second["functions"][0]["address"] != head
 
     def test_terminal_condition(self, tools):
@@ -257,20 +291,20 @@ class TestWorklist:
         tools.store.mark_reviewed(
             tools.binary_id, ["0x140001000", "0x140002000"], tool="t"
         )
-        payload = json.loads(tools.next(binary_id=tools.binary_id, count=10))
+        payload = _payload(tools.next(binary_id=tools.binary_id, count=10))
         assert payload["functions"] == []
         assert payload["remaining_after"] == 0
         assert payload["status"] == "ready"
 
     def test_remaining_after_accounts_for_the_batch(self, tools):
         tools.three_functions()
-        payload = json.loads(tools.next(binary_id=tools.binary_id, count=1))
+        payload = _payload(tools.next(binary_id=tools.binary_id, count=1))
         assert payload["returned"] == 1
         assert payload["remaining_after"] == 1
 
     def test_function_record_shape(self, tools):
         tools.three_functions()
-        payload = json.loads(tools.next(binary_id=tools.binary_id, count=1))
+        payload = _payload(tools.next(binary_id=tools.binary_id, count=1))
         entry = payload["functions"][0]
         assert set(entry) == {"address", "name", "size", "in_scope", "scope_reason"}
         assert entry["address"].startswith("0x")
@@ -278,8 +312,8 @@ class TestWorklist:
 
     def test_scope_all_includes_excluded_functions(self, tools):
         tools.three_functions()
-        in_scope = json.loads(tools.next(binary_id=tools.binary_id, count=10))
-        every = json.loads(tools.next(binary_id=tools.binary_id, count=10, scope="all"))
+        in_scope = _payload(tools.next(binary_id=tools.binary_id, count=10))
+        every = _payload(tools.next(binary_id=tools.binary_id, count=10, scope="all"))
         assert len(in_scope["functions"]) == 2
         assert len(every["functions"]) == 3
         thunk = next(f for f in every["functions"] if f["address"] == "0x140003000")
@@ -288,25 +322,25 @@ class TestWorklist:
 
     def test_invalid_scope_is_an_error(self, tools):
         tools.three_functions()
-        payload = json.loads(tools.next(binary_id=tools.binary_id, scope="sideways"))
+        payload = _payload(tools.next(binary_id=tools.binary_id, scope="sideways"))
         assert "error" in payload
 
     def test_count_out_of_range_is_an_error(self, tools):
         tools.three_functions()
-        assert "error" in json.loads(tools.next(binary_id=tools.binary_id, count=0))
-        assert "error" in json.loads(tools.next(binary_id=tools.binary_id, count=10_000))
+        assert "error" in _payload(tools.next(binary_id=tools.binary_id, count=0))
+        assert "error" in _payload(tools.next(binary_id=tools.binary_id, count=10_000))
 
 
 class TestIndexTool:
     def test_index_reports_counts(self, tools):
         tools.three_functions()
-        payload = json.loads(tools.index(binary_path=tools.path))
+        payload = _payload(tools.index(binary_path=tools.path))
         assert payload["status"] == "ready"
         _assert_contract_invariants(payload)
         assert payload["total"] == 3
 
     def test_index_without_analysis_is_an_error(self, tools):
-        payload = json.loads(tools.index(binary_path=tools.path))
+        payload = _payload(tools.index(binary_path=tools.path))
         assert "error" in payload
         assert payload["status"] == "not_indexed"
 
@@ -314,14 +348,14 @@ class TestIndexTool:
         tools.three_functions()
         tools.index(binary_path=tools.path)
         tools.store.mark_reviewed(tools.binary_id, ["0x140002000"], tool="t")
-        payload = json.loads(tools.index(binary_path=tools.path, force=True))
+        payload = _payload(tools.index(binary_path=tools.path, force=True))
         assert payload["reviewed"] == 1
 
 
 class TestMarkTool:
     def test_manual_mark_round_trip(self, tools):
         tools.three_functions()
-        payload = json.loads(
+        payload = _payload(
             tools.mark(
                 functions="0x140002000",
                 binary_id=tools.binary_id,
@@ -337,7 +371,7 @@ class TestMarkTool:
     def test_second_mark_is_idempotent(self, tools):
         tools.three_functions()
         tools.mark(functions="0x140002000", binary_id=tools.binary_id)
-        payload = json.loads(
+        payload = _payload(
             tools.mark(functions="0x140002000", binary_id=tools.binary_id)
         )
         assert payload["marked"] == []
@@ -346,19 +380,19 @@ class TestMarkTool:
 
     def test_unknown_address_is_reported_not_counted(self, tools):
         tools.three_functions()
-        payload = json.loads(tools.mark(functions="0xdeadbeef", binary_id=tools.binary_id))
+        payload = _payload(tools.mark(functions="0xdeadbeef", binary_id=tools.binary_id))
         assert payload["unknown"] == ["0xdeadbeef"]
         assert payload["reviewed"] == 0
 
     def test_function_names_are_rejected(self, tools):
         tools.three_functions()
-        payload = json.loads(tools.mark(functions="helper", binary_id=tools.binary_id))
+        payload = _payload(tools.mark(functions="helper", binary_id=tools.binary_id))
         assert "error" in payload
 
     def test_unmark(self, tools):
         tools.three_functions()
         tools.mark(functions="0x140002000", binary_id=tools.binary_id)
-        payload = json.loads(
+        payload = _payload(
             tools.mark(
                 functions="0x140002000", binary_id=tools.binary_id, reviewed=False
             )
@@ -366,7 +400,7 @@ class TestMarkTool:
         assert payload["reviewed"] == 0
 
     def test_mark_before_analysis_is_an_error(self, tools):
-        payload = json.loads(tools.mark(functions="0x140002000", binary_id=tools.binary_id))
+        payload = _payload(tools.mark(functions="0x140002000", binary_id=tools.binary_id))
         assert "error" in payload
 
 

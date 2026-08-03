@@ -18,8 +18,18 @@ unfalsifiable. With one it is arithmetic.
 | `coverage_index` | explicit (re)index; normally automatic |
 | `mark_function_reviewed` | manual mark / unmark, optional findings note |
 
-These four return **JSON**, unlike the rest of the server, because consumers
-bind to the field names and assert invariants on the counts.
+These four return a **flat JSON object**, unlike the rest of the server, because
+consumers bind to the field names and assert invariants on the counts.
+
+They return a `dict`, not a serialized string, and that is load-bearing: FastMCP
+puts a `str` return under `structuredContent.result` *as a string*, so a client
+that peels one envelope layer lands on a string and its flat-object assumption
+breaks. Returning the object keeps every transport path flat —
+`structuredContent`, `.data` and `content[0].text` all carry the same object,
+with no `result` / `data` / `coverage` wrapper.
+`tests/test_coverage_tools.py::TestWireShape` guards this.
+
+Errors use the same flat shape, carrying an `error` key.
 
 ### `get_coverage_status(binary_id=None, binary_path=None)`
 
@@ -50,12 +60,20 @@ returning bad numbers:
 - `in_scope_total <= total`, `reviewed_in_scope <= reviewed`
 - all six counts are non-negative integers
 
-`status` is `ready` | `not_indexed` | `indexing` | `stale`. On anything other
-than `ready` **all six counts are null, never zero.** Zero would read as
+`status` is `ready` | `not_indexed` | `indexing` | `stale`.
+
+On `not_indexed`, **all six counts are null, never zero.** Zero would read as
 "complete" and terminate a review loop on a binary nobody has looked at, which
-is the precise failure this store exists to prevent. Treat a non-ready status
-as "cannot conclude", never as "done". (`indexing` is reserved; indexing is
-synchronous today and never returns it.)
+is the precise failure this store exists to prevent. Treat any non-`ready`
+status as "cannot conclude", never as "done".
+
+`stale` means the analysis cache this ledger counted has been evicted. It still
+returns the last known counts — they are the best available truth and they
+satisfy every invariant above — but they are not current, so they must not
+settle a closure decision. The rule for a consumer asserting invariants:
+assert whenever `total is not None`, not only on `ready`.
+
+`indexing` is reserved; indexing is synchronous today and never returns it.
 
 There is deliberately no `reviewed_list` on this response — an 885-entry array
 on every poll saturates a model's context. Use `get_next_unreviewed`.
@@ -90,8 +108,17 @@ Seeing a function in a list is not reviewing it, and a regex sweep that marked
 is there to prevent. Over-marking is the dangerous direction; under-marking
 just means the operator re-marks.
 
-Marking is idempotent: re-decompiling does not double-count and does not
-rewrite the original timestamp or the tool that first recorded it.
+The rule, stated for the operator: **a function is marked reviewed only if its
+body — or a semantic analysis of that specific function — was returned to the
+caller.** Never merely because the server read or produced its pseudocode
+internally. So `analyze_binary` decompiles the whole binary and marks nothing;
+`decompile_function` on a structural cache runs a targeted Ghidra decompile
+internally and marks only the function you asked for, which is also the one you
+get back; `batch_decompile` marks only what it actually printed.
+
+Marking is idempotent: re-decompiling does not double-count, and `reviewed_at`
+/ `reviewed_by` record the *first* tool that marked it and are never
+overwritten.
 
 Use `mark_function_reviewed` for work done outside binary-mcp — a Ghidra GUI
 session, objdump, a debugger — and to attach a findings note.

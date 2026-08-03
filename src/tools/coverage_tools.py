@@ -31,7 +31,6 @@ false completion this store exists to prevent.
 
 from __future__ import annotations
 
-import json
 import logging
 
 from src.engines.static.ghidra.coverage_store import (
@@ -53,12 +52,9 @@ logger = logging.getLogger(__name__)
 MAX_WORKLIST = 500
 
 
-def _json(payload: dict) -> str:
-    return json.dumps(payload, indent=2)
-
-
-def _error(message: str, **extra) -> str:
-    return _json({"error": message, **extra})
+def _error(message: str, **extra) -> dict:
+    """Errors share the payload shape: a flat object carrying an `error` key."""
+    return {"error": message, **extra}
 
 
 def register_coverage_tools(app, session_manager, cache, runner=None):
@@ -96,7 +92,7 @@ def register_coverage_tools(app, session_manager, cache, runner=None):
     def get_coverage_status(
         binary_id: str | None = None,
         binary_path: str | None = None,
-    ) -> str:
+    ) -> dict:
         """
         Report review coverage for one binary: the denominator and what's left.
 
@@ -171,7 +167,7 @@ def register_coverage_tools(app, session_manager, cache, runner=None):
                 "Binary has not been analyzed. Run analyze_binary first; "
                 "coverage indexes automatically from the analysis cache."
             )
-            return _json(base)
+            return base
 
         payload = dict(base)
         payload.update(
@@ -186,7 +182,7 @@ def register_coverage_tools(app, session_manager, cache, runner=None):
             }
         )
         payload.update(store.counts(record))
-        return _json(payload)
+        return payload
 
     @app.tool()
     def get_next_unreviewed(
@@ -194,7 +190,7 @@ def register_coverage_tools(app, session_manager, cache, runner=None):
         count: int = 20,
         scope: str = "in_scope",
         binary_path: str | None = None,
-    ) -> str:
+    ) -> dict:
         """
         Return the next batch of functions that have not been reviewed yet.
 
@@ -243,16 +239,14 @@ def register_coverage_tools(app, session_manager, cache, runner=None):
             return _error(f"Coverage lookup failed: {exc}")
 
         if record is None:
-            return _json(
-                {
-                    "binary_id": resolved_id,
-                    "scope": scope,
-                    "returned": 0,
-                    "remaining_after": None,
-                    "functions": [],
-                    "status": status,
-                }
-            )
+            return {
+                "binary_id": resolved_id,
+                "scope": scope,
+                "returned": 0,
+                "remaining_after": None,
+                "functions": [],
+                "status": status,
+            }
 
         functions = record.get("functions") or {}
         pending = [
@@ -263,31 +257,29 @@ def register_coverage_tools(app, session_manager, cache, runner=None):
         pending.sort(key=lambda item: item[0])
 
         batch = pending[:count]
-        return _json(
-            {
-                "binary_id": resolved_id,
-                "scope": scope,
-                "returned": len(batch),
-                "remaining_after": len(pending) - len(batch),
-                "functions": [
-                    {
-                        "address": addr,
-                        "name": entry.get("name"),
-                        "size": entry.get("size"),
-                        "in_scope": bool(entry.get("in_scope")),
-                        "scope_reason": entry.get("scope_reason"),
-                    }
-                    for _, addr, entry in batch
-                ],
-                "status": status,
-            }
-        )
+        return {
+            "binary_id": resolved_id,
+            "scope": scope,
+            "returned": len(batch),
+            "remaining_after": len(pending) - len(batch),
+            "functions": [
+                {
+                    "address": addr,
+                    "name": entry.get("name"),
+                    "size": entry.get("size"),
+                    "in_scope": bool(entry.get("in_scope")),
+                    "scope_reason": entry.get("scope_reason"),
+                }
+                for _, addr, entry in batch
+            ],
+            "status": status,
+        }
 
     @app.tool()
     def coverage_index(
         binary_path: str,
         force: bool = False,
-    ) -> str:
+    ) -> dict:
         """
         Build or rebuild the coverage index for an already-analyzed binary.
 
@@ -340,7 +332,7 @@ def register_coverage_tools(app, session_manager, cache, runner=None):
             "status": "ready",
         }
         payload.update(store.counts(record))
-        return _json(payload)
+        return payload
 
     @app.tool()
     def mark_function_reviewed(
@@ -349,7 +341,7 @@ def register_coverage_tools(app, session_manager, cache, runner=None):
         binary_path: str | None = None,
         note: str | None = None,
         reviewed: bool = True,
-    ) -> str:
+    ) -> dict:
         """
         Manually mark functions reviewed (or clear the mark).
 
@@ -416,6 +408,6 @@ def register_coverage_tools(app, session_manager, cache, runner=None):
 
         payload = {"binary_id": resolved_id, "status": status, **result}
         payload.update(store.counts(refreshed))
-        return _json(payload)
+        return payload
 
     logger.info("Registered 4 coverage tools")

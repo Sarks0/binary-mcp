@@ -228,6 +228,16 @@ _BANG_MODULE_PATH_RE = re.compile(r"^!.*[\\/:.]")
 # names the specific primitive.
 _DENY_ARGFORM: tuple[tuple[re.Pattern[str], str], ...] = (
     (
+        # '??' evaluates a C++ expression, and that evaluator supports
+        # ASSIGNMENT -- '?? *(char*)0x401000 = 0x90' writes target memory. The
+        # allowlist admits '??' as a read-only evaluator on the rationale that
+        # the write family is e*, which this misses entirely. Allow comparisons
+        # (==, !=, <=, >=) and reject a bare '=' anywhere in the expression.
+        re.compile(r"^\s*\?\?.*(?<![=!<>])=(?!=)"),
+        "'??' with an assignment is forbidden: the expression evaluator "
+        "writes target memory. Use the read-only comparison forms",
+    ),
+    (
         # Script-file include operators: $<, $><, $$<, $$><, $$>a< all run an
         # arbitrary debugger command file from disk. Anchored at the subcommand
         # start so a legitimate pseudo-register use ("@$teb") is untouched.
@@ -322,15 +332,38 @@ def parse_compound(command: str) -> list[str]:
     in_dq = False
     in_sq = False
     i = 0
+
+    def _leading_is_carrier() -> bool:
+        """True if the part being built starts with a command-string carrier.
+
+        Brace blocks and ``${...}`` interpolation are constructs of the carrier
+        commands (``.foreach``, ``.for``, ``.if``, the breakpoint family). For
+        every OTHER command a ``{`` is just an ordinary character to WinDbg.
+
+        Suppressing ';' splitting inside braces unconditionally -- which is what
+        this tokenizer used to do -- therefore created a blind spot precisely
+        where nothing compensated for it: validate_command recurses into braces
+        only for carriers, so for a non-carrier the brace content was neither
+        split nor recursed into. ``lm {;.shell calc}``, ``k {;.shell calc}``,
+        ``!analyze -v {;.shell calc}`` and ``r {;q}`` all reached the debugger
+        behind a harmless leading token. Gating the suppression on the leading
+        token closes that: for a non-carrier the braces stop being protective,
+        the ';' splits as cdb would split it, and the payload is validated as
+        its own subcommand.
+        """
+        return _first_token("".join(current)) in _COMMAND_STRING_CARRIERS
+
     while i < len(command):
         ch = command[i]
-        # ${...} is variable interpolation in .foreach / .for, not a block.
+        # ${...} is variable interpolation in .foreach / .for, not a block --
+        # and only inside those carriers, hence the same gate as braces below.
         if (
             not in_dq
             and not in_sq
             and ch == "$"
             and i + 1 < len(command)
             and command[i + 1] == "{"
+            and _leading_is_carrier()
         ):
             j = command.find("}", i + 2)
             if j != -1:
@@ -353,10 +386,13 @@ def parse_compound(command: str) -> list[str]:
         elif not in_dq and ch == "'":
             in_sq = not in_sq
             current.append(ch)
-        elif not in_dq and not in_sq and ch == "{":
+        elif not in_dq and not in_sq and ch == "{" and (depth > 0 or _leading_is_carrier()):
+            # depth > 0 keeps nested braces inside an already-open carrier block
+            # balanced; the carrier test decides whether the OUTERMOST brace is
+            # protective at all. See _leading_is_carrier for why.
             depth += 1
             current.append(ch)
-        elif not in_dq and not in_sq and ch == "}":
+        elif not in_dq and not in_sq and ch == "}" and depth > 0:
             depth = max(0, depth - 1)
             current.append(ch)
         elif not in_dq and not in_sq and depth == 0 and ch in ";\n\r":
@@ -381,8 +417,21 @@ def _first_token(subcommand: str) -> str:
     s = subcommand.strip()
     if not s:
         return ""
-    m = re.match(r"\S+", s)
-    return m.group(0).lower() if m else ""
+    # Split on ASCII space/tab only, and case-fold ASCII only.
+    #
+    # Python's \S treats VT, FF, NEL (U+0085), NBSP and U+2028 as whitespace
+    # while cdb does not, so 'lm\x0b.dvalloc 1000' presented to this validator
+    # as a bare 'lm' with arguments and to the debugger as something else
+    # entirely. And str.lower() performs UNICODE case folding, so U+212A
+    # (KELVIN SIGN) lowered to 'k' and satisfied the k-family stack pattern.
+    # _structural_problem now rejects non-ASCII and stray control characters
+    # outright, so neither reaches here; these two narrowings make the
+    # tokenizer correct on its own rather than relying on that alone.
+    m = re.match(r"[^ \t]+", s)
+    if not m:
+        return ""
+    token = m.group(0)
+    return token.lower() if token.isascii() else token
 
 
 def _structural_problem(command: str) -> str | None:
@@ -406,6 +455,32 @@ def _structural_problem(command: str) -> str | None:
     cdb, so the validator refuses it. Well-formed commands are unaffected, and
     the debugger would reject most of these itself.
     """
+    # Character-set gate, checked before any structural parsing.
+    #
+    # WinDbg commands are ASCII. Anything else is either a homoglyph attack on
+    # this validator or garbage cdb will not execute, and admitting it only
+    # creates ways for the two tokenizers to disagree:
+    #   * U+212A KELVIN SIGN lowercases to 'k' under Unicode case folding, so
+    #     'Kb 401000' satisfied the k-family stack pattern here while cdb, which
+    #     does not case-fold, saw a different command.
+    #   * VT, FF, NEL (U+0085), NBSP and U+2028 are whitespace to Python's \S
+    #     but not to cdb, so 'lm<VT>.dvalloc 1000' read as a bare 'lm' here.
+    # Refusing both classes outright is fail-closed and costs nothing: no
+    # legitimate debugger command needs them. Tab, newline and CR are exempt --
+    # they are real separators this validator handles deliberately.
+    for ch in command:
+        if not ch.isascii():
+            return (
+                f"non-ASCII character {ch!r} (U+{ord(ch):04X}) in command; "
+                "WinDbg commands are ASCII and look-alike characters are a "
+                "known way to desynchronise validation from the debugger"
+            )
+        if ord(ch) < 0x20 and ch not in "\t\n\r":
+            return (
+                f"control character U+{ord(ch):04X} in command; it separates "
+                "tokens for this validator but not for the debugger"
+            )
+
     depth = 0
     in_dq = False
     in_sq = False

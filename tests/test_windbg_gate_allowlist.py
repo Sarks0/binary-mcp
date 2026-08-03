@@ -566,3 +566,109 @@ def test_tool_layer_no_longer_runs_a_second_substring_gate(windbg_tools):
     for cmd in (".printf \"x\"", ".foreach (a {!process 0 0}) {!handle ${a}}",
                 ".outmask /l verbose", ".formats 0x41", ".tlist", ".bugcheck"):
         assert_allowed(cmd)
+
+
+class TestBraceBlindSpot:
+    """Brace suppression must be gated on the leading token.
+
+    parse_compound stopped splitting on ';' inside {...} for EVERY command,
+    but validate_command recurses into braces only for the carriers -- so for
+    a non-carrier the brace content was neither split nor recursed into, and
+    a payload rode through behind a harmless leading token. Braces are only
+    meaningful to WinDbg for the carriers, so the suppression is now gated the
+    same way the recursion is.
+    """
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            "lm {;.shell calc}",
+            "k {;.shell calc}",
+            "!analyze -v {;.shell calc}",
+            "r {;q}",
+            "dt nt!_EPROCESS {;.dvalloc 1000}",
+            "db 401000 {;.logappend c:/x.txt}",
+        ],
+    )
+    def test_non_carrier_brace_payload_is_refused(self, payload):
+        ok, reason = validate_command(payload)
+        assert ok is False, f"{payload!r} reached the debugger"
+        assert reason
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            "lm ${x ; .dvalloc 1000}",
+            "k ${a ; .shell calc}",
+        ],
+    )
+    def test_non_carrier_interpolation_payload_is_refused(self, payload):
+        ok, reason = validate_command(payload)
+        assert ok is False, f"{payload!r} reached the debugger"
+        assert reason
+
+    def test_carrier_blocks_still_work(self):
+        ok, reason = validate_command(".foreach (a {!process 0 0}) {!handle ${a}}")
+        assert ok is True, reason
+
+
+class TestCharacterSetDesync:
+    """Non-ASCII and stray control characters are refused outright.
+
+    U+212A KELVIN SIGN lowercases to 'k' under Unicode case folding and so
+    satisfied the k-family stack pattern; VT/FF/NEL/NBSP/U+2028 are whitespace
+    to Python's \\S but not to cdb. Both let the validator and the debugger
+    read the same bytes differently.
+    """
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            "\u212ab 401000",       # KELVIN SIGN + b -> folds to "kb"
+            "\u212a 401000",        # bare KELVIN SIGN
+            "l\u043c 401000",       # Cyrillic em, homoglyph of "lm"
+            "lm\x0b.dvalloc 1000",  # vertical tab
+            "lm\x0c.dvalloc 1000",  # form feed
+            "lm\u0085.dvalloc 1000",  # NEL
+            "lm\u00a0.dvalloc 1000",  # NBSP
+            "lm\u2028.dvalloc 1000",  # line separator
+        ],
+    )
+    def test_desyncing_characters_are_refused(self, payload):
+        ok, reason = validate_command(payload)
+        assert ok is False, f"{payload!r} reached the debugger"
+        assert reason
+
+    @pytest.mark.parametrize("payload", ["Kb 401000", "LM", "K", "lm", "dt nt!_EPROCESS"])
+    def test_ascii_case_insensitivity_is_preserved(self, payload):
+        ok, reason = validate_command(payload)
+        assert ok is True, f"{payload!r} was refused: {reason}"
+
+
+class TestExpressionAssignment:
+    """'??' evaluates C++ expressions and that evaluator supports assignment."""
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            "?? *(char*)0x401000 = 0x90",
+            "??  *(int*)0x401000=1",
+        ],
+    )
+    def test_assignment_is_refused(self, payload):
+        ok, reason = validate_command(payload)
+        assert ok is False, f"{payload!r} reached the debugger"
+        assert reason
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            "?? sizeof(nt!_EPROCESS)",
+            "?? @$peb",
+            "?? 1 == 1",
+            "?? 1 != 2",
+        ],
+    )
+    def test_read_only_expressions_still_work(self, payload):
+        ok, reason = validate_command(payload)
+        assert ok is True, f"{payload!r} was refused: {reason}"

@@ -473,6 +473,49 @@ class TestIndexing:
         assert status == "ready"
         assert record["scope_version"] == SCOPE_VERSION
 
+    def test_a_v1_record_is_rebuilt_and_its_shrunken_scope_repaired(self, lab):
+        """The scope fix is worthless on existing records without the bump.
+
+        `scope_version` IS the rebuild trigger. A record written under
+        `fwd-bfs-v1` carries that version's shrunken scope -- a cycle reached
+        only indirectly, and everything below it, flagged out. If the constant
+        had stayed at v1 the mismatch would never fire and the shrink would be
+        permanent on every already-indexed binary.
+        """
+        ctx = _context(
+            [
+                _func("entry", "140001000"),
+                _func("DoCollect", "140002000", called=["140003000"]),
+                _func("FinishConcurrent", "140003000",
+                      called=["140002000", "140004000"]),
+                _func("MarkInterior", "140004000"),
+            ],
+            exports=[{"address": "140001000", "name": "entry", "type": "Function"}],
+        )
+        lab.analyze(ctx)
+        lab.store.index(lab.binary_id, lab.path)
+
+        # Rewind to what v1 would have written: the cycle and its subtree out
+        # of scope, stamped with the version that produced it.
+        stored = lab.store.read(lab.binary_id)
+        stored["scope_version"] = "fwd-bfs-v1"
+        for addr in ("0x140002000", "0x140003000", "0x140004000"):
+            stored["functions"][addr]["in_scope"] = False
+            stored["functions"][addr]["scope_reason"] = "excluded:unreachable"
+        # A mark taken under v1 must survive the migration.
+        stored["functions"]["0x140001000"]["reviewed"] = True
+        stored["functions"]["0x140001000"]["reviewed_at"] = "2026-08-03T12:00:00Z"
+        stored["functions"]["0x140001000"]["reviewed_by"] = "decompile_function"
+        lab.store.write(stored)
+
+        record, status = lab.store.ensure_indexed(lab.binary_id, lab.path)
+        assert status == "ready"
+        assert record["scope_version"] == SCOPE_VERSION
+        assert lab.store.counts(record)["in_scope_total"] == 4
+        assert record["functions"]["0x140004000"]["in_scope"]
+        assert record["functions"]["0x140001000"]["reviewed"] is True
+        assert record["functions"]["0x140001000"]["reviewed_at"] == "2026-08-03T12:00:00Z"
+
     def test_missing_analysis_cache_reports_stale_not_ready(self, lab):
         lab.analyze(_context([_func("entry", "140001000")]))
         lab.store.index(lab.binary_id, lab.path)

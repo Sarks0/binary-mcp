@@ -47,7 +47,7 @@ Errors use the same flat shape, carrying an `error` key.
   "remaining": 250,
   "remaining_in_scope": 242,
   "scope_description": "forward BFS over cached called_functions from …",
-  "scope_version": "fwd-bfs-v1",
+  "scope_version": "fwd-bfs-v2",
   "indexed_at": "2026-08-03T21:30:04Z",
   "status": "ready"
 }
@@ -171,8 +171,12 @@ the honest number, not a tighter one obtained by dropping the indirect surface.
 `remaining_in_scope == 0` therefore means the in-scope worklist is finished,
 **not** that the binary is. Full closure still consults `remaining`.
 
-`scope_version` records the method (`fwd-bfs-v1`). It changes whenever scope
-logic changes, and a consumer should invalidate its mirror when it does.
+`scope_version` records the method (`fwd-bfs-v2`). It changes whenever scope
+logic changes, and a consumer should invalidate its mirror when it does. It
+is also the rebuild trigger: a stored record carrying an older string is
+re-indexed on the next status query, marks preserved. `v1` is the pre-
+fixpoint walk described above, and any record still stamped with it is
+carrying that shrunken scope until it is rebuilt.
 
 ## Storage
 

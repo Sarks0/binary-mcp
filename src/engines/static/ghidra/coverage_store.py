@@ -52,8 +52,16 @@ SCHEMA_VERSION = 1
 
 # Machine-readable identifier for the reachability method behind `in_scope`.
 # Bump on ANY change to how scope is computed -- consumers invalidate their
-# mirror when this string changes.
-SCOPE_VERSION = "fwd-bfs-v1"
+# mirror when this string changes, and `_ensure_current` rebuilds any record
+# still carrying an older one.
+#
+# v2: cycle members are promoted to roots to a fixpoint. v1 treated "no direct
+# caller anywhere" as the only indirect-root signal, so a call cycle reached
+# only indirectly was never entered and its entire subtree fell out as
+# `excluded:unreachable` -- a shrunken denominator. Leaving the string at v1
+# would strand every record built before the fix, because this string IS the
+# rebuild trigger.
+SCOPE_VERSION = "fwd-bfs-v2"
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 

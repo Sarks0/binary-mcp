@@ -326,7 +326,38 @@ void InitCoverageLock() {
 }
 
 // Logging helpers
-void LogInfo(const char* format, ...) {
+// ---------------------------------------------------------------------------
+// Format-string checking for the log wrappers (CWE-686 / MSVC C4477)
+//
+// These are variadic wrappers around vsnprintf, and MSVC applies its C4477
+// format/argument check only to the printf family it recognises. It therefore
+// could not see ANY call site here -- which is exactly how twenty
+// `%llx`-with-`duint` bugs survived: the identical mistake in a direct
+// snprintf() was flagged on the very first x86 build, while the same mistake
+// inside LogInfo() was silent.
+//
+// `duint` is 64-bit on x64 and 32-bit on x86, so `%llx` on the 32-bit build
+// read eight bytes where four were pushed: a garbage high dword AND every
+// following argument shifted. In a call like
+// LogInfo("... 0x%llx (type: %s)", address, str) that shift hands `%s` a
+// non-pointer -- a crash, not merely wrong output.
+//
+// _Printf_format_string_ is what MSVC offers here. Be precise about its reach:
+// it drives /analyze (and IntelliSense), NOT the ordinary compile, so it is a
+// documentation and static-analysis aid rather than a build-time gate. The
+// arguments are cast at the call sites for that reason -- the annotation alone
+// would not have caught these.
+//
+// SAL arrives via <sal.h>, which every MSVC CRT header pulls in through
+// <vcruntime.h> (so <cstdio> above is sufficient). The fallback below means a
+// toolchain without SAL still compiles: an annotation that documents intent
+// must never be the thing that breaks a build.
+// ---------------------------------------------------------------------------
+#ifndef _Printf_format_string_
+#define _Printf_format_string_
+#endif
+
+void LogInfo(_Printf_format_string_ const char* format, ...) {
     char buffer[1024];
     va_list args;
     va_start(args, format);
@@ -335,7 +366,7 @@ void LogInfo(const char* format, ...) {
     _plugin_logprintf("[MCP] %s\n", buffer);
 }
 
-void LogError(const char* format, ...) {
+void LogError(_Printf_format_string_ const char* format, ...) {
     char buffer[1024];
     va_list args;
     va_start(args, format);
@@ -1130,7 +1161,7 @@ std::string HandleSetBreakpoint(const std::string& request) {
 
     // Set breakpoint using resolved address
     char cmd[256];
-    snprintf(cmd, sizeof(cmd), "bp %llx", address);
+    snprintf(cmd, sizeof(cmd), "bp %llx", (unsigned long long)address);
 
     if (!DbgCmdExec(cmd)) {
         // Try to determine why it failed
@@ -1144,7 +1175,7 @@ std::string HandleSetBreakpoint(const std::string& request) {
         return BuildJsonResponse(false, errData.str());
     }
 
-    LogInfo("Breakpoint set at 0x%llx", address);
+    LogInfo("Breakpoint set at 0x%llx", (unsigned long long)address);
 
     std::stringstream data;
     data << "\"address\":\"" << std::hex << address << std::dec << "\"";
@@ -1185,10 +1216,10 @@ std::string HandleDeleteBreakpoint(const std::string& request) {
     }
 
     char cmd[256];
-    snprintf(cmd, sizeof(cmd), "bc %llx", address);
+    snprintf(cmd, sizeof(cmd), "bc %llx", (unsigned long long)address);
     DbgCmdExec(cmd);
 
-    LogInfo("Breakpoint deleted at 0x%llx", address);
+    LogInfo("Breakpoint deleted at 0x%llx", (unsigned long long)address);
 
     std::stringstream data;
     data << "\"message\":\"Breakpoint deleted\","
@@ -1297,7 +1328,7 @@ std::string HandleGetStack(const std::string& request) {
     if (count < 1) count = 1;
     if (count > 256) count = 256;
 
-    LogInfo("GetStack: RSP=0x%llx, RBP=0x%llx, RIP=0x%llx, count=%d", rsp, rbp, rip, count);
+    LogInfo("GetStack: RSP=0x%llx, RBP=0x%llx, RIP=0x%llx, count=%d", (unsigned long long)rsp, (unsigned long long)rbp, (unsigned long long)rip, count);
 
     std::stringstream data;
 
@@ -1315,7 +1346,7 @@ std::string HandleGetStack(const std::string& request) {
         duint stackValue = 0;
 
         if (!DbgMemRead(stackAddr, &stackValue, sizeof(stackValue))) {
-            LogInfo("GetStack: Failed to read at 0x%llx", stackAddr);
+            LogInfo("GetStack: Failed to read at 0x%llx", (unsigned long long)stackAddr);
             break;
         }
 
@@ -1445,7 +1476,7 @@ std::string HandleWriteMemory(const std::string& request) {
         return BuildJsonResponse(false, "\"error\":\"Failed to write memory\"");
     }
 
-    LogInfo("Wrote %zu bytes to 0x%llx", bytes.size(), address);
+    LogInfo("Wrote %zu bytes to 0x%llx", bytes.size(), (unsigned long long)address);
 
     std::stringstream resultData;
     resultData << "\"bytes_written\":" << bytes.size();
@@ -1712,7 +1743,7 @@ std::string HandleSkipInstruction(const std::string& request) {
     // Set RIP/EIP to next instruction
     duint newCip = cip + instr.instr_size;
     char cmd[256];
-    snprintf(cmd, sizeof(cmd), "rip=%llx", newCip);
+    snprintf(cmd, sizeof(cmd), "rip=%llx", (unsigned long long)newCip);
     DbgCmdExec(cmd);
 
     std::stringstream data;
@@ -1763,12 +1794,12 @@ std::string HandleSetHardwareBreakpoint(const std::string& request) {
     else if (typeStr == "access") hwType = "a";
 
     char cmd[256];
-    snprintf(cmd, sizeof(cmd), "bph %llx, %s, %d", address, hwType.c_str(), size);
+    snprintf(cmd, sizeof(cmd), "bph %llx, %s, %d", (unsigned long long)address, hwType.c_str(), size);
     if (!DbgCmdExec(cmd)) {
         return BuildJsonResponse(false, "\"error\":\"Failed to set hardware breakpoint\"");
     }
 
-    LogInfo("Hardware breakpoint set at 0x%llx (type: %s, size: %d)", address, hwType.c_str(), size);
+    LogInfo("Hardware breakpoint set at 0x%llx (type: %s, size: %d)", (unsigned long long)address, hwType.c_str(), size);
 
     std::stringstream data;
     data << "\"address\":\"" << std::hex << address << std::dec << "\","
@@ -1799,12 +1830,12 @@ std::string HandleSetMemoryBreakpoint(const std::string& request) {
     else if (typeStr == "write") memType = "w";
 
     char cmd[256];
-    snprintf(cmd, sizeof(cmd), "bpm %llx, %s", address, memType.c_str());
+    snprintf(cmd, sizeof(cmd), "bpm %llx, %s", (unsigned long long)address, memType.c_str());
     if (!DbgCmdExec(cmd)) {
         return BuildJsonResponse(false, "\"error\":\"Failed to set memory breakpoint\"");
     }
 
-    LogInfo("Memory breakpoint set at 0x%llx (type: %s)", address, memType.c_str());
+    LogInfo("Memory breakpoint set at 0x%llx (type: %s)", (unsigned long long)address, memType.c_str());
 
     std::stringstream data;
     data << "\"address\":\"" << std::hex << address << std::dec << "\","
@@ -1827,10 +1858,10 @@ std::string HandleDeleteMemoryBreakpoint(const std::string& request) {
     }
 
     char cmd[256];
-    snprintf(cmd, sizeof(cmd), "bpmc %llx", address);
+    snprintf(cmd, sizeof(cmd), "bpmc %llx", (unsigned long long)address);
     DbgCmdExec(cmd);
 
-    LogInfo("Memory breakpoint deleted at 0x%llx", address);
+    LogInfo("Memory breakpoint deleted at 0x%llx", (unsigned long long)address);
     return BuildJsonResponse(true, "\"message\":\"Memory breakpoint deleted\"");
 }
 
@@ -2219,7 +2250,7 @@ std::string HandleVirtAlloc(const std::string& request) {
     // Format: alloc size [, address]
     char cmd[256];
     if (preferredAddr != 0) {
-        snprintf(cmd, sizeof(cmd), "alloc %d, %llx", size, preferredAddr);
+        snprintf(cmd, sizeof(cmd), "alloc %d, %llx", size, (unsigned long long)preferredAddr);
     } else {
         snprintf(cmd, sizeof(cmd), "alloc %d", size);
     }
@@ -2235,7 +2266,7 @@ std::string HandleVirtAlloc(const std::string& request) {
         return BuildJsonResponse(false, "\"error\":\"VirtualAllocEx returned NULL\"");
     }
 
-    LogInfo("Allocated %d bytes at 0x%llx", size, allocatedAddr);
+    LogInfo("Allocated %d bytes at 0x%llx", size, (unsigned long long)allocatedAddr);
 
     std::stringstream data;
     data << "\"address\":\"" << std::hex << allocatedAddr << std::dec << "\","
@@ -2264,13 +2295,13 @@ std::string HandleVirtFree(const std::string& request) {
 
     // Use free command
     char cmd[256];
-    snprintf(cmd, sizeof(cmd), "free %llx", address);
+    snprintf(cmd, sizeof(cmd), "free %llx", (unsigned long long)address);
 
     if (!DbgCmdExec(cmd)) {
         return BuildJsonResponse(false, "\"error\":\"Failed to free memory\"");
     }
 
-    LogInfo("Freed memory at 0x%llx", address);
+    LogInfo("Freed memory at 0x%llx", (unsigned long long)address);
     return BuildJsonResponse(true, "\"message\":\"Memory freed\"");
 }
 
@@ -2321,13 +2352,13 @@ std::string HandleVirtProtect(const std::string& request) {
 
     // Use setpagerights command (x64dbg specific)
     char cmd[256];
-    snprintf(cmd, sizeof(cmd), "setpagerights %llx, %d, %x", address, size, protection);
+    snprintf(cmd, sizeof(cmd), "setpagerights %llx, %d, %x", (unsigned long long)address, size, protection);
 
     if (!DbgCmdExec(cmd)) {
         return BuildJsonResponse(false, "\"error\":\"Failed to change memory protection\"");
     }
 
-    LogInfo("Changed protection at 0x%llx to 0x%x", address, protection);
+    LogInfo("Changed protection at 0x%llx to 0x%x", (unsigned long long)address, protection);
 
     std::stringstream data;
     data << "\"address\":\"" << std::hex << address << std::dec << "\","
@@ -2370,7 +2401,7 @@ std::string HandleMemSet(const std::string& request) {
         return BuildJsonResponse(false, "\"error\":\"Failed to write memory\"");
     }
 
-    LogInfo("Filled %d bytes at 0x%llx with 0x%02x", size, address, value & 0xFF);
+    LogInfo("Filled %d bytes at 0x%llx with 0x%02x", size, (unsigned long long)address, value & 0xFF);
 
     std::stringstream data;
     data << "\"address\":\"" << std::hex << address << std::dec << "\","
@@ -2429,16 +2460,16 @@ std::string HandleToggleBreakpoint(const std::string& request) {
     // Use bpe (breakpoint enable) or bpd (breakpoint disable)
     char cmd[256];
     if (enable) {
-        snprintf(cmd, sizeof(cmd), "bpe %llx", address);
+        snprintf(cmd, sizeof(cmd), "bpe %llx", (unsigned long long)address);
     } else {
-        snprintf(cmd, sizeof(cmd), "bpd %llx", address);
+        snprintf(cmd, sizeof(cmd), "bpd %llx", (unsigned long long)address);
     }
 
     if (!DbgCmdExec(cmd)) {
         return BuildJsonResponse(false, "\"error\":\"Failed to toggle breakpoint\"");
     }
 
-    LogInfo("Breakpoint at 0x%llx %s", address, enable ? "enabled" : "disabled");
+    LogInfo("Breakpoint at 0x%llx %s", (unsigned long long)address, enable ? "enabled" : "disabled");
 
     std::stringstream data;
     data << "\"address\":\"" << std::hex << address << std::dec << "\","
@@ -2466,10 +2497,10 @@ std::string HandleDeleteHardwareBreakpoint(const std::string& request) {
     }
 
     char cmd[256];
-    snprintf(cmd, sizeof(cmd), "bphc %llx", address);
+    snprintf(cmd, sizeof(cmd), "bphc %llx", (unsigned long long)address);
     DbgCmdExec(cmd);
 
-    LogInfo("Hardware breakpoint deleted at 0x%llx", address);
+    LogInfo("Hardware breakpoint deleted at 0x%llx", (unsigned long long)address);
     return BuildJsonResponse(true, "\"message\":\"Hardware breakpoint deleted\"");
 }
 
@@ -2495,16 +2526,16 @@ std::string HandleToggleHardwareBreakpoint(const std::string& request) {
 
     char cmd[256];
     if (enable) {
-        snprintf(cmd, sizeof(cmd), "bphe %llx", address);
+        snprintf(cmd, sizeof(cmd), "bphe %llx", (unsigned long long)address);
     } else {
-        snprintf(cmd, sizeof(cmd), "bphd %llx", address);
+        snprintf(cmd, sizeof(cmd), "bphd %llx", (unsigned long long)address);
     }
 
     if (!DbgCmdExec(cmd)) {
         return BuildJsonResponse(false, "\"error\":\"Failed to toggle hardware breakpoint\"");
     }
 
-    LogInfo("Hardware breakpoint at 0x%llx %s", address, enable ? "enabled" : "disabled");
+    LogInfo("Hardware breakpoint at 0x%llx %s", (unsigned long long)address, enable ? "enabled" : "disabled");
 
     std::stringstream data;
     data << "\"address\":\"" << std::hex << address << std::dec << "\","
@@ -2535,16 +2566,16 @@ std::string HandleToggleMemoryBreakpoint(const std::string& request) {
 
     char cmd[256];
     if (enable) {
-        snprintf(cmd, sizeof(cmd), "bpme %llx", address);
+        snprintf(cmd, sizeof(cmd), "bpme %llx", (unsigned long long)address);
     } else {
-        snprintf(cmd, sizeof(cmd), "bpmd %llx", address);
+        snprintf(cmd, sizeof(cmd), "bpmd %llx", (unsigned long long)address);
     }
 
     if (!DbgCmdExec(cmd)) {
         return BuildJsonResponse(false, "\"error\":\"Failed to toggle memory breakpoint\"");
     }
 
-    LogInfo("Memory breakpoint at 0x%llx %s", address, enable ? "enabled" : "disabled");
+    LogInfo("Memory breakpoint at 0x%llx %s", (unsigned long long)address, enable ? "enabled" : "disabled");
 
     std::stringstream data;
     data << "\"address\":\"" << std::hex << address << std::dec << "\","
@@ -2823,7 +2854,7 @@ std::string HandleSetApiBreakpoint(const std::string& request) {
 
     // Set conditional breakpoint with logging
     char cmd[512];
-    snprintf(cmd, sizeof(cmd), "bp %llx", address);
+    snprintf(cmd, sizeof(cmd), "bp %llx", (unsigned long long)address);
     if (!DbgCmdExec(cmd)) {
         return BuildJsonResponse(false, "\"error\":\"Failed to set breakpoint\"");
     }
@@ -2838,7 +2869,7 @@ std::string HandleSetApiBreakpoint(const std::string& request) {
     }
     LeaveCriticalSection(&g_apiLogLock);
 
-    LogInfo("API breakpoint set: %s at 0x%llx", apiName.c_str(), address);
+    LogInfo("API breakpoint set: %s at 0x%llx", apiName.c_str(), (unsigned long long)address);
 
     std::stringstream data;
     data << "\"api_name\":\"" << JsonEscape(apiName) << "\","
@@ -3256,7 +3287,7 @@ std::string HandleFindReferences(const std::string& request) {
 
     // Use x64dbg's reference search
     char cmd[256];
-    snprintf(cmd, sizeof(cmd), "findallmem %llx", targetAddr);
+    snprintf(cmd, sizeof(cmd), "findallmem %llx", (unsigned long long)targetAddr);
 
     // Get references using DbgGetRefList
     // Note: This is a simplified implementation - full implementation would use GUIREF APIs
@@ -3560,7 +3591,7 @@ std::string HandlePatchDbgCheck(const std::string& request) {
         return BuildJsonResponse(false, "\"error\":\"Failed to write patch\"");
     }
 
-    LogInfo("Patched debug check at 0x%llx with %s", address, patchType.c_str());
+    LogInfo("Patched debug check at 0x%llx with %s", (unsigned long long)address, patchType.c_str());
 
     std::stringstream data;
     data << "\"address\":\"" << std::hex << address << std::dec << "\","
@@ -3825,7 +3856,8 @@ std::string HandleExportCoverage(const std::string& request) {
             mainSize = 0x100000;  // Default estimate
         }
         fprintf(file, " 0, 0x%llx, 0x%llx, 0x%llx, %s\n",
-            mainBase, mainBase + mainSize, mainBase, mainModule);
+            (unsigned long long)mainBase, (unsigned long long)(mainBase + mainSize),
+            (unsigned long long)mainBase, mainModule);
 
         fprintf(file, "BB Table: %zu bbs\n", entryCount);
         for (const auto& pair : g_coverageState.entries) {

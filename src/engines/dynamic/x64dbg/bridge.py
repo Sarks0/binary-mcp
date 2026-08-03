@@ -598,6 +598,25 @@ class X64DbgBridge(Debugger):
             ConnectionError: If request fails
             RuntimeError: If API returns error or authentication fails
         """
+        # Validate command strings at the CHOKEPOINT, not per call site.
+        #
+        # F-9/F-16 follow-up: execute_command() validated its argument, but 38
+        # other bridge methods build a command string and POST it to
+        # /api/command directly, never touching that gate -- add_watch,
+        # set_watch_expression, set_watch_name, the type-system family
+        # (add_struct/add_type/parse_types/load_types/...), set_dll_breakpoint,
+        # set_variable, navigate_*, show_graph and the privilege toggles all
+        # interpolate caller-controlled text. 'AddWatch x;init C:/evil.exe'
+        # therefore left the bridge verbatim, and the plugin only inspects the
+        # first token, so DbgCmdExec split it and started the sample -- the same
+        # bug F-16 fixed for one method, still open for the rest.
+        #
+        # Validating here means a new bridge method cannot reintroduce it by
+        # forgetting to call _validate_command, which is exactly how these 38
+        # came to exist.
+        if endpoint == "/api/command" and data and "command" in data:
+            self._validate_command(str(data["command"]))
+
         url = f"{self.base_url}{endpoint}"
         start_time = time.time()
         operation = endpoint.split("/")[-1]  # Extract operation name from endpoint
@@ -2105,6 +2124,26 @@ class X64DbgBridge(Debugger):
         """
         if value.startswith("0x"):
             value = value[2:]
+
+        # F-9 class, plugin side: HandleSetRegister whitelists the register NAME
+        # but then snprintf's the VALUE into a "mov <reg>, <value>" string and
+        # hands it to DbgCmdExec, which splits on ';'. Stripping a leading "0x"
+        # was the only processing this value got, so
+        # set_register("rax", "0;init C:/evil.exe") reached the dispatcher and
+        # started the sample -- the same class as F-16, reachable through a
+        # dedicated tool rather than the raw command endpoint.
+        #
+        # A register value is a hex literal. Anything else is rejected outright
+        # rather than escaped, because there is no legitimate value containing a
+        # separator and a strict pattern cannot be got subtly wrong.
+        value = value.strip()
+        if not re.fullmatch(r"[0-9a-fA-F]{1,16}", value):
+            raise ValueError(
+                f"Invalid register value {value!r}: expected 1-16 hexadecimal "
+                "digits (an optional '0x' prefix is accepted). Values are "
+                "interpolated into a debugger command, so anything else is "
+                "refused."
+            )
 
         data = {
             "register": register.lower(),
@@ -5804,6 +5843,24 @@ class X64DbgBridge(Debugger):
         """
         if not definition or not definition.strip():
             raise ValueError("Type definition text cannot be empty")
+        # PRE-EXISTING limitation, surfaced rather than introduced by the
+        # per-segment validation below. ParseTypes is delivered over the
+        # command channel, and x64dbg's cmdsplit() splits every command string
+        # on ';' before the handler ever runs -- so C source, which is full of
+        # semicolons, was already being torn into fragments by the debugger
+        # itself ("ParseTypes struct A{int x" + "};"). It has never worked for
+        # anything but a single semicolon-free declaration.
+        #
+        # Fail with an accurate message instead of letting the generic
+        # allowlist rejection blame a stray '}' for it.
+        if ";" in definition:
+            raise ValueError(
+                "Type definitions containing ';' cannot be sent through the "
+                "x64dbg command channel: x64dbg splits every command on ';' "
+                "before the ParseTypes handler runs, so the definition would "
+                "arrive truncated. Write the types to a file and use "
+                "load_types() instead."
+            )
         return self._request_with_retry(
             "/api/command", {"command": f"ParseTypes {definition.strip()}"}
         )

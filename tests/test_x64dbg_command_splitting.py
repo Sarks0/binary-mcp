@@ -44,7 +44,7 @@ from __future__ import annotations
 import ast
 import re
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -545,3 +545,140 @@ def test_allowlist_exclusion_comment_warns_about_scriptcmd():
     assert "scriptcmd" in warning
     assert "scriptexec" in warning
     assert "cmddirectexec" in warning
+
+
+class TestCommandEndpointChokepoint:
+    """Every POST to /api/command is validated, not just execute_command().
+
+    F-9/F-16 fixed execute_command, but 38 other bridge methods build a command
+    string and POST it directly, never touching that gate. Validation now
+    happens in _request, so a new method cannot reintroduce the hole by
+    forgetting to call the validator -- which is how those 38 came to exist.
+    """
+
+    def _bridge(self):
+        from src.engines.dynamic.x64dbg.bridge import X64DbgBridge
+
+        bridge = X64DbgBridge()
+        bridge._auth_token = "test-token"
+        return bridge
+
+    def _fake_post(self, sent):
+        def post(url, json=None, headers=None, timeout=None):
+            sent.append(json.get("command") if json else None)
+
+            class Response:
+                status_code = 200
+
+                def raise_for_status(self):
+                    return None
+
+                def json(self):
+                    return {"success": True, "data": {}}
+
+            return Response()
+
+        return post
+
+    @pytest.mark.parametrize(
+        "call",
+        [
+            lambda b: b.add_watch("x;init C:/evil.exe"),
+            lambda b: b.set_watch_expression(1, "x;init C:/evil.exe"),
+            lambda b: b.set_watch_name(1, "n;init C:/evil.exe"),
+            lambda b: b.set_dll_breakpoint("d;init C:/evil.exe"),
+            lambda b: b.add_struct("S;init C:/evil.exe"),
+            lambda b: b.set_variable("v", "1;init C:/evil.exe"),
+        ],
+    )
+    def test_chained_payload_never_leaves_the_bridge(self, call):
+        sent: list = []
+        bridge = self._bridge()
+        with patch("requests.post", self._fake_post(sent)), patch(
+            "requests.get", self._fake_post(sent)
+        ):
+            with pytest.raises(ValueError):
+                call(bridge)
+        assert sent == [], f"payload reached the plugin: {sent!r}"
+
+    @pytest.mark.parametrize(
+        "call",
+        [
+            lambda b: b.add_watch("eax"),
+            lambda b: b.delete_watch(1),
+            lambda b: b.set_watchdog(1, "changed"),
+            lambda b: b.set_dll_breakpoint("kernel32.dll"),
+            lambda b: b.analyze_control_flow(),
+            lambda b: b.add_struct("MyStruct"),
+            lambda b: b.undo_instruction(),
+        ],
+    )
+    def test_legitimate_internal_commands_still_dispatch(self, call):
+        """The chokepoint must not break the dedicated tools -- an over-tight
+        gate here is just as much a defect as a missing one."""
+        sent: list = []
+        bridge = self._bridge()
+        with patch("requests.post", self._fake_post(sent)), patch(
+            "requests.get", self._fake_post(sent)
+        ):
+            call(bridge)
+        assert len(sent) == 1, f"expected one dispatched command, got {sent!r}"
+
+
+class TestSetRegisterValue:
+    """HandleSetRegister snprintf's the VALUE into 'mov reg, value' and hands
+    that to DbgCmdExec, which splits on ';'. Stripping '0x' was the only
+    processing it got."""
+
+    def _bridge(self):
+        from src.engines.dynamic.x64dbg.bridge import X64DbgBridge
+
+        bridge = X64DbgBridge()
+        bridge._auth_token = "test-token"
+        return bridge
+
+    @pytest.mark.parametrize(
+        "value",
+        ["0;init C:/evil.exe", "$(calc)", "1 2", "deadbeefdeadbeef0", "", "0xZZ", "-1"],
+    )
+    def test_non_hex_values_are_refused(self, value):
+        with pytest.raises(ValueError, match="Invalid register value"):
+            self._bridge().set_register("rax", value)
+
+    @pytest.mark.parametrize("value", ["0x401000", "401000", "0", "deadbeefdeadbeef"])
+    def test_hex_values_are_accepted(self, value):
+        sent: list = []
+
+        def post(url, json=None, headers=None, timeout=None):
+            sent.append(json)
+
+            class Response:
+                status_code = 200
+
+                def raise_for_status(self):
+                    return None
+
+                def json(self):
+                    return {"success": True, "data": {}}
+
+            return Response()
+
+        with patch("requests.post", post), patch("requests.get", post):
+            self._bridge().set_register("rax", value)
+        assert len(sent) == 1
+
+
+class TestParseTypesSemicolonLimitation:
+    """Pre-existing, surfaced not introduced: x64dbg splits every command on
+    ';' before ParseTypes runs, so C source was always arriving truncated."""
+
+    def test_semicolon_definition_gets_an_accurate_message(self):
+        from src.engines.dynamic.x64dbg.bridge import X64DbgBridge
+
+        bridge = X64DbgBridge()
+        bridge._auth_token = "test-token"
+        with pytest.raises(ValueError) as excinfo:
+            bridge.parse_types("struct A{int x;};")
+        message = str(excinfo.value)
+        assert "load_types" in message, message
+        assert "splits every command" in message, message

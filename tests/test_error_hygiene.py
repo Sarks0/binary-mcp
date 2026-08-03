@@ -621,3 +621,78 @@ def test_ast_guard_actually_catches_the_spellings_the_line_guard_missed():
         node for node in ast.walk(tree) if isinstance(node, ast.ExceptHandler)
     )
     assert set(_handler_clause_names(handler)) <= _AST_ALLOWED_HANDLERS
+
+
+class TestPeToolsStructuredErrorsAreCurated:
+    """pe_tools must not hand StructuredError.debug_info to the model.
+
+    The three pe_tools handlers returned ``to_user_message()``, which appends
+    a "Debug information" block verbatim. The producers put host state in it:
+    carving._validate_output_dir puts the resolved output_dir and the entire
+    BINARY_MCP_ALLOWED_DIRS list there, authenticode puts the resolved sample
+    path. All of that carries the operator's username into model context and
+    from there into any report built on the transcript.
+    """
+
+    def _confined_error(self, tmp_path, monkeypatch):
+        from pathlib import Path
+
+        from src.utils.carving import _validate_output_dir
+        from src.utils.structured_errors import StructuredBaseError
+
+        quarantine = tmp_path / "quarantine-token"
+        quarantine.mkdir()
+        monkeypatch.setenv("BINARY_MCP_ALLOWED_DIRS", str(quarantine))
+        try:
+            _validate_output_dir(Path("/etc/pwned"))
+        except StructuredBaseError as exc:
+            return exc, str(quarantine)
+        raise AssertionError("expected _validate_output_dir to refuse /etc/pwned")
+
+    def test_curated_text_omits_debug_info(self, tmp_path, monkeypatch):
+        from src.tools.error_hygiene import curated_structured_text
+
+        exc, quarantine = self._confined_error(tmp_path, monkeypatch)
+        out = curated_structured_text(exc)
+
+        assert quarantine not in out, out
+        assert "/etc/pwned" not in out, out
+        assert "Debug information" not in out, out
+
+    def test_curated_text_stays_actionable(self, tmp_path, monkeypatch):
+        """Suppressing the leak must not reduce the message to a bare code --
+        the model still needs to know how to correct its own call."""
+        from src.tools.error_hygiene import curated_structured_text
+
+        exc, _ = self._confined_error(tmp_path, monkeypatch)
+        out = curated_structured_text(exc)
+
+        assert "Invalid output_dir" in out
+        assert "BINARY_MCP_ALLOWED_DIRS" in out
+        assert "Suggested actions" in out
+
+    def test_pe_tools_no_longer_calls_to_user_message(self):
+        """Pin the fix so the leak cannot be reintroduced by a later edit.
+
+        AST-based rather than a substring scan: the explanatory comments above
+        each fixed site legitimately name ``to_user_message()``, and a textual
+        check flags those. Matching on actual call nodes is what the assertion
+        is really about.
+        """
+        import ast
+        import pathlib
+
+        tree = ast.parse(
+            pathlib.Path("src/tools/pe_tools.py").read_text(encoding="utf-8")
+        )
+        offenders = [
+            node.lineno
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "to_user_message"
+        ]
+        assert not offenders, (
+            f"pe_tools calls to_user_message() at lines {offenders}; it appends "
+            "the leaky debug_info block. Use curated_structured_text instead"
+        )

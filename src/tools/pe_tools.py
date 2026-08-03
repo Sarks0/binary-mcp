@@ -11,6 +11,7 @@ import logging
 from datetime import UTC, datetime
 from pathlib import Path
 
+from src.tools.error_hygiene import curated_structured_text
 from src.utils.formatters import wrap_untrusted
 
 logger = logging.getLogger(__name__)
@@ -825,7 +826,17 @@ def register_pe_tools(app, session_manager=None):
             result = inspect(binary_path)
             return render_markdown(result)
         except StructuredBaseError as e:
-            return e.structured_error.to_user_message()
+            # Audit F-10: to_user_message() appends a "Debug information"
+            # block verbatim, and the producers put host state in it --
+            # carving puts the resolved output_dir and the whole
+            # BINARY_MCP_ALLOWED_DIRS list there, authenticode puts the
+            # resolved sample path. All of that carries the operator's
+            # username into model context and from there into any report
+            # built on the transcript. curated_structured_text renders the
+            # same curated envelope (code, message, reason, suggestions)
+            # without that block; the full detail is logged instead.
+            logger.error("pe_tools structured error (detail withheld from model): %s", e.structured_error)
+            return curated_structured_text(e)
         except (PathTraversalError, FileSizeError) as e:
             return safe_error_message("inspect_authenticode", e)
         except Exception as e:
@@ -884,7 +895,17 @@ def register_pe_tools(app, session_manager=None):
             result = carve(binary_path, out_path, max_total_mb=max_total_mb)
             return render_markdown(result)
         except StructuredBaseError as e:
-            return e.structured_error.to_user_message()
+            # Audit F-10: to_user_message() appends a "Debug information"
+            # block verbatim, and the producers put host state in it --
+            # carving puts the resolved output_dir and the whole
+            # BINARY_MCP_ALLOWED_DIRS list there, authenticode puts the
+            # resolved sample path. All of that carries the operator's
+            # username into model context and from there into any report
+            # built on the transcript. curated_structured_text renders the
+            # same curated envelope (code, message, reason, suggestions)
+            # without that block; the full detail is logged instead.
+            logger.error("pe_tools structured error (detail withheld from model): %s", e.structured_error)
+            return curated_structured_text(e)
         except (PathTraversalError, FileSizeError) as e:
             return safe_error_message("extract_embedded_binaries", e)
         except Exception as e:
@@ -926,7 +947,17 @@ def register_pe_tools(app, session_manager=None):
         try:
             return render_markdown(compute(binary_path))
         except StructuredBaseError as e:
-            return e.structured_error.to_user_message()
+            # Audit F-10: to_user_message() appends a "Debug information"
+            # block verbatim, and the producers put host state in it --
+            # carving puts the resolved output_dir and the whole
+            # BINARY_MCP_ALLOWED_DIRS list there, authenticode puts the
+            # resolved sample path. All of that carries the operator's
+            # username into model context and from there into any report
+            # built on the transcript. curated_structured_text renders the
+            # same curated envelope (code, message, reason, suggestions)
+            # without that block; the full detail is logged instead.
+            logger.error("pe_tools structured error (detail withheld from model): %s", e.structured_error)
+            return curated_structured_text(e)
         except (PathTraversalError, FileSizeError) as e:
             return safe_error_message("compute_similarity_hashes", e)
         except Exception as e:

@@ -672,3 +672,63 @@ class TestExpressionAssignment:
     def test_read_only_expressions_still_work(self, payload):
         ok, reason = validate_command(payload)
         assert ok is True, f"{payload!r} was refused: {reason}"
+
+
+class TestEscapedQuoteInCarrierBodies:
+    r"""WinDbg documents \" as a literal quote inside a command string.
+
+    Treating it as a terminator broke _extract_quoted_bodies in BOTH
+    directions, which is why the fix had to be made carefully rather than
+    quickly:
+
+      * SECURITY -- 'bp 401000 "bp 402000 \".shell calc\""' produced the bodies
+        'bp 402000 \' and '', so '.shell calc' sat BETWEEN two extracted
+        regions and was never validated. It reached the debugger.
+      * USABILITY -- 'bp nt!NtClose ".printf \"rcx=%p\n\", rcx"' closed at the
+        first escaped quote, leaving ', rcx' to be validated as its own
+        subcommand and rejected for starting with ','. A textbook conditional
+        breakpoint was refused.
+
+    Both classes are pinned here: a future narrowing that re-breaks the
+    legitimate form has to break a test that says why it matters.
+    """
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            r'bp 401000 "bp 402000 \".shell calc\""',
+            r'bp 401000 "bp 402000 \"eb 401000 90\""',
+            r'bp 401000 "bp 402000 \".dvalloc 1000\""',
+            r'ba e1 401000 "bp 1 \".dvalloc 1000\""',
+            r'bp 401000 "\".shell calc\""',
+            r'bu nt!NtClose "bs 1 \".shell calc\""',
+            r'bp 401000 ".printf \"x\"; .shell calc"',
+        ],
+    )
+    def test_command_smuggled_past_an_escaped_quote_is_refused(self, payload):
+        ok, reason = validate_command(payload)
+        assert ok is False, f"{payload!r} reached the debugger"
+        assert reason
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            r'bp nt!NtClose ".printf \"hit\n\""',
+            r'bp nt!NtClose ".printf \"rcx=%p\n\", rcx"',
+            r'bp nt!NtClose ".printf \"%p %p\n\", rcx, rdx"',
+            r'ba w4 401000 ".printf \"w\n\"; gc"',
+            r'bp nt!NtClose ".echo hit"',
+            r'bp nt!NtClose ".if (rcx==0) {} .else {gc}"',
+            r'bu nt!NtOpenFile "k"',
+        ],
+    )
+    def test_legitimate_nested_quoting_still_works(self, payload):
+        ok, reason = validate_command(payload)
+        assert ok is True, f"{payload!r} was refused: {reason}"
+
+    def test_single_quotes_get_no_invented_escape(self):
+        r"""WinDbg documents no backslash escape inside '...'. Inventing one is
+        the desync parse_compound already had to undo, so it must not be
+        reintroduced here."""
+        ok, _ = validate_command(r"j 1 '.shell calc'")
+        assert ok is False

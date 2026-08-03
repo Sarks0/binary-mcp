@@ -661,6 +661,30 @@ def _extract_quoted_bodies(command: str) -> list[str]:
                 break
             i = j + 1
             continue
+        # Inside a DOUBLE-quoted region, WinDbg documents \" as a literal quote
+        # rather than a terminator. Treating it as a terminator here split the
+        # region in the wrong places, and that broke this function BOTH ways:
+        #
+        #   bp 401000 "bp 402000 \".shell calc\""
+        #     -- the bodies came out as 'bp 402000 \' and '', so '.shell calc'
+        #        sat BETWEEN two extracted regions and was never validated at
+        #        all. The carrier bypass.
+        #   bp nt!NtClose ".printf \"rcx=%p\n\", rcx"
+        #     -- the region closed at the first \", leaving ', rcx' to be
+        #        validated as its own subcommand, which was rejected for
+        #        starting with ','. A legitimate .printf with a format argument
+        #        was refused.
+        #
+        # Honouring the escape fixes both: the body extends to the real closing
+        # quote, so the nested command is seen (and recursed into, since 'bp' is
+        # itself a carrier) and the format argument stays part of its .printf.
+        #
+        # Single-quoted regions are left alone -- WinDbg documents no backslash
+        # escape there, and inventing one is the mistake parse_compound already
+        # had to undo.
+        if quote == '"' and ch == "\\" and i + 1 < len(command) and command[i + 1] == '"':
+            i += 2
+            continue
         if ch in ("'", '"'):
             if not quote:
                 quote = ch

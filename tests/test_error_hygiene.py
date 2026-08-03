@@ -492,13 +492,48 @@ def _handler_clause_names(handler: ast.ExceptHandler) -> list[str]:
 def _interpolated_names(node: ast.AST) -> set[str]:
     """Every bare name interpolated by an f-string anywhere under ``node``."""
     names: set[str] = set()
-    for formatted in ast.walk(node):
-        if not isinstance(formatted, ast.FormattedValue):
-            continue
-        for inner in ast.walk(formatted.value):
-            if isinstance(inner, ast.Name):
-                names.add(inner.id)
+    # Walk EVERY name in the returned expression, not just the ones inside
+    # f-string placeholders.
+    #
+    # The original guard inspected only ast.FormattedValue, so it caught
+    # `return f"Error: {e}"` and nothing else. An adversarial review pointed
+    # out that `str(e)`, `"{}".format(e)`, `"x: " % e`, `"x: " + str(e)`,
+    # `return e` and `e.args[0]` all leak exactly the same host detail and all
+    # sailed past it -- a guard that reports coverage it does not have.
+    #
+    # Subtrees that are calls to an audited safe helper are pruned rather than
+    # walked: passing the exception to safe_tool_error / safe_error_message /
+    # safe_path_error / curated_structured_text IS the sanctioned fix, so
+    # seeing `e` in there is correct, not a leak.
+    for inner in _walk_pruning_safe_helpers(node):
+        if isinstance(inner, ast.Name):
+            names.add(inner.id)
     return names
+
+
+#: Helpers that log the detail internally and return a safe string. Handing a
+#: caught exception to one of these is the fix, not the defect.
+_SAFE_ERROR_HELPERS = frozenset(
+    {
+        "safe_tool_error",
+        "safe_error_message",
+        "safe_path_error",
+        "curated_structured_text",
+        "format_error_response",
+    }
+)
+
+
+def _walk_pruning_safe_helpers(node: ast.AST):
+    """Yield every node under ``node``, skipping audited safe-helper calls."""
+    if isinstance(node, ast.Call):
+        func = node.func
+        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+        if name in _SAFE_ERROR_HELPERS:
+            return
+    yield node
+    for child in ast.iter_child_nodes(node):
+        yield from _walk_pruning_safe_helpers(child)
 
 
 def _exception_echoing_returns(path: Path) -> list[tuple[int, str, str]]:
@@ -696,3 +731,56 @@ class TestPeToolsStructuredErrorsAreCurated:
             f"pe_tools calls to_user_message() at lines {offenders}; it appends "
             "the leaky debug_info block. Use curated_structured_text instead"
         )
+
+
+# ---------------------------------------------------------------------------
+# Self-test: the widened guard must actually catch the non-f-string spellings
+# ---------------------------------------------------------------------------
+
+_LEAKY_SPELLINGS = {
+    "f-string": 'return f"Error: {e}"',
+    "str() call": "return str(e)",
+    "repr() call": "return repr(e)",
+    "format()": 'return "Error: {}".format(e)',
+    "percent": 'return "Error: %s" % e',
+    "concatenation": 'return "Error: " + str(e)',
+    "bare name": "return e",
+    "attribute": "return e.args[0]",
+    "join": 'return "".join(["Error: ", str(e)])',
+    "nested in fstring call": 'return f"Error: {str(e)}"',
+}
+
+_SAFE_SPELLINGS = {
+    "safe_tool_error": 'return safe_tool_error("op", e)',
+    "safe_error_message": 'return safe_error_message("op", e)',
+    "safe_path_error": 'return safe_path_error("op", e)',
+    "curated_structured_text": "return curated_structured_text(e)",
+    "prefixed safe call": 'return "note\\n" + safe_tool_error("op", e)',
+    "unrelated name": 'return f"Error: {other}"',
+}
+
+
+def _guard_flags(body: str, tmp_path) -> bool:
+    """Run the real guard over a synthetic handler and report whether it fired."""
+    source = "def f():\n    try:\n        pass\n    except Exception as e:\n        " + body + "\n"
+    path = tmp_path / "synthetic_tool.py"
+    path.write_text(source, encoding="utf-8")
+    return bool(_exception_echoing_returns(path))
+
+
+@pytest.mark.parametrize("label,body", sorted(_LEAKY_SPELLINGS.items()))
+def test_widened_guard_catches_every_leaky_spelling(label, body, tmp_path):
+    """
+    The guard inspected only ``ast.FormattedValue``, so it caught the f-string
+    and nothing else -- ``str(e)``, ``.format(e)``, ``%``, concatenation, a
+    bare ``return e`` and ``e.args[0]`` all leak identical host detail and all
+    passed. A guard reporting coverage it does not have is worse than none.
+    """
+    assert _guard_flags(body, tmp_path), f"{label} not flagged: {body}"
+
+
+@pytest.mark.parametrize("label,body", sorted(_SAFE_SPELLINGS.items()))
+def test_widened_guard_does_not_flag_the_sanctioned_fix(label, body, tmp_path):
+    """Handing the exception to an audited helper IS the fix; flagging it would
+    make the guard unusable and push people to suppress it."""
+    assert not _guard_flags(body, tmp_path), f"{label} wrongly flagged: {body}"

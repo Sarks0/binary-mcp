@@ -525,13 +525,50 @@ std::string BuildJsonResponse(bool success, const std::string& data = "") {
 // The fix is confinement, not sanitisation: resolve the requested name against
 // one fixed output directory, canonicalise the result with GetFullPathNameA,
 // and then require the canonical result to still live under that directory.
-// Prefix-matching AFTER canonicalisation is what makes this robust -- it does
-// not matter what trick produced the path ("..", "....\\\\", a short 8.3 name,
-// a trailing dot, a device name like CON which GetFullPathNameA rewrites to
-// \\.\CON) because anything that escapes the base no longer has the base as its
-// prefix. The syntactic rejections below are a fast, legible first pass; the
-// prefix check is the actual control.
+// Prefix-matching AFTER canonicalisation handles every LEXICAL trick ("..",
+// "....\\\\", a short 8.3 name, a trailing dot, a device name like CON which
+// GetFullPathNameA rewrites to \\.\CON), because anything that spells its way
+// out of the base no longer has the base as its prefix.
+//
+// It does NOT handle reparse points, and an earlier revision of this comment
+// wrongly claimed it handled everything. GetFullPathNameA is purely lexical --
+// it never touches the filesystem -- so a junction planted inside the output
+// root keeps the prefix intact while sending the write somewhere else entirely.
+// Since the root lives under %TEMP%, the debuggee can plant one. That is why
+// IsReparsePoint is applied to the root in GetOutputRoot and to every component
+// below it here. Three layers, none of them sufficient alone: the syntactic
+// rejections are a fast first pass, the prefix check is the lexical control,
+// and the reparse-point walk is the physical one.
 // ---------------------------------------------------------------------------
+
+// True if `path` exists AND is a reparse point (junction, directory symlink,
+// mount point). CWE-59.
+//
+// GetFullPathNameA, which the confinement below relies on, is a purely LEXICAL
+// function -- it never touches the filesystem and therefore never resolves a
+// reparse point. So a prefix comparison against a canonicalised string proves
+// only that the path SPELLS its way inside the root, not that it physically
+// lands there. Anything that can create a directory inside the root can
+// therefore redirect writes out of it, and the root lives under %TEMP%, which
+// is writable by every process running as this user -- the debuggee included.
+//
+// A path that does not exist yet is not a reparse point and is not a problem:
+// it will be created inside the root by the writer.
+//
+// GetFileAttributesA is kernel32, so this adds no new link dependency.
+static bool IsReparsePoint(const std::string& path) {
+    std::string probe = path;
+    // GetFileAttributes dislikes a trailing separator on some paths. Keep the
+    // one in "C:\" -- a bare drive root must stay "C:\".
+    while (probe.size() > 3 && probe.back() == '\\') {
+        probe.pop_back();
+    }
+    DWORD attrs = GetFileAttributesA(probe.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES) {
+        return false;  // absent: nothing to follow
+    }
+    return (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+}
 
 // Returns the single directory that plugin-written files may live in, with a
 // trailing backslash. Created on demand.
@@ -544,10 +581,24 @@ static bool GetOutputRoot(std::string& outRoot) {
         return false;
     }
 
-    std::string root = std::string(tempPath) + "obsidian_x64dbg\\";
-    CreateDirectoryA(root.c_str(), nullptr);  // ERROR_ALREADY_EXISTS is fine
-    root += "output\\";
+    // CreateDirectoryA fails with ERROR_ALREADY_EXISTS when the name is taken,
+    // and that is normally fine -- but it is ALSO what happens when the name
+    // was pre-created as a junction. Ignoring the error unconditionally is what
+    // let a sample point the whole output tree somewhere else and have every
+    // later write follow it, with the lexical prefix check none the wiser. So
+    // each level is checked after creation and the whole root is refused if
+    // either is a reparse point.
+    std::string base = std::string(tempPath) + "obsidian_x64dbg\\";
+    CreateDirectoryA(base.c_str(), nullptr);  // ERROR_ALREADY_EXISTS is fine
+    if (IsReparsePoint(base)) {
+        return false;
+    }
+
+    std::string root = base + "output\\";
     CreateDirectoryA(root.c_str(), nullptr);
+    if (IsReparsePoint(root)) {
+        return false;
+    }
 
     // %TEMP% itself may be an 8.3 short path or contain a symlink component, so
     // canonicalise the base too -- otherwise the prefix comparison below would
@@ -682,6 +733,35 @@ static bool ResolveConfinedOutputPath(const std::string& requested,
         _strnicmp(canonical.c_str(), root.c_str(), root.size()) != 0) {
         outError = "File path escapes the plugin output directory";
         return false;
+    }
+
+    // The prefix check above is LEXICAL, so it proves spelling, not location.
+    // Walk every component strictly below the root and refuse if any of them is
+    // an existing reparse point -- otherwise "sub\\trace.log", where "sub" was
+    // pre-created as a junction, spells its way inside the root and writes
+    // outside it. The final component is included on purpose: an existing
+    // symlinked FILE is followed by fopen(..., "w") just as happily.
+    //
+    // This is the same control src/utils/security.py::_reject_symlinked_components
+    // applies on the Python side; the C++ writer had no equivalent.
+    {
+        size_t pos = root.size();
+        while (true) {
+            size_t sep = canonical.find('\\', pos);
+            std::string component = (sep == std::string::npos)
+                                        ? canonical
+                                        : canonical.substr(0, sep);
+            if (IsReparsePoint(component)) {
+                outError = "File path passes through a junction or symlink, "
+                           "which could redirect the write outside the plugin "
+                           "output directory";
+                return false;
+            }
+            if (sep == std::string::npos) {
+                break;
+            }
+            pos = sep + 1;
+        }
     }
 
     // Extension whitelist last, on the CANONICAL path, so it cannot be dodged
@@ -4448,7 +4528,21 @@ static DWORD WINAPI PipeServerThread(LPVOID lpParam) {
             LogError("Failed to create named pipe: %d", GetLastError());
             return 1;
         }
+        // Publish the handle UNDER THE LOCK (CWE-362). pluginStop reads
+        // g_pipeServer while holding g_pipeHandleLock and calls CancelIoEx /
+        // DisconnectNamedPipe on it; ClosePipeServerHandle clears it under the
+        // same lock. This assignment was the one access that did neither, so
+        // the invariant pluginStop's comment asserts -- that the handle cannot
+        // change under it mid-call -- did not actually hold, and g_pipeServer
+        // is a plain static a compiler is free to cache.
+        //
+        // Practical effect of the old race was bounded (pluginStop could see
+        // INVALID_HANDLE_VALUE, skip the cancel, and rely on g_running plus
+        // g_shutdownEvent to unwind the thread) but it was still a data race,
+        // and "bounded today" is not a property that survives edits.
+        if (g_pipeHandleLockInit) EnterCriticalSection(&g_pipeHandleLock);
         g_pipeServer = pipe;
+        if (g_pipeHandleLockInit) LeaveCriticalSection(&g_pipeHandleLock);
 
         // Signal that pipe is ready for server to connect (first instance only)
         if (!signalledReady && g_pipeReadyEvent) {
@@ -4584,14 +4678,35 @@ static DWORD WINAPI PipeServerThread(LPVOID lpParam) {
                 continue;
             }
 
+            // A zero-length frame carries nothing to dispatch, and
+            // std::vector<char>(0).data() may be null -- constructing a string
+            // from a null pointer is UB even with a zero count. Answer and
+            // carry on rather than tearing the connection down.
+            if (requestLength == 0) {
+                LogError("Empty request frame; ignoring");
+                continue;
+            }
+
             // Read request data
             std::vector<char> buffer(requestLength);
+            bytesRead = 0;
             if (!ReadFile(g_pipeServer, buffer.data(), requestLength, &bytesRead, nullptr)) {
                 LogError("Failed to read request: %d", GetLastError());
                 break;
             }
 
-            std::string request(buffer.data(), requestLength);
+            // Use what was ACTUALLY read, not what the length prefix promised
+            // (CWE-252). The two differ on a short read, and building the
+            // string from requestLength then tacked the vector's zero-filled
+            // tail onto the JSON. Not an info leak -- std::vector<char>(n)
+            // value-initialises -- but the parser saw a frame the peer never
+            // sent.
+            if (bytesRead != requestLength) {
+                LogError("Short request frame: expected %u bytes, got %lu",
+                         requestLength, (unsigned long)bytesRead);
+            }
+
+            std::string request(buffer.data(), bytesRead);
             LogInfo("Received request: %s", request.c_str());
 
             // Parse request type and route to appropriate handler

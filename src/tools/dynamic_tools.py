@@ -2033,7 +2033,11 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 )
 
             params = api_params[api_name]
-            output = [f"API: {api_name}", "Parameters:", ""]
+            # Server-authored header stays OUTSIDE the fence; the parameter
+            # block goes inside it. Keeping the framing out is what makes
+            # the boundary meaningful (audit F-7).
+            header = [f"API: {api_name}", "Parameters:", ""]
+            param_lines: list[str] = []
 
             for param_name, reg_or_stack, param_type in params:
                 try:
@@ -2074,12 +2078,20 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                     elif param_type == "bool":
                         value = "TRUE" if int(value, 16) != 0 else "FALSE"
 
-                    output.append(f"  {param_name}: {value}")
+                    param_lines.append(f"  {param_name}: {value}")
 
                 except Exception as e:
-                    output.append(f"  {param_name}: (error: {e})")
+                    param_lines.append(f"  {param_name}: (error: {e})")
 
-            return "\n".join(output)
+            # unicode_ptr / ascii_ptr parameters are DECODED OUT OF SAMPLE
+            # MEMORY -- lpFileName, lpCommandLine and friends. That is the
+            # most attacker-controlled string channel on the dynamic side:
+            # the sample chooses those bytes outright, and unfenced they
+            # reach the model looking like this server's own analysis.
+            return "\n".join(header) + "\n" + wrap_untrusted(
+                "\n".join(param_lines),
+                kind="API parameters decoded from target memory",
+            )
 
         except Exception as e:
             logger.error(f"x64dbg_get_api_params failed: {e}")

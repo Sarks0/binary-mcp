@@ -25,7 +25,7 @@ from pathlib import Path
 from fastmcp import FastMCP
 
 from src.engines.session import AnalysisType, UnifiedSessionManager
-from src.engines.static.ghidra.coverage_store import CoverageStore
+from src.engines.static.ghidra.coverage_store import CoverageStore, has_reviewable_body
 from src.engines.static.ghidra.coverage_store import auto_mark as auto_mark_reviewed
 from src.engines.static.ghidra.project_cache import ProjectCache
 from src.engines.static.ghidra.runner import GhidraAnalysisError, GhidraRunner
@@ -1965,11 +1965,14 @@ def decompile_function(
 
         # Coverage side effect: the pseudocode is about to be handed to the
         # caller, so this function counts as reviewed. Best-effort -- never
-        # let the ledger break a decompile.
-        auto_mark_reviewed(
-            cache, binary_path, [function.get("address")],
-            tool="decompile_function", context=context,
-        )
+        # let the ledger break a decompile. A body that is only a decompiler
+        # banner comment is still returned, but showing a remark about the
+        # function is not showing the function, so it does not mark.
+        if has_reviewable_body(pseudocode):
+            auto_mark_reviewed(
+                cache, binary_path, [function.get("address")],
+                tool="decompile_function", context=context,
+            )
 
         # Format output
         result = f"**Decompiled: {function_name}**\n\n"

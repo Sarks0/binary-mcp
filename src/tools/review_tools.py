@@ -13,7 +13,7 @@ import logging
 import re
 from pathlib import Path
 
-from src.engines.static.ghidra.coverage_store import auto_mark
+from src.engines.static.ghidra.coverage_store import auto_mark, has_reviewable_body
 from src.utils.pseudocode_rules import (
     SINK_HINTS,
     PseudocodeRules,
@@ -724,7 +724,7 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
             # (callers, blocks and xrefs remain useful), yet a body nobody can
             # read was not reviewed. Marking here regardless would drive a
             # structural-depth cache to remaining==0 having shown zero code.
-            if pseudo.strip():
+            if has_reviewable_body(pseudo):
                 auto_mark(
                     cache, binary_path, [target.get("address")],
                     tool="get_review_package", context=context,
@@ -1010,7 +1010,7 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
                 )
 
             pseudo = target.get("pseudocode") or ""
-            if not pseudo.strip():
+            if not has_reviewable_body(pseudo):
                 return (
                     f"Function {target.get('name')} @ {target.get('address')} "
                     f"has no pseudocode in the cache. Re-analyze with full "

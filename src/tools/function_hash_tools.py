@@ -13,7 +13,7 @@ import logging
 import re
 from pathlib import Path
 
-from src.engines.static.ghidra.coverage_store import auto_mark
+from src.engines.static.ghidra.coverage_store import auto_mark, has_reviewable_body
 
 logger = logging.getLogger(__name__)
 
@@ -496,7 +496,11 @@ def register_function_hash_tools(app, session_manager, cache, runner):
                     output.append("")
                     output.append(pseudocode)
                     succeeded += 1
-                    decompiled.append(address)
+                    # Printed either way -- a banner-comment-only body is still
+                    # worth showing -- but only actual code advances the
+                    # denominator.
+                    if has_reviewable_body(pseudocode):
+                        decompiled.append(address)
                 elif func.get("is_thunk"):
                     output.append("(thunk function - no pseudocode)")
                     failed += 1

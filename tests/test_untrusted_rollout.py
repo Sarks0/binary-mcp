@@ -821,11 +821,19 @@ class TestYaraToolsEnvelope:
         assert out.index("Generated Yara rule") < begin
         assert "rule dropper" in out
 
-    def test_output_path_error_does_not_name_the_output_dir(self, monkeypatch):
+    def test_output_path_error_does_not_name_the_output_dir(self, monkeypatch, tmp_path):
         from src.tools import yara_tools
 
+        # The output dir must be somewhere mkdir(parents=True) actually
+        # succeeds: the tool creates it before sanitize_output_path runs, so an
+        # uncreatable dir raises first and we never reach the message under
+        # test. A hardcoded "/home/<token>/yara" works on the Linux runner
+        # (root, real /home) but macOS /home is autofs, where os.mkdir returns
+        # EOPNOTSUPP -- which is exactly how this test failed on macOS only.
+        # tmp_path is creatable everywhere; the token stays in the path so the
+        # no-leak assertion below still means something.
         monkeypatch.setattr(
-            yara_tools, "YARA_OUTPUT_DIR", Path(f"/home/{LEAK_TOKEN}/yara")
+            yara_tools, "YARA_OUTPUT_DIR", tmp_path / LEAK_TOKEN / "yara"
         )
         session_manager = MagicMock()
         session_manager.active_session_id = "s1"
@@ -886,11 +894,14 @@ class TestReportingEnvelope:
             UNTRUSTED_OPEN_SENTINEL
         )
 
-    def test_report_output_path_error_does_not_name_the_output_dir(self, monkeypatch):
+    def test_report_output_path_error_does_not_name_the_output_dir(self, monkeypatch, tmp_path):
         from src.tools import reporting
 
+        # See the note in TestYaraToolsEnvelope: the dir must be creatable on
+        # every platform, because generate_report mkdirs it before the path is
+        # validated. macOS /home is autofs and rejects mkdir with EOPNOTSUPP.
         monkeypatch.setattr(
-            reporting, "REPORTS_OUTPUT_DIR", Path(f"/home/{LEAK_TOKEN}/reports")
+            reporting, "REPORTS_OUTPUT_DIR", tmp_path / LEAK_TOKEN / "reports"
         )
         tools = _capture_tools(reporting.register_reporting_tools, self._session_manager())
 

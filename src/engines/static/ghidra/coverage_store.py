@@ -48,7 +48,19 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 # Bump when the on-disk layout changes in a way older readers can't handle.
-SCHEMA_VERSION = 1
+#
+# v2: records carry `dropped_address_count`. A v1 record cannot distinguish
+# "no address failed to parse" from "nobody counted", and that difference is
+# the whole point of the field, so v1 records are rebuilt rather than trusted.
+SCHEMA_VERSION = 2
+
+# Oldest layout this reader can still parse well enough to salvage review marks
+# from. Anything in [MIN..SCHEMA_VERSION) is readable but stale -- rebuilt on
+# the next status query, marks preserved. Anything outside is refused: a record
+# we cannot interpret must report `not_indexed` with null counts, because
+# serving it as `ready` would put numbers of unknown provenance in front of a
+# closure decision.
+MIN_READABLE_SCHEMA_VERSION = 1
 
 # Machine-readable identifier for the reachability method behind `in_scope`.
 # Bump on ANY change to how scope is computed -- consumers invalidate their
@@ -247,6 +259,22 @@ def compute_scope(context: dict) -> tuple[dict[str, dict], str]:
     # residual functions with no caller inside the residual -- so provenance
     # stays meaningful; a pure cycle with no source is broken at its lowest
     # address, which keeps the result deterministic for a resuming client.
+    #
+    # When no source exists, promote the WHOLE residual in ascending address
+    # order rather than one function per pass. Skipping any address the running
+    # BFS already reached makes that sequence identical to repeatedly taking
+    # min(residual) -- the same roots, the same `scope_reason` on every
+    # function -- because once a pass has no source, no later pass has one
+    # either: if x survives a pass it was called by some y in the old residual,
+    # and y cannot have been reached (the BFS follows every callee, so it would
+    # have taken x with it), so y survives too and still calls x. The loop
+    # therefore runs at most twice -- one source pass, one cycle pass -- rather
+    # than once per independent cycle, and each pass is linear in the graph.
+    #
+    # Not a micro-optimization: every fixpoint pass on the 29-binary cached
+    # corpus is a no-source pass, so the old code recomputed `residual` and
+    # `called_within` over the entire graph once per cycle (chakra: 16 passes
+    # over 25026 functions). This sits on `get_analysis_context`'s hot path.
     while True:
         residual = {
             a for a in by_addr
@@ -262,7 +290,10 @@ def compute_scope(context: dict) -> tuple[dict[str, dict], str]:
                     called_within.add(c_addr)
         sources = sorted(residual - called_within, key=lambda x: int(x, 16))
         if not sources:
-            sources = [min(residual, key=lambda x: int(x, 16))]
+            sources = sorted(residual, key=lambda x: int(x, 16))
+        # Termination: `sources` is drawn from `residual`, which is disjoint
+        # from `reasons`, so its first element is always promoted and every
+        # pass shrinks the residual by at least one.
         for root in sources:
             if root in reasons:
                 continue
@@ -291,6 +322,14 @@ def compute_scope(context: dict) -> tuple[dict[str, dict], str]:
             scope_reason = excluded
             excluded_count += 1
         elif reason is None:
+            # Structurally unreachable, and deliberately kept. The fixpoint
+            # above only exits once every non-excluded address has a reason, so
+            # nothing can land here -- `in_scope` is now exactly "not
+            # mechanically excluded", and the call graph supplies provenance
+            # rather than membership. This branch is the tripwire that catches
+            # a future change breaking that: it fails toward a smaller
+            # denominator, so it must stay visible in the counts and in
+            # `scope_description` rather than being silently folded in.
             in_scope = False
             scope_reason = "excluded:unreachable"
             unreached_count += 1
@@ -319,6 +358,8 @@ def compute_scope(context: dict) -> tuple[dict[str, dict], str]:
             f"after the walk settled"
         )
     description += f"; minus {excluded_count} thunk/external/library function(s)"
+    # Only reachable if the fixpoint above stops draining the residual -- see
+    # the tripwire comment below. Zero on all 29 cached binaries.
     if unreached_count:
         description += (
             f"; {unreached_count} function(s) still unreachable from any root "
@@ -328,7 +369,10 @@ def compute_scope(context: dict) -> tuple[dict[str, dict], str]:
     description += ". Indirect calls are invisible to a forward walk, so scope is "
     description += (
         "over-approximated on purpose: unreached functions are promoted to roots "
-        "until nothing is left, and the denominator never shrinks on a guess."
+        "until nothing is left, and the denominator never shrinks on a guess. "
+        "Because that drains the residual entirely, in_scope_total is exactly "
+        "total minus the mechanically excluded set -- the walk supplies "
+        "scope_reason, not membership."
     )
 
     return records, description
@@ -422,6 +466,33 @@ class CoverageStore:
             return None
         if not isinstance(data, dict) or "functions" not in data:
             logger.error("Malformed coverage side-car %s: no functions map", path)
+            return None
+        version = data.get("schema_version")
+        if not isinstance(version, int) or isinstance(version, bool):
+            logger.error(
+                "Coverage side-car %s has no usable schema_version (%r); refusing "
+                "to serve counts from a record of unknown provenance",
+                path,
+                version,
+            )
+            return None
+        if not MIN_READABLE_SCHEMA_VERSION <= version <= SCHEMA_VERSION:
+            # A future layout is the dangerous one: fields this reader does not
+            # know about may be what make the counts mean what they say, and
+            # `bool()`-coercing the entries it does recognize would turn an
+            # unread binary into a confidently-reported one. Refuse instead --
+            # the caller sees `not_indexed` with null counts, and rebuilds from
+            # the analysis cache with everything unreviewed. That loses marks,
+            # which is the safe direction: it asks for work to be redone rather
+            # than claiming work that was never done.
+            logger.error(
+                "Coverage side-car %s carries schema_version %d, outside the "
+                "readable range %d..%d; treating the binary as not indexed",
+                path,
+                version,
+                MIN_READABLE_SCHEMA_VERSION,
+                SCHEMA_VERSION,
+            )
             return None
         return data
 
@@ -541,6 +612,41 @@ class CoverageStore:
 
         records, description = compute_scope(context)
 
+        # Every function whose address `canon_addr` cannot parse (a Ghidra
+        # `EXTERNAL:` pseudo-address, anything malformed) is absent from
+        # `records` and therefore absent from `total`. Nothing downstream
+        # compares `total` against the source list, and both staleness probes
+        # agree with each other, so an under-counted denominator would be
+        # served as `ready` forever.
+        dropped = len(functions) - len(records)
+        if not records:
+            # Not one address survived. Reporting `ready` with six zeros here
+            # is the documented terminal condition -- a review loop would stop
+            # on a binary nobody read. `not_indexed` with null counts is the
+            # honest answer.
+            logger.error(
+                "Coverage index for %s: none of the %d function address(es) in "
+                "the analysis cache could be parsed; reporting not_indexed "
+                "rather than a denominator of zero",
+                binary_id[:12],
+                len(functions),
+            )
+            return None
+        if dropped:
+            logger.warning(
+                "Coverage index for %s: %d of %d function(s) dropped -- their "
+                "addresses did not parse, so they are missing from the "
+                "denominator",
+                binary_id[:12],
+                dropped,
+                len(functions),
+            )
+            description += (
+                f" WARNING: {dropped} of {len(functions)} function(s) in the "
+                f"analysis cache have unparseable addresses and are missing "
+                f"from this denominator; total under-counts the binary."
+            )
+
         previous = self.read(binary_id) or {}
         prior_functions = previous.get("functions") or {}
         for addr, record in records.items():
@@ -575,10 +681,40 @@ class CoverageStore:
             "scope_version": SCOPE_VERSION,
             "scope_description": description,
             "source_function_count": len(functions),
+            "dropped_address_count": dropped,
             "functions": records,
         }
         self.write(data)
         return data
+
+    @staticmethod
+    def _counts_add_up(record: dict) -> bool:
+        """Does the stored denominator account for every source function?
+
+        ``total`` (the size of the function map) plus the addresses that failed
+        to parse must equal the function count the analysis cache supplied. The
+        two sides come from different places -- one derived at index time, one
+        recorded from the source list -- so unlike the count invariants this is
+        a real cross-check rather than a restatement of its own arithmetic.
+
+        Returns True when either field is missing: a legacy record has no
+        opinion to check, and the schema-version trigger already rebuilds it.
+        """
+        dropped = record.get("dropped_address_count")
+        source_count = record.get("source_function_count")
+        if not isinstance(dropped, int) or not isinstance(source_count, int):
+            return True
+        return len(record.get("functions") or {}) + dropped == source_count
+
+    def has_analysis_cache(self, binary_id: str) -> bool:
+        """Is the Ghidra analysis this ledger counts still on disk?
+
+        The rebuild source. Without it a dropped record cannot be reconstructed,
+        so callers that are about to destroy a record must check first.
+        """
+        return (self.cache_dir / f"{binary_id}.json.gz").exists() or (
+            self.cache_dir / f"{binary_id}.json"
+        ).exists()
 
     def ensure_indexed(
         self,
@@ -593,8 +729,9 @@ class CoverageStore:
         - No coverage record but an analysis cache exists -> index now. It is a
           pure cache walk, and reporting ``not_indexed`` for a binary that is
           already fully analyzed would strand every previously-cached target.
-        - Coverage record whose ``source_function_count`` or ``scope_version``
-          no longer matches -> re-index, preserving review marks.
+        - Coverage record whose ``source_function_count``, ``scope_version`` or
+          ``schema_version`` no longer matches, or whose own stored numbers do
+          not add up -> re-index, preserving review marks.
         - Coverage record with no analysis cache behind it any more -> ``stale``;
           the counts are still returned because they are the last known truth,
           but the consumer is told not to trust them as current.
@@ -606,10 +743,7 @@ class CoverageStore:
                 return None, STATUS_NOT_INDEXED
             return rebuilt, STATUS_READY
 
-        cache_present = (self.cache_dir / f"{binary_id}.json.gz").exists() or (
-            self.cache_dir / f"{binary_id}.json"
-        ).exists()
-        if not cache_present:
+        if not self.has_analysis_cache(binary_id):
             # The analysis this ledger counted has been evicted. Return the
             # last known counts -- they are still the best available truth --
             # but flag them as not current so nobody concludes on them.
@@ -622,7 +756,25 @@ class CoverageStore:
             and record.get("source_function_count") is not None
             and source_count != record.get("source_function_count")
         )
-        if stale_scope or stale_count:
+        # A record written before drop accounting existed cannot say whether
+        # its `total` covers every function or quietly lost some, so rebuild
+        # rather than trust it. Deliberately keyed on the schema version and on
+        # the record's own arithmetic, NOT on `dropped_address_count != 0`: a
+        # binary that genuinely has unparseable addresses would then re-index
+        # -- decompressing the whole analysis cache -- on every status poll,
+        # forever, and produce the identical record each time.
+        stale_schema = record.get("schema_version") != SCHEMA_VERSION
+        inconsistent = not self._counts_add_up(record)
+        if stale_scope or stale_count or stale_schema or inconsistent:
+            if inconsistent:
+                logger.warning(
+                    "Coverage record for %s does not add up (total=%s + dropped=%s "
+                    "!= source_function_count=%s); rebuilding",
+                    binary_id[:12],
+                    len(record.get("functions") or {}),
+                    record.get("dropped_address_count"),
+                    record.get("source_function_count"),
+                )
             rebuilt = self.index(binary_id, binary_path or record.get("binary_path"))
             if rebuilt is not None:
                 return rebuilt, STATUS_READY
@@ -658,7 +810,7 @@ class CoverageStore:
             "remaining": total - reviewed,
             "remaining_in_scope": in_scope_total - reviewed_in_scope,
         }
-        _assert_invariants(counts)
+        _assert_invariants(counts, record)
         return counts
 
     # marking
@@ -755,6 +907,27 @@ class CoverageStore:
         return {"marked": marked, "already": already, "unknown": unknown}
 
 
+def has_reviewable_body(pseudocode: object) -> bool:
+    """Did the decompiler actually return code, as opposed to a remark about it?
+
+    The auto-marking tools use this to decide whether what they handed back
+    counts as a review. Non-empty is not enough: Ghidra emits bodies that are
+    only a banner comment (``/* WARNING: Globals starting with '_' overlap */``)
+    when it declines to decompile, and marking on those advances the
+    denominator for a function whose code nobody saw.
+
+    A statement terminator or a brace is the cheapest signal that separates the
+    two. Genuine empty stubs still mark -- ``void FUN_140137c58(void) { return; }``
+    is real, reviewable code and http.sys has two of them. Across the 18500
+    pseudocode bodies in the cached corpus, none lack both characters, so this
+    rejects the comment-only case without excluding anything real.
+    """
+    if not isinstance(pseudocode, str):
+        return False
+    body = pseudocode.strip()
+    return bool(body) and ("{" in body or ";" in body)
+
+
 def auto_mark(
     cache,
     binary_path: str | None,
@@ -786,11 +959,19 @@ def auto_mark(
         logger.warning("auto-mark (%s) failed for %s: %s", tool, binary_path, exc)
 
 
-def _assert_invariants(counts: dict[str, int]) -> None:
+def _assert_invariants(counts: dict[str, int], record: dict | None = None) -> None:
     """Fail loudly on an inconsistent count set.
 
     The consumer treats an invariant violation as a hard error; producing one
     server-side would be worse than crashing, so this raises rather than logs.
+
+    The count relations below are near-tautological when :meth:`CoverageStore.counts`
+    is the caller -- it derives ``remaining`` as ``total - reviewed`` a few lines
+    before this asserts they are equal. ``record`` is what gives the check
+    something it did not compute itself: ``source_function_count`` was recorded
+    from the analysis cache's own function list, so comparing the denominator
+    against it catches the one failure the relations cannot see -- a ``total``
+    that silently lost functions.
     """
     for key, value in counts.items():
         if not isinstance(value, int) or value < 0:
@@ -805,3 +986,11 @@ def _assert_invariants(counts: dict[str, int]) -> None:
         raise CoverageError("invariant violated: in_scope_total > total")
     if counts["reviewed_in_scope"] > counts["reviewed"]:
         raise CoverageError("invariant violated: reviewed_in_scope > reviewed")
+    if record is not None and not CoverageStore._counts_add_up(record):
+        raise CoverageError(
+            "invariant violated: total + dropped_address_count != "
+            f"source_function_count (total={counts['total']}, "
+            f"dropped={record.get('dropped_address_count')!r}, "
+            f"source={record.get('source_function_count')!r}) -- the "
+            "denominator does not account for every function in the binary"
+        )

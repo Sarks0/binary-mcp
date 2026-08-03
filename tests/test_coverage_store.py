@@ -21,6 +21,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from src.engines.static.ghidra.coverage_store import (
+    SCHEMA_VERSION,
     SCOPE_VERSION,
     CoverageError,
     CoverageStore,
@@ -28,6 +29,7 @@ from src.engines.static.ghidra.coverage_store import (
     auto_mark,
     canon_addr,
     compute_scope,
+    has_reviewable_body,
 )
 from src.engines.static.ghidra.project_cache import ProjectCache
 
@@ -619,3 +621,286 @@ class TestAutoMark:
     def test_auto_mark_on_unanalyzed_binary_is_a_noop(self, lab):
         auto_mark(lab.cache, lab.path, ["140001000"], tool="decompile_function")
         assert lab.store.read(lab.binary_id) is None
+
+
+# Unparseable addresses and the drop accounting
+
+
+class TestDroppedAddresses:
+    """Functions whose address `canon_addr` rejects are absent from `total`.
+
+    `total` is derived from the normalized map; `source_function_count` comes
+    from the pre-normalization list. Nothing used to compare them, and both
+    staleness probes agreed with each other, so a denominator that had silently
+    lost functions was served as `ready` indefinitely.
+    """
+
+    def test_all_addresses_unparseable_is_not_indexed_not_six_zeros(self, lab):
+        """`ready` with `total: 0` is the documented terminal condition.
+
+        Reporting it for a binary whose every address failed to parse tells a
+        review loop it has finished a binary nobody read.
+        """
+        lab.analyze(
+            _context([_func("a", "EXTERNAL:1"), _func("b", "EXTERNAL:2")])
+        )
+        assert lab.store.index(lab.binary_id, lab.path) is None
+        record, status = lab.store.ensure_indexed(lab.binary_id, lab.path)
+        assert record is None
+        assert status == "not_indexed"
+
+    def test_partial_drop_is_recorded_not_silent(self, lab):
+        lab.analyze(
+            _context(
+                [
+                    _func("a", "140001000"),
+                    _func("b", "140002000"),
+                    _func("x", "EXTERNAL:1"),
+                    _func("y", "EXTERNAL:2"),
+                    _func("z", "EXTERNAL:3"),
+                ]
+            )
+        )
+        record = lab.store.index(lab.binary_id, lab.path)
+        assert lab.store.counts(record)["total"] == 2
+        assert record["dropped_address_count"] == 3
+        assert record["source_function_count"] == 5
+        assert "under-counts" in record["scope_description"]
+
+    def test_clean_binary_records_a_zero_drop(self, lab):
+        """The field must be present and 0, not absent -- absent cannot be told
+        apart from 'nobody counted'."""
+        lab.analyze(_context([_func("entry", "140001000")]))
+        record = lab.store.index(lab.binary_id, lab.path)
+        assert record["dropped_address_count"] == 0
+
+    def test_counts_cross_check_catches_a_shrunken_denominator(self, lab):
+        """The one invariant that is not a restatement of its own arithmetic.
+
+        `source_function_count` was recorded from the analysis cache's function
+        list, so comparing the denominator against it detects a `total` that
+        lost functions -- which the remaining/total/reviewed relations cannot.
+        """
+        lab.analyze(_context([_func("a", "140001000"), _func("b", "140002000")]))
+        record = lab.store.index(lab.binary_id, lab.path)
+        del record["functions"]["0x140002000"]
+        with pytest.raises(CoverageError, match="does not account for every function"):
+            lab.store.counts(record)
+
+    def test_a_record_whose_numbers_do_not_add_up_is_rebuilt(self, lab):
+        """Corrupts only `dropped_address_count`, so `source_function_count`
+        still matches the meta side-car and the pre-existing count/scope/schema
+        triggers all pass. The arithmetic cross-check is the only thing that can
+        catch it."""
+        lab.analyze(_context([_func("a", "140001000"), _func("b", "140002000")]))
+        lab.store.index(lab.binary_id, lab.path)
+
+        stored = lab.store.read(lab.binary_id)
+        stored["dropped_address_count"] = 5
+        assert lab.store._source_function_count(lab.binary_id) == stored[
+            "source_function_count"
+        ], "the count trigger must NOT be what fires here"
+        lab.store.write(stored)
+
+        record, status = lab.store.ensure_indexed(lab.binary_id, lab.path)
+        assert status == "ready"
+        assert record["dropped_address_count"] == 0
+        assert lab.store.counts(record)["total"] == 2
+
+    def test_a_genuine_drop_does_not_rebuild_on_every_query(self, lab):
+        """`dropped != 0` must NOT be the rebuild trigger.
+
+        A binary that really does carry unparseable addresses would then
+        re-index -- decompressing the whole analysis cache -- on every status
+        poll forever, producing the identical record each time.
+        """
+        lab.analyze(_context([_func("a", "140001000"), _func("x", "EXTERNAL:1")]))
+        first, _ = lab.store.ensure_indexed(lab.binary_id, lab.path)
+        second, status = lab.store.ensure_indexed(lab.binary_id, lab.path)
+        assert status == "ready"
+        assert second["indexed_at"] == first["indexed_at"]
+
+
+# On-disk schema versioning
+
+
+class TestSchemaVersion:
+    """`schema_version` was written but never read: a record stamped 999 was
+    accepted and served as `ready`."""
+
+    def _corrupt(self, lab, **fields):
+        stored = lab.store.read(lab.binary_id)
+        stored.update(fields)
+        path = lab.cache.cache_dir / f"{lab.binary_id}.coverage.json"
+        path.write_text(json.dumps(stored), encoding="utf-8")
+
+    @pytest.mark.parametrize("version", [999, "2", None, True])
+    def test_unreadable_schema_version_is_refused(self, lab, version):
+        lab.analyze(_context([_func("entry", "140001000")]))
+        lab.store.index(lab.binary_id, lab.path)
+        self._corrupt(lab, schema_version=version)
+        assert lab.store.read(lab.binary_id) is None
+
+    def test_a_future_record_reports_not_indexed_not_ready(self, lab):
+        """Null counts are the honest answer for a layout we cannot interpret;
+        serving it as `ready` puts numbers of unknown provenance in front of a
+        closure decision."""
+        lab.analyze(_context([_func("entry", "140001000")]))
+        lab.store.index(lab.binary_id, lab.path)
+        self._corrupt(lab, schema_version=999)
+        # Remove the rebuild source so the refusal is what decides the status,
+        # rather than an immediate re-index papering over it.
+        (lab.cache.cache_dir / f"{lab.binary_id}.json.gz").unlink()
+        record, status = lab.store.ensure_indexed(lab.binary_id, lab.path)
+        assert record is None
+        assert status == "not_indexed"
+
+    def test_an_older_readable_record_is_rebuilt_with_marks_intact(self, lab):
+        """A v1 record has a readable layout, so its review history is
+        salvageable -- rebuild, do not discard."""
+        lab.analyze(_context([_func("entry", "140001000")]))
+        lab.store.index(lab.binary_id, lab.path)
+        lab.store.mark_reviewed(lab.binary_id, ["0x140001000"], tool="a", note="keep")
+        stored = lab.store.read(lab.binary_id)
+        stored["schema_version"] = 1
+        del stored["dropped_address_count"]
+        lab.store.write(stored)
+
+        record, status = lab.store.ensure_indexed(lab.binary_id, lab.path)
+        assert status == "ready"
+        assert record["schema_version"] == SCHEMA_VERSION
+        assert record["dropped_address_count"] == 0
+        entry = record["functions"]["0x140001000"]
+        assert entry["reviewed"] is True
+        assert entry["findings_note"] == "keep"
+
+    def test_a_future_scope_version_is_rebuilt_under_current_semantics(self, lab):
+        """Documented downgrade behaviour: any scope_version mismatch rebuilds,
+        future included, and re-stamps the record with the current string. The
+        consumer detects it by reading `scope_version` back."""
+        lab.analyze(_context([_func("entry", "140001000")]))
+        lab.store.index(lab.binary_id, lab.path)
+        stored = lab.store.read(lab.binary_id)
+        stored["scope_version"] = "fwd-bfs-v99"
+        lab.store.write(stored)
+
+        record, status = lab.store.ensure_indexed(lab.binary_id, lab.path)
+        assert status == "ready"
+        assert record["scope_version"] == SCOPE_VERSION
+
+
+# What `in_scope` actually means
+
+
+class TestScopeIsProvenanceNotFiltering:
+    """The fixpoint drains the residual entirely, so membership is exactly
+    "not mechanically excluded" and the walk only supplies `scope_reason`.
+
+    Documenting it the other way round -- "in_scope is real reachability" --
+    invites a consumer to believe the call graph narrowed the denominator.
+    """
+
+    def test_in_scope_is_total_minus_the_mechanical_exclusions(self, lab):
+        lab.analyze(
+            _context(
+                [
+                    _func("entry", "140001000"),
+                    _func("thunk", "140002000", is_thunk=True),
+                    _func("ext", "140003000", is_external=True),
+                    _func("fid", "140004000", fid_match="memcpy"),
+                    # Reachable only through a cycle nothing calls into.
+                    _func("cyc_a", "140005000", called=["140006000"]),
+                    _func("cyc_b", "140006000", called=["140005000"]),
+                ]
+            )
+        )
+        record = lab.store.index(lab.binary_id, lab.path)
+        counts = lab.store.counts(record)
+        excluded = sum(
+            1
+            for e in record["functions"].values()
+            if e["scope_reason"].startswith("excluded:")
+        )
+        assert excluded == 3
+        assert counts["in_scope_total"] == counts["total"] - excluded
+
+    def test_nothing_is_ever_labelled_excluded_unreachable(self, lab):
+        lab.analyze(
+            _context(
+                [
+                    _func("cyc_a", "140005000", called=["140006000"]),
+                    _func("cyc_b", "140006000", called=["140005000"]),
+                    _func("below", "140007000"),
+                ]
+            )
+        )
+        record = lab.store.index(lab.binary_id, lab.path)
+        reasons = {e["scope_reason"] for e in record["functions"].values()}
+        assert "excluded:unreachable" not in reasons
+
+    def test_disjoint_cycles_are_promoted_in_one_pass(self):
+        """Guards the fixpoint against going quadratic again.
+
+        Each pass recomputes `residual` and `called_within` over the whole
+        graph. Promoting one root per pass therefore costs one full sweep per
+        independent cycle -- and every fixpoint pass on the real cached corpus
+        is a no-source pass, so this is the path real binaries take, not a
+        synthetic corner. Counting `canon_addr` calls measures it without a
+        wall clock: linear here, quadratic before (800 nodes: 3200 vs 162800).
+        """
+        import src.engines.static.ghidra.coverage_store as module
+
+        nodes = 800
+        functions = []
+        for i in range(0, nodes, 2):
+            a = 0x140001000 + i * 0x10
+            b = a + 0x10
+            functions.append(_func(f"f{a:x}", f"{a:x}", called=[f"{b:x}"]))
+            functions.append(_func(f"f{b:x}", f"{b:x}", called=[f"{a:x}"]))
+
+        real = module.canon_addr
+        calls = []
+
+        def counting(raw):
+            calls.append(1)
+            return real(raw)
+
+        module.canon_addr = counting
+        try:
+            records, _description = module.compute_scope(_context(functions))
+        finally:
+            module.canon_addr = real
+
+        assert len(records) == nodes
+        assert all(r["in_scope"] for r in records.values())
+        assert len(calls) < 10 * nodes, (
+            f"{len(calls)} canon_addr calls for {nodes} nodes -- the fixpoint is "
+            f"promoting one root per pass again"
+        )
+
+
+# The reviewable-body predicate
+
+
+class TestHasReviewableBody:
+    """Auto-marking must not advance the denominator for a function whose code
+    nobody saw. Ghidra emits banner-comment-only bodies when it declines to
+    decompile, and non-empty alone accepts those."""
+
+    def test_comment_only_body_is_not_a_review(self):
+        assert not has_reviewable_body(
+            "/* WARNING: Globals starting with '_' overlap smaller symbols */\n"
+        )
+
+    def test_genuine_empty_stub_still_marks(self):
+        """http.sys FUN_140137c58 and FUN_1401d5530, verbatim. These are real,
+        reviewable code -- excluding them would under-mark."""
+        assert has_reviewable_body("void FUN_140137c58(void)\n\n{\n  return;\n}")
+
+    def test_ordinary_body_marks(self):
+        assert has_reviewable_body("int f(void) { return g(1); }")
+
+    def test_empty_and_non_string_do_not_mark(self):
+        assert not has_reviewable_body("")
+        assert not has_reviewable_body("   \n ")
+        assert not has_reviewable_body(None)

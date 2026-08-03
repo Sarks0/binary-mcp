@@ -35,10 +35,8 @@ import logging
 import uuid
 
 from src.utils.security import (
-    ENV_ALLOW_ANY_PATH,
-    ENV_ALLOWED_DIRS,
-    FileSizeError,
-    PathTraversalError,
+    PATH_ERROR_GUIDANCE,
+    path_error_guidance,
     safe_error_message,
 )
 from src.utils.structured_errors import StructuredBaseError
@@ -139,31 +137,10 @@ def safe_tool_error(operation: str, error: Exception) -> str:
 # and when it is not (a path taken from a session record or a cached context)
 # echoing it is another way host layout re-enters the transcript.
 
-_PATH_ERROR_GUIDANCE: dict[type, str] = {
-    PathTraversalError: (
-        "the path is outside the directories this server is allowed to read. "
-        f"Analyse files from a directory the operator exposed via "
-        f"{ENV_ALLOWED_DIRS} (or the default quarantine directories). The "
-        f"configured directories are intentionally not listed here; ask the "
-        f"operator, or have them set {ENV_ALLOWED_DIRS} / "
-        f"{ENV_ALLOW_ANY_PATH}. Output paths must likewise stay inside this "
-        "server's own output directory -- pass a bare filename rather than "
-        "an absolute path."
-    ),
-    FileSizeError: (
-        "the file is larger than this server's analysis size limit. Carve "
-        "out the region of interest and analyse that instead."
-    ),
-    FileNotFoundError: (
-        "no file exists at the path supplied. Check the name and extension, "
-        "and confirm the sample was copied onto this host."
-    ),
-    IsADirectoryError: "the path names a directory, not a file.",
-    NotADirectoryError: "a component of the path is not a directory.",
-    PermissionError: (
-        "this server does not have permission to read the path supplied."
-    ),
-}
+# The mapping itself lives in src/utils/security.py so the src/utils/ producers
+# that raise StructuredBaseError from a path failure share exactly this text --
+# see the note there for why a second copy is what let the leak reopen.
+_PATH_ERROR_GUIDANCE = PATH_ERROR_GUIDANCE
 
 
 def safe_path_error(operation: str, error: Exception, subject: str = "path") -> str:
@@ -180,11 +157,7 @@ def safe_path_error(operation: str, error: Exception, subject: str = "path") -> 
     Returns:
         Safe, still-actionable error string carrying a reference ID.
     """
-    guidance = None
-    for exc_type, text in _PATH_ERROR_GUIDANCE.items():
-        if isinstance(error, exc_type):
-            guidance = text
-            break
+    guidance = path_error_guidance(error)
 
     if guidance is None:
         # A ValueError from sanitize_binary_path ("Path is not a file: ...")

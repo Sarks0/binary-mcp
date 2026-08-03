@@ -629,14 +629,19 @@ def _extract_quoted_bodies(command: str) -> list[str]:
     """Return the bodies of the ``'...'`` and ``"..."`` regions in ``command``.
 
     Only called for :data:`_COMMAND_STRING_CARRIERS`, where a quoted region is
-    a command string rather than data. The scanning rules are kept identical to
-    :func:`parse_compound` so that what this hands back to the validator is
-    exactly what that function treated as an opaque protected region:
+    a command string rather than data:
 
       - the first quote character seen opens the region and only the matching
         character closes it, so ``"it's fine"`` is one body, not two;
       - ``${x}`` interpolation is skipped wholesale;
-      - there is no backslash escape (see :func:`parse_compound`).
+      - inside a DOUBLE-quoted region ``\\"`` is a literal quote, not a
+        terminator. This is the ONE place the scanning rules deliberately
+        diverge from :func:`parse_compound`, which has no backslash escape --
+        see the block comment on that branch below for the bypass and the
+        false rejection that forced it, and note the divergence is safe in
+        this direction: parse_compound splitting MORE only ever hands the
+        validator more subcommands, while extracting a LONGER body here only
+        ever hands it more text to validate. Neither can hide a subcommand.
 
     An *unterminated* body is returned rather than dropped. That case is not
     merely sloppy input: parse_compound stops splitting on ``;`` once a quote

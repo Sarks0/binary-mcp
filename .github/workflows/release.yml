@@ -26,9 +26,25 @@ jobs:
 
     - name: Download x64dbg Plugin SDK
       shell: pwsh
+      env:
+        # Authenticate the release LOOKUP. Unauthenticated api.github.com calls
+        # are rate-limited per source IP, and shared CI egress can exhaust that
+        # quota -- which would fail a release for a reason having nothing to do
+        # with the release. Matches the same call in ci.yml.
+        #
+        # Only the API call carries the header. The asset download below goes to
+        # a redirected CDN URL that is already signed; sending Authorization
+        # there is unnecessary and can itself be rejected.
+        GH_TOKEN: ${{ github.token }}
       run: |
+        $headers = @{
+          'Accept'        = 'application/vnd.github+json'
+          'Authorization' = "Bearer $env:GH_TOKEN"
+          'User-Agent'    = 'binary-mcp-ci'
+        }
+
         Write-Host "Fetching latest x64dbg release info..."
-        $release = Invoke-RestMethod -Uri "https://api.github.com/repos/x64dbg/x64dbg/releases/latest"
+        $release = Invoke-RestMethod -Uri "https://api.github.com/repos/x64dbg/x64dbg/releases/latest" -Headers $headers
 
         Write-Host "Latest release: $($release.tag_name)"
         $sdkAsset = $release.assets | Where-Object { $_.name -eq "x64dbg-pluginsdk.zip" }

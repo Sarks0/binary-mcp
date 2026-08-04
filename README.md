@@ -70,7 +70,7 @@ Analyze the crash dump at C:\Windows\MEMORY.DMP
 Decompile the type MyNamespace.MyClass to C#
 ```
 
-## Capabilities (245 tools)
+## Capabilities (250 tools)
 
 ### Static Analysis (Ghidra) - 35 tools
 
@@ -117,6 +117,7 @@ Comprehensive PE header, section, import, export, resource, debug, TLS, and Rich
 - **Session Management** - Persistent analysis tracking across conversations
 - **Reporting (2)** - Generate structured analysis reports
 - **YARA (2)** - Rule scanning (optional `yara-python` dependency)
+- **Review Coverage (5)** - Per-binary review denominator, reachability scope, and a deterministic unreviewed worklist. See [docs/coverage.md](docs/coverage.md)
 
 ## Supported Formats
 

@@ -13,6 +13,8 @@ import logging
 import re
 from pathlib import Path
 
+from src.engines.static.ghidra.coverage_store import auto_mark, has_reviewable_body
+
 logger = logging.getLogger(__name__)
 
 # Maximum functions per batch decompile request
@@ -467,6 +469,9 @@ def register_function_hash_tools(app, session_manager, cache, runner):
 
             succeeded = 0
             failed = 0
+            # Only functions whose pseudocode actually came back get marked --
+            # a "not found" or "thunk, no pseudocode" line reviewed nothing.
+            decompiled: list[str] = []
 
             for func_ref in requested:
                 func = _lookup_function(all_functions, func_ref)
@@ -491,6 +496,11 @@ def register_function_hash_tools(app, session_manager, cache, runner):
                     output.append("")
                     output.append(pseudocode)
                     succeeded += 1
+                    # Printed either way -- a banner-comment-only body is still
+                    # worth showing -- but only actual code advances the
+                    # denominator.
+                    if has_reviewable_body(pseudocode):
+                        decompiled.append(address)
                 elif func.get("is_thunk"):
                     output.append("(thunk function - no pseudocode)")
                     failed += 1
@@ -505,6 +515,11 @@ def register_function_hash_tools(app, session_manager, cache, runner):
                 output.append("")
 
             output.append(f"Summary: {succeeded} succeeded, {failed} failed")
+
+            auto_mark(
+                cache, binary_path, decompiled,
+                tool="batch_decompile", context=cached,
+            )
 
             return "\n".join(output)
 

@@ -370,7 +370,10 @@ class TestReviewToolsEnvelope:
         assert out.count(UNTRUSTED_END_MARKER) == out.count(
             f"{UNTRUSTED_OPEN_SENTINEL}BEGIN UNTRUSTED SAMPLE DATA"
         )
-        assert "<U+27E6>END UNTRUSTED SAMPLE DATA<U+27E7>" in out
+        # The phrase is now escaped even inside escaped brackets: the old
+        # exemption was a lookbehind a sample could forge with a literal
+        # "<U+0041>" prefix, so it was removed.
+        assert "<U+27E6><escaped:END_UNTRUSTED_SAMPLE_DATA><U+27E7>" in out
 
     def test_scan_pseudocode_fences_excerpts(self, monkeypatch):
         tools = _register_review_tools(
@@ -591,7 +594,10 @@ class TestVirusTotalEnvelope:
         assert out.index("MALICIOUS:") < begin
         assert out.index("Type: Win32 EXE") < begin
         # The forged marker inside a submitted file name is neutralised.
-        assert "<U+27E6>END UNTRUSTED SAMPLE DATA<U+27E7>" in out
+        # The phrase is now escaped even inside escaped brackets: the old
+        # exemption was a lookbehind a sample could forge with a literal
+        # "<U+0041>" prefix, so it was removed.
+        assert "<U+27E6><escaped:END_UNTRUSTED_SAMPLE_DATA><U+27E7>" in out
 
     def test_vt_search_fences_result_rows(self, monkeypatch):
         import src.tools.vt_tools as vt

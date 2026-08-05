@@ -384,6 +384,18 @@ class TestOtherToolModulesDoNotLeak:
 
 _TOOLS_DIR = Path(__file__).resolve().parent.parent / "src" / "tools"
 
+# src/server.py is NOT under src/tools/, and every F-10 guard globbed only that
+# directory -- so the single largest tool surface in the repo (41 MCP tools) was
+# scanned by none of them. It carried 55 handlers echoing caught exceptions,
+# including one this branch itself added that returned the Path.home()-derived
+# extraction root. Scanning it here is what stops that recurring.
+_SERVER_PY = Path(__file__).resolve().parent.parent / "src" / "server.py"
+
+
+def _guarded_sources() -> list[Path]:
+    """Every file the F-10 guards must inspect: src/tools/*.py plus server.py."""
+    return sorted(_TOOLS_DIR.glob("*.py")) + [_SERVER_PY]
+
 # Exception types whose messages are raised by this project's own validators.
 # Those are deliberately echoed verbatim (see the F-10 comments in the tool
 # modules); anything broader has to go through safe_error_message /
@@ -417,7 +429,7 @@ def test_no_catch_all_handler_echoes_raw_exception_text():
     ``safe_error_message`` / ``safe_tool_error`` instead.
     """
     offenders = []
-    for path in sorted(_TOOLS_DIR.glob("*.py")):
+    for path in _guarded_sources():
         for line_no, clause in _raw_error_returns(path):
             if clause not in _VALIDATION_ONLY_HANDLERS:
                 offenders.append(f"{path.name}:{line_no} (except {clause})")
@@ -458,6 +470,12 @@ _AST_ALLOWED_HANDLERS = {
     # call, and they quote the model's own arguments, not the host.
     "ValueError",
     "TypeError",
+    # UserFacingError exists precisely to make a verbatim passthrough safe by
+    # construction (src/utils/security.py). Its __str__ is
+    # ``user_message + "Reference ID: ..."`` -- user_message is written in this
+    # repo, and the untrusted half (internal_details) is LOGGED in __init__ and
+    # never rendered. Echoing one is the sanctioned pattern, not a leak.
+    "UserFacingError",
     # Dedicated, module-private exception types introduced precisely so that
     # a verbatim passthrough is bounded by construction rather than by
     # inspection. Both are raised ONLY with sentences written in this repo:
@@ -582,7 +600,7 @@ def test_no_returned_fstring_interpolates_a_caught_exception():
     of the audited types in ``_AST_ALLOWED_HANDLERS``.
     """
     offenders = []
-    for path in sorted(_TOOLS_DIR.glob("*.py")):
+    for path in _guarded_sources():
         for line_no, clause, source in _exception_echoing_returns(path):
             offenders.append(f"{path.name}:{line_no} (except {clause}) -> {source}")
 

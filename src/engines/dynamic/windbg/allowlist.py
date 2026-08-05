@@ -231,11 +231,47 @@ _DENY_ARGFORM: tuple[tuple[re.Pattern[str], str], ...] = (
         # '??' evaluates a C++ expression, and that evaluator supports
         # ASSIGNMENT -- '?? *(char*)0x401000 = 0x90' writes target memory. The
         # allowlist admits '??' as a read-only evaluator on the rationale that
-        # the write family is e*, which this misses entirely. Allow comparisons
-        # (==, !=, <=, >=) and reject a bare '=' anywhere in the expression.
-        re.compile(r"^\s*\?\?.*(?<![=!<>])=(?!=)"),
-        "'??' with an assignment is forbidden: the expression evaluator "
-        "writes target memory. Use the read-only comparison forms",
+        # the write family is e*, which this misses entirely.
+        #
+        # The first version of this rule was `(?<![=!<>])=(?!=)`, whose
+        # lookbehind exempts the comparison operators <= and >=. It also
+        # exempted the SHIFT-ASSIGNMENTS <<= and >>=, which are writes wearing
+        # a comparison's last two characters, and it could not see ++ or --,
+        # which are writes containing no '=' at all:
+        #
+        #     ?? *(char*)<kaddr> >>= 8     zeroes a byte
+        #     ?? (*(char*)<kaddr>)++       increments it; repeat to any value
+        #
+        # Those three forms are therefore matched explicitly, BEFORE the
+        # general rule, rather than trying to describe assignment with one
+        # lookbehind. The comment that claimed this rejected "a bare '='
+        # anywhere in the expression" was simply untrue.
+        re.compile(r"^\s*\?\?.*(?:\+\+|--|>>=|<<=|(?<![=!<>])=(?!=))"),
+        "'??' with an assignment or side-effect operator is forbidden: the "
+        "expression evaluator writes target memory. Use the read-only "
+        "comparison forms",
+    ),
+    (
+        # The C++ evaluator is not reachable only through '??'. WinDbg lets ANY
+        # command's expression argument switch evaluators with the documented
+        # '@@c++( ... )' (and bare '@@( ... )') operator, so the assignment
+        # primitive the rule above closes for '??' was still reachable from
+        # '?', 'dd', 'db', 'dt', '.printf', '.if' and every other allowlisted
+        # command that takes an expression:
+        #
+        #     ? @@c++(*(unsigned char*)<kaddr> = 0xcc)
+        #
+        # In kernel mode that is an arbitrary kernel write issued through a
+        # gate whose docstring says "Everything here is a display/inspection
+        # command". Nothing in this project issues '@@' -- the structured tools
+        # build plain MASM expressions and the one conditional-breakpoint
+        # string is `.if (<cond>) {} .else {gc}` -- so refusing the evaluator
+        # switch outright costs nothing and is the same call already made for
+        # 'dx', which is absent from the allowlist for the same reason.
+        re.compile(r"^.*@@", re.IGNORECASE),
+        "the '@@' expression-evaluator switch is forbidden: it reaches the "
+        "C++ evaluator, whose assignment operators write target memory, from "
+        "any command that takes an expression",
     ),
     (
         # Script-file include operators: $<, $><, $$<, $$><, $$>a< all run an
@@ -499,6 +535,35 @@ def _structural_problem(command: str) -> str | None:
                 return (
                     "unbalanced '${' alias interpolation; refusing rather "
                     "than guessing how the debugger splits the remainder"
+                )
+            # REGRESSION GUARD. This skip is UNCONDITIONAL, while
+            # parse_compound's identical-looking skip is gated on
+            # _leading_is_carrier(). That asymmetry is deliberate there and was
+            # a hole here: for a NON-carrier lead, parse_compound treats '$'
+            # and '{' as ordinary characters, so a quote inside ${...} opens a
+            # region that never closes and swallows every ';' and newline to
+            # end of line into one subcommand behind a harmless first token --
+            #
+            #     lm m ${"} ; .shell calc
+            #
+            # which this balance check hopped straight over and pronounced
+            # well-formed. The denylist this module replaced refused that
+            # payload, so it was a regression, not an inherited gap.
+            #
+            # Rather than duplicate the carrier gate (two scanners agreeing by
+            # coincidence is what produced the bug), constrain what may live
+            # inside the region. A ${...} interpolation names an ALIAS; alias
+            # names are ordinary identifier text. Anything carrying quoting or
+            # separator significance means the two tokenizers can disagree
+            # about it, and this module's stated contract is to refuse what it
+            # cannot reason about rather than guess.
+            interior = command[i + 2:j]
+            bad = [c for c in interior if c in "\"'{};\r\n"]
+            if bad:
+                return (
+                    f"'${{...}}' interpolation contains {bad[0]!r}; alias names "
+                    "do not, and a quote or separator here makes this "
+                    "validator's tokenization disagree with the debugger's"
                 )
             i = j + 1
             continue

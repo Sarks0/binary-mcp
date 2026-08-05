@@ -824,7 +824,12 @@ def register_pe_tools(app, session_manager=None):
 
         try:
             result = inspect(binary_path)
-            return render_markdown(result)
+            # Signer/Issuer/chain/TSA common names come from the sample's own
+            # embedded PKCS#7 certificate and are arbitrary UTF-8. Signature
+            # validity is never asserted, so a self-signed cert is enough to
+            # put chosen text -- including the real envelope sentinels -- into
+            # model context.
+            return wrap_untrusted(render_markdown(result), "Authenticode certificate fields")
         except StructuredBaseError as e:
             # Audit F-10: to_user_message() appends a "Debug information"
             # block verbatim, and the producers put host state in it --
@@ -893,7 +898,9 @@ def register_pe_tools(app, session_manager=None):
 
             out_path = Path(output_dir).expanduser() if output_dir else None
             result = carve(binary_path, out_path, max_total_mb=max_total_mb)
-            return render_markdown(result)
+            # resource_path is built from PE resource names (arbitrary UTF-16
+            # chosen by whoever built the sample).
+            return wrap_untrusted(render_markdown(result), "carved blob table")
         except StructuredBaseError as e:
             # Audit F-10: to_user_message() appends a "Debug information"
             # block verbatim, and the producers put host state in it --
@@ -945,7 +952,10 @@ def register_pe_tools(app, session_manager=None):
         from src.utils.structured_errors import StructuredBaseError
 
         try:
-            return render_markdown(compute(binary_path))
+            # Section names come straight from the PE section headers.
+            return wrap_untrusted(
+                render_markdown(compute(binary_path)), "PE section names and hashes"
+            )
         except StructuredBaseError as e:
             # Audit F-10: to_user_message() appends a "Debug information"
             # block verbatim, and the producers put host state in it --

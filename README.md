@@ -70,7 +70,7 @@ Analyze the crash dump at C:\Windows\MEMORY.DMP
 Decompile the type MyNamespace.MyClass to C#
 ```
 
-## Capabilities (250 tools)
+## Capabilities (255 tools)
 
 ### Static Analysis (Ghidra) - 35 tools
 
@@ -107,7 +107,7 @@ Type listing, C# decompilation, IL disassembly, type search, and full assembly d
 
 Comprehensive PE header, section, import, export, resource, debug, TLS, and Rich header analysis in a single fast call (<500ms). Three detail levels (basic/standard/full) with decoded characteristic flags, compiler attribution, and malware indicators.
 
-### Other - 28 tools
+### Other - 33 tools
 
 - **Triage (3)** - Quick file type detection, packer identification, entropy analysis
 - **Malware Analysis (4)** - Behavior detection, threat chain identification, IOC extraction

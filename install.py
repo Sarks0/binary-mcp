@@ -370,7 +370,18 @@ def download_file(
         print_error(f"Download failed: {e}")
         return False
 
-    expected = expected_sha256 or (pinned_sha256(hash_key) if hash_key else None)
+    # PRECEDENCE: an operator pin BEATS the publisher manifest.
+    #
+    # This was the other way round, while install.ps1 and INSTALL.md both told
+    # the operator a pin "overrides" the manifest and is "the only defence
+    # against a takeover of the release itself". Manifest-wins makes that
+    # promise empty in exactly the threat it names: whoever takes over the
+    # release publishes a matching SHA256SUMS too, so the tampered artifact
+    # verifies "OK" and the out-of-band digest the operator went to the trouble
+    # of obtaining is never consulted. A pin is a deliberate, manual act; the
+    # manifest is whatever the release currently serves. The deliberate act wins.
+    pinned = pinned_sha256(hash_key) if hash_key else None
+    expected = pinned or expected_sha256
     if expected:
         verify_sha256(dest, expected, description)
     else:

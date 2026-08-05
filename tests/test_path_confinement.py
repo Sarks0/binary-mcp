@@ -791,3 +791,57 @@ class TestGhidraCacheConfinement:
             "_get_binary_hash, bypassing confinement (audit F-8):\n  "
             + "\n  ".join(offenders)
         )
+
+
+class TestArtifactDirUnionAppliesAtEveryCallSite:
+    """The union was skipped in exactly the posture it was written for.
+
+    ``sanitize_binary_path`` unioned ``server_artifact_dirs()`` only when the
+    CALLER omitted ``allowed_dirs`` -- while ten production call sites pass
+    ``allowed_dirs=get_allowed_dirs()`` explicitly, which is truthy precisely
+    when the operator has configured an allow-list. So the recommended posture
+    still broke every write-then-read loop, ``server_artifact_dirs``'s docstring
+    ("unioned into the allow-list unconditionally") was false, and confinement
+    differed per tool: one that omits the argument could read an artifact that
+    one passing it explicitly refused.
+    """
+
+    @pytest.fixture
+    def configured(self, tmp_path, monkeypatch):
+        quarantine = tmp_path / "quarantine"
+        quarantine.mkdir()
+        monkeypatch.setenv("BINARY_MCP_ALLOWED_DIRS", str(quarantine))
+        monkeypatch.delenv("BINARY_MCP_ALLOW_ANY_PATH", raising=False)
+        return quarantine
+
+    def test_artifact_is_readable_however_the_caller_spells_it(self, configured):
+        from src.utils.security import get_allowed_dirs, server_artifact_dirs
+
+        artifact_root = server_artifact_dirs()[0]
+        artifact_root.mkdir(parents=True, exist_ok=True)
+        dumped = artifact_root / "dumped.bin"
+        dumped.write_bytes(b"MZ")
+
+        # Omitted -- worked before.
+        assert sanitize_binary_path(str(dumped)) == dumped.resolve()
+        # Explicit -- the ten real call sites. This is what regressed.
+        assert (
+            sanitize_binary_path(str(dumped), allowed_dirs=get_allowed_dirs())
+            == dumped.resolve()
+        )
+
+    def test_union_does_not_widen_the_operator_boundary(self, configured, tmp_path):
+        """The artifact dirs are added; nothing else is."""
+        from src.utils.security import get_allowed_dirs
+
+        outside = tmp_path / "elsewhere.bin"
+        outside.write_bytes(b"MZ")
+        with pytest.raises(PathTraversalError):
+            sanitize_binary_path(str(outside), allowed_dirs=get_allowed_dirs())
+
+        # Temp is in default_quarantine_dirs but NOT in server_artifact_dirs,
+        # so a configured allow-list must still exclude it.
+        temp_probe = Path(tempfile.gettempdir()) / "union_probe.bin"
+        temp_probe.write_bytes(b"MZ")
+        with pytest.raises(PathTraversalError):
+            sanitize_binary_path(str(temp_probe), allowed_dirs=get_allowed_dirs())

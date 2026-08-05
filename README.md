@@ -176,16 +176,26 @@ worth being precise about which parts:
 - **Raw debugger commands are filtered, not sandboxed.**
   `x64dbg_execute_command` is gated by an allowlist at the tool layer and a
   second, authoritative allowlist in the C++ plugin, which fails closed on any
-  command name it does not recognise. Only the command's first token is
-  checked; its arguments are forwarded verbatim.
-  `windbg_execute_command` is gated by a token-aware *denylist* that splits
-  compound commands, recurses into nested bodies, and refuses process control,
-  host file I/O, script and command-file execution, module loading, symbol-path
-  changes, and target memory/register writes - a handful of argument forms
-  (`r @rip = ...`, `.process /i`, `!chkimg /f`, `s -b`) are matched too.
-  Anything not named still reaches the debugger. Both tools act on a live
-  target with the debugger's full read access. See each tool's docstring for
-  the exact rules.
+  command name it does not recognise. Every `;`-separated segment is validated
+  independently, at the HTTP chokepoint every bridge method posts through, so a
+  command chained after an allowed one cannot slip past on the strength of the
+  first token.
+  `windbg_execute_command` is **disabled unless the operator sets
+  `BINARY_MCP_ENABLE_RAW_WINDBG=1`** in the server environment. When enabled it
+  is gated by a fail-closed *allowlist*: a subcommand runs only if its command
+  name appears in a curated read-only/inspection list, and anything
+  unrecognised - a new verb, an extension export, a misspelling - is refused.
+  The gate splits compound commands on every separator WinDbg honours, recurses
+  into the quoted and braced command-string arguments of the few carriers it
+  permits, and refuses a set of unsafe argument forms on commands that are
+  otherwise allowed. Both tools act on a live target with the debugger's full
+  read access. See each tool's docstring for the exact rules.
+
+  This paragraph described a denylist ("anything not named still reaches the
+  debugger") until the gate was rewritten; the description is corrected here
+  because an operator auditing the server against it would conclude the
+  opposite of the truth in both directions - the control is stronger than
+  stated, and the tool is off by default.
 - **Samples are never uploaded anywhere.** The VirusTotal integration performs
   GET lookups only - hash reports, behavior summaries, and Intelligence
   search. There is no submission or upload tool, so no sample can leave your

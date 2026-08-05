@@ -100,6 +100,39 @@ redo the work must not silently attach to the run it was trying to bypass.
 analysis went wrong — it means the process running it went away. Its
 subprocesses have been reaped and the work needs restarting.
 
+## Job ids are validated, not trusted
+
+`job_id` arrives as an MCP tool argument, and `root / f"{job_id}.job.json"`
+happily accepts `../../x` or an absolute path — either of which leaves the
+cache root. Generated ids are `uuid4().hex[:16]`, so `_job_path` requires
+lowercase hex and additionally asserts the resolved parent is the jobs
+directory. Everything keyed by job id goes through that one function, so
+`read`, `_update`, `_write`, `_add_child` and `cancel` are all covered by the
+single check rather than four tool entry points that each have to remember.
+
+A rejected id reads as "no such job" rather than an error that would confirm
+whether the traversed path exists.
+
+## A claim can change hands
+
+Releasing a claim is guarded by the job that believes it holds it. Without
+that guard: process A hangs long enough to look dead, B breaks the claim and
+starts a replacement, then A wakes up and finishes — and A's tidy-up deletes
+*B's* claim. The next submit sees an unclaimed key and starts a second
+concurrent Ghidra run on the same binary, which is the exact failure the
+registry exists to prevent, reached through the recovery path.
+
+Terminal states are first-writer-wins for the same reason. A worker that
+finishes normally must not overwrite a `cancelled` or `orphaned` state another
+process wrote while it was running, or an operator who cancelled a job and was
+told so later reads `succeeded`.
+
+`job_cancel` from a process that does not own the job cannot interrupt the
+worker directly — it has no `JobContext` to flag. It kills the subprocesses and
+writes the state; the owner's heartbeat loop sees the state change on its next
+tick and sets the local cancel flag, so the worker reports cancelled rather
+than claiming success for work that was stopped out from under it.
+
 ## Liveness, and why heartbeats rather than pids
 
 A claim is only useful if a crashed owner cannot hold it forever. Owners

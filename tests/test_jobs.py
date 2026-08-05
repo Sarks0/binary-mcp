@@ -152,7 +152,7 @@ class TestDeadOwners:
         )
         record = {
             "schema_version": jobs_mod.SCHEMA_VERSION,
-            "job_id": "deadjob",
+            "job_id": "deadbeef0000dead",
             "kind": "analyze_binary",
             "key": "abandoned",
             "state": STATE_RUNNING,
@@ -166,7 +166,7 @@ class TestDeadOwners:
             "error": None,
         }
         registry._write(record)
-        registry._try_claim("abandoned", "deadjob")
+        registry._try_claim("abandoned", "deadbeef0000dead")
         return record
 
     def test_stale_heartbeat_makes_a_job_stale(self, registry):
@@ -185,18 +185,18 @@ class TestDeadOwners:
         self._plant_dead_job(registry, children=(4242, 4343))
         result = registry.sweep()
 
-        assert result["orphaned"] == ["deadjob"]
+        assert result["orphaned"] == ["deadbeef0000dead"]
         assert sorted(no_killing) == [4242, 4343]
-        assert registry.read("deadjob")["state"] == STATE_ORPHANED
+        assert registry.read("deadbeef0000dead")["state"] == STATE_ORPHANED
 
     def test_a_dead_owners_claim_becomes_takeable(self, registry, no_killing):
         self._plant_dead_job(registry)
         taken = registry.submit(kind="analyze", key="abandoned", fn=lambda ctx: {"ok": 1})
 
         assert taken["attached"] is False, "a dead owner must not hold the claim"
-        assert taken["job_id"] != "deadjob"
+        assert taken["job_id"] != "deadbeef0000dead"
         assert _wait_for(lambda: registry.read(taken["job_id"])["state"] == STATE_SUCCEEDED)
-        assert registry.read("deadjob")["state"] == STATE_ORPHANED
+        assert registry.read("deadbeef0000dead")["state"] == STATE_ORPHANED
 
     def test_sweep_leaves_our_own_running_jobs_alone(self, registry):
         release = threading.Event()
@@ -402,3 +402,112 @@ class TestKillBlastRadius:
         )
         assert jobs_mod._kill_pid(5150) is True
         assert calls == [["taskkill", "/F", "/T", "/PID", "5150"]]
+
+
+class TestJobIdValidation:
+    """`job_id` arrives from an MCP tool argument and is concatenated into a
+    filesystem path. `root / f"{job_id}.job.json"` accepts `../../x` and
+    absolute paths alike, so an unvalidated id reads and writes outside the
+    cache root -- and `cancel` sources its kill list from whatever record it
+    finds there."""
+
+    @pytest.mark.parametrize(
+        "hostile",
+        [
+            "../../../../etc/shadow",
+            "/etc/passwd",
+            "..",
+            "a/b",
+            "a\\b",
+            "AAAA",          # uppercase is not in the generated alphabet
+            "zzzz",          # non-hex
+            "",
+            "a" * 65,        # longer than a sha256
+        ],
+    )
+    def test_hostile_ids_are_refused(self, registry, hostile):
+        with pytest.raises(ValueError):
+            registry._job_path(hostile)
+
+    def test_a_hostile_id_reads_as_no_such_job(self, registry):
+        """The tools must report 'no such job', not an error that confirms
+        whether the traversed path exists."""
+        assert registry.read("../../../../etc/shadow") is None
+
+    def test_a_hostile_id_cannot_be_written_to(self, registry, tmp_path):
+        outside = tmp_path.parent / "escaped.job.json"
+        registry._write({"schema_version": jobs_mod.SCHEMA_VERSION,
+                         "job_id": "../escaped", "state": STATE_RUNNING})
+        assert not outside.exists()
+
+    def test_cancel_on_a_hostile_id_kills_nothing(self, registry, no_killing):
+        result = registry.cancel("../../../../etc/shadow")
+        assert "error" in result
+        assert no_killing == []
+
+    def test_generated_ids_pass(self, registry):
+        submitted = registry.submit(kind="test", key="k", fn=lambda ctx: {})
+        assert registry._job_path(submitted["job_id"]).parent == registry.root
+
+
+class TestClaimHandover:
+    """A claim can change hands underneath its original owner. The original
+    must not then delete the *new* owner's claim -- that frees the key and the
+    next submit starts a second concurrent Ghidra run on the same binary."""
+
+    def test_a_stale_owner_does_not_release_the_replacement_claim(self, registry):
+        registry._try_claim("shared", "aaaa1111")
+        # A second process broke the stale claim and took it.
+        registry._release_claim("shared", expect="aaaa1111")
+        registry._try_claim("shared", "bbbb2222")
+
+        # The original owner now finishes and tries to tidy up.
+        registry._release_claim("shared", expect="aaaa1111")
+
+        assert registry._read_claim("shared") == "bbbb2222", (
+            "the replacement's claim must survive the original owner's exit"
+        )
+
+    def test_an_owner_releases_its_own_claim(self, registry):
+        registry._try_claim("k", "aaaa1111")
+        registry._release_claim("k", expect="aaaa1111")
+        assert registry._read_claim("k") is None
+
+    def test_a_finished_job_frees_the_key_for_the_next_one(self, registry):
+        first = registry.submit(kind="analyze", key="k", fn=lambda ctx: {})
+        assert _wait_for(lambda: registry.read(first["job_id"])["state"] == STATE_SUCCEEDED)
+        assert registry._read_claim("k") is None
+
+
+class TestTerminalStateIsFirstWriterWins:
+    """An operator told a job was cancelled must not later read 'succeeded'."""
+
+    def test_a_worker_does_not_overwrite_a_cancellation(self, registry, no_killing):
+        release = threading.Event()
+        submitted = registry.submit(kind="test", key="k", fn=lambda ctx: release.wait(5))
+        job_id = submitted["job_id"]
+        assert _wait_for(lambda: registry.read(job_id) is not None)
+
+        registry.cancel(job_id)
+        release.set()
+        import time
+
+        time.sleep(0.3)
+        assert registry.read(job_id)["state"] == STATE_CANCELLED
+
+    def test_a_worker_does_not_overwrite_an_orphaning(self, registry):
+        release = threading.Event()
+        submitted = registry.submit(kind="test", key="k", fn=lambda ctx: release.wait(5))
+        job_id = submitted["job_id"]
+        assert _wait_for(lambda: registry.read(job_id) is not None)
+
+        # Another process concluded we were dead while we were still working.
+        registry._update(job_id, state=STATE_ORPHANED)
+        release.set()
+        import time
+
+        time.sleep(0.3)
+        assert registry.read(job_id)["state"] == STATE_ORPHANED
+
+    def test_finalize_is_a_no_op_on_an_unknown_job(self, registry):
+        assert registry._finalize("aaaa1111", state=STATE_SUCCEEDED) is None

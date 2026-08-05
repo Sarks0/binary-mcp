@@ -54,6 +54,7 @@ import atexit
 import json
 import logging
 import os
+import re
 import subprocess  # nosec B404 - process liveness/identity probes only
 import sys
 import threading
@@ -84,6 +85,14 @@ STALE_AFTER_SECONDS = 120
 
 # Substrings that identify a process as one of ours before we kill it.
 _REAPABLE_MARKERS = ("analyzeheadless", "ghidra")
+
+# Job ids are `uuid4().hex[:16]`, so plain lowercase hex. Anything else is
+# rejected before it reaches the filesystem: `job_id` arrives from an MCP tool
+# argument, and `root / f"{job_id}.job.json"` happily accepts `../../x` or an
+# absolute path, either of which leaves the cache root entirely. Same shape as
+# `src.utils.security.validate_state_id`, which guards the debug-state
+# side-cars for exactly this reason.
+_JOB_ID_RE = re.compile(r"^[0-9a-f]{1,64}$")
 
 
 def _utc_now() -> str:
@@ -243,7 +252,21 @@ class JobRegistry:
     # paths
 
     def _job_path(self, job_id: str) -> Path:
-        return self.root / f"{job_id}.job.json"
+        """Resolve a job id to its record path, refusing anything off-root.
+
+        The single choke point for every read and write keyed by job id, so
+        validating here covers ``read``, ``_update``, ``_write``, ``_add_child``
+        and ``cancel`` at once rather than four tool entry points that each
+        have to remember.
+        """
+        if not isinstance(job_id, str) or not _JOB_ID_RE.match(job_id):
+            raise ValueError(f"invalid job id: {job_id!r}")
+        path = self.root / f"{job_id}.job.json"
+        # Belt and braces against a symlinked root or a future loosening of
+        # the pattern: the record must land directly in the jobs directory.
+        if path.parent.resolve() != self.root.resolve():
+            raise ValueError(f"job id escapes the registry root: {job_id!r}")
+        return path
 
     def _claim_path(self, key: str) -> Path:
         safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in key)[:120]
@@ -252,7 +275,13 @@ class JobRegistry:
     # persistence
 
     def _write(self, record: dict) -> None:
-        path = self._job_path(record["job_id"])
+        try:
+            path = self._job_path(record.get("job_id"))
+        except ValueError as exc:
+            # A record whose own job_id is a traversal string -- planted, or
+            # corrupted. Refuse rather than write wherever it points.
+            logger.error("refusing to write job record: %s", exc)
+            return
         tmp = path.with_suffix(".tmp")
         try:
             tmp.write_text(json.dumps(record), encoding="utf-8")
@@ -264,7 +293,13 @@ class JobRegistry:
     def read(self, job_id: str) -> dict | None:
         try:
             data = json.loads(self._job_path(job_id).read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+        except ValueError as exc:
+            # Covers both a malformed id and unparseable JSON. A rejected id
+            # reads as "no such job" rather than an error that would confirm
+            # whether the path exists.
+            logger.debug("job read rejected: %s", exc)
+            return None
+        except OSError:
             return None
         if not isinstance(data, dict) or data.get("schema_version") != SCHEMA_VERSION:
             return None
@@ -275,6 +310,26 @@ class JobRegistry:
             record = self.read(job_id)
             if record is None:
                 return None
+            record.update(fields)
+            record["updated_at"] = _utc_now()
+            self._write(record)
+            return record
+
+    def _finalize(self, job_id: str, **fields) -> dict | None:
+        """Write a terminal state, unless somebody already wrote one.
+
+        Without this, a worker that finishes normally overwrites a
+        ``cancelled`` or ``orphaned`` state another process set while it was
+        still running -- so an operator who cancelled a job, and was told it
+        was cancelled, later reads ``succeeded``. The record has to reflect the
+        first terminal decision, not the last writer.
+        """
+        with self._lock:
+            record = self.read(job_id)
+            if record is None:
+                return None
+            if record.get("state") in TERMINAL_STATES:
+                return record
             record.update(fields)
             record["updated_at"] = _utc_now()
             self._write(record)
@@ -348,7 +403,22 @@ class JobRegistry:
             path.unlink(missing_ok=True)
             return False
 
-    def _release_claim(self, key: str) -> None:
+    def _release_claim(self, key: str, expect: str | None = None) -> None:
+        """Drop the claim on ``key``, but only if it still names ``expect``.
+
+        The guard is load-bearing. A claim can change hands underneath its
+        original owner: process A hangs long enough to look dead, B breaks the
+        claim and starts a replacement job, then A wakes up and finishes. An
+        unguarded release at that point deletes *B's* claim, and the next
+        submit sees an unclaimed key and starts a second concurrent Ghidra run
+        on the same binary -- precisely the thing this registry exists to
+        prevent, arrived at through the recovery path.
+
+        ``expect=None`` means "release whatever is there", which is only
+        correct for a claim that names nobody (an unparseable one).
+        """
+        if expect is not None and self._read_claim(key) != expect:
+            return
         self._claim_path(key).unlink(missing_ok=True)
 
     # submission
@@ -437,11 +507,11 @@ class JobRegistry:
             return None
         record = self.read(job_id)
         if record is None:
-            self._release_claim(key)
+            self._release_claim(key, expect=job_id)
             return None
         if record.get("state") in TERMINAL_STATES:
             # Finished. The claim is spent; the result stays readable by id.
-            self._release_claim(key)
+            self._release_claim(key, expect=job_id)
             return None
         if self.is_stale(record):
             logger.warning(
@@ -449,31 +519,41 @@ class JobRegistry:
                 job_id, record.get("kind"), record.get("owner_pid"),
             )
             self._orphan(record)
-            self._release_claim(key)
+            self._release_claim(key, expect=job_id)
             return None
         return record
 
     def _run(self, job_id: str, key: str, fn, context: JobContext) -> None:
         beat = threading.Thread(
-            target=self._heartbeat, args=(job_id,), name=f"hb-{job_id}", daemon=True
+            target=self._heartbeat, args=(job_id, context),
+            name=f"hb-{job_id}", daemon=True,
         )
         beat.start()
         try:
             result = fn(context)
             if context.cancelled:
-                self._update(job_id, state=STATE_CANCELLED, progress="cancelled")
+                self._finalize(job_id, state=STATE_CANCELLED, progress="cancelled")
             else:
-                self._update(job_id, state=STATE_SUCCEEDED, result=result,
-                             progress="complete")
+                self._finalize(job_id, state=STATE_SUCCEEDED, result=result,
+                               progress="complete")
         except Exception as exc:
             logger.exception("job %s failed", job_id)
-            self._update(job_id, state=STATE_FAILED, error=str(exc), progress="failed")
+            self._finalize(job_id, state=STATE_FAILED, error=str(exc), progress="failed")
         finally:
-            self._release_claim(key)
+            self._release_claim(key, expect=job_id)
             with self._lock:
                 self._local.pop(job_id, None)
 
-    def _heartbeat(self, job_id: str) -> None:
+    def _heartbeat(self, job_id: str, context: JobContext) -> None:
+        """Refresh the claim, and notice if somebody else ended this job.
+
+        ``cancel`` can be called from a process that does not own the job,
+        where it has no ``JobContext`` to flag -- it can only kill the
+        subprocesses and write the state. This loop is the owner's side of
+        that: it sees the state change and sets the local cancel flag, so the
+        worker reports cancelled instead of claiming success for work that was
+        stopped out from under it.
+        """
         while not self._stop.is_set():
             if self._stop.wait(self.heartbeat_interval):
                 return
@@ -481,7 +561,10 @@ class JobRegistry:
                 if job_id not in self._local:
                     return
             record = self.read(job_id)
-            if record is None or record.get("state") != STATE_RUNNING:
+            if record is None:
+                return
+            if record.get("state") != STATE_RUNNING:
+                context._cancelled.set()
                 return
             self._update(job_id, heartbeat_at=_utc_now())
 
@@ -522,7 +605,7 @@ class JobRegistry:
                 context._cancelled.set()
         self._update(job_id, state=STATE_CANCELLED, progress="cancelled",
                      error=f"cancelled; reaped {reaped} subprocess(es)")
-        self._release_claim(record.get("key") or "")
+        self._release_claim(record.get("key") or "", expect=job_id)
         return {"job_id": job_id, "state": STATE_CANCELLED, "cancelled": True,
                 "reaped": reaped}
 
@@ -545,7 +628,7 @@ class JobRegistry:
                 continue
             reaped.extend(self._orphan(record))
             orphaned.append(record["job_id"])
-            self._release_claim(record.get("key") or "")
+            self._release_claim(record.get("key") or "", expect=record["job_id"])
         if orphaned:
             logger.warning("swept %d orphaned job(s), reaped %d process(es)",
                            len(orphaned), len(reaped))
@@ -598,4 +681,4 @@ class JobRegistry:
                 job_id, state=STATE_FAILED, progress="server exited",
                 error=f"server process exited before completion; reaped {reaped} subprocess(es)",
             )
-            self._release_claim(record.get("key") or "")
+            self._release_claim(record.get("key") or "", expect=job_id)

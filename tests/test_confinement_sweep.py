@@ -201,7 +201,15 @@ def test_extraction_refuses_absolute_output_dir_outside_root(
         binary_path=str(sample), output_dir=str(evil), packer_type="py2exe"
     )
 
-    assert "must be within" in result
+    # Assert the SECURITY property, not the wording. The previous assertion
+    # pinned "must be within", which was the leaky spelling: that message
+    # interpolated the resolved extraction root (a Path.home()-derived
+    # directory) straight back to the model. Routing this handler through
+    # safe_path_error removed the host path, so a test that demanded the old
+    # string was pinning the leak in place.
+    assert "Invalid path" in result or "outside the directories" in result
+    assert str(extraction_root) not in result, "refusal must not echo host layout"
+    assert str(evil) not in result, "refusal must not echo the requested path"
     assert not evil.exists(), "the refused destination must not be created"
 
 
@@ -218,7 +226,8 @@ def test_extraction_refuses_traversal_output_dir(
         packer_type="py2exe",
     )
 
-    assert "must be within" in result
+    assert "Invalid path" in result or "outside the directories" in result
+    assert str(extraction_root) not in result, "refusal must not echo host layout"
     assert not (tmp_path / "escape").exists()
 
 

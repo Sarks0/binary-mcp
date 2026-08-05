@@ -732,3 +732,95 @@ class TestEscapedQuoteInCarrierBodies:
         reintroduced here."""
         ok, _ = validate_command(r"j 1 '.shell calc'")
         assert ok is False
+
+
+# ---------------------------------------------------------------------------
+# Regressions found by the pre-merge review
+# ---------------------------------------------------------------------------
+
+
+class TestAliasInterpolationCannotHideASubcommand:
+    """``${...}`` desynchronised the two tokenizers, re-opening RCE.
+
+    ``_structural_problem`` skipped ``${...}`` unconditionally while
+    ``parse_compound`` skips it only for a carrier lead. For a non-carrier a
+    quote inside the region was invisible to the balance check but still opened
+    an unterminated quoted region in the splitter, swallowing every ';' to end
+    of line into one subcommand behind a harmless first token.
+
+    origin/main's denylist refused every payload below, so this was a
+    regression introduced by the allowlist rewrite, not an inherited gap.
+    """
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'lm m ${"} ; .shell calc',
+            'lm ${"} ; .dvalloc 1000',
+            "k ${'} ; .shell calc",
+            'r ${"} ; eb 401000 90',
+            'lm ${;} ; .shell calc',
+            'lm ${}} ; .shell calc',
+            'lm ${\n} ; .shell calc',
+        ],
+    )
+    def test_quote_or_separator_inside_interpolation_is_refused(self, command):
+        assert_refused(command)
+
+    def test_legitimate_foreach_interpolation_still_works(self):
+        """The fix must not break the construct ${...} actually exists for."""
+        ok, reason = validate_command(".foreach (a {!process 0 0}) {!handle ${a}}")
+        assert ok, reason
+
+
+class TestCppEvaluatorSwitchIsRefused:
+    """'@@c++( )' reaches the writing evaluator from ANY expression command.
+
+    The '??' assignment rule was the only control, and it is anchored on a
+    leading '??' -- so '? @@c++(*(char*)addr = 0xcc)' walked straight past it.
+    """
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "? @@c++(*(unsigned char*)0x401000 = 0xcc)",
+            "dd @@c++(*(int*)0x401000 = 1)",
+            'dt @@c++(*(int*)0x401000 = 1)',
+            '.printf "%d", @@c++(*(int*)0x401000 = 1)',
+            "?? @@c++(*(int*)0x401000 = 1)",
+            "? @@(*(int*)0x401000 = 1)",
+        ],
+    )
+    def test_evaluator_switch_is_refused(self, command):
+        assert_refused(command)
+
+
+class TestExpressionSideEffectOperators:
+    """The '??' deny missed >>=, <<=, ++ and --.
+
+    The original lookbehind exempted <= and >=, which also exempted the shift
+    assignments; ++ and -- contain no '=' for it to see at all.
+    """
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "?? *(char*)0x401000 >>= 8",
+            "?? *(char*)0x401000 <<= 8",
+            "?? (*(char*)0x401000)++",
+            "?? (*(char*)0x401000)--",
+            "?? *(char*)0x401000 = 0x90",
+            "?? a += 1",
+            "?? a &= 1",
+        ],
+    )
+    def test_write_operators_are_refused(self, command):
+        assert_refused(command)
+
+    @pytest.mark.parametrize(
+        "command",
+        ["?? a == b", "?? a != b", "?? a <= b", "?? a >= b", "?? a >> 2", "?? a << 2"],
+    )
+    def test_read_only_comparisons_and_shifts_still_work(self, command):
+        ok, reason = validate_command(command)
+        assert ok, reason

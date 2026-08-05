@@ -222,7 +222,11 @@ def register_windbg_tools(
             return _PLATFORM_MSG
         try:
             commands = get_windbg_commands()
-            return commands.get_status_summary()
+            # get_status_summary() appends the current instruction, which is
+            # target disassembly (commands.py). Server-authored status text is
+            # inside the same block, so the whole summary is fenced rather than
+            # split -- over-fencing is safe, under-fencing is the bug.
+            return _fence(commands.get_status_summary(), "debugger status and current instruction")
         except (WinDbgBridgeError, StructuredBaseError) as e:
             return safe_tool_error("windbg_status", e)
 
@@ -577,9 +581,14 @@ def register_windbg_tools(
             stack = bridge.get_stack(thread_id=thread_id, frames=frames)
             if not stack:
                 return "Stack walk returned no frames."
-            return "\n".join(
-                f"{f['frame']}  {f['child_sp']}  {f['ret_addr']}  {f['call_site']}"
-                for f in stack
+            # call_site resolves through the target's own module and export
+            # names, which a malicious driver chooses.
+            return _fence(
+                "\n".join(
+                    f"{f['frame']}  {f['child_sp']}  {f['ret_addr']}  {f['call_site']}"
+                    for f in stack
+                ),
+                "stack frames and call-site symbols",
             )
         except (WinDbgBridgeError, StructuredBaseError) as e:
             return safe_tool_error("windbg_get_stack", e)
@@ -721,7 +730,12 @@ def register_windbg_tools(
         try:
             bridge = get_windbg_bridge()
             result = bridge.switch_thread(thread_id=thread_id)
-            return f"Switched to thread {result['thread_id']}.\n{result['output']}"
+            # The confirmation line is ours; result['output'] is raw debugger
+            # output about the target, so only that half is fenced.
+            return (
+                f"Switched to thread {result['thread_id']}.\n"
+                + _fence(result["output"], "debugger output")
+            )
         except (WinDbgBridgeError, StructuredBaseError) as e:
             return safe_tool_error("windbg_switch_thread", e)
 
@@ -739,7 +753,11 @@ def register_windbg_tools(
             loc = bridge.step_into()
             parts = [f"Address: 0x{loc.get('address', '?')}"]
             if loc.get("instruction"):
-                parts.append(f"Instruction: {loc['instruction']}")
+                # Target disassembly: operand text can carry sample-chosen
+                # symbol and string references.
+                parts.append(
+                    "Instruction: " + _fence(loc["instruction"], "target disassembly")
+                )
             return "\n".join(parts)
         except (WinDbgBridgeError, StructuredBaseError) as e:
             return safe_tool_error("windbg_step_into", e)
@@ -758,7 +776,11 @@ def register_windbg_tools(
             loc = bridge.step_over()
             parts = [f"Address: 0x{loc.get('address', '?')}"]
             if loc.get("instruction"):
-                parts.append(f"Instruction: {loc['instruction']}")
+                # Target disassembly: operand text can carry sample-chosen
+                # symbol and string references.
+                parts.append(
+                    "Instruction: " + _fence(loc["instruction"], "target disassembly")
+                )
             return "\n".join(parts)
         except (WinDbgBridgeError, StructuredBaseError) as e:
             return safe_tool_error("windbg_step_over", e)

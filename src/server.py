@@ -45,6 +45,7 @@ from src.tools.diff_tools import register_diff_tools
 from src.tools.dispatch_tools import register_dispatch_tools
 from src.tools.dotnet_tools import register_dotnet_tools
 from src.tools.dynamic_tools import register_dynamic_tools
+from src.tools.error_hygiene import safe_path_error, safe_tool_error
 from src.tools.fid_tools import register_fid_tools
 from src.tools.function_hash_tools import register_function_hash_tools
 from src.tools.indirect_call_tools import register_indirect_call_tools
@@ -1145,7 +1146,7 @@ def load_pdb(
             except ValueError as e:
                 return f"Cannot auto-fetch PDB: {e}"
             except RuntimeError as e:
-                return f"Symbol server fetch failed: {e}"
+                return safe_tool_error("load_pdb", e)
             pdb_path = str(fetched)
             pdb_was_fetched = True
 
@@ -1248,7 +1249,7 @@ def load_pdb(
         return "\n".join(lines)
 
     except FileNotFoundError as e:
-        return f"PDB not found: {e}"
+        return safe_path_error("load_pdb", e, "path")
     except (PathTraversalError, FileSizeError) as e:
         return safe_error_message("Invalid binary or PDB path", e)
     except Exception as e:
@@ -1418,7 +1419,7 @@ def get_functions(
 
     except Exception as e:
         logger.error(f"get_functions failed: {e}")
-        return f"Error: {e}"
+        return safe_tool_error("get_functions", e)
 
 
 @app.tool()
@@ -1481,7 +1482,7 @@ def get_imports(
 
     except Exception as e:
         logger.error(f"get_imports failed: {e}")
-        return f"Error: {e}"
+        return safe_tool_error("get_imports", e)
 
 
 @app.tool()
@@ -1552,7 +1553,7 @@ def get_strings(
 
     except Exception as e:
         logger.error(f"get_strings failed: {e}")
-        return f"Error: {e}"
+        return safe_tool_error("get_strings", e)
 
 
 def _normalize_xref_addr(raw: str | None) -> str:
@@ -1953,7 +1954,7 @@ def get_xrefs(
 
     except Exception as e:
         logger.error(f"get_xrefs failed: {e}")
-        return f"Error: {e}"
+        return safe_tool_error("get_xrefs", e)
 
 
 @app.tool()
@@ -2079,7 +2080,7 @@ def decompile_function(
         return safe_error_message("Invalid binary path", e)
     except Exception as e:
         logger.error(f"decompile_function failed: {e}")
-        return f"Error: {e}"
+        return safe_tool_error("decompile_function", e)
 
 
 # Phase 2: Enhanced Analysis Tools (P1 - Important)
@@ -2385,7 +2386,7 @@ def get_call_graph(
 
     except Exception as e:
         logger.error(f"get_call_graph failed: {e}")
-        return f"Error: {e}"
+        return safe_tool_error("get_call_graph", e)
 
 
 @app.tool()
@@ -2472,7 +2473,7 @@ def find_api_calls(
 
     except Exception as e:
         logger.error(f"find_api_calls failed: {e}")
-        return f"Error: {e}"
+        return safe_tool_error("find_api_calls", e)
 
 
 @app.tool()
@@ -2522,7 +2523,7 @@ def get_memory_map(
 
     except Exception as e:
         logger.error(f"get_memory_map failed: {e}")
-        return f"Error: {e}"
+        return safe_tool_error("get_memory_map", e)
 
 
 @app.tool()
@@ -2553,7 +2554,7 @@ def extract_metadata(
 
     except Exception as e:
         logger.error(f"extract_metadata failed: {e}")
-        return f"Error: {e}"
+        return safe_tool_error("extract_metadata", e)
 
 
 def _parse_byte_pattern(pattern: str) -> tuple[bytes, bytes] | None:
@@ -2738,12 +2739,12 @@ def search_bytes(
         return "\n".join(lines)
 
     except FileNotFoundError as e:
-        return f"Binary not found: {e}"
+        return safe_path_error("search_bytes", e, "path")
     except (PathTraversalError, FileSizeError) as e:
         return safe_error_message("search_bytes", e)
     except Exception as e:
         logger.error(f"search_bytes failed: {e}")
-        return f"Error: {e}"
+        return safe_tool_error("search_bytes", e)
 
 
 # Phase 3: Advanced Tools (P2 - Nice-To-Have)
@@ -2782,7 +2783,7 @@ def detect_crypto(
 
     except Exception as e:
         logger.error(f"detect_crypto failed: {e}")
-        return f"Error: {e}"
+        return safe_tool_error("detect_crypto", e)
 
 
 @app.tool()
@@ -2853,7 +2854,7 @@ def generate_iocs(
 
     except Exception as e:
         logger.error(f"generate_iocs failed: {e}")
-        return f"Error: {e}"
+        return safe_tool_error("generate_iocs", e)
 
 
 @app.tool()
@@ -2909,7 +2910,7 @@ def diagnose_setup() -> str:
 
     except Exception as e:
         logger.error(f"diagnose_setup failed: {e}")
-        return f"Error: {e}"
+        return safe_tool_error("diagnose_setup", e)
 
 
 # Additional Tools
@@ -2978,10 +2979,10 @@ def check_binary(binary_path: str) -> str:
     except (PathTraversalError, FileSizeError) as e:
         return safe_error_message("Invalid binary file or path", e)
     except FileNotFoundError as e:
-        return f"Error: {e}"
+        return safe_path_error("check_binary", e, "path")
     except Exception as e:
         logger.error(f"check_binary failed: {e}")
-        return f"Error checking binary: {e}"
+        return safe_tool_error("check_binary", e)
 
 
 @app.tool()
@@ -3036,7 +3037,7 @@ def list_data_types(
 
     except Exception as e:
         logger.error(f"list_data_types failed: {e}")
-        return f"Error: {e}"
+        return safe_tool_error("list_data_types", e)
 
 
 @app.tool()
@@ -3165,7 +3166,7 @@ def rename_function(
 
     except Exception as e:
         logger.error(f"rename_function failed: {e}")
-        return f"Error: {e}"
+        return safe_tool_error("rename_function", e)
 
 
 _NOTE_KIND_VALUES = ("plate", "pre", "post")
@@ -3291,7 +3292,7 @@ def add_note(
         return result
     except Exception as e:
         logger.error(f"add_note failed: {e}")
-        return f"Error: {e}"
+        return safe_tool_error("add_note", e)
 
 
 @app.tool()
@@ -3376,7 +3377,7 @@ def get_notes(
         return safe_error_message("Invalid binary path", e)
     except Exception as e:
         logger.error(f"get_notes failed: {e}")
-        return f"Error: {e}"
+        return safe_tool_error("get_notes", e)
 
 
 @app.tool()
@@ -3456,7 +3457,7 @@ def delete_note(
         return result
     except Exception as e:
         logger.error(f"delete_note failed: {e}")
-        return f"Error: {e}"
+        return safe_tool_error("delete_note", e)
 
 
 # Analysis Session Tools
@@ -3540,7 +3541,7 @@ def start_analysis_session(
         return safe_error_message("Invalid binary path", e)
     except Exception as e:
         logger.error(f"start_analysis_session failed: {e}")
-        return f"Error: {e}"
+        return safe_tool_error("start_analysis_session", e)
 
 
 @app.tool()
@@ -3608,7 +3609,7 @@ def save_session(session_id: str | None = None) -> str:
 
     except Exception as e:
         logger.error(f"save_session failed: {e}")
-        return f"Error: {e}"
+        return safe_tool_error("save_session", e)
 
 
 @app.tool()
@@ -3696,7 +3697,7 @@ def list_sessions(
 
     except Exception as e:
         logger.error(f"list_sessions failed: {e}")
-        return f"Error: {e}"
+        return safe_tool_error("list_sessions", e)
 
 
 @app.tool()
@@ -3781,7 +3782,7 @@ def get_session_summary(session_id: str) -> str:
 
     except Exception as e:
         logger.error(f"get_session_summary failed: {e}")
-        return f"Error: {e}"
+        return safe_tool_error("get_session_summary", e)
 
 
 @app.tool()
@@ -3890,7 +3891,7 @@ def load_session_section(
 
     except Exception as e:
         logger.error(f"load_session_section failed: {e}")
-        return f"Error: {e}"
+        return safe_tool_error("load_session_section", e)
 
 
 @app.tool()
@@ -3951,7 +3952,7 @@ def load_full_session(session_id: str) -> str:
 
     except Exception as e:
         logger.error(f"load_full_session failed: {e}")
-        return f"Error: {e}"
+        return safe_tool_error("load_full_session", e)
 
 
 @app.tool()
@@ -3995,7 +3996,7 @@ def delete_session(session_id: str) -> str:
 
     except Exception as e:
         logger.error(f"delete_session failed: {e}")
-        return f"Error: {e}"
+        return safe_tool_error("delete_session", e)
 
 
 @app.tool()
@@ -4057,7 +4058,7 @@ def find_related_sessions(binary_path: str, limit: int = 10) -> str:
         return safe_error_message("Invalid binary path", e)
     except Exception as e:
         logger.error(f"find_related_sessions failed: {e}")
-        return f"Error: {e}"
+        return safe_tool_error("find_related_sessions", e)
 
 
 @app.tool()
@@ -4216,7 +4217,7 @@ def detect_crypto_patterns(binary_path: str) -> str:
         return safe_error_message("detect_crypto_patterns", e)
     except Exception as e:
         logger.error(f"detect_crypto_patterns failed: {e}")
-        return f"Error analyzing file: {e}"
+        return safe_tool_error("detect_crypto_patterns", e)
 
 
 @app.tool()
@@ -4296,7 +4297,7 @@ def analyze_xor_encryption(
         return safe_error_message("analyze_xor_encryption", e)
     except Exception as e:
         logger.error(f"analyze_xor_encryption failed: {e}")
-        return f"Error analyzing file: {e}"
+        return safe_tool_error("analyze_xor_encryption", e)
 
 
 @app.tool()
@@ -4388,7 +4389,7 @@ def decrypt_xor(
         return safe_error_message("decrypt_xor", e)
     except Exception as e:
         logger.error(f"decrypt_xor failed: {e}")
-        return f"Error decrypting file: {e}"
+        return safe_tool_error("decrypt_xor", e)
 
 
 @app.tool()
@@ -4429,7 +4430,7 @@ def decode_base64_file(
             text = ''.join(text.split())  # Remove whitespace
             decoded = base64.b64decode(text)
         except Exception as e:
-            return f"Error: Failed to decode Base64: {e}"
+            return safe_tool_error("decode_base64_file", e)
 
         entropy = calculate_entropy(decoded)
 
@@ -4480,7 +4481,7 @@ def decode_base64_file(
         return safe_error_message("decode_base64_file", e)
     except Exception as e:
         logger.error(f"decode_base64_file failed: {e}")
-        return f"Error decoding file: {e}"
+        return safe_tool_error("decode_base64_file", e)
 
 
 # Python Bytecode Analysis Tools
@@ -4551,10 +4552,10 @@ def detect_python_packer(binary_path: str) -> str:
     except (PathTraversalError, FileSizeError) as e:
         return safe_error_message("detect_python_packer", e)
     except FileNotFoundError as e:
-        return f"File not found: {e}"
+        return safe_path_error("detect_python_packer", e, "path")
     except Exception as e:
         logger.error(f"detect_python_packer failed: {e}")
-        return f"Error detecting packer: {e}"
+        return safe_tool_error("detect_python_packer", e)
 
 
 @app.tool()
@@ -4612,7 +4613,7 @@ def extract_python_packed(
         try:
             safe_output_dir = sanitize_output_dir(output_dir, EXTRACTION_OUTPUT_DIR)
         except PathTraversalError as e:
-            return f"Error: {e}"
+            return safe_path_error("extract_python_packed", e, "path")
         except ValueError as e:
             return f"Error: invalid output directory: {e}"
 
@@ -4663,10 +4664,10 @@ def extract_python_packed(
     except (PathTraversalError, FileSizeError) as e:
         return safe_error_message("extract_python_packed", e)
     except FileNotFoundError as e:
-        return f"File not found: {e}"
+        return safe_path_error("extract_python_packed", e, "path")
     except Exception as e:
         logger.error(f"extract_python_packed failed: {e}")
-        return f"Error extracting packed binary: {e}"
+        return safe_tool_error("extract_python_packed", e)
 
 
 @app.tool()
@@ -4725,10 +4726,10 @@ def analyze_pyc_file(pyc_path: str) -> str:
     except (PathTraversalError, FileSizeError) as e:
         return safe_error_message("analyze_pyc_file", e)
     except FileNotFoundError as e:
-        return f"File not found: {e}"
+        return safe_path_error("analyze_pyc_file", e, "path")
     except Exception as e:
         logger.error(f"analyze_pyc_file failed: {e}")
-        return f"Error analyzing .pyc file: {e}"
+        return safe_tool_error("analyze_pyc_file", e)
 
 
 @app.tool()
@@ -4797,10 +4798,10 @@ def list_python_archive_contents(binary_path: str) -> str:
     except (PathTraversalError, FileSizeError) as e:
         return safe_error_message("list_python_archive_contents", e)
     except FileNotFoundError as e:
-        return f"File not found: {e}"
+        return safe_path_error("list_python_archive_contents", e, "path")
     except Exception as e:
         logger.error(f"list_python_archive_contents failed: {e}")
-        return f"Error listing archive contents: {e}"
+        return safe_tool_error("list_python_archive_contents", e)
 
 
 def main():

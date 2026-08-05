@@ -1119,3 +1119,87 @@ class TestExaminationInvariants:
             "total": 2, "in_scope_total": 2, "reviewed": 1, "reviewed_in_scope": 1,
             "remaining": 1, "remaining_in_scope": 1,
         })
+
+
+class TestStalenessProbe:
+    """The cheap staleness probe compares the analysis cache's
+    `.meta.json` function_count against a count stored in the record. Those
+    two must be derived the SAME way: `ProjectCache` writes
+    `len(_build_function_index(data))`, a dict keyed on the raw address, so a
+    falsy address vanishes and duplicates collapse. Comparing that against
+    `len(functions)` made the probe read stale forever on such a binary, and
+    every status poll decompressed the whole analysis cache to re-index.
+    """
+
+    def _poll_stamps(self, lab, times=3):
+        import time
+
+        stamps = []
+        for _ in range(times):
+            time.sleep(1.01)  # indexed_at has one-second resolution
+            record, _status = lab.store.ensure_indexed(lab.binary_id, lab.path)
+            stamps.append(record["indexed_at"])
+        return stamps
+
+    def test_duplicate_addresses_do_not_cause_a_rebuild_loop(self, lab):
+        lab.analyze(_context([
+            _func("a", "140001000"),
+            _func("dup", "140001000"),
+            _func("b", "140002000"),
+        ]))
+        lab.store.index(lab.binary_id, lab.path)
+        assert len(set(self._poll_stamps(lab))) == 1
+
+    def test_an_addressless_function_does_not_cause_a_rebuild_loop(self, lab):
+        lab.analyze(_context([
+            _func("a", "140001000"),
+            _func("noaddr", ""),
+            _func("b", "140002000"),
+        ]))
+        lab.store.index(lab.binary_id, lab.path)
+        assert len(set(self._poll_stamps(lab))) == 1
+
+    def test_the_stored_count_mirrors_how_meta_derives_its_own(self, lab):
+        lab.analyze(_context([
+            _func("a", "140001000"),
+            _func("dup", "140001000"),
+            _func("noaddr", ""),
+            _func("b", "140002000"),
+        ]))
+        record = lab.store.index(lab.binary_id, lab.path)
+        assert record["source_index_count"] == lab.store._source_function_count(
+            lab.binary_id
+        )
+        # The honest denominator cross-check still counts the whole list.
+        assert record["source_function_count"] == 4
+
+    def test_a_grown_cache_still_rebuilds(self, lab):
+        """The probe must keep doing its actual job: an incremental Ghidra run
+        that adds functions has to re-index."""
+        lab.analyze(_context([_func("a", "140001000")]))
+        first = lab.store.index(lab.binary_id, lab.path)
+        assert first["total"] if "total" in first else True
+
+        lab.analyze(_context([_func("a", "140001000"), _func("b", "140002000")]))
+        record, status = lab.store.ensure_indexed(lab.binary_id, lab.path)
+        assert status == "ready"
+        assert lab.store.counts(record)["total"] == 2
+
+    def test_a_v3_record_is_rebuilt_to_acquire_the_count(self, lab):
+        """A record predating v4 has no comparable count; it must not be
+        trusted forever, nor loop."""
+        lab.analyze(_context([_func("a", "140001000")]))
+        lab.store.index(lab.binary_id, lab.path)
+        lab.store.mark_reviewed(lab.binary_id, ["140001000"], tool="decompile_function")
+
+        path = lab.store._coverage_path(lab.binary_id)
+        stored = json.loads(path.read_text())
+        stored["schema_version"] = 3
+        stored.pop("source_index_count", None)
+        path.write_text(json.dumps(stored))
+
+        record, status = lab.store.ensure_indexed(lab.binary_id, lab.path)
+        assert status == "ready"
+        assert record["schema_version"] == SCHEMA_VERSION
+        assert "source_index_count" in record
+        assert record["functions"]["0x140001000"]["reviewed"] is True

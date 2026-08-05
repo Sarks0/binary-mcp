@@ -70,7 +70,16 @@ logger = logging.getLogger(__name__)
 # as never-touched. That is the safe direction -- it under-states the leads
 # rather than over-stating the reviews -- so v2 records are readable and are
 # rebuilt with an empty examination set, marks preserved.
-SCHEMA_VERSION = 3
+#
+# v4: records carry `source_index_count`, derived the same way the analysis
+# cache's `.meta.json` derives its `function_count`. The staleness probe used
+# to compare that meta value against `source_function_count`, which counts the
+# raw function list -- two different quantities. A binary with a duplicate
+# address or an address-less function makes them differ permanently, so the
+# probe read stale on every poll and re-indexed forever, decompressing the
+# whole analysis cache each time. A v3 record has no comparable count, so it
+# is rebuilt once to acquire one.
+SCHEMA_VERSION = 4
 
 # Oldest layout this reader can still parse well enough to salvage review marks
 # from. Anything in [MIN..SCHEMA_VERSION) is readable but stale -- rebuilt on
@@ -754,6 +763,15 @@ class CoverageStore:
             Path(resolved_path).name if resolved_path else None
         )
 
+        # `ProjectCache.save_cached` writes `function_count` as
+        # `len(self._build_function_index(data))` -- a dict keyed on the raw
+        # address, so functions with a falsy address vanish and duplicates
+        # collapse. Mirror that derivation exactly; comparing it against
+        # `len(functions)` is what produced the permanent-rebuild loop.
+        source_index_count = len({
+            f.get("address") for f in functions if f.get("address")
+        })
+
         data = {
             "schema_version": SCHEMA_VERSION,
             "binary_id": binary_id,
@@ -764,6 +782,7 @@ class CoverageStore:
             "scope_version": SCOPE_VERSION,
             "scope_description": description,
             "source_function_count": len(functions),
+            "source_index_count": source_index_count,
             "dropped_address_count": dropped,
             "functions": records,
         }
@@ -834,10 +853,15 @@ class CoverageStore:
 
         source_count = self._source_function_count(binary_id)
         stale_scope = record.get("scope_version") != SCOPE_VERSION
+        # Compared against `source_index_count`, NOT `source_function_count`:
+        # the meta value counts distinct addressed functions, the latter counts
+        # the raw list. A record predating v4 has no comparable value, so it
+        # expresses no opinion here -- the schema bump rebuilds it anyway.
+        indexed_count = record.get("source_index_count")
         stale_count = (
             source_count is not None
-            and record.get("source_function_count") is not None
-            and source_count != record.get("source_function_count")
+            and isinstance(indexed_count, int)
+            and source_count != indexed_count
         )
         # A record written before drop accounting existed cannot say whether
         # its `total` covers every function or quietly lost some, so rebuild

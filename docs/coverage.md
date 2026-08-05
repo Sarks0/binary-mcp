@@ -403,11 +403,29 @@ Two independent version stamps:
 - `schema_version` — the on-disk layout. Validated on read.
 - `scope_version` — how scope was computed. Any mismatch rebuilds.
 
-The current `schema_version` is **3**; the minimum readable is 1. A v2 record
+The current `schema_version` is **4**; the minimum readable is 1. A v2 record
 cannot say a function was machine-examined, so every function in one reads as
 never-examined. That is the safe direction — it under-states the leads rather
 than over-stating the reviews — so v2 records are read and rebuilt with an empty
-examination set, review marks preserved.
+examination set, review marks preserved. A v3 record is rebuilt once to
+acquire `source_index_count` — see below.
+
+### The staleness probe compares like with like
+
+`ProjectCache` writes `function_count` into `<sha>.meta.json` as
+`len(_build_function_index(data))` — a dict keyed on the raw address, so a
+function with a falsy address vanishes and duplicates collapse. The record
+stores `source_index_count`, derived exactly the same way, and the probe
+compares those two.
+
+It used to compare the meta value against `source_function_count`, which counts
+the raw function list. Those are different quantities, and on a binary with a
+duplicate address or an address-less function they differ *permanently* — so
+the probe read stale on every status poll and re-indexed forever,
+decompressing the whole analysis cache each time. `source_function_count`
+remains the honest denominator cross-check
+([`dropped_address_count`](#dropped_address_count)); it is simply not what the
+cheap probe compares.
 
 | Stored value | Behaviour |
 |---|---|

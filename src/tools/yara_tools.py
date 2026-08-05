@@ -196,11 +196,19 @@ def generate_yara_rule(
     # reads it unconditionally for the "medium" and "high" strictness levels,
     # so generate_yara_rule(strings=[]) raised UnboundLocalError for both --
     # only "low" survived, because its condition branch never mentions it.
+    # Entries are COLLECTED first and the "strings:" header emitted only if
+    # there are any. Two ways this produced rules yara cannot compile:
+    #
+    #   * the header was written whenever `strings` was non-empty, even if
+    #     scoring then filtered every candidate out -- an empty "strings:"
+    #     section is a syntax error; and
+    #   * the imports block appended "$impN = ..." lines WITHOUT emitting the
+    #     header, assuming the block above had already done so. With
+    #     strings=[] and imports non-empty the identifiers landed under
+    #     "meta:" and the condition's "all of them" bound to nothing.
     selected: list[str] = []
+    string_entries: list[str] = []
     if strings:
-        lines.append("")
-        lines.append("    strings:")
-
         # Score and sort strings
         scored_strings = []
         for s in strings:
@@ -230,20 +238,27 @@ def generate_yara_rule(
             if all(c in 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-. /\\:@' for c in s):
                 # ASCII string - check if wide
                 if "\\" in s or "HKEY" in s:
-                    lines.append(f'        {var_name} = "{escape_yara_string(s)}" wide ascii')
+                    string_entries.append(f'        {var_name} = "{escape_yara_string(s)}" wide ascii')
                 else:
-                    lines.append(f'        {var_name} = "{escape_yara_string(s)}" ascii')
+                    string_entries.append(f'        {var_name} = "{escape_yara_string(s)}" ascii')
             else:
                 # Hex encode non-printable
                 hex_str = " ".join(f"{ord(c):02x}" for c in s)
-                lines.append(f'        {var_name} = {{ {hex_str} }}')
+                string_entries.append(f'        {var_name} = {{ {hex_str} }}')
 
-    # Imports section (as strings)
+    # Imports, as string identifiers -- they belong in the same section.
     if imports:
-        lines.append("")
-        lines.append("        // Suspicious imports")
+        string_entries.append("        // Suspicious imports")
         for i, imp in enumerate(imports[:5]):
-            lines.append(f'        $imp{i} = "{imp}" ascii')
+            string_entries.append(f'        $imp{i} = "{imp}" ascii')
+
+    # Emit the section only when it has at least one real identifier. A bare
+    # "// comment" does not count: a section containing only a comment is as
+    # uncompilable as an empty one.
+    if any(e.lstrip().startswith("$") for e in string_entries):
+        lines.append("")
+        lines.append("    strings:")
+        lines.extend(string_entries)
 
     # Condition section
     lines.append("")

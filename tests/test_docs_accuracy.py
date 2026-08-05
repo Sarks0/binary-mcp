@@ -449,7 +449,12 @@ def test_windbg_execute_command_docstring_states_the_restrictions():
     are validated and which classes are refused.
     """
     lowered = _get_docstring(WINDBG_TOOLS, "windbg_execute_command")
-    assert "denylist" in lowered, "the WinDbg gate must not be sold as an allowlist"
+    # This asserted `"denylist" in lowered` with the message "the WinDbg gate
+    # must not be sold as an allowlist". Correct when the gate WAS a denylist;
+    # backwards once it was rewritten. It passed only by catching a historical
+    # mention, and would FAIL a docstring cleaned up to describe the current
+    # design. The gate is a fail-closed allowlist and must say so.
+    assert "allowlist" in lowered, "the fail-closed allowlist must be described"
     assert "not a sandbox" in lowered
     for refused_class in (".shell", ".dump", ".load", ".sympath", ".dvalloc"):
         assert refused_class in lowered, f"{refused_class} no longer named as refused"
@@ -510,12 +515,16 @@ def test_windbg_docstring_refusal_classes_match_the_deny_set():
 
 def test_windbg_tool_layer_substring_blocklist_is_as_documented():
     """
-    The docstring warns that the tool layer is a SUBSTRING matcher and names
-    the read-only commands it over-blocks as a result.
+    ``_BLOCKED_COMMANDS`` is RETAINED BUT NO LONGER CONSULTED.
 
-    Those six are the surprising part of the contract -- a caller reaching for
-    ``.printf`` or ``.foreach`` gets a refusal the bridge validator would not
-    have produced -- so the docstring names them and this pins them.
+    This described the six names as "the surprising part of the contract -- a
+    caller reaching for ``.printf`` gets a refusal the bridge validator would
+    not have produced". That stopped being true when the tool layer's substring
+    scan was removed: nothing consults the tuple now, so it over-blocks
+    nothing, and the old framing pinned a dead path as live. The tuple is worth
+    keeping as the record of what the old denylist covered, so what is pinned
+    is its CONTENTS -- plus the fact that it stays unconsulted, which
+    test_windbg_gate_allowlist.py asserts.
     """
     from src.engines.dynamic.windbg.bridge import _BLOCKED_COMMANDS
 
@@ -528,10 +537,12 @@ def test_windbg_tool_layer_substring_blocklist_is_as_documented():
 
 def test_windbg_docstring_does_not_claim_read_only():
     """
-    It is a denylist: read-only inspection commands still reach the debugger.
+    Read-only inspection commands must still reach the debugger.
 
-    The docstring must not imply the tool is restricted to reads, because it
-    is not -- it is restricted away from a named set of write/exec primitives.
+    The framing here said "it is a denylist ... restricted away from a named
+    set of write/exec primitives", which the allowlist rewrite inverted. What
+    the test actually checks is unchanged and still worth checking: the gate
+    must not have tightened so far that ordinary inspection stops working.
     """
     from src.engines.dynamic.windbg.allowlist import validate_command
 

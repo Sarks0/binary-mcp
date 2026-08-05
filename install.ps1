@@ -238,8 +238,12 @@ function Invoke-VerifiedDownload {
 
     Invoke-WebRequest -Uri $Uri -OutFile $OutFile -UseBasicParsing
 
-    $expected = $ExpectedSha256
-    if (-not $expected) { $expected = Get-PinnedSha256 -HashKey $HashKey }
+    # PRECEDENCE: an operator pin BEATS the publisher manifest -- see the same
+    # note in install.py. Manifest-wins made this file's own header comment
+    # ("the only defence against a takeover of the release itself") false,
+    # because an attacker who owns the release owns SHA256SUMS as well.
+    $expected = Get-PinnedSha256 -HashKey $HashKey
+    if (-not $expected) { $expected = $ExpectedSha256 }
 
     if ($expected) {
         Assert-FileHash -Path $OutFile -ExpectedSha256 $expected -Description $Description | Out-Null

@@ -388,14 +388,30 @@ def sanitize_binary_path(
     # (pe_tools, authenticode, similarity_hashes, carving, server).
     if allowed_dirs is _UNSET or not allowed_dirs:
         allowed_dirs = get_allowed_dirs()
-        if allowed_dirs:
-            # Union the server's own artifact directories into the operator's
-            # allow-list. Setting BINARY_MCP_ALLOWED_DIRS previously REPLACED
-            # the defaults outright, which meant the recommended posture broke
-            # every write-then-read loop in the server -- see the rationale on
-            # server_artifact_dirs(). Temp is deliberately not included, so the
-            # operator's restriction still means what they intended.
-            allowed_dirs = list(allowed_dirs) + server_artifact_dirs()
+
+    if allowed_dirs:
+        # Union the server's own artifact directories into whatever allow-list
+        # is in force. Setting BINARY_MCP_ALLOWED_DIRS previously REPLACED the
+        # defaults outright, which meant the recommended posture broke every
+        # write-then-read loop in the server -- see the rationale on
+        # server_artifact_dirs(). Temp is deliberately not included, so the
+        # operator's restriction still means what they intended.
+        #
+        # THIS UNION IS UNCONDITIONAL, and previously was not. It sat inside
+        # the `allowed_dirs is _UNSET or not allowed_dirs` branch above, so it
+        # applied only when the CALLER omitted allowed_dirs -- while ten
+        # production call sites pass `allowed_dirs=get_allowed_dirs()`
+        # explicitly, which is truthy exactly when the operator has configured
+        # an allow-list. The union was therefore skipped in precisely the
+        # posture it was written for, the docstring on server_artifact_dirs()
+        # ("unioned into the allow-list unconditionally -- including when the
+        # operator has configured BINARY_MCP_ALLOWED_DIRS") was false, and
+        # confinement differed per tool: quick_scan (which omits the argument)
+        # could read a dumped artifact that analyze_binary (which does not)
+        # refused. Same invariant as before -- an artifact this server wrote is
+        # exactly as trustworthy as the sample it came from -- now actually
+        # applied at every entry point.
+        allowed_dirs = list(allowed_dirs) + server_artifact_dirs()
 
     confined_by_default = False
     if not allowed_dirs:

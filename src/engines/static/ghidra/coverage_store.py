@@ -7,6 +7,18 @@ actually been reviewed. Consumers (vr-lab's notes-mcp ledger) mirror the counts
 and keep their own campaign semantics (stratum, verdict, finding linkage) on
 top; they never recompute a total from their own mark count.
 
+Two dimensions, never summed
+----------------------------
+``reviewed`` -- somebody read this function's body.
+``examined``  -- a machine pass produced a per-function judgement about it: a
+diff paired it with its twin and scored the delta, a sweep flagged it as a
+sink. See :data:`EXAMINATION_KINDS`.
+
+They are orthogonal, and ``examined`` never moves ``reviewed``, ``remaining``
+or the worklist. A diff that pairs 5958 functions has reviewed none of them,
+and a store that could not say so would have to choose between losing the diff
+entirely and inflating the review count by thousands. This one says so.
+
 Storage
 -------
 A ``<sha256>.coverage.json`` side-car beside the existing Ghidra cache, sharing
@@ -52,7 +64,13 @@ logger = logging.getLogger(__name__)
 # v2: records carry `dropped_address_count`. A v1 record cannot distinguish
 # "no address failed to parse" from "nobody counted", and that difference is
 # the whole point of the field, so v1 records are rebuilt rather than trusted.
-SCHEMA_VERSION = 2
+#
+# v3: entries carry an examination alongside the review mark. A v2 record
+# cannot say a function was machine-examined, so every function in one reads
+# as never-touched. That is the safe direction -- it under-states the leads
+# rather than over-stating the reviews -- so v2 records are readable and are
+# rebuilt with an empty examination set, marks preserved.
+SCHEMA_VERSION = 3
 
 # Oldest layout this reader can still parse well enough to salvage review marks
 # from. Anything in [MIN..SCHEMA_VERSION) is readable but stale -- rebuilt on
@@ -76,6 +94,57 @@ MIN_READABLE_SCHEMA_VERSION = 1
 SCOPE_VERSION = "fwd-bfs-v2"
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+# Examination: the second, deliberately separate dimension
+#
+# `reviewed` means a human-or-model read this function's body. `examined` means
+# a machine pass touched it and produced a per-function judgement about it --
+# a diff pairing it with its twin and scoring the delta, a sweep flagging a
+# sink. The two are ORTHOGONAL and are never summed: a function can be
+# examined and unreviewed (a lead nobody has read), reviewed and unexamined,
+# both, or neither.
+#
+# Keeping them apart is the whole point. A diff run that pairs 5958 functions
+# has not reviewed 5958 functions, and folding those into `reviewed` would
+# manufacture the exact false completion this store exists to prevent -- at
+# scale, and silently. So `examined` never enters `remaining`, never enters
+# `reviewed`, and never shortens the worklist. It only tells the operator
+# which of the unreviewed functions already have a machine reason to be read
+# first.
+#
+# The vocabulary is closed on purpose. A free-form kind lets a caller invent
+# something that reads like a review ("audited", "cleared") and park it in a
+# field the counts do not police.
+EXAMINATION_DIFF = "diff"
+EXAMINATION_SWEEP = "sweep"
+EXAMINATION_EXTERNAL = "external"
+
+EXAMINATION_KINDS = (EXAMINATION_DIFF, EXAMINATION_SWEEP, EXAMINATION_EXTERNAL)
+
+# What each kind claims, verbatim, for the tool docstrings and the docs.
+EXAMINATION_KIND_MEANINGS = {
+    EXAMINATION_DIFF: (
+        "paired against a twin by a binary-diff run and its delta scored; "
+        "the function's body was not necessarily read"
+    ),
+    EXAMINATION_SWEEP: (
+        "surfaced by a whole-binary pattern sweep (sink extraction, lock "
+        "analysis, regex scan); a hit, not a reading"
+    ),
+    EXAMINATION_EXTERNAL: (
+        "examined by a machine pass outside binary-mcp -- a script driving "
+        "the caches directly, BinDiff, Diaphora"
+    ),
+}
+
+# Per-entry examination fields, cleared together.
+_EXAMINATION_FIELDS = (
+    "examined",
+    "examined_at",
+    "examined_by",
+    "examination_kind",
+    "examination_note",
+)
 
 # Cached `decompile_status` value meaning Ghidra deliberately did not
 # decompile: a thunk or an external stub. notes-mcp already treats this as a
@@ -662,6 +731,20 @@ class CoverageStore:
                 record["reviewed_by"] = None
                 record["findings_note"] = prior.get("findings_note") if prior else None
 
+            # Examination survives a rebuild on its own terms, not the review
+            # mark's: a diff-flagged lead that nobody has read yet is exactly
+            # the state worth keeping across an incremental re-analysis, and it
+            # is the state where `reviewed` is False.
+            if prior and prior.get("examined"):
+                record["examined"] = True
+                record["examined_at"] = prior.get("examined_at")
+                record["examined_by"] = prior.get("examined_by")
+                record["examination_kind"] = prior.get("examination_kind")
+                record["examination_note"] = prior.get("examination_note")
+            else:
+                for field in _EXAMINATION_FIELDS:
+                    record[field] = False if field == "examined" else None
+
         metadata = context.get("metadata") or {}
         image_base = canon_addr(metadata.get("image_base")) or None
         resolved_path = binary_path or previous.get("binary_path") or metadata.get(
@@ -786,21 +869,41 @@ class CoverageStore:
 
     @staticmethod
     def counts(record: dict) -> dict[str, int]:
-        """Derive the six count fields and assert the contract invariants."""
+        """Derive the count fields and assert the contract invariants.
+
+        The six review counts are the contract and are unchanged. ``examined``
+        and ``examined_in_scope`` are additive and sit *beside* them: they are
+        never summed into ``reviewed`` and never subtracted from ``remaining``,
+        so ``remaining == total - reviewed`` still holds exactly and a consumer
+        mirroring only the six keeps working.
+
+        ``examined_unreviewed`` is the number that actually drives work -- the
+        machine found a reason to look at these and nobody has.
+        """
         functions = record.get("functions") or {}
         total = len(functions)
         in_scope_total = 0
         reviewed = 0
         reviewed_in_scope = 0
+        examined = 0
+        examined_in_scope = 0
+        examined_unreviewed = 0
         for entry in functions.values():
             in_scope = bool(entry.get("in_scope"))
             is_reviewed = bool(entry.get("reviewed"))
+            is_examined = bool(entry.get("examined"))
             if in_scope:
                 in_scope_total += 1
             if is_reviewed:
                 reviewed += 1
                 if in_scope:
                     reviewed_in_scope += 1
+            if is_examined:
+                examined += 1
+                if in_scope:
+                    examined_in_scope += 1
+                if not is_reviewed:
+                    examined_unreviewed += 1
 
         counts = {
             "total": total,
@@ -809,9 +912,35 @@ class CoverageStore:
             "reviewed_in_scope": reviewed_in_scope,
             "remaining": total - reviewed,
             "remaining_in_scope": in_scope_total - reviewed_in_scope,
+            "examined": examined,
+            "examined_in_scope": examined_in_scope,
+            "examined_unreviewed": examined_unreviewed,
         }
         _assert_invariants(counts, record)
         return counts
+
+    @staticmethod
+    def examination_breakdown(record: dict) -> dict[str, int]:
+        """``{kind: count}`` over the examined functions.
+
+        Always carries every known kind, zero included, so a consumer reading
+        ``breakdown["diff"]`` does not have to guard for a missing key and a
+        kind that dropped to zero is visibly zero rather than absent.
+        """
+        breakdown = dict.fromkeys(EXAMINATION_KINDS, 0)
+        for entry in (record.get("functions") or {}).values():
+            if not entry.get("examined"):
+                continue
+            kind = entry.get("examination_kind")
+            if kind in breakdown:
+                breakdown[kind] += 1
+            else:
+                # A kind written by a newer server, or hand-edited in. Counted
+                # under its own key rather than dropped -- an examination that
+                # vanishes from the breakdown but survives in `examined` makes
+                # the two disagree, and the operator cannot tell which lied.
+                breakdown[str(kind)] = breakdown.get(str(kind), 0) + 1
+        return breakdown
 
     # marking
 
@@ -906,6 +1035,94 @@ class CoverageStore:
 
         return {"marked": marked, "already": already, "unknown": unknown}
 
+    def mark_examined(
+        self,
+        binary_id: str,
+        addresses,
+        kind: str,
+        tool: str,
+        note: str | None = None,
+        examined: bool = True,
+    ) -> dict:
+        """Record a machine examination against functions (idempotent).
+
+        Deliberately NOT :meth:`mark_reviewed` with a flag. An examination is a
+        different claim -- "a pass produced a per-function judgement about
+        this" -- and it must not be able to move the review counts, whatever a
+        caller passes. Nothing here writes ``reviewed``.
+
+        Returns ``{"marked": [...], "already": [...], "unknown": [...]}`` in
+        the same shape as :meth:`mark_reviewed`. Addresses absent from the
+        function map are reported as ``unknown`` and never inserted: a phantom
+        entry would push ``examined`` above ``total``.
+
+        The first examination wins for ``examined_at`` / ``examined_by`` /
+        ``examination_kind``, matching the review rule -- re-running a diff
+        does not rewrite when the function was first flagged. An explicit
+        ``note`` always lands, so a later run can update why.
+        """
+        if examined and kind not in EXAMINATION_KINDS:
+            raise CoverageError(
+                f"unknown examination kind {kind!r}; expected one of "
+                + ", ".join(EXAMINATION_KINDS)
+            )
+
+        record = self.read(binary_id)
+        if record is None:
+            return {"marked": [], "already": [], "unknown": [canon_addr(a) for a in addresses]}
+
+        functions = record.get("functions") or {}
+        marked: list[str] = []
+        already: list[str] = []
+        unknown: list[str] = []
+
+        for raw in addresses:
+            addr = canon_addr(raw)
+            if not addr or addr not in functions:
+                unknown.append(addr or str(raw))
+                continue
+            entry = functions[addr]
+            if note is not None:
+                entry["examination_note"] = note
+            if bool(entry.get("examined")) == examined:
+                already.append(addr)
+                continue
+            entry["examined"] = examined
+            entry["examined_at"] = _utc_now() if examined else None
+            entry["examined_by"] = tool if examined else None
+            entry["examination_kind"] = kind if examined else None
+            if not examined:
+                entry["examination_note"] = None
+            marked.append(addr)
+
+        if marked or note is not None:
+            self.write(record)
+
+        return {"marked": marked, "already": already, "unknown": unknown}
+
+    def reset_examinations(self, binary_id: str) -> int:
+        """Clear every examination, keeping the review marks and the scope.
+
+        Separate from :meth:`reset_marks` because the two contaminate
+        independently: a diff pointed at the wrong pair floods the examination
+        set while the reviews stay honest, and a bad review sweep leaves the
+        examinations perfectly good. Clearing one must not cost the other.
+
+        Returns the number of functions whose examination was cleared.
+        """
+        record = self.read(binary_id)
+        if record is None:
+            return 0
+        cleared = 0
+        for entry in (record.get("functions") or {}).values():
+            if entry.get("examined") or entry.get("examination_note"):
+                cleared += 1
+            for field in _EXAMINATION_FIELDS:
+                entry[field] = False if field == "examined" else None
+        if cleared:
+            self.write(record)
+        return cleared
+
 
 def has_reviewable_body(pseudocode: object) -> bool:
     """Did the decompiler actually return code, as opposed to a remark about it?
@@ -959,6 +1176,45 @@ def auto_mark(
         logger.warning("auto-mark (%s) failed for %s: %s", tool, binary_path, exc)
 
 
+def auto_examine(
+    cache,
+    binary_path: str | None,
+    addresses,
+    kind: str,
+    tool: str,
+    note: str | None = None,
+    context: dict | None = None,
+) -> int:
+    """Best-effort examination hook for the machine passes.
+
+    The examination counterpart to :func:`auto_mark`, and safe to call at a
+    scale :func:`auto_mark` must never be called at: a diff pairs thousands of
+    functions, and recording that is honest precisely because ``examined`` is
+    not ``reviewed``.
+
+    Unlike :func:`auto_mark` this returns the number of functions newly
+    recorded, so the calling tool can tell the operator what it wrote to the
+    ledger instead of doing it silently. Failures are logged and swallowed --
+    coverage must never break an analysis tool -- and report ``0``.
+    """
+    try:
+        addresses = [a for a in (canon_addr(x) for x in addresses) if a]
+        if not addresses or not binary_path:
+            return 0
+        store = CoverageStore(cache)
+        binary_id = store.binary_id_for_path(binary_path)
+        if store.read(binary_id) is None:
+            if store.index(binary_id, binary_path, context=context) is None:
+                return 0
+        result = store.mark_examined(
+            binary_id, addresses, kind=kind, tool=tool, note=note
+        )
+        return len(result["marked"])
+    except Exception as exc:
+        logger.warning("auto-examine (%s) failed for %s: %s", tool, binary_path, exc)
+        return 0
+
+
 def _assert_invariants(counts: dict[str, int], record: dict | None = None) -> None:
     """Fail loudly on an inconsistent count set.
 
@@ -986,6 +1242,25 @@ def _assert_invariants(counts: dict[str, int], record: dict | None = None) -> No
         raise CoverageError("invariant violated: in_scope_total > total")
     if counts["reviewed_in_scope"] > counts["reviewed"]:
         raise CoverageError("invariant violated: reviewed_in_scope > reviewed")
+    # The examination counts are bounded but never subtracted: `remaining` is
+    # still `total - reviewed` above, and nothing here relaxes it. What these
+    # catch is an examination set that outgrew the denominator it is supposed
+    # to be a subset of -- which is how a bulk import of a diff run's output
+    # would announce that it inserted phantom addresses.
+    if "examined" in counts:
+        if counts["examined"] > counts["total"]:
+            raise CoverageError("invariant violated: examined > total")
+        if counts["examined_in_scope"] > counts["examined"]:
+            raise CoverageError("invariant violated: examined_in_scope > examined")
+        if counts["examined_in_scope"] > counts["in_scope_total"]:
+            raise CoverageError("invariant violated: examined_in_scope > in_scope_total")
+        if counts["examined_unreviewed"] > counts["examined"]:
+            raise CoverageError("invariant violated: examined_unreviewed > examined")
+        if counts["examined_unreviewed"] > counts["remaining"]:
+            # Every examined-and-unreviewed function is by definition one of
+            # the unreviewed ones. If this trips, `examined` is counting
+            # something that is not in the ledger.
+            raise CoverageError("invariant violated: examined_unreviewed > remaining")
     if record is not None and not CoverageStore._counts_add_up(record):
         raise CoverageError(
             "invariant violated: total + dropped_address_count != "

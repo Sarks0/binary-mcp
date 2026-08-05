@@ -10,6 +10,19 @@ renames or compiler reorderings.
 Designed to be the bulk counterpart to ``find_similar_functions``:
 where that one returns per-pair similarity, this one returns
 ADDED / REMOVED / MODIFIED buckets with deltas attached.
+
+Coverage
+--------
+A diff run is a machine pass, not a reading, so it records on the
+*examination* axis of the coverage ledger rather than the review axis --
+see ``docs/coverage.md``. Only the MODIFIED entries are recorded, and
+only because those are the ones this tool actually analyses per function:
+it scores the bounds-check, stack-cookie, caller-count and size deltas
+and extracts the first changed line for each. ADDED, REMOVED and the
+unchanged pairs get bucket membership and nothing else, so recording
+them would be claiming an analysis that never happened -- and on a
+Patch-Tuesday-shaped diff of a large DLL, claiming it several thousand
+times over.
 """
 
 from __future__ import annotations
@@ -18,6 +31,7 @@ import logging
 import re
 from pathlib import Path
 
+from src.engines.static.ghidra.coverage_store import EXAMINATION_DIFF, auto_examine
 from src.tools.function_hash_tools import _compute_function_hash, _get_capstone_mode
 
 logger = logging.getLogger(__name__)
@@ -362,6 +376,7 @@ def _format_report(
     mode: str,
     group_by: str,
     unchanged_renamed: list[tuple[dict, dict]] | None = None,
+    coverage_line: str | None = None,
 ) -> str:
     """Render the diff report; ``modified`` already carries score dicts."""
     unchanged_renamed = unchanged_renamed or []
@@ -373,8 +388,12 @@ def _format_report(
         f"New: {Path(new_path).name}  ({len(new_ctx.get('functions', []))} functions)",
         f"Mode: {mode}    group_by={group_by}",
         f"Unchanged pairs: {unchanged_count}",
-        "",
     ]
+    if coverage_line:
+        # In the header, not a footer: the MODIFIED section can run to
+        # thousands of lines and a footer would never be read.
+        lines.append(coverage_line)
+    lines.append("")
 
     lines.append(f"### ADDED ({len(added)})")
     for f in added:
@@ -450,6 +469,63 @@ def _format_modified_entry(
     return out
 
 
+def _record_examinations(
+    cache,
+    old_path: str,
+    new_path: str,
+    old_ctx: dict,
+    new_ctx: dict,
+    modified: list[tuple[dict, dict, str, dict]],
+    enabled: bool,
+) -> str:
+    """Record the MODIFIED pairs as ``diff`` examinations on both ledgers.
+
+    Each side goes to its own coverage record: the ledger is keyed by the
+    sha256 of the file's bytes, so the old binary's addresses belong to the
+    old binary's record and cross-writing them would land phantom addresses
+    in a ledger they do not exist in.
+
+    Only the MODIFIED bucket. ADDED and REMOVED are single-sided -- there is
+    no pair and no delta, only a bucket -- and the unchanged pairs are the
+    ones this tool concluded nothing happened to. Recording either would
+    inflate the examination axis with functions nothing analysed, which is
+    the same dishonesty as inflating the review axis, just one column over.
+
+    Returns the header line for the report.
+    """
+    if not enabled:
+        return "Coverage: not recorded (record_examination=False)"
+    if not modified:
+        return "Coverage: 0 diff examinations recorded (no MODIFIED entries)"
+
+    old_name = Path(old_path).name
+    new_name = Path(new_path).name
+
+    old_written = auto_examine(
+        cache,
+        old_path,
+        [of.get("address") for of, _, _, _ in modified],
+        kind=EXAMINATION_DIFF,
+        tool="diff_binaries",
+        note=f"MODIFIED in diff_binaries against {new_name}",
+        context=old_ctx,
+    )
+    new_written = auto_examine(
+        cache,
+        new_path,
+        [nf.get("address") for _, nf, _, _ in modified],
+        kind=EXAMINATION_DIFF,
+        tool="diff_binaries",
+        note=f"MODIFIED in diff_binaries against {old_name}",
+        context=new_ctx,
+    )
+    return (
+        f"Coverage: recorded {old_written} new diff examination(s) on {old_name}, "
+        f"{new_written} on {new_name} "
+        f"(of {len(modified)} MODIFIED pair(s); examined is not reviewed)"
+    )
+
+
 def register_diff_tools(app, session_manager, cache, runner):
     """
     Register the cross-binary diff tool with the MCP app.
@@ -474,6 +550,7 @@ def register_diff_tools(app, session_manager, cache, runner):
         new_path: str,
         group_by: str = "none",
         mode: str = "security",
+        record_examination: bool = True,
     ) -> str:
         """
         Diff two analyzed binaries and rank likely security fixes.
@@ -498,9 +575,19 @@ def register_diff_tools(app, session_manager, cache, runner):
             group_by: ``"none"`` (default) or ``"module"``.
             mode: ``"security"`` (default, ranked by fix-likelihood) or
                 ``"none"`` (source-order, no scoring).
+            record_examination: Record the MODIFIED entries against both
+                binaries' coverage ledgers as machine examinations
+                (``kind="diff"``). Default on, and safe on: an examination is
+                explicitly **not** a review, so this cannot inflate the review
+                counts or shorten the worklist -- it makes the diff's leads
+                retrievable afterwards through
+                ``get_next_unreviewed(only_examined=True)`` instead of
+                vanishing when the report scrolls away. Set false for a dry
+                run against a ledger you do not want touched.
 
         Returns:
-            Markdown-style report of ADDED / REMOVED / MODIFIED buckets.
+            Markdown-style report of ADDED / REMOVED / MODIFIED buckets. The
+            header states how many examinations were recorded on each side.
         """
         try:
             old_path = str(sanitize_binary_path(old_path))
@@ -565,6 +652,16 @@ def register_diff_tools(app, session_manager, cache, runner):
                 deltas = _score_modified(of, nf, old_ctx, new_ctx, mode)
                 modified.append((of, nf, "modified-renamed", deltas))
 
+            coverage_line = _record_examinations(
+                cache,
+                old_path,
+                new_path,
+                old_ctx,
+                new_ctx,
+                modified,
+                enabled=record_examination,
+            )
+
             return _format_report(
                 old_path,
                 new_path,
@@ -577,6 +674,7 @@ def register_diff_tools(app, session_manager, cache, runner):
                 unchanged_renamed=unchanged_renamed,
                 mode=mode,
                 group_by=group_by,
+                coverage_line=coverage_line,
             )
 
         except (PathTraversalError, FileSizeError) as e:

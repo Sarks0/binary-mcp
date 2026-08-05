@@ -21,11 +21,14 @@ from unittest.mock import MagicMock
 import pytest
 
 from src.engines.static.ghidra.coverage_store import (
+    EXAMINATION_DIFF,
+    EXAMINATION_SWEEP,
     SCHEMA_VERSION,
     SCOPE_VERSION,
     CoverageError,
     CoverageStore,
     _assert_invariants,
+    auto_examine,
     auto_mark,
     canon_addr,
     compute_scope,
@@ -335,6 +338,9 @@ class TestCounts:
             "reviewed_in_scope": 0,
             "remaining": 3,
             "remaining_in_scope": 2,
+            "examined": 0,
+            "examined_in_scope": 0,
+            "examined_unreviewed": 0,
         }
 
     def test_reviewed_in_scope_tracks_scope(self, lab):
@@ -904,3 +910,212 @@ class TestHasReviewableBody:
         assert not has_reviewable_body("")
         assert not has_reviewable_body("   \n ")
         assert not has_reviewable_body(None)
+
+
+# The examination axis
+
+
+class TestExamination:
+    """`examined` is a machine pass's claim, `reviewed` is a human's. The
+    separation is the whole feature: a diff pairs thousands of functions and
+    has read none of them, so an examination that could move the review counts
+    would manufacture false completion at exactly the scale that matters.
+    """
+
+    def _indexed(self, lab):
+        lab.analyze(
+            _context(
+                [
+                    _func("entry", "140001000", called=["140002000"]),
+                    _func("helper", "140002000"),
+                    _func("thunk", "140003000", is_thunk=True),
+                ],
+                exports=[{"address": "140001000", "name": "entry", "type": "Function"}],
+            )
+        )
+        return lab.store.index(lab.binary_id, lab.path)
+
+    def test_examining_does_not_review(self, lab):
+        self._indexed(lab)
+        lab.store.mark_examined(
+            lab.binary_id, ["140001000", "140002000"],
+            kind=EXAMINATION_DIFF, tool="diff_binaries",
+        )
+        counts = lab.store.counts(lab.store.read(lab.binary_id))
+        assert counts["examined"] == 2
+        assert counts["reviewed"] == 0
+        # The load-bearing one: an examination must not shorten the work left.
+        assert counts["remaining"] == counts["total"] == 3
+        assert counts["remaining_in_scope"] == counts["in_scope_total"] == 2
+
+    def test_examined_unreviewed_is_the_lead_count(self, lab):
+        self._indexed(lab)
+        lab.store.mark_examined(
+            lab.binary_id, ["140001000", "140002000"],
+            kind=EXAMINATION_DIFF, tool="diff_binaries",
+        )
+        lab.store.mark_reviewed(lab.binary_id, ["140001000"], tool="decompile_function")
+        counts = lab.store.counts(lab.store.read(lab.binary_id))
+        assert counts["examined"] == 2
+        assert counts["reviewed"] == 1
+        assert counts["examined_unreviewed"] == 1
+
+    def test_reviewing_does_not_examine(self, lab):
+        """The axes are orthogonal in both directions -- reading a body is not
+        a machine examination of it, so `examined` must stay put."""
+        self._indexed(lab)
+        lab.store.mark_reviewed(lab.binary_id, ["140001000"], tool="decompile_function")
+        counts = lab.store.counts(lab.store.read(lab.binary_id))
+        assert counts["reviewed"] == 1
+        assert counts["examined"] == 0
+
+    def test_examination_is_idempotent_and_keeps_the_first_timestamp(self, lab):
+        self._indexed(lab)
+        lab.store.mark_examined(
+            lab.binary_id, ["140001000"], kind=EXAMINATION_DIFF, tool="diff_binaries",
+        )
+        first = lab.store.read(lab.binary_id)["functions"]["0x140001000"]
+        result = lab.store.mark_examined(
+            lab.binary_id, ["140001000"], kind=EXAMINATION_SWEEP, tool="other_pass",
+        )
+        assert result["already"] == ["0x140001000"]
+        assert result["marked"] == []
+        again = lab.store.read(lab.binary_id)["functions"]["0x140001000"]
+        assert again["examined_at"] == first["examined_at"]
+        assert again["examined_by"] == "diff_binaries"
+        assert again["examination_kind"] == EXAMINATION_DIFF
+
+    def test_unknown_address_is_never_inserted(self, lab):
+        """A phantom entry would push `examined` above `total` and break the
+        invariant a consumer asserts on."""
+        self._indexed(lab)
+        result = lab.store.mark_examined(
+            lab.binary_id, ["140099999"], kind=EXAMINATION_DIFF, tool="diff_binaries",
+        )
+        assert result["unknown"] == ["0x140099999"]
+        counts = lab.store.counts(lab.store.read(lab.binary_id))
+        assert counts["examined"] == 0
+        assert counts["total"] == 3
+
+    def test_unknown_kind_is_refused(self, lab):
+        """A free-form kind lets a caller invent something that reads like a
+        review and park it where the counts do not police it."""
+        self._indexed(lab)
+        with pytest.raises(CoverageError):
+            lab.store.mark_examined(
+                lab.binary_id, ["140001000"], kind="audited", tool="whatever",
+            )
+
+    def test_examination_survives_a_rebuild_without_a_review(self, lab):
+        """The state worth preserving is precisely the one where `reviewed` is
+        False: a diff-flagged lead nobody has read yet."""
+        self._indexed(lab)
+        lab.store.mark_examined(
+            lab.binary_id, ["140002000"], kind=EXAMINATION_DIFF,
+            tool="diff_binaries", note="MODIFIED vs old.sys",
+        )
+        rebuilt = lab.store.index(lab.binary_id, lab.path)
+        entry = rebuilt["functions"]["0x140002000"]
+        assert entry["examined"] is True
+        assert entry["reviewed"] is False
+        assert entry["examination_kind"] == EXAMINATION_DIFF
+        assert entry["examination_note"] == "MODIFIED vs old.sys"
+
+    def test_clearing_an_examination(self, lab):
+        self._indexed(lab)
+        lab.store.mark_examined(
+            lab.binary_id, ["140001000"], kind=EXAMINATION_DIFF, tool="diff_binaries",
+        )
+        lab.store.mark_examined(
+            lab.binary_id, ["140001000"], kind=EXAMINATION_DIFF,
+            tool="diff_binaries", examined=False,
+        )
+        entry = lab.store.read(lab.binary_id)["functions"]["0x140001000"]
+        assert entry["examined"] is False
+        assert entry["examination_kind"] is None
+        assert entry["examination_note"] is None
+
+    def test_breakdown_counts_every_kind_including_zero(self, lab):
+        self._indexed(lab)
+        lab.store.mark_examined(
+            lab.binary_id, ["140001000"], kind=EXAMINATION_DIFF, tool="diff_binaries",
+        )
+        breakdown = lab.store.examination_breakdown(lab.store.read(lab.binary_id))
+        assert breakdown[EXAMINATION_DIFF] == 1
+        # Present and zero, not absent: a consumer must not have to guard for
+        # a key that disappears when its count drops.
+        assert breakdown[EXAMINATION_SWEEP] == 0
+
+    def test_reset_axes_are_independent(self, lab):
+        """A diff pointed at the wrong pair floods the examinations while the
+        reviews stay honest. Clearing one must not cost the other."""
+        self._indexed(lab)
+        lab.store.mark_examined(
+            lab.binary_id, ["140001000"], kind=EXAMINATION_DIFF, tool="diff_binaries",
+        )
+        lab.store.mark_reviewed(lab.binary_id, ["140002000"], tool="decompile_function")
+
+        assert lab.store.reset_examinations(lab.binary_id) == 1
+        counts = lab.store.counts(lab.store.read(lab.binary_id))
+        assert counts["examined"] == 0
+        assert counts["reviewed"] == 1
+
+        assert lab.store.reset_marks(lab.binary_id) == 1
+        assert lab.store.counts(lab.store.read(lab.binary_id))["reviewed"] == 0
+
+    def test_auto_examine_indexes_on_demand_and_reports_what_it_wrote(self, lab):
+        context = _context(
+            [_func("entry", "140001000")],
+            exports=[{"address": "140001000", "name": "entry", "type": "Function"}],
+        )
+        lab.analyze(context)
+        assert lab.store.read(lab.binary_id) is None
+        written = auto_examine(
+            lab.cache, lab.path, ["140001000"],
+            kind=EXAMINATION_DIFF, tool="diff_binaries", context=context,
+        )
+        assert written == 1
+        assert lab.store.counts(lab.store.read(lab.binary_id))["examined"] == 1
+
+    def test_auto_examine_swallows_failure_and_reports_zero(self, lab):
+        """Coverage must never be able to break an analysis tool."""
+        broken = MagicMock()
+        broken.cache_dir = "/nonexistent/nope"
+        assert auto_examine(
+            broken, lab.path, ["140001000"], kind=EXAMINATION_DIFF, tool="diff_binaries"
+        ) == 0
+
+
+class TestExaminationInvariants:
+    def test_examined_above_total_raises(self):
+        with pytest.raises(CoverageError, match="examined > total"):
+            _assert_invariants({
+                "total": 2, "in_scope_total": 2, "reviewed": 0, "reviewed_in_scope": 0,
+                "remaining": 2, "remaining_in_scope": 2,
+                "examined": 3, "examined_in_scope": 0, "examined_unreviewed": 0,
+            })
+
+    def test_examined_in_scope_above_examined_raises(self):
+        with pytest.raises(CoverageError, match="examined_in_scope > examined"):
+            _assert_invariants({
+                "total": 2, "in_scope_total": 2, "reviewed": 0, "reviewed_in_scope": 0,
+                "remaining": 2, "remaining_in_scope": 2,
+                "examined": 1, "examined_in_scope": 2, "examined_unreviewed": 0,
+            })
+
+    def test_examined_unreviewed_above_remaining_raises(self):
+        """Every examined-and-unreviewed function is one of the unreviewed
+        ones; exceeding `remaining` means `examined` counts a phantom."""
+        with pytest.raises(CoverageError, match="examined_unreviewed > remaining"):
+            _assert_invariants({
+                "total": 2, "in_scope_total": 2, "reviewed": 2, "reviewed_in_scope": 2,
+                "remaining": 0, "remaining_in_scope": 0,
+                "examined": 2, "examined_in_scope": 2, "examined_unreviewed": 2,
+            })
+
+    def test_six_count_records_still_validate(self):
+        """A caller holding only the review counts must keep working."""
+        _assert_invariants({
+            "total": 2, "in_scope_total": 2, "reviewed": 1, "reviewed_in_scope": 1,
+            "remaining": 1, "remaining_in_scope": 1,
+        })

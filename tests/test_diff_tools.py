@@ -697,3 +697,127 @@ class TestRegistration:
 
         assert app.tool.call_count >= 1
         assert isinstance(result, tuple) and len(result) == 1
+
+
+class TestCoverageExamination:
+    """A diff run is a machine pass, so it records on the examination axis --
+    and only for the MODIFIED entries, the ones it actually analyses per
+    function. Recording the ADDED wall would inflate the ledger by thousands
+    on a real Patch-Tuesday diff, which is the same dishonesty as inflating
+    the review count, one column over.
+    """
+
+    @staticmethod
+    def _capture(monkeypatch):
+        import src.tools.diff_tools as dt
+
+        calls = []
+
+        def _fake(cache, binary_path, addresses, kind, tool, note=None, context=None):
+            addrs = list(addresses)
+            calls.append(
+                {"path": binary_path, "addresses": addrs, "kind": kind,
+                 "tool": tool, "note": note}
+            )
+            return len(addrs)
+
+        monkeypatch.setattr(dt, "auto_examine", _fake)
+        return calls
+
+    @staticmethod
+    def _hash_per_address(monkeypatch):
+        """Hash by address, so a same-named pair on two sides differs and
+        lands in MODIFIED. A name-keyed hash table gives both sides the same
+        value, which is the UNCHANGED bucket."""
+        import src.tools.diff_tools as dt
+
+        monkeypatch.setattr(
+            dt, "_compute_function_hash",
+            lambda reader, a, m, func: {
+                "hash": f"h-{func['address']}", "instruction_count": 1,
+                "operands_normalized": 0,
+            },
+        )
+
+    def _one_modified_one_added(self, monkeypatch):
+        """Old has Changed; new has Changed (different body) plus BrandNew."""
+        old_ctx = _make_context([
+            _make_function(name="Changed", address="0x1000", pseudocode="int f(){return 1;}"),
+        ])
+        new_ctx = _make_context([
+            _make_function(name="Changed", address="0x2000", pseudocode="int f(){return 2;}"),
+            _make_function(name="BrandNew", address="0x3000"),
+        ])
+        self._hash_per_address(monkeypatch)
+        return _register(monkeypatch, old_ctx, new_ctx)
+
+    def test_modified_pairs_are_recorded_on_both_sides(self, monkeypatch):
+        calls = self._capture(monkeypatch)
+        # Distinct hashes per side so the PDB-name pair lands in MODIFIED.
+        old_ctx = _make_context([
+            _make_function(name="Changed", address="0x1000"),
+        ])
+        new_ctx = _make_context([
+            _make_function(name="Changed", address="0x2000"),
+            _make_function(name="BrandNew", address="0x3000"),
+        ])
+        self._hash_per_address(monkeypatch)
+        diff, _cache, _runner = _register(monkeypatch, old_ctx, new_ctx)
+        diff(old_path="/old.bin", new_path="/new.bin")
+
+        assert len(calls) == 2
+        old_call, new_call = calls
+        assert old_call["path"] == "/old.bin"
+        assert old_call["addresses"] == ["0x1000"]
+        assert new_call["path"] == "/new.bin"
+        assert new_call["addresses"] == ["0x2000"]
+        assert {c["kind"] for c in calls} == {"diff"}
+        assert {c["tool"] for c in calls} == {"diff_binaries"}
+
+    def test_added_functions_are_never_recorded(self, monkeypatch):
+        """The ADDED bucket is membership, not analysis. On a real diff it is
+        thousands of entries and recording them is how a ledger gets inflated.
+        """
+        calls = self._capture(monkeypatch)
+        diff, _cache, _runner = self._one_modified_one_added(monkeypatch)
+        report = diff(old_path="/old.bin", new_path="/new.bin")
+
+        assert "BrandNew" in report, "the added function should still be reported"
+        recorded = [a for c in calls for a in c["addresses"]]
+        assert "0x3000" not in recorded
+
+    def test_unchanged_pairs_are_never_recorded(self, monkeypatch):
+        """Hash-identical means this tool concluded nothing happened."""
+        calls = self._capture(monkeypatch)
+        old_ctx = _make_context([_make_function(name="Same", address="0x1000")])
+        new_ctx = _make_context([_make_function(name="Same", address="0x2000")])
+        diff, _cache, _runner = _register(
+            monkeypatch, old_ctx, new_ctx, hash_table={"Same": "identical"}
+        )
+        diff(old_path="/old.bin", new_path="/new.bin")
+        assert [a for c in calls for a in c["addresses"]] == []
+
+    def test_record_examination_false_is_a_dry_run(self, monkeypatch):
+        calls = self._capture(monkeypatch)
+        diff, _cache, _runner = self._one_modified_one_added(monkeypatch)
+        report = diff(
+            old_path="/old.bin", new_path="/new.bin", record_examination=False
+        )
+        assert calls == []
+        assert "not recorded" in report
+
+    def test_header_states_what_was_written(self, monkeypatch):
+        self._capture(monkeypatch)
+        diff, _cache, _runner = self._one_modified_one_added(monkeypatch)
+        report = diff(old_path="/old.bin", new_path="/new.bin")
+        header = report.split("### ADDED")[0]
+        assert "Coverage:" in header
+        assert "examined is not reviewed" in header
+
+    def test_coverage_failure_cannot_break_the_diff(self, monkeypatch):
+        """Coverage is a side effect; a broken ledger must not cost the report.
+        The real `auto_examine` runs here against a MagicMock cache."""
+        diff, _cache, _runner = self._one_modified_one_added(monkeypatch)
+        report = diff(old_path="/old.bin", new_path="/new.bin")
+        assert "BINARY DIFF" in report
+        assert "### MODIFIED" in report

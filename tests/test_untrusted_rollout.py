@@ -1275,3 +1275,66 @@ def test_named_tool_applies_a_fence(module_name, tool_name):
         "without fencing it; the module-level guard cannot see this because it "
         "only checks whether the helper is mentioned anywhere in the file"
     )
+
+
+# ---------------------------------------------------------------------------
+# src/server.py: every tool classified
+# ---------------------------------------------------------------------------
+#
+# server.py holds the largest tool surface in the repo and sits outside
+# src/tools/, so no F-7 guard saw it. Listing individual tools here would rot
+# the moment one is added, so the assertion is inverted: every tool must EITHER
+# fence its output OR appear below with a reason. A new tool returning sample
+# text cannot land unasserted, which is the property the module-level guard
+# claimed and did not have.
+_SERVER_TOOLS_WITHOUT_SAMPLE_TEXT: dict[str, str] = {
+    "clean_cache": "returns removal counts and an operator-supplied filename",
+    "diagnose_setup": "reports the host toolchain; contains no sample-derived text",
+    "save_session": "returns a session id and save status",
+    "list_sessions": "returns session ids, names and timestamps",
+    "delete_session": "returns a session id and deletion status",
+    "configure_auto_session": "returns the configured mode",
+    "get_active_session": "returns the active session id",
+}
+
+
+def _server_tools() -> dict:
+    import ast
+
+    src = (
+        Path(__file__).resolve().parent.parent / "src" / "server.py"
+    ).read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    return {
+        node.name: node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and any("tool(" in ast.unparse(d) for d in node.decorator_list)
+    }
+
+
+def test_every_server_tool_fences_or_is_explicitly_exempt():
+    import ast
+
+    tools = _server_tools()
+    unclassified = []
+    for name, node in tools.items():
+        if "wrap_untrusted" in ast.unparse(node):
+            continue
+        if name in _SERVER_TOOLS_WITHOUT_SAMPLE_TEXT:
+            continue
+        unclassified.append(name)
+
+    assert not unclassified, (
+        "src/server.py tool(s) neither fenced nor declared free of "
+        "sample-derived text; if the tool really emits none, add it to "
+        "_SERVER_TOOLS_WITHOUT_SAMPLE_TEXT with the reason: "
+        + ", ".join(sorted(unclassified))
+    )
+
+
+def test_server_exempt_list_has_no_stale_entries():
+    """A name for a tool that no longer exists makes the list look complete."""
+    tools = _server_tools()
+    stale = sorted(set(_SERVER_TOOLS_WITHOUT_SAMPLE_TEXT) - set(tools))
+    assert not stale, "exempt entries for tools that no longer exist: " + ", ".join(stale)

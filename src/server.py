@@ -1046,7 +1046,7 @@ Format: {compat_info.format.value}
 Analysis cached for fast subsequent queries.
 Use other tools like get_functions, get_imports, decompile_function to explore the binary.
 """
-        return summary
+        return wrap_untrusted(summary, "analysis summary")
 
     except UserFacingError as e:
         # Return safe error with reference ID
@@ -1247,7 +1247,7 @@ def load_pdb(
                 "(no types/locals); Gain reflects function-name count only."
             )
             lines.append(f"  - Inspect {debug_log} for full Ghidra output.")
-        return "\n".join(lines)
+        return wrap_untrusted('\n'.join(lines), "PDB symbol names")
 
     except FileNotFoundError as e:
         return safe_path_error("load_pdb", e, "path")
@@ -1951,7 +1951,7 @@ def get_xrefs(
                 f"*Showing {limit} of {total}. Increase `limit` to see more.*"
             )
 
-        return "\n".join(lines)
+        return wrap_untrusted('\n'.join(lines), "cross-references")
 
     except Exception as e:
         logger.error(f"get_xrefs failed: {e}")
@@ -2305,19 +2305,7 @@ def expand_callgraph(
         ) or "  (none)"
 
         return (
-            f"**expand_callgraph from `{root_fn.get('name', root)}` "
-            f"@ {root_addr}**\n"
-            f"\n"
-            f"Coverage by depth:\n{depth_lines}\n"
-            f"\n"
-            f"Run summary:\n"
-            f"- Functions decompiled this run: {decompiled_this_run}\n"
-            f"- Already cached with pseudocode: {already_cached}\n"
-            f"- Skipped (external/import): {skipped_external}\n"
-            f"- Skipped (thunk): {skipped_thunk}\n"
-            f"- Decompile failures: {len(decompile_failures)}\n"
-            f"\n"
-            f"Status: **{status}**{hint}"
+            wrap_untrusted(f'**expand_callgraph from `{root_fn.get('name', root)}` @ {root_addr}**\n\nCoverage by depth:\n{depth_lines}\n\nRun summary:\n- Functions decompiled this run: {decompiled_this_run}\n- Already cached with pseudocode: {already_cached}\n- Skipped (external/import): {skipped_external}\n- Skipped (thunk): {skipped_thunk}\n- Decompile failures: {len(decompile_failures)}\n\nStatus: **{status}**{hint}', "call-graph expansion and function names")
         )
 
     except (PathTraversalError, FileSizeError) as e:
@@ -2378,12 +2366,12 @@ def get_call_graph(
                 for called_func in called:
                     result += build_graph(called_func.get('name'), current_depth + 1, visited)
 
-            return result
+            return wrap_untrusted(result, "call graph")
 
         result = f"**Call Graph for {function_name}** (depth={depth}, direction={direction})\n\n"
         result += build_graph(function_name, 0)
 
-        return result
+        return wrap_untrusted(result, "call graph")
 
     except Exception as e:
         logger.error(f"get_call_graph failed: {e}")
@@ -2470,7 +2458,7 @@ def find_api_calls(
                     result += f"  Called from: {', '.join(api['call_sites'][:5])}\n"
                 result += "\n"
 
-        return result
+        return wrap_untrusted(result, "API call sites")
 
     except Exception as e:
         logger.error(f"find_api_calls failed: {e}")
@@ -2520,7 +2508,7 @@ def get_memory_map(
                 result += f"- Comment: {block.get('comment')}\n"
             result += "\n"
 
-        return result
+        return wrap_untrusted(result, "section layout")
 
     except Exception as e:
         logger.error(f"get_memory_map failed: {e}")
@@ -2551,7 +2539,7 @@ def extract_metadata(
             formatted_key = key.replace('_', ' ').title()
             result += f"- **{formatted_key}:** `{value}`\n"
 
-        return result
+        return wrap_untrusted(result, "PE version metadata")
 
     except Exception as e:
         logger.error(f"extract_metadata failed: {e}")
@@ -2723,7 +2711,7 @@ def search_bytes(
         lines = [f"**Byte Pattern Search: `{pattern}`**", ""]
         if total == 0:
             lines.append("No matches found.")
-            return "\n".join(lines)
+            return wrap_untrusted('\n'.join(lines), "byte-search hits")
 
         lines.append(
             f"Found {total} match(es)"
@@ -2737,7 +2725,7 @@ def search_bytes(
                 line += f"  in `{h['function']}` +0x{h['offset_in_function']:x}"
             lines.append(line)
 
-        return "\n".join(lines)
+        return wrap_untrusted('\n'.join(lines), "byte-search hits")
 
     except FileNotFoundError as e:
         return safe_path_error("search_bytes", e, "path")
@@ -2780,7 +2768,7 @@ def detect_crypto(
         else:
             result += "No known cryptographic constants detected.\n"
 
-        return result
+        return wrap_untrusted(result, "crypto constants")
 
     except Exception as e:
         logger.error(f"detect_crypto failed: {e}")
@@ -2851,7 +2839,7 @@ def generate_iocs(
                     result += f"\n*...and {len(values) - 20} more*\n"
                 result += "\n"
 
-        return result
+        return wrap_untrusted(result, "extracted IOCs")
 
     except Exception as e:
         logger.error(f"generate_iocs failed: {e}")
@@ -2975,7 +2963,7 @@ def check_binary(binary_path: str) -> str:
             guidance += "- Binary is NOT recommended for Ghidra analysis\n"
             guidance += "- Use specialized tools for this format\n"
 
-        return report + guidance
+        return wrap_untrusted(report + guidance, "triage report")
 
     except (PathTraversalError, FileSizeError) as e:
         return safe_error_message("Invalid binary file or path", e)
@@ -3034,7 +3022,7 @@ def list_data_types(
                     result += f"  - ...and {len(values) - 10} more values\n"
                 result += "\n"
 
-        return result
+        return wrap_untrusted(result, "type names")
 
     except Exception as e:
         logger.error(f"list_data_types failed: {e}")
@@ -3163,7 +3151,7 @@ def rename_function(
         result += f"- **New Signature:** `{target_function.get('signature', 'N/A')}`\n\n"
         result += "*The rename is saved in the analysis cache and will be reflected in all subsequent tool calls.*"
 
-        return result
+        return wrap_untrusted(result, "function rename result")
 
     except Exception as e:
         logger.error(f"rename_function failed: {e}")
@@ -3290,7 +3278,7 @@ def add_note(
             "*Stored in the per-binary side-car. Survives "
             "force_reanalyze and load_pdb.*"
         )
-        return result
+        return wrap_untrusted(result, "annotation and function name")
     except Exception as e:
         logger.error(f"add_note failed: {e}")
         return safe_tool_error("add_note", e)
@@ -3373,7 +3361,7 @@ def get_notes(
                 total += 1
             lines.append("")
         lines.append(f"_Total: {total}_")
-        return "\n".join(lines)
+        return wrap_untrusted('\n'.join(lines), "annotations and function names")
     except (PathTraversalError, FileSizeError) as e:
         return safe_error_message("Invalid binary path", e)
     except Exception as e:
@@ -3455,7 +3443,7 @@ def delete_note(
         result += f"- **Address:** `{address}`\n"
         result += f"- **Kind:** `{kind}`\n"
         result += f"- **Text:** {removed.get('text', '')}\n"
-        return result
+        return wrap_untrusted(result, "annotation and function name")
     except Exception as e:
         logger.error(f"delete_note failed: {e}")
         return safe_tool_error("delete_note", e)
@@ -3536,7 +3524,7 @@ def start_analysis_session(
         result += "2. Call `save_session()` when done to persist all outputs\n"
         result += "3. Use the session ID in a new conversation to load the data\n"
 
-        return result
+        return wrap_untrusted(result, "session summary")
 
     except (PathTraversalError, FileSizeError) as e:
         return safe_error_message("Invalid binary path", e)
@@ -3779,7 +3767,7 @@ def get_session_summary(session_id: str) -> str:
         result += f"- Specific tool: `load_session_section('{session_id}', 'tools', 'tool_name')`\n"
         result += f"- All data: `load_full_session('{session_id}')`\n"
 
-        return result
+        return wrap_untrusted(result, "session summary")
 
     except Exception as e:
         logger.error(f"get_session_summary failed: {e}")
@@ -3835,7 +3823,7 @@ def load_session_section(
             result += f"- Type: {section_data.get('analysis_type', 'static')}\n"
             result += f"- Tool Count: {section_data.get('tool_count')}\n"
             result += f"- Size: {section_data.get('total_output_size', 0) / 1024:.1f} KB\n"
-            return result
+            return wrap_untrusted(result, "session section")
 
         if section == "summary":
             return get_session_summary(session_id)
@@ -3886,7 +3874,7 @@ def load_session_section(
                 result += f"\n{output}\n\n"
                 result += "---\n\n"
 
-            return result
+            return wrap_untrusted(result, "session section")
 
         return f"Error: Unknown section type: {section}. Valid sections: metadata, summary, tools, static_tools, dynamic_tools"
 
@@ -3949,7 +3937,7 @@ def load_full_session(session_id: str) -> str:
             result += f"\n{output}\n\n"
             result += "---\n\n"
 
-        return result
+        return wrap_untrusted(result, "session contents")
 
     except Exception as e:
         logger.error(f"load_full_session failed: {e}")
@@ -4053,7 +4041,7 @@ def find_related_sessions(binary_path: str, limit: int = 10) -> str:
             result += f"- **Tools:** {tool_count}\n"
             result += f"- **Load:** `get_session_summary('{session_id}')`\n\n"
 
-        return result
+        return wrap_untrusted(result, "related sessions")
 
     except (PathTraversalError, FileSizeError) as e:
         return safe_error_message("Invalid binary path", e)
@@ -4212,7 +4200,7 @@ def detect_crypto_patterns(binary_path: str) -> str:
         else:
             output.append("No significant crypto patterns detected.")
 
-        return "\n".join(output)
+        return wrap_untrusted('\n'.join(output), "crypto pattern report")
 
     except (PathTraversalError, FileSizeError) as e:
         return safe_error_message("detect_crypto_patterns", e)
@@ -4292,7 +4280,7 @@ def analyze_xor_encryption(
         else:
             output.append("No XOR encryption patterns detected.")
 
-        return "\n".join(output)
+        return wrap_untrusted('\n'.join(output), "XOR analysis")
 
     except (PathTraversalError, FileSizeError) as e:
         return safe_error_message("analyze_xor_encryption", e)
@@ -4384,7 +4372,7 @@ def decrypt_xor(
                 output.append("")
                 output.append(f"Error: Output path must be within {CRYPTO_OUTPUT_DIR}")
 
-        return "\n".join(output)
+        return wrap_untrusted('\n'.join(output), "decrypted sample bytes")
 
     except (PathTraversalError, FileSizeError) as e:
         return safe_error_message("decrypt_xor", e)
@@ -4476,7 +4464,7 @@ def decode_base64_file(
                 output.append("")
                 output.append(f"Error: Output path must be within {CRYPTO_OUTPUT_DIR}")
 
-        return "\n".join(output)
+        return wrap_untrusted('\n'.join(output), "decoded sample bytes")
 
     except (PathTraversalError, FileSizeError) as e:
         return safe_error_message("decode_base64_file", e)
@@ -4548,7 +4536,7 @@ def detect_python_packer(binary_path: str) -> str:
                 for indicator in result["indicators"]:
                     output.append(f"  - {indicator}")
 
-        return "\n".join(output)
+        return wrap_untrusted('\n'.join(output), "packer detection")
 
     except (PathTraversalError, FileSizeError) as e:
         return safe_error_message("detect_python_packer", e)
@@ -4660,7 +4648,7 @@ def extract_python_packed(
             for err in result["errors"][:10]:
                 output.append(f"  - {err}")
 
-        return "\n".join(output)
+        return wrap_untrusted('\n'.join(output), "extracted archive members")
 
     except (PathTraversalError, FileSizeError) as e:
         return safe_error_message("extract_python_packed", e)
@@ -4722,7 +4710,7 @@ def analyze_pyc_file(pyc_path: str) -> str:
             if result.get("error"):
                 output.append(f"  Error: {result['error']}")
 
-        return "\n".join(output)
+        return wrap_untrusted('\n'.join(output), "pyc analysis")
 
     except (PathTraversalError, FileSizeError) as e:
         return safe_error_message("analyze_pyc_file", e)

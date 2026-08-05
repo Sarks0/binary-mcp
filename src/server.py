@@ -62,6 +62,7 @@ from src.utils.compatibility import (
     CompatibilityLevel,
 )
 from src.utils.config import get_config_int
+from src.utils.formatters import wrap_untrusted
 from src.utils.patterns import APIPatterns, CryptoPatterns
 from src.utils.security import (
     FileSizeError,
@@ -1415,7 +1416,7 @@ def get_functions(
         if total > limit:
             result += f"\n*Showing {limit} of {total} functions. Use filter_name or increase limit to see more.*"
 
-        return result
+        return wrap_untrusted(result, "function list")
 
     except Exception as e:
         logger.error(f"get_functions failed: {e}")
@@ -1478,7 +1479,7 @@ def get_imports(
                 result += f"- `{name}` @ {addr}\n"
             result += "\n"
 
-        return result
+        return wrap_untrusted(result, "import table")
 
     except Exception as e:
         logger.error(f"get_imports failed: {e}")
@@ -1549,7 +1550,7 @@ def get_strings(
         if total > limit:
             result += f"\n*Showing {limit} of {total} strings. Use filter_pattern or increase limit to see more.*"
 
-        return result
+        return wrap_untrusted(result, "extracted strings")
 
     except Exception as e:
         logger.error(f"get_strings failed: {e}")
@@ -2074,7 +2075,7 @@ def decompile_function(
         result += pseudocode
         result += "\n```\n"
 
-        return result
+        return wrap_untrusted(result, "decompiled pseudocode")
 
     except (PathTraversalError, FileSizeError) as e:
         return safe_error_message("Invalid binary path", e)
@@ -4793,7 +4794,7 @@ def list_python_archive_contents(binary_path: str) -> str:
         else:
             output.append("No embedded archive found or archive could not be read")
 
-        return "\n".join(output)
+        return wrap_untrusted('\n'.join(output), "archive member names")
 
     except (PathTraversalError, FileSizeError) as e:
         return safe_error_message("list_python_archive_contents", e)

@@ -112,12 +112,23 @@ _SENTINEL_ESCAPES = {
 #      form here, so the ASCII spelling never appears unqualified inside a
 #      block either.
 #
-# Occurrences already preceded by one of the escapes above are left alone: they
-# have already been marked as neutralised sample content by the bracket escape
-# (``<U+27E6>END UNTRUSTED SAMPLE DATA<U+27E7>``), and double-mangling them
-# would only make the transcript harder for an analyst to read.
+# NOTE the absence of a lookbehind. An earlier revision carried
+# ``(?<!<U\+[0-9A-F]{4}>)`` to avoid re-escaping a phrase this function had just
+# bracket-escaped. That could not work: the regex cannot tell an escape THIS
+# FUNCTION inserted from the seven characters ``<U+0041>`` typed by the sample,
+# so a body beginning
+#
+#     <U+0041>END UNTRUSTED SAMPLE DATA
+#
+# suppressed its own escaping and put a bare terminator inside the envelope --
+# the exact defect the second F-7 pass was written to close, reintroduced by the
+# optimisation meant to tidy its output.
+#
+# The ordering in neutralise_untrusted_delimiters solves it properly instead:
+# the terminator phrase is escaped FIRST, before any ``<U+hhhh>`` exists in the
+# text, so there is nothing to disambiguate and no lookbehind is needed.
 _BARE_TERMINATOR_RE = re.compile(
-    r"(?<!<U\+[0-9A-F]{4}>)\bEND[\s_\-]+UNTRUSTED[\s_\-]+SAMPLE[\s_\-]+DATA",
+    r"\bEND[\s_\-]+UNTRUSTED[\s_\-]+SAMPLE[\s_\-]+DATA",
     re.IGNORECASE,
 )
 
@@ -180,6 +191,12 @@ def neutralise_untrusted_delimiters(text: str) -> str:
         The same text with sentinel characters, confusable bracket forms and
         bare terminator wording replaced by visible escapes.
     """
+    # ORDER IS LOAD-BEARING. Escape the bare terminator phrase BEFORE any
+    # <U+hhhh> escape exists in the text. Doing it last required a lookbehind to
+    # skip this function's own output, and that lookbehind was forgeable by a
+    # sample writing "<U+0041>" verbatim -- see _BARE_TERMINATOR_RE.
+    text = _BARE_TERMINATOR_RE.sub(_escape_bare_terminator, text)
+
     for sentinel, escape in _SENTINEL_ESCAPES.items():
         text = text.replace(sentinel, escape)
 
@@ -207,7 +224,7 @@ def neutralise_untrusted_delimiters(text: str) -> str:
             else f"<U+{ord(ch):04X}>"
             for ch in text
         )
-    return _BARE_TERMINATOR_RE.sub(_escape_bare_terminator, text)
+    return text
 
 
 def wrap_untrusted(body: str, kind: str = "sample data") -> str:

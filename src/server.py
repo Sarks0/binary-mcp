@@ -844,6 +844,83 @@ def _submit_analysis_job(
     )
 
 
+
+def _decompile_job_key(binary_path: str, function_name: str) -> str:
+    """Identity of a targeted decompile, for cross-process de-duplication."""
+    import hashlib
+
+    try:
+        binary_id = cache._get_binary_hash(binary_path)
+    except Exception:
+        binary_id = hashlib.sha256(str(binary_path).encode()).hexdigest()
+    fn = hashlib.sha256(function_name.encode()).hexdigest()[:8]
+    return f"decompile-{binary_id[:16]}-{fn}"
+
+
+def _submit_decompile_job(binary_path: str, function_name: str, fn_address: str) -> str:
+    """Run a targeted single-function decompile in the background.
+
+    Deliberately does NOT auto-mark coverage. The rule in ``docs/coverage.md``
+    is that a function is marked reviewed only once its body has been handed to
+    the caller, and this path does not hand it to anyone -- it merges the
+    pseudocode into the cache and finishes. The mark lands on the next
+    ``decompile_function`` call, which now hits the warm path and returns the
+    body for real.
+
+    So collecting the result purely through ``job_result`` under-marks. That is
+    the safe direction and the documented one: under-marking costs a re-mark,
+    over-marking manufactures the false completion the ledger exists to
+    prevent.
+    """
+    key = _decompile_job_key(binary_path, function_name)
+
+    def _work(ctx):
+        ctx.set_progress(f"decompiling {function_name} at {fn_address}")
+        context = get_analysis_context(
+            binary_path,
+            incremental=True,
+            start_address=fn_address,
+            max_functions=1,
+            job_context=ctx,
+        )
+        function = next(
+            (f for f in context.get("functions", []) if f.get("name") == function_name),
+            None,
+        )
+        pseudocode = (function or {}).get("pseudocode")
+        return {
+            "binary_path": binary_path,
+            "function_name": function_name,
+            "address": fn_address,
+            "decompiled": bool(pseudocode),
+            "pseudocode": pseudocode,
+            "note": (
+                "Merged into the analysis cache. Call decompile_function again "
+                "for the formatted body -- that path is warm now, and it is the "
+                "call that marks the function reviewed."
+            ),
+        }
+
+    submitted = jobs.submit(kind="decompile_function", key=key, fn=_work)
+    if "error" in submitted:
+        return f"Error: {submitted['error']}"
+
+    job_id = submitted["job_id"]
+    lead = (
+        f"Attached to a decompile already running for {function_name}."
+        if submitted.get("attached")
+        else f"Decompiling {function_name} in the background."
+    )
+    return (
+        f"{lead}\n"
+        f"job_id: {job_id}\n\n"
+        f"'{function_name}' has no pseudocode in the cache (built shallow or "
+        f"structural), so this needs a targeted Ghidra decompile at {fn_address}. "
+        "Poll job_status(job_id) until done, then call decompile_function again "
+        "to get the formatted body from the now-warm cache."
+    )
+
+
 # Phase 1: Core Tools (P0 - Critical)
 
 @app.tool()
@@ -1973,7 +2050,8 @@ def get_xrefs(
 @log_to_session
 def decompile_function(
     binary_path: str,
-    function_name: str
+    function_name: str,
+    wait: bool = True,
 ) -> str:
     """
     Decompile a function to C-like pseudocode.
@@ -1990,9 +2068,18 @@ def decompile_function(
     Args:
         binary_path: Path to analyzed binary
         function_name: Name of the function to decompile
+        wait: When False, do not block on that targeted decompile -- return a
+            ``job_id`` and let it run in the background, past this call's
+            client timeout. Poll with ``job_status`` and then call this tool
+            again to read the body from the now-warm cache.
+
+            Only the Ghidra-invoking path is affected. When the pseudocode is
+            already cached this returns it immediately either way, because
+            there is nothing to wait for.
 
     Returns:
-        Decompiled C pseudocode
+        Decompiled C pseudocode, or a ``job_id`` when a targeted decompile was
+        needed and ``wait`` is False.
     """
     try:
         # Peek at the existing cache first. If it was produced shallow/structural,
@@ -2034,6 +2121,8 @@ def decompile_function(
             # just this function and merge the result back into the cache so
             # subsequent calls hit the warm path.
             fn_address = function.get("address")
+            if cached_depth in ("shallow", "structural") and fn_address and not wait:
+                return _submit_decompile_job(binary_path, function_name, fn_address)
             if cached_depth in ("shallow", "structural") and fn_address:
                 logger.info(
                     "decompile_function: pseudocode missing for %s on %s cache -- "

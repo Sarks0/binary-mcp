@@ -50,6 +50,34 @@ job_result("4f9c2a10be7d3355")   -> {"function_count": 14260, ...}
 The analysis survives the client timeout, and the result lands in the shared
 cache either way — so once the job succeeds the ordinary tools just work.
 
+## `decompile_function(..., wait=False)`
+
+Same shape, but only the Ghidra-invoking path goes async. When the pseudocode
+is already cached this returns it immediately regardless of `wait` — there is
+nothing to wait for, and making a warm read return a job id would be a worse
+tool. A background decompile is only started when the cache was built shallow
+or structural and the function's body genuinely has to be produced.
+
+```
+decompile_function("/path/to/tquery.dll", "CQuery::Execute", wait=False)
+  -> job_id: 91b3d0f5c7a24411
+job_status(...)                  -> succeeded
+decompile_function("/path/to/tquery.dll", "CQuery::Execute")
+  -> the formatted body, from the now-warm cache
+```
+
+### It does not mark coverage, on purpose
+
+`docs/coverage.md` says a function is marked reviewed only once its body has
+been handed to the caller. A background decompile hands it to nobody: it merges
+the pseudocode into the cache and finishes. So the job does not mark, and the
+mark lands on the next `decompile_function` call — the one that actually
+returns the body.
+
+Collecting the result purely through `job_result` therefore **under-marks**.
+That is deliberate and it is the safe direction: under-marking costs a re-mark,
+over-marking manufactures the false completion the ledger exists to prevent.
+
 ## One runner per key
 
 A job's key is the binary's content hash plus the analysis parameters. A second

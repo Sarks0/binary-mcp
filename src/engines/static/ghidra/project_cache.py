@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 # Side-car suffixes that share the <hash>.<suffix> stem with a cache file.
 # When auto-pruning legacy <hash>.json duplicates we must NOT touch these.
-_SIDECAR_SUFFIXES = (".meta.json", ".funcidx.json", ".notes.json")
+_SIDECAR_SUFFIXES = (".meta.json", ".funcidx.json", ".notes.json", ".coverage.json")
 
 
 class ProjectCache:

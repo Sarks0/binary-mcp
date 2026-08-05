@@ -258,7 +258,7 @@ class TestPairingByPdbName:
         assert "MODIFIED (1)" in result
         assert "kept_modified" in result
         # Unchanged pair is reported as count, not as a section row.
-        assert "Unchanged pairs: 1" in result
+        assert "UNCHANGED 1" in result
         # Cache-only contract.
         assert runner.method_calls == []
 
@@ -441,7 +441,7 @@ class TestAslrShiftedAddresses:
         assert "REMOVED (0)" in result
         # B is modified; A is unchanged.
         assert "MODIFIED (1)" in result
-        assert "Unchanged pairs: 1" in result
+        assert "UNCHANGED 1" in result
         # The new address is reported on the right of the arrow.
         assert "->  B (0x100002000)" in result
 
@@ -512,7 +512,7 @@ class TestPhase2HashRename:
 
         assert "MODIFIED (0)" in result
         assert "Renamed (unchanged body) (0)" in result
-        assert "Unchanged pairs: 1" in result
+        assert "UNCHANGED 1" in result
 
 
 class TestPhase3CalleeMatch:
@@ -966,3 +966,145 @@ class TestProbePrefixLength:
         from src.tools.diff_tools import _probe_prefix_length
 
         assert _probe_prefix_length(0) == 0
+
+
+class TestReportBounds:
+    """An unbounded report on a real pair is 20000 lines and cannot cross an
+    MCP client. Bounding it is only honest if the counts stay exact, every cut
+    announces itself, and the omitted content is still reachable."""
+
+    @staticmethod
+    def _big(monkeypatch, n_modified=100, n_added=80, n_removed=70, tmp_path=None):
+        """A pair with enough of everything to trip every bound."""
+        import src.tools.diff_tools as dt
+
+        old_funcs, new_funcs = [], []
+        for i in range(n_modified):
+            a = 0x1000 + i * 0x40
+            old_funcs.append(_make_function(name=f"Mod{i}", address=f"{a:#x}",
+                                            pseudocode="int f(){return 0;}"))
+            new_funcs.append(_make_function(name=f"Mod{i}", address=f"{a:#x}",
+                                            pseudocode="int f(){if(n<max){return 1;}}"))
+        for i in range(n_removed):
+            old_funcs.append(_make_function(name=f"Gone{i}", address=f"{0x90000 + i * 0x40:#x}"))
+        for i in range(n_added):
+            new_funcs.append(_make_function(name=f"New{i}", address=f"{0xB0000 + i * 0x40:#x}"))
+
+        monkeypatch.setattr(
+            dt, "_compute_function_hash",
+            lambda reader, a, m, func, md=None: {
+                "hash": f"{reader.path}-{func['address']}-{func['name']}",
+                "instruction_count": 10, "operands_normalized": 0},
+        )
+        tool, cache, _ = _register(monkeypatch,
+                                   _make_context(old_funcs), _make_context(new_funcs))
+        if tmp_path is not None:
+            cache.cache_dir = str(tmp_path)
+            cache._get_binary_hash.side_effect = lambda p: ("a" if "old" in p else "b") * 64
+        return tool
+
+    def test_counts_stay_exact_when_listings_are_cut(self, monkeypatch):
+        tool = self._big(monkeypatch)
+        report = tool("/old.bin", "/new.bin", top_n=5, list_limit=3)
+        assert "ADDED     80" in report
+        assert "REMOVED   70" in report
+        assert "MODIFIED  100" in report
+
+    def test_every_cut_says_how_much_it_omitted(self, monkeypatch):
+        tool = self._big(monkeypatch)
+        report = tool("/old.bin", "/new.bin", top_n=5, list_limit=3)
+        assert "... 77 more added function(s) not shown" in report
+        assert "... 67 more removed function(s) not shown" in report
+        assert "... 95 more modified pair(s) not shown" in report
+
+    def test_default_bounds_hold_however_big_the_diff_gets(self, monkeypatch):
+        """The whole point: report size must not scale with the binary. A
+        1000-modified pair and a 100-modified pair return the same size."""
+        small = self._big(monkeypatch, n_modified=100, n_added=80, n_removed=70)
+        small_report = small("/old.bin", "/new.bin")
+
+        big = self._big(monkeypatch, n_modified=1000, n_added=900, n_removed=800)
+        big_report = big("/old.bin", "/new.bin")
+        unbounded = big("/old.bin", "/new.bin", top_n=0, list_limit=0)
+
+        assert len(big_report.splitlines()) == len(small_report.splitlines())
+        assert len(big_report.splitlines()) < 260
+        assert len(unbounded.splitlines()) > 4000
+
+    def test_zero_means_no_limit(self, monkeypatch):
+        tool = self._big(monkeypatch)
+        report = tool("/old.bin", "/new.bin", top_n=0, list_limit=0)
+        assert "not shown" not in report
+        assert "New79" in report and "Gone69" in report
+
+    def test_modified_are_ordered_by_score_before_truncation(self, monkeypatch):
+        """Truncation must keep the *most* likely fixes, so the sort has to
+        happen first -- otherwise top_n returns an arbitrary slice."""
+        import re
+
+        tool = self._big(monkeypatch)
+        report = tool("/old.bin", "/new.bin", top_n=10, list_limit=0)
+        scores = [float(m) for m in re.findall(r"^ +score=([0-9.]+)", report, re.M)]
+        assert scores == sorted(scores, reverse=True)
+        assert len(scores) == 10
+
+    def test_min_score_filters_and_says_so(self, monkeypatch):
+        tool = self._big(monkeypatch)
+        report = tool("/old.bin", "/new.bin", min_score=1000.0, top_n=0, list_limit=0)
+        assert "min_score=1000 filtered out" in report
+
+    def test_min_score_is_applied_before_top_n(self, monkeypatch):
+        import re
+
+        tool = self._big(monkeypatch)
+        report = tool("/old.bin", "/new.bin", min_score=1000.0, top_n=5, list_limit=0)
+        assert re.findall(r"^ +score=([0-9.]+)", report, re.M) == []
+
+    def test_full_report_is_written_and_pointed_at(self, monkeypatch, tmp_path):
+        import re
+
+        tool = self._big(monkeypatch, tmp_path=tmp_path)
+        report = tool("/old.bin", "/new.bin", top_n=5, list_limit=3)
+
+        written = list(tmp_path.glob("*.diff.txt"))
+        assert len(written) == 1, "a truncated report must persist the full one"
+        assert str(written[0]) in report
+
+        full = written[0].read_text()
+        assert "not shown" not in full
+        assert "New79" in full and "Gone69" in full
+        assert len(re.findall(r"^ +score=", full, re.M)) == 100
+
+    def test_untruncated_run_writes_nothing(self, monkeypatch, tmp_path):
+        """An ordinary small diff must not litter the cache with a duplicate
+        of output it already returned in full."""
+        tool = self._big(monkeypatch, n_modified=2, n_added=1, n_removed=1,
+                         tmp_path=tmp_path)
+        report = tool("/old.bin", "/new.bin")
+        assert list(tmp_path.glob("*.diff.txt")) == []
+        assert "not shown" not in report
+
+    def test_same_pair_overwrites_rather_than_accumulating(self, monkeypatch, tmp_path):
+        tool = self._big(monkeypatch, tmp_path=tmp_path)
+        for _ in range(3):
+            tool("/old.bin", "/new.bin", top_n=5, list_limit=3)
+        assert len(list(tmp_path.glob("*.diff.txt"))) == 1
+
+    def test_unwritable_full_report_does_not_lose_the_diff(self, monkeypatch):
+        """A report we cannot persist must not cost the report we can return."""
+        tool = self._big(monkeypatch)  # MagicMock cache dir -> write fails
+        report = tool("/old.bin", "/new.bin", top_n=5, list_limit=3)
+        assert "### MODIFIED" in report
+        assert "... 95 more modified pair(s) not shown" in report
+
+    @pytest.mark.parametrize(
+        "kwargs,expected",
+        [
+            ({"top_n": -1}, "top_n and list_limit must be >= 0"),
+            ({"list_limit": -1}, "top_n and list_limit must be >= 0"),
+            ({"min_score": -0.5}, "min_score must be >= 0"),
+        ],
+    )
+    def test_negative_bounds_are_rejected(self, monkeypatch, kwargs, expected):
+        tool = self._big(monkeypatch, n_modified=1, n_added=0, n_removed=0)
+        assert expected in tool("/old.bin", "/new.bin", **kwargs)

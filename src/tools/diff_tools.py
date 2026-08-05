@@ -60,6 +60,15 @@ _COOKIE_NAMES = {"__security_check_cookie", "__security_init_cookie"}
 # Jaccard threshold + scoring weights. Tuned for Patch-Tuesday-shaped
 # diffs (mostly stable, a handful of fixed funcs); not load-bearing.
 _CALLEE_JACCARD_THRESHOLD = 0.85
+
+# Report bounds. An unbounded report on a 14000-function pair is 20000 lines
+# and ~240K tokens -- it cannot come back through an MCP client, which is what
+# drove diff work out into offline scripts. These defaults land around 250
+# lines while keeping every bucket count exact, and the untruncated report is
+# written to disk whenever they bite.
+DEFAULT_TOP_N = 40
+DEFAULT_LIST_LIMIT = 20
+
 _BOUNDS_WEIGHT = 5.0
 _COOKIE_WEIGHT = 8.0
 _CALLER_WEIGHT = 1.0
@@ -479,6 +488,25 @@ def _confirm_phase1_buckets(
     return modified, unchanged
 
 
+def _elide(count: int, shown: int, what: str) -> str:
+    """The line that admits a section was cut.
+
+    Every truncation says so, in place, with the number omitted. A section
+    that silently stops reads as a complete answer, and on a Patch-Tuesday
+    diff "no more added functions" versus "4000 more added functions" is the
+    difference between a finished triage and an abandoned one.
+    """
+    return f"  ... {count - shown} more {what} not shown"
+
+
+def _sorted_modified(
+    modified: list[tuple[dict, dict, str, dict]], mode: str
+) -> list[tuple[dict, dict, str, dict]]:
+    if mode == "security":
+        return sorted(modified, key=lambda m: -m[3]["score"])
+    return list(modified)
+
+
 def _format_report(
     old_path: str,
     new_path: str,
@@ -492,9 +520,27 @@ def _format_report(
     group_by: str,
     unchanged_renamed: list[tuple[dict, dict]] | None = None,
     coverage_line: str | None = None,
+    top_n: int = 0,
+    list_limit: int = 0,
+    min_score: float = 0.0,
+    full_report_path: str | None = None,
 ) -> str:
-    """Render the diff report; ``modified`` already carries score dicts."""
+    """Render the diff report; ``modified`` already carries score dicts.
+
+    ``top_n`` / ``list_limit`` / ``min_score`` bound the output; 0 means no
+    bound, which is what the on-disk full report is rendered with.
+    """
     unchanged_renamed = unchanged_renamed or []
+
+    modified_sorted = _sorted_modified(modified, mode)
+    scored_out = 0
+    if min_score > 0.0 and mode == "security":
+        kept = [m for m in modified_sorted if m[3]["score"] >= min_score]
+        scored_out = len(modified_sorted) - len(kept)
+        modified_sorted = kept
+
+    shown_modified = modified_sorted if top_n <= 0 else modified_sorted[:top_n]
+
     lines = [
         "=" * 60,
         "BINARY DIFF",
@@ -502,45 +548,72 @@ def _format_report(
         f"Old: {Path(old_path).name}  ({len(old_ctx.get('functions', []))} functions)",
         f"New: {Path(new_path).name}  ({len(new_ctx.get('functions', []))} functions)",
         f"Mode: {mode}    group_by={group_by}",
-        f"Unchanged pairs: {unchanged_count}",
+        "",
+        "### SUMMARY",
+        f"  ADDED     {len(added)}",
+        f"  REMOVED   {len(removed)}",
+        f"  RENAMED   {len(unchanged_renamed)}  (identical body, different name)",
+        f"  MODIFIED  {len(modified)}",
+        f"  UNCHANGED {unchanged_count}",
     ]
+    if scored_out:
+        lines.append(f"  (min_score={min_score:g} filtered out {scored_out} MODIFIED)")
     if coverage_line:
-        # In the header, not a footer: the MODIFIED section can run to
-        # thousands of lines and a footer would never be read.
-        lines.append(coverage_line)
+        # In the header, not a footer: even a bounded report is long enough
+        # that a footer gets skimmed past.
+        lines.append(f"  {coverage_line}")
+    if full_report_path:
+        lines.append(f"  Full untruncated report: {full_report_path}")
     lines.append("")
 
-    lines.append(f"### ADDED ({len(added)})")
-    for f in added:
-        lines.append(f"- {f.get('name')} @ {f.get('address')}")
-    lines.append("")
+    def _name_section(title: str, entries: list[str], total: int, noun: str) -> None:
+        shown = entries if list_limit <= 0 else entries[:list_limit]
+        suffix = f", showing {len(shown)}" if len(shown) < total else ""
+        lines.append(f"### {title} ({total}{suffix})")
+        lines.extend(shown)
+        if len(shown) < total:
+            lines.append(_elide(total, len(shown), noun))
+        lines.append("")
 
-    lines.append(f"### REMOVED ({len(removed)})")
-    for f in removed:
-        lines.append(f"- {f.get('name')} @ {f.get('address')}")
-    lines.append("")
-
+    _name_section(
+        "ADDED",
+        [f"- {f.get('name')} @ {f.get('address')}" for f in added],
+        len(added),
+        "added function(s)",
+    )
+    _name_section(
+        "REMOVED",
+        [f"- {f.get('name')} @ {f.get('address')}" for f in removed],
+        len(removed),
+        "removed function(s)",
+    )
     # Renamed-but-otherwise-unchanged: hash-identical phase-2 pairs whose
     # names differ. Surfaced separately so they don't pollute the MODIFIED
     # bucket (which is meant for actual body changes / security fixes).
-    lines.append(f"### Renamed (unchanged body) ({len(unchanged_renamed)})")
-    for of, nf in unchanged_renamed:
-        lines.append(
+    _name_section(
+        "Renamed (unchanged body)",
+        [
             f"- {of.get('name')} ({of.get('address')})  ->  "
             f"{nf.get('name')} ({nf.get('address')})  [unchanged_renamed]"
+            for of, nf in unchanged_renamed
+        ],
+        len(unchanged_renamed),
+        "rename(s)",
+    )
+
+    if len(shown_modified) < len(modified_sorted):
+        ordering = "by fix-likelihood score" if mode == "security" else "in source order"
+        header = (
+            f"### MODIFIED ({len(modified_sorted)}, showing top "
+            f"{len(shown_modified)} {ordering})"
         )
-    lines.append("")
-
-    lines.append(f"### MODIFIED ({len(modified)})")
-
-    if mode == "security":
-        modified_sorted = sorted(modified, key=lambda m: -m[3]["score"])
     else:
-        modified_sorted = list(modified)
+        header = f"### MODIFIED ({len(modified_sorted)})"
+    lines.append(header)
 
     if group_by == "module":
         groups: dict[str, list[tuple[dict, dict, str, dict]]] = {}
-        for entry in modified_sorted:
+        for entry in shown_modified:
             old_func, _, _, _ = entry
             groups.setdefault(_module_prefix(old_func.get("name") or ""), []).append(entry)
         for module, entries in sorted(groups.items()):
@@ -549,8 +622,15 @@ def _format_report(
                 lines.extend(_format_modified_entry(entry, old_ctx, new_ctx))
             lines.append("")
     else:
-        for entry in modified_sorted:
+        for entry in shown_modified:
             lines.extend(_format_modified_entry(entry, old_ctx, new_ctx))
+
+    if len(shown_modified) < len(modified_sorted):
+        lines.append(_elide(len(modified_sorted), len(shown_modified), "modified pair(s)"))
+        lines.append(
+            "  Raise top_n, or set min_score, to see more"
+            + (f" -- or read {full_report_path}" if full_report_path else "")
+        )
 
     return "\n".join(lines)
 
@@ -582,6 +662,32 @@ def _format_modified_entry(
         out.append(f"    L{line_no}  -  {a_short}")
         out.append(f"    L{line_no}  +  {b_short}")
     return out
+
+
+def _write_full_report(cache, old_path: str, new_path: str, render) -> str | None:
+    """Write the untruncated report beside the analysis caches.
+
+    Truncation is only acceptable if nothing is lost, so whenever the returned
+    report is bounded the complete one goes to disk and the header points at
+    it. ``render`` is a callable so the full report -- 1.5 MB and 20000 lines
+    on a large pair -- is never built when it is not needed.
+
+    The name is derived from both binaries' content hashes, so re-running the
+    same diff overwrites rather than accumulating, and two different pairs
+    never collide. Returns the path, or None if it could not be written.
+    """
+    try:
+        old_id = cache._get_binary_hash(old_path)
+        new_id = cache._get_binary_hash(new_path)
+        target = Path(cache.cache_dir) / f"{old_id[:16]}-{new_id[:16]}.diff.txt"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(render(), encoding="utf-8")
+        return str(target)
+    except Exception as exc:
+        # A report we could not persist must not cost the report we can
+        # return; the caller falls back to saying so in the header.
+        logger.warning("could not write full diff report: %s", exc)
+        return None
 
 
 def _record_examinations(
@@ -666,6 +772,9 @@ def register_diff_tools(app, session_manager, cache, runner):
         group_by: str = "none",
         mode: str = "security",
         record_examination: bool = True,
+        top_n: int = DEFAULT_TOP_N,
+        list_limit: int = DEFAULT_LIST_LIMIT,
+        min_score: float = 0.0,
     ) -> str:
         """
         Diff two analyzed binaries and rank likely security fixes.
@@ -691,6 +800,13 @@ def register_diff_tools(app, session_manager, cache, runner):
         re-analysis that redraws them recomputes rather than serving a stale
         hash.
 
+        The report is bounded by default. An unbounded one on a large pair
+        runs to 20000 lines and cannot come back through an MCP client at
+        all, so the buckets are capped and every cut says how much it
+        omitted. Nothing is lost: whenever the returned report is truncated
+        the complete one is written next to the analysis caches and the
+        header carries its path.
+
         Args:
             old_path: Path to the OLD analyzed binary.
             new_path: Path to the NEW analyzed binary.
@@ -706,10 +822,24 @@ def register_diff_tools(app, session_manager, cache, runner):
                 ``get_next_unreviewed(only_examined=True)`` instead of
                 vanishing when the report scrolls away. Set false for a dry
                 run against a ledger you do not want touched.
+            top_n: How many MODIFIED entries to print, highest score first in
+                ``mode="security"`` and source order otherwise. ``0`` prints
+                every one -- use it when writing to a file, not when the
+                result has to cross a client.
+            list_limit: How many names to print per ADDED / REMOVED / renamed
+                bucket. ``0`` prints every one. The counts are always exact
+                regardless; this bounds only the listings.
+            min_score: Drop MODIFIED entries scoring below this before
+                ``top_n`` applies. ``mode="security"`` only -- there is no
+                score to filter on otherwise. Use it to widen coverage of
+                what actually matters rather than raising ``top_n`` and
+                pulling in cosmetic churn.
 
         Returns:
-            Markdown-style report of ADDED / REMOVED / MODIFIED buckets. The
-            header states how many examinations were recorded on each side.
+            Markdown-style report: a SUMMARY block with exact bucket counts,
+            then the bounded listings. The header states how many
+            examinations were recorded on each side, and the path to the full
+            report when one was written.
         """
         try:
             old_path = str(sanitize_binary_path(old_path))
@@ -719,6 +849,10 @@ def register_diff_tools(app, session_manager, cache, runner):
                 return "Error: mode must be 'security' or 'none'."
             if group_by not in ("none", "module"):
                 return "Error: group_by must be 'none' or 'module'."
+            if top_n < 0 or list_limit < 0:
+                return "Error: top_n and list_limit must be >= 0 (0 means no limit)."
+            if min_score < 0:
+                return "Error: min_score must be >= 0."
 
             old_ctx = cache.get_cached(old_path)
             if not old_ctx:
@@ -795,20 +929,43 @@ def register_diff_tools(app, session_manager, cache, runner):
                 enabled=record_examination,
             )
 
-            return _format_report(
-                old_path,
-                new_path,
-                old_ctx,
-                new_ctx,
-                added=new_residue,
-                removed=old_residue,
-                modified=modified,
-                unchanged_count=unchanged_count,
-                unchanged_renamed=unchanged_renamed,
-                mode=mode,
-                group_by=group_by,
-                coverage_line=coverage_line,
+            def _render(bounded: bool, full_path: str | None = None) -> str:
+                return _format_report(
+                    old_path,
+                    new_path,
+                    old_ctx,
+                    new_ctx,
+                    added=new_residue,
+                    removed=old_residue,
+                    modified=modified,
+                    unchanged_count=unchanged_count,
+                    unchanged_renamed=unchanged_renamed,
+                    mode=mode,
+                    group_by=group_by,
+                    coverage_line=coverage_line,
+                    top_n=top_n if bounded else 0,
+                    list_limit=list_limit if bounded else 0,
+                    min_score=min_score if bounded else 0.0,
+                    full_report_path=full_path,
+                )
+
+            truncates = (
+                (top_n > 0 and len(modified) > top_n)
+                or (min_score > 0 and mode == "security")
+                or (
+                    list_limit > 0
+                    and max(len(new_residue), len(old_residue), len(unchanged_renamed))
+                    > list_limit
+                )
             )
+            # Only when something is actually cut, so an ordinary small diff
+            # does not litter the cache with a duplicate of its own output.
+            full_path = (
+                _write_full_report(cache, old_path, new_path, lambda: _render(bounded=False))
+                if truncates
+                else None
+            )
+            return _render(bounded=True, full_path=full_path)
 
         except (PathTraversalError, FileSizeError) as e:
             return safe_error_message("diff_binaries", e)

@@ -426,7 +426,11 @@ class ProjectCache:
         """
         count = 0
 
-        for pattern in ("*.json.gz", "*.json"):
+        # `.diff.txt` is the untruncated cross-binary diff report a bounded
+        # `diff_binaries` call persists. It is derived output like everything
+        # else here, so a full wipe must take it -- otherwise it is the one
+        # thing `clear_all` leaves behind, and it is the largest.
+        for pattern in ("*.json.gz", "*.json", "*.diff.txt"):
             for cache_file in self.cache_dir.glob(pattern):
                 try:
                     cache_file.unlink()
@@ -593,7 +597,7 @@ class ProjectCache:
         """Get total size of cache in bytes (all cache + sidecar files)."""
         total_size = 0
 
-        for pattern in ("*.json.gz", "*.json"):
+        for pattern in ("*.json.gz", "*.json", "*.diff.txt"):
             for cache_file in self.cache_dir.glob(pattern):
                 try:
                     total_size += cache_file.stat().st_size

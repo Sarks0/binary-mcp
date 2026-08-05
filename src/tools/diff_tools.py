@@ -675,12 +675,24 @@ def _write_full_report(cache, old_path: str, new_path: str, render) -> str | Non
     The name is derived from both binaries' content hashes, so re-running the
     same diff overwrites rather than accumulating, and two different pairs
     never collide. Returns the path, or None if it could not be written.
+
+    Writes only into a cache directory that already exists, and never creates
+    one. ``ProjectCache.__init__`` makes it, so a missing directory means the
+    cache root is not what we think it is -- and creating it anyway turns that
+    into a tree of files somewhere nobody asked for. A ``MagicMock`` cache is
+    the concrete case: ``__fspath__`` hands back a plausible-looking relative
+    path rather than raising, so ``mkdir(parents=True)`` silently built
+    ``MagicMock/mock.cache_dir/<id>/`` under the working directory during a
+    test run. Degrade to "no full report" instead.
     """
     try:
+        cache_dir = Path(cache.cache_dir)
+        if not cache_dir.is_dir():
+            logger.debug("no full diff report: cache dir %s does not exist", cache_dir)
+            return None
         old_id = cache._get_binary_hash(old_path)
         new_id = cache._get_binary_hash(new_path)
-        target = Path(cache.cache_dir) / f"{old_id[:16]}-{new_id[:16]}.diff.txt"
-        target.parent.mkdir(parents=True, exist_ok=True)
+        target = cache_dir / f"{old_id[:16]}-{new_id[:16]}.diff.txt"
         target.write_text(render(), encoding="utf-8")
         return str(target)
     except Exception as exc:

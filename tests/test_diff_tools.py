@@ -1108,3 +1108,54 @@ class TestReportBounds:
     def test_negative_bounds_are_rejected(self, monkeypatch, kwargs, expected):
         tool = self._big(monkeypatch, n_modified=1, n_added=0, n_removed=0)
         assert expected in tool("/old.bin", "/new.bin", **kwargs)
+
+
+class TestNoStrayWrites:
+    """The diff must never create files or directories outside a real cache
+    directory.
+
+    Regression: `_write_full_report` called `mkdir(parents=True)`, and
+    `MagicMock.__fspath__()` returns a plausible relative path
+    (`MagicMock/mock.cache_dir/<id>`) instead of raising -- so a test run
+    silently built that tree under the working directory, 30+ files of it got
+    committed, and Windows CI then failed at checkout because `<` and `>` are
+    illegal in Windows filenames.
+    """
+
+    def test_mock_cache_creates_nothing_on_disk(self, monkeypatch, tmp_path):
+        import src.tools.diff_tools as dt
+
+        old_funcs, new_funcs = [], []
+        for i in range(60):
+            a = 0x1000 + i * 0x40
+            old_funcs.append(_make_function(name=f"Mod{i}", address=f"{a:#x}",
+                                            pseudocode="int f(){return 0;}"))
+            new_funcs.append(_make_function(name=f"Mod{i}", address=f"{a:#x}",
+                                            pseudocode="int f(){if(n<max){return 1;}}"))
+        monkeypatch.setattr(
+            dt, "_compute_function_hash",
+            lambda reader, a, m, func, md=None: {
+                "hash": f"{reader.path}-{func['address']}",
+                "instruction_count": 10, "operands_normalized": 0},
+        )
+        tool, _cache, _ = _register(monkeypatch,
+                                    _make_context(old_funcs), _make_context(new_funcs))
+
+        # Run from an empty cwd so anything created is unambiguously ours.
+        monkeypatch.chdir(tmp_path)
+        report = tool("/old.bin", "/new.bin", top_n=5, list_limit=3)
+
+        assert "### MODIFIED" in report, "the diff itself must still work"
+        assert list(tmp_path.iterdir()) == [], (
+            f"diff created files outside the cache dir: {list(tmp_path.iterdir())}"
+        )
+
+    def test_full_report_is_skipped_when_cache_dir_is_absent(self, tmp_path):
+        from src.tools.diff_tools import _write_full_report
+
+        cache = MagicMock()
+        cache.cache_dir = str(tmp_path / "does" / "not" / "exist")
+        cache._get_binary_hash.side_effect = lambda p: "a" * 64
+
+        assert _write_full_report(cache, "/old.bin", "/new.bin", lambda: "x") is None
+        assert not (tmp_path / "does").exists()

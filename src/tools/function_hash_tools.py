@@ -128,8 +128,17 @@ class FunctionHashCache:
         self._dirty = True
 
     def save(self) -> None:
-        """Persist atomically. Never raises."""
+        """Persist atomically into an existing cache directory. Never raises.
+
+        Does not create the directory. ``ProjectCache.__init__`` owns that, and
+        a cache object whose ``cache_dir`` does not exist is not one we should
+        be materializing a tree for -- a ``MagicMock`` cache hands back a
+        plausible relative path from ``__fspath__`` rather than raising.
+        """
         if self._path is None or not self._dirty:
+            return
+        if not self._path.parent.is_dir():
+            logger.debug("skipping function-hash side-car: %s absent", self._path.parent)
             return
         payload = {
             "schema_version": _FNHASH_SCHEMA_VERSION,

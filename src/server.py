@@ -1,7 +1,7 @@
 """
 Binary MCP Server for comprehensive binary analysis.
 
-Provides 279 tools for static and dynamic binary analysis:
+Provides 284 tools for static and dynamic binary analysis:
 - Static analysis via Ghidra (headless mode) for native binaries
 - Static analysis via ILSpyCmd for .NET assemblies
 - Dynamic analysis via x64dbg (native plugin)
@@ -9,6 +9,7 @@ Provides 279 tools for static and dynamic binary analysis:
 - Control flow analysis (CFG, cyclomatic complexity, loops, dead code)
 - Malware behavior detection (10 categories, anti-analysis, API call chains)
 - Function hashing and cross-binary matching
+- Review coverage (per-binary denominator, scope, unreviewed worklist)
 
 The tool count above is asserted by tests/test_docs_accuracy.py against the
 tools actually registered by main(), so it cannot silently drift (audit
@@ -34,9 +35,12 @@ from pathlib import Path
 from fastmcp import FastMCP
 
 from src.engines.session import AnalysisType, UnifiedSessionManager
+from src.engines.static.ghidra.coverage_store import CoverageStore, has_reviewable_body
+from src.engines.static.ghidra.coverage_store import auto_mark as auto_mark_reviewed
 from src.engines.static.ghidra.project_cache import ProjectCache
 from src.engines.static.ghidra.runner import GhidraAnalysisError, GhidraRunner
 from src.tools.control_flow_tools import register_control_flow_tools
+from src.tools.coverage_tools import register_coverage_tools
 from src.tools.diff_tools import register_diff_tools
 from src.tools.dispatch_tools import register_dispatch_tools
 from src.tools.dotnet_tools import register_dotnet_tools
@@ -788,6 +792,21 @@ def get_analysis_context(
             cache.save_cached(binary_path, context)
         except Exception as e:
             logger.warning(f"Failed to apply notes overlay after analysis: {e}")
+
+        # Populate the review-coverage function list off the fresh context.
+        # Best-effort and never fatal: coverage is additive, and a ledger
+        # failure must not sink an analysis that otherwise succeeded. Review
+        # marks survive the rebuild, so an incremental run that grows the
+        # function list extends the denominator without losing history.
+        try:
+            coverage_store = CoverageStore(cache)
+            coverage_store.index(
+                coverage_store.binary_id_for_path(binary_path),
+                binary_path,
+                context=context,
+            )
+        except Exception as e:
+            logger.warning(f"Coverage indexing failed for {binary_path}: {e}")
 
         # Clean up temp file
         output_path.unlink()
@@ -2034,6 +2053,17 @@ def decompile_function(
                     f"Function '{function_name}' could not be decompiled "
                     f"(decompilation may have failed)."
                 )
+
+        # Coverage side effect: the pseudocode is about to be handed to the
+        # caller, so this function counts as reviewed. Best-effort -- never
+        # let the ledger break a decompile. A body that is only a decompiler
+        # banner comment is still returned, but showing a remark about the
+        # function is not showing the function, so it does not mark.
+        if has_reviewable_body(pseudocode):
+            auto_mark_reviewed(
+                cache, binary_path, [function.get("address")],
+                tool="decompile_function", context=context,
+            )
 
         # Format output
         result = f"**Decompiled: {function_name}**\n\n"
@@ -4827,7 +4857,10 @@ def main():
     # Register Function ID (FID) library-match reader
     register_fid_tools(app, session_manager, cache, runner)
 
-    logger.info("Registered all analysis tools (static, dynamic, VT, triage, reporting, Yara, control flow, malware, function hash, PE structure, review, fid)")
+    # Register review-coverage tools (denominator + worklist)
+    register_coverage_tools(app, session_manager, cache, runner)
+
+    logger.info("Registered all analysis tools (static, dynamic, VT, triage, reporting, Yara, control flow, malware, function hash, PE structure, review, fid, coverage)")
     logger.info(f"Session Directory: {session_manager.store_dir}")
 
     # Run the FastMCP server (handles stdio automatically)

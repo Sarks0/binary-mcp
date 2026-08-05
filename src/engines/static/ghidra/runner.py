@@ -609,6 +609,7 @@ class GhidraRunner:
         enable_fid: bool = False,
         max_heap_mb: int | None = None,
         analysis_depth: str = "full",
+        on_spawn=None,
     ) -> dict:
         """
         Run Ghidra headless analysis on a binary.
@@ -840,6 +841,17 @@ class GhidraRunner:
                 # Windows ignores start_new_session; we use taskkill /T instead.
                 start_new_session=(os.name != "nt"),
             )
+
+            # Publish the pid before we block on it. If this process dies
+            # during `communicate` -- which is exactly what happens when a
+            # client abandons a call and the server is torn down -- the pid
+            # recorded here is the only handle anyone has left on the Ghidra
+            # tree, and a sweep from another process uses it to reap.
+            if on_spawn is not None:
+                try:
+                    on_spawn(proc.pid)
+                except Exception as exc:  # never let bookkeeping kill analysis
+                    logger.warning("on_spawn hook failed for pid %s: %s", proc.pid, exc)
 
             try:
                 stdout, stderr = proc.communicate(timeout=timeout)

@@ -24,6 +24,7 @@ from pathlib import Path
 
 from fastmcp import FastMCP
 
+from src.engines.jobs import JobRegistry
 from src.engines.session import AnalysisType, UnifiedSessionManager
 from src.engines.static.ghidra.coverage_store import CoverageStore, has_reviewable_body
 from src.engines.static.ghidra.coverage_store import auto_mark as auto_mark_reviewed
@@ -38,6 +39,7 @@ from src.tools.dynamic_tools import register_dynamic_tools
 from src.tools.fid_tools import register_fid_tools
 from src.tools.function_hash_tools import register_function_hash_tools
 from src.tools.indirect_call_tools import register_indirect_call_tools
+from src.tools.job_tools import register_job_tools
 from src.tools.malware_tools import register_malware_tools
 from src.tools.pe_tools import register_pe_tools
 from src.tools.reporting import register_reporting_tools
@@ -79,6 +81,9 @@ app = FastMCP("binary-mcp")
 runner = GhidraRunner()
 cache = ProjectCache()
 session_manager = UnifiedSessionManager()
+# Shared with every other server process on this cache root -- that is how
+# two agents analyzing the same binary end up on one Ghidra run instead of two.
+jobs = JobRegistry(cache.cache_dir)
 api_patterns = APIPatterns()
 crypto_patterns = CryptoPatterns()
 compatibility_checker = BinaryCompatibilityChecker()
@@ -455,6 +460,7 @@ def get_analysis_context(
     pdb_path: str | None = None,
     enable_fid: bool = False,
     analysis_depth: str = "structural",
+    job_context=None,
 ) -> dict:
     """
     Get or create analysis context for a binary.
@@ -606,6 +612,9 @@ def get_analysis_context(
             end_address=end_address,
             pdb_path=pdb_path,
             enable_fid=enable_fid,
+            # Report the headless pid into the job record so a sweep from
+            # another process can reap it if this one dies mid-analysis.
+            on_spawn=(job_context.track_child if job_context is not None else None),
         )
 
         # Save Ghidra output to debug file for inspection
@@ -769,6 +778,72 @@ def get_analysis_context(
             logger.debug(f"Delta-run lock release failed: {e}")
 
 
+
+def _analysis_job_key(binary_path: str, force: bool, processor, loader, kwargs: dict) -> str:
+    """Identity of an analysis run, for cross-process de-duplication.
+
+    Everything that changes what Ghidra produces goes in, so two agents asking
+    for the *same* analysis share one run while genuinely different parameters
+    still get their own. `force_reanalyze` is part of the key on purpose: a
+    caller asking to redo the work must not silently attach to the cached run
+    it was trying to bypass.
+    """
+    import hashlib
+
+    try:
+        binary_id = cache._get_binary_hash(binary_path)
+    except Exception:
+        binary_id = hashlib.sha256(str(binary_path).encode()).hexdigest()
+    shape = json.dumps(
+        {"force": bool(force), "processor": processor, "loader": loader, **kwargs},
+        sort_keys=True, default=str,
+    )
+    return f"analyze-{binary_id[:16]}-{hashlib.sha256(shape.encode()).hexdigest()[:8]}"
+
+
+def _submit_analysis_job(
+    binary_path: str, force: bool, processor, loader, kwargs: dict
+) -> str:
+    """Start (or attach to) a background analysis and describe how to collect it."""
+    key = _analysis_job_key(binary_path, force, processor, loader, kwargs)
+
+    def _work(ctx):
+        ctx.set_progress("running Ghidra headless analysis")
+        context = get_analysis_context(
+            binary_path, force, processor, loader, job_context=ctx, **kwargs
+        )
+        metadata = context.get("metadata", {}) or {}
+        return {
+            "binary_path": binary_path,
+            "module_name": metadata.get("name"),
+            "function_count": len(context.get("functions", []) or []),
+            "import_count": len(context.get("imports", []) or []),
+            "string_count": len(context.get("strings", []) or []),
+            "note": "Analysis cached. Use the ordinary tools now; they read the cache.",
+        }
+
+    submitted = jobs.submit(kind="analyze_binary", key=key, fn=_work)
+    if "error" in submitted:
+        return f"Error: {submitted['error']}"
+
+    job_id = submitted["job_id"]
+    if submitted.get("attached"):
+        return (
+            f"Attached to an analysis already running for {Path(binary_path).name}.\n"
+            f"job_id: {job_id}\n\n"
+            "Another process (likely another agent) was already analyzing this "
+            "binary with these parameters, so this did NOT start a second Ghidra "
+            "run. Poll job_status(job_id) until done, then job_result(job_id)."
+        )
+    return (
+        f"Analysis started in the background for {Path(binary_path).name}.\n"
+        f"job_id: {job_id}\n\n"
+        "Poll job_status(job_id) until done, then job_result(job_id). The work "
+        "continues even if this call's client times out, and the result lands in "
+        "the shared cache either way."
+    )
+
+
 # Phase 1: Core Tools (P0 - Critical)
 
 @app.tool()
@@ -788,6 +863,7 @@ def analyze_binary(
     pdb_path: str | None = None,
     enable_fid: bool = False,
     analysis_depth: str = "full",
+    wait: bool = True,
 ) -> str:
     """
     Analyze a binary file with Ghidra headless analyzer.
@@ -830,6 +906,20 @@ def analyze_binary(
             binaries, then upgrade with ``analysis_depth="structural"`` or
             ``"full"`` once you've narrowed the target.
 
+        wait: When False, return a ``job_id`` immediately instead of blocking.
+
+            A full analysis of a multi-MB binary takes minutes and no MCP
+            client will wait that long -- the call times out while the work
+            carries on unwatched, which is also how orphaned Ghidra processes
+            accumulate. With ``wait=False`` the analysis runs in the
+            background, survives this call's client timeout, and is collected
+            with ``job_status`` / ``job_result``.
+
+            Jobs are keyed on the binary and the analysis parameters and
+            registered in the shared cache directory, so a second agent asking
+            for the same analysis **attaches to the running job** rather than
+            starting a competing Ghidra run. That is what stops N agents from
+            saturating the box with N copies of the same work.
     Returns:
         Analysis summary with basic statistics, or compatibility warning if issues detected
 
@@ -874,11 +964,7 @@ Format: {compat_info.format.value}
                 # Don't fail on compatibility check errors, just log and proceed
                 logger.warning(f"Compatibility check failed, proceeding with analysis: {e}")
 
-        context = get_analysis_context(
-            binary_path,
-            force_reanalyze,
-            processor,
-            loader,
+        analysis_kwargs = dict(
             skip_decompile=skip_decompile,
             max_functions=max_functions,
             function_timeout=function_timeout,
@@ -888,6 +974,19 @@ Format: {compat_info.format.value}
             pdb_path=pdb_path,
             enable_fid=enable_fid,
             analysis_depth=analysis_depth,
+        )
+
+        if not wait:
+            return _submit_analysis_job(
+                binary_path, force_reanalyze, processor, loader, analysis_kwargs
+            )
+
+        context = get_analysis_context(
+            binary_path,
+            force_reanalyze,
+            processor,
+            loader,
+            **analysis_kwargs,
         )
 
         metadata = context.get("metadata", {})
@@ -4660,6 +4759,18 @@ def main():
 
     # Register review-coverage tools (denominator + worklist)
     register_coverage_tools(app, session_manager, cache, runner)
+
+    # Register job-control tools (the poll side of the async transport)
+    register_job_tools(app, jobs)
+
+    # Reap anything a previously-abandoned client left running before we
+    # add load of our own.
+    swept = jobs.sweep()
+    if swept.get("orphaned"):
+        logger.warning(
+            "Startup sweep: %d orphaned job(s), reaped %d process(es)",
+            len(swept["orphaned"]), len(swept.get("reaped_pids") or []),
+        )
 
     logger.info("Registered all analysis tools (static, dynamic, VT, triage, reporting, Yara, control flow, malware, function hash, PE structure, review, fid, coverage)")
     logger.info(f"Session Directory: {session_manager.store_dir}")

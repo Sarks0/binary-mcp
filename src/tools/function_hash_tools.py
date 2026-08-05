@@ -9,8 +9,11 @@ Provides tools for:
 """
 
 import hashlib
+import json
 import logging
+import os
 import re
+import tempfile
 from pathlib import Path
 
 from src.engines.static.ghidra.coverage_store import auto_mark, has_reviewable_body
@@ -22,6 +25,132 @@ MAX_BATCH_SIZE = 20
 
 # Safety valve for fuzzy matching to prevent runaway comparisons
 MAX_FUZZY_COMPARISONS = 100_000
+
+# Normalization identity. A stored hash is only comparable to a freshly
+# computed one if both came from the same normalization, so this string is
+# part of the cache key. Bump it on ANY change to `_normalize_instructions`
+# or `_normalize_stack_imm` -- leaving it alone would serve hashes from the
+# old algorithm alongside new ones and silently mis-bucket every comparison.
+HASH_ALGO_VERSION = "norm-v1"
+
+_FNHASH_SCHEMA_VERSION = 1
+
+
+def _block_guard(func: dict) -> str:
+    """Short digest of a function's basic-block extents.
+
+    The cached hash is keyed on the binary's content sha, which fixes the
+    *bytes*, but not on the block list -- and that comes from the Ghidra
+    analysis cache, which an incremental re-analysis can grow under the same
+    sha. Same address, more blocks, different hash. Storing this guard beside
+    each entry means a changed block list misses the cache and recomputes
+    rather than serving a hash for a function shape that no longer exists.
+    """
+    parts = []
+    for block in func.get("basic_blocks") or []:
+        parts.append(f"{block.get('start', '')}-{block.get('end', '')}")
+    return hashlib.blake2b(",".join(parts).encode("utf-8"), digest_size=8).hexdigest()
+
+
+class FunctionHashCache:
+    """A ``<sha256>.fnhash.json`` side-car of normalized opcode hashes.
+
+    Hashing a large binary is the dominant cost of a cross-binary diff --
+    about 6 seconds per side for 14000 functions, and the diff hashes both.
+    The inputs are fully determined by the binary's bytes, the block extents
+    and the normalization version, so the result is worth keeping: a repeat
+    diff of the same pair (the normal case when iterating on a patch) skips
+    it entirely.
+
+    Every failure is swallowed and degrades to recomputation. A hash cache
+    that can break a diff is worse than no hash cache.
+    """
+
+    def __init__(self, cache, binary_path: str):
+        self._path = None
+        self._entries: dict[str, dict] = {}
+        self._dirty = False
+        try:
+            binary_id = cache._get_binary_hash(binary_path)
+            self._path = Path(cache.cache_dir) / f"{binary_id}.fnhash.json"
+        except Exception as exc:
+            logger.debug("function-hash cache unavailable for %s: %s", binary_path, exc)
+            return
+        self._load()
+
+    def _load(self) -> None:
+        if self._path is None or not self._path.exists():
+            return
+        try:
+            with open(self._path, encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, ValueError) as exc:
+            logger.debug("unreadable function-hash side-car %s: %s", self._path, exc)
+            return
+        if not isinstance(data, dict):
+            return
+        # A record written by a different normalization is not upgradable --
+        # the hashes mean something else. Drop it and recompute.
+        if data.get("schema_version") != _FNHASH_SCHEMA_VERSION:
+            return
+        if data.get("algo_version") != HASH_ALGO_VERSION:
+            return
+        entries = data.get("hashes")
+        if isinstance(entries, dict):
+            self._entries = entries
+
+    def get(self, func: dict) -> dict | None:
+        """Return the stored hash result for ``func``, or None."""
+        entry = self._entries.get(func.get("address") or "")
+        if not isinstance(entry, dict):
+            return None
+        if entry.get("g") != _block_guard(func):
+            return None
+        hash_value = entry.get("h")
+        if not isinstance(hash_value, str):
+            return None
+        return {
+            "hash": hash_value,
+            "instruction_count": entry.get("n") or 0,
+            "operands_normalized": entry.get("o") or 0,
+        }
+
+    def put(self, func: dict, result: dict) -> None:
+        address = func.get("address")
+        if not address:
+            return
+        self._entries[address] = {
+            "g": _block_guard(func),
+            "h": result["hash"],
+            "n": result.get("instruction_count") or 0,
+            "o": result.get("operands_normalized") or 0,
+        }
+        self._dirty = True
+
+    def save(self) -> None:
+        """Persist atomically. Never raises."""
+        if self._path is None or not self._dirty:
+            return
+        payload = {
+            "schema_version": _FNHASH_SCHEMA_VERSION,
+            "algo_version": HASH_ALGO_VERSION,
+            "hashes": self._entries,
+        }
+        try:
+            handle = tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=str(self._path.parent),
+                prefix=f".{self._path.stem}.", suffix=".tmp", delete=False,
+            )
+            try:
+                with handle:
+                    json.dump(payload, handle)
+                os.replace(handle.name, self._path)
+            except BaseException:
+                Path(handle.name).unlink(missing_ok=True)
+                raise
+            self._dirty = False
+        except OSError as exc:
+            logger.debug("could not write function-hash side-car %s: %s", self._path, exc)
 
 
 def _get_capstone_mode(binary_path: str):
@@ -101,17 +230,18 @@ def _normalize_stack_imm(mnemonic: str, op_str: str) -> tuple[str, int]:
     return _STACK_IMM_PATTERN.subn("STACK_IMM", op_str)
 
 
-def _normalize_instructions(disasm_instructions) -> tuple[str, dict]:
+def _normalize_pairs(mnemonic_operand_pairs) -> tuple[str, dict]:
     """
-    Normalize disassembled instructions for hashing.
+    Normalize ``(mnemonic, op_str)`` pairs for hashing.
+
+    The actual normalization, shared by both entry points so the object API
+    and capstone's lite API cannot drift apart -- a divergence here would
+    silently change every stored hash and every cross-binary comparison.
 
     Replaces absolute address operands with a placeholder while keeping
     opcodes and register names intact. Stack-pointer arithmetic immediates
     are collapsed to ``STACK_IMM`` so prologue frame-size differences do
     not fragment otherwise-identical inlined clones.
-
-    Args:
-        disasm_instructions: Iterable of capstone instruction objects
 
     Returns:
         Tuple of (normalized_string, stats_dict)
@@ -122,26 +252,57 @@ def _normalize_instructions(disasm_instructions) -> tuple[str, dict]:
     # Pattern to match hex addresses (0x followed by 4+ hex digits)
     addr_pattern = re.compile(r"0x[0-9a-fA-F]{4,}")
 
-    for insn in disasm_instructions:
+    for mnemonic, op_str in mnemonic_operand_pairs:
         stats["total_instructions"] += 1
-        op_str = insn.op_str
 
         # Collapse stack-pointer arithmetic immediates first so frame-size
         # variance hashes identically across inlined clones.
-        op_str, stack_count = _normalize_stack_imm(insn.mnemonic, op_str)
+        op_str, stack_count = _normalize_stack_imm(mnemonic, op_str)
         stats["operands_normalized"] += stack_count
 
         # Normalize absolute address operands to ADDR placeholder
         normalized_op, count = addr_pattern.subn("ADDR", op_str)
         stats["operands_normalized"] += count
 
-        normalized_parts.append(f"{insn.mnemonic} {normalized_op}".strip())
+        normalized_parts.append(f"{mnemonic} {normalized_op}".strip())
 
     normalized_string = "\n".join(normalized_parts)
     return normalized_string, stats
 
 
-def _compute_function_hash(reader, cs_arch, cs_mode, func: dict) -> dict | None:
+def _normalize_instructions(disasm_instructions) -> tuple[str, dict]:
+    """
+    Normalize capstone instruction objects for hashing.
+
+    Args:
+        disasm_instructions: Iterable of capstone instruction objects
+
+    Returns:
+        Tuple of (normalized_string, stats_dict)
+    """
+    return _normalize_pairs((i.mnemonic, i.op_str) for i in disasm_instructions)
+
+
+def _disasm_pairs(md, raw_bytes, start_addr) -> list[tuple[str, str]]:
+    """Disassemble to ``(mnemonic, op_str)`` pairs.
+
+    Uses capstone's lite mode, which skips constructing a ``CsInsn`` per
+    instruction. Normalization reads exactly these two fields and nothing
+    else, so the output is identical and it is 2.6x faster -- worth having
+    when a cross-binary diff disassembles both sides of a 14000-function
+    binary.
+
+    Falls back to the object API on a diet capstone build, where lite mode
+    is unavailable. The check raises before yielding anything, so the
+    fallback cannot double-count instructions.
+    """
+    try:
+        return [(m, o) for _addr, _size, m, o in md.disasm_lite(raw_bytes, start_addr)]
+    except Exception:
+        return [(i.mnemonic, i.op_str) for i in md.disasm(raw_bytes, start_addr)]
+
+
+def _compute_function_hash(reader, cs_arch, cs_mode, func: dict, md=None) -> dict | None:
     """
     Compute normalized opcode hash for a single function.
 
@@ -150,6 +311,11 @@ def _compute_function_hash(reader, cs_arch, cs_mode, func: dict) -> dict | None:
         cs_arch: Capstone architecture constant
         cs_mode: Capstone mode constant
         func: Function dict from cache (must have basic_blocks)
+        md: Optional pre-built ``capstone.Cs`` to reuse. Constructing one is
+            an FFI allocation, and a bulk caller hashing 14000 functions pays
+            it 14000 times for an object that never varies -- about 9% of the
+            hashing cost. Callers in a loop should build one and pass it.
+            Omitted, a private one is built per call as before.
 
     Returns:
         Dict with hash, instruction_count, stats or None on failure
@@ -160,10 +326,12 @@ def _compute_function_hash(reader, cs_arch, cs_mode, func: dict) -> dict | None:
     if not basic_blocks:
         return None
 
-    md = capstone.Cs(cs_arch, cs_mode)
-    md.detail = False
+    if md is None:
+        md = capstone.Cs(cs_arch, cs_mode)
+        md.detail = False
 
-    all_instructions = []
+    # (mnemonic, op_str) pairs, not capstone objects -- see `_disasm_pairs`.
+    decoded: list[tuple[str, str]] = []
 
     for block in basic_blocks:
         start_str = block.get("start", "")
@@ -185,13 +353,12 @@ def _compute_function_hash(reader, cs_arch, cs_mode, func: dict) -> dict | None:
         if raw_bytes is None:
             continue
 
-        instructions = list(md.disasm(raw_bytes, start_addr))
-        all_instructions.extend(instructions)
+        decoded.extend(_disasm_pairs(md, raw_bytes, start_addr))
 
-    if not all_instructions:
+    if not decoded:
         return None
 
-    normalized_str, stats = _normalize_instructions(all_instructions)
+    normalized_str, stats = _normalize_pairs(decoded)
     hash_value = hashlib.sha256(normalized_str.encode("utf-8")).hexdigest()
 
     return {

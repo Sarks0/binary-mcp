@@ -27,7 +27,13 @@ logger = logging.getLogger(__name__)
 
 # Side-car suffixes that share the <hash>.<suffix> stem with a cache file.
 # When auto-pruning legacy <hash>.json duplicates we must NOT touch these.
-_SIDECAR_SUFFIXES = (".meta.json", ".funcidx.json", ".notes.json", ".coverage.json")
+_SIDECAR_SUFFIXES = (
+    ".meta.json",
+    ".funcidx.json",
+    ".notes.json",
+    ".coverage.json",
+    ".fnhash.json",
+)
 
 
 class ProjectCache:
@@ -329,6 +335,13 @@ class ProjectCache:
         preserved so that user-supplied annotations survive a
         ``force_reanalyze`` or ``load_pdb`` rebuild. Use :meth:`clear_all`
         for an explicit full wipe.
+
+        The opcode-hash side-car (``<hash>.fnhash.json``) is preserved too,
+        and safely: it is keyed on this same content hash, so the bytes it
+        hashed cannot have changed, and each entry carries a guard over its
+        function's basic-block extents so a re-analysis that redraws them
+        misses the cache instead of serving a stale hash. Re-running a diff
+        after ``force_reanalyze`` is exactly when it earns its keep.
 
         Args:
             binary_path: Path to the binary whose cache should be dropped.

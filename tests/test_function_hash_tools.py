@@ -5,7 +5,10 @@ Uses mocked cache data and capstone for testing normalization,
 hashing, completeness scoring, and batch operations.
 """
 
+from pathlib import Path
 from unittest.mock import MagicMock
+
+import pytest
 
 
 def _make_function(
@@ -675,3 +678,168 @@ class TestFindInlinedClones:
         tool("/bin/test.exe")
         assert runner.method_calls == []
         assert runner.mock_calls == []
+
+
+class TestFunctionHashCache:
+    """Hashing is the dominant cost of a cold diff. Caching it is only
+    acceptable if a stale entry can never be served: the key fixes the bytes,
+    the guard fixes the function's shape, and the algo version fixes the
+    meaning of the number."""
+
+    @pytest.fixture
+    def lab(self, tmp_path):
+        import hashlib
+
+        from src.engines.static.ghidra.project_cache import ProjectCache
+
+        class Lab:
+            def __init__(self):
+                self.cache = ProjectCache(cache_dir=str(tmp_path / "c"))
+                self.binary = tmp_path / "t.dll"
+                self.binary.write_bytes(b"MZ" + b"\x00" * 512)
+                self.path = str(self.binary)
+                self.binary_id = hashlib.sha256(self.binary.read_bytes()).hexdigest()
+
+            @property
+            def sidecar(self):
+                return Path(self.cache.cache_dir) / f"{self.binary_id}.fnhash.json"
+
+        return Lab()
+
+    @staticmethod
+    def _func(address="0x1000", blocks=(("0x1000", "0x100f"),)):
+        return {"name": "f", "address": address,
+                "basic_blocks": [{"start": s, "end": e} for s, e in blocks]}
+
+    def test_round_trips_through_disk(self, lab):
+        from src.tools.function_hash_tools import FunctionHashCache
+
+        func = self._func()
+        c = FunctionHashCache(lab.cache, lab.path)
+        assert c.get(func) is None
+        c.put(func, {"hash": "abc", "instruction_count": 7, "operands_normalized": 2})
+        c.save()
+        assert lab.sidecar.exists()
+
+        fresh = FunctionHashCache(lab.cache, lab.path)
+        got = fresh.get(func)
+        assert got["hash"] == "abc"
+        assert got["instruction_count"] == 7
+
+    def test_changed_basic_blocks_miss(self, lab):
+        """An incremental re-analysis can redraw a function's blocks under the
+        same binary hash. Same address, different shape, different hash."""
+        from src.tools.function_hash_tools import FunctionHashCache
+
+        c = FunctionHashCache(lab.cache, lab.path)
+        c.put(self._func(), {"hash": "abc", "instruction_count": 7})
+        c.save()
+
+        grown = self._func(blocks=(("0x1000", "0x100f"), ("0x1010", "0x101f")))
+        assert FunctionHashCache(lab.cache, lab.path).get(grown) is None
+
+    def test_algo_version_change_discards_the_record(self, lab):
+        """A hash from a different normalization is not a stale value to
+        refresh, it is a different quantity. Serving it would mis-bucket every
+        comparison silently."""
+        import json
+
+        from src.tools.function_hash_tools import FunctionHashCache
+
+        c = FunctionHashCache(lab.cache, lab.path)
+        c.put(self._func(), {"hash": "abc", "instruction_count": 7})
+        c.save()
+
+        stored = json.loads(lab.sidecar.read_text())
+        stored["algo_version"] = "norm-v0-something-else"
+        lab.sidecar.write_text(json.dumps(stored))
+
+        assert FunctionHashCache(lab.cache, lab.path).get(self._func()) is None
+
+    def test_unknown_schema_version_discards_the_record(self, lab):
+        import json
+
+        from src.tools.function_hash_tools import FunctionHashCache
+
+        c = FunctionHashCache(lab.cache, lab.path)
+        c.put(self._func(), {"hash": "abc", "instruction_count": 7})
+        c.save()
+        stored = json.loads(lab.sidecar.read_text())
+        stored["schema_version"] = 99
+        lab.sidecar.write_text(json.dumps(stored))
+
+        assert FunctionHashCache(lab.cache, lab.path).get(self._func()) is None
+
+    def test_corrupt_sidecar_degrades_to_recomputation(self, lab):
+        from src.tools.function_hash_tools import FunctionHashCache
+
+        lab.sidecar.parent.mkdir(parents=True, exist_ok=True)
+        lab.sidecar.write_text("{not json")
+        c = FunctionHashCache(lab.cache, lab.path)
+        assert c.get(self._func()) is None
+        # and still usable afterwards
+        c.put(self._func(), {"hash": "abc", "instruction_count": 1})
+        c.save()
+        assert FunctionHashCache(lab.cache, lab.path).get(self._func())["hash"] == "abc"
+
+    def test_unreachable_binary_is_not_fatal(self, tmp_path):
+        """A cache that cannot resolve its binary must degrade, not raise --
+        it is an optimization, not a precondition for diffing."""
+        from src.engines.static.ghidra.project_cache import ProjectCache
+        from src.tools.function_hash_tools import FunctionHashCache
+
+        c = FunctionHashCache(ProjectCache(cache_dir=str(tmp_path)), "/no/such/file")
+        assert c.get(self._func()) is None
+        c.put(self._func(), {"hash": "abc", "instruction_count": 1})
+        c.save()  # must not raise
+
+    def test_clean_save_writes_nothing(self, lab):
+        from src.tools.function_hash_tools import FunctionHashCache
+
+        FunctionHashCache(lab.cache, lab.path).save()
+        assert not lab.sidecar.exists()
+
+
+class TestDisasmLiteEquivalence:
+    """`_compute_function_hash` disassembles via capstone's lite API. If that
+    ever diverges from the object API by even one operand string, every hash
+    in every `.fnhash.json` and every cross-binary comparison silently changes
+    meaning -- so pin it."""
+
+    def test_lite_and_object_paths_normalize_identically(self):
+        capstone = pytest.importorskip("capstone")
+        from src.tools.function_hash_tools import (
+            _disasm_pairs,
+            _normalize_instructions,
+            _normalize_pairs,
+        )
+
+        code = bytes.fromhex(
+            "48895c2408488974241057415441554883ec20488b0511223344"
+            "4831e44889442418488501748d488b01ff5010"
+        )
+        md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
+        md.detail = False
+
+        via_objects = _normalize_instructions(md.disasm(code, 0x140001000))
+        via_pairs = _normalize_pairs(_disasm_pairs(md, code, 0x140001000))
+        assert via_pairs == via_objects
+        assert via_objects[1]["total_instructions"] > 5, "fixture must disassemble"
+
+    def test_falls_back_when_lite_is_unavailable(self):
+        """A diet capstone build has no lite mode. The check raises before
+        yielding, so the fallback must not double-count."""
+        from src.tools.function_hash_tools import _disasm_pairs
+
+        class _Insn:
+            def __init__(self, m, o):
+                self.mnemonic, self.op_str = m, o
+
+        class _DietCs:
+            def disasm_lite(self, raw, addr):
+                raise RuntimeError("CS_ERR_DIET")
+
+            def disasm(self, raw, addr):
+                return [_Insn("push", "rbp"), _Insn("ret", "")]
+
+        assert _disasm_pairs(_DietCs(), b"\x55\xc3", 0) == [("push", "rbp"), ("ret", "")]

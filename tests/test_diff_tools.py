@@ -143,7 +143,7 @@ def _register(monkeypatch, old_ctx, new_ctx, hash_table=None):
 
     if hash_table is not None:
 
-        def _fake_hash(reader, cs_arch, cs_mode, func):
+        def _fake_hash(reader, cs_arch, cs_mode, func, md=None):
             entry = hash_table.get(func.get("name"))
             if entry is None:
                 return None
@@ -236,7 +236,7 @@ class TestPairingByPdbName:
 
         call_counts: dict[str, int] = {}
 
-        def _fake_hash(reader, cs_arch, cs_mode, func):
+        def _fake_hash(reader, cs_arch, cs_mode, func, md=None):
             n = func.get("name")
             entry = per_side.get(n)
             if entry is None:
@@ -314,7 +314,7 @@ class TestSecurityRanking:
 
         call_counts: dict[str, int] = {}
 
-        def _fake_hash(reader, cs_arch, cs_mode, func):
+        def _fake_hash(reader, cs_arch, cs_mode, func, md=None):
             n = func.get("name")
             entry = per_side.get(n)
             if entry is None:
@@ -370,7 +370,7 @@ class TestModeNoneOrdering:
 
         call_counts: dict[str, int] = {}
 
-        def _fake_hash(reader, cs_arch, cs_mode, func):
+        def _fake_hash(reader, cs_arch, cs_mode, func, md=None):
             n = func.get("name")
             entry = per_side.get(n)
             if entry is None:
@@ -419,7 +419,7 @@ class TestAslrShiftedAddresses:
 
         call_counts: dict[str, int] = {}
 
-        def _fake_hash(reader, cs_arch, cs_mode, func):
+        def _fake_hash(reader, cs_arch, cs_mode, func, md=None):
             n = func.get("name")
             entry = per_side.get(n)
             if entry is None:
@@ -632,7 +632,7 @@ class TestCallerDelta:
 
         call_counts: dict[str, int] = {}
 
-        def _fake_hash(reader, cs_arch, cs_mode, func):
+        def _fake_hash(reader, cs_arch, cs_mode, func, md=None):
             n = func.get("name")
             entry = per_side.get(n)
             if entry is None:
@@ -733,7 +733,7 @@ class TestCoverageExamination:
 
         monkeypatch.setattr(
             dt, "_compute_function_hash",
-            lambda reader, a, m, func: {
+            lambda reader, a, m, func, md=None: {
                 "hash": f"h-{func['address']}", "instruction_count": 1,
                 "operands_normalized": 0,
             },
@@ -821,3 +821,148 @@ class TestCoverageExamination:
         report = diff(old_path="/old.bin", new_path="/new.bin")
         assert "BINARY DIFF" in report
         assert "### MODIFIED" in report
+
+
+def _reference_pair_by_callees(old_residue, new_residue):
+    """The pre-optimization all-pairs scan, kept verbatim as an oracle.
+
+    Phase 3 decides which functions get reported as security-relevant
+    modifications, so the fast path is only acceptable if it is *identical*,
+    not merely similar. This is what the equivalence test compares against.
+    """
+    from src.tools.diff_tools import (
+        _CALLEE_JACCARD_THRESHOLD,
+        _bb_count,
+        _callee_name_set,
+        _jaccard,
+    )
+
+    by_bb: dict[int, list[dict]] = {}
+    for f in new_residue:
+        by_bb.setdefault(_bb_count(f), []).append(f)
+    pairs, paired_old_ids, paired_new_ids = [], set(), set()
+    for of in old_residue:
+        candidates = by_bb.get(_bb_count(of), [])
+        if not candidates:
+            continue
+        of_set = _callee_name_set(of)
+        if not of_set:
+            continue
+        best, best_score = None, 0.0
+        for nf in candidates:
+            if id(nf) in paired_new_ids:
+                continue
+            nf_set = _callee_name_set(nf)
+            if not nf_set:
+                continue
+            score = _jaccard(of_set, nf_set)
+            if score > best_score:
+                best_score, best = score, nf
+        if best is not None and best_score >= _CALLEE_JACCARD_THRESHOLD:
+            pairs.append((of, best))
+            paired_old_ids.add(id(of))
+            paired_new_ids.add(id(best))
+    old_remaining = [f for f in old_residue if id(f) not in paired_old_ids]
+    new_remaining = [f for f in new_residue if id(f) not in paired_new_ids]
+    return pairs, old_remaining, new_remaining
+
+
+class TestPhase3Equivalence:
+    """The indexed phase-3 must return exactly what the all-pairs scan did."""
+
+    @staticmethod
+    def _residue(rng, n, pool, max_bb, max_callees):
+        out = []
+        for i in range(n):
+            a = 0x140001000 + i * 0x40
+            out.append(_make_function(
+                name=f"FUN_{a:x}", address=f"{a:x}", name_source="DEFAULT",
+                called_functions=[{"address": "0", "name": nm}
+                                  for nm in rng.sample(pool, rng.randint(0, max_callees))],
+                basic_blocks=[{"start": f"{a:x}", "end": f"{a + 15:x}",
+                               "num_addresses": 16}
+                              for _ in range(rng.randint(1, max_bb))],
+            ))
+        return out
+
+    @pytest.mark.parametrize("trial", range(60))
+    def test_matches_the_all_pairs_scan(self, trial):
+        import random
+
+        from src.tools.diff_tools import _pair_by_callees
+
+        rng = random.Random(trial)
+        # Vary the shape hard. A tiny callee pool forces heavy overlap and
+        # exact-score ties; a single bb value forces one enormous bucket --
+        # both are where an index-based candidate filter would diverge if the
+        # pruning were merely a heuristic.
+        pool = [f"api_{i}" for i in range(rng.choice([3, 6, 20, 200]))]
+        max_bb = rng.choice([1, 2, 5, 30])
+        max_callees = min(len(pool), rng.choice([1, 3, 8, 20]))
+        old = self._residue(rng, rng.randint(0, 60), pool, max_bb, max_callees)
+        new = self._residue(rng, rng.randint(0, 60), pool, max_bb, max_callees)
+
+        exp_pairs, exp_old, exp_new = _reference_pair_by_callees(old, new)
+        got_pairs, got_old, got_new = _pair_by_callees(old, new)
+
+        addr = lambda fs: [f["address"] for f in fs]  # noqa: E731
+        assert [(a["address"], b["address"]) for a, b in got_pairs] == \
+               [(a["address"], b["address"]) for a, b in exp_pairs]
+        assert addr(got_old) == addr(exp_old)
+        assert addr(got_new) == addr(exp_new)
+
+    def test_ties_still_go_to_the_earliest_candidate(self):
+        """Two identical candidates: the scan took the first in bucket order,
+        and the index must not reorder that."""
+        from src.tools.diff_tools import _pair_by_callees
+
+        callees = [{"address": "0", "name": n} for n in ("a", "b", "c", "d")]
+        old = [_make_function(name="FUN_1", address="0x1000",
+                              name_source="DEFAULT", called_functions=callees)]
+        new = [
+            _make_function(name="FUN_first", address="0x2000",
+                           name_source="DEFAULT", called_functions=callees),
+            _make_function(name="FUN_second", address="0x3000",
+                           name_source="DEFAULT", called_functions=callees),
+        ]
+        pairs, _, _ = _pair_by_callees(old, new)
+        assert [b["address"] for _, b in pairs] == ["0x2000"]
+
+    def test_a_new_function_is_only_paired_once(self):
+        from src.tools.diff_tools import _pair_by_callees
+
+        callees = [{"address": "0", "name": n} for n in ("a", "b", "c", "d")]
+        old = [_make_function(name=f"FUN_{i}", address=f"0x{i}000",
+                              name_source="DEFAULT", called_functions=callees)
+               for i in (1, 2)]
+        new = [_make_function(name="FUN_only", address="0x9000",
+                              name_source="DEFAULT", called_functions=callees)]
+        pairs, old_left, new_left = _pair_by_callees(old, new)
+        assert len(pairs) == 1
+        assert [f["address"] for f in old_left] == ["0x2000"]
+        assert new_left == []
+
+
+class TestProbePrefixLength:
+    def test_prefix_covers_every_element_a_match_could_miss(self):
+        """At t=0.85 a qualifying B misses at most |A| - ceil(t*|A|) of A's
+        elements, so probing one more than that cannot miss it."""
+        import math
+
+        from src.tools.diff_tools import _CALLEE_JACCARD_THRESHOLD as T
+        from src.tools.diff_tools import _probe_prefix_length
+
+        for size in range(1, 200):
+            max_missable = size - math.ceil(T * size)
+            assert _probe_prefix_length(size) > max_missable
+
+    def test_stays_within_the_set(self):
+        from src.tools.diff_tools import _probe_prefix_length
+
+        for size in range(1, 200):
+            assert 1 <= _probe_prefix_length(size) <= size
+
+    def test_empty_set_probes_nothing(self):
+        from src.tools.diff_tools import _probe_prefix_length
+
+        assert _probe_prefix_length(0) == 0

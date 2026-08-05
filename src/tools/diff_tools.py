@@ -28,11 +28,16 @@ times over.
 from __future__ import annotations
 
 import logging
+import math
 import re
 from pathlib import Path
 
 from src.engines.static.ghidra.coverage_store import EXAMINATION_DIFF, auto_examine
-from src.tools.function_hash_tools import _compute_function_hash, _get_capstone_mode
+from src.tools.function_hash_tools import (
+    FunctionHashCache,
+    _compute_function_hash,
+    _get_capstone_mode,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -176,7 +181,55 @@ def _pair_by_pdb_name(
     return pairs, old_residue, new_residue
 
 
-def _hash_functions(binary_path: str, funcs: list[dict]) -> dict[str, list[dict]]:
+def _new_capstone(cs_arch, cs_mode):
+    """One reusable disassembler for a whole bulk pass, or None.
+
+    ``_compute_function_hash`` builds its own when not given one, which is an
+    FFI allocation per function -- 14000 of them for an object that never
+    varies, about 9% of the hashing cost.
+
+    Returns None rather than raising when the arch/mode pair is rejected.
+    This is purely an optimization, so it must not be the thing that decides
+    whether a diff runs: on None the per-function path builds its own handle
+    and fails exactly where it always did.
+    """
+    try:
+        import capstone
+
+        md = capstone.Cs(cs_arch, cs_mode)
+        md.detail = False
+        return md
+    except Exception as exc:
+        logger.debug("shared capstone handle unavailable (%s, %s): %s", cs_arch, cs_mode, exc)
+        return None
+
+
+def _hash_many(reader, cs_arch, cs_mode, funcs, hash_cache) -> dict[int, dict]:
+    """Hash ``funcs`` through one reader, consulting ``hash_cache``.
+
+    Returns ``{id(func): result}``. Functions whose hash cannot be computed
+    (no basic_blocks, unsupported arch, read failure) are absent.
+
+    The disassembler is built on the first cache miss, not up front, so a
+    fully-cached side never allocates one at all.
+    """
+    md = None
+    out: dict[int, dict] = {}
+    for func in funcs:
+        result = hash_cache.get(func) if hash_cache is not None else None
+        if result is None:
+            if md is None:
+                md = _new_capstone(cs_arch, cs_mode)
+            result = _compute_function_hash(reader, cs_arch, cs_mode, func, md=md)
+            if result is None:
+                continue
+            if hash_cache is not None:
+                hash_cache.put(func, result)
+        out[id(func)] = result
+    return out
+
+
+def _hash_functions(binary_path: str, funcs: list[dict], hash_cache=None) -> dict[str, list[dict]]:
     """Compute opcode hashes for every hashable function in ``funcs``.
 
     Returns ``{hash: [func, func, ...]}``. Functions whose hash cannot be
@@ -195,10 +248,10 @@ def _hash_functions(binary_path: str, funcs: list[dict]) -> dict[str, list[dict]
 
     out: dict[str, list[dict]] = {}
     with BinaryReader(binary_path) as reader:
-        for func in hashable:
-            result = _compute_function_hash(reader, cs_arch, cs_mode, func)
-            if result is None:
-                continue
+        results = _hash_many(reader, cs_arch, cs_mode, hashable, hash_cache)
+    for func in hashable:
+        result = results.get(id(func))
+        if result is not None:
             out.setdefault(result["hash"], []).append(func)
     return out
 
@@ -208,10 +261,12 @@ def _pair_by_hash(
     new_path: str,
     old_residue: list[dict],
     new_residue: list[dict],
+    old_hash_cache=None,
+    new_hash_cache=None,
 ) -> tuple[list[tuple[dict, dict]], list[dict], list[dict]]:
     """Phase 2: pair residue by exact opcode hash."""
-    old_hashes = _hash_functions(old_path, old_residue)
-    new_hashes = _hash_functions(new_path, new_residue)
+    old_hashes = _hash_functions(old_path, old_residue, old_hash_cache)
+    new_hashes = _hash_functions(new_path, new_residue, new_hash_cache)
 
     pairs: list[tuple[dict, dict]] = []
     paired_old_ids: set[int] = set()
@@ -231,45 +286,109 @@ def _pair_by_hash(
     return pairs, old_remaining, new_remaining
 
 
+def _probe_prefix_length(size: int) -> int:
+    """How many of a set's elements must be probed to find every match.
+
+    Prefix filter, and it is exact rather than a heuristic. If
+    ``J(A, B) >= t`` then ``|A & B| >= t * |A | B| >= t * |A|``, so B can miss
+    at most ``|A| - ceil(t * |A|)`` of A's elements. Probing one more element
+    than that guarantees any qualifying B is found: it cannot miss them all.
+
+    At ``t = 0.85`` a 5-element set probes 1 element, a 20-element set probes
+    4. Combined with rarest-first ordering those are the *short* posting
+    lists, which is what keeps a ubiquitous callee like ``memcpy`` from
+    dragging its entire bucket into the candidate set.
+    """
+    if size <= 0:
+        return 0
+    misses = size - math.ceil(_CALLEE_JACCARD_THRESHOLD * size)
+    return max(1, min(size, misses + 1))
+
+
 def _pair_by_callees(
     old_residue: list[dict], new_residue: list[dict]
 ) -> tuple[list[tuple[dict, dict]], list[dict], list[dict]]:
-    """Phase 3: pair residue by callee-set Jaccard with same bb count."""
-    by_bb: dict[int, list[dict]] = {}
-    for f in new_residue:
-        by_bb.setdefault(_bb_count(f), []).append(f)
+    """Phase 3: pair residue by callee-set Jaccard with same bb count.
+
+    Output is identical to the all-pairs scan this replaces -- same pairs,
+    same tie-breaking -- but it does not compare every old function against
+    every same-bb candidate. That scan was 98% of ``diff_binaries``' runtime
+    on a tquery-sized residue (~6000 unmatched twins per side): 51 of 53
+    seconds, two thirds of it rebuilding the *candidate's* callee set inside
+    the inner loop, 6.7 million times. That is what put the tool over a 30s
+    client timeout and forced diffs out into offline scripts.
+
+    Two changes, neither of which can alter the result:
+
+    1. Callee sets are computed once per function instead of once per
+       comparison.
+    2. Candidates come from an inverted index on ``(bb_count, callee_name)``
+       rather than the whole bucket. A candidate sharing no callee with the
+       old function scores 0.0, and the scan below requires ``score >
+       best_score`` starting at 0.0 -- so a zero-overlap candidate could
+       never be selected and dropping it changes nothing. The prefix filter
+       narrowing that further is exact; see :func:`_probe_prefix_length`.
+    """
+    # Rarest-first ordering, so the elements we probe are the ones with the
+    # shortest posting lists. Ties broken by name to keep the walk
+    # deterministic across runs.
+    frequency: dict[str, int] = {}
+    new_sets: list[frozenset[str]] = []
+    for func in new_residue:
+        callees = _callee_name_set(func)
+        new_sets.append(callees)
+        for name in callees:
+            frequency[name] = frequency.get(name, 0) + 1
+
+    index: dict[tuple[int, str], list[int]] = {}
+    for idx, func in enumerate(new_residue):
+        callees = new_sets[idx]
+        # Functions with zero callees give no Jaccard signal - pairing them
+        # via this phase would silently match every leaf to every leaf with
+        # the same bb count. Never indexed, so never a candidate.
+        if not callees:
+            continue
+        bb = _bb_count(func)
+        for name in callees:
+            index.setdefault((bb, name), []).append(idx)
 
     pairs: list[tuple[dict, dict]] = []
     paired_old_ids: set[int] = set()
-    paired_new_ids: set[int] = set()
+    paired_new_idx: set[int] = set()
 
     for of in old_residue:
-        candidates = by_bb.get(_bb_count(of), [])
-        if not candidates:
-            continue
         of_set = _callee_name_set(of)
-        # Functions with zero callees give no Jaccard signal - pairing
-        # them via this phase would silently match every leaf to every
-        # leaf with the same bb count. Skip outright.
         if not of_set:
             continue
+        bb = _bb_count(of)
+        probe = sorted(of_set, key=lambda n: (frequency.get(n, 0), n))
+        probe = probe[: _probe_prefix_length(len(of_set))]
+
+        candidates: set[int] = set()
+        for name in probe:
+            candidates.update(index.get((bb, name), ()))
+        if not candidates:
+            continue
+
         best = None
         best_score = 0.0
-        for nf in candidates:
-            if id(nf) in paired_new_ids:
+        # Ascending index is the order the old all-pairs scan walked the
+        # bucket in, so an exact tie still goes to the earliest candidate.
+        for idx in sorted(candidates):
+            if idx in paired_new_idx:
                 continue
-            nf_set = _callee_name_set(nf)
-            if not nf_set:
-                continue
-            score = _jaccard(of_set, nf_set)
+            nf_set = new_sets[idx]
+            intersection = len(of_set & nf_set)
+            score = intersection / (len(of_set) + len(nf_set) - intersection)
             if score > best_score:
                 best_score = score
-                best = nf
+                best = idx
         if best is not None and best_score >= _CALLEE_JACCARD_THRESHOLD:
-            pairs.append((of, best))
+            pairs.append((of, new_residue[best]))
             paired_old_ids.add(id(of))
-            paired_new_ids.add(id(best))
+            paired_new_idx.add(best)
 
+    paired_new_ids = {id(new_residue[i]) for i in paired_new_idx}
     old_remaining = [f for f in old_residue if id(f) not in paired_old_ids]
     new_remaining = [f for f in new_residue if id(f) not in paired_new_ids]
     return pairs, old_remaining, new_remaining
@@ -309,6 +428,8 @@ def _confirm_phase1_buckets(
     pairs: list[tuple[dict, dict, str]],
     old_path: str,
     new_path: str,
+    old_hash_cache=None,
+    new_hash_cache=None,
 ) -> tuple[list[tuple[dict, dict]], list[tuple[dict, dict]]]:
     """
     For each PDB-name match, decide unchanged vs modified.
@@ -334,29 +455,23 @@ def _confirm_phase1_buckets(
 
     from src.utils.binary_reader import BinaryReader
 
-    old_hashes: dict[int, str] = {}
-    new_hashes: dict[int, str] = {}
+    old_hashes: dict[int, dict] = {}
+    new_hashes: dict[int, dict] = {}
 
     if old_funcs:
         cs_arch, cs_mode = old_mode
         with BinaryReader(old_path) as reader:
-            for of in old_funcs:
-                result = _compute_function_hash(reader, cs_arch, cs_mode, of)
-                if result:
-                    old_hashes[id(of)] = result["hash"]
+            old_hashes = _hash_many(reader, cs_arch, cs_mode, old_funcs, old_hash_cache)
     if new_funcs:
         cs_arch, cs_mode = new_mode
         with BinaryReader(new_path) as reader:
-            for nf in new_funcs:
-                result = _compute_function_hash(reader, cs_arch, cs_mode, nf)
-                if result:
-                    new_hashes[id(nf)] = result["hash"]
+            new_hashes = _hash_many(reader, cs_arch, cs_mode, new_funcs, new_hash_cache)
 
     modified: list[tuple[dict, dict]] = []
     unchanged: list[tuple[dict, dict]] = []
     for of, nf, _ in pairs:
-        oh = old_hashes.get(id(of))
-        nh = new_hashes.get(id(nf))
+        oh = (old_hashes.get(id(of)) or {}).get("hash")
+        nh = (new_hashes.get(id(nf)) or {}).get("hash")
         if oh and nh and oh == nh:
             unchanged.append((of, nf))
         else:
@@ -569,6 +684,13 @@ def register_diff_tools(app, session_manager, cache, runner):
         class prefix (``A::B::method`` -> ``A::B``); ``"none"`` emits a
         flat list.
 
+        Opcode hashes are cached to a ``<sha256>.fnhash.json`` side-car per
+        binary, so re-running a diff of the same pair skips the dominant cost
+        of a cold run. The side-car is keyed on the binary's content hash and
+        each entry is guarded by its function's basic-block extents, so a
+        re-analysis that redraws them recomputes rather than serving a stale
+        hash.
+
         Args:
             old_path: Path to the OLD analyzed binary.
             new_path: Path to the NEW analyzed binary.
@@ -614,16 +736,27 @@ def register_diff_tools(app, session_manager, cache, runner):
             old_funcs = list(old_ctx.get("functions", []))
             new_funcs = list(new_ctx.get("functions", []))
 
+            # Hashing both sides is the dominant cost of a cold diff (~6s per
+            # side for 14000 functions). It is fully determined by the bytes
+            # and the block extents, so it is cached to a side-car and a
+            # repeat diff of the same pair -- the normal case when iterating
+            # on a patch -- skips it.
+            old_hash_cache = FunctionHashCache(cache, old_path)
+            new_hash_cache = FunctionHashCache(cache, new_path)
+
             # Phase 1: PDB-name match.
             phase1_pairs, old_residue, new_residue = _pair_by_pdb_name(old_funcs, new_funcs)
             modified_phase1, unchanged_phase1 = _confirm_phase1_buckets(
-                phase1_pairs, old_path, new_path
+                phase1_pairs, old_path, new_path, old_hash_cache, new_hash_cache
             )
 
             # Phase 2: hash match across the residue.
             phase2_pairs, old_residue, new_residue = _pair_by_hash(
-                old_path, new_path, old_residue, new_residue
+                old_path, new_path, old_residue, new_residue,
+                old_hash_cache, new_hash_cache,
             )
+            old_hash_cache.save()
+            new_hash_cache.save()
 
             # Phase 3: callee-set Jaccard.
             phase3_pairs, old_residue, new_residue = _pair_by_callees(old_residue, new_residue)

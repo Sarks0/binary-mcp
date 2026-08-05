@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import threading
 import time
 
@@ -338,6 +339,10 @@ class TestKillBlastRadius:
         monkeypatch.setattr(jobs_mod, "_pid_alive", lambda pid: True)
         monkeypatch.setattr(jobs_mod, "_process_matches", lambda pid: True)
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="POSIX process-group semantics; Windows kills the tree with taskkill /T",
+    )
     def test_non_group_leader_is_killed_alone(self, monkeypatch):
         calls = {"killpg": [], "kill": []}
         monkeypatch.setattr(jobs_mod.os, "getpgid", lambda pid: 4242)
@@ -348,6 +353,10 @@ class TestKillBlastRadius:
         assert calls["killpg"] == [], "must not fan out to a group it does not lead"
         assert calls["kill"] == [5150]
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="POSIX process-group semantics; Windows kills the tree with taskkill /T",
+    )
     def test_group_leader_takes_its_tree_with_it(self, monkeypatch):
         """Ghidra is spawned with start_new_session, so it leads its own group
         and the whole java tree must go down together."""
@@ -360,6 +369,10 @@ class TestKillBlastRadius:
         assert calls["killpg"] == [5150]
         assert calls["kill"] == []
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="POSIX process-group semantics; Windows kills the tree with taskkill /T",
+    )
     def test_unknown_group_falls_back_to_the_single_pid(self, monkeypatch):
         calls = {"killpg": [], "kill": []}
 
@@ -373,3 +386,19 @@ class TestKillBlastRadius:
         assert jobs_mod._kill_pid(5150) is True
         assert calls["killpg"] == []
         assert calls["kill"] == [5150]
+
+    def test_windows_kills_the_tree_by_pid(self, monkeypatch):
+        """The Windows branch has no group to over-reach into.
+
+        `taskkill /F /T` is scoped to the pid's own descendants, so the hazard
+        the POSIX tests above guard against cannot arise -- but the branch
+        still needs to be exercised somewhere, and skipping it on POSIX would
+        leave it covered only on one runner.
+        """
+        monkeypatch.setattr(jobs_mod.sys, "platform", "win32")
+        calls = []
+        monkeypatch.setattr(
+            jobs_mod.subprocess, "run", lambda *args, **kwargs: calls.append(args[0])
+        )
+        assert jobs_mod._kill_pid(5150) is True
+        assert calls == [["taskkill", "/F", "/T", "/PID", "5150"]]

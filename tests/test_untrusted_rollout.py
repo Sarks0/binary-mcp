@@ -966,7 +966,26 @@ _SAMPLE_TEXT_MODULES = {
     "vt_tools",
     "windbg_tools",
     "yara_tools",
+    # Returns JSON payloads rather than markdown, so it neutralises rather than
+    # wrapping -- see the assertion below for why both count.
+    "coverage_tools",
 }
+
+# Tool modules that emit NO sample-derived content, with the reason. Membership
+# here is a claim someone has to defend, which is the point: the alternative is
+# a module drifting into neither set and being silently unasserted.
+_NO_SAMPLE_TEXT_MODULES: dict[str, str] = {
+    "error_hygiene": "helper module, defines no tools and returns no sample text",
+}
+
+# Either mechanism discharges the obligation:
+#   wrap_untrusted                  -- text tools, full data/instruction envelope
+#   neutralise_untrusted_delimiters -- structured-payload tools, escaping only
+# The second is the right primitive when the return value is a dict whose shape
+# is a contract: an envelope cannot go inside a JSON string field, but a
+# sample-authored value can still forge the sentinel of an envelope some OTHER
+# tool emitted into the same context.
+_ENVELOPE_MECHANISMS = ("wrap_untrusted", "neutralise_untrusted_delimiters")
 
 
 def test_every_sample_text_module_applies_the_envelope():
@@ -983,12 +1002,41 @@ def test_every_sample_text_module_applies_the_envelope():
     missing = []
     for name in sorted(_SAMPLE_TEXT_MODULES):
         source = (tools_dir / f"{name}.py").read_text(encoding="utf-8")
-        if "wrap_untrusted" not in source:
+        if not any(m in source for m in _ENVELOPE_MECHANISMS):
             missing.append(name)
 
     assert not missing, (
         "tool modules returning sample-derived text without the F-7 "
         "untrusted-content envelope: " + ", ".join(missing)
+    )
+
+
+def test_every_tool_module_is_classified():
+    """The set above is OPT-IN, and that was a hole of its own.
+
+    ``coverage_tools`` arrived from another PR emitting sample-derived function
+    and module names and joined neither set, so the guard passed for it without
+    asserting anything -- structurally the same failure as the windbg_tools
+    blind spot, arrived at by omission rather than by an explicit exclusion.
+
+    Every module under src/tools/ must therefore be classified as either
+    emitting sample text (and applying a mechanism) or explicitly not, with a
+    stated reason. A new module cannot land unasserted.
+    """
+    tools_dir = Path(__file__).resolve().parent.parent / "src" / "tools"
+    modules = {p.stem for p in tools_dir.glob("*.py") if p.stem != "__init__"}
+
+    unclassified = sorted(modules - _SAMPLE_TEXT_MODULES - set(_NO_SAMPLE_TEXT_MODULES))
+    assert not unclassified, (
+        "tool module(s) in neither _SAMPLE_TEXT_MODULES nor "
+        "_NO_SAMPLE_TEXT_MODULES, so the F-7 guard asserts nothing about "
+        "them: " + ", ".join(unclassified)
+    )
+
+    stale = sorted((_SAMPLE_TEXT_MODULES | set(_NO_SAMPLE_TEXT_MODULES)) - modules)
+    assert not stale, (
+        "classified module(s) that no longer exist; a stale name makes the "
+        "sets look more complete than they are: " + ", ".join(stale)
     )
 
 

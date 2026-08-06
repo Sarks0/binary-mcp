@@ -1,7 +1,7 @@
 """
 Binary MCP Server for comprehensive binary analysis.
 
-Provides 250 tools for static and dynamic binary analysis:
+Provides 255 tools for static and dynamic binary analysis:
 - Static analysis via Ghidra (headless mode) for native binaries
 - Static analysis via ILSpyCmd for .NET assemblies
 - Dynamic analysis via x64dbg (native plugin)
@@ -24,6 +24,7 @@ from pathlib import Path
 
 from fastmcp import FastMCP
 
+from src.engines.jobs import JobRegistry
 from src.engines.session import AnalysisType, UnifiedSessionManager
 from src.engines.static.ghidra.coverage_store import CoverageStore, has_reviewable_body
 from src.engines.static.ghidra.coverage_store import auto_mark as auto_mark_reviewed
@@ -38,6 +39,7 @@ from src.tools.dynamic_tools import register_dynamic_tools
 from src.tools.fid_tools import register_fid_tools
 from src.tools.function_hash_tools import register_function_hash_tools
 from src.tools.indirect_call_tools import register_indirect_call_tools
+from src.tools.job_tools import register_job_tools
 from src.tools.malware_tools import register_malware_tools
 from src.tools.pe_tools import register_pe_tools
 from src.tools.reporting import register_reporting_tools
@@ -79,6 +81,9 @@ app = FastMCP("binary-mcp")
 runner = GhidraRunner()
 cache = ProjectCache()
 session_manager = UnifiedSessionManager()
+# Shared with every other server process on this cache root -- that is how
+# two agents analyzing the same binary end up on one Ghidra run instead of two.
+jobs = JobRegistry(cache.cache_dir)
 api_patterns = APIPatterns()
 crypto_patterns = CryptoPatterns()
 compatibility_checker = BinaryCompatibilityChecker()
@@ -336,44 +341,83 @@ def _write_resume_manifest(
         return None
 
 
-@contextlib.contextmanager
-def _delta_run_lock(cache_dir: Path, binary_path: str):
-    """
-    Cross-platform exclusive lock for incremental Ghidra runs on a binary.
+# How long a plain analysis queues behind another run on the same Ghidra
+# project before giving up. Sized against GHIDRA_TIMEOUT's 3600s ceiling: the
+# holder cannot legitimately outlast its own timeout, so waiting past that
+# means the lock is stale rather than busy.
+_RUN_LOCK_WAIT_SECONDS = 3600.0
 
-    Two parallel ``analyze_binary(..., incremental=True)`` calls on the same
-    binary would race on the manifest, the temp output JSON, and the cache
-    file. This advisory lock makes the second caller fail fast with a clear
-    message instead of silently corrupting cache state.
+
+def _try_lock(fd: int) -> bool:
+    """Take an exclusive advisory lock without blocking. False if held."""
+    if sys.platform == "win32":
+        import msvcrt
+        try:
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            return True
+        except OSError:
+            return False
+    import fcntl
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except (BlockingIOError, OSError):
+        return False
+
+
+@contextlib.contextmanager
+def _delta_run_lock(
+    cache_dir: Path,
+    binary_path: str,
+    lock_key: str | None = None,
+    wait_seconds: float = 0.0,
+):
     """
+    Cross-platform exclusive lock over the per-binary Ghidra run resources.
+
+    Two parallel runs on one binary race on the manifest and the cache file;
+    two parallel runs on binaries that merely share a *filename stem* race on
+    the Ghidra project, which is named from the stem and created with
+    ``-overwrite``. ``lock_key`` is therefore the sanitized project name rather
+    than the path, so the lock covers exactly the collisions that exist.
+
+    ``wait_seconds`` picks the posture. Zero means fail fast, which is what an
+    ``incremental=True`` caller wants: it asked to extend a specific cache, and
+    queueing behind another writer of that cache is not what it meant. A
+    positive value queues instead, which is what a plain analysis wants -- an
+    old and a new build of one DLL is the patch-diff case, and failing the
+    second of those would break the workflow to protect it.
+
+    The lock file is deliberately never unlinked. Removing it while another
+    process waits on that inode lets a third create a fresh file and take a
+    second "exclusive" lock on the same resource.
+    """
+    # Deliberately no mkdir. `ProjectCache.__init__` owns creating the cache
+    # directory; creating it here would put a `mkdir(parents=True)` on the path
+    # of every Ghidra run, and against a mocked cache `Path(MagicMock)` yields
+    # a plausible relative path rather than raising -- which is exactly how a
+    # stray `MagicMock/` tree got committed once already (see 37d2820).
     cache_dir = Path(cache_dir)
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    lock_path = cache_dir / f"delta_run_{Path(binary_path).stem}.lock"
+    key = lock_key or Path(binary_path).stem
+    lock_path = cache_dir / f"delta_run_{key}.lock"
     fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
     locked = False
     try:
-        if sys.platform == "win32":
-            import msvcrt
-            try:
-                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-                locked = True
-            except OSError:
-                raise RuntimeError(
-                    f"Another incremental analysis is already running for "
-                    f"{binary_path}. Wait for it to finish or remove "
-                    f"{lock_path} if you are sure no run is in progress."
-                )
-        else:
-            import fcntl
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                locked = True
-            except (BlockingIOError, OSError):
-                raise RuntimeError(
-                    f"Another incremental analysis is already running for "
-                    f"{binary_path}. Wait for it to finish or remove "
-                    f"{lock_path} if you are sure no run is in progress."
-                )
+        deadline = time.monotonic() + max(0.0, wait_seconds)
+        while True:
+            locked = _try_lock(fd)
+            if locked or time.monotonic() >= deadline:
+                break
+            time.sleep(0.25)
+        if not locked:
+            waited = (
+                f" after waiting {wait_seconds:.0f}s" if wait_seconds else ""
+            )
+            raise RuntimeError(
+                f"Another analysis is already running for {binary_path}{waited}. "
+                f"Wait for it to finish or remove {lock_path} if you are sure "
+                f"no run is in progress."
+            )
         yield
     finally:
         if locked:
@@ -392,10 +436,6 @@ def _delta_run_lock(cache_dir: Path, binary_path: str):
                 pass
         try:
             os.close(fd)
-        except OSError:
-            pass
-        try:
-            lock_path.unlink(missing_ok=True)
         except OSError:
             pass
 
@@ -455,6 +495,8 @@ def get_analysis_context(
     pdb_path: str | None = None,
     enable_fid: bool = False,
     analysis_depth: str = "structural",
+    force_decompile: bool = False,
+    job_context=None,
 ) -> dict:
     """
     Get or create analysis context for a binary.
@@ -539,7 +581,7 @@ def get_analysis_context(
     if processor or loader:
         logger.info(f"Using explicit loader config - Processor: {processor}, Loader: {loader}")
 
-    output_path = cache.cache_dir / f"temp_analysis_{Path(binary_path).stem}.json"
+    output_path = cache.temp_output_path(binary_path)
     script_path = Path(__file__).parent / "engines" / "static" / "ghidra" / "scripts"
 
     # Resolve resume path if caller wants to extend an existing cache.
@@ -558,27 +600,35 @@ def get_analysis_context(
     resume_from_cache = None
     resume_manifest_path = None
     existing_cache_data = None
-    delta_lock_cm = contextlib.nullcontext()
     if incremental:
         resume_from_cache = cache.get_cache_path(binary_path)
         if resume_from_cache is None:
             logger.info("incremental=True but no cache exists yet; running full analysis")
         else:
             logger.info(f"Resuming analysis from cache: {resume_from_cache}")
-            # Acquire an advisory lock so a second concurrent incremental run
-            # on the same binary fails fast instead of corrupting the cache.
-            delta_lock_cm = _delta_run_lock(cache.cache_dir, binary_path)
-            delta_lock_cm.__enter__()
-            try:
-                existing_cache_data = cache.get_cached(binary_path)
-            except Exception as e:
-                logger.warning(f"Could not pre-load cache for delta merge: {e}")
-                existing_cache_data = None
-            if existing_cache_data is not None:
-                resume_manifest_path = _write_resume_manifest(
-                    cache.cache_dir, binary_path, existing_cache_data,
-                    skip_decompile=skip_decompile,
-                )
+
+    # Every Ghidra run through here shares project state with any other run on
+    # a binary of the same name, so the lock covers all of them -- not only the
+    # incremental ones, which is all it used to guard. `wait=False` jobs made
+    # that concurrency the normal case rather than an accident.
+    delta_lock_cm = _delta_run_lock(
+        cache.cache_dir,
+        binary_path,
+        lock_key=cache._get_project_name(binary_path),
+        wait_seconds=0.0 if resume_from_cache is not None else _RUN_LOCK_WAIT_SECONDS,
+    )
+    delta_lock_cm.__enter__()
+    if resume_from_cache is not None:
+        try:
+            existing_cache_data = cache.get_cached(binary_path)
+        except Exception as e:
+            logger.warning(f"Could not pre-load cache for delta merge: {e}")
+            existing_cache_data = None
+        if existing_cache_data is not None:
+            resume_manifest_path = _write_resume_manifest(
+                cache.cache_dir, binary_path, existing_cache_data,
+                skip_decompile=skip_decompile,
+            )
 
     try:
         # Default bumped to 1800s (30 min) -- large binaries routinely need more
@@ -598,6 +648,7 @@ def get_analysis_context(
             max_functions=max_functions,
             function_timeout=function_timeout,
             analysis_depth=analysis_depth,
+            force_decompile=force_decompile,
             resume_from_cache=None if resume_manifest_path else (
                 str(resume_from_cache) if resume_from_cache else None
             ),
@@ -606,6 +657,9 @@ def get_analysis_context(
             end_address=end_address,
             pdb_path=pdb_path,
             enable_fid=enable_fid,
+            # Report the headless pid into the job record so a sweep from
+            # another process can reap it if this one dies mid-analysis.
+            on_spawn=(job_context.track_child if job_context is not None else None),
         )
 
         # Save Ghidra output to debug file for inspection
@@ -702,8 +756,8 @@ def get_analysis_context(
             if elf_recommendation:
                 user_message += f"\n\n**Recommendation:**\n{elf_recommendation}"
 
-            # Don't cache invalid results
-            output_path.unlink(missing_ok=True)
+            # Don't cache invalid results. (The `finally` unlinks the temp
+            # output; this raise just stops it reaching save_cached.)
             raise UserFacingError(user_message, internal_details=internal_details)
 
         # Tag the cache with the depth it was produced at so callers can
@@ -711,7 +765,20 @@ def get_analysis_context(
         # decompiled output. Existing caches without this field count as
         # "full" because that was the only mode prior to PR #116.
         meta = context.setdefault("metadata", {})
-        meta["analysis_depth"] = analysis_depth
+        # Record the depth that was actually PRODUCED, not the one requested.
+        # `skip_decompile=True` alongside the default `analysis_depth="full"`
+        # yields a cache with zero pseudocode; tagging that "full" makes
+        # `decompile_function`'s shallow/structural recovery path unreachable,
+        # so two flags producing the identical physical cache behave
+        # differently -- one recoverable, one not.
+        #
+        # `force_decompile` deliberately does NOT promote the tag: a targeted
+        # run decompiles one function on an otherwise structural cache, and
+        # calling that "full" would strand every other function in it.
+        effective_depth = analysis_depth
+        if skip_decompile and analysis_depth == "full":
+            effective_depth = "structural"
+        meta["analysis_depth"] = effective_depth
 
         # Cache the results
         cache.save_cached(binary_path, context)
@@ -742,9 +809,7 @@ def get_analysis_context(
         except Exception as e:
             logger.warning(f"Coverage indexing failed for {binary_path}: {e}")
 
-        # Clean up temp file
-        output_path.unlink()
-
+        # Temp file cleanup happens in the `finally` below, on every path.
         logger.info(f"Analysis complete: {result['elapsed_time']:.2f}s")
         return context
 
@@ -758,6 +823,13 @@ def get_analysis_context(
         logger.error(f"Analysis failed: {e}")
         raise RuntimeError(f"Failed to analyze binary: {e}")
     finally:
+        # The temp output is run-scoped now, so a failure that leaves one
+        # behind leaks a fresh multi-megabyte file rather than overwriting a
+        # single shared one. Unlink on every exit path, not just success.
+        try:
+            output_path.unlink(missing_ok=True)
+        except OSError as e:
+            logger.debug(f"Could not clean up temp analysis output: {e}")
         if resume_manifest_path:
             try:
                 Path(resume_manifest_path).unlink(missing_ok=True)
@@ -767,6 +839,166 @@ def get_analysis_context(
             delta_lock_cm.__exit__(None, None, None)
         except Exception as e:
             logger.debug(f"Delta-run lock release failed: {e}")
+
+
+
+def _analysis_job_key(binary_path: str, force: bool, processor, loader, kwargs: dict) -> str:
+    """Identity of an analysis run, for cross-process de-duplication.
+
+    Everything that changes what Ghidra produces goes in, so two agents asking
+    for the *same* analysis share one run while genuinely different parameters
+    still get their own. `force_reanalyze` is part of the key on purpose: a
+    caller asking to redo the work must not silently attach to the cached run
+    it was trying to bypass.
+    """
+    import hashlib
+
+    try:
+        binary_id = cache._get_binary_hash(binary_path)
+    except Exception:
+        binary_id = hashlib.sha256(str(binary_path).encode()).hexdigest()
+    shape = json.dumps(
+        {"force": bool(force), "processor": processor, "loader": loader, **kwargs},
+        sort_keys=True, default=str,
+    )
+    return f"analyze-{binary_id[:16]}-{hashlib.sha256(shape.encode()).hexdigest()[:8]}"
+
+
+def _submit_analysis_job(
+    binary_path: str, force: bool, processor, loader, kwargs: dict
+) -> str:
+    """Start (or attach to) a background analysis and describe how to collect it."""
+    key = _analysis_job_key(binary_path, force, processor, loader, kwargs)
+
+    def _work(ctx):
+        ctx.set_progress("running Ghidra headless analysis")
+        context = get_analysis_context(
+            binary_path, force, processor, loader, job_context=ctx, **kwargs
+        )
+        metadata = context.get("metadata", {}) or {}
+        return {
+            "binary_path": binary_path,
+            "module_name": metadata.get("name"),
+            "function_count": len(context.get("functions", []) or []),
+            "import_count": len(context.get("imports", []) or []),
+            "string_count": len(context.get("strings", []) or []),
+            "note": "Analysis cached. Use the ordinary tools now; they read the cache.",
+        }
+
+    submitted = jobs.submit(kind="analyze_binary", key=key, fn=_work)
+    if "error" in submitted:
+        return f"Error: {submitted['error']}"
+
+    job_id = submitted["job_id"]
+    if submitted.get("attached"):
+        return (
+            f"Attached to an analysis already running for {Path(binary_path).name}.\n"
+            f"job_id: {job_id}\n\n"
+            "Another process (likely another agent) was already analyzing this "
+            "binary with these parameters, so this did NOT start a second Ghidra "
+            "run. Poll job_status(job_id) until done, then job_result(job_id)."
+        )
+    return (
+        f"Analysis started in the background for {Path(binary_path).name}.\n"
+        f"job_id: {job_id}\n\n"
+        "Poll job_status(job_id) until done, then job_result(job_id). The work "
+        "continues even if this call's client times out, and the result lands in "
+        "the shared cache either way."
+    )
+
+
+
+def _decompile_job_key(binary_path: str, function_name: str) -> str:
+    """Identity of a targeted decompile, for cross-process de-duplication."""
+    import hashlib
+
+    try:
+        binary_id = cache._get_binary_hash(binary_path)
+    except Exception:
+        binary_id = hashlib.sha256(str(binary_path).encode()).hexdigest()
+    fn = hashlib.sha256(function_name.encode()).hexdigest()[:8]
+    return f"decompile-{binary_id[:16]}-{fn}"
+
+
+def _submit_decompile_job(binary_path: str, function_name: str, fn_address: str) -> str:
+    """Run a targeted single-function decompile in the background.
+
+    Deliberately does NOT auto-mark coverage. The rule in ``docs/coverage.md``
+    is that a function is marked reviewed only once its body has been handed to
+    the caller, and this path does not hand it to anyone -- it merges the
+    pseudocode into the cache and finishes. The mark lands on the next
+    ``decompile_function`` call, which now hits the warm path and returns the
+    body for real.
+
+    So collecting the result purely through ``job_result`` under-marks. That is
+    the safe direction and the documented one: under-marking costs a re-mark,
+    over-marking manufactures the false completion the ledger exists to
+    prevent.
+    """
+    key = _decompile_job_key(binary_path, function_name)
+
+    def _work(ctx):
+        ctx.set_progress(f"decompiling {function_name} at {fn_address}")
+        context = get_analysis_context(
+            binary_path,
+            incremental=True,
+            start_address=fn_address,
+            max_functions=1,
+            # Without this the run inherits `analysis_depth="structural"` and
+            # tells Ghidra to SKIP decompilation -- on the one call whose only
+            # purpose is producing a body.
+            force_decompile=True,
+            job_context=ctx,
+        )
+        function = next(
+            (f for f in context.get("functions", []) if f.get("name") == function_name),
+            None,
+        )
+        pseudocode = (function or {}).get("pseudocode")
+        if not pseudocode:
+            # Succeeding here would be a lie with consequences: the job reports
+            # `succeeded`, its note claims the cache was updated, and the caller
+            # is sent to a `decompile_function` call that then answers "could
+            # not be decompiled". A job must not claim success for work that
+            # produced nothing -- that is the whole value of having a state.
+            raise RuntimeError(
+                f"targeted decompile of {function_name} at {fn_address} produced "
+                f"no pseudocode, so the analysis cache was not updated. The "
+                f"incremental single-function path did not merge a body back. "
+                f"Re-analyze with analyze_binary(analysis_depth='full') to get "
+                f"pseudocode for this binary."
+            )
+        return {
+            "binary_path": binary_path,
+            "function_name": function_name,
+            "address": fn_address,
+            "decompiled": True,
+            "pseudocode": pseudocode,
+            "note": (
+                "Merged into the analysis cache. Call decompile_function again "
+                "for the formatted body -- that path is warm now, and it is the "
+                "call that marks the function reviewed."
+            ),
+        }
+
+    submitted = jobs.submit(kind="decompile_function", key=key, fn=_work)
+    if "error" in submitted:
+        return f"Error: {submitted['error']}"
+
+    job_id = submitted["job_id"]
+    lead = (
+        f"Attached to a decompile already running for {function_name}."
+        if submitted.get("attached")
+        else f"Decompiling {function_name} in the background."
+    )
+    return (
+        f"{lead}\n"
+        f"job_id: {job_id}\n\n"
+        f"'{function_name}' has no pseudocode in the cache (built shallow or "
+        f"structural), so this needs a targeted Ghidra decompile at {fn_address}. "
+        "Poll job_status(job_id) until done, then call decompile_function again "
+        "to get the formatted body from the now-warm cache."
+    )
 
 
 # Phase 1: Core Tools (P0 - Critical)
@@ -788,6 +1020,7 @@ def analyze_binary(
     pdb_path: str | None = None,
     enable_fid: bool = False,
     analysis_depth: str = "full",
+    wait: bool = True,
 ) -> str:
     """
     Analyze a binary file with Ghidra headless analyzer.
@@ -830,6 +1063,20 @@ def analyze_binary(
             binaries, then upgrade with ``analysis_depth="structural"`` or
             ``"full"`` once you've narrowed the target.
 
+        wait: When False, return a ``job_id`` immediately instead of blocking.
+
+            A full analysis of a multi-MB binary takes minutes and no MCP
+            client will wait that long -- the call times out while the work
+            carries on unwatched, which is also how orphaned Ghidra processes
+            accumulate. With ``wait=False`` the analysis runs in the
+            background, survives this call's client timeout, and is collected
+            with ``job_status`` / ``job_result``.
+
+            Jobs are keyed on the binary and the analysis parameters and
+            registered in the shared cache directory, so a second agent asking
+            for the same analysis **attaches to the running job** rather than
+            starting a competing Ghidra run. That is what stops N agents from
+            saturating the box with N copies of the same work.
     Returns:
         Analysis summary with basic statistics, or compatibility warning if issues detected
 
@@ -874,11 +1121,7 @@ Format: {compat_info.format.value}
                 # Don't fail on compatibility check errors, just log and proceed
                 logger.warning(f"Compatibility check failed, proceeding with analysis: {e}")
 
-        context = get_analysis_context(
-            binary_path,
-            force_reanalyze,
-            processor,
-            loader,
+        analysis_kwargs = dict(
             skip_decompile=skip_decompile,
             max_functions=max_functions,
             function_timeout=function_timeout,
@@ -888,6 +1131,19 @@ Format: {compat_info.format.value}
             pdb_path=pdb_path,
             enable_fid=enable_fid,
             analysis_depth=analysis_depth,
+        )
+
+        if not wait:
+            return _submit_analysis_job(
+                binary_path, force_reanalyze, processor, loader, analysis_kwargs
+            )
+
+        context = get_analysis_context(
+            binary_path,
+            force_reanalyze,
+            processor,
+            loader,
+            **analysis_kwargs,
         )
 
         metadata = context.get("metadata", {})
@@ -1874,7 +2130,8 @@ def get_xrefs(
 @log_to_session
 def decompile_function(
     binary_path: str,
-    function_name: str
+    function_name: str,
+    wait: bool = True,
 ) -> str:
     """
     Decompile a function to C-like pseudocode.
@@ -1891,9 +2148,18 @@ def decompile_function(
     Args:
         binary_path: Path to analyzed binary
         function_name: Name of the function to decompile
+        wait: When False, do not block on that targeted decompile -- return a
+            ``job_id`` and let it run in the background, past this call's
+            client timeout. Poll with ``job_status`` and then call this tool
+            again to read the body from the now-warm cache.
+
+            Only the Ghidra-invoking path is affected. When the pseudocode is
+            already cached this returns it immediately either way, because
+            there is nothing to wait for.
 
     Returns:
-        Decompiled C pseudocode
+        Decompiled C pseudocode, or a ``job_id`` when a targeted decompile was
+        needed and ``wait`` is False.
     """
     try:
         # Peek at the existing cache first. If it was produced shallow/structural,
@@ -1935,6 +2201,8 @@ def decompile_function(
             # just this function and merge the result back into the cache so
             # subsequent calls hit the warm path.
             fn_address = function.get("address")
+            if cached_depth in ("shallow", "structural") and fn_address and not wait:
+                return _submit_decompile_job(binary_path, function_name, fn_address)
             if cached_depth in ("shallow", "structural") and fn_address:
                 logger.info(
                     "decompile_function: pseudocode missing for %s on %s cache -- "
@@ -1947,6 +2215,7 @@ def decompile_function(
                         incremental=True,
                         start_address=fn_address,
                         max_functions=1,
+                        force_decompile=True,
                     )
                     functions = context.get("functions", [])
                     function = next(
@@ -1958,9 +2227,19 @@ def decompile_function(
                     logger.warning(f"On-demand decompile failed for {function_name}: {e}")
 
             if not pseudocode:
+                if cached_depth in ("shallow", "structural"):
+                    return (
+                        f"Function '{function_name}' has no pseudocode: the cache "
+                        f"for this binary was built '{cached_depth}', which opts "
+                        f"out of decompilation, and the targeted decompile did "
+                        f"not produce a body either. Run "
+                        f"analyze_binary(analysis_depth='full') to decompile the "
+                        f"whole binary."
+                    )
                 return (
-                    f"Function '{function_name}' could not be decompiled "
-                    f"(decompilation may have failed)."
+                    f"Function '{function_name}' could not be decompiled -- the "
+                    f"cache was built '{cached_depth}', so decompilation was "
+                    f"attempted and did not produce a body for this function."
                 )
 
         # Coverage side effect: the pseudocode is about to be handed to the
@@ -4660,6 +4939,18 @@ def main():
 
     # Register review-coverage tools (denominator + worklist)
     register_coverage_tools(app, session_manager, cache, runner)
+
+    # Register job-control tools (the poll side of the async transport)
+    register_job_tools(app, jobs)
+
+    # Reap anything a previously-abandoned client left running before we
+    # add load of our own.
+    swept = jobs.sweep()
+    if swept.get("orphaned"):
+        logger.warning(
+            "Startup sweep: %d orphaned job(s), reaped %d process(es)",
+            len(swept["orphaned"]), len(swept.get("reaped_pids") or []),
+        )
 
     logger.info("Registered all analysis tools (static, dynamic, VT, triage, reporting, Yara, control flow, malware, function hash, PE structure, review, fid, coverage)")
     logger.info(f"Session Directory: {session_manager.store_dir}")

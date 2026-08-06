@@ -70,7 +70,7 @@ Analyze the crash dump at C:\Windows\MEMORY.DMP
 Decompile the type MyNamespace.MyClass to C#
 ```
 
-## Capabilities (250 tools)
+## Capabilities (255 tools)
 
 ### Static Analysis (Ghidra) - 35 tools
 
@@ -107,7 +107,7 @@ Type listing, C# decompilation, IL disassembly, type search, and full assembly d
 
 Comprehensive PE header, section, import, export, resource, debug, TLS, and Rich header analysis in a single fast call (<500ms). Three detail levels (basic/standard/full) with decoded characteristic flags, compiler attribution, and malware indicators.
 
-### Other - 23 tools
+### Other - 33 tools
 
 - **Triage (3)** - Quick file type detection, packer identification, entropy analysis
 - **Malware Analysis (4)** - Behavior detection, threat chain identification, IOC extraction
@@ -117,7 +117,8 @@ Comprehensive PE header, section, import, export, resource, debug, TLS, and Rich
 - **Session Management** - Persistent analysis tracking across conversations
 - **Reporting (2)** - Generate structured analysis reports
 - **YARA (2)** - Rule scanning (optional `yara-python` dependency)
-- **Review Coverage (5)** - Per-binary review denominator, reachability scope, and a deterministic unreviewed worklist. See [docs/coverage.md](docs/coverage.md)
+- **Background Jobs (4)** - Poll long-running analysis that outlives the MCP client timeout, with one Ghidra run per binary shared across server processes and orphan reaping. See [docs/jobs.md](docs/jobs.md)
+- **Review Coverage (6)** - Per-binary review denominator, reachability scope, a deterministic unreviewed worklist, and a separate machine-examination axis so a diff run is recorded without being counted as a review. See [docs/coverage.md](docs/coverage.md)
 
 ## Supported Formats
 

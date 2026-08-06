@@ -19,6 +19,7 @@ import logging
 import re
 import shutil
 import time
+import uuid
 from pathlib import Path
 
 from src.utils.config import get_cache_dir
@@ -27,7 +28,13 @@ logger = logging.getLogger(__name__)
 
 # Side-car suffixes that share the <hash>.<suffix> stem with a cache file.
 # When auto-pruning legacy <hash>.json duplicates we must NOT touch these.
-_SIDECAR_SUFFIXES = (".meta.json", ".funcidx.json", ".notes.json", ".coverage.json")
+_SIDECAR_SUFFIXES = (
+    ".meta.json",
+    ".funcidx.json",
+    ".notes.json",
+    ".coverage.json",
+    ".fnhash.json",
+)
 
 
 class ProjectCache:
@@ -112,6 +119,25 @@ class ProjectCache:
         if legacy.exists():
             return legacy
         return None
+
+    def temp_output_path(self, binary_path: str) -> Path:
+        """A run-scoped path for a Ghidra script's JSON output.
+
+        Unique per call, deliberately. The previous
+        ``temp_analysis_<stem>.json`` was shared by every run on a binary of
+        that name, and the window between the Jython script writing it and the
+        parent reading it back spans the whole JVM teardown -- seconds on a
+        large binary. Two concurrent runs on same-named binaries could
+        therefore have one parent load the other's context and ``save_cached``
+        it under the wrong content hash, so a diff of the two would report
+        them identical. Same-stem concurrency is not exotic here: an old and a
+        new build of one DLL is the patch-diff case this server exists for.
+
+        Callers must unlink the path they get back. ``clear_all``'s ``*.json``
+        sweep still collects anything left behind by a crash.
+        """
+        stem = Path(binary_path).stem or "binary"
+        return self.cache_dir / f"temp_analysis_{stem}_{uuid.uuid4().hex[:12]}.json"
 
     def _get_metadata_path(self, binary_hash: str) -> Path:
         return self.cache_dir / f"{binary_hash}.meta.json"
@@ -330,6 +356,13 @@ class ProjectCache:
         ``force_reanalyze`` or ``load_pdb`` rebuild. Use :meth:`clear_all`
         for an explicit full wipe.
 
+        The opcode-hash side-car (``<hash>.fnhash.json``) is preserved too,
+        and safely: it is keyed on this same content hash, so the bytes it
+        hashed cannot have changed, and each entry carries a guard over its
+        function's basic-block extents so a re-analysis that redraws them
+        misses the cache instead of serving a stale hash. Re-running a diff
+        after ``force_reanalyze`` is exactly when it earns its keep.
+
         Args:
             binary_path: Path to the binary whose cache should be dropped.
             include_project: Also remove the matching
@@ -413,7 +446,11 @@ class ProjectCache:
         """
         count = 0
 
-        for pattern in ("*.json.gz", "*.json"):
+        # `.diff.txt` is the untruncated cross-binary diff report a bounded
+        # `diff_binaries` call persists. It is derived output like everything
+        # else here, so a full wipe must take it -- otherwise it is the one
+        # thing `clear_all` leaves behind, and it is the largest.
+        for pattern in ("*.json.gz", "*.json", "*.diff.txt"):
             for cache_file in self.cache_dir.glob(pattern):
                 try:
                     cache_file.unlink()
@@ -580,7 +617,7 @@ class ProjectCache:
         """Get total size of cache in bytes (all cache + sidecar files)."""
         total_size = 0
 
-        for pattern in ("*.json.gz", "*.json"):
+        for pattern in ("*.json.gz", "*.json", "*.diff.txt"):
             for cache_file in self.cache_dir.glob(pattern):
                 try:
                     total_size += cache_file.stat().st_size

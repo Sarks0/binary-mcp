@@ -921,9 +921,26 @@ def extract_comprehensive_analysis():
         except Exception:
             name_source = u"UNKNOWN"
 
+        # Class/namespace, when the symbol source provides one. Ghidra's PDB
+        # import puts the class in the NAMESPACE rather than the flat name, so
+        # getName() alone yields a bare method name -- which makes any grouping
+        # by class collapse into a single bucket. Measured on a symbolized
+        # Windows DLL: 1 of 3119 functions had an A::B::method shaped flat name.
+        #
+        # Wrapped because nothing here may break an analysis run: a namespace we
+        # cannot read costs a grouping, an exception costs the whole binary.
+        try:
+            parent = function.getParentNamespace()
+            namespace = safe_unicode(parent.getName(True)) if parent else u""
+            if namespace == u"Global":
+                namespace = u""
+        except Exception:
+            namespace = u""
+
         # Get basic info
         function_info = {
             "name": safe_unicode(function.getName()),
+            "namespace": namespace,
             "address": safe_unicode(entry_point),
             "size": body.getNumAddresses() if body else 0,
             "signature": safe_unicode(signature),

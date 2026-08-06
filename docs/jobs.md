@@ -66,6 +66,25 @@ decompile_function("/path/to/tquery.dll", "CQuery::Execute")
   -> the formatted body, from the now-warm cache
 ```
 
+### A job that produced no body fails
+
+If the targeted decompile comes back with no pseudocode, the job finalizes
+`failed` — not `succeeded` with an empty result. That distinction is the whole
+value of having a state: an earlier version returned `decompiled: false`
+alongside a note claiming the cache had been updated, finalized `succeeded`,
+and sent the caller to a `decompile_function` call that answered "could not be
+decompiled". Three ways of saying it worked, about work that produced nothing.
+
+The `error` says what to do — normally
+`analyze_binary(analysis_depth='full')`.
+
+This generalises to every job. **`submit`'s contract is that `fn` returning
+normally means success; failure is raised, never encoded in the returned
+payload.** The registry deliberately does not inspect the result, because it
+cannot know which of a caller's fields mean failure. If your work function
+computes something like a `succeeded` flag into its own result, that is the
+signal it should be raising instead.
+
 ### It does not mark coverage, on purpose
 
 `docs/coverage.md` says a function is marked reviewed only once its body has

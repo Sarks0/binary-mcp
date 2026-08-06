@@ -884,7 +884,13 @@ def register_diff_tools(app, session_manager, cache, runner):
         Args:
             old_path: Path to the OLD analyzed binary.
             new_path: Path to the NEW analyzed binary.
-            group_by: ``"none"`` (default) or ``"module"``.
+            group_by: ``"none"`` (default) or ``"module"``. Module grouping
+                keys on the function's ``namespace`` as recorded by the
+                analysis cache, because Ghidra's PDB import puts the class in
+                the namespace rather than in the flat name. A cache analyzed
+                before that field existed falls back to splitting the flat name
+                on ``::``, which on a symbolized Windows binary puts everything
+                in ``(global)`` -- re-analyze to get real grouping.
             mode: ``"security"`` (default, ranked by fix-likelihood) or
                 ``"none"`` (source-order, no scoring).
             record_examination: Record the MODIFIED entries against both

@@ -271,3 +271,48 @@ class TestAnalyzeJobKey:
             "/bin/x.dll", False, None, None, {"weird": object()}
         )
         assert key.startswith("analyze-")
+
+
+class TestDecompileJobHonesty:
+    """A job must not report `succeeded` for work that produced nothing.
+
+    Found by live testing on a real structural cache: the targeted incremental
+    decompile merged no body back, but the job still finalized `succeeded`,
+    its result said `decompiled: false` alongside a note claiming the cache had
+    been updated, and it directed the caller to a `decompile_function` call
+    that then answered "could not be decompiled".
+    """
+
+    @staticmethod
+    def _structural_producing_nothing(server, monkeypatch):
+        cold = _ctx([_func("Parse", "0x1000")])
+        monkeypatch.setattr(server.cache, "get_cached", lambda p: cold)
+        # The incremental run returns without ever populating pseudocode.
+        monkeypatch.setattr(server, "get_analysis_context", lambda *a, **kw: cold)
+
+    def test_a_decompile_that_produced_nothing_fails(self, server, monkeypatch):
+        self._structural_producing_nothing(server, monkeypatch)
+        result = server.decompile_function("/bin/test.dll", "Parse", wait=False)
+        record = _wait_done(server, _job_id(result))
+
+        assert record["state"] == "failed", "no body means the job did not succeed"
+        assert "produced no pseudocode" in record["error"]
+        assert record["result"] is None
+
+    def test_the_failure_says_what_to_do_next(self, server, monkeypatch):
+        self._structural_producing_nothing(server, monkeypatch)
+        result = server.decompile_function("/bin/test.dll", "Parse", wait=False)
+        record = _wait_done(server, _job_id(result))
+        assert "analysis_depth='full'" in record["error"]
+
+    def test_a_decompile_that_produced_a_body_still_succeeds(self, server, monkeypatch):
+        cold = _ctx([_func("Parse", "0x1000")])
+        warm = _ctx([_func("Parse", "0x1000", pseudocode="int Parse(void){return 1;}")])
+        monkeypatch.setattr(server.cache, "get_cached", lambda p: cold)
+        monkeypatch.setattr(server, "get_analysis_context", lambda *a, **kw: warm)
+
+        result = server.decompile_function("/bin/test.dll", "Parse", wait=False)
+        record = _wait_done(server, _job_id(result))
+        assert record["state"] == "succeeded"
+        assert record["result"]["decompiled"] is True
+        assert record["result"]["pseudocode"] == "int Parse(void){return 1;}"

@@ -888,11 +888,24 @@ def _submit_decompile_job(binary_path: str, function_name: str, fn_address: str)
             None,
         )
         pseudocode = (function or {}).get("pseudocode")
+        if not pseudocode:
+            # Succeeding here would be a lie with consequences: the job reports
+            # `succeeded`, its note claims the cache was updated, and the caller
+            # is sent to a `decompile_function` call that then answers "could
+            # not be decompiled". A job must not claim success for work that
+            # produced nothing -- that is the whole value of having a state.
+            raise RuntimeError(
+                f"targeted decompile of {function_name} at {fn_address} produced "
+                f"no pseudocode, so the analysis cache was not updated. The "
+                f"incremental single-function path did not merge a body back. "
+                f"Re-analyze with analyze_binary(analysis_depth='full') to get "
+                f"pseudocode for this binary."
+            )
         return {
             "binary_path": binary_path,
             "function_name": function_name,
             "address": fn_address,
-            "decompiled": bool(pseudocode),
+            "decompiled": True,
             "pseudocode": pseudocode,
             "note": (
                 "Merged into the analysis cache. Call decompile_function again "

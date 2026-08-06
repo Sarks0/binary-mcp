@@ -61,6 +61,13 @@ _COOKIE_NAMES = {"__security_check_cookie", "__security_init_cookie"}
 # diffs (mostly stable, a handful of fixed funcs); not load-bearing.
 _CALLEE_JACCARD_THRESHOLD = 0.85
 
+# Below this share of pairs coming from phase 1, MODIFIED is under-reported
+# badly enough that the report has to say so. The two real pairs measured sit
+# far either side of it -- 3% stripped, 69% symbolized -- so the exact value is
+# not load-bearing; it only has to separate "a handful of CRT functions Ghidra
+# named by itself" from "this binary actually has symbols".
+_LOW_PHASE1_PAIR_SHARE = 0.25
+
 # Report bounds. An unbounded report on a 14000-function pair is 20000 lines
 # and ~240K tokens -- it cannot come back through an MCP client, which is what
 # drove diff work out into offline scripts. These defaults land around 250
@@ -522,10 +529,21 @@ def _pairing_notes(old_ctx: dict, new_ctx: dict, pair_counts: dict | None) -> li
 
     A diff nobody can calibrate is worse than no diff, so the report says so
     in its own header rather than leaving it to be inferred.
+
+    Presence of PDB-named functions is not the test, because it never reaches
+    zero in practice: Ghidra recognizes CRT scaffolding (``entry``,
+    ``__security_check_cookie``, ``__scrt_acquire_startup_lock``) with no PDB
+    at all. The real cscsvc pair this warning exists for carries 75 of 2524
+    (3.0%) on each side -- both non-zero, so a presence check stays silent on
+    exactly the MODIFIED=1 / RENAMED=2367 report it is meant to flag. What
+    matters is how much of the pairing phase 1 actually supplied: 75 of 2452
+    pairs (3%) stripped against 2120 of 3069 (69%) symbolized.
     """
     notes: list[str] = []
     old_named = sum(1 for f in old_ctx.get("functions") or [] if _is_pdb_named(f))
     new_named = sum(1 for f in new_ctx.get("functions") or [] if _is_pdb_named(f))
+    name_pairs = (pair_counts or {}).get("name", 0)
+    total_pairs = sum((pair_counts or {}).values())
 
     if pair_counts:
         notes.append(
@@ -542,6 +560,17 @@ def _pairing_notes(old_ctx: dict, new_ctx: dict, pair_counts: dict | None) -> li
             "MODIFIED count here is NOT evidence that little changed. Apply "
             "symbols (analyze_binary(pdb_path=...)) and re-run before drawing "
             "any conclusion."
+        )
+    elif total_pairs and name_pairs / total_pairs < _LOW_PHASE1_PAIR_SHARE:
+        notes.append(
+            f"WARNING: phase-1 (name) pairing supplied only {name_pairs} of "
+            f"{total_pairs} pairs ({name_pairs / total_pairs:.0%}); PDB-named "
+            f"functions old={old_named}, new={new_named}. Phase 1 is the only "
+            "phase that distinguishes MODIFIED from UNCHANGED, so at this share "
+            "MODIFIED is UNDER-REPORTED and changed functions land in "
+            "ADDED/REMOVED. A small MODIFIED count here is NOT evidence that "
+            "little changed. Apply symbols (analyze_binary(pdb_path=...)) and "
+            "re-run before drawing any conclusion."
         )
     return notes
 

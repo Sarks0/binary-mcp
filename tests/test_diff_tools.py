@@ -1207,6 +1207,56 @@ class TestPairingProvenance:
         assert "Pairs:" in report
         assert "by name" in report and "by opcode hash" in report and "by callee-set" in report
 
+    @staticmethod
+    def _mostly_stripped(monkeypatch, named_count, total):
+        """A pair where only `named_count` of `total` functions are PDB-named.
+
+        Hashes key on address alone, so the unnamed remainder pairs in phase 2
+        and the named few pair in phase 1 -- the real shape of a stripped
+        Windows binary, where Ghidra recognizes CRT scaffolding on its own.
+        """
+        old_funcs, new_funcs = [], []
+        for i in range(total):
+            a = f"{0x1000 + i * 64:#x}"
+            if i < named_count:
+                kw = {"name": f"__security_check_cookie_{i}", "name_source": "USER_DEFINED"}
+            else:
+                kw = {"name": f"FUN_{0x1000 + i * 64:x}", "name_source": "DEFAULT"}
+            old_funcs.append(_make_function(address=a, **kw))
+            new_funcs.append(_make_function(address=a, **kw))
+        import src.tools.diff_tools as dt
+
+        monkeypatch.setattr(
+            dt, "_compute_function_hash",
+            lambda reader, ar, m, func, md=None: {
+                "hash": f"h-{func['address']}",
+                "instruction_count": 5, "operands_normalized": 0},
+        )
+        tool, _cache, _ = _register(monkeypatch,
+                                    _make_context(old_funcs), _make_context(new_funcs))
+        return tool("/old.bin", "/new.bin")
+
+    def test_a_barely_symbolized_pair_still_warns(self, monkeypatch):
+        """Ghidra names CRT scaffolding even with no PDB, so a stripped binary
+        is never at zero PDB-named functions. Measured on the real cscsvc pair
+        that motivated this warning: 75 of 2524 (3.0%) on each side, both
+        non-zero -- so a presence check stays silent on exactly the pair whose
+        MODIFIED=1/RENAMED=2367 it exists to flag. Phase 1 is *effectively*
+        inactive at 3%, and the report has to say so.
+        """
+        report = self._mostly_stripped(monkeypatch, named_count=2, total=40)
+        assert "WARNING" in report
+        assert "UNDER-REPORTED" in report
+
+    def test_a_mostly_symbolized_pair_does_not_warn(self, monkeypatch):
+        """The other side of the threshold: real symbol coverage must stay quiet.
+
+        On the symbolized sdengin2 pair phase 1 supplied 2120 of 3069 pairs
+        (69%), against 75 of 2452 (3%) stripped.
+        """
+        report = self._mostly_stripped(monkeypatch, named_count=36, total=40)
+        assert "WARNING" not in report
+
 
 class TestModuleGrouping:
     """`group_by="module"` was inert on Ghidra-imported PDB names.

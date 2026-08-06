@@ -1316,3 +1316,110 @@ class TestModuleGrouping:
         assert "-- module: CQuery" in report
         assert "-- module: CIndex" in report
         assert "-- module: (global)" not in report
+
+
+# ---------------------------------------------------------------------------
+# F-7: the diff report is sample-derived on both sides
+# ---------------------------------------------------------------------------
+
+
+def _diff_func(name, address, pseudocode=""):
+    return {
+        "name": name,
+        "address": address,
+        "pseudocode": pseudocode,
+        "basic_blocks": [],
+        "called_functions": [],
+        "size": 32,
+    }
+
+
+def test_diff_report_fences_every_sample_derived_section():
+    """Both inputs to a diff are untrusted, so both sides' names are too.
+
+    The module-level F-7 guard only checks that ``wrap_untrusted`` appears
+    somewhere in diff_tools.py. That was enough until the report builder was
+    rewritten to merge in bounded output (top_n / list_limit / _name_section),
+    at which point a fence could be dropped from one section while the module
+    scan still passed. This asserts per section.
+    """
+    from src.tools.diff_tools import _format_report
+
+    old_ctx = {"functions": [_diff_func("OldOnly", "0x1000")]}
+    new_ctx = {"functions": [_diff_func("NewOnly", "0x2000")]}
+
+    report = _format_report(
+        old_path="old.dll",
+        new_path="new.dll",
+        old_ctx=old_ctx,
+        new_ctx=new_ctx,
+        added=[_diff_func("EvilAdded", "0x2000")],
+        removed=[_diff_func("EvilRemoved", "0x1000")],
+        modified=[],
+        unchanged_count=0,
+        mode="security",
+        group_by="none",
+        unchanged_renamed=[
+            (_diff_func("EvilOld", "0x1000"), _diff_func("EvilNew", "0x2000"))
+        ],
+    )
+
+    # Three name sections, three envelopes -- ADDED, REMOVED, Renamed.
+    assert report.count("⟦BEGIN UNTRUSTED SAMPLE DATA") == 3
+    assert report.count("⟦END UNTRUSTED SAMPLE DATA⟧") == 3
+
+    # Each name is inside a fence, and the bucket headings are outside it.
+    for name in ("EvilAdded", "EvilRemoved", "EvilOld", "EvilNew"):
+        assert name in report
+    for heading in ("### ADDED (1)", "### REMOVED (1)"):
+        assert heading in report
+        assert report.index(heading) < report.index(
+            "⟦BEGIN UNTRUSTED SAMPLE DATA", report.index(heading)
+        )
+
+
+def test_diff_report_fences_the_modified_bucket_once():
+    """The MODIFIED bucket carries pseudocode from both binaries.
+
+    One envelope around the bucket, not one per pair: a bounded report can
+    still hold hundreds of entries, and a per-entry fence would cost more
+    boilerplate than content -- the failure this branch already hit in
+    get_call_graph and in session replay.
+    """
+    from src.tools.diff_tools import _format_report
+
+    pairs = [
+        (
+            _diff_func(f"Fn{i}", f"0x{0x1000 + i:x}", "int a(){return 0;}"),
+            _diff_func(f"Fn{i}", f"0x{0x2000 + i:x}", "int a(){return 1;}"),
+            "modified",
+            {
+                "score": 1.0,
+                "bounds_delta": 1,
+                "cookie_delta": 0,
+                "caller_delta": 0,
+                "size_delta": 4,
+            },
+        )
+        for i in range(4)
+    ]
+
+    report = _format_report(
+        old_path="old.dll",
+        new_path="new.dll",
+        old_ctx={"functions": []},
+        new_ctx={"functions": []},
+        added=[],
+        removed=[],
+        modified=pairs,
+        unchanged_count=0,
+        mode="security",
+        group_by="none",
+    )
+
+    assert "### MODIFIED (4)" in report
+    # Empty ADDED/REMOVED/Renamed sections emit no envelope, so the only one
+    # here is the MODIFIED bucket's.
+    assert report.count("⟦BEGIN UNTRUSTED SAMPLE DATA") == 1
+    for i in range(4):
+        assert f"Fn{i}" in report

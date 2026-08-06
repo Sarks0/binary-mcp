@@ -12,6 +12,7 @@ import logging
 from datetime import datetime
 from pathlib import Path
 
+from src.utils.formatters import wrap_untrusted
 from src.utils.security import PathTraversalError, safe_error_message, sanitize_output_path
 
 logger = logging.getLogger(__name__)
@@ -89,6 +90,29 @@ def map_to_mitre(indicators: list) -> list[dict]:
                     techniques[technique_id]["indicators"].append(indicator_str)
 
     return list(techniques.values())
+
+
+def _fence_report(report: str) -> str:
+    """
+    Fence a generated analysis report (audit F-7).
+
+    A report is an aggregation of everything the session collected: IOCs the
+    sample contains, strings, imported API names, and the raw text of earlier
+    tool outputs. The Markdown scaffolding around them is this module's, but
+    it is interleaved with sample text section by section, so the report is
+    fenced as one block with a short server-authored preamble above it rather
+    than being split into a dozen envelopes.
+
+    Reports generated here are routinely pasted into tickets and shared, so
+    the boundary travels with the content -- which is the point.
+    """
+    if not report.strip():
+        return report
+    return (
+        "Generated analysis report. The body below aggregates content taken "
+        "from the analysed sample:\n\n"
+        + wrap_untrusted(report, kind="analysis report aggregating sample content")
+    )
 
 
 def generate_markdown_report(
@@ -367,7 +391,11 @@ def register_reporting_tools(app, session_manager):
 
         Args:
             session_id: Session ID to generate report for (uses active session if empty)
-            output_path: Optional path to save report to file
+            output_path: Optional path to save report to file. Confined to
+                ~/.binary_mcp_output/reports -- a relative name is interpreted
+                inside that directory, and an absolute path or one that escapes
+                it via ".." or a symlink is refused. This tool cannot write
+                anywhere else on the host.
             format: Report format (currently only "markdown" supported)
             sections: Comma-separated list of sections to include
                       (executive_summary,iocs,mitre_attack,technical_details,timeline,recommendations)
@@ -413,11 +441,24 @@ def register_reporting_tools(app, session_manager):
                     safe_path = sanitize_output_path(Path(output_path), REPORTS_OUTPUT_DIR)
                     safe_path.parent.mkdir(parents=True, exist_ok=True)
                     safe_path.write_text(report)
-                    return f"Report saved to: {safe_path}\n\n" + report[:500] + "\n...\n(truncated)"
+                    return (
+                        f"Report saved to: {safe_path}\n\n"
+                        + _fence_report(report[:500] + "\n...\n(truncated)")
+                    )
                 except PathTraversalError:
-                    return f"Error: Output path must be within {REPORTS_OUTPUT_DIR}"
+                    # Audit F-10: the old text interpolated REPORTS_OUTPUT_DIR,
+                    # which is rooted at Path.home() -- the operator's username
+                    # handed to the model, and from there into whatever report
+                    # the transcript becomes. Naming the directory is not what
+                    # makes the message actionable; "give a bare filename" is.
+                    return (
+                        "Error: Output path must stay inside this server's "
+                        "report output directory. Pass a bare filename such "
+                        'as "report.md"; it is created inside that directory. '
+                        "Absolute paths, \"..\" and symlink escapes are refused."
+                    )
 
-            return report
+            return _fence_report(report)
 
         except Exception as e:
             logger.error(f"generate_report failed: {e}")
@@ -435,7 +476,9 @@ def register_reporting_tools(app, session_manager):
         Args:
             session_id: Session ID (uses active session if empty)
             format: Export format (text, csv, json)
-            output_path: Optional path to save IOCs
+            output_path: Optional path to save IOCs. Confined to
+                ~/.binary_mcp_output/reports, same as generate_report -- give a
+                bare filename; absolute or escaping paths are refused.
 
         Returns:
             Exported IOCs
@@ -520,9 +563,27 @@ def register_reporting_tools(app, session_manager):
                     safe_path.write_text(output)
                     return f"IOCs exported to: {safe_path}\n\nTotal IOCs: {len(all_iocs)}"
                 except PathTraversalError:
-                    return f"Error: Output path must be within {REPORTS_OUTPUT_DIR}"
+                    # Audit F-10: see generate_report -- REPORTS_OUTPUT_DIR is
+                    # Path.home()-derived and must not be echoed.
+                    return (
+                        "Error: Output path must stay inside this server's "
+                        "report output directory. Pass a bare filename such "
+                        'as "iocs.csv"; it is created inside that directory. '
+                        "Absolute paths, \"..\" and symlink escapes are refused."
+                    )
 
-            return output
+            # Audit F-7: an IOC export is nothing BUT sample-authored text --
+            # URLs, domains, dropped file paths and registry keys the malware
+            # itself contains. Unfenced it was the purest instance of the
+            # finding: the tool's entire return value was attacker text with
+            # no server-authored framing at all. The count and format label
+            # are added here so the envelope has something to contrast with.
+            return (
+                f"Exported {len(all_iocs)} IOCs as {format.lower()}:\n\n"
+                + wrap_untrusted(
+                    output, kind="IOCs extracted from the sample"
+                )
+            )
 
         except Exception as e:
             logger.error(f"export_iocs failed: {e}")

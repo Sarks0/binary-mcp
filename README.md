@@ -10,17 +10,46 @@ MCP server that gives AI assistants the ability to analyze binaries, debug proce
 
 ### Install
 
+Clone, or download the installer and read it before running it. The installers
+pull down Ghidra, x64dbg, the Windows debuggers and this project's own x64dbg
+plugins, and `install.ps1` requires Administrator.
+
 ```bash
-# Windows (as Administrator)
-irm https://raw.githubusercontent.com/Sarks0/binary-mcp/main/install.ps1 | iex
+# Recommended: clone, then run the installer from the checkout
+git clone https://github.com/Sarks0/binary-mcp.git
+cd binary-mcp
+python3 install.py          # Windows: .\install.ps1  (as Administrator)
 
-# Linux / macOS
-curl -sSL https://raw.githubusercontent.com/Sarks0/binary-mcp/main/install.py | python3 -
-
-# Manual
+# Or just the dependencies, no installer
 git clone https://github.com/Sarks0/binary-mcp.git
 cd binary-mcp && uv sync
 ```
+
+Without git — download, check what you got, look at it, then run it:
+
+```bash
+# Linux / macOS
+curl -fsSLO https://raw.githubusercontent.com/Sarks0/binary-mcp/main/install.py
+sha256sum install.py
+less install.py
+python3 install.py
+```
+
+```powershell
+# Windows (as Administrator)
+Invoke-WebRequest -Uri https://raw.githubusercontent.com/Sarks0/binary-mcp/main/install.ps1 -OutFile install.ps1
+Get-FileHash .\install.ps1 -Algorithm SHA256
+notepad .\install.ps1
+.\install.ps1
+```
+
+> **No `| iex` / `| python3 -` one-liner is offered on purpose.** Piping a fresh
+> download into an interpreter runs whatever the network returned, with no copy
+> on disk to inspect, nothing to compare a digest against, and no record of what
+> ran — and on Windows it runs elevated. The extra command above is the whole
+> difference. See [INSTALL.md → Supply-Chain
+> Integrity](INSTALL.md#supply-chain-integrity) for what the installers verify
+> and how to pin a digest.
 
 ### Connect to Claude
 
@@ -70,11 +99,21 @@ Analyze the crash dump at C:\Windows\MEMORY.DMP
 Decompile the type MyNamespace.MyClass to C#
 ```
 
-## Capabilities (255 tools)
+## Capabilities (289 tools)
 
-### Static Analysis (Ghidra) - 35 tools
+Counts below are derived from the tools actually registered by `src/server.py`, and `tests/test_docs_accuracy.py` fails if this file and the code disagree.
 
-Analysis, decompilation, cross-references, memory maps, byte pattern search, function renaming, call graphs, API pattern detection (100+ Windows APIs), crypto constant identification, IOC extraction, and binary compatibility checking.
+### Static Analysis (Ghidra) - 19 tools
+
+Analysis, decompilation, cross-references, memory maps, byte pattern search, function renaming, call graphs, API pattern detection (100+ Windows APIs), crypto constant identification, IOC extraction, PDB loading, and binary compatibility checking.
+
+### Python & Encoding Utilities - 7 tools
+
+Python bytecode (`.pyc`) analysis, PyInstaller/py2exe packer detection and extraction, packed-archive listing, XOR key recovery and decryption, and Base64 file decoding.
+
+### Sessions & Server Utilities - 15 tools
+
+Persistent analysis sessions (create, save, load, list, delete, summarise, relate), analyst notes, auto-session configuration, cache cleanup, and a setup diagnostic.
 
 ### Dynamic Analysis (x64dbg) - 159 tools
 
@@ -95,30 +134,84 @@ Analysis, decompilation, cross-references, memory maps, byte pattern search, fun
 | **Process** | Attach/detach, minidump creation, module listing with exports |
 | **Navigation** | Navigate disassembly/dump/graph views, generic command execution |
 
-### Kernel Debugging (WinDbg) - 20 tools
+### Kernel Debugging (WinDbg) - 33 tools
 
-Connection (KDNET, local kernel, crash dumps), execution control, breakpoints, register and memory inspection, driver object analysis, IOCTL decoding, process listing, and raw WinDbg command execution.
+Connection (KDNET, named pipe, serial, local kernel, crash dumps), execution control, software/hardware/conditional breakpoints, register, memory and thread inspection, structure display (`dt`), disassembly, module and process listing, symbol path management, and raw WinDbg command execution. Windows only - every tool returns a platform message elsewhere.
 
 ### .NET Analysis (ILSpyCmd) - 7 tools
 
-Type listing, C# decompilation, IL disassembly, type search, and full assembly decompilation.
+Type listing, C# decompilation, IL disassembly, type search, full assembly decompilation, and a setup diagnostic.
 
-### PE Structure (pefile) - 1 tool
+### PE Structure (pefile) - 4 tools
 
-Comprehensive PE header, section, import, export, resource, debug, TLS, and Rich header analysis in a single fast call (<500ms). Three detail levels (basic/standard/full) with decoded characteristic flags, compiler attribution, and malware indicators.
+Comprehensive PE header, section, import, export, resource, debug, TLS, and Rich header analysis in a single call, at three detail levels (basic/standard/full) with decoded characteristic flags, compiler attribution, and malware indicators. Plus Authenticode signature inspection, embedded-binary carving, and similarity hashing.
 
-### Other - 33 tools
+### Other - 45 tools
 
 - **Triage (3)** - Quick file type detection, packer identification, entropy analysis
-- **Malware Analysis (4)** - Behavior detection, threat chain identification, IOC extraction
+- **Malware Analysis (6)** - Behavior detection, API call chains, dynamic API resolution, anti-analysis detection, stack-string recovery, IOC extraction with context
 - **Control Flow (4)** - CFG generation, cyclomatic complexity, loop detection, dead code
-- **Function Hashing (4)** - Cross-binary function matching and similarity scoring
-- **VirusTotal (4)** - Hash lookups, file submission, detection reports
-- **Session Management** - Persistent analysis tracking across conversations
-- **Reporting (2)** - Generate structured analysis reports
-- **YARA (2)** - Rule scanning (optional `yara-python` dependency)
-- **Background Jobs (4)** - Poll long-running analysis that outlives the MCP client timeout, with one Ghidra run per binary shared across server processes and orphan reaping. See [docs/jobs.md](docs/jobs.md)
+- **Function Hashing (5)** - Cross-binary function matching, similarity scoring, inlined-clone detection, batch decompilation, completeness checks
+- **Pseudocode Review (5)** - Decompiler-output scanning, caller analysis, parameter sinks, switch tables, review packages
 - **Review Coverage (6)** - Per-binary review denominator, reachability scope, a deterministic unreviewed worklist, and a separate machine-examination axis so a diff run is recorded without being counted as a review. See [docs/coverage.md](docs/coverage.md)
+- **Background Jobs (4)** - Poll long-running analysis that outlives the MCP client timeout, with one Ghidra run per binary shared across server processes and orphan reaping. See [docs/jobs.md](docs/jobs.md)
+- **VirusTotal (4)** - Hash lookups, sandbox behavior reports, Intelligence search, API-key check. Read-only: see "Operational safety" below
+- **Reporting (2)** - Generate structured analysis reports, export IOCs
+- **YARA (2)** - Rule *generation* from session data or extracted strings. This server emits rule text; it does not compile or run rules, so no YARA library is required or installed
+- **IOCTL Dispatch (1)** - Recover driver IOCTL handlers
+- **Binary Diff (1)** - Cross-binary patch diffing
+- **Indirect Calls (1)** - Vtable enumeration
+- **Function ID (1)** - Ghidra FID library-match reading
+
+## Operational safety
+
+This is a malware-analysis tool. Analyze samples in an isolated VM, on a
+host you can revert. That advice is partly enforced by the code, and it is
+worth being precise about which parts:
+
+- **No tool can execute a sample.** Nothing in `src/tools/` starts a process
+  from a file on disk. The x64dbg bridge has a `load_binary()` method and the
+  C++ plugin has a `LOAD_BINARY` handler, but no MCP tool calls either, so
+  neither is reachable from a client. `x64dbg_attach` attaches to a PID that
+  is *already running* - you decide what runs, and where.
+- **Raw debugger commands are filtered, not sandboxed.**
+  `x64dbg_execute_command` is gated by an allowlist at the tool layer and a
+  second, authoritative allowlist in the C++ plugin, which fails closed on any
+  command name it does not recognise. Every `;`-separated segment is validated
+  independently, at the HTTP chokepoint every bridge method posts through, so a
+  command chained after an allowed one cannot slip past on the strength of the
+  first token.
+  `windbg_execute_command` is **disabled unless the operator sets
+  `BINARY_MCP_ENABLE_RAW_WINDBG=1`** in the server environment. When enabled it
+  is gated by a fail-closed *allowlist*: a subcommand runs only if its command
+  name appears in a curated read-only/inspection list, and anything
+  unrecognised - a new verb, an extension export, a misspelling - is refused.
+  The gate splits compound commands on every separator WinDbg honours, recurses
+  into the quoted and braced command-string arguments of the few carriers it
+  permits, and refuses a set of unsafe argument forms on commands that are
+  otherwise allowed. Both tools act on a live target with the debugger's full
+  read access. See each tool's docstring for the exact rules.
+
+  This paragraph described a denylist ("anything not named still reaches the
+  debugger") until the gate was rewritten; the description is corrected here
+  because an operator auditing the server against it would conclude the
+  opposite of the truth in both directions - the control is stronger than
+  stated, and the tool is off by default.
+- **Samples are never uploaded anywhere.** The VirusTotal integration performs
+  GET lookups only - hash reports, behavior summaries, and Intelligence
+  search. There is no submission or upload tool, so no sample can leave your
+  host through it, deliberately or by accident. Sending a hash still tells
+  VirusTotal you have the sample; sending the file would tell everyone with VT
+  Intelligence access.
+- **File access is confined by default.** Binary paths go through
+  `sanitize_binary_path` (`src/utils/security.py`), which checks a symlink's
+  target for containment before following it, and answers "denied" identically
+  whether or not the path exists so it cannot be used to probe the filesystem.
+  With `BINARY_MCP_ALLOWED_DIRS` unset, access defaults to a quarantine allow-list -
+  the system temp directory, this server's cache root (`$BINARY_CACHE_DIR` or
+  `~/ghidra_mcp_cache`), and `~/.binary_mcp_cache` / `~/.cache/binary_mcp` -
+  so `~/.ssh/id_rsa` and `/etc/shadow` are out of reach without you saying so.
+  Report and rule output is separately confined to `~/.binary_mcp_output/`.
 
 ## Supported Formats
 
@@ -157,6 +250,11 @@ Comprehensive PE header, section, import, export, resource, debug, TLS, and Rich
 | `X64DBG_PATH` | x64dbg installation path | Auto-detected |
 | `WINDBG_PATH` | WinDbg/CDB installation path | Auto-detected |
 | `WINDBG_MODE` | Operating mode: `kernel`, `user`, `dump` | `kernel` |
+| `BINARY_CACHE_DIR` | Cache root for Ghidra projects and carved output | `~/ghidra_mcp_cache` |
+| `VT_API_KEY` | VirusTotal API key (lookups only) | Unset - VT tools report how to configure it |
+| `BINARY_MCP_ALLOWED_DIRS` | Directories analysis is confined to, separated by `:` (POSIX) or `;` (Windows) | Unset - falls back to the quarantine directories described under "Operational safety" |
+| `BINARY_MCP_REQUIRE_CONFINEMENT` | Fail closed: refuse to open any binary unless `BINARY_MCP_ALLOWED_DIRS` is set explicitly | Unset (off) |
+| `BINARY_MCP_ALLOW_ANY_PATH` | Opt out of path confinement entirely. Not recommended - every file this process can read becomes reachable through the server. Logs a warning once per process, and is ignored when `BINARY_MCP_REQUIRE_CONFINEMENT` is set | Unset (off) |
 
 **Ghidra 12.1+ users:** Jython is no longer bundled with Ghidra and is required for analysis. Install it once from the Ghidra Front End: **File -> Install Extensions -> Jython**, then restart Ghidra. Ghidra 12.0.x and earlier ship with Jython built in and need no extra setup.
 

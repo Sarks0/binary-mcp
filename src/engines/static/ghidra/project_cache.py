@@ -95,9 +95,54 @@ class ProjectCache:
         return pruned
 
     def _get_binary_hash(self, binary_path: str) -> str:
-        """Calculate SHA256 hash of binary file."""
+        """Calculate SHA256 hash of binary file, after confining the path.
+
+        THE CHOKEPOINT for path confinement in this class (audit F-8 ordering).
+
+        Ten x64dbg tools in ``src/tools/dynamic_tools.py`` -- resolve_function,
+        set_breakpoint_by_function, goto_function, list_function_mappings,
+        search_function, bulk_resolve_functions, set_breakpoints_by_functions,
+        refresh_function_cache, resolve_static_address and
+        get_runtime_function_address -- accept a ``binary_path`` straight from
+        the model and reach this method via ``_load_function_mappings`` /
+        ``has_cached`` / ``get_cached`` WITHOUT ever calling
+        ``sanitize_binary_path``. This method then did
+        ``open(binary_path, "rb")`` and read the file to the end. Two problems,
+        neither of them "just an ordering nit":
+
+          * it opened and read an arbitrary host path, outside the allow-list
+            that governs every other read in this server; and
+          * it did so with NO size cap, unlike sanitize_binary_path's 500 MB
+            limit -- so a path naming an endless file (``/dev/zero``) span
+            forever inside a tool call.
+
+        The contents never reached the caller (the digest is only used to name
+        a cache file, which will not exist), so this was a read and a resource
+        exhaustion rather than a disclosure. It is fixed here rather than in
+        the ten tools because that is the lesson this branch already learned
+        twice: ``execute_command`` validated while 38 sibling methods did not,
+        and one session-ID validator was fixed while its twin was missed.
+        Every public method on this class routes through here, so a new one
+        cannot reintroduce the gap by forgetting.
+
+        Callers that already sanitised (the whole static path) pass an
+        allow-listed absolute path, and re-validating it is a cheap no-op.
+
+        Raises:
+            PathTraversalError: If the path is outside the allow-list.
+            FileSizeError: If the file exceeds the analysis size limit.
+            FileNotFoundError: If the file does not exist.
+        """
+        # Local import: security.py is deliberately free of intra-package
+        # imports, and importing it at module scope here would invert that.
+        from src.utils.security import get_allowed_dirs, sanitize_binary_path
+
+        safe_path = sanitize_binary_path(
+            str(binary_path), allowed_dirs=get_allowed_dirs()
+        )
+
         sha256 = hashlib.sha256()
-        with open(binary_path, "rb") as f:
+        with open(safe_path, "rb") as f:
             for chunk in iter(lambda: f.read(8192), b""):
                 sha256.update(chunk)
         return sha256.hexdigest()

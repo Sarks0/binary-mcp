@@ -14,6 +14,8 @@ import re
 from pathlib import Path
 
 from src.engines.static.ghidra.coverage_store import auto_mark, has_reviewable_body
+from src.tools.error_hygiene import safe_path_error
+from src.utils.formatters import wrap_untrusted
 from src.utils.pseudocode_rules import (
     SINK_HINTS,
     PseudocodeRules,
@@ -422,15 +424,30 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
                     "...)` for combined direct + indirect candidates."
                 )
             else:
-                for caller in shown:
-                    lines.append(f"- {caller.get('name')} @ {caller.get('address')}")
+                # Audit F-7: caller names are symbol/PDB/export strings the
+                # sample author chose. The counts and the indirect-call caveat
+                # are ours and stay outside the fence.
+                lines.append(
+                    wrap_untrusted(
+                        "\n".join(
+                            f"- {caller.get('name')} @ {caller.get('address')}"
+                            for caller in shown
+                        ),
+                        kind="caller names recovered from the sample",
+                    )
+                )
             return "\n".join(lines)
 
         except (PathTraversalError, FileSizeError, FileNotFoundError) as e:
-            return f"Invalid binary path: {e}"
+            # Audit F-10: forwarding this exception verbatim leaked the
+            # host layout -- a confinement denial names the resolved
+            # quarantine directories and ends with a Path.home()-derived
+            # worked example. The category and the remedy survive; the
+            # directory listing goes to the server log instead.
+            return safe_path_error("get_function_callers", e, "binary path")
         except Exception as e:
             logger.exception(f"get_function_callers failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("get_function_callers failed", e)
 
     @app.tool()
     def scan_pseudocode(
@@ -664,16 +681,31 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
                 )
                 return "\n".join(lines)
 
+            # F-7: every ``excerpt`` is a verbatim slice of decompiled sample
+            # code, and the function names come from the sample's symbols --
+            # both are attacker-authored. The rows interleave that text with
+            # our rule metadata, so the whole findings list is fenced once
+            # rather than emitting an envelope per finding (which would be
+            # unreadable and would dilute the boundary). The header, rule
+            # counts and pagination footer stay outside as server text.
+            finding_lines: list[str] = []
             for hit in page:
-                lines.append(
+                finding_lines.append(
                     f"[{hit['severity'].upper()} conf={hit['confidence']}] "
                     f"{hit['rule_id']} ({hit['cwe']}) "
                     f"-- {hit['function']} @ {hit['address']}"
                 )
-                lines.append(f"    {hit['description']}")
-                lines.append(f"    excerpt: {hit['excerpt']}")
-                lines.append(f"    -> {hit['recommendation']}")
-                lines.append("")
+                finding_lines.append(f"    {hit['description']}")
+                finding_lines.append(f"    excerpt: {hit['excerpt']}")
+                finding_lines.append(f"    -> {hit['recommendation']}")
+                finding_lines.append("")
+            lines.append(
+                wrap_untrusted(
+                    "\n".join(finding_lines).rstrip("\n"),
+                    kind="decompiled sample code excerpts",
+                )
+            )
+            lines.append("")
 
             next_offset = offset + len(page)
             if next_offset < total_findings:
@@ -686,10 +718,15 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
             return "\n".join(lines)
 
         except (PathTraversalError, FileSizeError, FileNotFoundError) as e:
-            return f"Invalid binary path: {e}"
+            # Audit F-10: forwarding this exception verbatim leaked the
+            # host layout -- a confinement denial names the resolved
+            # quarantine directories and ends with a Path.home()-derived
+            # worked example. The category and the remedy survive; the
+            # directory listing goes to the server log instead.
+            return safe_path_error("scan_pseudocode", e, "binary path")
         except Exception as e:
             logger.exception(f"scan_pseudocode failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("scan_pseudocode failed", e)
 
     @app.tool()
     def get_review_package(
@@ -846,8 +883,19 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
             lines.append("")
             lines.append("## Strings referenced")
             if strings_referenced:
-                for s in strings_referenced[:25]:
-                    lines.append(f"- `{s['value']}` @ {s['address']}")
+                # F-7: string literals are sample content verbatim. Fence the
+                # list once; the section heading and the "... and N more"
+                # counter stay outside as server text.
+                string_lines = [
+                    f"- `{s['value']}` @ {s['address']}"
+                    for s in strings_referenced[:25]
+                ]
+                lines.append(
+                    wrap_untrusted(
+                        "\n".join(string_lines),
+                        kind="string literals from the sample",
+                    )
+                )
                 if len(strings_referenced) > 25:
                     lines.append(f"  ... and {len(strings_referenced) - 25} more")
             else:
@@ -863,21 +911,40 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
             lines.append("")
             lines.append("## Pseudocode rule findings")
             if findings:
+                # F-7: each excerpt is a raw slice of the decompiled sample.
+                # One envelope around the list keeps it readable while marking
+                # the sample text; the heading stays outside.
+                finding_lines: list[str] = []
                 for hit in findings:
-                    lines.append(
+                    finding_lines.append(
                         f"- [{hit['severity'].upper()}] {hit['rule_id']} "
                         f"({hit['cwe']}): {hit['description']}"
                     )
-                    lines.append(f"    excerpt: {hit['excerpt']}")
+                    finding_lines.append(f"    excerpt: {hit['excerpt']}")
+                lines.append(
+                    wrap_untrusted(
+                        "\n".join(finding_lines),
+                        kind="decompiled sample code excerpts",
+                    )
+                )
             else:
                 lines.append("(no rule-based findings for this function)")
 
             lines.append("")
             lines.append("## Pseudocode")
             if pseudo:
-                lines.append("```c")
-                lines.append(pseudo)
-                lines.append("```")
+                # F-7: decompiled pseudocode is the malware author's own code,
+                # comments and string constants rendered as C. This is the
+                # highest-volume untrusted block in the whole server, so it is
+                # fenced in full -- never truncated, the reviewer needs all of
+                # it -- with the markdown code fence kept inside the envelope
+                # so the block still renders as code for the analyst.
+                lines.append(
+                    wrap_untrusted(
+                        "```c\n" + pseudo + "\n```",
+                        kind="decompiled pseudocode from the sample",
+                    )
+                )
             else:
                 lines.append(
                     "(no pseudocode -- function was likely analyzed with "
@@ -887,10 +954,15 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
             return "\n".join(lines)
 
         except (PathTraversalError, FileSizeError, FileNotFoundError) as e:
-            return f"Invalid binary path: {e}"
+            # Audit F-10: forwarding this exception verbatim leaked the
+            # host layout -- a confinement denial names the resolved
+            # quarantine directories and ends with a Path.home()-derived
+            # worked example. The category and the remedy survive; the
+            # directory listing goes to the server log instead.
+            return safe_path_error("get_review_package", e, "binary path")
         except Exception as e:
             logger.exception(f"get_review_package failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("get_review_package failed", e)
 
     @app.tool()
     def get_switch_tables(
@@ -950,23 +1022,38 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
                 return "No jump/switch tables found."
 
             lines = [f"**Jump tables: {total} total ({len(tables)} shown)**", ""]
+            # Audit F-7: function names and jump-table target labels come out
+            # of the analysed binary, so the listing goes inside the fence
+            # while the "N total (M shown)" header stays outside it.
+            body: list[str] = []
             for func, jt in tables:
                 targets = jt.get("targets") or []
-                lines.append(
+                body.append(
                     f"- {func.get('name')} @ {func.get('address')} -- "
                     f"switch @ {jt.get('source_addr')} -> {len(targets)} cases"
                 )
                 for t in targets[:12]:
-                    lines.append(f"    -> {t}")
+                    body.append(f"    -> {t}")
                 if len(targets) > 12:
-                    lines.append(f"    ... and {len(targets) - 12} more")
+                    body.append(f"    ... and {len(targets) - 12} more")
+            lines.append(
+                wrap_untrusted(
+                    "\n".join(body),
+                    kind="jump-table targets recovered from the sample",
+                )
+            )
             return "\n".join(lines)
 
         except (PathTraversalError, FileSizeError, FileNotFoundError) as e:
-            return f"Invalid binary path: {e}"
+            # Audit F-10: forwarding this exception verbatim leaked the
+            # host layout -- a confinement denial names the resolved
+            # quarantine directories and ends with a Path.home()-derived
+            # worked example. The category and the remedy survive; the
+            # directory listing goes to the server log instead.
+            return safe_path_error("get_switch_tables", e, "binary path")
         except Exception as e:
             logger.exception(f"get_switch_tables failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("get_switch_tables failed", e)
 
     @app.tool()
     def get_param_sinks(binary_path: str, function: str) -> str:
@@ -1057,21 +1144,39 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
                 )
                 return "\n".join(lines)
 
+            # F-7: the taint-chain steps are verbatim pseudocode statements
+            # from the sample (and the identifiers in them are the sample's
+            # own). Fence the chain listing once; the counts, the parameter
+            # list and the methodology caveat above stay outside as server
+            # text so the boundary between our analysis and the sample's
+            # words is visible.
+            chain_lines: list[str] = []
             for f in findings:
-                lines.append(
+                chain_lines.append(
                     f"- {f['sink']}() arg #{f['arg_index']} "
                     f"@ line {f['sink_line']}  "
                     f"[root={f['parameter_root']}, "
                     f"confidence={f['confidence']}]"
                 )
                 for step in f["taint_chain"]:
-                    lines.append(f"    L{step['line']}: {step['text']}")
-                lines.append("")
+                    chain_lines.append(f"    L{step['line']}: {step['text']}")
+                chain_lines.append("")
+            lines.append(
+                wrap_untrusted(
+                    "\n".join(chain_lines).rstrip("\n"),
+                    kind="decompiled sample statements",
+                )
+            )
 
             return "\n".join(lines)
 
         except (PathTraversalError, FileSizeError, FileNotFoundError) as e:
-            return f"Invalid binary path: {e}"
+            # Audit F-10: forwarding this exception verbatim leaked the
+            # host layout -- a confinement denial names the resolved
+            # quarantine directories and ends with a Path.home()-derived
+            # worked example. The category and the remedy survive; the
+            # directory listing goes to the server log instead.
+            return safe_path_error("get_param_sinks", e, "binary path")
         except Exception as e:
             logger.error(f"get_param_sinks failed: {e}")
             return safe_error_message("Failed to trace parameter sinks", e)

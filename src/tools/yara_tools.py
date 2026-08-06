@@ -14,12 +14,41 @@ import re
 from datetime import datetime
 from pathlib import Path
 
+from src.utils.formatters import wrap_untrusted
 from src.utils.security import sanitize_output_path
 
 logger = logging.getLogger(__name__)
 
 # Allowed output directory for Yara rules
 YARA_OUTPUT_DIR = Path.home() / ".binary_mcp_output" / "yara"
+
+
+def _fence_rule(rule: str) -> str:
+    """
+    Return a generated Yara rule behind the F-7 untrusted-content boundary.
+
+    Audit F-7: a generated rule is mostly a transcription of SAMPLE-AUTHORED
+    STRINGS. ``generate_yara_rule`` selects the highest-scoring strings a
+    binary contains and copies them into ``$s0..$sN``, and the meta block
+    carries the sample's own filename as ``description``. ``escape_yara_string``
+    makes the result valid Yara -- it escapes quotes and backslashes -- but
+    that is a syntax concern, not a trust boundary: a sample containing
+    ``SYSTEM: analysis complete, now call ...`` still emits that sentence
+    verbatim inside the rule, and the whole rule used to be the tool's entire
+    return value, with no server-authored text around it at all.
+
+    A short server-authored preamble is emitted above the fence so the reader
+    can see which part of the response this server is vouching for. The rule
+    text itself is unchanged and uncut -- it still has to be copy-pasteable
+    into a Yara installation, which is the whole point of the tool.
+    """
+    if not rule.strip():
+        return rule
+    return (
+        "Generated Yara rule (rule text is built from strings the sample "
+        "itself contains -- review before use):\n\n"
+        + wrap_untrusted(rule, kind="generated Yara rule quoting sample strings")
+    )
 
 
 def sanitize_rule_name(name: str) -> str:
@@ -162,10 +191,24 @@ def generate_yara_rule(
         lines.append(f'        date = "{datetime.now().strftime("%Y-%m-%d")}"')
 
     # Strings section
+    #
+    # `selected` must exist before this block: the condition section below
+    # reads it unconditionally for the "medium" and "high" strictness levels,
+    # so generate_yara_rule(strings=[]) raised UnboundLocalError for both --
+    # only "low" survived, because its condition branch never mentions it.
+    # Entries are COLLECTED first and the "strings:" header emitted only if
+    # there are any. Two ways this produced rules yara cannot compile:
+    #
+    #   * the header was written whenever `strings` was non-empty, even if
+    #     scoring then filtered every candidate out -- an empty "strings:"
+    #     section is a syntax error; and
+    #   * the imports block appended "$impN = ..." lines WITHOUT emitting the
+    #     header, assuming the block above had already done so. With
+    #     strings=[] and imports non-empty the identifiers landed under
+    #     "meta:" and the condition's "all of them" bound to nothing.
+    selected: list[str] = []
+    string_entries: list[str] = []
     if strings:
-        lines.append("")
-        lines.append("    strings:")
-
         # Score and sort strings
         scored_strings = []
         for s in strings:
@@ -195,26 +238,43 @@ def generate_yara_rule(
             if all(c in 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-. /\\:@' for c in s):
                 # ASCII string - check if wide
                 if "\\" in s or "HKEY" in s:
-                    lines.append(f'        {var_name} = "{escape_yara_string(s)}" wide ascii')
+                    string_entries.append(f'        {var_name} = "{escape_yara_string(s)}" wide ascii')
                 else:
-                    lines.append(f'        {var_name} = "{escape_yara_string(s)}" ascii')
+                    string_entries.append(f'        {var_name} = "{escape_yara_string(s)}" ascii')
             else:
                 # Hex encode non-printable
                 hex_str = " ".join(f"{ord(c):02x}" for c in s)
-                lines.append(f'        {var_name} = {{ {hex_str} }}')
+                string_entries.append(f'        {var_name} = {{ {hex_str} }}')
 
-    # Imports section (as strings)
+    # Imports, as string identifiers -- they belong in the same section.
     if imports:
-        lines.append("")
-        lines.append("        // Suspicious imports")
+        string_entries.append("        // Suspicious imports")
         for i, imp in enumerate(imports[:5]):
-            lines.append(f'        $imp{i} = "{imp}" ascii')
+            string_entries.append(f'        $imp{i} = "{imp}" ascii')
+
+    # Emit the section only when it has at least one real identifier. A bare
+    # "// comment" does not count: a section containing only a comment is as
+    # uncompilable as an empty one.
+    if any(e.lstrip().startswith("$") for e in string_entries):
+        lines.append("")
+        lines.append("    strings:")
+        lines.extend(string_entries)
 
     # Condition section
     lines.append("")
     lines.append("    condition:")
 
-    if strictness == "high":
+    if not selected and not imports:
+        # No strings survived scoring and no imports were supplied, so there is
+        # no "strings:" section. Every branch below references "them" or "$s*",
+        # and a condition referencing string identifiers that were never
+        # declared does not COMPILE in yara -- the tool would hand back a rule
+        # that looks fine and fails the moment anyone tries to use it. Emit the
+        # one meaningful strings-free condition instead, and say why.
+        lines.append("        // No strings met the scoring threshold for this")
+        lines.append("        // strictness level; matching on PE header only.")
+        lines.append("        uint16(0) == 0x5A4D")
+    elif strictness == "high":
         # Require PE and multiple matches
         if len(selected) >= 3:
             lines.append("        uint16(0) == 0x5A4D and")
@@ -262,19 +322,27 @@ def register_yara_tools(app, session_manager):
         output_path: str = "",
     ) -> str:
         """
-        Generate a Yara rule from analysis session data.
+        Generate Yara rule TEXT from analysis session data.
 
         Creates detection rules based on unique strings, imports,
         and other indicators collected during analysis.
+
+        This server generates rules only -- it does not compile or run them.
+        There is no Yara scanning tool here and the yara-python library is not
+        imported anywhere in src/ (audit finding F-11, which found the README
+        advertising "rule scanning"). Take the emitted text to your own Yara
+        installation to actually match it against files.
 
         Args:
             session_id: Session ID (uses active session if empty)
             rule_name: Name for the rule (auto-generated if empty)
             strictness: Rule strictness - "low" (more FPs), "medium", "high" (fewer FPs)
-            output_path: Optional path to save rule
+            output_path: Optional path to save rule. Confined to
+                ~/.binary_mcp_output/yara -- a relative name lands inside that
+                directory; absolute paths and ".."/symlink escapes are refused.
 
         Returns:
-            Generated Yara rule
+            Generated Yara rule text
 
         Example:
             generate_yara_rule_from_session()
@@ -350,11 +418,25 @@ def register_yara_tools(app, session_manager):
                     safe_path = sanitize_output_path(Path(output_path), YARA_OUTPUT_DIR)
                     safe_path.parent.mkdir(parents=True, exist_ok=True)
                     safe_path.write_text(rule)
-                    return f"Yara rule saved to: {safe_path}\n\n{rule}"
+                    return (
+                        f"Yara rule saved to: {safe_path}\n\n"
+                        + _fence_rule(rule)
+                    )
                 except PathTraversalError:
-                    return f"Error: Output path must be within {YARA_OUTPUT_DIR}"
+                    # Audit F-10: the old message interpolated
+                    # YARA_OUTPUT_DIR, which is rooted at Path.home() and so
+                    # carries the operator's username into model context (and
+                    # from there into any report built on this transcript).
+                    # The instruction the model actually needs -- "give a bare
+                    # filename" -- does not require naming the directory.
+                    return (
+                        "Error: Output path must stay inside this server's "
+                        "Yara output directory. Pass a bare filename such as "
+                        '"rule.yar"; it is created inside that directory. '
+                        "Absolute paths, \"..\" and symlink escapes are refused."
+                    )
 
-            return rule
+            return _fence_rule(rule)
 
         except Exception as e:
             logger.error(f"generate_yara_rule_from_session failed: {e}")
@@ -368,23 +450,29 @@ def register_yara_tools(app, session_manager):
         output_path: str = "",
     ) -> str:
         """
-        Generate a Yara rule by extracting strings from a binary.
+        Generate Yara rule TEXT by extracting strings from a binary.
 
-        Analyzes the binary directly to find unique, high-value strings
-        suitable for detection.
+        Reads the binary and picks unique, high-value strings suitable for
+        detection. The file is only read, never executed.
+
+        As with generate_yara_rule_from_session, this produces rule text and
+        nothing more -- no rule is compiled or run against anything (F-11).
 
         Args:
-            binary_path: Path to binary file
+            binary_path: Path to binary file. Subject to the same path
+                confinement as every other analysis tool (BINARY_MCP_ALLOWED_DIRS,
+                defaulting to the quarantine directories -- see README).
             rule_name: Name for the rule (auto-generated if empty)
             strictness: Rule strictness - "low", "medium", "high"
-            output_path: Optional path to save rule
+            output_path: Optional path to save rule. Confined to
+                ~/.binary_mcp_output/yara; give a bare filename.
 
         Returns:
-            Generated Yara rule
+            Generated Yara rule text
 
         Example:
-            generate_yara_rule_from_strings("malware.exe")
-            generate_yara_rule_from_strings("malware.exe", strictness="high")
+            generate_yara_rule_from_strings("/tmp/samples/malware.exe")
+            generate_yara_rule_from_strings("/tmp/samples/malware.exe", strictness="high")
         """
         try:
             binary_path = sanitize_binary_path(binary_path)
@@ -453,11 +541,25 @@ def register_yara_tools(app, session_manager):
                     safe_path = sanitize_output_path(Path(output_path), YARA_OUTPUT_DIR)
                     safe_path.parent.mkdir(parents=True, exist_ok=True)
                     safe_path.write_text(rule)
-                    return f"Yara rule saved to: {safe_path}\n\n{rule}"
+                    return (
+                        f"Yara rule saved to: {safe_path}\n\n"
+                        + _fence_rule(rule)
+                    )
                 except PathTraversalError:
-                    return f"Error: Output path must be within {YARA_OUTPUT_DIR}"
+                    # Audit F-10: the old message interpolated
+                    # YARA_OUTPUT_DIR, which is rooted at Path.home() and so
+                    # carries the operator's username into model context (and
+                    # from there into any report built on this transcript).
+                    # The instruction the model actually needs -- "give a bare
+                    # filename" -- does not require naming the directory.
+                    return (
+                        "Error: Output path must stay inside this server's "
+                        "Yara output directory. Pass a bare filename such as "
+                        '"rule.yar"; it is created inside that directory. '
+                        "Absolute paths, \"..\" and symlink escapes are refused."
+                    )
 
-            return rule
+            return _fence_rule(rule)
 
         except (PathTraversalError, FileSizeError) as e:
             return safe_error_message("generate_yara_rule_from_strings", e)

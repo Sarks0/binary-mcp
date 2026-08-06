@@ -26,9 +26,25 @@ jobs:
 
     - name: Download x64dbg Plugin SDK
       shell: pwsh
+      env:
+        # Authenticate the release LOOKUP. Unauthenticated api.github.com calls
+        # are rate-limited per source IP, and shared CI egress can exhaust that
+        # quota -- which would fail a release for a reason having nothing to do
+        # with the release. Matches the same call in ci.yml.
+        #
+        # Only the API call carries the header. The asset download below goes to
+        # a redirected CDN URL that is already signed; sending Authorization
+        # there is unnecessary and can itself be rejected.
+        GH_TOKEN: ${{ github.token }}
       run: |
+        $headers = @{
+          'Accept'        = 'application/vnd.github+json'
+          'Authorization' = "Bearer $env:GH_TOKEN"
+          'User-Agent'    = 'binary-mcp-ci'
+        }
+
         Write-Host "Fetching latest x64dbg release info..."
-        $release = Invoke-RestMethod -Uri "https://api.github.com/repos/x64dbg/x64dbg/releases/latest"
+        $release = Invoke-RestMethod -Uri "https://api.github.com/repos/x64dbg/x64dbg/releases/latest" -Headers $headers
 
         Write-Host "Latest release: $($release.tag_name)"
         $sdkAsset = $release.assets | Where-Object { $_.name -eq "x64dbg-pluginsdk.zip" }
@@ -218,6 +234,54 @@ jobs:
         echo "Release package created: ${PACKAGE_NAME}.zip"
         ls -lh "${PACKAGE_NAME}.zip"
 
+    - name: Generate SHA256SUMS Manifest
+      # F-3: obsidian.dp64 / obsidian.dp32 / obsidian_server.exe are loaded by
+      # x64dbg into the process that debugs live malware, and install.ps1 copies
+      # them into the plugins directory while running as Administrator. The
+      # installers already know how to verify a release asset against a
+      # SHA256SUMS manifest published with the release - but until this step
+      # existed no manifest was ever published, so that machinery was inert and
+      # every plugin install was trusted purely because TLS said the bytes came
+      # from GitHub. This step is what makes the verification real: the digests
+      # are computed here, in the same job that publishes the assets, from the
+      # exact bytes that are uploaded.
+      #
+      # The manifest is written in coreutils format ("<hash>  <name>", bare
+      # basenames) because that is what both installers parse, and the asset is
+      # named SHA256SUMS because that is the name they look for.
+      run: |
+        set -euo pipefail
+        PACKAGE_NAME="binary-mcp-${{ steps.version.outputs.version }}"
+
+        mkdir -p dist
+        cp "${PACKAGE_NAME}.zip" dist/
+        cp release/obsidian-plugins/obsidian.dp64 dist/
+        cp release/obsidian-plugins/obsidian.dp32 dist/
+        cp release/obsidian-plugins/obsidian_server.exe dist/
+
+        cd dist
+        {
+          echo "# binary-mcp ${{ steps.version.outputs.version }} release checksums (SHA-256)"
+          echo "# Verify with: sha256sum -c SHA256SUMS"
+          sha256sum obsidian.dp64 obsidian.dp32 obsidian_server.exe "${PACKAGE_NAME}.zip"
+        } > SHA256SUMS
+
+        # Fail the release rather than publish a manifest that silently omits an
+        # asset: the installers fail closed when a manifest exists but does not
+        # cover the asset they are about to install, so a partial manifest would
+        # break every install - and a missing entry is exactly the shape a
+        # tampered asset would take.
+        for f in obsidian.dp64 obsidian.dp32 obsidian_server.exe "${PACKAGE_NAME}.zip"; do
+          grep -qE "^[0-9a-f]{64}  ${f}\$" SHA256SUMS || {
+            echo "SHA256SUMS is missing an entry for ${f}" >&2
+            exit 1
+          }
+        done
+
+        # Prove the manifest describes the bytes we are about to upload.
+        sha256sum -c SHA256SUMS
+        cat SHA256SUMS
+
     - name: Create Release Notes
       run: |
         cat > release_notes.md << 'NOTES_EOF'
@@ -232,19 +296,46 @@ jobs:
           - `obsidian.dp32` - 32-bit debugger plugin
           - `obsidian_server.exe` - HTTP server (external process architecture)
 
-        ### Installation
+        ### Verifying this release
 
-        **Option 1: Quick Install (Recommended)**
+        `SHA256SUMS` lists the SHA-256 of every asset above. Download it
+        alongside the assets and check them before running anything:
+
         ```bash
-        # Windows
-        irm https://raw.githubusercontent.com/Sarks0/binary-mcp/main/install.ps1 | iex
-
-        # Linux/macOS
-        curl -fsSL https://raw.githubusercontent.com/Sarks0/binary-mcp/main/install.py | python3 -
+        sha256sum -c SHA256SUMS
         ```
 
-        **Option 2: Manual Installation**
-        1. Download and extract `binary-mcp-${{ steps.version.outputs.version }}.zip`
+        ```powershell
+        Get-FileHash .\obsidian.dp64 -Algorithm SHA256   # compare against SHA256SUMS
+        ```
+
+        `install.ps1` verifies `obsidian.dp64`, `obsidian.dp32` and
+        `obsidian_server.exe` against this manifest automatically, and refuses to
+        install a plugin the manifest does not cover.
+
+        ### Installation
+
+        **Option 1: Clone the repository (recommended)**
+        ```bash
+        git clone https://github.com/Sarks0/binary-mcp.git
+        cd binary-mcp
+        python3 install.py          # Windows: .\install.ps1  (as Administrator)
+        ```
+
+        **Option 2: Download the installer, read it, then run it**
+        ```bash
+        curl -fsSLO https://raw.githubusercontent.com/Sarks0/binary-mcp/main/install.py
+        sha256sum install.py && less install.py
+        python3 install.py
+        ```
+
+        These installers are deliberately not offered as a
+        `download | interpreter` one-liner: that form executes whatever the
+        network returned with no copy on disk to inspect, and on Windows it runs
+        elevated. See `INSTALL.md` -> Supply-Chain Integrity.
+
+        **Option 3: Manual Installation**
+        1. Download and extract `binary-mcp-${{ steps.version.outputs.version }}.zip` (verify it against `SHA256SUMS` first)
         2. Follow instructions in `INSTALL.md`
         3. For Obsidian x64dbg plugins, see `obsidian-plugins/README.md`
 
@@ -282,11 +373,15 @@ jobs:
       with:
         name: obsidian-${{ steps.version.outputs.version }}
         body_path: release_notes.md
+        # F-3: upload from dist/ - the exact directory the SHA256SUMS step
+        # hashed - so the published manifest cannot describe a different copy of
+        # the assets than the one users download.
         files: |
-          binary-mcp-${{ steps.version.outputs.version }}.zip
-          release/obsidian-plugins/obsidian.dp64
-          release/obsidian-plugins/obsidian.dp32
-          release/obsidian-plugins/obsidian_server.exe
+          dist/SHA256SUMS
+          dist/binary-mcp-${{ steps.version.outputs.version }}.zip
+          dist/obsidian.dp64
+          dist/obsidian.dp32
+          dist/obsidian_server.exe
         draft: false
         prerelease: ${{ contains(github.ref, '-rc') }}
       env:

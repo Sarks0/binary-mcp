@@ -17,7 +17,25 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from src.tools.error_hygiene import safe_path_error
+from src.utils.formatters import wrap_untrusted
+
 logger = logging.getLogger(__name__)
+
+
+class VirusTotalError(RuntimeError):
+    """
+    A VirusTotal API failure whose message this module wrote itself.
+
+    Audit F-10: the vt_* handlers return ``f"VirusTotal error: {e}"``
+    verbatim, which is right for the curated sentences raised below ("Hash not
+    found in VirusTotal database", "rate limit exceeded", the HTTP status
+    line) and wrong for anything else that happens to be a ``RuntimeError``
+    inside the same try block -- urllib, json and the hashing helpers all live
+    in there. Raising and catching a dedicated subclass makes the passthrough
+    apply to exactly the strings this module authored; everything else drops
+    through to ``safe_error_message``.
+    """
 
 # VirusTotal API configuration
 VT_API_BASE = "https://www.virustotal.com/api/v3"
@@ -69,15 +87,15 @@ def _vt_request(endpoint: str, method: str = "GET", data: bytes | None = None) -
             return json.loads(response.read().decode("utf-8"))
     except HTTPError as e:
         if e.code == 404:
-            raise RuntimeError("Hash not found in VirusTotal database")
+            raise VirusTotalError("Hash not found in VirusTotal database")
         elif e.code == 401:
-            raise RuntimeError("Invalid VirusTotal API key")
+            raise VirusTotalError("Invalid VirusTotal API key")
         elif e.code == 429:
-            raise RuntimeError("VirusTotal API rate limit exceeded. Try again later.")
+            raise VirusTotalError("VirusTotal API rate limit exceeded. Try again later.")
         else:
-            raise RuntimeError(f"VirusTotal API error: {e.code} {e.reason}")
+            raise VirusTotalError(f"VirusTotal API error: {e.code} {e.reason}")
     except URLError as e:
-        raise RuntimeError(f"Network error connecting to VirusTotal: {e.reason}")
+        raise VirusTotalError(f"Network error connecting to VirusTotal: {e.reason}")
 
 
 def calculate_file_hashes(file_path: str) -> dict:
@@ -340,11 +358,24 @@ def register_vt_tools(app, session_manager=None):
             if summary["last_seen"]:
                 output.append(f"  Last Seen: {summary['last_seen']}")
 
+            # F-7: `tags` and `names` are free-form strings chosen by whoever
+            # uploaded or tagged the sample -- i.e. attacker-controlled text
+            # arriving over the network, not VirusTotal's own verdict. A
+            # submitter can name a file anything, so these two lines are fenced
+            # as one block while the detection ratio, file type and hashes
+            # around them stay outside as trusted server/VT-computed values.
+            attacker_named: list[str] = []
             if summary["tags"]:
-                output.append(f"  Tags: {', '.join(summary['tags'][:10])}")
-
+                attacker_named.append(f"  Tags: {', '.join(summary['tags'][:10])}")
             if summary["names"]:
-                output.append(f"  Known Names: {', '.join(summary['names'])}")
+                attacker_named.append(f"  Known Names: {', '.join(summary['names'])}")
+            if attacker_named:
+                output.append(
+                    wrap_untrusted(
+                        "\n".join(attacker_named),
+                        kind="VirusTotal submitter-supplied names and tags",
+                    )
+                )
 
             # Show detections
             if summary["detections"]:
@@ -368,10 +399,15 @@ def register_vt_tools(app, session_manager=None):
             return safe_error_message("vt_lookup", e)
         except ValueError as e:
             return f"Configuration error: {e}"
-        except RuntimeError as e:
+        except VirusTotalError as e:
+            # Audit F-10: curated, host-free text raised by this module.
             return f"VirusTotal error: {e}"
         except FileNotFoundError as e:
-            return f"File not found: {e}"
+            # Audit F-10: compute_file_hashes is handed the SANITIZED absolute
+            # path, so its "File not found: <path>" message quotes a resolved
+            # host path -- under the default quarantine policy, one rooted at
+            # Path.home(). The category survives; the path does not.
+            return safe_path_error("vt_lookup", e, "file path")
         except Exception as e:
             logger.error(f"vt_lookup failed: {e}")
             return safe_error_message("Failed to look up file", e)
@@ -406,78 +442,97 @@ def register_vt_tools(app, session_manager=None):
                 output.append("The file may not have been executed in a sandbox.")
                 return "\n".join(output)
 
+            # F-7: everything a sandbox observed is a string the SAMPLE chose --
+            # process command lines, dropped file names, C2 URLs, mutex names,
+            # registry paths. A command line is an especially attractive
+            # injection carrier because it is long, free-form and expected to
+            # look like text. Collect the observed-activity sections into one
+            # block, fence it once, and leave the report header and the sandbox
+            # verdicts (which the sandbox vendor authors, not the sample)
+            # outside the envelope.
+            activity: list[str] = []
+
             # Process activity
             processes = behavior.get("processes_created", [])
             if processes:
-                output.append(f"Processes Created ({len(processes)}):")
+                activity.append(f"Processes Created ({len(processes)}):")
                 for proc in processes[:10]:
-                    output.append(f"  - {proc}")
+                    activity.append(f"  - {proc}")
                 if len(processes) > 10:
-                    output.append(f"  ... and {len(processes) - 10} more")
-                output.append("")
+                    activity.append(f"  ... and {len(processes) - 10} more")
+                activity.append("")
 
             # Files operations
             files_written = behavior.get("files_written", [])
             if files_written:
-                output.append(f"Files Written ({len(files_written)}):")
+                activity.append(f"Files Written ({len(files_written)}):")
                 for f in files_written[:10]:
-                    output.append(f"  - {f}")
+                    activity.append(f"  - {f}")
                 if len(files_written) > 10:
-                    output.append(f"  ... and {len(files_written) - 10} more")
-                output.append("")
+                    activity.append(f"  ... and {len(files_written) - 10} more")
+                activity.append("")
 
             files_deleted = behavior.get("files_deleted", [])
             if files_deleted:
-                output.append(f"Files Deleted ({len(files_deleted)}):")
+                activity.append(f"Files Deleted ({len(files_deleted)}):")
                 for f in files_deleted[:10]:
-                    output.append(f"  - {f}")
-                output.append("")
+                    activity.append(f"  - {f}")
+                activity.append("")
 
             # Network activity
             dns = behavior.get("dns_lookups", [])
             if dns:
-                output.append(f"DNS Lookups ({len(dns)}):")
+                activity.append(f"DNS Lookups ({len(dns)}):")
                 for d in dns[:10]:
                     if isinstance(d, dict):
-                        output.append(f"  - {d.get('hostname', d)}")
+                        activity.append(f"  - {d.get('hostname', d)}")
                     else:
-                        output.append(f"  - {d}")
-                output.append("")
+                        activity.append(f"  - {d}")
+                activity.append("")
 
             http = behavior.get("http_conversations", [])
             if http:
-                output.append(f"HTTP Connections ({len(http)}):")
+                activity.append(f"HTTP Connections ({len(http)}):")
                 for h in http[:10]:
                     if isinstance(h, dict):
-                        output.append(f"  - {h.get('url', h)}")
+                        activity.append(f"  - {h.get('url', h)}")
                     else:
-                        output.append(f"  - {h}")
-                output.append("")
+                        activity.append(f"  - {h}")
+                activity.append("")
 
             # Registry
             registry = behavior.get("registry_keys_set", [])
             if registry:
-                output.append(f"Registry Keys Set ({len(registry)}):")
+                activity.append(f"Registry Keys Set ({len(registry)}):")
                 for r in registry[:10]:
-                    output.append(f"  - {r}")
+                    activity.append(f"  - {r}")
                 if len(registry) > 10:
-                    output.append(f"  ... and {len(registry) - 10} more")
-                output.append("")
+                    activity.append(f"  ... and {len(registry) - 10} more")
+                activity.append("")
 
             # Mutexes
             mutexes = behavior.get("mutexes_created", [])
             if mutexes:
-                output.append(f"Mutexes Created ({len(mutexes)}):")
+                activity.append(f"Mutexes Created ({len(mutexes)}):")
                 for m in mutexes[:10]:
-                    output.append(f"  - {m}")
-                output.append("")
+                    activity.append(f"  - {m}")
+                activity.append("")
 
             # Command executions
             commands = behavior.get("command_executions", [])
             if commands:
-                output.append(f"Commands Executed ({len(commands)}):")
+                activity.append(f"Commands Executed ({len(commands)}):")
                 for c in commands[:10]:
-                    output.append(f"  - {c[:100]}...")
+                    activity.append(f"  - {c[:100]}...")
+                activity.append("")
+
+            if activity:
+                output.append(
+                    wrap_untrusted(
+                        "\n".join(activity).rstrip("\n"),
+                        kind="sandbox-observed activity of the sample",
+                    )
+                )
                 output.append("")
 
             # Tags/verdicts
@@ -487,14 +542,19 @@ def register_vt_tools(app, session_manager=None):
                 for v in verdicts:
                     output.append(f"  - {v}")
 
-            if len(output) == 4:  # Only header lines
+            # The observed-activity sections are now assembled in `activity`
+            # rather than appended to `output` one line at a time, so the old
+            # "len(output) == 4" heuristic for an empty report no longer
+            # matches. Check the collected data directly instead.
+            if not activity and not verdicts:
                 output.append("No significant behavior recorded.")
 
             return "\n".join(output)
 
         except ValueError as e:
             return f"Configuration error: {e}"
-        except RuntimeError as e:
+        except VirusTotalError as e:
+            # Audit F-10: curated, host-free text raised by this module.
             return f"VirusTotal error: {e}"
         except Exception as e:
             logger.error(f"vt_behavior failed: {e}")
@@ -536,6 +596,12 @@ def register_vt_tools(app, session_manager=None):
             output.append(f"Found {len(results)} results:")
             output.append("")
 
+            # F-7: each result row leads with a submitter-chosen file name and
+            # ends with community tags -- both attacker-controlled free text
+            # (an uploader can name a sample anything, including a fake tool
+            # transcript). Fence the result list once; the query echo, the
+            # result count and this tool's own banner stay outside.
+            rows: list[str] = []
             for i, item in enumerate(results, 1):
                 attrs = item.get("attributes", {})
                 stats = attrs.get("last_analysis_stats", {})
@@ -548,22 +614,31 @@ def register_vt_tools(app, session_manager=None):
                 names = attrs.get("names", [])
                 name = names[0] if names else "Unknown"
 
-                output.append(f"{i}. {name}")
-                output.append(f"   SHA256: {sha256}")
-                output.append(f"   Type: {file_type}")
-                output.append(f"   Detection: {malicious}/{total}")
+                rows.append(f"{i}. {name}")
+                rows.append(f"   SHA256: {sha256}")
+                rows.append(f"   Type: {file_type}")
+                rows.append(f"   Detection: {malicious}/{total}")
 
                 tags = attrs.get("tags", [])
                 if tags:
-                    output.append(f"   Tags: {', '.join(tags[:5])}")
+                    rows.append(f"   Tags: {', '.join(tags[:5])}")
 
-                output.append("")
+                rows.append("")
+
+            output.append(
+                wrap_untrusted(
+                    "\n".join(rows).rstrip("\n"),
+                    kind="VirusTotal search results (submitter-supplied names and tags)",
+                )
+            )
+            output.append("")
 
             return "\n".join(output)
 
         except ValueError as e:
             return f"Configuration error: {e}"
-        except RuntimeError as e:
+        except VirusTotalError as e:
+            # Audit F-10: curated, host-free text raised by this module.
             return f"VirusTotal error: {e}"
         except Exception as e:
             logger.error(f"vt_search failed: {e}")
@@ -612,7 +687,7 @@ def register_vt_tools(app, session_manager=None):
                 output.append("Test lookup (EICAR test file):")
                 summary = format_detection_summary(result)
                 output.append(f"  Detection: {summary['detection_ratio']}")
-            except RuntimeError as e:
+            except VirusTotalError as e:
                 if "rate limit" in str(e).lower():
                     output.append("API rate limit reached")
                 else:

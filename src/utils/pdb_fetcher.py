@@ -165,7 +165,14 @@ def _default_symbol_cache() -> Path:
     """
     explicit = os.environ.get("BINARY_MCP_SYMBOL_CACHE")
     if explicit:
-        return Path(explicit)
+        # .expanduser() matters: security.default_quarantine_dirs() and
+        # carving._default_carve_dir() both expand '~' on this variable, and
+        # this one did not. With BINARY_MCP_SYMBOL_CACHE=~/symbols the fetcher
+        # created a LITERAL directory named '~' under the process CWD while
+        # confinement allowed $HOME/symbols -- so the server downloaded a PDB
+        # and then refused to read it back. That write-then-refuse class has
+        # already shipped from this branch twice; the three resolvers now agree.
+        return Path(explicit).expanduser()
     if sys.platform == "win32":
         return Path.home() / ".binary_mcp_cache" / "symbols"
     xdg = os.environ.get("XDG_CACHE_HOME")

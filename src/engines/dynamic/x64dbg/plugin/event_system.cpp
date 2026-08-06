@@ -11,6 +11,23 @@ static uint64_t GetCurrentTimeMs() {
 }
 
 // JSON escape helper
+//
+// AUDIT (JSON escaping / non-ASCII): this is the second copy of the escaper --
+// plugin.cpp has JsonEscape -- and it had the same defect: bytes >= 0x80 were
+// copied through raw.
+//
+// It matters more here than anywhere else, because the strings this function
+// sees are the ones the debuggee supplies most directly: module paths from
+// LOADDLL/UNLOADDLL callbacks, breakpoint names, and OutputDebugString content
+// the sample chooses byte for byte. A single high byte in any of them makes the
+// /api/events response invalid UTF-8, and the Python bridge's response.json()
+// raises on it -- so the sample can permanently break event polling for the
+// analysis session by calling OutputDebugStringA("\xff").
+//
+// Escape every byte outside printable ASCII (0x20..0x7E) as \u00XX. That is a
+// latin-1 reading of the byte -- a guess about encoding, but a reversible one
+// that always decodes. \b and \f are added for parity with plugin.cpp's copy;
+// they were previously only reachable via the generic \u path.
 static std::string JsonEscapeEvent(const std::string& str) {
     std::string result;
     result.reserve(str.length() * 2);
@@ -21,15 +38,19 @@ static std::string JsonEscapeEvent(const std::string& str) {
             case '\n': result += "\\n"; break;
             case '\r': result += "\\r"; break;
             case '\t': result += "\\t"; break;
-            default:
-                if (static_cast<unsigned char>(c) < 0x20) {
+            case '\b': result += "\\b"; break;
+            case '\f': result += "\\f"; break;
+            default: {
+                unsigned char uc = static_cast<unsigned char>(c);
+                if (uc < 0x20 || uc >= 0x7F) {
                     char buf[8];
-                    snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned char>(c));
+                    snprintf(buf, sizeof(buf), "\\u%04x", uc);
                     result += buf;
                 } else {
                     result += c;
                 }
                 break;
+            }
         }
     }
     return result;

@@ -164,6 +164,7 @@ def compute(binary_path: str | Path) -> SimilarityHashes:
         FileSizeError,
         PathTraversalError,
         get_allowed_dirs,
+        safe_path_reason,
         sanitize_binary_path,
     )
     from src.utils.structured_errors import (
@@ -181,9 +182,13 @@ def compute(binary_path: str | Path) -> SimilarityHashes:
             StructuredError(
                 error=ErrorCode.PARAMETER_INVALID,
                 message="Invalid binary path",
-                reason=str(e),
+                # NOT str(e): a confinement denial names the quarantine
+                # directories and Path.home(), and reason IS forwarded to the
+                # model by curated_structured_text. The raw text goes to
+                # debug_info, which that renderer drops and the log keeps.
+                reason=safe_path_reason(e),
                 suggestions=["Provide an absolute path to an existing PE file"],
-                debug_info={"binary_path": str(binary_path)},
+                debug_info={"binary_path": str(binary_path), "detail": str(e)},
             )
         ) from e
 

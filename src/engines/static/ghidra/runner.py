@@ -610,6 +610,7 @@ class GhidraRunner:
         max_heap_mb: int | None = None,
         analysis_depth: str = "full",
         on_spawn=None,
+        force_decompile: bool = False,
     ) -> dict:
         """
         Run Ghidra headless analysis on a binary.
@@ -698,7 +699,16 @@ class GhidraRunner:
                 f"Invalid analysis_depth {analysis_depth!r}; "
                 "expected 'full', 'structural', or 'shallow'"
             )
-        if analysis_depth in ("structural", "shallow") or skip_decompile:
+        # `force_decompile` is for the targeted single-function run: it needs a
+        # body for one address on a cache that is deliberately structural
+        # overall. Without it that run asks Ghidra to skip decompilation --
+        # which is the entire point of the call -- and then reports the
+        # function as undecompilable. Raising `analysis_depth` instead would
+        # work for Ghidra but re-tag the merged cache as "full", so every other
+        # function in it would stop taking the recovery path.
+        if not force_decompile and (
+            analysis_depth in ("structural", "shallow") or skip_decompile
+        ):
             env["GHIDRA_SKIP_DECOMPILE"] = "1"
         env["GHIDRA_ANALYSIS_DEPTH"] = analysis_depth
         if resume_from_cache:

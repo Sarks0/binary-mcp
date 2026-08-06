@@ -1159,3 +1159,50 @@ class TestNoStrayWrites:
 
         assert _write_full_report(cache, "/old.bin", "/new.bin", lambda: "x") is None
         assert not (tmp_path / "does").exists()
+
+
+class TestPairingProvenance:
+    """Only phase 1 can classify a pair as modified-vs-unchanged: phase 2 pairs
+    on hash EQUALITY so everything it pairs is unchanged by construction, and
+    phase 1 needs PDB names. On a stripped pair the report therefore shows a
+    near-empty MODIFIED bucket that reads as "barely anything changed" when the
+    truth is "this tool cannot tell you" -- MODIFIED=1/RENAMED=2367 stripped
+    versus MODIFIED=106/RENAMED=11 symbolized, on the same binaries.
+    """
+
+    @staticmethod
+    def _pair(monkeypatch, named):
+        source = "USER_DEFINED" if named else "DEFAULT"
+        name = (lambda i: f"Method{i}") if named else (lambda i: f"FUN_{0x1000 + i * 64:x}")
+        old_funcs, new_funcs = [], []
+        for i in range(4):
+            a = f"{0x1000 + i * 64:#x}"
+            old_funcs.append(_make_function(name=name(i), address=a, name_source=source))
+            new_funcs.append(_make_function(name=name(i), address=a, name_source=source))
+        import src.tools.diff_tools as dt
+
+        monkeypatch.setattr(
+            dt, "_compute_function_hash",
+            lambda reader, ar, m, func, md=None: {
+                "hash": f"h-{reader.path}-{func['address']}",
+                "instruction_count": 5, "operands_normalized": 0},
+        )
+        tool, _cache, _ = _register(monkeypatch,
+                                    _make_context(old_funcs), _make_context(new_funcs))
+        return tool("/old.bin", "/new.bin")
+
+    def test_a_stripped_pair_warns_that_modified_is_under_reported(self, monkeypatch):
+        report = self._pair(monkeypatch, named=False)
+        assert "WARNING: PDB-named functions -- old=0, new=0" in report
+        assert "UNDER-REPORTED" in report
+        assert "NOT evidence that little changed" in report
+
+    def test_a_symbolized_pair_does_not_warn(self, monkeypatch):
+        report = self._pair(monkeypatch, named=True)
+        assert "WARNING: PDB-named functions" not in report
+
+    def test_the_report_says_where_its_pairs_came_from(self, monkeypatch):
+        """So the phase-2 tautology is visible rather than inferred."""
+        report = self._pair(monkeypatch, named=True)
+        assert "Pairs:" in report
+        assert "by name" in report and "by opcode hash" in report and "by callee-set" in report

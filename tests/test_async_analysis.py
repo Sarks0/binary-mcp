@@ -316,3 +316,79 @@ class TestDecompileJobHonesty:
         assert record["state"] == "succeeded"
         assert record["result"]["decompiled"] is True
         assert record["result"]["pseudocode"] == "int Parse(void){return 1;}"
+
+
+class TestTargetedDecompileForcesDecompilation:
+    """The targeted single-function decompile must not ask Ghidra to skip
+    decompilation.
+
+    `get_analysis_context` defaults to `analysis_depth="structural"`, and
+    `runner.analyze` maps structural/shallow onto GHIDRA_SKIP_DECOMPILE. So the
+    one call whose entire purpose is producing a body was switching the
+    decompiler off, then reporting the function as undecompilable. Found by
+    live testing: 734 functions, 0 with pseudocode, on a cache where a full
+    re-analysis yields 690.
+    """
+
+    @staticmethod
+    def _capture(server, monkeypatch):
+        cold = _ctx([_func("Parse", "0x1000")])
+        warm = _ctx([_func("Parse", "0x1000", pseudocode="int Parse(void){return 1;}")])
+        monkeypatch.setattr(server.cache, "get_cached", lambda p: cold)
+        calls = []
+
+        def _analysis(binary_path, *a, **kw):
+            calls.append(kw)
+            return warm
+
+        monkeypatch.setattr(server, "get_analysis_context", _analysis)
+        return calls
+
+    def test_the_async_path_forces_decompilation(self, server, monkeypatch):
+        calls = self._capture(server, monkeypatch)
+        result = server.decompile_function("/bin/test.dll", "Parse", wait=False)
+        _wait_done(server, _job_id(result))
+        assert calls[0]["force_decompile"] is True
+
+    def test_the_sync_path_forces_decompilation(self, server, monkeypatch):
+        calls = self._capture(server, monkeypatch)
+        server.decompile_function("/bin/test.dll", "Parse", wait=True)
+        assert calls[0]["force_decompile"] is True
+
+    def test_forcing_does_not_promote_the_cached_depth(self, server, monkeypatch):
+        """Tagging a 1-of-734-decompiled cache "full" would make every OTHER
+        function skip the recovery path -- fixing one and breaking the rest."""
+        calls = self._capture(server, monkeypatch)
+        server.decompile_function("/bin/test.dll", "Parse", wait=True)
+        assert calls[0].get("analysis_depth") in (None, "structural")
+
+
+class TestRunnerDecompileGate:
+    def test_force_decompile_overrides_a_structural_skip(self):
+        """`runner.analyze` is where the depth becomes GHIDRA_SKIP_DECOMPILE."""
+        import inspect
+
+        from src.engines.static.ghidra.runner import GhidraRunner
+
+        source = inspect.getsource(GhidraRunner.analyze)
+        assert "force_decompile" in inspect.signature(GhidraRunner.analyze).parameters
+        # The gate must consult force_decompile before setting the skip flag.
+        gate = source.split("GHIDRA_SKIP_DECOMPILE")[0]
+        assert "not force_decompile and (" in gate
+
+
+class TestRecordedDepthIsHonest:
+    """Two flags that produce the same physical cache must not behave
+    differently. `skip_decompile=True` with the default `analysis_depth="full"`
+    yielded a cache with zero pseudocode tagged "full", which made
+    decompile_function's whole recovery path unreachable for it."""
+
+    def test_skip_decompile_records_structural_not_full(self):
+        import inspect
+
+        import src.server as server_mod
+
+        source = inspect.getsource(server_mod.get_analysis_context)
+        assert 'effective_depth = analysis_depth' in source
+        assert 'if skip_decompile and analysis_depth == "full":' in source
+        assert 'meta["analysis_depth"] = effective_depth' in source

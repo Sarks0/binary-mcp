@@ -460,6 +460,7 @@ def get_analysis_context(
     pdb_path: str | None = None,
     enable_fid: bool = False,
     analysis_depth: str = "structural",
+    force_decompile: bool = False,
     job_context=None,
 ) -> dict:
     """
@@ -604,6 +605,7 @@ def get_analysis_context(
             max_functions=max_functions,
             function_timeout=function_timeout,
             analysis_depth=analysis_depth,
+            force_decompile=force_decompile,
             resume_from_cache=None if resume_manifest_path else (
                 str(resume_from_cache) if resume_from_cache else None
             ),
@@ -720,7 +722,20 @@ def get_analysis_context(
         # decompiled output. Existing caches without this field count as
         # "full" because that was the only mode prior to PR #116.
         meta = context.setdefault("metadata", {})
-        meta["analysis_depth"] = analysis_depth
+        # Record the depth that was actually PRODUCED, not the one requested.
+        # `skip_decompile=True` alongside the default `analysis_depth="full"`
+        # yields a cache with zero pseudocode; tagging that "full" makes
+        # `decompile_function`'s shallow/structural recovery path unreachable,
+        # so two flags producing the identical physical cache behave
+        # differently -- one recoverable, one not.
+        #
+        # `force_decompile` deliberately does NOT promote the tag: a targeted
+        # run decompiles one function on an otherwise structural cache, and
+        # calling that "full" would strand every other function in it.
+        effective_depth = analysis_depth
+        if skip_decompile and analysis_depth == "full":
+            effective_depth = "structural"
+        meta["analysis_depth"] = effective_depth
 
         # Cache the results
         cache.save_cached(binary_path, context)
@@ -881,6 +896,10 @@ def _submit_decompile_job(binary_path: str, function_name: str, fn_address: str)
             incremental=True,
             start_address=fn_address,
             max_functions=1,
+            # Without this the run inherits `analysis_depth="structural"` and
+            # tells Ghidra to SKIP decompilation -- on the one call whose only
+            # purpose is producing a body.
+            force_decompile=True,
             job_context=ctx,
         )
         function = next(
@@ -2148,6 +2167,7 @@ def decompile_function(
                         incremental=True,
                         start_address=fn_address,
                         max_functions=1,
+                        force_decompile=True,
                     )
                     functions = context.get("functions", [])
                     function = next(
@@ -2159,9 +2179,19 @@ def decompile_function(
                     logger.warning(f"On-demand decompile failed for {function_name}: {e}")
 
             if not pseudocode:
+                if cached_depth in ("shallow", "structural"):
+                    return (
+                        f"Function '{function_name}' has no pseudocode: the cache "
+                        f"for this binary was built '{cached_depth}', which opts "
+                        f"out of decompilation, and the targeted decompile did "
+                        f"not produce a body either. Run "
+                        f"analyze_binary(analysis_depth='full') to decompile the "
+                        f"whole binary."
+                    )
                 return (
-                    f"Function '{function_name}' could not be decompiled "
-                    f"(decompilation may have failed)."
+                    f"Function '{function_name}' could not be decompiled -- the "
+                    f"cache was built '{cached_depth}', so decompilation was "
+                    f"attempted and did not produce a body for this function."
                 )
 
         # Coverage side effect: the pseudocode is about to be handed to the

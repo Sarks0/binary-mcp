@@ -437,6 +437,19 @@ class JobRegistry:
         when another process (or an earlier call in this one) was already
         running this key -- the caller polls the same job and gets the same
         answer instead of starting a competing run.
+
+        **The contract for ``fn``: returning normally means it succeeded.**
+        Raise to fail. There is deliberately no inspection of the returned
+        payload, because the registry cannot know which of a caller's fields
+        mean failure.
+
+        That puts the burden on the caller, and it has already been got wrong
+        once: the decompile job returned ``{"decompiled": False,
+        "pseudocode": None}`` and the job was marked ``succeeded``, so a client
+        polling ``job_status`` -- the documented loop -- never learned the work
+        produced nothing. If ``fn`` computes something like a ``succeeded``
+        flag in its own result, that is the signal it should be raising
+        instead.
         """
         with self._lock:
             existing = self._existing_for_key(key)

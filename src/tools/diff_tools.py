@@ -488,6 +488,49 @@ def _confirm_phase1_buckets(
     return modified, unchanged
 
 
+
+def _pairing_notes(old_ctx: dict, new_ctx: dict, pair_counts: dict | None) -> list[str]:
+    """Say where the pairs came from, and warn when MODIFIED cannot populate.
+
+    Only phase 1 can classify a pair as modified-vs-unchanged, because it is
+    the only phase that pairs on *name* and then compares hashes.
+
+    - Phase 2 pairs on opcode-hash EQUALITY, so everything it pairs is
+      hash-identical by construction and can only ever be "unchanged".
+    - Phase 3 (callee Jaccard) is the sole remaining route to MODIFIED.
+
+    Phase 1 requires PDB names. On a stripped pair it does nothing, and the
+    report then shows a near-empty MODIFIED bucket that reads as "barely
+    anything changed" when the truth is "this tool cannot tell you". On one
+    real cross-build pair that was MODIFIED=1 / RENAMED=2367 stripped versus
+    MODIFIED=106 / RENAMED=11 with symbols applied -- same binaries.
+
+    A diff nobody can calibrate is worse than no diff, so the report says so
+    in its own header rather than leaving it to be inferred.
+    """
+    notes: list[str] = []
+    old_named = sum(1 for f in old_ctx.get("functions") or [] if _is_pdb_named(f))
+    new_named = sum(1 for f in new_ctx.get("functions") or [] if _is_pdb_named(f))
+
+    if pair_counts:
+        notes.append(
+            f"Pairs: {pair_counts.get('name', 0)} by name, "
+            f"{pair_counts.get('hash', 0)} by opcode hash, "
+            f"{pair_counts.get('callee', 0)} by callee-set"
+        )
+    if not old_named or not new_named:
+        notes.append(
+            f"WARNING: PDB-named functions -- old={old_named}, new={new_named}. "
+            "Phase-1 (name) pairing is inactive, and it is the only phase that "
+            "distinguishes MODIFIED from UNCHANGED. MODIFIED is therefore "
+            "UNDER-REPORTED and changed functions land in ADDED/REMOVED. A small "
+            "MODIFIED count here is NOT evidence that little changed. Apply "
+            "symbols (analyze_binary(pdb_path=...)) and re-run before drawing "
+            "any conclusion."
+        )
+    return notes
+
+
 def _elide(count: int, shown: int, what: str) -> str:
     """The line that admits a section was cut.
 
@@ -524,6 +567,7 @@ def _format_report(
     list_limit: int = 0,
     min_score: float = 0.0,
     full_report_path: str | None = None,
+    pair_counts: dict | None = None,
 ) -> str:
     """Render the diff report; ``modified`` already carries score dicts.
 
@@ -548,6 +592,9 @@ def _format_report(
         f"Old: {Path(old_path).name}  ({len(old_ctx.get('functions', []))} functions)",
         f"New: {Path(new_path).name}  ({len(new_ctx.get('functions', []))} functions)",
         f"Mode: {mode}    group_by={group_by}",
+    ]
+    lines.extend(_pairing_notes(old_ctx, new_ctx, pair_counts))
+    lines += [
         "",
         "### SUMMARY",
         f"  ADDED     {len(added)}",
@@ -931,6 +978,12 @@ def register_diff_tools(app, session_manager, cache, runner):
                 deltas = _score_modified(of, nf, old_ctx, new_ctx, mode)
                 modified.append((of, nf, "modified-renamed", deltas))
 
+            pair_counts = {
+                "name": len(phase1_pairs),
+                "hash": len(phase2_pairs),
+                "callee": len(phase3_pairs),
+            }
+
             coverage_line = _record_examinations(
                 cache,
                 old_path,
@@ -959,6 +1012,7 @@ def register_diff_tools(app, session_manager, cache, runner):
                     list_limit=list_limit if bounded else 0,
                     min_score=min_score if bounded else 0.0,
                     full_report_path=full_path,
+                    pair_counts=pair_counts,
                 )
 
             truncates = (

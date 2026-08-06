@@ -283,3 +283,60 @@ def test_clean_cache_preserves_notes_sidecar(server_with_temp_cache, tmp_path):
 
     assert notes.exists()
     assert "hi" in notes.read_text()
+
+
+class TestTempOutputPath:
+    """The Ghidra script's JSON output is run-scoped, not name-scoped.
+
+    ``temp_analysis_<stem>.json`` was shared by every run on a binary of that
+    name. The window between the Jython script writing it and the parent
+    reading it back spans the whole JVM teardown, so two concurrent runs on
+    same-named binaries could have one parent load the other's context and
+    cache it under the wrong content hash -- and a diff of the two would then
+    report them identical. An old and a new build of one DLL is the patch-diff
+    case, so same-stem concurrency is the normal case here, not a corner.
+    """
+
+    def test_two_calls_never_collide(self, server_with_temp_cache, tmp_path):
+        server_module, _ = server_with_temp_cache
+        cache = server_module.cache
+
+        first = cache.temp_output_path("/old/tquery.dll")
+        second = cache.temp_output_path("/new/tquery.dll")
+        again = cache.temp_output_path("/old/tquery.dll")
+
+        assert first != second
+        assert first != again
+        assert len({first, second, again}) == 3
+
+    def test_path_stays_in_the_cache_dir_and_keeps_the_stem(
+        self, server_with_temp_cache
+    ):
+        server_module, cache_dir = server_with_temp_cache
+        path = server_module.cache.temp_output_path("/samples/tquery.dll")
+
+        assert path.parent == cache_dir
+        # The stem stays for human legibility when one is left behind.
+        assert path.name.startswith("temp_analysis_tquery_")
+        assert path.suffix == ".json"
+
+    def test_a_pathless_name_still_produces_a_usable_path(
+        self, server_with_temp_cache
+    ):
+        server_module, cache_dir = server_with_temp_cache
+        path = server_module.cache.temp_output_path("")
+
+        assert path.parent == cache_dir
+        assert path.name.startswith("temp_analysis_binary_")
+
+    def test_clear_all_still_sweeps_a_leaked_temp_file(
+        self, server_with_temp_cache
+    ):
+        """Unique names must not escape the wipe that used to catch the shared one."""
+        server_module, cache_dir = server_with_temp_cache
+        leaked = server_module.cache.temp_output_path("/samples/tquery.dll")
+        leaked.write_text("{}")
+
+        server_module.cache.clear_all()
+
+        assert not leaked.exists()

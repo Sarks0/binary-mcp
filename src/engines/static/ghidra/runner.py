@@ -609,6 +609,8 @@ class GhidraRunner:
         enable_fid: bool = False,
         max_heap_mb: int | None = None,
         analysis_depth: str = "full",
+        on_spawn=None,
+        force_decompile: bool = False,
     ) -> dict:
         """
         Run Ghidra headless analysis on a binary.
@@ -697,7 +699,16 @@ class GhidraRunner:
                 f"Invalid analysis_depth {analysis_depth!r}; "
                 "expected 'full', 'structural', or 'shallow'"
             )
-        if analysis_depth in ("structural", "shallow") or skip_decompile:
+        # `force_decompile` is for the targeted single-function run: it needs a
+        # body for one address on a cache that is deliberately structural
+        # overall. Without it that run asks Ghidra to skip decompilation --
+        # which is the entire point of the call -- and then reports the
+        # function as undecompilable. Raising `analysis_depth` instead would
+        # work for Ghidra but re-tag the merged cache as "full", so every other
+        # function in it would stop taking the recovery path.
+        if not force_decompile and (
+            analysis_depth in ("structural", "shallow") or skip_decompile
+        ):
             env["GHIDRA_SKIP_DECOMPILE"] = "1"
         env["GHIDRA_ANALYSIS_DEPTH"] = analysis_depth
         if resume_from_cache:
@@ -840,6 +851,17 @@ class GhidraRunner:
                 # Windows ignores start_new_session; we use taskkill /T instead.
                 start_new_session=(os.name != "nt"),
             )
+
+            # Publish the pid before we block on it. If this process dies
+            # during `communicate` -- which is exactly what happens when a
+            # client abandons a call and the server is torn down -- the pid
+            # recorded here is the only handle anyone has left on the Ghidra
+            # tree, and a sweep from another process uses it to reap.
+            if on_spawn is not None:
+                try:
+                    on_spawn(proc.pid)
+                except Exception as exc:  # never let bookkeeping kill analysis
+                    logger.warning("on_spawn hook failed for pid %s: %s", proc.pid, exc)
 
             try:
                 stdout, stderr = proc.communicate(timeout=timeout)

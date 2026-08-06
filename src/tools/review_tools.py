@@ -97,27 +97,31 @@ def _load_context(binary_path: str, cache, runner):
     if cached:
         return cached, bp
 
-    output_path = cache.cache_dir / f"temp_analysis_{Path(bp).stem}.json"
+    output_path = cache.temp_output_path(bp)
     script_path = Path(__file__).parent.parent / "engines" / "static" / "ghidra" / "scripts"
     timeout = get_config_int("GHIDRA_TIMEOUT", 1800)
     timeout = validate_numeric_range(timeout, 30, 3600, "GHIDRA_TIMEOUT")
 
-    runner.analyze(
-        binary_path=bp,
-        script_path=str(script_path),
-        script_name="core_analysis.py",
-        output_path=str(output_path),
-        keep_project=True,
-        timeout=timeout,
-    )
-    if not output_path.exists():
-        raise RuntimeError("Ghidra did not produce output.")
+    # The temp output is run-scoped, so cleanup has to happen on the failure
+    # paths too -- otherwise every failed run leaves a fresh copy behind.
+    try:
+        runner.analyze(
+            binary_path=bp,
+            script_path=str(script_path),
+            script_name="core_analysis.py",
+            output_path=str(output_path),
+            keep_project=True,
+            timeout=timeout,
+        )
+        if not output_path.exists():
+            raise RuntimeError("Ghidra did not produce output.")
 
-    with open(output_path, encoding="utf-8") as f:
-        context = json.load(f)
-    cache.save_cached(bp, context)
-    output_path.unlink(missing_ok=True)
-    return context, bp
+        with open(output_path, encoding="utf-8") as f:
+            context = json.load(f)
+        cache.save_cached(bp, context)
+        return context, bp
+    finally:
+        output_path.unlink(missing_ok=True)
 
 
 # get_param_sinks helpers

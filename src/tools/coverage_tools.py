@@ -13,6 +13,7 @@ Tools
 ``get_next_unreviewed``  -- deterministic worklist, ascending address.
 ``coverage_index``       -- explicit (re)index; normally automatic.
 ``mark_function_reviewed`` -- manual mark / unmark, optional findings note.
+``mark_functions_examined`` -- bulk-record a machine pass; never a review.
 ``reset_coverage``       -- clear the marks; the undo for a contaminated ledger.
 
 Auto-marking
@@ -28,6 +29,15 @@ per-function analysis of it. Everything else -- ``get_functions``,
 sweep -- does NOT auto-mark. Seeing a function in a list is not reviewing it,
 and a regex sweep that "reviewed" 3000 functions would manufacture exactly the
 false completion this store exists to prevent.
+
+Examination
+-----------
+The machine passes record on a separate axis instead. ``diff_binaries`` writes
+an ``examined`` record for every pair it actually scores, and
+``mark_functions_examined`` is the bulk import for a pass run outside the
+server. Neither can move ``reviewed``, ``remaining`` or the worklist -- the
+claim is "a machine found a reason to look here", not "somebody looked".
+That distinction is the point: conflating them is how coverage gets inflated.
 """
 
 from __future__ import annotations
@@ -35,7 +45,11 @@ from __future__ import annotations
 import logging
 
 from src.engines.static.ghidra.coverage_store import (
+    EXAMINATION_EXTERNAL,
+    EXAMINATION_KIND_MEANINGS,
+    EXAMINATION_KINDS,
     SCOPE_VERSION,
+    CoverageError,
     CoverageStore,
     canon_addr,
 )
@@ -53,6 +67,20 @@ logger = logging.getLogger(__name__)
 # Cap on one worklist batch. Large enough for a real pass, small enough that a
 # poll cannot bury the model.
 MAX_WORKLIST = 500
+
+# Cap on one bulk examination import. Far larger than MAX_WORKLIST because the
+# two are bounded by different things: a worklist batch has to fit in a model's
+# context, whereas an examination import is a machine pass reporting what it
+# touched and is only ever read back as a count. A whole-binary diff of a
+# 14000-function DLL must fit in one call, or the caller has to shard it and
+# a partial failure leaves the ledger half-written with no way to tell.
+MAX_EXAMINE_BATCH = 20000
+
+# How many unknown addresses a bulk response echoes back. The full list is
+# useless at import scale and would be the largest thing in the payload; a
+# handful is enough to diagnose the usual cause (addresses from the wrong side
+# of the diff, or a rebased image).
+UNKNOWN_SAMPLE = 10
 
 
 def _untrusted(value):
@@ -90,7 +118,7 @@ def _error(message: str, **extra) -> dict:
 
 
 def _null_counts() -> dict:
-    """The six counts, explicitly null.
+    """The count fields, explicitly null.
 
     Every payload that reports counts starts from this, so a key is never
     merely absent. A consumer reading `payload.get("total", 0)` off a response
@@ -105,6 +133,9 @@ def _null_counts() -> dict:
         "reviewed_in_scope": None,
         "remaining": None,
         "remaining_in_scope": None,
+        "examined": None,
+        "examined_in_scope": None,
+        "examined_unreviewed": None,
     }
 
 
@@ -167,7 +198,7 @@ def register_coverage_tools(app, session_manager, cache, runner=None):
             ``indexed_at`` and ``status``.
 
             ``status`` is ``ready`` | ``not_indexed`` | ``indexing`` |
-            ``stale``. On anything other than ``ready`` **all six counts are
+            ``stale``. On anything other than ``ready`` **every count is
             null, never zero** -- zero would read as "complete" and terminate a
             review loop on a binary nobody has looked at. Treat a non-ready
             status as "cannot conclude", not "done".
@@ -181,6 +212,15 @@ def register_coverage_tools(app, session_manager, cache, runner=None):
             not be parsed. It is 0 on every binary seen so far; a non-zero value
             means ``total`` under-counts the binary by that much and no
             completion claim should be made on it.
+
+            ``examined``, ``examined_in_scope`` and ``examined_unreviewed``
+            report the separate machine-examination axis, with a per-kind
+            ``examined_by_kind`` breakdown. **An examination is not a review.**
+            A diff that paired and scored a function examined it; nobody read
+            it. These counts never move ``reviewed`` or ``remaining``, and a
+            binary with ``examined == total`` and ``reviewed == 0`` has been
+            entirely machine-touched and entirely unread. Read
+            ``examined_unreviewed`` as the size of the lead queue.
         """
         try:
             resolved_id, resolved_path = _resolve(binary_id, binary_path)
@@ -201,6 +241,7 @@ def register_coverage_tools(app, session_manager, cache, runner=None):
             "module_name": None,
             "image_base": None,
             **_null_counts(),
+            "examined_by_kind": None,
             "dropped_address_count": None,
             "scope_description": None,
             "scope_version": SCOPE_VERSION,
@@ -232,6 +273,7 @@ def register_coverage_tools(app, session_manager, cache, runner=None):
                 "scope_version": record.get("scope_version"),
                 "indexed_at": record.get("indexed_at"),
                 "dropped_address_count": record.get("dropped_address_count"),
+                "examined_by_kind": store.examination_breakdown(record),
                 "status": status,
             }
         )
@@ -244,6 +286,7 @@ def register_coverage_tools(app, session_manager, cache, runner=None):
         count: int = 20,
         scope: str = "in_scope",
         binary_path: str | None = None,
+        only_examined: bool = False,
     ) -> dict:
         """
         Return the next batch of functions that have not been reviewed yet.
@@ -260,15 +303,25 @@ def register_coverage_tools(app, session_manager, cache, runner=None):
                 functions. Excluded functions stay retrievable through
                 ``"all"`` precisely so an under-counted scope cannot hide work.
             binary_path: Optional path alternative to ``binary_id``.
+            only_examined: Restrict the queue to functions a machine pass has
+                already flagged -- the diff-paired, sweep-hit leads that nobody
+                has read. This is a **narrowing filter, not a shorter path to
+                closure**: emptying it means the leads are read, not that the
+                binary is. ``remaining_after`` then counts what is left in the
+                filtered queue, and the unfiltered remainder is reported
+                separately as ``remaining_unfiltered`` so an empty lead queue
+                cannot be mistaken for a finished binary.
 
         Returns:
-            JSON with ``binary_id``, ``scope``, ``returned``,
-            ``remaining_after`` and a ``functions`` list of
-            ``{address, name, size, in_scope, scope_reason}``.
+            JSON with ``binary_id``, ``scope``, ``only_examined``, ``returned``,
+            ``remaining_after``, ``remaining_unfiltered`` and a ``functions``
+            list of ``{address, name, size, in_scope, scope_reason, examined,
+            examination_kind, examination_note}``.
 
             ``functions: []`` with ``remaining_after: 0`` is the terminal
-            condition. A ``status`` other than ``ready`` means the binary is not
-            indexed -- do not read an empty list as completion.
+            condition **only when ``only_examined`` is false**. A ``status``
+            other than ``ready`` means the binary is not indexed -- do not read
+            an empty list as completion.
         """
         if scope not in ("in_scope", "all"):
             return _error(f"scope must be 'in_scope' or 'all', got {scope!r}")
@@ -296,26 +349,39 @@ def register_coverage_tools(app, session_manager, cache, runner=None):
             return {
                 "binary_id": resolved_id,
                 "scope": scope,
+                "only_examined": only_examined,
                 "returned": 0,
                 "remaining_after": None,
+                "remaining_unfiltered": None,
                 "functions": [],
                 "status": status,
             }
 
         functions = record.get("functions") or {}
-        pending = [
+        unfiltered = [
             (int(addr, 16), addr, entry)
             for addr, entry in functions.items()
             if not entry.get("reviewed") and (scope == "all" or entry.get("in_scope"))
         ]
+        pending = (
+            [item for item in unfiltered if item[2].get("examined")]
+            if only_examined
+            else unfiltered
+        )
         pending.sort(key=lambda item: item[0])
 
         batch = pending[:count]
         return {
             "binary_id": resolved_id,
             "scope": scope,
+            "only_examined": only_examined,
             "returned": len(batch),
             "remaining_after": len(pending) - len(batch),
+            # Always the whole unreviewed queue, filter or no filter. A caller
+            # that narrowed to the leads and drained them has finished the
+            # leads; this is the number that says how much of the binary is
+            # still unread, so an empty batch cannot be read as closure.
+            "remaining_unfiltered": len(unfiltered),
             "functions": [
                 {
                     "address": addr,
@@ -323,6 +389,9 @@ def register_coverage_tools(app, session_manager, cache, runner=None):
                     "size": entry.get("size"),
                     "in_scope": bool(entry.get("in_scope")),
                     "scope_reason": entry.get("scope_reason"),
+                    "examined": bool(entry.get("examined")),
+                    "examination_kind": entry.get("examination_kind"),
+                    "examination_note": entry.get("examination_note"),
                 }
                 for _, addr, entry in batch
             ],
@@ -342,7 +411,11 @@ def register_coverage_tools(app, session_manager, cache, runner=None):
         the scope algorithm, or to pre-warm the ledger.
 
         Review marks are preserved across a rebuild -- an address that was
-        reviewed stays reviewed, with its original timestamp and note.
+        reviewed stays reviewed, with its original timestamp and note. So are
+        examinations, and independently of the review mark: a diff-flagged lead
+        nobody has read yet is exactly the state worth keeping across an
+        incremental re-analysis, and it is the state where ``reviewed`` is
+        false.
 
         Args:
             binary_path: Path to a binary that has already been analyzed.
@@ -384,6 +457,7 @@ def register_coverage_tools(app, session_manager, cache, runner=None):
             "scope_version": record.get("scope_version"),
             "indexed_at": record.get("indexed_at"),
             "dropped_address_count": record.get("dropped_address_count"),
+            "examined_by_kind": store.examination_breakdown(record),
             "status": "ready",
         }
         payload.update(store.counts(record))
@@ -466,10 +540,145 @@ def register_coverage_tools(app, session_manager, cache, runner=None):
         return payload
 
     @app.tool()
+    def mark_functions_examined(
+        functions: str,
+        kind: str = EXAMINATION_EXTERNAL,
+        binary_id: str | None = None,
+        binary_path: str | None = None,
+        note: str | None = None,
+        examined: bool = True,
+    ) -> dict:
+        """
+        Bulk-record that a machine pass examined these functions. NOT a review.
+
+        The honest import path for analysis that ran outside binary-mcp's
+        tool surface -- a script driving the Ghidra caches directly, BinDiff,
+        Diaphora, an external sink extractor. Those passes genuinely touch
+        thousands of functions, and until now the only way to record them was
+        ``mark_function_reviewed``, which would have claimed somebody read
+        thousands of function bodies. This records what actually happened.
+
+        **An examination never becomes a review.** It does not move
+        ``reviewed``, does not shrink ``remaining``, and does not remove a
+        function from ``get_next_unreviewed``. What it does is mark which of
+        the unreviewed functions a machine already found a reason to look at,
+        retrievable with ``get_next_unreviewed(only_examined=True)``. Use
+        ``mark_function_reviewed`` when a body was genuinely read.
+
+        Args:
+            functions: Comma-separated addresses
+                (``"0x140006d8c,140001010"``). Addresses only -- names are
+                ambiguous across a binary and the ledger is keyed by address.
+                Up to 20000 per call, so a whole-binary diff fits in one.
+            kind: What kind of pass this was. One of ``"diff"`` (paired against
+                a twin and the delta scored), ``"sweep"`` (a whole-binary
+                pattern hit) or ``"external"`` (default -- a machine pass
+                outside binary-mcp). Rejected if unrecognized: a free-form
+                value would let a caller invent something that reads like a
+                review and park it where the counts do not police it.
+            binary_id: Lowercase sha256 hexdigest of the binary's bytes.
+            binary_path: Optional path alternative to ``binary_id``.
+            note: What the pass concluded, stored against every listed
+                function. Worth setting -- ``"lock/sink candidate from the
+                KB5044273 twin-pair diff"`` is what makes the record
+                auditable six weeks later.
+            examined: Set False to clear the examination (a pass retracted, or
+                pointed at the wrong pair).
+
+        Returns:
+            JSON with ``requested`` / ``marked`` / ``already`` / ``unknown``
+            **as counts, not lists** -- at import scale the address lists are
+            the largest thing in the payload and are only ever read back as
+            totals. Up to 10 unknown addresses are echoed in
+            ``unknown_sample`` because that is enough to diagnose the usual
+            cause: addresses taken from the wrong side of the diff, or from a
+            rebased image. Also carries the refreshed counts and
+            ``examined_by_kind``.
+
+            Marking is idempotent, and the first examination wins for the
+            timestamp and kind -- re-running a diff does not rewrite when a
+            function was first flagged.
+        """
+        if examined and kind not in EXAMINATION_KINDS:
+            return _error(
+                f"kind must be one of {', '.join(EXAMINATION_KINDS)}, got {kind!r}",
+                kind_meanings=EXAMINATION_KIND_MEANINGS,
+            )
+        try:
+            resolved_id, resolved_path = _resolve(binary_id, binary_path)
+        except ValueError as exc:
+            return _error(str(exc))
+        except (PathTraversalError, FileSizeError, FileNotFoundError) as exc:
+            return _error(safe_path_error("mark_functions_examined", exc, "binary path"))
+
+        if not resolved_id:
+            return _error("No binary resolved. Pass binary_id or binary_path.")
+
+        requested = [item.strip() for item in (functions or "").split(",") if item.strip()]
+        if not requested:
+            return _error("No functions specified. Provide comma-separated addresses.")
+        if len(requested) > MAX_EXAMINE_BATCH:
+            return _error(
+                f"Too many functions ({len(requested)}); maximum is "
+                f"{MAX_EXAMINE_BATCH} per call."
+            )
+
+        malformed = [item for item in requested if not canon_addr(item)]
+        if malformed:
+            return _error(
+                f"{len(malformed)} entr(ies) are not valid hex addresses: "
+                + ", ".join(malformed[:5]),
+                hint="Pass addresses like 0x140006d8c, not function names.",
+            )
+
+        try:
+            record, status = store.ensure_indexed(resolved_id, resolved_path)
+            if record is None:
+                return _error(
+                    "Binary has not been analyzed yet. Run analyze_binary first.",
+                    binary_id=resolved_id,
+                    status=status,
+                )
+            result = store.mark_examined(
+                resolved_id,
+                requested,
+                kind=kind,
+                tool="mark_functions_examined",
+                note=note,
+                examined=examined,
+            )
+            refreshed = store.read(resolved_id) or record
+        except CoverageError as exc:
+            return _error(str(exc))
+        except Exception as exc:
+            logger.exception("mark_functions_examined failed")
+            return _error(safe_tool_error("mark_functions_examined", exc))
+
+        payload = {
+            "binary_id": resolved_id,
+            "status": status,
+            "kind": kind if examined else None,
+            # Not "examined": that key is the *count* of examined functions,
+            # and `payload.update(counts)` below would overwrite a boolean
+            # flag parked there with an int, silently.
+            "action": "examined" if examined else "cleared",
+            "requested": len(requested),
+            "marked": len(result["marked"]),
+            "already": len(result["already"]),
+            "unknown": len(result["unknown"]),
+            "unknown_sample": result["unknown"][:UNKNOWN_SAMPLE],
+            "examined_by_kind": store.examination_breakdown(refreshed),
+        }
+        payload.update(store.counts(refreshed))
+        return payload
+
+    @app.tool()
     def reset_coverage(
         binary_id: str | None = None,
         binary_path: str | None = None,
         drop_index: bool = False,
+        clear_reviewed: bool = True,
+        clear_examined: bool = True,
     ) -> dict:
         """
         Clear the review marks for a binary. The undo for a contaminated ledger.
@@ -491,13 +700,24 @@ def register_coverage_tools(app, session_manager, cache, runner=None):
                 next query re-indexes from the analysis cache. Use when the
                 index itself is suspect, not just the marks. Refused when the
                 analysis cache is gone, because then nothing can rebuild it.
+                Takes both axes with it regardless of the two flags below --
+                there is no record left to hold either.
+            clear_reviewed: Clear the review marks (default true).
+            clear_examined: Clear the machine examinations (default true).
+                Separate flags because the two axes contaminate independently:
+                a diff pointed at the wrong pair floods the examinations while
+                the reviews stay honest, and a bad review sweep leaves the
+                examinations perfectly good. Clearing one must not cost the
+                other. Set both false and this is a no-op that still reports
+                the counts.
 
         Returns:
-            JSON with ``cleared`` (how many functions had a mark or note),
+            JSON with ``cleared`` (how many functions had a review mark or
+            note), ``cleared_examined`` (how many had an examination),
             ``dropped`` (whether the record was deleted) and the refreshed
             counts. Clearing an already-clean ledger reports ``cleared: 0``
-            rather than failing. The six count keys are always present, null
-            when no record could be read.
+            rather than failing. Every count key is always present, null when
+            no record could be read.
         """
         try:
             resolved_id, resolved_path = _resolve(binary_id, binary_path)
@@ -536,11 +756,15 @@ def register_coverage_tools(app, session_manager, cache, runner=None):
                     binary_id=resolved_id,
                     binary_path=existing.get("binary_path") or resolved_path,
                     cleared=0,
+                    cleared_examined=0,
                     dropped=False,
                     status="stale",
                     **_null_counts(),
                 )
-            cleared = store.reset_marks(resolved_id)
+            cleared = store.reset_marks(resolved_id) if clear_reviewed else 0
+            cleared_examined = (
+                store.reset_examinations(resolved_id) if clear_examined else 0
+            )
             dropped = store.drop(resolved_id) if drop_index else False
             record, status = store.ensure_indexed(resolved_id, resolved_path)
         except Exception as exc:
@@ -551,12 +775,15 @@ def register_coverage_tools(app, session_manager, cache, runner=None):
             "binary_id": resolved_id,
             "binary_path": (record or {}).get("binary_path") or resolved_path,
             "cleared": cleared,
+            "cleared_examined": cleared_examined,
             "dropped": dropped,
             **_null_counts(),
+            "examined_by_kind": None,
             "status": status if record is not None else "not_indexed",
         }
         if record is not None:
             payload.update(store.counts(record))
+            payload["examined_by_kind"] = store.examination_breakdown(record)
         return payload
 
-    logger.info("Registered 5 coverage tools")
+    logger.info("Registered 6 coverage tools")

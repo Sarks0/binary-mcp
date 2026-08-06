@@ -992,6 +992,13 @@ _SAMPLE_TEXT_MODULES = {
 # a module drifting into neither set and being silently unasserted.
 _NO_SAMPLE_TEXT_MODULES: dict[str, str] = {
     "error_hygiene": "helper module, defines no tools and returns no sample text",
+    # job_tools constructs no sample-derived text of its own: job_result hands
+    # back the payload the PRODUCING tool put in the job record, and job_tools
+    # cannot know which of a payload's fields came from the binary. The fence
+    # therefore lives with the producer, in src/server.py, and
+    # test_job_result_payloads_are_fenced_by_their_producer below is what stops
+    # this entry from being a way to opt out.
+    "job_tools": "relays a payload fenced by its producer in src/server.py",
 }
 
 # Either mechanism discharges the obligation:
@@ -1554,3 +1561,57 @@ def test_report_excerpts_show_content_not_envelope_boilerplate():
     )
     assert "ATTACKER-CONTROLLED content authored by" not in report
     assert "BEGIN UNTRUSTED SAMPLE DATA" not in report
+
+
+def test_job_result_payloads_are_fenced_by_their_producer():
+    """job_tools is exempt only because the producers fence. Prove they do.
+
+    ``job_result`` returns the dict a background job stored, and the decompile
+    job stores ``pseudocode`` -- a whole decompiled function body, the canonical
+    injection vector for this server. job_tools cannot fence it because it
+    cannot know which fields of an arbitrary payload came from the binary, so
+    the obligation sits with ``_submit_analysis_job`` / ``_submit_decompile_job``
+    in src/server.py. Without this test, listing job_tools as exempt would be a
+    way to lose the fence entirely.
+    """
+    import ast
+
+    src = (
+        Path(__file__).resolve().parent.parent / "src" / "server.py"
+    ).read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    funcs = {
+        n.name: n
+        for n in ast.walk(tree)
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+    expectations = {
+        # field -> (producer, required mechanism)
+        "pseudocode": ("_submit_decompile_job", "wrap_untrusted"),
+        "module_name": ("_submit_analysis_job", "neutralise_untrusted_delimiters"),
+    }
+    for field, (producer, mechanism) in expectations.items():
+        assert producer in funcs, (
+            f"{producer} no longer exists; job payload fencing is now unasserted"
+        )
+        node = funcs[producer]
+        entry = next(
+            (
+                kv
+                for d in ast.walk(node)
+                if isinstance(d, ast.Dict)
+                for k, kv in zip(d.keys, d.values)
+                if isinstance(k, ast.Constant) and k.value == field
+            ),
+            None,
+        )
+        assert entry is not None, (
+            f"{producer} no longer returns a {field!r} field; update this guard "
+            "rather than letting it assert nothing"
+        )
+        assert mechanism in ast.unparse(entry), (
+            f"{producer} stores {field!r} in the job record without "
+            f"{mechanism}. job_result relays it to the model verbatim, and "
+            "job_tools is listed as exempt on the promise that this fence exists"
+        )

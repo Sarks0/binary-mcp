@@ -90,3 +90,9 @@ security/
 DEVELOPMENT_ROADMAP.md
 WINDBG_INTEGRATION_PLAN.md
 AUDIT.md
+
+# Stray mock-cache trees. `MagicMock.__fspath__()` returns a plausible
+# relative path rather than raising, so a mocked cache_dir can become a real
+# directory if any code path creates one. The code no longer does; this is the
+# tripwire, because these names contain characters Windows cannot check out.
+MagicMock/

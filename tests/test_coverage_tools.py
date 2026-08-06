@@ -42,6 +42,14 @@ COUNT_FIELDS = (
     "reviewed_in_scope",
     "remaining",
     "remaining_in_scope",
+    # The examination axis. Additive: the six above are the contract a
+    # consumer binds to and are unchanged, but these obey the same
+    # null-not-zero rule -- a machine-examination count of 0 on an unindexed
+    # binary reads as "the diff found nothing", which is a different and
+    # equally wrong conclusion from "nobody has run one".
+    "examined",
+    "examined_in_scope",
+    "examined_unreviewed",
 )
 
 
@@ -116,6 +124,7 @@ def tools(tmp_path):
             self.next = app.tools["get_next_unreviewed"]
             self.index = app.tools["coverage_index"]
             self.mark = app.tools["mark_function_reviewed"]
+            self.examine = app.tools["mark_functions_examined"]
             self.reset = app.tools["reset_coverage"]
 
         def analyze(self, functions, exports=None):
@@ -307,7 +316,16 @@ class TestWorklist:
         tools.three_functions()
         payload = _payload(tools.next(binary_id=tools.binary_id, count=1))
         entry = payload["functions"][0]
-        assert set(entry) == {"address", "name", "size", "in_scope", "scope_reason"}
+        assert set(entry) == {
+            "address",
+            "name",
+            "size",
+            "in_scope",
+            "scope_reason",
+            "examined",
+            "examination_kind",
+            "examination_note",
+        }
         assert entry["address"].startswith("0x")
         assert entry["in_scope"] is True
 
@@ -741,3 +759,147 @@ class TestAutoMarkingSet:
         assert second["reviewed_at"] == first["reviewed_at"]
         assert second["reviewed_by"] == "batch_decompile"
         assert tools.store.counts(tools.store.read(tools.binary_id))["reviewed"] == 1
+
+
+class TestExaminationTool:
+    """`mark_functions_examined` is the honest bulk-import path for a machine
+    pass that ran outside the server. Its one hard requirement is that it can
+    never become a review, however it is called."""
+
+    def test_examining_never_moves_the_review_counts(self, tools):
+        tools.three_functions()
+        payload = _payload(
+            tools.examine(functions="0x140001000,0x140002000", binary_id=tools.binary_id)
+        )
+        assert payload["marked"] == 2
+        assert payload["examined"] == 2
+        assert payload["reviewed"] == 0
+        assert payload["remaining"] == payload["total"] == 3
+        _assert_contract_invariants(payload)
+
+    def test_bulk_response_reports_counts_not_address_lists(self, tools):
+        """At import scale the address lists are the largest thing in the
+        payload and are only ever read back as totals."""
+        tools.three_functions()
+        payload = _payload(
+            tools.examine(functions="0x140001000", binary_id=tools.binary_id)
+        )
+        for field in ("requested", "marked", "already", "unknown"):
+            assert isinstance(payload[field], int), field
+        assert payload["unknown_sample"] == []
+
+    def test_unknown_addresses_are_sampled_not_dumped(self, tools):
+        tools.three_functions()
+        bogus = ",".join(f"0x14009{i:04x}" for i in range(30))
+        payload = _payload(tools.examine(functions=bogus, binary_id=tools.binary_id))
+        assert payload["unknown"] == 30
+        assert len(payload["unknown_sample"]) == 10
+        assert payload["examined"] == 0
+
+    def test_unknown_kind_is_refused_with_the_vocabulary(self, tools):
+        tools.three_functions()
+        payload = _payload(
+            tools.examine(
+                functions="0x140001000", kind="reviewed", binary_id=tools.binary_id
+            )
+        )
+        assert "error" in payload
+        assert "kind_meanings" in payload
+
+    def test_kind_shows_up_in_the_status_breakdown(self, tools):
+        tools.three_functions()
+        tools.examine(
+            functions="0x140001000", kind="diff", binary_id=tools.binary_id,
+            note="MODIFIED vs old.sys",
+        )
+        payload = _payload(tools.status(binary_id=tools.binary_id))
+        assert payload["examined_by_kind"]["diff"] == 1
+        assert payload["examined_by_kind"]["sweep"] == 0
+        assert payload["examined_unreviewed"] == 1
+
+    def test_batch_cap_admits_a_whole_binary_diff(self, tools):
+        """A 14000-function DLL's diff must fit in one call: sharding it means
+        a partial failure leaves the ledger half-written with no way to tell."""
+        from src.tools.coverage_tools import MAX_EXAMINE_BATCH
+
+        assert MAX_EXAMINE_BATCH >= 15000
+        tools.three_functions()
+        too_many = ",".join("0x140001000" for _ in range(MAX_EXAMINE_BATCH + 1))
+        payload = _payload(tools.examine(functions=too_many, binary_id=tools.binary_id))
+        assert "error" in payload
+
+
+class TestExaminedWorklist:
+    def test_only_examined_narrows_to_the_leads(self, tools):
+        tools.three_functions()
+        tools.examine(functions="0x140002000", kind="diff", binary_id=tools.binary_id)
+        payload = _payload(
+            tools.next(binary_id=tools.binary_id, only_examined=True, scope="all")
+        )
+        assert [f["address"] for f in payload["functions"]] == ["0x140002000"]
+        assert payload["functions"][0]["examination_kind"] == "diff"
+
+    def test_examined_function_stays_in_the_unfiltered_worklist(self, tools):
+        """An examination is not a review, so it must not remove work."""
+        tools.three_functions()
+        tools.examine(functions="0x140002000", kind="diff", binary_id=tools.binary_id)
+        payload = _payload(tools.next(binary_id=tools.binary_id, scope="all"))
+        assert "0x140002000" in [f["address"] for f in payload["functions"]]
+
+    def test_empty_lead_queue_is_not_closure(self, tools):
+        """Draining the leads finishes the leads. `remaining_unfiltered` is
+        what stops that being read as finishing the binary."""
+        tools.three_functions()
+        payload = _payload(
+            tools.next(binary_id=tools.binary_id, only_examined=True, scope="all")
+        )
+        assert payload["functions"] == []
+        assert payload["remaining_after"] == 0
+        assert payload["remaining_unfiltered"] == 3
+
+    def test_reviewed_leads_leave_the_queue(self, tools):
+        tools.three_functions()
+        tools.examine(functions="0x140002000", kind="diff", binary_id=tools.binary_id)
+        tools.mark(functions="0x140002000", binary_id=tools.binary_id)
+        payload = _payload(
+            tools.next(binary_id=tools.binary_id, only_examined=True, scope="all")
+        )
+        assert payload["functions"] == []
+
+
+class TestResetAxes:
+    def test_reset_clears_both_axes_by_default(self, tools):
+        tools.three_functions()
+        tools.examine(functions="0x140001000", kind="diff", binary_id=tools.binary_id)
+        tools.mark(functions="0x140002000", binary_id=tools.binary_id)
+        payload = _payload(tools.reset(binary_id=tools.binary_id))
+        assert payload["cleared"] == 1
+        assert payload["cleared_examined"] == 1
+        assert payload["reviewed"] == 0
+        assert payload["examined"] == 0
+
+    def test_clearing_examinations_spares_the_reviews(self, tools):
+        """A diff pointed at the wrong pair floods one axis while the other
+        stays honest."""
+        tools.three_functions()
+        tools.examine(functions="0x140001000", kind="diff", binary_id=tools.binary_id)
+        tools.mark(functions="0x140002000", binary_id=tools.binary_id)
+        payload = _payload(
+            tools.reset(binary_id=tools.binary_id, clear_reviewed=False)
+        )
+        assert payload["cleared"] == 0
+        assert payload["cleared_examined"] == 1
+        assert payload["reviewed"] == 1
+        assert payload["examined"] == 0
+
+    def test_clearing_reviews_spares_the_examinations(self, tools):
+        tools.three_functions()
+        tools.examine(functions="0x140001000", kind="diff", binary_id=tools.binary_id)
+        tools.mark(functions="0x140002000", binary_id=tools.binary_id)
+        payload = _payload(
+            tools.reset(binary_id=tools.binary_id, clear_examined=False)
+        )
+        assert payload["cleared"] == 1
+        assert payload["cleared_examined"] == 0
+        assert payload["reviewed"] == 0
+        assert payload["examined"] == 1

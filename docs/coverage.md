@@ -17,9 +17,10 @@ unfalsifiable. With one it is arithmetic.
 | `get_next_unreviewed` | deterministic worklist, ascending address |
 | `coverage_index` | explicit (re)index; normally automatic |
 | `mark_function_reviewed` | manual mark / unmark, optional findings note |
+| `mark_functions_examined` | bulk-record a machine pass; never a review |
 | `reset_coverage` | clear every mark for a binary, or drop the record entirely |
 
-These five return a **flat JSON object**, unlike the rest of the server, because
+These six return a **flat JSON object**, unlike the rest of the server, because
 consumers bind to the field names and assert invariants on the counts.
 
 They return a `dict`, not a serialized string, and that is load-bearing: FastMCP
@@ -46,6 +47,10 @@ Errors use the same flat shape, carrying an `error` key.
   "reviewed_in_scope": 6,
   "remaining": 250,
   "remaining_in_scope": 242,
+  "examined": 31,
+  "examined_in_scope": 31,
+  "examined_unreviewed": 27,
+  "examined_by_kind": { "diff": 31, "sweep": 0, "external": 0 },
   "dropped_address_count": 0,
   "scope_description": "forward BFS over cached called_functions from …",
   "scope_version": "fwd-bfs-v2",
@@ -60,16 +65,16 @@ returning bad numbers:
 - `remaining == total - reviewed`
 - `remaining_in_scope == in_scope_total - reviewed_in_scope`
 - `in_scope_total <= total`, `reviewed_in_scope <= reviewed`
-- all six counts are non-negative integers
+- all counts are non-negative integers
 - `total + dropped_address_count == source_function_count` — the only one of
   these that compares the denominator against something it did not derive
   itself; see [`dropped_address_count`](#dropped_address_count)
 
 `status` is `ready` | `not_indexed` | `indexing` | `stale`.
 
-On `not_indexed`, **all six counts are null, never zero.** Zero would read as
-"complete" and terminate a review loop on a binary nobody has looked at, which
-is the precise failure this store exists to prevent. Treat any non-`ready`
+On `not_indexed`, **every count is null, never zero** — the examination counts
+included. Zero would read as "complete" and terminate a review loop on a binary
+nobody has looked at, which is the precise failure this store exists to prevent. Treat any non-`ready`
 status as "cannot conclude", never as "done".
 
 `stale` means the analysis cache this ledger counted has been evicted. It still
@@ -83,7 +88,7 @@ assert whenever `total is not None`, not only on `ready`.
 There is deliberately no `reviewed_list` on this response — an 885-entry array
 on every poll saturates a model's context. Use `get_next_unreviewed`.
 
-### `get_next_unreviewed(binary_id=None, count=20, scope="in_scope", binary_path=None)`
+### `get_next_unreviewed(binary_id=None, count=20, scope="in_scope", binary_path=None, only_examined=False)`
 
 Ordered by ascending numeric address. A client that crashes mid-batch and
 re-calls gets the same head of the queue, and makes forward progress once those
@@ -92,6 +97,9 @@ condition — but only when `status == "ready"`.
 
 `scope="all"` includes thunk / library / unreachable functions. They stay
 retrievable precisely so an under-counted scope cannot hide work.
+
+`only_examined=True` narrows to the machine-flagged leads — see
+[the lead queue](#the-lead-queue).
 
 ## Auto-marking
 
@@ -138,6 +146,122 @@ overwritten.
 
 Use `mark_function_reviewed` for work done outside binary-mcp — a Ghidra GUI
 session, objdump, a debugger — and to attach a findings note.
+
+None of this changes for a machine pass, because a machine pass does not mark
+reviewed at all. It records on the separate axis below.
+
+## Examination: the second axis
+
+A machine pass is not a review, and the ledger says so on a separate axis.
+
+| | claim | moves `reviewed` / `remaining` | recorded by |
+|---|---|---|---|
+| `reviewed` | somebody read this function's body | yes | the four auto-markers, `mark_function_reviewed` |
+| `examined` | a machine pass produced a per-function judgement about it | **never** | `diff_binaries`, `mark_functions_examined` |
+
+The two are **orthogonal**, not ordered. A function can be examined and
+unreviewed (a lead nobody has read), reviewed and unexamined, both, or neither.
+`examined` never enters `reviewed`, never shortens `remaining`, and never
+removes a function from `get_next_unreviewed`.
+
+This exists because the alternative was a choice between two lies. A diff that
+pairs 5,958 functions has reviewed none of them, so marking them reviewed
+inflates the denominator by thousands, silently, at exactly the scale where
+nobody can audit it — and marking nothing loses the fact that a pass ran at
+all, which is why script-driven diff work used to be invisible here. The honest
+answer is a column that says what actually happened.
+
+Three kinds, and the vocabulary is closed:
+
+| `kind` | what it claims |
+|---|---|
+| `diff` | paired against a twin by a binary-diff run and its delta scored; the body was not necessarily read |
+| `sweep` | surfaced by a whole-binary pattern sweep (sink extraction, lock analysis, regex scan) — a hit, not a reading |
+| `external` | examined by a machine pass outside binary-mcp — a script driving the caches directly, BinDiff, Diaphora |
+
+An unrecognized `kind` is refused rather than stored. Free-form values let a
+caller invent something that reads like a review (`"audited"`, `"cleared"`) and
+park it in a field the counts do not police.
+
+### Counts
+
+`examined` and `examined_in_scope` sit beside the six, and are additive: the
+six are unchanged, `remaining == total - reviewed` still holds exactly, and a
+consumer mirroring only the six keeps working untouched.
+
+`examined_unreviewed` is the number that drives work — the machine found a
+reason to look at these and nobody has. `examined_by_kind` breaks the total
+down, always carrying every known kind including the zeros, so a consumer
+reading `breakdown["diff"]` never has to guard for a key that vanished when its
+count dropped.
+
+The invariants are bounds, never subtractions: `examined <= total`,
+`examined_in_scope <= min(examined, in_scope_total)`, and
+`examined_unreviewed <= remaining`. That last one is the useful tripwire — every
+examined-and-unreviewed function is by definition one of the unreviewed ones, so
+exceeding `remaining` means the examination set has acquired an address the
+ledger does not have.
+
+A binary showing `examined == total` and `reviewed == 0` has been entirely
+machine-touched and entirely unread. That is a real and common state after a
+diff, and the counts must be able to say it.
+
+### The lead queue
+
+`get_next_unreviewed(only_examined=True)` narrows the worklist to functions a
+machine pass already flagged — read it as "what did the diff tell me to look at
+that I haven't looked at". It is a **narrowing filter, not a shorter path to
+closure**: emptying it means the leads are read, not that the binary is. The
+response therefore always carries `remaining_unfiltered` alongside
+`remaining_after`, so an empty lead queue cannot be mistaken for a finished
+binary the way an empty unfiltered queue legitimately can.
+
+### `diff_binaries`
+
+`diff_binaries` records `kind="diff"` for **the MODIFIED entries only**, on both
+binaries' ledgers — each side to its own record, since the ledger is keyed by
+the sha256 of the file's bytes and cross-writing would land phantom addresses in
+a ledger they do not exist in.
+
+Only MODIFIED, because those are the ones the tool actually analyses per
+function: it scores the bounds-check, stack-cookie, caller-count and size deltas
+and extracts the first changed line for each. ADDED and REMOVED are single-sided
+— a bucket, no pair, no delta — and the unchanged pairs are the ones it
+concluded nothing happened to. Recording either would inflate the examination
+axis with functions nothing analysed, which is the same dishonesty as inflating
+the review axis, one column over.
+
+The report header states what was written. `record_examination=False` gives a
+dry run against a ledger you do not want touched, and coverage failure is
+swallowed — a broken ledger must never cost you the diff.
+
+### Bulk import
+
+`mark_functions_examined` is the import path for a pass that ran outside the
+server: a script driving the Ghidra caches directly, BinDiff, Diaphora, an
+external sink extractor.
+
+Its cap is 20000 addresses per call, far above `mark_function_reviewed`'s 500,
+because the two are bounded by different things — a worklist batch has to fit in
+a model's context, whereas an import is a machine pass reporting what it touched
+and is only ever read back as a count. A whole-binary diff of a
+14000-function DLL has to fit in one call: sharding it means a partial failure
+leaves the ledger half-written with no way to tell.
+
+For the same reason the response reports `requested` / `marked` / `already` /
+`unknown` as **counts, not lists**, with up to ten unknown addresses echoed in
+`unknown_sample` — enough to diagnose the usual cause (addresses taken from the
+wrong side of the diff, or from a rebased image) without making the address dump
+the largest thing in the payload.
+
+Set `note` — `"lock/sink candidate from the KB5044273 twin-pair diff"` is what
+makes the record auditable six weeks later, and it is carried on
+`get_next_unreviewed` entries as `examination_note`.
+
+Marking is idempotent and the first examination wins for `examined_at`,
+`examined_by` and `examination_kind`: re-running a diff does not rewrite when a
+function was first flagged. An explicit `note` always lands, so a later run can
+update why.
 
 ## Scope, and what it cannot see
 
@@ -265,8 +389,12 @@ Indexing happens automatically after `analyze_binary`, and on the first status
 query for a binary that was analyzed before coverage existed. The index rebuilds
 itself when the analysis cache grows (an incremental run), when `scope_version`
 changes, when `schema_version` is older than the current one, or when the
-record's own numbers do not add up — **review marks, timestamps and notes are
-preserved across a rebuild.**
+record's own numbers do not add up — **review marks, examinations, timestamps
+and notes are preserved across a rebuild.**
+
+Examinations survive on their own terms, not the review mark's. The state worth
+preserving across an incremental re-analysis is precisely a diff-flagged lead
+nobody has read yet, and that is the state where `reviewed` is false.
 
 ### Versioning, and what happens to a record we cannot read
 
@@ -274,6 +402,30 @@ Two independent version stamps:
 
 - `schema_version` — the on-disk layout. Validated on read.
 - `scope_version` — how scope was computed. Any mismatch rebuilds.
+
+The current `schema_version` is **4**; the minimum readable is 1. A v2 record
+cannot say a function was machine-examined, so every function in one reads as
+never-examined. That is the safe direction — it under-states the leads rather
+than over-stating the reviews — so v2 records are read and rebuilt with an empty
+examination set, review marks preserved. A v3 record is rebuilt once to
+acquire `source_index_count` — see below.
+
+### The staleness probe compares like with like
+
+`ProjectCache` writes `function_count` into `<sha>.meta.json` as
+`len(_build_function_index(data))` — a dict keyed on the raw address, so a
+function with a falsy address vanishes and duplicates collapse. The record
+stores `source_index_count`, derived exactly the same way, and the probe
+compares those two.
+
+It used to compare the meta value against `source_function_count`, which counts
+the raw function list. Those are different quantities, and on a binary with a
+duplicate address or an address-less function they differ *permanently* — so
+the probe read stale on every status poll and re-indexed forever,
+decompressing the whole analysis cache each time. `source_function_count`
+remains the honest denominator cross-check
+([`dropped_address_count`](#dropped_address_count)); it is simply not what the
+cheap probe compares.
 
 | Stored value | Behaviour |
 |---|---|
@@ -305,8 +457,16 @@ neighbouring binaries with it.
 
 | Call | Effect |
 |---|---|
-| `reset_coverage(binary_path=...)` | clears every mark; keeps the stored function list and scope exactly as built. |
+| `reset_coverage(binary_path=...)` | clears every mark on both axes; keeps the stored function list and scope exactly as built. |
+| `reset_coverage(binary_path=..., clear_reviewed=False)` | clears only the examinations. |
+| `reset_coverage(binary_path=..., clear_examined=False)` | clears only the review marks. |
 | `reset_coverage(binary_path=..., drop_index=True)` | deletes the side-car, then rebuilds it from the current analysis cache under current scope logic. **Refused when there is no analysis cache to rebuild from** — see below. |
+
+The two axes get independent flags because they contaminate independently: a
+diff pointed at the wrong pair floods the examinations while the reviews stay
+honest, and a bad review sweep leaves the examinations perfectly good. Clearing
+one must not cost the other. The response reports `cleared` and
+`cleared_examined` separately.
 
 With the analysis cache present, both return `status: "ready"` with
 `reviewed: 0` and the denominator intact. `drop_index=True` does not leave the
@@ -322,7 +482,7 @@ unrecoverable. The refusal keeps it and points at the two ways forward: re-run
 `analyze_binary` to restore the rebuild source, or reset without `drop_index`
 to clear the marks while keeping the denominator.
 
-Every `reset_coverage` response carries all six count keys, null when no record
+Every `reset_coverage` response carries every count key, null when no record
 could be read. An **omitted** key is not a null: a consumer reading
 `payload.get("total", 0)` off a response that dropped the key lands on `0`, and
 `0` reads as "complete" — the same false completion the null-not-zero rule

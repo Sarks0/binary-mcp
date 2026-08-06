@@ -488,6 +488,13 @@ _AST_ALLOWED_HANDLERS = {
     # with one. Widening this set requires the same audit.
     "CfgBuildError",
     "VirusTotalError",
+    #   * CoverageError (src/engines/static/ghidra/coverage_store.py) -- every
+    #     raise site was audited when it was added here: "invariant violated:
+    #     remaining != total - reviewed", "unknown examination kind 'x';
+    #     expected one of diff, sweep, external", "coverage count k=v is not a
+    #     non-negative int". Counts, kind names and the caller's own arguments;
+    #     no raise site interpolates a path or any other host state.
+    "CoverageError",
     # Third-party, reviewed: pefile raises PEFormatError with a fixed set of
     # structural descriptions ("DOS Header magic not found.", "Invalid NT
     # Headers signature.") and never interpolates the file path -- pefile is

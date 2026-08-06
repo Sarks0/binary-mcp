@@ -62,7 +62,7 @@ def _get_or_run_analysis(binary_path: str, cache, runner) -> dict:
     from src.utils.config import get_config_int
     from src.utils.security import validate_numeric_range
 
-    output_path = cache.cache_dir / f"temp_analysis_{Path(binary_path).stem}.json"
+    output_path = cache.temp_output_path(str(binary_path))
     script_path = Path(__file__).parent.parent / "engines" / "static" / "ghidra" / "scripts"
 
     timeout = get_config_int("GHIDRA_TIMEOUT", 600)
@@ -70,26 +70,33 @@ def _get_or_run_analysis(binary_path: str, cache, runner) -> dict:
 
     import json
 
-    runner.analyze(
-        binary_path=str(binary_path),
-        script_path=str(script_path),
-        script_name="core_analysis.py",
-        output_path=str(output_path),
-        keep_project=True,
-        timeout=timeout,
-    )
-
-    if not output_path.exists():
-        raise CfgBuildError(
-            "Ghidra did not produce output. The binary format may be unsupported."
+    # The temp output is run-scoped, so cleanup has to happen on the failure
+    # paths too -- otherwise every failed run leaves a fresh copy behind.
+    try:
+        runner.analyze(
+            binary_path=str(binary_path),
+            script_path=str(script_path),
+            script_name="core_analysis.py",
+            output_path=str(output_path),
+            keep_project=True,
+            timeout=timeout,
         )
 
-    with open(output_path, encoding="utf-8") as f:
-        context = json.load(f)
+        if not output_path.exists():
+            # CfgBuildError, not RuntimeError: it is one of the two types the
+            # error-hygiene guard sanctions for verbatim passthrough, because
+            # it is only ever raised with sentences written in this repo.
+            raise CfgBuildError(
+                "Ghidra did not produce output. The binary format may be unsupported."
+            )
 
-    cache.save_cached(str(binary_path), context)
-    output_path.unlink(missing_ok=True)
-    return context
+        with open(output_path, encoding="utf-8") as f:
+            context = json.load(f)
+
+        cache.save_cached(str(binary_path), context)
+        return context
+    finally:
+        output_path.unlink(missing_ok=True)
 
 
 def _find_function(functions: list[dict], name_or_address: str) -> dict | None:

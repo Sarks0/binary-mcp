@@ -99,7 +99,7 @@ Analyze the crash dump at C:\Windows\MEMORY.DMP
 Decompile the type MyNamespace.MyClass to C#
 ```
 
-## Capabilities (284 tools)
+## Capabilities (289 tools)
 
 Counts below are derived from the tools actually registered by `src/server.py`, and `tests/test_docs_accuracy.py` fails if this file and the code disagree.
 
@@ -146,14 +146,15 @@ Type listing, C# decompilation, IL disassembly, type search, full assembly decom
 
 Comprehensive PE header, section, import, export, resource, debug, TLS, and Rich header analysis in a single call, at three detail levels (basic/standard/full) with decoded characteristic flags, compiler attribution, and malware indicators. Plus Authenticode signature inspection, embedded-binary carving, and similarity hashing.
 
-### Other - 40 tools
+### Other - 45 tools
 
 - **Triage (3)** - Quick file type detection, packer identification, entropy analysis
 - **Malware Analysis (6)** - Behavior detection, API call chains, dynamic API resolution, anti-analysis detection, stack-string recovery, IOC extraction with context
 - **Control Flow (4)** - CFG generation, cyclomatic complexity, loop detection, dead code
 - **Function Hashing (5)** - Cross-binary function matching, similarity scoring, inlined-clone detection, batch decompilation, completeness checks
 - **Pseudocode Review (5)** - Decompiler-output scanning, caller analysis, parameter sinks, switch tables, review packages
-- **Review Coverage (5)** - Per-binary review denominator, reachability scope, and a deterministic unreviewed worklist. See [docs/coverage.md](docs/coverage.md)
+- **Review Coverage (6)** - Per-binary review denominator, reachability scope, a deterministic unreviewed worklist, and a separate machine-examination axis so a diff run is recorded without being counted as a review. See [docs/coverage.md](docs/coverage.md)
+- **Background Jobs (4)** - Poll long-running analysis that outlives the MCP client timeout, with one Ghidra run per binary shared across server processes and orphan reaping. See [docs/jobs.md](docs/jobs.md)
 - **VirusTotal (4)** - Hash lookups, sandbox behavior reports, Intelligence search, API-key check. Read-only: see "Operational safety" below
 - **Reporting (2)** - Generate structured analysis reports, export IOCs
 - **YARA (2)** - Rule *generation* from session data or extracted strings. This server emits rule text; it does not compile or run rules, so no YARA library is required or installed

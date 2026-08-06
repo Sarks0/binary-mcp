@@ -10,15 +10,34 @@ renames or compiler reorderings.
 Designed to be the bulk counterpart to ``find_similar_functions``:
 where that one returns per-pair similarity, this one returns
 ADDED / REMOVED / MODIFIED buckets with deltas attached.
+
+Coverage
+--------
+A diff run is a machine pass, not a reading, so it records on the
+*examination* axis of the coverage ledger rather than the review axis --
+see ``docs/coverage.md``. Only the MODIFIED entries are recorded, and
+only because those are the ones this tool actually analyses per function:
+it scores the bounds-check, stack-cookie, caller-count and size deltas
+and extracts the first changed line for each. ADDED, REMOVED and the
+unchanged pairs get bucket membership and nothing else, so recording
+them would be claiming an analysis that never happened -- and on a
+Patch-Tuesday-shaped diff of a large DLL, claiming it several thousand
+times over.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import re
 from pathlib import Path
 
-from src.tools.function_hash_tools import _compute_function_hash, _get_capstone_mode
+from src.engines.static.ghidra.coverage_store import EXAMINATION_DIFF, auto_examine
+from src.tools.function_hash_tools import (
+    FunctionHashCache,
+    _compute_function_hash,
+    _get_capstone_mode,
+)
 from src.utils.formatters import wrap_untrusted
 
 logger = logging.getLogger(__name__)
@@ -42,6 +61,22 @@ _COOKIE_NAMES = {"__security_check_cookie", "__security_init_cookie"}
 # Jaccard threshold + scoring weights. Tuned for Patch-Tuesday-shaped
 # diffs (mostly stable, a handful of fixed funcs); not load-bearing.
 _CALLEE_JACCARD_THRESHOLD = 0.85
+
+# Below this share of pairs coming from phase 1, MODIFIED is under-reported
+# badly enough that the report has to say so. The two real pairs measured sit
+# far either side of it -- 3% stripped, 69% symbolized -- so the exact value is
+# not load-bearing; it only has to separate "a handful of CRT functions Ghidra
+# named by itself" from "this binary actually has symbols".
+_LOW_PHASE1_PAIR_SHARE = 0.25
+
+# Report bounds. An unbounded report on a 14000-function pair is 20000 lines
+# and ~240K tokens -- it cannot come back through an MCP client, which is what
+# drove diff work out into offline scripts. These defaults land around 250
+# lines while keeping every bucket count exact, and the untruncated report is
+# written to disk whenever they bite.
+DEFAULT_TOP_N = 40
+DEFAULT_LIST_LIMIT = 20
+
 _BOUNDS_WEIGHT = 5.0
 _COOKIE_WEIGHT = 8.0
 _CALLER_WEIGHT = 1.0
@@ -125,12 +160,27 @@ def _first_changed_line(old_text: str, new_text: str) -> tuple[int, str, str] | 
     return None
 
 
-def _module_prefix(name: str) -> str:
-    """C++ class prefix: ``A::B::method`` -> ``A::B``; bare names -> ``(global)``."""
-    if not name or "::" not in name:
+def _module_prefix(func: dict) -> str:
+    """Group key for a function: its class / namespace.
+
+    Prefers the ``namespace`` the analysis cache records. Ghidra's PDB import
+    puts the class in the namespace rather than the flat name, so splitting the
+    flat name on ``::`` put an entire symbolized Windows binary into one
+    ``(global)`` bucket -- 1 of 3119 functions had an ``A::B::method`` shape,
+    and the 99 that contained ``::`` at all were template arguments like
+    ``~ComPtr<struct_Windows::Foundation::...>``.
+
+    Falls back to the flat-name split, which keeps working for caches written
+    before the field existed and for symbol sources that genuinely do embed the
+    class in the name.
+    """
+    namespace = (func.get("namespace") or "").strip()
+    if namespace:
+        return namespace
+    name = func.get("name") or ""
+    if "::" not in name:
         return "(global)"
-    parts = name.rsplit("::", 1)
-    return parts[0]
+    return name.rsplit("::", 1)[0]
 
 
 def _pair_by_pdb_name(
@@ -163,7 +213,55 @@ def _pair_by_pdb_name(
     return pairs, old_residue, new_residue
 
 
-def _hash_functions(binary_path: str, funcs: list[dict]) -> dict[str, list[dict]]:
+def _new_capstone(cs_arch, cs_mode):
+    """One reusable disassembler for a whole bulk pass, or None.
+
+    ``_compute_function_hash`` builds its own when not given one, which is an
+    FFI allocation per function -- 14000 of them for an object that never
+    varies, about 9% of the hashing cost.
+
+    Returns None rather than raising when the arch/mode pair is rejected.
+    This is purely an optimization, so it must not be the thing that decides
+    whether a diff runs: on None the per-function path builds its own handle
+    and fails exactly where it always did.
+    """
+    try:
+        import capstone
+
+        md = capstone.Cs(cs_arch, cs_mode)
+        md.detail = False
+        return md
+    except Exception as exc:
+        logger.debug("shared capstone handle unavailable (%s, %s): %s", cs_arch, cs_mode, exc)
+        return None
+
+
+def _hash_many(reader, cs_arch, cs_mode, funcs, hash_cache) -> dict[int, dict]:
+    """Hash ``funcs`` through one reader, consulting ``hash_cache``.
+
+    Returns ``{id(func): result}``. Functions whose hash cannot be computed
+    (no basic_blocks, unsupported arch, read failure) are absent.
+
+    The disassembler is built on the first cache miss, not up front, so a
+    fully-cached side never allocates one at all.
+    """
+    md = None
+    out: dict[int, dict] = {}
+    for func in funcs:
+        result = hash_cache.get(func) if hash_cache is not None else None
+        if result is None:
+            if md is None:
+                md = _new_capstone(cs_arch, cs_mode)
+            result = _compute_function_hash(reader, cs_arch, cs_mode, func, md=md)
+            if result is None:
+                continue
+            if hash_cache is not None:
+                hash_cache.put(func, result)
+        out[id(func)] = result
+    return out
+
+
+def _hash_functions(binary_path: str, funcs: list[dict], hash_cache=None) -> dict[str, list[dict]]:
     """Compute opcode hashes for every hashable function in ``funcs``.
 
     Returns ``{hash: [func, func, ...]}``. Functions whose hash cannot be
@@ -182,10 +280,10 @@ def _hash_functions(binary_path: str, funcs: list[dict]) -> dict[str, list[dict]
 
     out: dict[str, list[dict]] = {}
     with BinaryReader(binary_path) as reader:
-        for func in hashable:
-            result = _compute_function_hash(reader, cs_arch, cs_mode, func)
-            if result is None:
-                continue
+        results = _hash_many(reader, cs_arch, cs_mode, hashable, hash_cache)
+    for func in hashable:
+        result = results.get(id(func))
+        if result is not None:
             out.setdefault(result["hash"], []).append(func)
     return out
 
@@ -195,10 +293,12 @@ def _pair_by_hash(
     new_path: str,
     old_residue: list[dict],
     new_residue: list[dict],
+    old_hash_cache=None,
+    new_hash_cache=None,
 ) -> tuple[list[tuple[dict, dict]], list[dict], list[dict]]:
     """Phase 2: pair residue by exact opcode hash."""
-    old_hashes = _hash_functions(old_path, old_residue)
-    new_hashes = _hash_functions(new_path, new_residue)
+    old_hashes = _hash_functions(old_path, old_residue, old_hash_cache)
+    new_hashes = _hash_functions(new_path, new_residue, new_hash_cache)
 
     pairs: list[tuple[dict, dict]] = []
     paired_old_ids: set[int] = set()
@@ -218,45 +318,109 @@ def _pair_by_hash(
     return pairs, old_remaining, new_remaining
 
 
+def _probe_prefix_length(size: int) -> int:
+    """How many of a set's elements must be probed to find every match.
+
+    Prefix filter, and it is exact rather than a heuristic. If
+    ``J(A, B) >= t`` then ``|A & B| >= t * |A | B| >= t * |A|``, so B can miss
+    at most ``|A| - ceil(t * |A|)`` of A's elements. Probing one more element
+    than that guarantees any qualifying B is found: it cannot miss them all.
+
+    At ``t = 0.85`` a 5-element set probes 1 element, a 20-element set probes
+    4. Combined with rarest-first ordering those are the *short* posting
+    lists, which is what keeps a ubiquitous callee like ``memcpy`` from
+    dragging its entire bucket into the candidate set.
+    """
+    if size <= 0:
+        return 0
+    misses = size - math.ceil(_CALLEE_JACCARD_THRESHOLD * size)
+    return max(1, min(size, misses + 1))
+
+
 def _pair_by_callees(
     old_residue: list[dict], new_residue: list[dict]
 ) -> tuple[list[tuple[dict, dict]], list[dict], list[dict]]:
-    """Phase 3: pair residue by callee-set Jaccard with same bb count."""
-    by_bb: dict[int, list[dict]] = {}
-    for f in new_residue:
-        by_bb.setdefault(_bb_count(f), []).append(f)
+    """Phase 3: pair residue by callee-set Jaccard with same bb count.
+
+    Output is identical to the all-pairs scan this replaces -- same pairs,
+    same tie-breaking -- but it does not compare every old function against
+    every same-bb candidate. That scan was 98% of ``diff_binaries``' runtime
+    on a tquery-sized residue (~6000 unmatched twins per side): 51 of 53
+    seconds, two thirds of it rebuilding the *candidate's* callee set inside
+    the inner loop, 6.7 million times. That is what put the tool over a 30s
+    client timeout and forced diffs out into offline scripts.
+
+    Two changes, neither of which can alter the result:
+
+    1. Callee sets are computed once per function instead of once per
+       comparison.
+    2. Candidates come from an inverted index on ``(bb_count, callee_name)``
+       rather than the whole bucket. A candidate sharing no callee with the
+       old function scores 0.0, and the scan below requires ``score >
+       best_score`` starting at 0.0 -- so a zero-overlap candidate could
+       never be selected and dropping it changes nothing. The prefix filter
+       narrowing that further is exact; see :func:`_probe_prefix_length`.
+    """
+    # Rarest-first ordering, so the elements we probe are the ones with the
+    # shortest posting lists. Ties broken by name to keep the walk
+    # deterministic across runs.
+    frequency: dict[str, int] = {}
+    new_sets: list[frozenset[str]] = []
+    for func in new_residue:
+        callees = _callee_name_set(func)
+        new_sets.append(callees)
+        for name in callees:
+            frequency[name] = frequency.get(name, 0) + 1
+
+    index: dict[tuple[int, str], list[int]] = {}
+    for idx, func in enumerate(new_residue):
+        callees = new_sets[idx]
+        # Functions with zero callees give no Jaccard signal - pairing them
+        # via this phase would silently match every leaf to every leaf with
+        # the same bb count. Never indexed, so never a candidate.
+        if not callees:
+            continue
+        bb = _bb_count(func)
+        for name in callees:
+            index.setdefault((bb, name), []).append(idx)
 
     pairs: list[tuple[dict, dict]] = []
     paired_old_ids: set[int] = set()
-    paired_new_ids: set[int] = set()
+    paired_new_idx: set[int] = set()
 
     for of in old_residue:
-        candidates = by_bb.get(_bb_count(of), [])
-        if not candidates:
-            continue
         of_set = _callee_name_set(of)
-        # Functions with zero callees give no Jaccard signal - pairing
-        # them via this phase would silently match every leaf to every
-        # leaf with the same bb count. Skip outright.
         if not of_set:
             continue
+        bb = _bb_count(of)
+        probe = sorted(of_set, key=lambda n: (frequency.get(n, 0), n))
+        probe = probe[: _probe_prefix_length(len(of_set))]
+
+        candidates: set[int] = set()
+        for name in probe:
+            candidates.update(index.get((bb, name), ()))
+        if not candidates:
+            continue
+
         best = None
         best_score = 0.0
-        for nf in candidates:
-            if id(nf) in paired_new_ids:
+        # Ascending index is the order the old all-pairs scan walked the
+        # bucket in, so an exact tie still goes to the earliest candidate.
+        for idx in sorted(candidates):
+            if idx in paired_new_idx:
                 continue
-            nf_set = _callee_name_set(nf)
-            if not nf_set:
-                continue
-            score = _jaccard(of_set, nf_set)
+            nf_set = new_sets[idx]
+            intersection = len(of_set & nf_set)
+            score = intersection / (len(of_set) + len(nf_set) - intersection)
             if score > best_score:
                 best_score = score
-                best = nf
+                best = idx
         if best is not None and best_score >= _CALLEE_JACCARD_THRESHOLD:
-            pairs.append((of, best))
+            pairs.append((of, new_residue[best]))
             paired_old_ids.add(id(of))
-            paired_new_ids.add(id(best))
+            paired_new_idx.add(best)
 
+    paired_new_ids = {id(new_residue[i]) for i in paired_new_idx}
     old_remaining = [f for f in old_residue if id(f) not in paired_old_ids]
     new_remaining = [f for f in new_residue if id(f) not in paired_new_ids]
     return pairs, old_remaining, new_remaining
@@ -296,6 +460,8 @@ def _confirm_phase1_buckets(
     pairs: list[tuple[dict, dict, str]],
     old_path: str,
     new_path: str,
+    old_hash_cache=None,
+    new_hash_cache=None,
 ) -> tuple[list[tuple[dict, dict]], list[tuple[dict, dict]]]:
     """
     For each PDB-name match, decide unchanged vs modified.
@@ -321,34 +487,112 @@ def _confirm_phase1_buckets(
 
     from src.utils.binary_reader import BinaryReader
 
-    old_hashes: dict[int, str] = {}
-    new_hashes: dict[int, str] = {}
+    old_hashes: dict[int, dict] = {}
+    new_hashes: dict[int, dict] = {}
 
     if old_funcs:
         cs_arch, cs_mode = old_mode
         with BinaryReader(old_path) as reader:
-            for of in old_funcs:
-                result = _compute_function_hash(reader, cs_arch, cs_mode, of)
-                if result:
-                    old_hashes[id(of)] = result["hash"]
+            old_hashes = _hash_many(reader, cs_arch, cs_mode, old_funcs, old_hash_cache)
     if new_funcs:
         cs_arch, cs_mode = new_mode
         with BinaryReader(new_path) as reader:
-            for nf in new_funcs:
-                result = _compute_function_hash(reader, cs_arch, cs_mode, nf)
-                if result:
-                    new_hashes[id(nf)] = result["hash"]
+            new_hashes = _hash_many(reader, cs_arch, cs_mode, new_funcs, new_hash_cache)
 
     modified: list[tuple[dict, dict]] = []
     unchanged: list[tuple[dict, dict]] = []
     for of, nf, _ in pairs:
-        oh = old_hashes.get(id(of))
-        nh = new_hashes.get(id(nf))
+        oh = (old_hashes.get(id(of)) or {}).get("hash")
+        nh = (new_hashes.get(id(nf)) or {}).get("hash")
         if oh and nh and oh == nh:
             unchanged.append((of, nf))
         else:
             modified.append((of, nf))
     return modified, unchanged
+
+
+
+def _pairing_notes(old_ctx: dict, new_ctx: dict, pair_counts: dict | None) -> list[str]:
+    """Say where the pairs came from, and warn when MODIFIED cannot populate.
+
+    Only phase 1 can classify a pair as modified-vs-unchanged, because it is
+    the only phase that pairs on *name* and then compares hashes.
+
+    - Phase 2 pairs on opcode-hash EQUALITY, so everything it pairs is
+      hash-identical by construction and can only ever be "unchanged".
+    - Phase 3 (callee Jaccard) is the sole remaining route to MODIFIED.
+
+    Phase 1 requires PDB names. On a stripped pair it does nothing, and the
+    report then shows a near-empty MODIFIED bucket that reads as "barely
+    anything changed" when the truth is "this tool cannot tell you". On one
+    real cross-build pair that was MODIFIED=1 / RENAMED=2367 stripped versus
+    MODIFIED=106 / RENAMED=11 with symbols applied -- same binaries.
+
+    A diff nobody can calibrate is worse than no diff, so the report says so
+    in its own header rather than leaving it to be inferred.
+
+    Presence of PDB-named functions is not the test, because it never reaches
+    zero in practice: Ghidra recognizes CRT scaffolding (``entry``,
+    ``__security_check_cookie``, ``__scrt_acquire_startup_lock``) with no PDB
+    at all. The real cscsvc pair this warning exists for carries 75 of 2524
+    (3.0%) on each side -- both non-zero, so a presence check stays silent on
+    exactly the MODIFIED=1 / RENAMED=2367 report it is meant to flag. What
+    matters is how much of the pairing phase 1 actually supplied: 75 of 2452
+    pairs (3%) stripped against 2120 of 3069 (69%) symbolized.
+    """
+    notes: list[str] = []
+    old_named = sum(1 for f in old_ctx.get("functions") or [] if _is_pdb_named(f))
+    new_named = sum(1 for f in new_ctx.get("functions") or [] if _is_pdb_named(f))
+    name_pairs = (pair_counts or {}).get("name", 0)
+    total_pairs = sum((pair_counts or {}).values())
+
+    if pair_counts:
+        notes.append(
+            f"Pairs: {pair_counts.get('name', 0)} by name, "
+            f"{pair_counts.get('hash', 0)} by opcode hash, "
+            f"{pair_counts.get('callee', 0)} by callee-set"
+        )
+    if not old_named or not new_named:
+        notes.append(
+            f"WARNING: PDB-named functions -- old={old_named}, new={new_named}. "
+            "Phase-1 (name) pairing is inactive, and it is the only phase that "
+            "distinguishes MODIFIED from UNCHANGED. MODIFIED is therefore "
+            "UNDER-REPORTED and changed functions land in ADDED/REMOVED. A small "
+            "MODIFIED count here is NOT evidence that little changed. Apply "
+            "symbols (analyze_binary(pdb_path=...)) and re-run before drawing "
+            "any conclusion."
+        )
+    elif total_pairs and name_pairs / total_pairs < _LOW_PHASE1_PAIR_SHARE:
+        notes.append(
+            f"WARNING: phase-1 (name) pairing supplied only {name_pairs} of "
+            f"{total_pairs} pairs ({name_pairs / total_pairs:.0%}); PDB-named "
+            f"functions old={old_named}, new={new_named}. Phase 1 is the only "
+            "phase that distinguishes MODIFIED from UNCHANGED, so at this share "
+            "MODIFIED is UNDER-REPORTED and changed functions land in "
+            "ADDED/REMOVED. A small MODIFIED count here is NOT evidence that "
+            "little changed. Apply symbols (analyze_binary(pdb_path=...)) and "
+            "re-run before drawing any conclusion."
+        )
+    return notes
+
+
+def _elide(count: int, shown: int, what: str) -> str:
+    """The line that admits a section was cut.
+
+    Every truncation says so, in place, with the number omitted. A section
+    that silently stops reads as a complete answer, and on a Patch-Tuesday
+    diff "no more added functions" versus "4000 more added functions" is the
+    difference between a finished triage and an abandoned one.
+    """
+    return f"  ... {count - shown} more {what} not shown"
+
+
+def _sorted_modified(
+    modified: list[tuple[dict, dict, str, dict]], mode: str
+) -> list[tuple[dict, dict, str, dict]]:
+    if mode == "security":
+        return sorted(modified, key=lambda m: -m[3]["score"])
+    return list(modified)
 
 
 def _format_report(
@@ -363,9 +607,29 @@ def _format_report(
     mode: str,
     group_by: str,
     unchanged_renamed: list[tuple[dict, dict]] | None = None,
+    coverage_line: str | None = None,
+    top_n: int = 0,
+    list_limit: int = 0,
+    min_score: float = 0.0,
+    full_report_path: str | None = None,
+    pair_counts: dict | None = None,
 ) -> str:
-    """Render the diff report; ``modified`` already carries score dicts."""
+    """Render the diff report; ``modified`` already carries score dicts.
+
+    ``top_n`` / ``list_limit`` / ``min_score`` bound the output; 0 means no
+    bound, which is what the on-disk full report is rendered with.
+    """
     unchanged_renamed = unchanged_renamed or []
+
+    modified_sorted = _sorted_modified(modified, mode)
+    scored_out = 0
+    if min_score > 0.0 and mode == "security":
+        kept = [m for m in modified_sorted if m[3]["score"] >= min_score]
+        scored_out = len(modified_sorted) - len(kept)
+        modified_sorted = kept
+
+    shown_modified = modified_sorted if top_n <= 0 else modified_sorted[:top_n]
+
     lines = [
         "=" * 60,
         "BINARY DIFF",
@@ -373,81 +637,121 @@ def _format_report(
         f"Old: {Path(old_path).name}  ({len(old_ctx.get('functions', []))} functions)",
         f"New: {Path(new_path).name}  ({len(new_ctx.get('functions', []))} functions)",
         f"Mode: {mode}    group_by={group_by}",
-        f"Unchanged pairs: {unchanged_count}",
-        "",
     ]
-
-    # Audit F-7: every row below names a function in one of the two binaries
-    # under comparison, and those names come from the binaries' own symbol /
-    # PDB data -- attacker-authored for a malware sample, and equally so for
-    # the "patched" side when both inputs are untrusted. The bucket counts are
-    # this tool's own arithmetic and stay outside the fence.
-    lines.append(f"### ADDED ({len(added)})")
-    lines.append(
-        wrap_untrusted(
-            "\n".join(f"- {f.get('name')} @ {f.get('address')}" for f in added),
-            kind="function names from the new binary",
-        )
-    )
+    lines.extend(_pairing_notes(old_ctx, new_ctx, pair_counts))
+    lines += [
+        "",
+        "### SUMMARY",
+        f"  ADDED     {len(added)}",
+        f"  REMOVED   {len(removed)}",
+        f"  RENAMED   {len(unchanged_renamed)}  (identical body, different name)",
+        f"  MODIFIED  {len(modified)}",
+        f"  UNCHANGED {unchanged_count}",
+    ]
+    if scored_out:
+        lines.append(f"  (min_score={min_score:g} filtered out {scored_out} MODIFIED)")
+    if coverage_line:
+        # In the header, not a footer: even a bounded report is long enough
+        # that a footer gets skimmed past.
+        lines.append(f"  {coverage_line}")
+    if full_report_path:
+        lines.append(f"  Full untruncated report: {full_report_path}")
     lines.append("")
 
-    lines.append(f"### REMOVED ({len(removed)})")
-    lines.append(
-        wrap_untrusted(
-            "\n".join(f"- {f.get('name')} @ {f.get('address')}" for f in removed),
-            kind="function names from the old binary",
-        )
-    )
-    lines.append("")
+    def _name_section(
+        title: str, entries: list[str], total: int, noun: str, kind: str
+    ) -> None:
+        shown = entries if list_limit <= 0 else entries[:list_limit]
+        suffix = f", showing {len(shown)}" if len(shown) < total else ""
+        lines.append(f"### {title} ({total}{suffix})")
+        # Audit F-7: every row names a function in one of the two binaries
+        # under comparison, and those names come from the binaries' own symbol
+        # / PDB data -- attacker-authored for a malware sample, and equally so
+        # for the "patched" side when both inputs are untrusted. The bucket
+        # counts and the elision note are this tool's own arithmetic and stay
+        # outside the fence. Fencing here rather than at the three call sites
+        # means a fourth section cannot be added unfenced.
+        if shown:
+            lines.append(wrap_untrusted("\n".join(shown), kind=kind))
+        if len(shown) < total:
+            lines.append(_elide(total, len(shown), noun))
+        lines.append("")
 
+    _name_section(
+        "ADDED",
+        [f"- {f.get('name')} @ {f.get('address')}" for f in added],
+        len(added),
+        "added function(s)",
+        "function names from the new binary",
+    )
+    _name_section(
+        "REMOVED",
+        [f"- {f.get('name')} @ {f.get('address')}" for f in removed],
+        len(removed),
+        "removed function(s)",
+        "function names from the old binary",
+    )
     # Renamed-but-otherwise-unchanged: hash-identical phase-2 pairs whose
     # names differ. Surfaced separately so they don't pollute the MODIFIED
     # bucket (which is meant for actual body changes / security fixes).
-    lines.append(f"### Renamed (unchanged body) ({len(unchanged_renamed)})")
-    lines.append(
-        wrap_untrusted(
-            "\n".join(
-                f"- {of.get('name')} ({of.get('address')})  ->  "
-                f"{nf.get('name')} ({nf.get('address')})  [unchanged_renamed]"
-                for of, nf in unchanged_renamed
-            ),
-            kind="function names from both binaries",
-        )
+    _name_section(
+        "Renamed (unchanged body)",
+        [
+            f"- {of.get('name')} ({of.get('address')})  ->  "
+            f"{nf.get('name')} ({nf.get('address')})  [unchanged_renamed]"
+            for of, nf in unchanged_renamed
+        ],
+        len(unchanged_renamed),
+        "rename(s)",
+        "function names from both binaries",
     )
-    lines.append("")
 
-    lines.append(f"### MODIFIED ({len(modified)})")
-
-    if mode == "security":
-        modified_sorted = sorted(modified, key=lambda m: -m[3]["score"])
+    if len(shown_modified) < len(modified_sorted):
+        ordering = "by fix-likelihood score" if mode == "security" else "in source order"
+        header = (
+            f"### MODIFIED ({len(modified_sorted)}, showing top "
+            f"{len(shown_modified)} {ordering})"
+        )
     else:
-        modified_sorted = list(modified)
+        header = f"### MODIFIED ({len(modified_sorted)})"
+    lines.append(header)
 
     # Audit F-7: the MODIFIED bucket is the richest sample-derived block in
     # this report -- besides the names it prints the first changed line of
     # decompiled pseudocode from BOTH binaries. The "-- module:" sub-headings
     # are derived from those names too (``A::B::method`` -> ``A::B``), so they
-    # belong inside the fence rather than framing it.
+    # belong inside the fence rather than framing it. One envelope around the
+    # whole bucket, not one per entry: a bounded report can still hold
+    # hundreds of pairs, and a per-entry fence would cost more boilerplate
+    # than content.
     body: list[str] = []
     if group_by == "module":
         groups: dict[str, list[tuple[dict, dict, str, dict]]] = {}
-        for entry in modified_sorted:
+        for entry in shown_modified:
             old_func, _, _, _ = entry
-            groups.setdefault(_module_prefix(old_func.get("name") or ""), []).append(entry)
+            groups.setdefault(_module_prefix(old_func), []).append(entry)
         for module, entries in sorted(groups.items()):
             body.append(f"-- module: {module} ({len(entries)})")
             for entry in entries:
                 body.extend(_format_modified_entry(entry, old_ctx, new_ctx))
             body.append("")
     else:
-        for entry in modified_sorted:
+        for entry in shown_modified:
             body.extend(_format_modified_entry(entry, old_ctx, new_ctx))
-    lines.append(
-        wrap_untrusted(
-            "\n".join(body).rstrip("\n"),
-            kind="function names and decompiled excerpts from both binaries",
+    if body:
+        lines.append(
+            wrap_untrusted(
+                "\n".join(body).rstrip("\n"),
+                kind="function names and decompiled excerpts from both binaries",
+            )
         )
-    )
+
+    if len(shown_modified) < len(modified_sorted):
+        lines.append(_elide(len(modified_sorted), len(shown_modified), "modified pair(s)"))
+        lines.append(
+            "  Raise top_n, or set min_score, to see more"
+            + (f" -- or read {full_report_path}" if full_report_path else "")
+        )
 
     return "\n".join(lines)
 
@@ -481,6 +785,101 @@ def _format_modified_entry(
     return out
 
 
+def _write_full_report(cache, old_path: str, new_path: str, render) -> str | None:
+    """Write the untruncated report beside the analysis caches.
+
+    Truncation is only acceptable if nothing is lost, so whenever the returned
+    report is bounded the complete one goes to disk and the header points at
+    it. ``render`` is a callable so the full report -- 1.5 MB and 20000 lines
+    on a large pair -- is never built when it is not needed.
+
+    The name is derived from both binaries' content hashes, so re-running the
+    same diff overwrites rather than accumulating, and two different pairs
+    never collide. Returns the path, or None if it could not be written.
+
+    Writes only into a cache directory that already exists, and never creates
+    one. ``ProjectCache.__init__`` makes it, so a missing directory means the
+    cache root is not what we think it is -- and creating it anyway turns that
+    into a tree of files somewhere nobody asked for. A ``MagicMock`` cache is
+    the concrete case: ``__fspath__`` hands back a plausible-looking relative
+    path rather than raising, so ``mkdir(parents=True)`` silently built
+    ``MagicMock/mock.cache_dir/<id>/`` under the working directory during a
+    test run. Degrade to "no full report" instead.
+    """
+    try:
+        cache_dir = Path(cache.cache_dir)
+        if not cache_dir.is_dir():
+            logger.debug("no full diff report: cache dir %s does not exist", cache_dir)
+            return None
+        old_id = cache._get_binary_hash(old_path)
+        new_id = cache._get_binary_hash(new_path)
+        target = cache_dir / f"{old_id[:16]}-{new_id[:16]}.diff.txt"
+        target.write_text(render(), encoding="utf-8")
+        return str(target)
+    except Exception as exc:
+        # A report we could not persist must not cost the report we can
+        # return; the caller falls back to saying so in the header.
+        logger.warning("could not write full diff report: %s", exc)
+        return None
+
+
+def _record_examinations(
+    cache,
+    old_path: str,
+    new_path: str,
+    old_ctx: dict,
+    new_ctx: dict,
+    modified: list[tuple[dict, dict, str, dict]],
+    enabled: bool,
+) -> str:
+    """Record the MODIFIED pairs as ``diff`` examinations on both ledgers.
+
+    Each side goes to its own coverage record: the ledger is keyed by the
+    sha256 of the file's bytes, so the old binary's addresses belong to the
+    old binary's record and cross-writing them would land phantom addresses
+    in a ledger they do not exist in.
+
+    Only the MODIFIED bucket. ADDED and REMOVED are single-sided -- there is
+    no pair and no delta, only a bucket -- and the unchanged pairs are the
+    ones this tool concluded nothing happened to. Recording either would
+    inflate the examination axis with functions nothing analysed, which is
+    the same dishonesty as inflating the review axis, just one column over.
+
+    Returns the header line for the report.
+    """
+    if not enabled:
+        return "Coverage: not recorded (record_examination=False)"
+    if not modified:
+        return "Coverage: 0 diff examinations recorded (no MODIFIED entries)"
+
+    old_name = Path(old_path).name
+    new_name = Path(new_path).name
+
+    old_written = auto_examine(
+        cache,
+        old_path,
+        [of.get("address") for of, _, _, _ in modified],
+        kind=EXAMINATION_DIFF,
+        tool="diff_binaries",
+        note=f"MODIFIED in diff_binaries against {new_name}",
+        context=old_ctx,
+    )
+    new_written = auto_examine(
+        cache,
+        new_path,
+        [nf.get("address") for _, nf, _, _ in modified],
+        kind=EXAMINATION_DIFF,
+        tool="diff_binaries",
+        note=f"MODIFIED in diff_binaries against {old_name}",
+        context=new_ctx,
+    )
+    return (
+        f"Coverage: recorded {old_written} new diff examination(s) on {old_name}, "
+        f"{new_written} on {new_name} "
+        f"(of {len(modified)} MODIFIED pair(s); examined is not reviewed)"
+    )
+
+
 def register_diff_tools(app, session_manager, cache, runner):
     """
     Register the cross-binary diff tool with the MCP app.
@@ -505,6 +904,10 @@ def register_diff_tools(app, session_manager, cache, runner):
         new_path: str,
         group_by: str = "none",
         mode: str = "security",
+        record_examination: bool = True,
+        top_n: int = DEFAULT_TOP_N,
+        list_limit: int = DEFAULT_LIST_LIMIT,
+        min_score: float = 0.0,
     ) -> str:
         """
         Diff two analyzed binaries and rank likely security fixes.
@@ -523,15 +926,59 @@ def register_diff_tools(app, session_manager, cache, runner):
         class prefix (``A::B::method`` -> ``A::B``); ``"none"`` emits a
         flat list.
 
+        Opcode hashes are cached to a ``<sha256>.fnhash.json`` side-car per
+        binary, so re-running a diff of the same pair skips the dominant cost
+        of a cold run. The side-car is keyed on the binary's content hash and
+        each entry is guarded by its function's basic-block extents, so a
+        re-analysis that redraws them recomputes rather than serving a stale
+        hash.
+
+        The report is bounded by default. An unbounded one on a large pair
+        runs to 20000 lines and cannot come back through an MCP client at
+        all, so the buckets are capped and every cut says how much it
+        omitted. Nothing is lost: whenever the returned report is truncated
+        the complete one is written next to the analysis caches and the
+        header carries its path.
+
         Args:
             old_path: Path to the OLD analyzed binary.
             new_path: Path to the NEW analyzed binary.
-            group_by: ``"none"`` (default) or ``"module"``.
+            group_by: ``"none"`` (default) or ``"module"``. Module grouping
+                keys on the function's ``namespace`` as recorded by the
+                analysis cache, because Ghidra's PDB import puts the class in
+                the namespace rather than in the flat name. A cache analyzed
+                before that field existed falls back to splitting the flat name
+                on ``::``, which on a symbolized Windows binary puts everything
+                in ``(global)`` -- re-analyze to get real grouping.
             mode: ``"security"`` (default, ranked by fix-likelihood) or
                 ``"none"`` (source-order, no scoring).
+            record_examination: Record the MODIFIED entries against both
+                binaries' coverage ledgers as machine examinations
+                (``kind="diff"``). Default on, and safe on: an examination is
+                explicitly **not** a review, so this cannot inflate the review
+                counts or shorten the worklist -- it makes the diff's leads
+                retrievable afterwards through
+                ``get_next_unreviewed(only_examined=True)`` instead of
+                vanishing when the report scrolls away. Set false for a dry
+                run against a ledger you do not want touched.
+            top_n: How many MODIFIED entries to print, highest score first in
+                ``mode="security"`` and source order otherwise. ``0`` prints
+                every one -- use it when writing to a file, not when the
+                result has to cross a client.
+            list_limit: How many names to print per ADDED / REMOVED / renamed
+                bucket. ``0`` prints every one. The counts are always exact
+                regardless; this bounds only the listings.
+            min_score: Drop MODIFIED entries scoring below this before
+                ``top_n`` applies. ``mode="security"`` only -- there is no
+                score to filter on otherwise. Use it to widen coverage of
+                what actually matters rather than raising ``top_n`` and
+                pulling in cosmetic churn.
 
         Returns:
-            Markdown-style report of ADDED / REMOVED / MODIFIED buckets.
+            Markdown-style report: a SUMMARY block with exact bucket counts,
+            then the bounded listings. The header states how many
+            examinations were recorded on each side, and the path to the full
+            report when one was written.
         """
         try:
             old_path = str(sanitize_binary_path(old_path))
@@ -541,6 +988,10 @@ def register_diff_tools(app, session_manager, cache, runner):
                 return "Error: mode must be 'security' or 'none'."
             if group_by not in ("none", "module"):
                 return "Error: group_by must be 'none' or 'module'."
+            if top_n < 0 or list_limit < 0:
+                return "Error: top_n and list_limit must be >= 0 (0 means no limit)."
+            if min_score < 0:
+                return "Error: min_score must be >= 0."
 
             old_ctx = cache.get_cached(old_path)
             if not old_ctx:
@@ -558,16 +1009,27 @@ def register_diff_tools(app, session_manager, cache, runner):
             old_funcs = list(old_ctx.get("functions", []))
             new_funcs = list(new_ctx.get("functions", []))
 
+            # Hashing both sides is the dominant cost of a cold diff (~6s per
+            # side for 14000 functions). It is fully determined by the bytes
+            # and the block extents, so it is cached to a side-car and a
+            # repeat diff of the same pair -- the normal case when iterating
+            # on a patch -- skips it.
+            old_hash_cache = FunctionHashCache(cache, old_path)
+            new_hash_cache = FunctionHashCache(cache, new_path)
+
             # Phase 1: PDB-name match.
             phase1_pairs, old_residue, new_residue = _pair_by_pdb_name(old_funcs, new_funcs)
             modified_phase1, unchanged_phase1 = _confirm_phase1_buckets(
-                phase1_pairs, old_path, new_path
+                phase1_pairs, old_path, new_path, old_hash_cache, new_hash_cache
             )
 
             # Phase 2: hash match across the residue.
             phase2_pairs, old_residue, new_residue = _pair_by_hash(
-                old_path, new_path, old_residue, new_residue
+                old_path, new_path, old_residue, new_residue,
+                old_hash_cache, new_hash_cache,
             )
+            old_hash_cache.save()
+            new_hash_cache.save()
 
             # Phase 3: callee-set Jaccard.
             phase3_pairs, old_residue, new_residue = _pair_by_callees(old_residue, new_residue)
@@ -596,19 +1058,60 @@ def register_diff_tools(app, session_manager, cache, runner):
                 deltas = _score_modified(of, nf, old_ctx, new_ctx, mode)
                 modified.append((of, nf, "modified-renamed", deltas))
 
-            return _format_report(
+            pair_counts = {
+                "name": len(phase1_pairs),
+                "hash": len(phase2_pairs),
+                "callee": len(phase3_pairs),
+            }
+
+            coverage_line = _record_examinations(
+                cache,
                 old_path,
                 new_path,
                 old_ctx,
                 new_ctx,
-                added=new_residue,
-                removed=old_residue,
-                modified=modified,
-                unchanged_count=unchanged_count,
-                unchanged_renamed=unchanged_renamed,
-                mode=mode,
-                group_by=group_by,
+                modified,
+                enabled=record_examination,
             )
+
+            def _render(bounded: bool, full_path: str | None = None) -> str:
+                return _format_report(
+                    old_path,
+                    new_path,
+                    old_ctx,
+                    new_ctx,
+                    added=new_residue,
+                    removed=old_residue,
+                    modified=modified,
+                    unchanged_count=unchanged_count,
+                    unchanged_renamed=unchanged_renamed,
+                    mode=mode,
+                    group_by=group_by,
+                    coverage_line=coverage_line,
+                    top_n=top_n if bounded else 0,
+                    list_limit=list_limit if bounded else 0,
+                    min_score=min_score if bounded else 0.0,
+                    full_report_path=full_path,
+                    pair_counts=pair_counts,
+                )
+
+            truncates = (
+                (top_n > 0 and len(modified) > top_n)
+                or (min_score > 0 and mode == "security")
+                or (
+                    list_limit > 0
+                    and max(len(new_residue), len(old_residue), len(unchanged_renamed))
+                    > list_limit
+                )
+            )
+            # Only when something is actually cut, so an ordinary small diff
+            # does not litter the cache with a duplicate of its own output.
+            full_path = (
+                _write_full_report(cache, old_path, new_path, lambda: _render(bounded=False))
+                if truncates
+                else None
+            )
+            return _render(bounded=True, full_path=full_path)
 
         except (PathTraversalError, FileSizeError) as e:
             return safe_error_message("diff_binaries", e)

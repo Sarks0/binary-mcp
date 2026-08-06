@@ -1138,7 +1138,7 @@ class TestDeltaRunLock:
         from src.server import _delta_run_lock
 
         with _delta_run_lock(tmp_path, "/tmp/sample.bin"):
-            with pytest.raises(RuntimeError, match="incremental analysis is already running"):
+            with pytest.raises(RuntimeError, match="already running"):
                 with _delta_run_lock(tmp_path, "/tmp/sample.bin"):
                     pass  # pragma: no cover
 
@@ -1151,6 +1151,81 @@ class TestDeltaRunLock:
         # Should not raise.
         with _delta_run_lock(tmp_path, "/tmp/sample.bin"):
             pass
+
+    def test_lock_key_groups_by_project_not_by_path(self, tmp_path):
+        """Two paths sharing a Ghidra project must share a lock.
+
+        The project is named from the filename stem, so an old and a new build
+        of one DLL -- different directories, different content -- collide on
+        it. Keying the lock on the path would let exactly that pair run
+        concurrently, which is the patch-diff case.
+        """
+        from src.server import _delta_run_lock
+
+        with _delta_run_lock(tmp_path, "/old/tquery.dll", lock_key="tquery"):
+            with pytest.raises(RuntimeError, match="already running"):
+                with _delta_run_lock(tmp_path, "/new/tquery.dll", lock_key="tquery"):
+                    pass  # pragma: no cover
+
+        # Different project, no contention.
+        with _delta_run_lock(tmp_path, "/old/tquery.dll", lock_key="tquery"):
+            with _delta_run_lock(tmp_path, "/old/other.dll", lock_key="other"):
+                pass
+
+    def test_waiting_caller_queues_instead_of_failing(self, tmp_path):
+        """A positive wait queues behind the holder rather than erroring."""
+        import threading
+
+        from src.server import _delta_run_lock
+
+        holder_in = threading.Event()
+        release = threading.Event()
+        acquired = []
+
+        def _hold():
+            with _delta_run_lock(tmp_path, "/tmp/sample.bin"):
+                holder_in.set()
+                release.wait(10)
+
+        thread = threading.Thread(target=_hold, daemon=True)
+        thread.start()
+        assert holder_in.wait(5)
+
+        def _wait_for_it():
+            with _delta_run_lock(tmp_path, "/tmp/sample.bin", wait_seconds=10.0):
+                acquired.append(True)
+
+        waiter = threading.Thread(target=_wait_for_it, daemon=True)
+        waiter.start()
+        # Still blocked while the holder holds it.
+        waiter.join(timeout=1.0)
+        assert acquired == []
+
+        release.set()
+        waiter.join(timeout=10)
+        thread.join(timeout=10)
+        assert acquired == [True]
+
+    def test_wait_expires_with_a_message_naming_the_wait(self, tmp_path):
+        from src.server import _delta_run_lock
+
+        with _delta_run_lock(tmp_path, "/tmp/sample.bin"):
+            with pytest.raises(RuntimeError, match="after waiting 1s"):
+                with _delta_run_lock(tmp_path, "/tmp/sample.bin", wait_seconds=1.0):
+                    pass  # pragma: no cover
+
+    def test_lock_file_survives_release(self, tmp_path):
+        """The lock file is never unlinked.
+
+        Removing it while another process waits on that inode lets a third
+        create a fresh file and take a second "exclusive" lock on the same
+        resource.
+        """
+        from src.server import _delta_run_lock
+
+        with _delta_run_lock(tmp_path, "/tmp/sample.bin"):
+            pass
+        assert (tmp_path / "delta_run_sample.lock").exists()
 
 
 class TestDeltaMerge:

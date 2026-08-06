@@ -152,12 +152,27 @@ def _first_changed_line(old_text: str, new_text: str) -> tuple[int, str, str] | 
     return None
 
 
-def _module_prefix(name: str) -> str:
-    """C++ class prefix: ``A::B::method`` -> ``A::B``; bare names -> ``(global)``."""
-    if not name or "::" not in name:
+def _module_prefix(func: dict) -> str:
+    """Group key for a function: its class / namespace.
+
+    Prefers the ``namespace`` the analysis cache records. Ghidra's PDB import
+    puts the class in the namespace rather than the flat name, so splitting the
+    flat name on ``::`` put an entire symbolized Windows binary into one
+    ``(global)`` bucket -- 1 of 3119 functions had an ``A::B::method`` shape,
+    and the 99 that contained ``::`` at all were template arguments like
+    ``~ComPtr<struct_Windows::Foundation::...>``.
+
+    Falls back to the flat-name split, which keeps working for caches written
+    before the field existed and for symbol sources that genuinely do embed the
+    class in the name.
+    """
+    namespace = (func.get("namespace") or "").strip()
+    if namespace:
+        return namespace
+    name = func.get("name") or ""
+    if "::" not in name:
         return "(global)"
-    parts = name.rsplit("::", 1)
-    return parts[0]
+    return name.rsplit("::", 1)[0]
 
 
 def _pair_by_pdb_name(
@@ -662,7 +677,7 @@ def _format_report(
         groups: dict[str, list[tuple[dict, dict, str, dict]]] = {}
         for entry in shown_modified:
             old_func, _, _, _ = entry
-            groups.setdefault(_module_prefix(old_func.get("name") or ""), []).append(entry)
+            groups.setdefault(_module_prefix(old_func), []).append(entry)
         for module, entries in sorted(groups.items()):
             lines.append(f"-- module: {module} ({len(entries)})")
             for entry in entries:

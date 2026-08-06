@@ -1206,3 +1206,63 @@ class TestPairingProvenance:
         report = self._pair(monkeypatch, named=True)
         assert "Pairs:" in report
         assert "by name" in report and "by opcode hash" in report and "by callee-set" in report
+
+
+class TestModuleGrouping:
+    """`group_by="module"` was inert on Ghidra-imported PDB names.
+
+    Ghidra puts the class in the NAMESPACE, not the flat name, so splitting the
+    flat name on `::` put a whole symbolized Windows binary into one `(global)`
+    bucket. Measured on sdengin2: 1 of 3119 functions had an `A::B::method`
+    shape, and the 99 containing `::` at all were template arguments.
+    """
+
+    def test_the_namespace_is_preferred_over_the_flat_name(self):
+        from src.tools.diff_tools import _module_prefix
+
+        func = _make_function(name="_RestoreNonSpannedFile")
+        func["namespace"] = "CSdRestoreImpl"
+        assert _module_prefix(func) == "CSdRestoreImpl"
+
+    def test_a_flat_name_still_groups_when_there_is_no_namespace(self):
+        """Caches written before the field existed, and symbol sources that do
+        embed the class in the name, must keep working."""
+        from src.tools.diff_tools import _module_prefix
+
+        assert _module_prefix(_make_function(name="A::B::method")) == "A::B"
+
+    def test_a_bare_name_with_no_namespace_is_global(self):
+        from src.tools.diff_tools import _module_prefix
+
+        assert _module_prefix(_make_function(name="memcpy")) == "(global)"
+
+    def test_an_empty_namespace_falls_back_rather_than_grouping_on_blank(self):
+        from src.tools.diff_tools import _module_prefix
+
+        func = _make_function(name="A::B::method")
+        func["namespace"] = "   "
+        assert _module_prefix(func) == "A::B"
+
+    def test_grouping_uses_the_namespace_end_to_end(self, monkeypatch):
+        import src.tools.diff_tools as dt
+
+        def _named(name, namespace, address):
+            f = _make_function(name=name, address=address, name_source="USER_DEFINED")
+            f["namespace"] = namespace
+            return f
+
+        old_funcs = [_named("Run", "CQuery", "0x1000"), _named("Stop", "CIndex", "0x2000")]
+        new_funcs = [_named("Run", "CQuery", "0x1000"), _named("Stop", "CIndex", "0x2000")]
+        monkeypatch.setattr(
+            dt, "_compute_function_hash",
+            lambda reader, a, m, func, md=None: {
+                "hash": f"h-{reader.path}-{func['address']}",
+                "instruction_count": 5, "operands_normalized": 0},
+        )
+        tool, _cache, _ = _register(monkeypatch,
+                                    _make_context(old_funcs), _make_context(new_funcs))
+        report = tool("/old.bin", "/new.bin", group_by="module")
+
+        assert "-- module: CQuery" in report
+        assert "-- module: CIndex" in report
+        assert "-- module: (global)" not in report

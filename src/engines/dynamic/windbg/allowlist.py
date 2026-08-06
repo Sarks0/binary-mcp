@@ -268,8 +268,16 @@ _DENY_ARGFORM: tuple[tuple[re.Pattern[str], str], ...] = (
         # string is `.if (<cond>) {} .else {gc}` -- so refusing the evaluator
         # switch outright costs nothing and is the same call already made for
         # 'dx', which is absent from the allowlist for the same reason.
-        re.compile(r"^.*@@", re.IGNORECASE),
-        "the '@@' expression-evaluator switch is forbidden: it reaches the "
+        # Anchored on the CALL form, not on '@@' alone. '@@' is also a
+        # mandatory part of MSVC name mangling -- '?Func@@YAXXZ',
+        # '?Method@Class@@QEAAXXZ', '??0Class@@QEAA@XZ' -- so a blanket refusal
+        # rejected ordinary read-only commands naming a C++ symbol by its
+        # decorated form ('bp mod!?Func@@YAXXZ', 'x', 'u', 'ln', 'dt'). That is
+        # an over-block, and a confusing refusal on a legitimate bp is exactly
+        # the pressure that gets a gate weakened later. The evaluator switch is
+        # always a call: '@@( ... )' or '@@c++( ... )'.
+        re.compile(r"^.*@@\s*(?:c\+\+)?\s*\(", re.IGNORECASE),
+        "the '@@( )' expression-evaluator switch is forbidden: it reaches the "
         "C++ evaluator, whose assignment operators write target memory, from "
         "any command that takes an expression",
     ),
@@ -606,6 +614,52 @@ def _is_allowed(first: str, part: str) -> bool:
     return False
 
 
+
+def _quoted_region_hides_a_separator(part: str) -> bool:
+    """True if a quoted region in ``part`` contains ';' or a newline.
+
+    THE NON-CARRIER QUOTE BLIND SPOT, and the exact twin of the brace blind
+    spot ``_leading_is_carrier`` was added to close.
+
+    ``parse_compound`` toggles ``in_dq``/``in_sq`` for EVERY command, so a
+    quoted region stops ';' and newline splitting no matter what leads the
+    line. But ``validate_command`` recurses into quoted bodies only for
+    :data:`_COMMAND_STRING_CARRIERS`. For any other allowlisted command the
+    quoted text is therefore neither split nor inspected::
+
+        lm m "; .shell calc"        k "; .shell calc"        r "; q"
+        u "x; .dvalloc 1000"        dd "x; ed 401000 90"
+
+    all reached the debugger behind a harmless first token. Unlike the ``${``
+    spelling this is INHERITED -- origin/main accepts these too -- but the
+    module's headline claim is that it is the authoritative fail-closed gate,
+    and it was not.
+
+    Recursing into non-carrier quotes is not the answer: for them the quoted
+    text really is data (``.printf "hello world"``), and validating it as a
+    command would refuse every legitimate use. Splitting on the ';' instead
+    would guess at cdb's behaviour. So this refuses only the AMBIGUOUS case --
+    a separator inside a non-carrier's quoted region, where this validator's
+    tokenization and the debugger's may disagree and nothing downstream
+    compensates. That is the rule ``_structural_problem`` already applies to
+    unterminated regions, for the same reason.
+
+    Cost: ``.printf "a;b"`` is refused. The project never issues that (its one
+    conditional-breakpoint string puts ``.printf`` inside ``bp "..."``, which
+    IS a carrier and is recursed into normally).
+    """
+    quote = ""
+    for ch in part:
+        if not quote:
+            if ch in ("'", '"'):
+                quote = ch
+        elif ch == quote:
+            quote = ""
+        elif ch in ";\r\n":
+            return True
+    return False
+
+
 def validate_command(command: str, _depth: int = 0) -> tuple[bool, str | None]:
     """Validate a (possibly compound) WinDbg command string.
 
@@ -654,6 +708,14 @@ def validate_command(command: str, _depth: int = 0) -> tuple[bool, str | None]:
         for pattern, reason in _DENY_ARGFORM:
             if pattern.match(part):
                 return False, reason
+
+        if first not in _COMMAND_STRING_CARRIERS and _quoted_region_hides_a_separator(part):
+            return False, (
+                f"command {first!r} is not a command-string carrier, so its "
+                "quoted text is data -- but a quoted ';' or newline here would "
+                "stop this validator splitting where the debugger may still "
+                "split. Refusing rather than guessing"
+            )
 
         if not _is_allowed(first, part):
             return False, (

@@ -230,6 +230,24 @@ class TestKillGating:
         )
         assert jobs_mod._process_matches(4242) is True
 
+    def test_merely_mentioning_ghidra_is_not_enough(self, monkeypatch):
+        """The gate is the launcher, not the word.
+
+        Matching the bare substring "ghidra" against the whole command line
+        accepts any process that happens to name it in an argument. A recycled
+        pid landing on one of those would be killed, which is exactly the
+        unrecoverable case the gate exists to prevent.
+        """
+        monkeypatch.setattr(jobs_mod, "_pid_alive", lambda pid: True)
+        for command in (
+            "vim /opt/ghidra/scripts/core_analysis.py",
+            "grep -r ghidra /home/user",
+            "/usr/bin/python3 -c import os; os.environ['GHIDRA_INSTALL_DIR']",
+        ):
+            monkeypatch.setattr(jobs_mod, "_process_command", lambda pid, c=command: c)
+            assert jobs_mod._process_matches(4242) is False, command
+            assert jobs_mod._kill_pid(4242) is False, command
+
     def test_dead_pid_is_not_killed(self, monkeypatch):
         monkeypatch.setattr(jobs_mod, "_pid_alive", lambda pid: False)
         assert jobs_mod._kill_pid(4242) is False
@@ -267,6 +285,59 @@ class TestCancellation:
 
     def test_cancelling_an_unknown_job_reports_it(self, registry):
         assert "error" in registry.cancel("nope")
+
+    def test_a_job_that_finishes_mid_cancel_keeps_its_result(self, registry, monkeypatch):
+        """First terminal decision wins, even when it is not the cancel's.
+
+        `cancel` checks for a terminal state, then spends seconds killing
+        pids. A worker that finishes inside that window writes `succeeded`.
+        Writing `cancelled` over it leaves `job_result` reporting a cancelled
+        job next to a populated result -- three statements about one job, two
+        of them false.
+        """
+        release = threading.Event()
+
+        def _work(ctx):
+            ctx.track_child(6060)
+            release.wait(5)
+            return {"pseudocode": "int main() {}"}
+
+        submitted = registry.submit(kind="test", key="k", fn=_work)
+        job_id = submitted["job_id"]
+        assert _wait_for(
+            lambda: (registry.read(job_id).get("child_pids") or []) == [6060]
+        )
+
+        # The kill loop is where the window lives: let the worker finish inside it.
+        def _slow_kill(pid):
+            release.set()
+            assert _wait_for(
+                lambda: registry.read(job_id)["state"] == STATE_SUCCEEDED
+            )
+            return True
+
+        monkeypatch.setattr(jobs_mod, "_kill_pid", _slow_kill)
+
+        result = registry.cancel(job_id)
+        assert result["cancelled"] is False
+        assert result["state"] == STATE_SUCCEEDED
+        assert "that result stands" in result["note"]
+
+        record = registry.read(job_id)
+        assert record["state"] == STATE_SUCCEEDED
+        assert record["result"] == {"pseudocode": "int main() {}"}
+
+    def test_an_orphan_sweep_does_not_overwrite_a_finished_job(self, registry):
+        """Same rule for the reaper: the owner looked dead, not was dead."""
+        submitted = registry.submit(kind="test", key="k", fn=lambda ctx: {"ok": 1})
+        job_id = submitted["job_id"]
+        assert _wait_for(lambda: registry.read(job_id)["state"] == STATE_SUCCEEDED)
+
+        registry._orphan(registry.read(job_id))
+
+        record = registry.read(job_id)
+        assert record["state"] == STATE_SUCCEEDED
+        assert record["result"] == {"ok": 1}
 
 
 class TestShutdown:

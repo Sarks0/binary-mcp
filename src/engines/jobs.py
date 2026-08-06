@@ -83,8 +83,14 @@ TERMINAL_STATES = (STATE_SUCCEEDED, STATE_FAILED, STATE_CANCELLED, STATE_ORPHANE
 HEARTBEAT_INTERVAL_SECONDS = 15
 STALE_AFTER_SECONDS = 120
 
-# Substrings that identify a process as one of ours before we kill it.
-_REAPABLE_MARKERS = ("analyzeheadless", "ghidra")
+# Substring that identifies a process as one of ours before we kill it.
+# Deliberately just the launcher: this is matched against the WHOLE command
+# line, so a broader marker like "ghidra" also matches any process that merely
+# mentions it in an argument -- an editor with a Ghidra script open, a grep, a
+# sibling tool pointed at GHIDRA_INSTALL_DIR. A recycled pid landing on one of
+# those would pass the gate and be killed. Every process this registry spawns
+# is an `analyzeHeadless` invocation, so the narrower marker loses nothing.
+_REAPABLE_MARKERS = ("analyzeheadless",)
 
 # Job ids are `uuid4().hex[:16]`, so plain lowercase hex. Anything else is
 # rejected before it reaches the filesystem: `job_id` arrives from an MCP tool
@@ -168,7 +174,7 @@ def _process_matches(pid: int) -> bool:
     is recoverable, killing an unrelated one that happens to have inherited
     the pid is not.
     """
-    command = _process_command(pid)
+    command = _process_command(pid).lower()
     if not command:
         return False
     return any(marker in command for marker in _REAPABLE_MARKERS)
@@ -589,7 +595,11 @@ class JobRegistry:
         for pid in record.get("child_pids") or []:
             if isinstance(pid, int) and _kill_pid(pid):
                 reaped.append(pid)
-        self._update(
+        # _finalize, not _update: the owner looked dead but may have been slow,
+        # and a `succeeded` it wrote while we were reaping is the first
+        # terminal decision. Overwriting it would report work that finished as
+        # abandoned.
+        self._finalize(
             record["job_id"],
             state=STATE_ORPHANED,
             progress="owner exited without finishing",
@@ -616,11 +626,23 @@ class JobRegistry:
             context = self._local.get(job_id)
             if context is not None:
                 context._cancelled.set()
-        self._update(job_id, state=STATE_CANCELLED, progress="cancelled",
-                     error=f"cancelled; reaped {reaped} subprocess(es)")
+        # _finalize, not _update. The terminal check above happens BEFORE the
+        # kill loop, which takes seconds; a worker that finishes inside that
+        # window writes `succeeded` and this would overwrite it -- leaving
+        # `job_result` reporting `cancelled` next to a populated `result`. The
+        # first terminal decision wins, and here that may not be ours.
+        final = self._finalize(job_id, state=STATE_CANCELLED, progress="cancelled",
+                               error=f"cancelled; reaped {reaped} subprocess(es)")
         self._release_claim(record.get("key") or "", expect=job_id)
-        return {"job_id": job_id, "state": STATE_CANCELLED, "cancelled": True,
-                "reaped": reaped}
+        state = (final or {}).get("state", STATE_CANCELLED)
+        result = {"job_id": job_id, "state": state,
+                  "cancelled": state == STATE_CANCELLED, "reaped": reaped}
+        if state != STATE_CANCELLED:
+            result["note"] = (
+                f"finished as {state} while the cancel was reaping; that "
+                f"result stands"
+            )
+        return result
 
     def sweep(self) -> dict:
         """Find jobs whose owner died and reap what they left behind.

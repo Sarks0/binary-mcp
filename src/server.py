@@ -341,44 +341,83 @@ def _write_resume_manifest(
         return None
 
 
-@contextlib.contextmanager
-def _delta_run_lock(cache_dir: Path, binary_path: str):
-    """
-    Cross-platform exclusive lock for incremental Ghidra runs on a binary.
+# How long a plain analysis queues behind another run on the same Ghidra
+# project before giving up. Sized against GHIDRA_TIMEOUT's 3600s ceiling: the
+# holder cannot legitimately outlast its own timeout, so waiting past that
+# means the lock is stale rather than busy.
+_RUN_LOCK_WAIT_SECONDS = 3600.0
 
-    Two parallel ``analyze_binary(..., incremental=True)`` calls on the same
-    binary would race on the manifest, the temp output JSON, and the cache
-    file. This advisory lock makes the second caller fail fast with a clear
-    message instead of silently corrupting cache state.
+
+def _try_lock(fd: int) -> bool:
+    """Take an exclusive advisory lock without blocking. False if held."""
+    if sys.platform == "win32":
+        import msvcrt
+        try:
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            return True
+        except OSError:
+            return False
+    import fcntl
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except (BlockingIOError, OSError):
+        return False
+
+
+@contextlib.contextmanager
+def _delta_run_lock(
+    cache_dir: Path,
+    binary_path: str,
+    lock_key: str | None = None,
+    wait_seconds: float = 0.0,
+):
     """
+    Cross-platform exclusive lock over the per-binary Ghidra run resources.
+
+    Two parallel runs on one binary race on the manifest and the cache file;
+    two parallel runs on binaries that merely share a *filename stem* race on
+    the Ghidra project, which is named from the stem and created with
+    ``-overwrite``. ``lock_key`` is therefore the sanitized project name rather
+    than the path, so the lock covers exactly the collisions that exist.
+
+    ``wait_seconds`` picks the posture. Zero means fail fast, which is what an
+    ``incremental=True`` caller wants: it asked to extend a specific cache, and
+    queueing behind another writer of that cache is not what it meant. A
+    positive value queues instead, which is what a plain analysis wants -- an
+    old and a new build of one DLL is the patch-diff case, and failing the
+    second of those would break the workflow to protect it.
+
+    The lock file is deliberately never unlinked. Removing it while another
+    process waits on that inode lets a third create a fresh file and take a
+    second "exclusive" lock on the same resource.
+    """
+    # Deliberately no mkdir. `ProjectCache.__init__` owns creating the cache
+    # directory; creating it here would put a `mkdir(parents=True)` on the path
+    # of every Ghidra run, and against a mocked cache `Path(MagicMock)` yields
+    # a plausible relative path rather than raising -- which is exactly how a
+    # stray `MagicMock/` tree got committed once already (see 37d2820).
     cache_dir = Path(cache_dir)
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    lock_path = cache_dir / f"delta_run_{Path(binary_path).stem}.lock"
+    key = lock_key or Path(binary_path).stem
+    lock_path = cache_dir / f"delta_run_{key}.lock"
     fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
     locked = False
     try:
-        if sys.platform == "win32":
-            import msvcrt
-            try:
-                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-                locked = True
-            except OSError:
-                raise RuntimeError(
-                    f"Another incremental analysis is already running for "
-                    f"{binary_path}. Wait for it to finish or remove "
-                    f"{lock_path} if you are sure no run is in progress."
-                )
-        else:
-            import fcntl
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                locked = True
-            except (BlockingIOError, OSError):
-                raise RuntimeError(
-                    f"Another incremental analysis is already running for "
-                    f"{binary_path}. Wait for it to finish or remove "
-                    f"{lock_path} if you are sure no run is in progress."
-                )
+        deadline = time.monotonic() + max(0.0, wait_seconds)
+        while True:
+            locked = _try_lock(fd)
+            if locked or time.monotonic() >= deadline:
+                break
+            time.sleep(0.25)
+        if not locked:
+            waited = (
+                f" after waiting {wait_seconds:.0f}s" if wait_seconds else ""
+            )
+            raise RuntimeError(
+                f"Another analysis is already running for {binary_path}{waited}. "
+                f"Wait for it to finish or remove {lock_path} if you are sure "
+                f"no run is in progress."
+            )
         yield
     finally:
         if locked:
@@ -397,10 +436,6 @@ def _delta_run_lock(cache_dir: Path, binary_path: str):
                 pass
         try:
             os.close(fd)
-        except OSError:
-            pass
-        try:
-            lock_path.unlink(missing_ok=True)
         except OSError:
             pass
 
@@ -546,7 +581,7 @@ def get_analysis_context(
     if processor or loader:
         logger.info(f"Using explicit loader config - Processor: {processor}, Loader: {loader}")
 
-    output_path = cache.cache_dir / f"temp_analysis_{Path(binary_path).stem}.json"
+    output_path = cache.temp_output_path(binary_path)
     script_path = Path(__file__).parent / "engines" / "static" / "ghidra" / "scripts"
 
     # Resolve resume path if caller wants to extend an existing cache.
@@ -565,27 +600,35 @@ def get_analysis_context(
     resume_from_cache = None
     resume_manifest_path = None
     existing_cache_data = None
-    delta_lock_cm = contextlib.nullcontext()
     if incremental:
         resume_from_cache = cache.get_cache_path(binary_path)
         if resume_from_cache is None:
             logger.info("incremental=True but no cache exists yet; running full analysis")
         else:
             logger.info(f"Resuming analysis from cache: {resume_from_cache}")
-            # Acquire an advisory lock so a second concurrent incremental run
-            # on the same binary fails fast instead of corrupting the cache.
-            delta_lock_cm = _delta_run_lock(cache.cache_dir, binary_path)
-            delta_lock_cm.__enter__()
-            try:
-                existing_cache_data = cache.get_cached(binary_path)
-            except Exception as e:
-                logger.warning(f"Could not pre-load cache for delta merge: {e}")
-                existing_cache_data = None
-            if existing_cache_data is not None:
-                resume_manifest_path = _write_resume_manifest(
-                    cache.cache_dir, binary_path, existing_cache_data,
-                    skip_decompile=skip_decompile,
-                )
+
+    # Every Ghidra run through here shares project state with any other run on
+    # a binary of the same name, so the lock covers all of them -- not only the
+    # incremental ones, which is all it used to guard. `wait=False` jobs made
+    # that concurrency the normal case rather than an accident.
+    delta_lock_cm = _delta_run_lock(
+        cache.cache_dir,
+        binary_path,
+        lock_key=cache._get_project_name(binary_path),
+        wait_seconds=0.0 if resume_from_cache is not None else _RUN_LOCK_WAIT_SECONDS,
+    )
+    delta_lock_cm.__enter__()
+    if resume_from_cache is not None:
+        try:
+            existing_cache_data = cache.get_cached(binary_path)
+        except Exception as e:
+            logger.warning(f"Could not pre-load cache for delta merge: {e}")
+            existing_cache_data = None
+        if existing_cache_data is not None:
+            resume_manifest_path = _write_resume_manifest(
+                cache.cache_dir, binary_path, existing_cache_data,
+                skip_decompile=skip_decompile,
+            )
 
     try:
         # Default bumped to 1800s (30 min) -- large binaries routinely need more
@@ -713,8 +756,8 @@ def get_analysis_context(
             if elf_recommendation:
                 user_message += f"\n\n**Recommendation:**\n{elf_recommendation}"
 
-            # Don't cache invalid results
-            output_path.unlink(missing_ok=True)
+            # Don't cache invalid results. (The `finally` unlinks the temp
+            # output; this raise just stops it reaching save_cached.)
             raise UserFacingError(user_message, internal_details=internal_details)
 
         # Tag the cache with the depth it was produced at so callers can
@@ -766,9 +809,7 @@ def get_analysis_context(
         except Exception as e:
             logger.warning(f"Coverage indexing failed for {binary_path}: {e}")
 
-        # Clean up temp file
-        output_path.unlink()
-
+        # Temp file cleanup happens in the `finally` below, on every path.
         logger.info(f"Analysis complete: {result['elapsed_time']:.2f}s")
         return context
 
@@ -782,6 +823,13 @@ def get_analysis_context(
         logger.error(f"Analysis failed: {e}")
         raise RuntimeError(f"Failed to analyze binary: {e}")
     finally:
+        # The temp output is run-scoped now, so a failure that leaves one
+        # behind leaks a fresh multi-megabyte file rather than overwriting a
+        # single shared one. Unlink on every exit path, not just success.
+        try:
+            output_path.unlink(missing_ok=True)
+        except OSError as e:
+            logger.debug(f"Could not clean up temp analysis output: {e}")
         if resume_manifest_path:
             try:
                 Path(resume_manifest_path).unlink(missing_ok=True)

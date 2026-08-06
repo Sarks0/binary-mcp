@@ -19,6 +19,7 @@ import logging
 import re
 import shutil
 import time
+import uuid
 from pathlib import Path
 
 from src.utils.config import get_cache_dir
@@ -118,6 +119,25 @@ class ProjectCache:
         if legacy.exists():
             return legacy
         return None
+
+    def temp_output_path(self, binary_path: str) -> Path:
+        """A run-scoped path for a Ghidra script's JSON output.
+
+        Unique per call, deliberately. The previous
+        ``temp_analysis_<stem>.json`` was shared by every run on a binary of
+        that name, and the window between the Jython script writing it and the
+        parent reading it back spans the whole JVM teardown -- seconds on a
+        large binary. Two concurrent runs on same-named binaries could
+        therefore have one parent load the other's context and ``save_cached``
+        it under the wrong content hash, so a diff of the two would report
+        them identical. Same-stem concurrency is not exotic here: an old and a
+        new build of one DLL is the patch-diff case this server exists for.
+
+        Callers must unlink the path they get back. ``clear_all``'s ``*.json``
+        sweep still collects anything left behind by a crash.
+        """
+        stem = Path(binary_path).stem or "binary"
+        return self.cache_dir / f"temp_analysis_{stem}_{uuid.uuid4().hex[:12]}.json"
 
     def _get_metadata_path(self, binary_hash: str) -> Path:
         return self.cache_dir / f"{binary_hash}.meta.json"

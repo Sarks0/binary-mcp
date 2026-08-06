@@ -2366,7 +2366,17 @@ def get_call_graph(
                 for called_func in called:
                     result += build_graph(called_func.get('name'), current_depth + 1, visited)
 
-            return wrap_untrusted(result, "call graph")
+            # NOT fenced here. build_graph is a nested, self-recursive helper
+            # whose parent accumulates its return with `result += ...`, so
+            # wrapping here emitted a full envelope -- header, the ~470-char
+            # notice, terminator -- per graph NODE, which the outer wrap then
+            # escaped into its own body: 241 nodes rendered 162 KB for 4.9 KB
+            # of graph. The mechanical rewrite that added the fences matched
+            # both `return result` statements in this function and could not
+            # tell the tool's return from the helper's. The envelope belongs
+            # once around the whole block; wrap_untrusted's own docstring says
+            # so ("emitted once around a whole block (never per line)").
+            return result
 
         result = f"**Call Graph for {function_name}** (depth={depth}, direction={direction})\n\n"
         result += build_graph(function_name, 0)

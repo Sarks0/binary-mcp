@@ -1220,6 +1220,10 @@ _TOOLS_THAT_MUST_FENCE: dict[str, tuple[str, ...]] = {
         "windbg_read_memory",
         "windbg_disassemble",
         "windbg_get_modules",
+        # The raw command tool returns whatever the debugger printed. It was
+        # missing from this list despite being the single highest-value fence
+        # in the module.
+        "windbg_execute_command",
     ),
     "pe_tools": (
         "inspect_authenticode",     # certificate CNs chosen by the sample
@@ -1269,11 +1273,37 @@ def test_named_tool_applies_a_fence(module_name, tool_name):
         f"{module_name}.{tool_name} no longer exists; update "
         "_TOOLS_THAT_MUST_FENCE rather than letting the assertion rot"
     )
-    body = ast.unparse(tools[tool_name])
-    assert any(m in body for m in ("_fence(", "wrap_untrusted", "_untrusted(")), (
+    node = tools[tool_name]
+
+    # The fence must be on the TOOL's own return, not merely somewhere inside
+    # it. A substring scan over ast.unparse(node) cannot tell the difference,
+    # and that gap shipped: get_call_graph's fence landed on the return of its
+    # nested, self-RECURSIVE helper, so every graph node emitted a full
+    # envelope which the outer wrap then escaped into its own body -- 241 nodes
+    # rendered 162 KB for 4.9 KB of graph. This guard passed the whole time.
+    nested = {
+        sub
+        for child in ast.walk(node)
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and child is not node
+        for sub in ast.walk(child)
+    }
+    # The fence must be in the tool's OWN body -- fencing a component before
+    # joining it (windbg_step_into fences the instruction, then joins) is fine,
+    # because that still runs once per call. What is not fine is a fence inside
+    # a nested helper, which multiplies with however many times the helper runs.
+    own_nodes = [n for n in ast.walk(node) if n not in nested]
+    fenced = [
+        n
+        for n in own_nodes
+        if isinstance(n, ast.Call)
+        and any(m in ast.unparse(n.func) for m in ("_fence", "wrap_untrusted", "_untrusted"))
+    ]
+    assert fenced, (
         f"{module_name}.{tool_name} returns sample- or target-derived text "
-        "without fencing it; the module-level guard cannot see this because it "
-        "only checks whether the helper is mentioned anywhere in the file"
+        "without fencing it in its own body. A fence that appears only inside "
+        "a NESTED helper does not count: it emits one envelope per call of "
+        "that helper instead of one per response."
     )
 
 

@@ -269,6 +269,58 @@ def wrap_untrusted(body: str, kind: str = "sample data") -> str:
     )
 
 
+def strip_untrusted_envelope(text: str) -> str:
+    """
+    Remove one wrap_untrusted() envelope and return the body it fenced.
+
+    Storing an already-fenced tool return and re-fencing it on the way out
+    nests the envelope: the inner header, the ~530-character notice and the
+    terminator are escaped into the outer body once per stored call, so a
+    30-call session replays roughly 16 KB of boilerplate and shows the model
+    a boundary marker that is deliberately not a boundary. Strip where output
+    is STORED and every consumer -- session replay, report generation, the
+    50-character excerpts in the markdown report -- sees content instead.
+
+    The escaping applied by neutralise_untrusted_delimiters is deliberately
+    NOT reversed. Its output contains no sentinel and no bare terminator, so
+    re-fencing a stripped body is idempotent; un-escaping would hand the next
+    wrapper text able to close the envelope early, which is the whole thing
+    the envelope exists to prevent.
+
+    Args:
+        text: A tool return that may or may not carry an envelope
+
+    Returns:
+        The fenced body when TEXT is exactly one envelope, otherwise TEXT
+        unchanged. A fence applied to part of a larger return (a component
+        fenced before joining) is left alone -- there is no outer envelope to
+        remove, and removing an inner one would unfence sample bytes.
+    """
+    if not isinstance(text, str):
+        return text
+
+    stripped = text.strip()
+    if not stripped.startswith(UNTRUSTED_OPEN_SENTINEL):
+        return text
+    if not stripped.endswith(UNTRUSTED_END_MARKER):
+        return text
+
+    lines = stripped.split("\n")
+    if len(lines) < 3:
+        return text
+    header = lines[0]
+    if not header.startswith(
+        f"{UNTRUSTED_OPEN_SENTINEL}BEGIN UNTRUSTED SAMPLE DATA: "
+    ) or not header.endswith(UNTRUSTED_CLOSE_SENTINEL):
+        return text
+    if lines[1] != _UNTRUSTED_NOTICE or lines[-1] != UNTRUSTED_END_MARKER:
+        return text
+
+    # Exactly one level. A neutralised body cannot itself carry a bare
+    # sentinel, so the shape matched above is unambiguously the wrapper's.
+    return "\n".join(lines[2:-1])
+
+
 def format_function_list(functions: list[dict], limit: int = 50) -> str:
     """
     Format a list of functions for display.

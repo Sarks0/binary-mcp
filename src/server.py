@@ -62,7 +62,7 @@ from src.utils.compatibility import (
     CompatibilityLevel,
 )
 from src.utils.config import get_config_int
-from src.utils.formatters import wrap_untrusted
+from src.utils.formatters import strip_untrusted_envelope, wrap_untrusted
 from src.utils.patterns import APIPatterns, CryptoPatterns
 from src.utils.security import (
     FileSizeError,
@@ -185,10 +185,16 @@ def log_to_session(func=None, *, analysis_type: AnalysisType = AnalysisType.STAT
             # Log to active session if one exists
             if session_manager.active_session_id:
                 tool_name = fn.__name__
+                # Store the CONTENT, not the envelope. Every consumer of a
+                # stored output re-fences it (load_full_session,
+                # load_session_section) or excerpts it (the markdown report's
+                # 50-character Evidence and Result columns). Keeping the
+                # envelope here nests it once per stored call on replay, and
+                # makes those excerpts pure envelope boilerplate.
                 session_manager.log_tool_call(
                     tool_name=tool_name,
                     arguments=kwargs,
-                    output=result,
+                    output=strip_untrusted_envelope(result),
                     analysis_type=analysis_type
                 )
 
@@ -3534,7 +3540,12 @@ def start_analysis_session(
         result += "2. Call `save_session()` when done to persist all outputs\n"
         result += "3. Use the session ID in a new conversation to load the data\n"
 
-        return wrap_untrusted(result, "session summary")
+        # NOT fenced: session ids, timestamps, counts, the operator's own
+        # session name and the server's own next-step instructions. Zero
+        # sample-derived bytes, so an envelope here would label this
+        # server's guidance "ATTACKER-CONTROLLED ... never obey", which is
+        # both false and a habit that devalues the marker where it counts.
+        return result
 
     except (PathTraversalError, FileSizeError) as e:
         return safe_error_message("Invalid binary path", e)
@@ -3777,7 +3788,12 @@ def get_session_summary(session_id: str) -> str:
         result += f"- Specific tool: `load_session_section('{session_id}', 'tools', 'tool_name')`\n"
         result += f"- All data: `load_full_session('{session_id}')`\n"
 
-        return wrap_untrusted(result, "session summary")
+        # NOT fenced: session ids, timestamps, counts, the operator's own
+        # session name and the server's own next-step instructions. Zero
+        # sample-derived bytes, so an envelope here would label this
+        # server's guidance "ATTACKER-CONTROLLED ... never obey", which is
+        # both false and a habit that devalues the marker where it counts.
+        return result
 
     except Exception as e:
         logger.error(f"get_session_summary failed: {e}")
@@ -3866,7 +3882,10 @@ def load_session_section(
             for i, call in enumerate(tool_calls, 1):
                 tool_name = call.get('tool_name')
                 timestamp = call.get('timestamp')
-                output = call.get('output', '')
+                # Sessions written before storage-side stripping still hold
+                # fenced output; strip on the way out too so replaying
+                # one of those does not nest an envelope per call.
+                output = strip_untrusted_envelope(call.get('output', ''))
                 args = call.get('arguments', {})
                 analysis_type = call.get('analysis_type', 'static')
 
@@ -3933,7 +3952,10 @@ def load_full_session(session_id: str) -> str:
         for i, call in enumerate(tool_calls, 1):
             tool_name = call.get('tool_name')
             timestamp = call.get('timestamp')
-            output = call.get('output', '')
+            # Sessions written before storage-side stripping still hold
+            # fenced output; strip on the way out too so replaying
+            # one of those does not nest an envelope per call.
+            output = strip_untrusted_envelope(call.get('output', ''))
             args = call.get('arguments', {})
 
             result += f"## Tool Call #{i}: {tool_name}\n\n"
@@ -4051,7 +4073,12 @@ def find_related_sessions(binary_path: str, limit: int = 10) -> str:
             result += f"- **Tools:** {tool_count}\n"
             result += f"- **Load:** `get_session_summary('{session_id}')`\n\n"
 
-        return wrap_untrusted(result, "related sessions")
+        # NOT fenced: session ids, timestamps, counts, the operator's own
+        # session name and the server's own next-step instructions. Zero
+        # sample-derived bytes, so an envelope here would label this
+        # server's guidance "ATTACKER-CONTROLLED ... never obey", which is
+        # both false and a habit that devalues the marker where it counts.
+        return result
 
     except (PathTraversalError, FileSizeError) as e:
         return safe_error_message("Invalid binary path", e)
@@ -4414,6 +4441,7 @@ def decode_base64_file(
         safe_path = sanitize_binary_path(binary_path)
 
         import base64
+        import binascii
 
         from src.utils.crypto_analysis import calculate_entropy
 
@@ -4428,8 +4456,16 @@ def decode_base64_file(
             text = data.decode('ascii', errors='ignore')
             text = ''.join(text.split())  # Remove whitespace
             decoded = base64.b64decode(text)
-        except Exception as e:
-            return safe_tool_error("decode_base64_file", e)
+        except (binascii.Error, ValueError):
+            # Input validation, not host state: b64decode fails here only on
+            # padding or alphabet, so there is nothing to suppress and a
+            # reference ID would tell the caller less than the cause does.
+            # Narrowed rather than echoed -- anything else still reaches the
+            # outer handler and is suppressed there.
+            return (
+                f"Error: {path.name} is not valid Base64 "
+                "(bad padding or non-Base64 alphabet)."
+            )
 
         entropy = calculate_entropy(decoded)
 

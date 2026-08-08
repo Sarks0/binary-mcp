@@ -103,11 +103,16 @@ def _load_context(binary_path: str, cache, runner):
     # The temp output is run-scoped, so cleanup has to happen on the failure
     # paths too -- otherwise every failed run leaves a fresh copy behind.
     try:
+        # Content-keyed project name, matching get_analysis_context, so the
+        # project this import leaves behind is the one later runs reuse
+        # instead of re-importing.
+        project_name = cache.project_name_for(bp)
         runner.analyze(
             binary_path=bp,
             script_path=str(script_path),
             script_name="core_analysis.py",
             output_path=str(output_path),
+            project_name=project_name,
             keep_project=True,
             timeout=timeout,
         )
@@ -117,6 +122,12 @@ def _load_context(binary_path: str, cache, runner):
         with open(output_path, encoding="utf-8") as f:
             context = json.load(f)
         cache.save_cached(bp, context)
+        cache.write_project_state(
+            project_name,
+            bp,
+            program_name=(context.get("metadata") or {}).get("name"),
+            analyzed=True,
+        )
         return context, bp
     finally:
         output_path.unlink(missing_ok=True)

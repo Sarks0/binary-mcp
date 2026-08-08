@@ -307,8 +307,15 @@ class ProjectCache:
     def _get_project_name(self, binary_path: str) -> str:
         """Mirror runner.py's project_name derivation from a binary path.
 
-        Must stay in sync with ``GhidraRunner.analyze`` so cache cleanup
-        targets the same ghidra_projects entries the runner created.
+        This is the *legacy* (pre-project-reuse) name: derived from the file
+        stem alone. It is still the lock key -- two binaries sharing a stem are
+        exactly the pair a same-named old/new build produces, and serialising
+        them costs a queue rather than a corrupted run -- and it is still
+        cleaned up, because installs upgraded from an older version have
+        projects under this name.
+
+        New projects are created under :meth:`project_name_for`, which appends
+        a content-hash discriminator.
         """
         stem = Path(binary_path).stem
         # Flatten dots as well as the illegal set -- MUST match the identical
@@ -318,21 +325,131 @@ class ProjectCache:
         name = re.sub(r'[^a-zA-Z0-9_\-]', '_', stem)
         if name.startswith('-'):
             name = f"proj_{name}"
-        return name
+        # Ghidra writes <name>.gpr / <name>.rep / <name>.lock, so the name has
+        # to leave room for those suffixes inside the filesystem's 255-byte
+        # component limit. Long stems are real (versioned symbol-server paths).
+        return name[:100]
+
+    def project_name_for(self, binary_path: str) -> str:
+        """Ghidra project name for a binary: ``<stem>_<hash8>``.
+
+        The hash discriminator is what makes project *reuse* safe. A project
+        holds one imported, fully-analyzed program; reusing it instead of
+        re-importing is the difference between a 30-second targeted decompile
+        and a 7-minute one. But the old stem-only name collides for an old and
+        a new build of the same DLL -- the patch-diff case this server exists
+        for -- and reusing a project across that collision would silently
+        decompile the wrong build. Keying on content means each build gets its
+        own project and each is reusable, so the alternating workflow stops
+        paying for a re-import every time it switches sides.
+
+        Falls back to the legacy stem-only name if the file cannot be hashed;
+        the caller then gets today's behaviour rather than an exception.
+        """
+        base = self._get_project_name(binary_path)
+        try:
+            return f"{base}_{self._get_binary_hash(binary_path)[:8]}"
+        except OSError as e:
+            logger.warning(f"Could not hash {binary_path} for project name: {e}")
+            return base
 
     def _ghidra_project_paths(self, project_name: str) -> list[Path]:
-        """Return the .gpr / .lock / .rep paths for a project_name."""
+        """Return the .gpr / .lock / .rep / .owner.json paths for a project."""
         project_dir = self.cache_dir / "ghidra_projects"
         return [
             project_dir / f"{project_name}.gpr",
             project_dir / f"{project_name}.lock",
             project_dir / f"{project_name}.rep",
+            self._project_state_path(project_name),
         ]
+
+    def _project_state_path(self, project_name: str) -> Path:
+        """Side-car recording which binary a Ghidra project actually holds."""
+        return self.cache_dir / "ghidra_projects" / f"{project_name}.owner.json"
+
+    def project_exists(self, project_name: str) -> bool:
+        """True iff the on-disk Ghidra project looks importable-into.
+
+        Both the ``.gpr`` and the ``.rep`` directory must be present: a ``.gpr``
+        on its own is a half-deleted project that ``-process`` cannot open.
+        """
+        project_dir = self.cache_dir / "ghidra_projects"
+        return (
+            (project_dir / f"{project_name}.gpr").exists()
+            and (project_dir / f"{project_name}.rep").is_dir()
+        )
+
+    def read_project_state(self, project_name: str) -> dict | None:
+        """Load the project's owner record, or None when absent/unreadable.
+
+        The record is what licenses reuse: it names the binary hash the project
+        was imported from, the program name inside it, and whether Ghidra's
+        auto-analysis actually ran. Treat a missing record as "do not reuse" --
+        the cost is one re-import, whereas trusting an unverified project risks
+        decompiling a different binary entirely.
+        """
+        try:
+            path = self._project_state_path(project_name)
+            if not path.exists():
+                return None
+            with open(path, encoding="utf-8") as f:
+                state = json.load(f)
+            return state if isinstance(state, dict) else None
+        except Exception as e:
+            logger.warning(f"Could not read project state for {project_name}: {e}")
+            return None
+
+    def write_project_state(
+        self,
+        project_name: str,
+        binary_path: str,
+        program_name: str | None,
+        analyzed: bool,
+        pdb_applied: bool = False,
+    ) -> bool:
+        """Record what a freshly-imported Ghidra project contains.
+
+        Written only after an import run succeeded, so the presence of this
+        file means "the project on disk holds this binary, imported and (if
+        ``analyzed``) auto-analyzed".
+        """
+        try:
+            state_path = self._project_state_path(project_name)
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "version": 1,
+                "project_name": project_name,
+                "binary_hash": self._get_binary_hash(binary_path),
+                "binary_path": str(Path(binary_path).resolve()),
+                "program_name": program_name,
+                "analyzed": bool(analyzed),
+                "pdb_applied": bool(pdb_applied),
+                "imported_at": time.time(),
+            }
+            tmp = state_path.with_suffix(".json.tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+            tmp.replace(state_path)
+            return True
+        except Exception as e:
+            logger.warning(f"Could not write project state for {project_name}: {e}")
+            return False
+
+    def clear_project_state(self, project_name: str) -> None:
+        """Drop the owner record so the next run re-imports.
+
+        Called when a reuse attempt failed: whatever is on disk did not answer
+        ``-process``, and the record claiming it would is worse than no record.
+        """
+        try:
+            self._project_state_path(project_name).unlink(missing_ok=True)
+        except OSError as e:
+            logger.debug(f"Could not clear project state for {project_name}: {e}")
 
     def _drop_ghidra_project(self, project_name: str) -> int:
         """Remove a binary's Ghidra project artifacts.
 
-        Returns the number of paths removed (0-3).
+        Returns the number of paths removed (0-4).
         """
         removed = 0
         for p in self._ghidra_project_paths(project_name):
@@ -386,8 +503,15 @@ class ProjectCache:
                     p.unlink()
 
             if include_project:
-                project_name = self._get_project_name(binary_path)
-                self._drop_ghidra_project(project_name)
+                # Drop both the content-keyed project and any legacy
+                # stem-only one left by an install that predates project
+                # reuse -- otherwise "discard the Ghidra project state"
+                # silently leaves half of it behind.
+                for name in {
+                    self.project_name_for(binary_path),
+                    self._get_project_name(binary_path),
+                }:
+                    self._drop_ghidra_project(name)
 
             logger.info(f"Invalidated cache for {binary_path}")
             return True

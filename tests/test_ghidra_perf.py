@@ -1492,8 +1492,8 @@ class TestDecompileOnDemand:
 
         result = server_module.decompile_function(str(binary), "FUN_401000")
 
-        assert captured.get("start_address") == "0x401000"
-        assert captured.get("max_functions") == 1
+        assert captured.get("target_addresses") == ["0x401000"]
+        assert captured.get("force_decompile") is True
         assert "FUN_401000(void) { return; }" in result
 
 

@@ -66,6 +66,17 @@ decompile_function("/path/to/tquery.dll", "CQuery::Execute")
   -> the formatted body, from the now-warm cache
 ```
 
+`decompile_functions(..., wait=False)` submits the same kind of job for a whole
+list of targets, running them through a single Ghidra invocation. Its result
+carries `decompiled_functions` and `failed` rather than a body — a batch of two
+hundred would put megabytes of pseudocode in the on-disk job record, and the
+cache is where the bodies are meant to be read from. A single-function job
+still carries `pseudocode` as before.
+
+Since [project reuse](large-binary-decompile.md) landed, a targeted decompile
+on a binary that has been analyzed once no longer re-imports and re-analyzes
+the binary first, so `wait=True` is viable far more often than it used to be.
+
 ### A job that produced no body fails
 
 If the targeted decompile comes back with no pseudocode, the job finalizes

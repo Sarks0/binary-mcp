@@ -16,6 +16,7 @@ import gzip
 import hashlib
 import json
 import logging
+import os
 import re
 import shutil
 import time
@@ -55,6 +56,8 @@ class ProjectCache:
         else:
             self.cache_dir = Path(cache_dir)
 
+        # (path, mtime_ns, size) -> sha256. See _get_binary_hash.
+        self._hash_memo: dict[tuple[str, int, int], str] = {}
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         pruned = self._prune_legacy_duplicates()
         if pruned:
@@ -95,12 +98,46 @@ class ProjectCache:
         return pruned
 
     def _get_binary_hash(self, binary_path: str) -> str:
-        """Calculate SHA256 hash of binary file."""
+        """SHA256 of a binary's contents, memoized on (path, mtime, size).
+
+        This is the cache key for everything, so it is called many times per
+        operation -- resolving the cache path, the project name, the reuse
+        decision, the job key, then saving. Each call re-read the whole file:
+        a single targeted decompile on a 500 MB binary made nine-plus full
+        passes, seconds of pure I/O on the call whose entire purpose is to be
+        fast.
+
+        Keying the memo on mtime and size rather than path alone is what keeps
+        it honest: a binary that changed on disk gets a fresh hash, which
+        matters because a stale entry here would serve another binary's cache
+        and, with project reuse, open another binary's Ghidra project.
+        """
+        try:
+            stat = os.stat(binary_path)
+            fingerprint = (str(Path(binary_path).resolve()), stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            # Cannot stat it -- fall through and let the read raise the real
+            # error rather than caching against an unusable key.
+            fingerprint = None
+
+        if fingerprint is not None:
+            cached = self._hash_memo.get(fingerprint)
+            if cached is not None:
+                return cached
+
         sha256 = hashlib.sha256()
         with open(binary_path, "rb") as f:
-            for chunk in iter(lambda: f.read(8192), b""):
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
                 sha256.update(chunk)
-        return sha256.hexdigest()
+        digest = sha256.hexdigest()
+
+        if fingerprint is not None:
+            # Bounded: a long-lived server that walks a symbol tree should not
+            # accumulate an entry per binary forever.
+            if len(self._hash_memo) >= 256:
+                self._hash_memo.clear()
+            self._hash_memo[fingerprint] = digest
+        return digest
 
     def _get_cache_path_gz(self, binary_hash: str) -> Path:
         """Path for the gzipped cache (current format)."""

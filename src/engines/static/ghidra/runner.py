@@ -717,6 +717,11 @@ class GhidraRunner:
         project_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', project_name)
         if project_name.startswith('-'):
             project_name = f"proj_{project_name}"
+        # Same 100-char clamp ProjectCache._get_project_name applies. Without
+        # it the two derivations diverge for long stems (versioned
+        # symbol-server paths), and then cache cleanup targets a project name
+        # that does not exist while the real artifacts are left behind.
+        project_name = project_name[:100]
 
         # Reuse only covers what re-running the post-script can deliver.
         # Everything below is decided at import time -- the loader that parsed

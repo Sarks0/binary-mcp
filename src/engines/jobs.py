@@ -469,7 +469,42 @@ class JobRegistry:
         """
         if expect is not None and self._read_claim(key) != expect:
             return
-        self._claim_path(key).unlink(missing_ok=True)
+        self._unlink_claim(self._claim_path(key))
+
+    @staticmethod
+    def _unlink_claim(path: Path) -> None:
+        """Delete a claim file, tolerating a Windows sharing violation.
+
+        On Windows, deleting a file any process still holds a handle to fails
+        with ``WinError 32`` -- and something transiently holds a handle to a
+        file that was just written and read, in practice Defender scanning it.
+        The claim we have just read is exactly that file, so the delete races a
+        scanner on every release.
+
+        A failure here is not cosmetic: the claim outlives its job, and the
+        next ``submit`` for that key attaches to a finished job instead of
+        starting the run the caller asked for -- the key stays wedged until the
+        heartbeat staleness window expires. So retry briefly rather than give
+        up on the first refusal, and never propagate: this runs in the job
+        thread's ``finally``, where raising would leave the registry's
+        in-memory state untidied and surface as an unhandled thread exception.
+        """
+        for attempt in range(5):
+            try:
+                path.unlink(missing_ok=True)
+                return
+            except PermissionError:
+                # Windows sharing violation -- back off and let the other
+                # handle close. POSIX never gets here: it happily unlinks an
+                # open file.
+                time.sleep(0.05 * (attempt + 1))
+            except OSError as exc:
+                logger.warning("could not remove claim %s: %s", path, exc)
+                return
+        logger.warning(
+            "claim %s could not be removed after retries; the key stays held "
+            "until its heartbeat goes stale", path,
+        )
 
     # submission
 
@@ -603,7 +638,14 @@ class JobRegistry:
             logger.exception("job %s failed", job_id)
             self._finalize(job_id, state=STATE_FAILED, error=str(exc), progress="failed")
         finally:
-            self._release_claim(key, expect=job_id)
+            # Cleanup must not be able to kill the worker thread. The terminal
+            # state is already written by this point, so a failure here is
+            # untidiness, not data loss -- but letting it propagate turns it
+            # into an unhandled thread exception and skips the _local pop.
+            try:
+                self._release_claim(key, expect=job_id)
+            except Exception:
+                logger.exception("releasing claim for job %s failed", job_id)
             with self._lock:
                 self._local.pop(job_id, None)
 

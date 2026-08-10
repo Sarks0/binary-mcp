@@ -567,6 +567,11 @@ def _merge_delta_into_cache(existing: dict, delta: dict) -> dict:
 
 _DEPTH_RANK = {"shallow": 0, "structural": 1, "full": 2}
 
+# The address shape runner.analyze accepts as a Ghidra target. Callers that
+# build target lists check against this first so one unusable entry costs
+# itself rather than the whole batch.
+_HEX_ADDR_RE = re.compile(r'^(0[xX])?[0-9a-fA-F]{1,16}$')
+
 
 def _acceptable_cached_context(
     binary_path: str,
@@ -808,16 +813,20 @@ def get_analysis_context(
         # work list. Writing one would mean serialising every completed
         # address in a 30K-function cache to tell Ghidra to skip work it was
         # never going to look at.
-        if existing_cache_data is not None and not target_addresses:
+
+    # Everything between taking the lock and the try/finally that releases it
+    # has to hand the lock back on the way out. A leak here is not a small bug:
+    # the next caller queues on it for `_RUN_LOCK_WAIT_SECONDS`. The manifest
+    # write belongs inside it too -- an OSError there (full disk, read-only
+    # cache dir) would otherwise strand the lock for the life of the process.
+    try:
+        if resume_from_cache is not None and existing_cache_data is not None \
+                and not target_addresses:
             resume_manifest_path = _write_resume_manifest(
                 cache.cache_dir, binary_path, existing_cache_data,
                 skip_decompile=skip_decompile,
             )
 
-    # Everything between taking the lock and the try/finally that releases it
-    # has to hand the lock back on the way out. A leak here is not a small bug:
-    # the next caller queues on it for `_RUN_LOCK_WAIT_SECONDS`.
-    try:
         if target_addresses and existing_cache_data is None:
             raise UserFacingError(
                 "A targeted decompile needs an existing analysis cache to "
@@ -853,6 +862,14 @@ def get_analysis_context(
             reuse_reason,
         )
     except BaseException:
+        # Release the lock AND drop a manifest this block may already have
+        # written -- the `finally` further down that normally cleans it up is
+        # attached to the next try, which we never entered.
+        if resume_manifest_path:
+            try:
+                Path(resume_manifest_path).unlink(missing_ok=True)
+            except OSError as e:
+                logger.debug(f"Could not clean up resume manifest: {e}")
         try:
             delta_lock_cm.__exit__(None, None, None)
         except Exception as e:
@@ -905,18 +922,29 @@ def get_analysis_context(
                 ),
             )
 
-        result = _run(reuse_project)
+        # A reuse run can fail in two shapes, and both mean the same thing:
+        # the project did not answer `-process` the way its owner record
+        # promised -- a half-deleted .rep, a stale .lock from a killed run, a
+        # program under an unexpected name, a Ghidra upgrade that cannot open
+        # the older database. Exit zero with no output is one; a non-zero exit
+        # is the other, and catching only the first left the second surfacing
+        # as a hard analysis failure with the stale record still in place.
+        # Drop the record and import once. The retry is the old behaviour, so
+        # the worst case is what users have today.
+        reuse_failure = None
+        try:
+            result = _run(reuse_project)
+            if reuse_project and not output_path.exists():
+                reuse_failure = "produced no output"
+        except GhidraAnalysisError as e:
+            if not reuse_project:
+                raise
+            reuse_failure = str(e)
 
-        # A reuse run that produced nothing means the project did not answer
-        # `-process` the way its owner record promised -- a half-deleted .rep,
-        # a program stored under an unexpected name, a Ghidra upgrade that
-        # cannot open the older database. Rather than surface that as an
-        # analysis failure, drop the record and import once. The retry is the
-        # old behaviour, so the worst case is what users have today.
-        if reuse_project and not output_path.exists():
+        if reuse_failure is not None:
             logger.warning(
-                "Project reuse for %s produced no output; falling back to a "
-                "fresh import.", project_name,
+                "Project reuse for %s failed (%s); falling back to a fresh "
+                "import.", project_name, reuse_failure,
             )
             cache.clear_project_state(project_name)
             reuse_project = False
@@ -1045,15 +1073,23 @@ def get_analysis_context(
         # that verbatim would re-tag a fully-decompiled cache as structural and
         # send every later tool down the recovery path for bodies it already
         # has.
-        if is_delta_run:
-            depth_rank = {"shallow": 0, "structural": 1, "full": 2}
-            prior_depth = (existing_cache_data or {}).get("metadata", {}).get(
-                "analysis_depth"
-            )
-            if prior_depth and depth_rank.get(prior_depth, 0) > depth_rank.get(
-                effective_depth, 0
-            ):
-                effective_depth = prior_depth
+        prior_depth = (existing_cache_data or {}).get("metadata", {}).get(
+            "analysis_depth"
+        )
+        is_targeted_run = bool(
+            context.get("analysis_stats", {}).get("targeted_run")
+        )
+        if is_targeted_run and prior_depth:
+            # Says nothing about how the program was analyzed -- it decompiled
+            # a handful of named functions. Promoting a shallow cache to
+            # "structural" here would claim an auto-analysis pass that never
+            # ran, and every later tool would accept that cache instead of
+            # forcing the re-analysis the ladder exists to force.
+            effective_depth = prior_depth
+        elif is_delta_run and prior_depth and _DEPTH_RANK.get(
+            prior_depth, 0
+        ) > _DEPTH_RANK.get(effective_depth, 0):
+            effective_depth = prior_depth
         meta["analysis_depth"] = effective_depth
 
         # Record what the project now holds so the next run can skip the
@@ -1223,6 +1259,12 @@ def _run_or_degrade(
     immediately, which is what a caller who already knows the work is long
     (or who wants to fan out and collect later) is asking for.
     """
+    # Resolve the deadline BEFORE submitting. validate_numeric_range raises
+    # rather than clamping, and doing this after submit would start Ghidra,
+    # then throw away the job_id with the ValueError -- leaving a headless run
+    # nobody has a handle to, on every call.
+    deadline = _inline_deadline() if wait else 0.0
+
     submitted = jobs.submit(kind=kind, key=key, fn=work)
     if "error" in submitted:
         return f"Error: {submitted['error']}"
@@ -1240,7 +1282,6 @@ def _run_or_degrade(
             "lands in the shared cache either way."
         )
 
-    deadline = _inline_deadline()
     record = jobs.wait(job_id, timeout=deadline)
 
     if record is None:
@@ -1513,14 +1554,22 @@ def analyze_binary(
             that is the difference between seconds per decompile and a full
             re-analysis each time.
 
-        wait: When False, return a ``job_id`` immediately instead of blocking.
+        wait: Whether to block on the analysis before answering.
 
-            A full analysis of a multi-MB binary takes minutes and no MCP
-            client will wait that long -- the call times out while the work
-            carries on unwatched, which is also how orphaned Ghidra processes
-            accumulate. With ``wait=False`` the analysis runs in the
-            background, survives this call's client timeout, and is collected
-            with ``job_status`` / ``job_result``.
+            Note what ``wait=True`` (the default) does NOT mean: it does not
+            block until the analysis finishes. The analysis always runs as a
+            background job; ``wait=True`` blocks on that job for up to
+            ``BINARY_MCP_INLINE_DEADLINE`` seconds (default 25) and then
+            returns a ``job_id`` if it is still going. So on a multi-MB binary
+            you should expect a ``job_id`` back even with the default, and a
+            full summary on a warm cache or a quick run.
+
+            ``wait=False`` skips the blocking window entirely and returns the
+            ``job_id`` straight away.
+
+            Either way the work survives this call, and the result lands in the
+            shared cache. Collect with ``job_status`` / ``job_result``, or just
+            call this tool again -- once the cache is warm it answers directly.
 
             Jobs are keyed on the binary and the analysis parameters and
             registered in the shared cache directory, so a second agent asking
@@ -2624,18 +2673,23 @@ def decompile_function(
     Args:
         binary_path: Path to analyzed binary
         function_name: Name of the function to decompile
-        wait: When False, do not block on that targeted decompile -- return a
-            ``job_id`` and let it run in the background, past this call's
-            client timeout. Poll with ``job_status`` and then call this tool
-            again to read the body from the now-warm cache.
+        wait: Whether to block on the targeted decompile before answering.
 
             Only the Ghidra-invoking path is affected. When the pseudocode is
             already cached this returns it immediately either way, because
             there is nothing to wait for.
 
+            When a decompile IS needed it runs as a background job.
+            ``wait=True`` (the default) blocks on that job for up to
+            ``BINARY_MCP_INLINE_DEADLINE`` seconds (default 25) and returns a
+            ``job_id`` if it has not finished -- so a ``job_id`` is a normal
+            answer here, not an error. ``wait=False`` returns the handle
+            immediately. Either way, calling this tool again once the job has
+            landed returns the body from the now-warm cache.
+
     Returns:
         Decompiled C pseudocode, or a ``job_id`` when a targeted decompile was
-        needed and ``wait`` is False.
+        needed and did not finish inside the inline deadline.
     """
     try:
         # Peek at the existing cache first. If it was produced shallow/structural,
@@ -2756,7 +2810,8 @@ def _resolve_decompile_targets(
 ) -> tuple[list[tuple[str, str]], list[str], list[str]]:
     """Resolve names/addresses to ``(name, address)`` pairs against the cache.
 
-    Returns ``(needs_decompile, already_warm, unresolved)``. Accepts either a
+    Returns ``(needs_decompile, already_warm, unresolved)``; the first two are
+    lists of ``(name, address)``. Accepts either a
     function name or an address for each entry, because the two things an
     operator has in hand -- a name from ``list_functions`` and an address out
     of a pseudocode body -- should both just work.
@@ -2773,7 +2828,7 @@ def _resolve_decompile_targets(
             by_addr[addr] = fn
 
     needs: list[tuple[str, str]] = []
-    warm: list[str] = []
+    warm: list[tuple[str, str]] = []
     unresolved: list[str] = []
     seen: set[str] = set()
 
@@ -2792,7 +2847,7 @@ def _resolve_decompile_targets(
         seen.add(key)
         name = fn.get("name") or addr
         if fn.get("pseudocode"):
-            warm.append(name)
+            warm.append((name, addr))
         elif fn.get("is_thunk") or fn.get("is_external"):
             # Never decompilable; asking Ghidra again would waste a slot in
             # the batch and report a failure that is really a category error.
@@ -2828,9 +2883,13 @@ def decompile_functions(
         binary_path: Path to analyzed binary
         function_names: Function names and/or addresses. Both forms are
             accepted and may be mixed.
-        wait: When False, return a ``job_id`` immediately and let the batch run
-            past this call's client timeout. Poll ``job_status``, then read
-            bodies with ``decompile_function`` (warm, instant).
+        wait: Whether to block on the batch before answering. The batch always
+            runs as a background job; ``wait=True`` (the default) blocks on it
+            for up to ``BINARY_MCP_INLINE_DEADLINE`` seconds (default 25) and
+            returns a ``job_id`` if it is still going, which is a normal answer
+            for a large batch. ``wait=False`` returns the handle immediately.
+            Either way, poll ``job_status`` then re-invoke this tool (or read
+            bodies with ``decompile_function``, warm and instant).
         include_bodies: Return the pseudocode inline. Set False when you only
             want the cache populated -- the report is then a short status
             table.
@@ -2891,12 +2950,11 @@ def decompile_functions(
                 failed.append(name)
 
         # Warm entries were requested too, so they belong in the output.
-        for name in warm:
-            fn = next(
-                (f for f in context.get("functions", []) or []
-                 if f.get("name") == name),
-                None,
-            )
+        # Looked up through the index rather than rescanning the function list
+        # once per name -- the documented resume pattern puts up to 200 warm
+        # names here against a 30K-entry list.
+        for name, addr in warm:
+            fn = by_addr.get(_normalize_xref_addr(addr))
             if fn:
                 produced.append((name, fn))
 
@@ -2964,8 +3022,15 @@ def decompile_functions(
 
     except (PathTraversalError, FileSizeError) as e:
         return safe_error_message("Invalid binary path", e)
-    except (UserFacingError, GhidraAnalysisError):
-        raise
+    except UserFacingError as e:
+        # Returned, not re-raised: these carry the remediation text (ELF loader
+        # hints, Ghidra diagnostics) and re-raising turns them into a
+        # protocol-level tool error, which also skips @log_to_session. Every
+        # sibling tool returns them.
+        return str(e)
+    except GhidraAnalysisError as e:
+        logger.error(f"decompile_functions -- Ghidra failure: {e}")
+        return _ghidra_failure_message(e)
     except Exception as e:
         logger.exception(f"decompile_functions failed: {e}")
         return safe_error_message("decompile_functions failed", e)
@@ -3138,11 +3203,24 @@ def expand_callgraph(
             # possible so Ghidra parses it cleanly. Fall back to 0x-prefixed
             # normalized form for not-yet-cached functions.
             targets = []
+            batch_targets = []
             for addr_norm, _d in batch:
                 fn_existing = addr_index.get(addr_norm)
-                targets.append(
+                candidate = (
                     fn_existing.get("address") if fn_existing else f"0x{addr_norm}"
                 )
+                # Batching made one bad address expensive: runner.analyze
+                # validates every target and raises on the first mismatch, so
+                # a callee Ghidra renders outside the default space (e.g.
+                # `EXTERNAL:00000008`, which normalises to something non-hex)
+                # would fail the entire frontier instead of just itself.
+                if not _HEX_ADDR_RE.match(str(candidate)):
+                    logger.debug("expand_callgraph: unusable address %r", candidate)
+                    decompile_failures.append(str(candidate))
+                    visited.add(addr_norm)
+                    continue
+                targets.append(candidate)
+                batch_targets.append((addr_norm, candidate))
 
             made_progress = False
             if targets:
@@ -3150,7 +3228,7 @@ def expand_callgraph(
                     new_context = _run_targeted_decompile(binary_path, targets)
                     functions = new_context.get("functions", [])
                     addr_index = _build_addr_index(functions)
-                    for (addr_norm, _d), target_addr in zip(batch, targets):
+                    for addr_norm, target_addr in batch_targets:
                         visited.add(addr_norm)
                         fn = addr_index.get(addr_norm)
                         if fn and fn.get("pseudocode"):
@@ -3163,7 +3241,7 @@ def expand_callgraph(
                         f"expand_callgraph: batch decompile of "
                         f"{len(targets)} function(s) failed: {e}"
                     )
-                    for (addr_norm, _d), target_addr in zip(batch, targets):
+                    for addr_norm, target_addr in batch_targets:
                         decompile_failures.append(target_addr)
                         visited.add(addr_norm)
 

@@ -1068,3 +1068,173 @@ class TestInlineDeadline:
         monkeypatch.setenv("BINARY_MCP_INLINE_DEADLINE", "99999")
         with pytest.raises(ValueError):
             server_module._inline_deadline()
+
+
+class TestReviewFindings:
+    """Regressions for defects found reviewing this change."""
+
+    def test_one_unusable_address_does_not_fail_the_whole_frontier(
+        self, tmp_path, monkeypatch, server_module
+    ):
+        """Batching made a single bad address expensive: runner.analyze
+        validates every target and raises on the first mismatch, so a callee
+        Ghidra renders outside the default space (EXTERNAL:00000008) used to
+        take the entire frontier down with it."""
+        assert server_module._HEX_ADDR_RE.match("0x140001000")
+        assert server_module._HEX_ADDR_RE.match("140001000")
+        assert not server_module._HEX_ADDR_RE.match("0xexternal:00000008")
+        assert not server_module._HEX_ADDR_RE.match("0x1000; rm -rf /")
+
+    def test_targeted_run_does_not_promote_a_shallow_cache(
+        self, tmp_path, monkeypatch, server_module
+    ):
+        """A targeted decompile says nothing about how the program was
+        analyzed. Tagging a shallow cache 'structural' claims an auto-analysis
+        pass that never ran, and every later tool then accepts it."""
+        binary, _ = _seed_analyzed_binary(
+            tmp_path, monkeypatch, server_module, depth="shallow"
+        )
+
+        def fake_analyze(**kwargs):
+            Path(kwargs["output_path"]).write_text(json.dumps({
+                "metadata": {"name": "target.dll"},
+                "functions": [
+                    {"address": "0x401000", "name": "Parse",
+                     "pseudocode": "void Parse(void) { return; }"},
+                ],
+                "analysis_stats": {"delta_run": True, "targeted_run": True},
+            }))
+            return {"elapsed_time": 1.0, "stdout": "", "stderr": ""}
+
+        monkeypatch.setattr(server_module.runner, "analyze", fake_analyze)
+        merged = server_module.get_analysis_context(
+            str(binary), target_addresses=["0x401000"], force_decompile=True
+        )
+
+        assert merged["metadata"]["analysis_depth"] == "shallow"
+
+    def test_a_reuse_run_that_exits_nonzero_falls_back_to_import(
+        self, tmp_path, monkeypatch, server_module
+    ):
+        """A stale .lock from a killed run makes -process exit non-zero. Only
+        catching 'exit 0 but no output' left that surfacing as a hard failure
+        with the stale owner record still in place."""
+        from src.engines.static.ghidra.runner import GhidraAnalysisError
+
+        binary, cache_obj = _seed_analyzed_binary(tmp_path, monkeypatch, server_module)
+        name = cache_obj.project_name_for(str(binary))
+        _make_project(cache_obj, name)
+        cache_obj.write_project_state(
+            name, str(binary), program_name="target.dll", analyzed=True
+        )
+        attempts = []
+
+        def fake_analyze(**kwargs):
+            attempts.append(kwargs["reuse_project"])
+            if kwargs["reuse_project"]:
+                raise GhidraAnalysisError("project is locked", diagnostic="lock")
+            Path(kwargs["output_path"]).write_text(json.dumps({
+                "metadata": {"name": "target.dll", "executable_format": "PE"},
+                "functions": [{"address": "0x401000", "name": "Parse",
+                               "pseudocode": "void Parse(void) { return; }"}],
+                "imports": [], "strings": [], "memory_map": [],
+                "analysis_stats": {"delta_run": True, "targeted_run": True},
+            }))
+            return {"elapsed_time": 1.0, "stdout": "", "stderr": ""}
+
+        monkeypatch.setattr(server_module.runner, "analyze", fake_analyze)
+        merged = server_module.get_analysis_context(
+            str(binary), target_addresses=["0x401000"], force_decompile=True
+        )
+
+        assert attempts == [True, False]
+        assert merged["functions"][0]["pseudocode"]
+
+    def test_an_import_failure_is_still_raised(
+        self, tmp_path, monkeypatch, server_module
+    ):
+        """The fallback must not swallow a genuine import failure -- there is
+        nothing left to fall back to."""
+        from src.engines.static.ghidra.runner import GhidraAnalysisError
+
+        binary, _ = _seed_analyzed_binary(tmp_path, monkeypatch, server_module)
+
+        def always_fails(**kwargs):
+            raise GhidraAnalysisError("no load spec found")
+
+        monkeypatch.setattr(server_module.runner, "analyze", always_fails)
+        with pytest.raises(GhidraAnalysisError):
+            server_module.get_analysis_context(
+                str(binary), target_addresses=["0x401000"], force_decompile=True
+            )
+
+    def test_a_bad_deadline_does_not_orphan_a_ghidra_run(
+        self, tmp_path, monkeypatch, server_module
+    ):
+        """validate_numeric_range raises rather than clamping. Resolving the
+        deadline after submit would start Ghidra and then discard the job_id
+        with the ValueError, leaving a run nobody has a handle to."""
+        binary, _ = _seed_analyzed_binary(tmp_path, monkeypatch, server_module)
+        monkeypatch.setenv("BINARY_MCP_INLINE_DEADLINE", "99999")
+        submitted = []
+        monkeypatch.setattr(
+            server_module.jobs, "submit",
+            lambda **kw: submitted.append(kw) or {"job_id": "x", "state": "running"},
+        )
+
+        result = server_module.decompile_function(str(binary), "Parse", wait=True)
+
+        assert submitted == [], "nothing may be submitted before the deadline parses"
+        assert "Error" in result
+
+    def test_binary_hash_is_memoized_but_notices_a_changed_file(self, tmp_path):
+        cache_obj = _cache(tmp_path)
+        binary = tmp_path / "target.dll"
+        binary.write_bytes(b"MZ" + b"\x00" * 64)
+
+        reads = []
+        real_open = open
+
+        def counting_open(path, *a, **kw):
+            if str(path) == str(binary):
+                reads.append(path)
+            return real_open(path, *a, **kw)
+
+        import builtins
+        original = builtins.open
+        builtins.open = counting_open
+        try:
+            first = cache_obj._get_binary_hash(str(binary))
+            second = cache_obj._get_binary_hash(str(binary))
+            assert first == second
+            assert len(reads) == 1, "the second call must not re-read the file"
+
+            # A changed file must produce a fresh hash, or the memo would serve
+            # another binary's cache and another binary's Ghidra project.
+            import os as _os
+            binary.write_bytes(b"MZ" + b"\xff" * 64)
+            _os.utime(binary, (0, 0))
+            assert cache_obj._get_binary_hash(str(binary)) != first
+        finally:
+            builtins.open = original
+
+    def test_runner_and_cache_agree_on_long_project_names(self, tmp_path, runner):
+        """The two derivations must produce the same name or cache cleanup
+        targets a project that does not exist."""
+        long_stem = "a" * 150
+        binary = tmp_path / f"{long_stem}.dll"
+        binary.write_bytes(b"MZ" + b"\x00" * 64)
+        scripts = tmp_path / "scripts"
+        scripts.mkdir()
+
+        seen = {}
+        runner._run_headless = lambda cmd, env, *a, **kw: seen.update(cmd=cmd) or {}
+        runner.analyze(
+            binary_path=str(binary),
+            script_path=str(scripts),
+            script_name="core_analysis.py",
+            output_path=str(tmp_path / "out.json"),
+        )
+
+        cache_obj = _cache(tmp_path)
+        assert seen["cmd"][2] == cache_obj._get_project_name(str(binary))

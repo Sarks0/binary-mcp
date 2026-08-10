@@ -19,6 +19,8 @@ import os
 import sys
 import threading
 import time
+from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -547,7 +549,50 @@ class TestClaimHandover:
     def test_a_finished_job_frees_the_key_for_the_next_one(self, registry):
         first = registry.submit(kind="analyze", key="k", fn=lambda ctx: {})
         assert _wait_for(lambda: registry.read(first["job_id"])["state"] == STATE_SUCCEEDED)
-        assert registry._read_claim("k") is None
+        # The claim is released *after* the terminal state is written -- which
+        # is the right order, since freeing the key first would let a second
+        # process start a duplicate run while this one is still writing its
+        # result. So observing SUCCEEDED does not imply the claim is already
+        # gone; wait for it rather than assuming the two are simultaneous.
+        assert _wait_for(lambda: registry._read_claim("k") is None), (
+            "a finished job must free its key for the next submit"
+        )
+
+    def test_a_windows_sharing_violation_does_not_wedge_the_key(self, registry):
+        """On Windows, deleting a file another process holds a handle to fails
+        with WinError 32, and something transiently holds one on a file just
+        written and read -- Defender scanning it. The claim we just read is
+        exactly that file. A single refusal used to escape the job thread and
+        leave the key claimed by a job that had already finished."""
+        registry._try_claim("k", "aaaa1111")
+        real_unlink = Path.unlink
+        calls = []
+
+        def flaky_unlink(self, *args, **kwargs):
+            calls.append(self)
+            if len(calls) == 1:
+                raise PermissionError(32, "being used by another process")
+            return real_unlink(self, *args, **kwargs)
+
+        with patch.object(Path, "unlink", flaky_unlink):
+            registry._release_claim("k", expect="aaaa1111")
+
+        assert len(calls) > 1, "the first refusal should have been retried"
+        assert registry._read_claim("k") is None, (
+            "the claim must be gone, or the next submit attaches to a job that "
+            "already finished and the key stays wedged"
+        )
+
+    def test_a_permanently_locked_claim_does_not_raise(self, registry):
+        """Retries eventually give up. That must be a logged warning, not an
+        exception out of the job thread's finally block."""
+        registry._try_claim("k", "aaaa1111")
+
+        def always_locked(self, *args, **kwargs):
+            raise PermissionError(32, "being used by another process")
+
+        with patch.object(Path, "unlink", always_locked):
+            registry._release_claim("k", expect="aaaa1111")  # must not raise
 
 
 class TestTerminalStateIsFirstWriterWins:

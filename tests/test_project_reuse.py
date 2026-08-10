@@ -45,6 +45,10 @@ def server_module(tmp_path_factory, monkeypatch):
     (fake_ghidra / "support").mkdir()
     (fake_ghidra / "support" / "analyzeHeadless").touch()
     monkeypatch.setenv("GHIDRA_HOME", str(fake_ghidra))
+    # The job registry is built at import time from the cache root, and the
+    # decompile paths now run through it. Without this the suite would write
+    # job records into the developer's real ~/ghidra_mcp_cache.
+    monkeypatch.setenv("BINARY_CACHE_DIR", str(tmp_path_factory.mktemp("cache")))
     sys.modules.pop("src.server", None)
     import src.server as server_mod
 
@@ -778,6 +782,9 @@ class TestBatchDecompileTool:
             ctx = server_module.cache.get_cached(bp)
             for fn in ctx["functions"]:
                 fn["pseudocode"] = f"void {fn['name']}(void) {{ return; }}"
+            # The real get_analysis_context persists; the tool reads the
+            # bodies back from the cache rather than from the return value.
+            server_module.cache.save_cached(bp, ctx)
             return ctx
 
         monkeypatch.setattr(server_module, "get_analysis_context", fake_context)
@@ -802,6 +809,7 @@ class TestBatchDecompileTool:
             ctx = server_module.cache.get_cached(bp)
             for fn in ctx["functions"]:
                 fn["pseudocode"] = "void f(void) { return; }"
+            server_module.cache.save_cached(bp, ctx)
             return ctx
 
         monkeypatch.setattr(server_module, "get_analysis_context", fake_context)
@@ -826,6 +834,7 @@ class TestBatchDecompileTool:
                 fn.setdefault("pseudocode", None)
                 if fn["name"] == "Helper":
                     fn["pseudocode"] = "void Helper(void) { return; }"
+            server_module.cache.save_cached(bp, fresh)
             return fresh
 
         monkeypatch.setattr(server_module, "get_analysis_context", fake_context)
@@ -869,6 +878,7 @@ class TestBatchDecompileTool:
             ctx = server_module.cache.get_cached(bp)
             for fn in ctx["functions"]:
                 fn["pseudocode"] = f"void {fn['name']}(void) {{ return; }}"
+            server_module.cache.save_cached(bp, ctx)
             return ctx
 
         marked = []
@@ -897,6 +907,7 @@ class TestBatchDecompileTool:
             ctx = server_module.cache.get_cached(bp)
             for fn in ctx["functions"]:
                 fn["pseudocode"] = "void f(void) { return; }" + "x" * 4000
+            server_module.cache.save_cached(bp, ctx)
             return ctx
 
         marked = []
@@ -922,6 +933,7 @@ class TestBatchDecompileTool:
             ctx = server_module.cache.get_cached(bp)
             for fn in ctx["functions"]:
                 fn["pseudocode"] = "x" * 5000
+            server_module.cache.save_cached(bp, ctx)
             return ctx
 
         monkeypatch.setattr(server_module, "get_analysis_context", fake_context)
@@ -931,3 +943,128 @@ class TestBatchDecompileTool:
 
         assert "withheld" in result
         assert "Decompiled this run: 2" in result
+
+
+class TestInlineDeadline:
+    """Deadline-then-degrade: block only as long as is safe, then hand back a
+    job handle. Correct against a client that waits 30 seconds and one that
+    waits 28 hours, without either being configured anywhere."""
+
+    def test_wait_returns_a_handle_when_work_outlives_the_deadline(
+        self, tmp_path, monkeypatch, server_module
+    ):
+        import threading
+
+        binary, _ = _seed_analyzed_binary(tmp_path, monkeypatch, server_module)
+        monkeypatch.setenv("BINARY_MCP_INLINE_DEADLINE", "1")
+        release = threading.Event()
+
+        def slow_context(bp, **kwargs):
+            release.wait(10)
+            ctx = server_module.cache.get_cached(bp)
+            for fn in ctx["functions"]:
+                fn["pseudocode"] = "void f(void) { return; }"
+            server_module.cache.save_cached(bp, ctx)
+            return ctx
+
+        monkeypatch.setattr(server_module, "get_analysis_context", slow_context)
+        result = server_module.decompile_function(str(binary), "Parse", wait=True)
+
+        assert "job_id:" in result
+        assert "Still running after 1s" in result
+        release.set()
+
+    def test_wait_answers_inline_when_work_beats_the_deadline(
+        self, tmp_path, monkeypatch, server_module
+    ):
+        binary, _ = _seed_analyzed_binary(tmp_path, monkeypatch, server_module)
+        monkeypatch.setenv("BINARY_MCP_INLINE_DEADLINE", "30")
+
+        def quick_context(bp, **kwargs):
+            ctx = server_module.cache.get_cached(bp)
+            for fn in ctx["functions"]:
+                fn["pseudocode"] = "void Parse(void) { return; }"
+            server_module.cache.save_cached(bp, ctx)
+            return ctx
+
+        monkeypatch.setattr(server_module, "get_analysis_context", quick_context)
+        result = server_module.decompile_function(str(binary), "Parse", wait=True)
+
+        # The whole point: a fast decompile still reads as an ordinary
+        # synchronous call, with no job id anywhere in the answer.
+        assert "job_id" not in result
+        assert "void Parse(void) { return; }" in result
+
+    def test_a_failed_job_reports_the_reason_not_a_handle(
+        self, tmp_path, monkeypatch, server_module
+    ):
+        """Handing back a job id for work that already failed would send the
+        caller to poll a job whose only content is the error."""
+        binary, _ = _seed_analyzed_binary(tmp_path, monkeypatch, server_module)
+        monkeypatch.setenv("BINARY_MCP_INLINE_DEADLINE", "30")
+
+        def boom(bp, **kwargs):
+            raise RuntimeError("ghidra exploded")
+
+        monkeypatch.setattr(server_module, "get_analysis_context", boom)
+        result = server_module.decompile_function(str(binary), "Parse", wait=True)
+
+        assert "ghidra exploded" in result
+        assert "job_id:" not in result
+
+    def test_wait_false_still_returns_immediately(
+        self, tmp_path, monkeypatch, server_module
+    ):
+        import threading
+
+        binary, _ = _seed_analyzed_binary(tmp_path, monkeypatch, server_module)
+        monkeypatch.setenv("BINARY_MCP_INLINE_DEADLINE", "300")
+        release = threading.Event()
+
+        def slow_context(bp, **kwargs):
+            release.wait(10)
+            return server_module.cache.get_cached(bp)
+
+        monkeypatch.setattr(server_module, "get_analysis_context", slow_context)
+        result = server_module.decompile_function(str(binary), "Parse", wait=False)
+
+        # Must not have honoured the 300s deadline.
+        assert "job_id:" in result
+        release.set()
+
+    def test_warm_cache_never_touches_the_job_registry(
+        self, tmp_path, monkeypatch, server_module
+    ):
+        """A cache hit needs no Ghidra run, so it must not pay for a claim
+        file, a job record, a thread and a poll."""
+        binary, cache_obj = _seed_analyzed_binary(
+            tmp_path, monkeypatch, server_module, depth="full"
+        )
+        ctx = cache_obj.get_cached(str(binary))
+        for fn in ctx["functions"]:
+            fn["pseudocode"] = "void f(void) { return; }"
+        cache_obj.save_cached(str(binary), ctx)
+
+        submitted = []
+        monkeypatch.setattr(
+            server_module.jobs, "submit",
+            lambda **kw: submitted.append(kw) or {"error": "should not submit"},
+        )
+
+        result = server_module.analyze_binary(
+            str(binary), skip_compatibility_check=True
+        )
+
+        assert submitted == []
+        assert "Binary Analysis Complete" in result
+
+    def test_deadline_is_configurable_and_bounded(self, monkeypatch, server_module):
+        monkeypatch.setenv("BINARY_MCP_INLINE_DEADLINE", "90")
+        assert server_module._inline_deadline() == 90.0
+
+        monkeypatch.delenv("BINARY_MCP_INLINE_DEADLINE", raising=False)
+        assert server_module._inline_deadline() == 25.0
+
+        monkeypatch.setenv("BINARY_MCP_INLINE_DEADLINE", "99999")
+        with pytest.raises(ValueError):
+            server_module._inline_deadline()

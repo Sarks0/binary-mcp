@@ -4,11 +4,24 @@ Cross-process job registry for work that outlives an MCP call.
 The problem this solves
 -----------------------
 binary-mcp runs over stdio, so every client gets its **own server process**.
-A Ghidra analysis routinely takes minutes; an MCP client gives up after ~30
-seconds. The server keeps going, finishes, and writes its cache -- but the
-caller is already gone and never learns the result. Worse, nobody is left
-waiting on the subprocess, so ``_kill_process_tree`` never fires and the
+A Ghidra analysis routinely takes minutes, and some MCP clients abandon a call
+long before that. The server keeps going, finishes, and writes its cache --
+but the caller is already gone and never learns the result. Worse, nobody is
+left waiting on the subprocess, so ``_kill_process_tree`` never fires and the
 ``analyzeHeadless`` tree runs on unattended.
+
+How long a client actually waits is a client setting, not a constant, and it
+is worth not guessing: Claude Code's stdio path has no 30-second limit (the
+figure this module was originally written against). Its wall-clock ceiling is
+``MCP_TOOL_TIMEOUT``, ~28 hours when unset, or a per-server ``timeout`` in
+``.mcp.json``; a call still running after two minutes is moved to a background
+task rather than blocking the session; and a call that emits nothing for the
+idle window -- 30 minutes for stdio -- is aborted. Other clients are stricter.
+
+So the server does not assume a number. Tools try to answer inline, give up
+waiting after ``BINARY_MCP_INLINE_DEADLINE`` seconds, and hand back a job
+handle instead. That is correct against a client that waits 30 seconds and
+against one that waits 28 hours, without either being configured anywhere.
 
 Run six agents against the same binary and that compounds: six server
 processes, six independent Ghidra trees on the same input, one saturated box,
@@ -310,6 +323,37 @@ class JobRegistry:
         if not isinstance(data, dict) or data.get("schema_version") != SCHEMA_VERSION:
             return None
         return data
+
+    def wait(self, job_id: str, timeout: float) -> dict | None:
+        """Block until ``job_id`` reaches a terminal state, or ``timeout``.
+
+        Returns the record either way -- the caller distinguishes "finished"
+        from "still going" by its ``state``, and ``None`` means no such job.
+
+        This is what lets a tool try to answer inline and fall back to a job
+        handle only when the work is genuinely slow, so a fast call does not
+        cost the caller a poll cycle it did not need.
+
+        The wait polls the record file rather than joining a thread, because
+        the job may be owned by a *different process*: the whole point of the
+        registry is that a second agent attaches to an in-flight run, and it
+        has no thread to join. Polling starts tight and backs off, so a job
+        that finishes in 20 ms is noticed in ~10 ms while a five-minute
+        analysis is not stat-ing the file thousands of times a second.
+        """
+        deadline = time.monotonic() + max(0.0, timeout)
+        interval = 0.01
+        while True:
+            record = self.read(job_id)
+            if record is None:
+                return None
+            if record.get("state") in TERMINAL_STATES:
+                return record
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return record
+            time.sleep(min(interval, remaining))
+            interval = min(interval * 2, 0.25)
 
     def _update(self, job_id: str, **fields) -> dict | None:
         with self._lock:

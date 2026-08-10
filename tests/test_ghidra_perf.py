@@ -964,6 +964,10 @@ def server_module(tmp_path_factory, monkeypatch):
     (fake_ghidra / "support").mkdir()
     (fake_ghidra / "support" / "analyzeHeadless").touch()
     monkeypatch.setenv("GHIDRA_HOME", str(fake_ghidra))
+    # The job registry is built at import time from the cache root, and the
+    # decompile paths run through it, so this keeps job records out of the
+    # developer's real ~/ghidra_mcp_cache.
+    monkeypatch.setenv("BINARY_CACHE_DIR", str(tmp_path_factory.mktemp("cache")))
 
     # Ensure a fresh import in case a prior test already loaded it
     sys.modules.pop("src.server", None)

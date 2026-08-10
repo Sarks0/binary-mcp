@@ -1,7 +1,7 @@
 # Background jobs
 
-A full Ghidra analysis of a multi-MB binary takes minutes. An MCP client gives
-up after about 30 seconds. The work carries on server-side, finishes, and
+A full Ghidra analysis of a multi-MB binary takes minutes. Some MCP clients
+abandon a call long before that. The work carries on server-side, finishes, and
 writes its cache — but the caller is already gone and never learns the result.
 
 That is the whole problem this solves, plus the thing it turns into: nobody is
@@ -9,6 +9,45 @@ left waiting on the subprocess, so the timeout cleanup never fires and the
 `analyzeHeadless` tree runs on unattended. Six agents against one binary means
 six abandoned Ghidra trees, a saturated box, and cascading timeouts on every
 later call that have nothing to do with what those calls asked for.
+
+## How long will a client actually wait?
+
+This doc used to assert "about 30 seconds" as a fact. It is not one — it is a
+client setting, and the spread is enormous. For **Claude Code over stdio**:
+
+| Limit | Default | Control |
+|---|---|---|
+| Wall clock per call | ~28 hours when unset | `MCP_TOOL_TIMEOUT`, or a per-server `timeout` (ms) in `.mcp.json` |
+| Idle — no response *and* no progress | 30 min (stdio) | `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT` |
+| Auto-background | 2 min, then it becomes a background task and stops blocking the session | `CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS` |
+
+So there is no 30-second wall there at all, and a per-server `timeout` is a
+**hard** ceiling that progress notifications do *not* extend. Other clients are
+stricter. Since a stdio server cannot know which client it is talking to, it
+does not guess — see the deadline below.
+
+## Deadline-then-degrade
+
+Tools that invoke Ghidra do not choose between "block" and "return a handle".
+They do both, in that order: submit the work, block up to
+`BINARY_MCP_INLINE_DEADLINE` seconds (default **25**), and return a job handle
+only if it is still running when that expires.
+
+That is correct against a client that waits 30 seconds and one that waits 28
+hours, without either being configured. A fast call reads as an ordinary
+synchronous call — no job id anywhere in the answer — and a slow one degrades
+to a handle instead of being abandoned mid-run. With project reuse
+(see [large-binary-decompile.md](large-binary-decompile.md)) most targeted
+decompiles now land inside the deadline.
+
+Raise the deadline if your client is known to be patient; under Claude Code,
+where a long call moves to a background task rather than failing, 90–120s
+returns more answers inline. `wait=False` still skips the window entirely and
+hands back the handle immediately.
+
+A **warm cache never touches the registry at all** — no claim file, no job
+record, no thread. A cache hit needs no Ghidra run, so it must not pay for the
+machinery that exists to survive one.
 
 ## Why it is file-backed
 
@@ -57,6 +96,10 @@ is already cached this returns it immediately regardless of `wait` — there is
 nothing to wait for, and making a warm read return a job id would be a worse
 tool. A background decompile is only started when the cache was built shallow
 or structural and the function's body genuinely has to be produced.
+
+With `wait=True` (the default) that decompile still runs as a job — it just
+blocks on it until the inline deadline first, so a quick one comes back as a
+formatted body and a slow one comes back as a handle.
 
 ```
 decompile_function("/path/to/tquery.dll", "CQuery::Execute", wait=False)

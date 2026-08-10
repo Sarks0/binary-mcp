@@ -805,17 +805,43 @@ class GhidraRunner:
         # Bump JVM heap. Loading a multi-GB resume cache or decompiling
         # complex functions on large binaries will OOM Ghidra's default heap.
         # _JAVA_OPTIONS is picked up by every JVM the analyzeHeadless script
-        # spawns, including the one running our Jython post-script.
+        # spawns, including the one running our Jython post-script, and the JVM
+        # parses it AFTER the command line -- so it overrides the -Xmx that
+        # Ghidra's own launcher passes (from support/launch.properties MAXMEM).
+        # Reading the java command line therefore tells you the wrong number;
+        # the JVM's own "Picked up _JAVA_OPTIONS:" line on stderr tells you the
+        # right one, and that lands in ghidra_debug.log.
         if max_heap_mb is None:
+            raw_heap = os.environ.get("GHIDRA_MAX_HEAP_MB", "4096")
             try:
-                max_heap_mb = int(os.environ.get("GHIDRA_MAX_HEAP_MB", "4096"))
+                max_heap_mb = int(raw_heap)
             except ValueError:
+                logger.warning(
+                    "GHIDRA_MAX_HEAP_MB=%r is not an integer; falling back to "
+                    "4096m", raw_heap,
+                )
                 max_heap_mb = 4096
         if max_heap_mb > 0:
             existing = env.get("_JAVA_OPTIONS", "")
-            if "-Xmx" not in existing:
+            inherited_xmx = re.search(r'-Xmx\S+', existing)
+            if inherited_xmx is None:
                 env["_JAVA_OPTIONS"] = (
                     f"{existing} -Xmx{max_heap_mb}m".strip()
+                )
+                logger.info("Ghidra JVM max heap: %dm", max_heap_mb)
+            else:
+                # Not clobbered: an explicit _JAVA_OPTIONS is the operator's
+                # call. But it is worth saying out loud, because _JAVA_OPTIONS
+                # lowers as readily as it raises -- an inherited -Xmx2g caps
+                # Ghidra at 2 GB while GHIDRA_MAX_HEAP_MB still reads 4096 and
+                # nothing anywhere reports the discrepancy. That is a silent
+                # OOM waiting to be misdiagnosed as a Ghidra bug.
+                logger.warning(
+                    "Ghidra JVM max heap will be %s, from the inherited "
+                    "_JAVA_OPTIONS -- NOT the requested %dm. An -Xmx already "
+                    "present there wins and is left alone. Unset _JAVA_OPTIONS "
+                    "or change its -Xmx if Ghidra runs out of heap.",
+                    inherited_xmx.group(0), max_heap_mb,
                 )
 
         # Stage PDB next to the binary so Ghidra's PdbUniversalAnalyzer finds

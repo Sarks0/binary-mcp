@@ -693,3 +693,40 @@ class TestUnreadableClaim:
         assert _wait_for(
             lambda: registry.read(submitted["job_id"])["state"] == STATE_SUCCEEDED
         )
+
+
+class TestRecordWriteContention:
+    """`wait` polls the job record while the worker replaces it. On Windows
+    os.replace fails if any handle is open on the target, and a swallowed
+    failure there loses the job's terminal state -- the caller is then told a
+    job that failed instantly is still running."""
+
+    def test_a_sharing_violation_does_not_lose_the_terminal_state(self, registry):
+        real_replace = jobs_mod.os.replace
+        calls = []
+
+        def flaky_replace(src, dst, *args, **kwargs):
+            calls.append(dst)
+            if len(calls) == 1:
+                raise PermissionError(32, "being used by another process")
+            return real_replace(src, dst, *args, **kwargs)
+
+        with patch.object(jobs_mod.os, "replace", flaky_replace):
+            submitted = registry.submit(kind="test", key="k", fn=lambda ctx: {"n": 1})
+            assert _wait_for(
+                lambda: registry.read(submitted["job_id"])["state"] == STATE_SUCCEEDED
+            ), "the retried write must still commit the terminal state"
+        assert len(calls) > 1, "the first refusal should have been retried"
+
+    def test_a_failed_job_seen_through_wait_reports_its_error(self, registry):
+        """The end-to-end shape that broke on CI: a job that raises instantly
+        must be observable as failed, not as 'still running'."""
+        def _boom(ctx):
+            raise RuntimeError("OSGi bundle cache corrupt")
+
+        submitted = registry.submit(kind="test", key="k", fn=_boom)
+        record = registry.wait(submitted["job_id"], timeout=5)
+
+        assert record is not None
+        assert record["state"] == STATE_FAILED
+        assert "OSGi bundle cache corrupt" in record["error"]

@@ -308,10 +308,40 @@ class JobRegistry:
         tmp = path.with_suffix(".tmp")
         try:
             tmp.write_text(json.dumps(record), encoding="utf-8")
-            os.replace(tmp, path)
         except OSError as exc:
             logger.error("could not write job %s: %s", record.get("job_id"), exc)
             tmp.unlink(missing_ok=True)
+            return
+
+        # On Windows os.replace fails if ANY handle is open on the target, and
+        # this file is polled: `wait` reads it every 10-250ms for the whole
+        # inline deadline, and `job_status` from other processes reads it too.
+        # A single collision used to be swallowed by the OSError handler below,
+        # which is the worst possible thing to drop -- if the losing write was
+        # `_finalize`, the job's terminal state is gone, the record says
+        # "running" forever, and a caller waiting on a job that failed
+        # instantly is told it is still going 25 seconds later. That is exactly
+        # how this surfaced on Windows CI.
+        for attempt in range(6):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:
+                # Sharing violation: a reader has it open. Back off and retry;
+                # POSIX never lands here.
+                time.sleep(0.02 * (attempt + 1))
+            except OSError as exc:
+                logger.error(
+                    "could not write job %s: %s", record.get("job_id"), exc
+                )
+                tmp.unlink(missing_ok=True)
+                return
+
+        logger.error(
+            "could not commit job record %s after retries; a reader has held "
+            "it open throughout", record.get("job_id"),
+        )
+        tmp.unlink(missing_ok=True)
 
     def read(self, job_id: str) -> dict | None:
         try:
@@ -370,7 +400,10 @@ class JobRegistry:
             if remaining <= 0:
                 return record
             time.sleep(min(interval, remaining))
-            interval = min(interval * 2, 0.25)
+            # Starts tight so a job finishing in 20ms is noticed immediately,
+            # then backs well off: every poll opens the record the worker is
+            # trying to replace, and on Windows that contention is not free.
+            interval = min(interval * 2, 0.5)
 
     def _update(self, job_id: str, **fields) -> dict | None:
         with self._lock:

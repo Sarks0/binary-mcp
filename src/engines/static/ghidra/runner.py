@@ -12,6 +12,7 @@ import subprocess  # nosec B404 - Required for Ghidra headless execution
 import time
 from pathlib import Path
 
+from src.engines.static.ghidra.project_cache import _PROJECT_NAME_MAX
 from src.utils.security import UserFacingError, validate_parameter_pattern
 
 logger = logging.getLogger(__name__)
@@ -717,11 +718,12 @@ class GhidraRunner:
         project_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', project_name)
         if project_name.startswith('-'):
             project_name = f"proj_{project_name}"
-        # Same 100-char clamp ProjectCache._get_project_name applies. Without
-        # it the two derivations diverge for long stems (versioned
-        # symbol-server paths), and then cache cleanup targets a project name
-        # that does not exist while the real artifacts are left behind.
-        project_name = project_name[:100]
+        # Same clamp ProjectCache applies, and the reason the cache reserves
+        # the last 9 characters of its budget for the content-hash suffix:
+        # truncating here after that suffix was appended would remove it, and
+        # Ghidra would create a project under a name the reuse check never
+        # looks for.
+        project_name = project_name[:_PROJECT_NAME_MAX]
 
         # Reuse only covers what re-running the post-script can deliver.
         # Everything below is decided at import time -- the loader that parsed

@@ -193,20 +193,20 @@ class TestReuseDecision:
         self, tmp_path, monkeypatch, server_module
     ):
         binary, name = self._seed(tmp_path, monkeypatch, server_module)
-        reuse, _ = self._decide(server_module, binary, name)
+        reuse, _, _ = self._decide(server_module, binary, name)
         assert reuse is True
 
     def test_no_project_on_disk_refuses(self, tmp_path, monkeypatch, server_module):
         binary, name = self._seed(tmp_path, monkeypatch, server_module)
         (server_module.cache.cache_dir / "ghidra_projects" / f"{name}.gpr").unlink()
-        reuse, reason = self._decide(server_module, binary, name)
+        reuse, reason, _ = self._decide(server_module, binary, name)
         assert reuse is False
         assert "no Ghidra project" in reason
 
     def test_missing_owner_record_refuses(self, tmp_path, monkeypatch, server_module):
         binary, name = self._seed(tmp_path, monkeypatch, server_module)
         server_module.cache.clear_project_state(name)
-        reuse, reason = self._decide(server_module, binary, name)
+        reuse, reason, _ = self._decide(server_module, binary, name)
         assert reuse is False
         assert "owner record" in reason
 
@@ -221,7 +221,7 @@ class TestReuseDecision:
         state["binary_hash"] = "0" * 64
         state_path.write_text(json.dumps(state))
 
-        reuse, reason = self._decide(server_module, binary, name)
+        reuse, reason, _ = self._decide(server_module, binary, name)
         assert reuse is False
         assert "different binary" in reason
 
@@ -229,7 +229,7 @@ class TestReuseDecision:
         self, tmp_path, monkeypatch, server_module
     ):
         binary, name = self._seed(tmp_path, monkeypatch, server_module, analyzed=False)
-        reuse, reason = self._decide(server_module, binary, name)
+        reuse, reason, _ = self._decide(server_module, binary, name)
         assert reuse is False
         assert "without analysis" in reason
 
@@ -237,7 +237,7 @@ class TestReuseDecision:
         self, tmp_path, monkeypatch, server_module
     ):
         binary, name = self._seed(tmp_path, monkeypatch, server_module, analyzed=False)
-        reuse, _ = self._decide(server_module, binary, name, analysis_depth="shallow")
+        reuse, _, _ = self._decide(server_module, binary, name, analysis_depth="shallow")
         assert reuse is True
 
     @pytest.mark.parametrize(
@@ -253,7 +253,7 @@ class TestReuseDecision:
         self, tmp_path, monkeypatch, server_module, override
     ):
         binary, name = self._seed(tmp_path, monkeypatch, server_module)
-        reuse, _ = self._decide(server_module, binary, name, **override)
+        reuse, _, _ = self._decide(server_module, binary, name, **override)
         assert reuse is False
 
 
@@ -1238,3 +1238,172 @@ class TestReviewFindings:
 
         cache_obj = _cache(tmp_path)
         assert seen["cmd"][2] == cache_obj._get_project_name(str(binary))
+
+
+class TestFinalReviewFindings:
+    """Regressions for the final review pass."""
+
+    def test_the_hash_suffix_survives_the_runner_name_clamp(self, tmp_path):
+        """project_name_for appended the hash and the runner then truncated it
+        off, so Ghidra created `<prefix>_43e6` while project_exists looked for
+        `<stem>_43e6bd75`. Reuse could never engage for a long stem, and the
+        .rep leaked under a name no cleanup path knows."""
+        from src.engines.static.ghidra.project_cache import _PROJECT_NAME_MAX
+
+        cache_obj = _cache(tmp_path)
+        binary = tmp_path / ("a" * 150 + ".dll")
+        binary.write_bytes(b"MZ" + b"\x00" * 64)
+
+        name = cache_obj.project_name_for(str(binary))
+        assert len(name) <= _PROJECT_NAME_MAX
+        assert name[:_PROJECT_NAME_MAX] == name, "the runner clamp must be a no-op"
+        assert name.endswith(cache_obj._get_binary_hash(str(binary))[:8])
+
+    def test_skip_decompile_first_pass_hits_its_own_cache(
+        self, tmp_path, monkeypatch, server_module
+    ):
+        """The documented large-binary workflow. skip_decompile=True writes a
+        'structural' cache but the request says depth='full', so without
+        lowering the requested depth every repeat invocation re-ran Ghidra."""
+        binary, cache_obj = _seed_analyzed_binary(
+            tmp_path, monkeypatch, server_module, depth="structural"
+        )
+
+        hit = server_module._acceptable_cached_context(
+            str(binary), analysis_depth="full", skip_decompile=True
+        )
+        assert hit is not None, "the structural first pass must hit its own cache"
+
+        miss = server_module._acceptable_cached_context(
+            str(binary), analysis_depth="full", skip_decompile=False
+        )
+        assert miss is None, "a genuine full request must still miss"
+
+    def test_warm_path_still_enforces_the_allowed_dirs(
+        self, tmp_path, monkeypatch, server_module
+    ):
+        """The warm short-circuit returns a cached report without reaching
+        get_analysis_context, where the confinement check used to live."""
+        binary, _ = _seed_analyzed_binary(tmp_path, monkeypatch, server_module)
+        elsewhere = tmp_path / "outside"
+        elsewhere.mkdir()
+        monkeypatch.setattr(server_module, "get_allowed_dirs", lambda: [elsewhere])
+
+        result = server_module.analyze_binary(
+            str(binary), skip_compatibility_check=True
+        )
+        assert "Binary Analysis Complete" not in result
+        assert "Invalid" in result or "denied" in result.lower()
+
+    def test_a_legacy_cache_without_a_depth_tag_is_not_demoted(
+        self, tmp_path, monkeypatch, server_module
+    ):
+        """A cache written before the depth was stamped reads as 'full'
+        everywhere else. Reading it as None here let a targeted delta write
+        'structural' over a fully-decompiled binary."""
+        cache_obj = _cache(tmp_path)
+        binary = tmp_path / "legacy.dll"
+        binary.write_bytes(b"MZ" + b"\x00" * 128)
+        cache_obj.save_cached(str(binary), {
+            "metadata": {"name": "legacy.dll"},   # no analysis_depth at all
+            "functions": [
+                {"address": "0x401000", "name": "Parse", "pseudocode": None},
+            ],
+            "imports": [], "strings": [], "memory_map": [],
+        })
+        monkeypatch.setattr(server_module, "cache", cache_obj)
+        monkeypatch.setattr(server_module, "get_allowed_dirs", lambda: [tmp_path])
+
+        def fake_analyze(**kwargs):
+            Path(kwargs["output_path"]).write_text(json.dumps({
+                "metadata": {"name": "legacy.dll"},
+                "functions": [{"address": "0x401000", "name": "Parse",
+                               "pseudocode": "void Parse(void) { return; }"}],
+                "analysis_stats": {"delta_run": True, "targeted_run": True},
+            }))
+            return {"elapsed_time": 1.0, "stdout": "", "stderr": ""}
+
+        monkeypatch.setattr(server_module.runner, "analyze", fake_analyze)
+        merged = server_module.get_analysis_context(
+            str(binary), target_addresses=["0x401000"], force_decompile=True
+        )
+        assert merged["metadata"]["analysis_depth"] == "full"
+
+    def test_the_merged_cache_is_written_once_per_run(
+        self, tmp_path, monkeypatch, server_module
+    ):
+        """Two full gzip writes per targeted decompile, on the hot path."""
+        binary, cache_obj = _seed_analyzed_binary(tmp_path, monkeypatch, server_module)
+        saves = []
+        real_save = cache_obj.save_cached
+        monkeypatch.setattr(
+            cache_obj, "save_cached",
+            lambda bp, data: saves.append(bp) or real_save(bp, data),
+        )
+
+        def fake_analyze(**kwargs):
+            Path(kwargs["output_path"]).write_text(json.dumps({
+                "metadata": {"name": "target.dll"},
+                "functions": [{"address": "0x401000", "name": "Parse",
+                               "pseudocode": "void Parse(void) { return; }"}],
+                "analysis_stats": {"delta_run": True, "targeted_run": True},
+            }))
+            return {"elapsed_time": 1.0, "stdout": "", "stderr": ""}
+
+        monkeypatch.setattr(server_module.runner, "analyze", fake_analyze)
+        server_module.get_analysis_context(
+            str(binary), target_addresses=["0x401000"], force_decompile=True
+        )
+        assert len(saves) == 1, f"expected one save, got {len(saves)}"
+
+    def test_a_transient_record_read_failure_is_not_a_vanished_job(self, tmp_path):
+        """read() maps every OSError to None, so a Windows sharing violation on
+        the heartbeat-rewritten record looked identical to a missing job and
+        told the caller their running analysis had disappeared."""
+        from src.engines.jobs import JobRegistry
+
+        registry = JobRegistry(tmp_path, stale_after=60, heartbeat_interval=60)
+        submitted = registry.submit(kind="test", key="k", fn=lambda ctx: {"ok": 1})
+        job_id = submitted["job_id"]
+
+        real_read = registry.read
+        calls = {"n": 0}
+
+        def flaky_read(jid):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return None      # transient
+            return real_read(jid)
+
+        registry.read = flaky_read
+        record = registry.wait(job_id, timeout=5)
+        assert record is not None, "one bad read must not read as 'job gone'"
+        assert record["state"] == "succeeded"
+
+    def test_the_hash_memo_expires(self, tmp_path, monkeypatch):
+        """mtime granularity is ~15.6ms on Windows, so a same-size rewrite can
+        be invisible to the fingerprint. The TTL bounds how long that can serve
+        the previous build's project."""
+        import src.engines.static.ghidra.project_cache as pc
+
+        cache_obj = _cache(tmp_path)
+        binary = tmp_path / "target.dll"
+        binary.write_bytes(b"MZ" + b"\x00" * 64)
+        first = cache_obj._get_binary_hash(str(binary))
+
+        # Same size, same mtime -- invisible to the fingerprint.
+        import os as _os
+        stat = _os.stat(binary)
+        binary.write_bytes(b"MZ" + b"\xff" * 64)
+        _os.utime(binary, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+
+        assert cache_obj._get_binary_hash(str(binary)) == first, "memo still warm"
+
+        clock = [1e9]
+        monkeypatch.setattr(pc.time, "monotonic", lambda: clock[0])
+        cache_obj._hash_memo.clear()
+        cache_obj._get_binary_hash(str(binary))
+        clock[0] += pc._HASH_MEMO_TTL_SECONDS + 1
+        binary.write_bytes(b"MZ" + b"\xaa" * 64)
+        _os.utime(binary, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+        assert cache_obj._get_binary_hash(str(binary)) != first, "TTL must expire it"

@@ -343,12 +343,25 @@ class JobRegistry:
         """
         deadline = time.monotonic() + max(0.0, timeout)
         interval = 0.01
+        misses = 0
         while True:
             record = self.read(job_id)
             if record is None:
-                return None
-            if record.get("state") in TERMINAL_STATES:
-                return record
+                # `read` maps every OSError to None, so a transient failure is
+                # indistinguishable from a missing job. On Windows that is not
+                # hypothetical: the heartbeat rewrites this very file via
+                # os.replace while we poll it, and a scanner's handle on the
+                # replacement yields a sharing violation -- the same class the
+                # claim unlink had to be hardened against. Concluding "gone"
+                # on the first miss tells the caller their analysis vanished
+                # while it is in fact running normally.
+                misses += 1
+                if misses > 3:
+                    return None
+            else:
+                misses = 0
+                if record.get("state") in TERMINAL_STATES:
+                    return record
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return record

@@ -27,6 +27,16 @@ from src.utils.config import get_cache_dir
 
 logger = logging.getLogger(__name__)
 
+# Longest project name we will hand Ghidra. GhidraRunner.analyze clamps to the
+# same value, and project_name_for reserves the last 9 characters for its
+# "_<hash8>" discriminator so the clamp can never remove it.
+_PROJECT_NAME_MAX = 100
+
+# How long a memoized binary hash may be trusted. Short enough that a rebuild
+# is never served a stale digest, long enough to collapse the many hashes a
+# single analysis performs. See ProjectCache._get_binary_hash.
+_HASH_MEMO_TTL_SECONDS = 5.0
+
 # Side-car suffixes that share the <hash>.<suffix> stem with a cache file.
 # When auto-pruning legacy <hash>.json duplicates we must NOT touch these.
 _SIDECAR_SUFFIXES = (
@@ -56,8 +66,9 @@ class ProjectCache:
         else:
             self.cache_dir = Path(cache_dir)
 
-        # (path, mtime_ns, size) -> sha256. See _get_binary_hash.
-        self._hash_memo: dict[tuple[str, int, int], str] = {}
+        # (path, mtime_ns, size) -> (sha256, monotonic_stamp). See
+        # _get_binary_hash for why the stamp is load-bearing.
+        self._hash_memo: dict[tuple[str, int, int], tuple[str, float]] = {}
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         pruned = self._prune_legacy_duplicates()
         if pruned:
@@ -107,10 +118,14 @@ class ProjectCache:
         passes, seconds of pure I/O on the call whose entire purpose is to be
         fast.
 
-        Keying the memo on mtime and size rather than path alone is what keeps
-        it honest: a binary that changed on disk gets a fresh hash, which
-        matters because a stale entry here would serve another binary's cache
-        and, with project reuse, open another binary's Ghidra project.
+        Keyed on mtime and size, and expired after a few seconds. Both parts
+        matter. Filesystem timestamp granularity is coarse -- ~15.6 ms on
+        Windows -- so a same-size rewrite inside that window is invisible to
+        the fingerprint, and a stale digest here does not merely serve the
+        wrong cache: with project reuse it opens the *previous build's* Ghidra
+        project and decompiles the wrong code, silently. The TTL bounds that to
+        a window far shorter than any edit-rebuild cycle while still collapsing
+        the nine-plus hashes a single operation performs.
         """
         try:
             stat = os.stat(binary_path)
@@ -120,10 +135,11 @@ class ProjectCache:
             # error rather than caching against an unusable key.
             fingerprint = None
 
+        now = time.monotonic()
         if fingerprint is not None:
-            cached = self._hash_memo.get(fingerprint)
-            if cached is not None:
-                return cached
+            entry = self._hash_memo.get(fingerprint)
+            if entry is not None and now - entry[1] <= _HASH_MEMO_TTL_SECONDS:
+                return entry[0]
 
         sha256 = hashlib.sha256()
         with open(binary_path, "rb") as f:
@@ -136,7 +152,7 @@ class ProjectCache:
             # accumulate an entry per binary forever.
             if len(self._hash_memo) >= 256:
                 self._hash_memo.clear()
-            self._hash_memo[fingerprint] = digest
+            self._hash_memo[fingerprint] = (digest, now)
         return digest
 
     def _get_cache_path_gz(self, binary_hash: str) -> Path:
@@ -365,7 +381,7 @@ class ProjectCache:
         # Ghidra writes <name>.gpr / <name>.rep / <name>.lock, so the name has
         # to leave room for those suffixes inside the filesystem's 255-byte
         # component limit. Long stems are real (versioned symbol-server paths).
-        return name[:100]
+        return name[:_PROJECT_NAME_MAX]
 
     def project_name_for(self, binary_path: str) -> str:
         """Ghidra project name for a binary: ``<stem>_<hash8>``.
@@ -385,10 +401,17 @@ class ProjectCache:
         """
         base = self._get_project_name(binary_path)
         try:
-            return f"{base}_{self._get_binary_hash(binary_path)[:8]}"
+            digest = self._get_binary_hash(binary_path)[:8]
         except OSError as e:
             logger.warning(f"Could not hash {binary_path} for project name: {e}")
             return base
+        # Reserve room for "_<hash8>" inside the same 100-char budget the
+        # runner clamps to. Appending first and letting the runner truncate
+        # afterwards silently removes the discriminator: Ghidra creates
+        # `<stem-prefix>_43e6` while project_exists looks for
+        # `<stem>_43e6bd75`, so reuse never engages and the .rep leaks under a
+        # name no cleanup path knows about.
+        return f"{base[:_PROJECT_NAME_MAX - 9]}_{digest}"
 
     def _ghidra_project_paths(self, project_name: str) -> list[Path]:
         """Return the .gpr / .lock / .rep / .owner.json paths for a project."""

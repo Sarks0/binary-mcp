@@ -585,6 +585,7 @@ def _acceptable_cached_context(
     pdb_path: str | None = None,
     enable_fid: bool = False,
     analysis_depth: str = "structural",
+    skip_decompile: bool = False,
 ) -> dict | None:
     """The cached context, if it satisfies this request without a Ghidra run.
 
@@ -603,12 +604,21 @@ def _acceptable_cached_context(
     cached = cache.get_cached(binary_path)
     if not cached:
         return None
+    # `skip_decompile=True` produces a structural cache even when
+    # analysis_depth says "full" (see the stamping in get_analysis_context), so
+    # it has to lower the *requested* depth too. Otherwise the documented
+    # large-binary first pass -- analyze_binary(..., skip_decompile=True) --
+    # asks for "full", is handed its own "structural" result, calls that a miss
+    # and re-runs Ghidra on every single invocation.
+    wanted = analysis_depth
+    if skip_decompile and wanted == "full":
+        wanted = "structural"
     cached_depth = cached.get("metadata", {}).get("analysis_depth", "full")
-    if _DEPTH_RANK.get(cached_depth, 2) >= _DEPTH_RANK.get(analysis_depth, 2):
+    if _DEPTH_RANK.get(cached_depth, 2) >= _DEPTH_RANK.get(wanted, 2):
         return cached
     logger.info(
         "Cache depth %s is shallower than requested %s; reanalyzing",
-        cached_depth, analysis_depth,
+        cached_depth, wanted,
     )
     return None
 
@@ -622,12 +632,14 @@ def _project_reuse_decision(
     processor: str | None,
     loader: str | None,
     pdb_path: str | None,
-) -> tuple[bool, str]:
+) -> tuple[bool, str, dict | None]:
     """Can this run open the project's existing program instead of importing?
 
-    Returns ``(reuse, reason)``; the reason is logged either way, because "why
-    did that take seven minutes again" is the question this whole path exists
-    to answer.
+    Returns ``(reuse, reason, state)``; the reason is logged either way,
+    because "why did that take seven minutes again" is the question this whole
+    path exists to answer, and the owner record comes back with it so the
+    caller does not re-read and re-parse the file we just decided on -- which
+    would also give it a second chance to disagree with the decision.
 
     Reuse is refused whenever the request would change what the import
     produced (a different loader, a PDB to apply, an explicit re-analysis), and
@@ -635,29 +647,29 @@ def _project_reuse_decision(
     *this* binary in an analyzed state.
     """
     if force_reanalyze:
-        return False, "force_reanalyze requested"
+        return False, "force_reanalyze requested", None
     if processor or loader:
-        return False, "explicit processor/loader only applies at import"
+        return False, "explicit processor/loader only applies at import", None
     if pdb_path:
-        return False, "PDB must be applied during import analysis"
+        return False, "PDB must be applied during import analysis", None
     if not cache.project_exists(project_name):
-        return False, "no Ghidra project on disk"
+        return False, "no Ghidra project on disk", None
 
     state = cache.read_project_state(project_name)
     if not state:
-        return False, "project has no owner record"
+        return False, "project has no owner record", None
     try:
         if state.get("binary_hash") != cache._get_binary_hash(binary_path):
-            return False, "project holds a different binary"
+            return False, "project holds a different binary", None
     except OSError as e:
-        return False, f"could not hash binary ({e})"
+        return False, f"could not hash binary ({e})", None
     # A shallow import ran with -noanalysis, so the program in the project has
     # no auto-analysis results. Serving a structural/full request off it would
     # return a function table that silently lacks most of the binary.
     if not state.get("analyzed") and analysis_depth != "shallow":
-        return False, "project program was imported without analysis"
+        return False, "project program was imported without analysis", None
 
-    return True, "owner record matches and program is analyzed"
+    return True, "owner record matches and program is analyzed", state
 
 
 def get_analysis_context(
@@ -756,6 +768,7 @@ def get_analysis_context(
         pdb_path=pdb_path,
         enable_fid=enable_fid,
         analysis_depth=analysis_depth,
+        skip_decompile=skip_decompile,
     )
     if cached_context is not None:
         logger.info("Using cached analysis for %s", binary_path)
@@ -843,7 +856,7 @@ def get_analysis_context(
         # under the lock on purpose: the owner record it reads is rewritten by
         # any import run on this binary.
         project_name = cache.project_name_for(binary_path)
-        reuse_project, reuse_reason = _project_reuse_decision(
+        reuse_project, reuse_reason, project_state = _project_reuse_decision(
             binary_path,
             project_name,
             analysis_depth=analysis_depth,
@@ -851,9 +864,6 @@ def get_analysis_context(
             processor=processor,
             loader=loader,
             pdb_path=pdb_path,
-        )
-        project_state = (
-            cache.read_project_state(project_name) if reuse_project else None
         )
         logger.info(
             "Ghidra project %s: %s (%s)",
@@ -1073,8 +1083,14 @@ def get_analysis_context(
         # that verbatim would re-tag a fully-decompiled cache as structural and
         # send every later tool down the recovery path for bodies it already
         # has.
-        prior_depth = (existing_cache_data or {}).get("metadata", {}).get(
-            "analysis_depth"
+        # Same "full" default every other reader of this key uses. A cache
+        # written before the depth was stamped has no key at all, and reading
+        # it as None here let a targeted delta write "structural" over a
+        # binary that was fully decompiled -- demoting it and forcing the
+        # complete re-analysis these lines exist to prevent.
+        prior_depth = (
+            (existing_cache_data or {}).get("metadata", {}).get("analysis_depth")
+            or ("full" if existing_cache_data else None)
         )
         is_targeted_run = bool(
             context.get("analysis_stats", {}).get("targeted_run")
@@ -1105,19 +1121,20 @@ def get_analysis_context(
                 pdb_applied=bool(pdb_path),
             )
 
-        # Cache the results
-        cache.save_cached(binary_path, context)
-
-        # Replay any user-supplied notes onto the freshly-built cache
-        # (the side-car survives invalidate, so this is what makes
-        # annotations persist across force_reanalyze / load_pdb). The
-        # second save is cheap and keeps the on-disk cache annotated
-        # so cache-direct readers see notes too.
+        # Replay any user-supplied notes onto the freshly-built context before
+        # persisting it (the side-car survives invalidate, so this is what
+        # makes annotations persist across force_reanalyze / load_pdb).
+        #
+        # Overlay first, save once. Saving before and after meant every
+        # targeted decompile wrote the whole merged cache to disk twice --
+        # two multi-hundred-megabyte gzip writes per single-function call, on
+        # the path whose entire purpose is to be fast.
         try:
             cache.apply_notes_overlay(binary_path, context)
-            cache.save_cached(binary_path, context)
         except Exception as e:
             logger.warning(f"Failed to apply notes overlay after analysis: {e}")
+
+        cache.save_cached(binary_path, context)
 
         # Populate the review-coverage function list off the fresh context.
         # Best-effort and never fatal: coverage is additive, and a ledger
@@ -1596,6 +1613,20 @@ def analyze_binary(
     compat_warning = None
 
     try:
+        # Validate BEFORE anything touches the path. This used to be implicit:
+        # every route out of this tool went through get_analysis_context, whose
+        # first act is sanitize_binary_path. The warm-cache short-circuit added
+        # below returns a cached report without ever reaching that call, so an
+        # unvalidated path would be hashed (no size ceiling) and its analysis
+        # served from outside the allowed directories.
+        binary_path = str(
+            sanitize_binary_path(
+                binary_path,
+                allowed_dirs=get_allowed_dirs(),
+                max_size_bytes=500 * 1024 * 1024,
+            )
+        )
+
         # Pre-analysis compatibility check (unless skipped or using cache)
         if not skip_compatibility_check and not cache.get_cached(binary_path):
             try:
@@ -1643,7 +1674,7 @@ Format: {compat_info.format.value}
             loader=loader,
             **{k: analysis_kwargs[k] for k in (
                 "incremental", "start_address", "end_address",
-                "pdb_path", "enable_fid", "analysis_depth",
+                "pdb_path", "enable_fid", "analysis_depth", "skip_decompile",
             )},
         )
 
@@ -2915,7 +2946,24 @@ def decompile_functions(
 
         context = cache.get_cached(binary_path)
         if context is None:
-            context = get_analysis_context(binary_path)
+            # No cache at all: the binary has to be analyzed before any target
+            # can even be resolved. Route that through the job path rather than
+            # blocking the tool for the whole cold run -- this docstring
+            # promises the batch always runs as a background job, and a
+            # synchronous multi-minute call here is the abandoned-call failure
+            # the registry exists to prevent.
+            degraded = _submit_analysis_job(
+                binary_path, False, None, None,
+                {"analysis_depth": "structural"}, wait=wait,
+            )
+            if degraded is not None:
+                return degraded
+            context = cache.get_cached(binary_path)
+            if context is None:
+                return (
+                    f"Error: analysis of {Path(binary_path).name} finished but "
+                    f"its cache could not be read back."
+                )
         cached_depth = context.get("metadata", {}).get("analysis_depth", "full")
 
         needs, warm, unresolved = _resolve_decompile_targets(

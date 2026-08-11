@@ -37,7 +37,17 @@ from src.engines.jobs import (
 
 @pytest.fixture
 def registry(tmp_path):
-    return JobRegistry(tmp_path, stale_after=1, heartbeat_interval=1)
+    # stale_after must leave real headroom over heartbeat_interval. _utc_now
+    # truncates to whole seconds and the heartbeat thread sleeps for one
+    # interval BEFORE its first refresh, so a record carries only its creation
+    # stamp for the first second of its life. With stale_after=1 a live job
+    # read as stale the moment a loaded runner took ~1s between creating it and
+    # the next submit -- and a "stale" claim gets broken, which is how
+    # test_second_submit_attaches... failed on Windows while the job was
+    # running normally. Production uses 15s/120s, an 8x margin; 1s/5s keeps
+    # the tests fast with the same shape. The dead-owner tests plant records
+    # aged 600s, so they are unaffected.
+    return JobRegistry(tmp_path, stale_after=5, heartbeat_interval=1)
 
 
 @pytest.fixture
@@ -627,3 +637,59 @@ class TestTerminalStateIsFirstWriterWins:
 
     def test_finalize_is_a_no_op_on_an_unknown_job(self, registry):
         assert registry._finalize("aaaa1111", state=STATE_SUCCEEDED) is None
+
+
+class TestUnreadableClaim:
+    """A claim that cannot be READ says nothing about whether its owner is
+    live. Concluding the key is free starts the second Ghidra run on one
+    binary that this whole registry exists to prevent."""
+
+    def test_a_transiently_unreadable_claim_is_not_discarded(self, registry):
+        registry._try_claim("k", "aaaa1111")
+        real_read_text = Path.read_text
+        calls = []
+
+        def flaky_read_text(self, *args, **kwargs):
+            if self.name.endswith(".claim.json"):
+                calls.append(self)
+                if len(calls) == 1:
+                    raise PermissionError(32, "being used by another process")
+            return real_read_text(self, *args, **kwargs)
+
+        with patch.object(Path, "read_text", flaky_read_text):
+            assert registry._read_claim("k") == "aaaa1111"
+        assert len(calls) > 1, "the first refusal should have been retried"
+
+    def test_a_persistently_unreadable_claim_blocks_rather_than_frees(
+        self, registry
+    ):
+        """The unsafe direction is starting a competing run, so an unresolvable
+        read must refuse to answer rather than declare the key free."""
+        registry._try_claim("k", "aaaa1111")
+
+        def always_locked(self, *args, **kwargs):
+            if self.name.endswith(".claim.json"):
+                raise PermissionError(32, "being used by another process")
+            raise FileNotFoundError
+
+        started = []
+        with patch.object(Path, "read_text", always_locked):
+            result = registry.submit(
+                kind="analyze", key="k", fn=lambda ctx: started.append(1),
+            )
+
+        assert "error" in result, "must not hand out a second runner"
+        assert started == [], "the competing work must not have started"
+        assert registry._claim_path("k").exists(), "the live claim must survive"
+
+    def test_a_corrupt_claim_is_still_discarded(self, registry):
+        """A truncated write from a process killed mid-claim names no owner, so
+        it protects nothing and must not wedge the key forever."""
+        registry._claim_path("k").write_text("{not json", encoding="utf-8")
+
+        submitted = registry.submit(kind="analyze", key="k", fn=lambda ctx: {})
+        assert "error" not in submitted
+        assert submitted["attached"] is False
+        assert _wait_for(
+            lambda: registry.read(submitted["job_id"])["state"] == STATE_SUCCEEDED
+        )

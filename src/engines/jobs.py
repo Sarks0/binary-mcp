@@ -114,6 +114,10 @@ _REAPABLE_MARKERS = ("analyzeheadless",)
 _JOB_ID_RE = re.compile(r"^[0-9a-f]{1,64}$")
 
 
+class _ClaimUnreadableError(Exception):
+    """A claim file exists but could not be read, so ownership is unknown."""
+
+
 def _utc_now() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -435,13 +439,58 @@ class JobRegistry:
 
     # claims
 
-    def _read_claim(self, key: str) -> str | None:
-        try:
-            data = json.loads(self._claim_path(key).read_text(encoding="utf-8"))
+    def _claim_state(self, key: str) -> tuple[str | None, str]:
+        """Read a claim, distinguishing *absent* from *could not be read*.
+
+        Collapsing those two into ``None`` is not a tidiness problem, it is the
+        failure this registry exists to prevent. ``_existing_for_key`` responds
+        to an unreadable claim by *releasing* it, so one transient read error
+        frees a key a live owner still holds and the next submit starts a
+        second Ghidra on the same binary. On Windows that is reachable: the
+        claim is a small file written and read constantly, and a scanner's
+        handle on it yields a sharing violation -- the same class that broke
+        the claim unlink and the job-record read.
+
+        Returns ``(job_id, state)`` where state is one of:
+
+        ``absent``      no claim file; the key is free.
+        ``held``        parsed cleanly, ``job_id`` names the owner.
+        ``corrupt``     present but unparseable JSON. A process killed
+                        mid-claim leaves exactly this, and it names no owner,
+                        so it protects nothing and must be cleared or the key
+                        wedges forever.
+        ``unreadable``  present, and the OS would not let us read it after
+                        retries. Says nothing about whether an owner is live,
+                        so the caller must NOT conclude the key is free --
+                        this module's whole liveness rule is that ambiguity
+                        resolves towards waiting, never towards starting a
+                        competing run.
+        """
+        path = self._claim_path(key)
+        for attempt in range(4):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                return None, "absent"
+            except ValueError:
+                # Truncated/garbage JSON never becomes parseable by waiting.
+                return None, "corrupt"
+            except OSError:
+                # Transient in practice; clears in tens of milliseconds.
+                if attempt == 3:
+                    return None, "unreadable"
+                time.sleep(0.02 * (attempt + 1))
+                continue
             job_id = data.get("job_id")
-            return job_id if isinstance(job_id, str) else None
-        except (OSError, ValueError):
-            return None
+            if isinstance(job_id, str):
+                return job_id, "held"
+            return None, "corrupt"
+        return None, "unreadable"
+
+    def _read_claim(self, key: str) -> str | None:
+        """The owning job id for ``key``, or None. See :meth:`_claim_state`."""
+        job_id, _state = self._claim_state(key)
+        return job_id
 
     def _try_claim(self, key: str, job_id: str) -> bool:
         """Atomically take the claim for ``key``. False if somebody has it.
@@ -550,7 +599,17 @@ class JobRegistry:
         instead.
         """
         with self._lock:
-            existing = self._existing_for_key(key)
+            try:
+                existing = self._existing_for_key(key)
+            except _ClaimUnreadableError:
+                # Better a caller who retries than two Ghidra runs on one
+                # binary, which is the whole reason this registry exists.
+                return {
+                    "error": (
+                        f"the claim for {key!r} could not be read, so whether a "
+                        f"run is already in flight is unknown. Retry shortly."
+                    )
+                }
             if existing is not None:
                 return {
                     "job_id": existing["job_id"],
@@ -605,15 +664,19 @@ class JobRegistry:
 
     def _existing_for_key(self, key: str) -> dict | None:
         """The live job for ``key``, breaking the claim if its owner died."""
-        job_id = self._read_claim(key)
+        job_id, state = self._claim_state(key)
+        if state == "unreadable":
+            # Ambiguous: somebody may well be running this key. Refuse to
+            # decide rather than free a claim we merely failed to read.
+            raise _ClaimUnreadableError(key)
         if job_id is None:
             # A claim file that exists but cannot be parsed names no owner, so
             # it protects nothing -- and left in place it wedges this key
             # forever, because the exclusive create keeps failing against it.
             # A truncated write from a process killed mid-claim looks exactly
             # like this.
-            if self._claim_path(key).exists():
-                logger.warning("discarding unreadable claim for key %r", key)
+            if state == "corrupt":
+                logger.warning("discarding unparseable claim for key %r", key)
                 self._release_claim(key)
             return None
         record = self.read(job_id)

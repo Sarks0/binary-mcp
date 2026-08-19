@@ -55,9 +55,6 @@ def _no_real_user_extensions(monkeypatch):
     )
 
 
-# -- helpers ----------------------------------------------------------------
-
-
 def _stub_install(
     base_dir,
     *,
@@ -152,9 +149,6 @@ def _run_analyze_capturing_popen(runner, tmp_path, binary_name="sample.bin",
     return captured.get("args"), captured.get("kwargs")
 
 
-# -- Fix 1: stdin detachment (the hang) -------------------------------------
-
-
 def test_popen_detaches_stdin(tmp_path):
     """The child MUST get stdin=DEVNULL so a Windows `pause` can't block on --
     and consume -- the MCP server's JSON-RPC stdin."""
@@ -174,9 +168,6 @@ def test_popen_still_captures_stdout_stderr(tmp_path):
     assert kwargs.get("stderr") == subprocess.PIPE
 
 
-# -- Fix 2: version detection on the real install layout --------------------
-
-
 def test_version_detected_under_ghidra_subdir(tmp_path):
     """application.properties under Ghidra/ (the real layout) must resolve."""
     install = _stub_install(tmp_path, version="12.1.2", version_at_root=False)
@@ -189,9 +180,6 @@ def test_version_detected_at_root_still_works(tmp_path):
     install = _stub_install(tmp_path, version="11.4", version_at_root=True)
     runner = GhidraRunner(ghidra_path=str(install))
     assert runner._get_ghidra_version() == (11, 4)
-
-
-# -- Fix 2 (cont.): the Jython gate actually fires now ----------------------
 
 
 def test_jython_gate_fires_on_real_layout_without_extension(tmp_path):
@@ -230,9 +218,6 @@ def test_jython_gate_passes_when_extension_installed(tmp_path):
     runner.ensure_jython_available()  # must not raise
 
 
-# -- Fix 3: dot flattening in project names ---------------------------------
-
-
 def test_dotted_derived_project_name_is_flattened(tmp_path):
     """A dotted sample name must yield a dot-free Ghidra project name so the
     files Ghidra creates match the paths cleanup reconstructs."""
@@ -257,9 +242,6 @@ def test_dotted_explicit_project_name_is_flattened(tmp_path):
     )
     assert "." not in args[0][2]
     assert args[0][2] == "my_proj_v2"
-
-
-# -- Fix 4: environment variable resolution ---------------------------------
 
 
 def test_ghidra_install_dir_is_honoured(tmp_path, monkeypatch):

@@ -21,7 +21,7 @@ import pytest
 
 from src.engines.dynamic.windbg.allowlist import parse_compound, validate_command
 
-# -- H1: a newline is a subcommand separator, validated like ';' --
+# H1: a newline is a subcommand separator, validated like ';'
 
 
 class TestNewlineInjection:
@@ -49,7 +49,7 @@ class TestNewlineInjection:
         assert ok is True, reason
 
 
-# -- H2: script-file include operators are denied --
+# H2: script-file include operators are denied
 
 
 class TestScriptFileInclude:
@@ -69,7 +69,7 @@ class TestScriptFileInclude:
         assert ok is True, reason
 
 
-# -- H3: alias-definition family is denied --
+# H3: alias-definition family is denied
 
 
 class TestAliasDefinition:

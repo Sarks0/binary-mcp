@@ -18,7 +18,7 @@ import pytest
 from src.utils.binary_reader import BinaryReader
 from src.utils.security import PathTraversalError, sanitize_binary_path
 
-# -- H9 / P4: confinement is applied even when the caller omits allowed_dirs --
+# H9 / P4: confinement is applied even when the caller omits allowed_dirs
 
 
 def test_confinement_applied_when_caller_omits_allowed_dirs(tmp_path, monkeypatch):
@@ -51,7 +51,7 @@ def test_explicit_allowed_dirs_still_enforced(tmp_path, monkeypatch):
         sanitize_binary_path(str(outside_file), allowed_dirs=[allowed])
 
 
-# -- M13: unconfigured behaviour (default-open with a signal, or fail closed) --
+# M13: unconfigured behaviour (default-open with a signal, or fail closed)
 
 
 def test_unconfigured_allows_by_default(tmp_path, monkeypatch):
@@ -84,7 +84,7 @@ def test_require_confinement_allows_inside_configured_dir(tmp_path, monkeypatch)
     assert sanitize_binary_path(str(f)) == f.resolve()
 
 
-# -- H8: read_full must not slurp an unbounded file into memory --
+# H8: read_full must not slurp an unbounded file into memory
 
 
 def test_read_full_accepts_within_cap(tmp_path):

@@ -31,8 +31,6 @@ _fastmcp_stub.FastMCP = MagicMock(return_value=_fastmcp_instance)
 sys.modules["fastmcp"] = _fastmcp_stub
 
 
-# -- ProjectCache ------------------------------------------------------------
-
 class TestProjectCacheCompression:
     def _cache(self, tmp_path):
         from src.engines.static.ghidra.project_cache import ProjectCache
@@ -232,9 +230,6 @@ class TestProjectCacheCompression:
         assert cache.read_notes(str(binary)) == [
             {"function_key": "a", "kind": "plate", "addr": None, "text": "n"}
         ]
-
-
-# -- GhidraRunner env plumbing ----------------------------------------------
 
 
 class _FakeRunResult:
@@ -702,8 +697,6 @@ class TestRunnerEnvPlumbing:
             runner._cleanup_pdb(staged)
 
 
-# -- GhidraRunner timeout cleanup -------------------------------------------
-#
 # Regression: subprocess.run on Windows can hang indefinitely after timeout
 # fires because Ghidra's java.exe grandchildren survive the .bat kill and
 # keep the captured pipes open. runner.analyze now uses Popen + manual
@@ -881,9 +874,6 @@ class TestRunnerTimeoutCleanup:
         with patch("subprocess.run") as mock_run:
             runner_mod._kill_process_tree(_DeadPopen())
             assert not mock_run.called
-
-
-# -- get_analysis_context incremental wiring --------------------------------
 
 
 @pytest.fixture
@@ -1355,7 +1345,6 @@ class TestDeltaIntegration:
         assert addrs["0x1040"]["pseudocode"] is None
 
 
-# -- Error propagation through get_analysis_context -------------------------
 # Regression tests for docs/ghidra-mcp-defender-issues.md (Issue 2):
 # get_analysis_context used to wrap every exception in a plain RuntimeError,
 # stripping GhidraAnalysisError.diagnostic and UserFacingError type info so

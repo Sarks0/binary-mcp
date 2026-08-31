@@ -12,6 +12,7 @@ import subprocess  # nosec B404 - Required for Ghidra headless execution
 import time
 from pathlib import Path
 
+from src.engines.static.ghidra.project_cache import _PROJECT_NAME_MAX
 from src.utils.security import UserFacingError, validate_parameter_pattern
 
 logger = logging.getLogger(__name__)
@@ -400,6 +401,34 @@ class GhidraRunner:
         except Exception as e:
             logger.warning(f"Failed to cleanup project {project_name}: {e}")
 
+    def _release_project_lock(self, project_dir: Path, project_name: str) -> None:
+        """Drop only the project's ``.lock``, keeping the analyzed database.
+
+        Ghidra removes its lock on a clean exit; a killed process leaves one
+        behind, and every later run then fails with "project is locked". The
+        import path answers that by deleting the whole project, which is right
+        there -- the import failed, so nothing of value is in it. A reuse run
+        is the opposite case: the project is the expensive artifact (minutes of
+        auto-analysis) and the run that timed out never wrote to it, because
+        reuse runs are ``-readOnly``. So clear the lock and keep the database.
+        """
+        lock_file = project_dir / f"{project_name}.lock"
+        try:
+            if lock_file.exists():
+                lock_file.unlink()
+                logger.debug(f"Released project lock: {lock_file}")
+        except OSError as e:
+            logger.warning(f"Could not release project lock {lock_file}: {e}")
+
+    def _cleanup_after_failure(
+        self, project_dir: Path, project_name: str, reused_project: bool
+    ) -> None:
+        """Post-failure cleanup, scaled to what the run could have damaged."""
+        if reused_project:
+            self._release_project_lock(project_dir, project_name)
+        else:
+            self._cleanup_project(project_dir, project_name)
+
     def _read_version_string(self) -> str | None:
         """
         Read the raw ``application.version`` value from Ghidra's
@@ -611,6 +640,9 @@ class GhidraRunner:
         analysis_depth: str = "full",
         on_spawn=None,
         force_decompile: bool = False,
+        target_addresses: list[str] | None = None,
+        reuse_project: bool = False,
+        program_name: str | None = None,
     ) -> dict:
         """
         Run Ghidra headless analysis on a binary.
@@ -636,9 +668,21 @@ class GhidraRunner:
                 Ghidra's PdbUniversalAnalyzer picks it up automatically.
             enable_fid: When True, set GHIDRA_ENABLE_FID=1 so the Jython script
                 runs Function ID library matching per function.
+            target_addresses: Exact function entry points to process. The script
+                then looks each one up directly instead of walking every
+                function in the program, which is what makes a targeted
+                decompile cost one decompile rather than a 30K-function sweep.
+            reuse_project: Open the program already imported in ``project_name``
+                via ``-process`` instead of re-importing the binary. The caller
+                is responsible for having verified (via the project's owner
+                record) that the project holds *this* binary, already analyzed.
+            program_name: Name of the program inside the project, used as the
+                ``-process`` pattern. Falls back to ``*`` when unknown or when
+                the name is not a safe pattern.
 
         Returns:
-            dict with analysis results and metadata
+            dict with analysis results and metadata. ``reused_project`` reports
+            whether this run skipped the import.
 
         Raises:
             GhidraAnalysisError: If Ghidra exits non-zero or times out. Carries
@@ -674,6 +718,37 @@ class GhidraRunner:
         project_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', project_name)
         if project_name.startswith('-'):
             project_name = f"proj_{project_name}"
+        # Same clamp ProjectCache applies, and the reason the cache reserves
+        # the last 9 characters of its budget for the content-hash suffix:
+        # truncating here after that suffix was appended would remove it, and
+        # Ghidra would create a project under a name the reuse check never
+        # looks for.
+        project_name = project_name[:_PROJECT_NAME_MAX]
+
+        # Reuse only covers what re-running the post-script can deliver.
+        # Everything below is decided at import time -- the loader that parsed
+        # the file, the PDB applied during analysis -- so honouring the request
+        # while silently skipping the import would hand back a program that
+        # does not reflect what the caller asked for.
+        if reuse_project:
+            conflicting = [
+                name for name, value in (
+                    ("processor", processor),
+                    ("loader", loader),
+                    ("pdb_path", pdb_path),
+                ) if value
+            ]
+            if conflicting:
+                raise ValueError(
+                    "reuse_project cannot be combined with "
+                    f"{', '.join(conflicting)}: those only take effect during "
+                    "import, so the reuse run would ignore them."
+                )
+            if not keep_project:
+                raise ValueError(
+                    "reuse_project requires keep_project=True; deleting the "
+                    "project this run just reused defeats the point."
+                )
 
         # Create temporary project directory
         project_dir = Path(output_path).parent / "ghidra_projects"
@@ -721,23 +796,59 @@ class GhidraRunner:
             env["GHIDRA_END_ADDRESS"] = str(end_address)
         if enable_fid:
             env["GHIDRA_ENABLE_FID"] = "1"
+        if target_addresses:
+            # Validated here rather than trusted: these reach a Jython script
+            # that turns them into addresses, and the env var is the boundary.
+            cleaned = []
+            for addr in target_addresses:
+                text = str(addr).strip()
+                if not re.match(r'^(0[xX])?[0-9a-fA-F]{1,16}$', text):
+                    raise ValueError(f"Invalid target address: {addr!r}")
+                cleaned.append(text)
+            env["GHIDRA_TARGET_ADDRESSES"] = ",".join(cleaned)
         # Give script a wall-clock budget with margin for JSON serialization
         env["GHIDRA_ANALYSIS_BUDGET"] = str(max(timeout - 60, 60))
 
         # Bump JVM heap. Loading a multi-GB resume cache or decompiling
         # complex functions on large binaries will OOM Ghidra's default heap.
         # _JAVA_OPTIONS is picked up by every JVM the analyzeHeadless script
-        # spawns, including the one running our Jython post-script.
+        # spawns, including the one running our Jython post-script, and the JVM
+        # parses it AFTER the command line -- so it overrides the -Xmx that
+        # Ghidra's own launcher passes (from support/launch.properties MAXMEM).
+        # Reading the java command line therefore tells you the wrong number;
+        # the JVM's own "Picked up _JAVA_OPTIONS:" line on stderr tells you the
+        # right one, and that lands in ghidra_debug.log.
         if max_heap_mb is None:
+            raw_heap = os.environ.get("GHIDRA_MAX_HEAP_MB", "4096")
             try:
-                max_heap_mb = int(os.environ.get("GHIDRA_MAX_HEAP_MB", "4096"))
+                max_heap_mb = int(raw_heap)
             except ValueError:
+                logger.warning(
+                    "GHIDRA_MAX_HEAP_MB=%r is not an integer; falling back to "
+                    "4096m", raw_heap,
+                )
                 max_heap_mb = 4096
         if max_heap_mb > 0:
             existing = env.get("_JAVA_OPTIONS", "")
-            if "-Xmx" not in existing:
+            inherited_xmx = re.search(r'-Xmx\S+', existing)
+            if inherited_xmx is None:
                 env["_JAVA_OPTIONS"] = (
                     f"{existing} -Xmx{max_heap_mb}m".strip()
+                )
+                logger.info("Ghidra JVM max heap: %dm", max_heap_mb)
+            else:
+                # Not clobbered: an explicit _JAVA_OPTIONS is the operator's
+                # call. But it is worth saying out loud, because _JAVA_OPTIONS
+                # lowers as readily as it raises -- an inherited -Xmx2g caps
+                # Ghidra at 2 GB while GHIDRA_MAX_HEAP_MB still reads 4096 and
+                # nothing anywhere reports the discrepancy. That is a silent
+                # OOM waiting to be misdiagnosed as a Ghidra bug.
+                logger.warning(
+                    "Ghidra JVM max heap will be %s, from the inherited "
+                    "_JAVA_OPTIONS -- NOT the requested %dm. An -Xmx already "
+                    "present there wins and is left alone. Unset _JAVA_OPTIONS "
+                    "or change its -Xmx if Ghidra runs out of heap.",
+                    inherited_xmx.group(0), max_heap_mb,
                 )
 
         # Stage PDB next to the binary so Ghidra's PdbUniversalAnalyzer finds
@@ -754,6 +865,36 @@ class GhidraRunner:
             f"resume_from_cache={resume_from_cache}, "
             f"start_address={start_address}, end_address={end_address}"
         )
+
+        # Reuse path: the project already holds this binary, imported and
+        # analyzed. `-process` opens that program and runs only the post-script.
+        #
+        # This is the whole large-binary story. `-import ... -overwrite` throws
+        # the analyzed program away and re-runs auto-analysis from scratch --
+        # ~7 minutes on a 17 MB, 30K-function DLL -- and it ran on EVERY
+        # invocation, including a targeted decompile of one function. Keeping
+        # the project (`keep_project=True`) never helped, because nothing ever
+        # opened it. `-noanalysis` is safe here precisely because the caller
+        # only sets `reuse_project` when the owner record says analysis already
+        # completed; `-readOnly` keeps a pure extraction run from re-saving a
+        # multi-hundred-MB program database on the way out.
+        if reuse_project:
+            cmd = [
+                self._get_analyze_headless_cmd(),
+                str(project_dir),
+                project_name,
+                "-process", self._process_pattern(program_name),
+                "-noanalysis",
+                "-readOnly",
+                "-scriptPath", str(script_path),
+                "-postScript", script_name,
+            ]
+
+            logger.info(f"Running Ghidra (project reuse): {' '.join(cmd)}")
+            return self._run_headless(
+                cmd, env, binary_path, project_name, project_dir,
+                timeout, on_spawn, staged_pdb, reused_project=True,
+            )
 
         # Build command - processor/loader must come immediately after binary path
         cmd = [
@@ -814,6 +955,44 @@ class GhidraRunner:
         logger.info(f"Running Ghidra analysis: {' '.join(cmd)}")
         logger.debug(f"Environment: GHIDRA_CONTEXT_JSON={output_path}")
 
+        return self._run_headless(
+            cmd, env, binary_path, project_name, project_dir,
+            timeout, on_spawn, staged_pdb, reused_project=False,
+        )
+
+    @staticmethod
+    def _process_pattern(program_name: str | None) -> str:
+        """The ``-process`` argument for a project-reuse run.
+
+        Ghidra reads this as a filename pattern where ``*`` and ``?`` are
+        wildcards, so a program name carrying either would silently widen the
+        selection. Anything that is not a plain, safe name degrades to ``*``,
+        which is exact anyway: a content-keyed project holds one program.
+        """
+        if not program_name:
+            return "*"
+        if re.match(r'^[A-Za-z0-9 ._\-+()]{1,255}$', program_name):
+            return program_name
+        return "*"
+
+    def _run_headless(
+        self,
+        cmd: list[str],
+        env: dict,
+        binary_path,
+        project_name: str,
+        project_dir: Path,
+        timeout: int,
+        on_spawn,
+        staged_pdb: Path | None,
+        reused_project: bool,
+    ) -> dict:
+        """Spawn analyzeHeadless, supervise it, and normalise the outcome.
+
+        Shared by the import and project-reuse paths so both get the same
+        process-tree teardown, timeout handling and staged-PDB cleanup -- the
+        parts that are load-bearing and easy to get subtly wrong twice.
+        """
         start_time = time.time()
 
         # Use Popen + manual lifecycle (instead of subprocess.run) so timeout
@@ -884,7 +1063,9 @@ class GhidraRunner:
                             pass
                     drain_stdout, drain_stderr = "", ""
 
-                self._cleanup_project(project_dir, project_name)
+                self._cleanup_after_failure(
+                    project_dir, project_name, reused_project
+                )
 
                 partial_stdout = (e.stdout.decode("utf-8", errors="replace")
                                   if isinstance(e.stdout, bytes)
@@ -908,7 +1089,9 @@ class GhidraRunner:
                 logger.error(f"stdout: {stdout}")
                 logger.error(f"stderr: {stderr}")
 
-                self._cleanup_project(project_dir, project_name)
+                self._cleanup_after_failure(
+                    project_dir, project_name, reused_project
+                )
 
                 diagnostic = _extract_ghidra_diagnostic(stdout or "", stderr or "")
                 raise GhidraAnalysisError(
@@ -917,17 +1100,21 @@ class GhidraRunner:
                     returncode=proc.returncode,
                 )
 
-            logger.info(f"Analysis completed in {elapsed_time:.2f}s")
+            logger.info(
+                f"Analysis completed in {elapsed_time:.2f}s"
+                f"{' (reused project)' if reused_project else ''}"
+            )
             logger.debug(f"stdout: {stdout[:500]}")
 
             return {
                 "success": True,
                 "binary": str(binary_path),
                 "project_name": project_name,
-                "output_path": output_path,
+                "output_path": env.get("GHIDRA_CONTEXT_JSON"),
                 "elapsed_time": elapsed_time,
                 "stdout": stdout,
                 "stderr": stderr,
+                "reused_project": reused_project,
             }
 
         finally:

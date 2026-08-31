@@ -103,6 +103,12 @@ def _load_context(binary_path: str, cache, runner):
     # The temp output is run-scoped, so cleanup has to happen on the failure
     # paths too -- otherwise every failed run leaves a fresh copy behind.
     try:
+        # Deliberately NOT the content-keyed project name get_analysis_context
+        # uses. This path holds no `_delta_run_lock`, so pointing it at that
+        # project would let it `-import -overwrite` the very database a
+        # concurrent reuse run has open -- and rewrite the owner record that
+        # run consulted under the lock. Letting it build its own stem-named
+        # project costs one extra import and shares nothing.
         runner.analyze(
             binary_path=bp,
             script_path=str(script_path),

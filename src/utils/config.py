@@ -187,6 +187,7 @@ CONFIG_KEYS = {
     "GHIDRA_END_ADDRESS": "Hex end address for chunked analysis",
     "GHIDRA_ENABLE_FID": "Enable Function ID library matching during analysis (1/true/yes)",
     "GHIDRA_MAX_HEAP_MB": "JVM max heap for Ghidra subprocess in MB (default 4096). Bump to 6144-8192 for very large binaries.",
+    "BINARY_MCP_INLINE_DEADLINE": "Seconds a Ghidra-invoking tool may block before returning a job handle instead (default 25, max 900). Raise it if your MCP client is patient -- under Claude Code, where long calls move to a background task after 2 min, 90-120 returns more answers inline.",
 
     # x64dbg
     "X64DBG_BRIDGE_URL": "URL for x64dbg HTTP bridge (default: http://localhost:27042)",

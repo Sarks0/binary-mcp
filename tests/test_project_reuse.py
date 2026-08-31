@@ -21,8 +21,11 @@ Covers:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sys
+import threading
+import time
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -1407,3 +1410,144 @@ class TestFinalReviewFindings:
         binary.write_bytes(b"MZ" + b"\xaa" * 64)
         _os.utime(binary, ns=(stat.st_atime_ns, stat.st_mtime_ns))
         assert cache_obj._get_binary_hash(str(binary)) != first, "TTL must expire it"
+
+
+class TestTargetedRunLockPosture:
+    """A targeted run must queue behind a stem-mate rather than fail instantly.
+
+    `ProjectCache._get_project_name` is the legacy stem-only name and is
+    deliberately still the lock key, because "two binaries sharing a stem are
+    exactly the pair a same-named old/new build produces, and serialising them
+    costs a queue rather than a corrupted run". A queue is the designed cost.
+
+    Passing `wait_seconds=0.0` on the targeted path charged a hard failure
+    instead. Observed on a patch-diff workload across four builds of one DLL:
+    6 of 47 targeted decompiles failed the moment a *different build* took the
+    lock, five of which were retried unchanged a minute later and succeeded.
+
+    Only a job-backed run can afford the queue, though -- it degrades to a
+    handle and the caller polls. The inline path keeps failing fast; see
+    `test_an_inline_targeted_run_still_fails_fast`.
+    """
+
+    def _fake_analyze(self, **kwargs):
+        Path(kwargs["output_path"]).write_text(json.dumps({
+            "metadata": {"name": "target.dll"},
+            "functions": [
+                {"address": "0x401000", "name": "Parse",
+                 "pseudocode": "void Parse(void) { return; }",
+                 "call_sites": []},
+            ],
+            "analysis_stats": {"delta_run": True, "targeted_run": True},
+        }))
+        return {"elapsed_time": 1.0, "stdout": "", "stderr": ""}
+
+    @contextlib.contextmanager
+    def _stem_mate_holding_the_lock(self, server_module, cache_obj, binary):
+        """Hold the run lock as a different build of the same DLL would."""
+        holder_in = threading.Event()
+        release = threading.Event()
+
+        def _hold():
+            with server_module._delta_run_lock(
+                cache_obj.cache_dir,
+                # Different path, same stem -- so the same lock key. This is
+                # exactly the production collision.
+                "/other/build/target.dll",
+                lock_key=cache_obj._get_project_name(str(binary)),
+            ):
+                holder_in.set()
+                release.wait(10)
+
+        holder = threading.Thread(target=_hold, daemon=True)
+        holder.start()
+        assert holder_in.wait(5)
+        try:
+            yield release
+        finally:
+            release.set()
+            holder.join(timeout=10)
+
+    def test_a_job_backed_targeted_run_queues_behind_a_stem_mate(
+        self, tmp_path, monkeypatch, server_module
+    ):
+        """The old/new build pair is the patch-diff case; it must not fail."""
+        binary, cache_obj = _seed_analyzed_binary(
+            tmp_path, monkeypatch, server_module
+        )
+        monkeypatch.setattr(server_module.runner, "analyze", self._fake_analyze)
+
+        with self._stem_mate_holding_the_lock(
+            server_module, cache_obj, binary
+        ) as release:
+            done = []
+
+            def _run():
+                done.append(server_module.get_analysis_context(
+                    str(binary),
+                    target_addresses=["0x401000"],
+                    force_decompile=True,
+                    job_context=MagicMock(),
+                ))
+
+            runner_thread = threading.Thread(target=_run, daemon=True)
+            runner_thread.start()
+            # Queued, not refused: still waiting while the stem-mate holds it.
+            runner_thread.join(timeout=1.0)
+            assert done == []
+
+            release.set()
+            runner_thread.join(timeout=10)
+
+        assert len(done) == 1 and done[0] is not None
+
+    def test_an_inline_targeted_run_still_fails_fast(
+        self, tmp_path, monkeypatch, server_module
+    ):
+        """Without a job there is no handle to poll, so queueing would just
+        hang the client. `expand_callgraph` decompiles frontier batches on the
+        request path and already records a refused batch and moves on."""
+        binary, cache_obj = _seed_analyzed_binary(
+            tmp_path, monkeypatch, server_module
+        )
+        monkeypatch.setattr(server_module.runner, "analyze", self._fake_analyze)
+
+        with self._stem_mate_holding_the_lock(server_module, cache_obj, binary):
+            started = time.monotonic()
+            with pytest.raises(RuntimeError, match="already running"):
+                server_module.get_analysis_context(
+                    str(binary),
+                    target_addresses=["0x401000"],
+                    force_decompile=True,
+                )
+            assert time.monotonic() - started < 2.0
+
+    def test_the_queue_is_bounded_well_below_a_plain_analysis(
+        self, tmp_path, monkeypatch, server_module
+    ):
+        """Queueing must not mean queueing for the plain-analysis hour.
+
+        A targeted decompile is interactive. Waiting `_RUN_LOCK_WAIT_SECONDS`
+        behind a full analysis would leave the caller polling a handle that has
+        not started for most of an hour; an error naming the wait beats that.
+        """
+        binary, _ = _seed_analyzed_binary(tmp_path, monkeypatch, server_module)
+        monkeypatch.setattr(server_module.runner, "analyze", self._fake_analyze)
+
+        real_lock = server_module._delta_run_lock
+        captured = {}
+
+        def capturing_lock(cache_dir, binary_path, **kwargs):
+            captured.update(kwargs)
+            return real_lock(cache_dir, binary_path, **kwargs)
+
+        monkeypatch.setattr(server_module, "_delta_run_lock", capturing_lock)
+        server_module.get_analysis_context(
+            str(binary),
+            target_addresses=["0x401000"],
+            force_decompile=True,
+            job_context=MagicMock(),
+        )
+
+        assert captured["wait_seconds"] > 0, "a job-backed targeted run queues"
+        assert captured["wait_seconds"] < server_module._RUN_LOCK_WAIT_SECONDS

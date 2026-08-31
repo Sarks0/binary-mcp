@@ -349,6 +349,14 @@ def _write_resume_manifest(
 # means the lock is stale rather than busy.
 _RUN_LOCK_WAIT_SECONDS = 3600.0
 
+# The same wait for a targeted run that is backed by a job. Such a run can
+# afford to queue: it degrades to a handle at BINARY_MCP_INLINE_DEADLINE and
+# the caller polls from there. Not the full hour above, though -- a targeted
+# decompile is interactive, and an hour of polling a handle that has not
+# started is worse than an error naming the wait. Sized to absorb a few
+# targeted runs, whose whole point is that they take tens of seconds.
+_TARGETED_RUN_LOCK_WAIT_SECONDS = 300.0
+
 
 def _try_lock(fd: int) -> bool:
     """Take an exclusive advisory lock without blocking. False if held."""
@@ -383,12 +391,15 @@ def _delta_run_lock(
     ``-overwrite``. ``lock_key`` is therefore the sanitized project name rather
     than the path, so the lock covers exactly the collisions that exist.
 
-    ``wait_seconds`` picks the posture. Zero means fail fast, which is what an
-    ``incremental=True`` caller wants: it asked to extend a specific cache, and
-    queueing behind another writer of that cache is not what it meant. A
-    positive value queues instead, which is what a plain analysis wants -- an
-    old and a new build of one DLL is the patch-diff case, and failing the
-    second of those would break the workflow to protect it.
+    ``wait_seconds`` is how long to queue, and the right answer is "as long as
+    this caller can afford". Queueing matters because ``lock_key`` is the
+    stem-only project name: the contender is as likely to be a *different build
+    of the same DLL* as another writer of this cache, and an old and a new build
+    of one DLL is the patch-diff case -- failing the second of those breaks the
+    workflow to protect it. So a run that can degrade to a job handle queues,
+    and a plain analysis queues longest. Zero is for callers that must answer
+    now and have somewhere to put a refusal, and for probing whether the lock
+    is free at all.
 
     The lock file is deliberately never unlinked. Removing it while another
     process waits on that inode lets a third create a fresh file and take a
@@ -809,11 +820,28 @@ def get_analysis_context(
     # a binary of the same name, so the lock covers all of them -- not only the
     # incremental ones, which is all it used to guard. `wait=False` jobs made
     # that concurrency the normal case rather than an accident.
+
+    # What this caller can afford to wait. A targeted run must not fail merely
+    # because a *stem-mate* holds the lock -- that is the patch-diff case, and
+    # it cost 6 of 47 targeted decompiles on a four-build workload, five of
+    # which succeeded unchanged on a manual retry a minute later. But only a
+    # job-backed run can afford to queue for it: it degrades to a handle and
+    # the caller polls. A targeted run answering inline (expand_callgraph's
+    # frontier batches) still fails fast, because blocking there blocks the
+    # client with nothing to poll, and that caller already records a refused
+    # batch and moves on.
+    if resume_from_cache is None:
+        run_lock_wait = _RUN_LOCK_WAIT_SECONDS
+    elif job_context is not None:
+        run_lock_wait = _TARGETED_RUN_LOCK_WAIT_SECONDS
+    else:
+        run_lock_wait = 0.0
+
     delta_lock_cm = _delta_run_lock(
         cache.cache_dir,
         binary_path,
         lock_key=cache._get_project_name(binary_path),
-        wait_seconds=0.0 if resume_from_cache is not None else _RUN_LOCK_WAIT_SECONDS,
+        wait_seconds=run_lock_wait,
     )
     delta_lock_cm.__enter__()
     if resume_from_cache is not None:

@@ -82,9 +82,6 @@ def _make_project(cache_obj, project_name):
     (pdir / f"{project_name}.rep").mkdir(exist_ok=True)
 
 
-# -- Project naming ----------------------------------------------------------
-
-
 class TestProjectNaming:
     def test_project_name_includes_content_hash(self, tmp_path):
         cache_obj = _cache(tmp_path)
@@ -133,9 +130,6 @@ class TestProjectNaming:
         assert not (pdir / f"{legacy}.gpr").exists()
 
 
-# -- Owner record ------------------------------------------------------------
-
-
 class TestProjectState:
     def test_round_trip(self, tmp_path):
         cache_obj = _cache(tmp_path)
@@ -162,9 +156,6 @@ class TestProjectState:
         assert not cache_obj.project_exists("half")
         (pdir / "half.rep").mkdir()
         assert cache_obj.project_exists("half")
-
-
-# -- The reuse decision ------------------------------------------------------
 
 
 class TestReuseDecision:
@@ -258,9 +249,6 @@ class TestReuseDecision:
         binary, name = self._seed(tmp_path, monkeypatch, server_module)
         reuse, _, _ = self._decide(server_module, binary, name, **override)
         assert reuse is False
-
-
-# -- Runner command shape ----------------------------------------------------
 
 
 class TestReuseCommand:
@@ -407,9 +395,6 @@ class TestReuseFailureCleanup:
 
         assert not (pdir / "p.gpr").exists()
         assert not (pdir / "p.rep").exists()
-
-
-# -- End-to-end wiring through get_analysis_context --------------------------
 
 
 def _seed_analyzed_binary(tmp_path, monkeypatch, server_module, depth="structural"):

@@ -19,6 +19,8 @@ import os
 import sys
 import threading
 import time
+from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -35,7 +37,17 @@ from src.engines.jobs import (
 
 @pytest.fixture
 def registry(tmp_path):
-    return JobRegistry(tmp_path, stale_after=1, heartbeat_interval=1)
+    # stale_after must leave real headroom over heartbeat_interval. _utc_now
+    # truncates to whole seconds and the heartbeat thread sleeps for one
+    # interval BEFORE its first refresh, so a record carries only its creation
+    # stamp for the first second of its life. With stale_after=1 a live job
+    # read as stale the moment a loaded runner took ~1s between creating it and
+    # the next submit -- and a "stale" claim gets broken, which is how
+    # test_second_submit_attaches... failed on Windows while the job was
+    # running normally. Production uses 15s/120s, an 8x margin; 1s/5s keeps
+    # the tests fast with the same shape. The dead-owner tests plant records
+    # aged 600s, so they are unaffected.
+    return JobRegistry(tmp_path, stale_after=5, heartbeat_interval=1)
 
 
 @pytest.fixture
@@ -547,7 +559,50 @@ class TestClaimHandover:
     def test_a_finished_job_frees_the_key_for_the_next_one(self, registry):
         first = registry.submit(kind="analyze", key="k", fn=lambda ctx: {})
         assert _wait_for(lambda: registry.read(first["job_id"])["state"] == STATE_SUCCEEDED)
-        assert registry._read_claim("k") is None
+        # The claim is released *after* the terminal state is written -- which
+        # is the right order, since freeing the key first would let a second
+        # process start a duplicate run while this one is still writing its
+        # result. So observing SUCCEEDED does not imply the claim is already
+        # gone; wait for it rather than assuming the two are simultaneous.
+        assert _wait_for(lambda: registry._read_claim("k") is None), (
+            "a finished job must free its key for the next submit"
+        )
+
+    def test_a_windows_sharing_violation_does_not_wedge_the_key(self, registry):
+        """On Windows, deleting a file another process holds a handle to fails
+        with WinError 32, and something transiently holds one on a file just
+        written and read -- Defender scanning it. The claim we just read is
+        exactly that file. A single refusal used to escape the job thread and
+        leave the key claimed by a job that had already finished."""
+        registry._try_claim("k", "aaaa1111")
+        real_unlink = Path.unlink
+        calls = []
+
+        def flaky_unlink(self, *args, **kwargs):
+            calls.append(self)
+            if len(calls) == 1:
+                raise PermissionError(32, "being used by another process")
+            return real_unlink(self, *args, **kwargs)
+
+        with patch.object(Path, "unlink", flaky_unlink):
+            registry._release_claim("k", expect="aaaa1111")
+
+        assert len(calls) > 1, "the first refusal should have been retried"
+        assert registry._read_claim("k") is None, (
+            "the claim must be gone, or the next submit attaches to a job that "
+            "already finished and the key stays wedged"
+        )
+
+    def test_a_permanently_locked_claim_does_not_raise(self, registry):
+        """Retries eventually give up. That must be a logged warning, not an
+        exception out of the job thread's finally block."""
+        registry._try_claim("k", "aaaa1111")
+
+        def always_locked(self, *args, **kwargs):
+            raise PermissionError(32, "being used by another process")
+
+        with patch.object(Path, "unlink", always_locked):
+            registry._release_claim("k", expect="aaaa1111")  # must not raise
 
 
 class TestTerminalStateIsFirstWriterWins:
@@ -582,3 +637,96 @@ class TestTerminalStateIsFirstWriterWins:
 
     def test_finalize_is_a_no_op_on_an_unknown_job(self, registry):
         assert registry._finalize("aaaa1111", state=STATE_SUCCEEDED) is None
+
+
+class TestUnreadableClaim:
+    """A claim that cannot be READ says nothing about whether its owner is
+    live. Concluding the key is free starts the second Ghidra run on one
+    binary that this whole registry exists to prevent."""
+
+    def test_a_transiently_unreadable_claim_is_not_discarded(self, registry):
+        registry._try_claim("k", "aaaa1111")
+        real_read_text = Path.read_text
+        calls = []
+
+        def flaky_read_text(self, *args, **kwargs):
+            if self.name.endswith(".claim.json"):
+                calls.append(self)
+                if len(calls) == 1:
+                    raise PermissionError(32, "being used by another process")
+            return real_read_text(self, *args, **kwargs)
+
+        with patch.object(Path, "read_text", flaky_read_text):
+            assert registry._read_claim("k") == "aaaa1111"
+        assert len(calls) > 1, "the first refusal should have been retried"
+
+    def test_a_persistently_unreadable_claim_blocks_rather_than_frees(
+        self, registry
+    ):
+        """The unsafe direction is starting a competing run, so an unresolvable
+        read must refuse to answer rather than declare the key free."""
+        registry._try_claim("k", "aaaa1111")
+
+        def always_locked(self, *args, **kwargs):
+            if self.name.endswith(".claim.json"):
+                raise PermissionError(32, "being used by another process")
+            raise FileNotFoundError
+
+        started = []
+        with patch.object(Path, "read_text", always_locked):
+            result = registry.submit(
+                kind="analyze", key="k", fn=lambda ctx: started.append(1),
+            )
+
+        assert "error" in result, "must not hand out a second runner"
+        assert started == [], "the competing work must not have started"
+        assert registry._claim_path("k").exists(), "the live claim must survive"
+
+    def test_a_corrupt_claim_is_still_discarded(self, registry):
+        """A truncated write from a process killed mid-claim names no owner, so
+        it protects nothing and must not wedge the key forever."""
+        registry._claim_path("k").write_text("{not json", encoding="utf-8")
+
+        submitted = registry.submit(kind="analyze", key="k", fn=lambda ctx: {})
+        assert "error" not in submitted
+        assert submitted["attached"] is False
+        assert _wait_for(
+            lambda: registry.read(submitted["job_id"])["state"] == STATE_SUCCEEDED
+        )
+
+
+class TestRecordWriteContention:
+    """`wait` polls the job record while the worker replaces it. On Windows
+    os.replace fails if any handle is open on the target, and a swallowed
+    failure there loses the job's terminal state -- the caller is then told a
+    job that failed instantly is still running."""
+
+    def test_a_sharing_violation_does_not_lose_the_terminal_state(self, registry):
+        real_replace = jobs_mod.os.replace
+        calls = []
+
+        def flaky_replace(src, dst, *args, **kwargs):
+            calls.append(dst)
+            if len(calls) == 1:
+                raise PermissionError(32, "being used by another process")
+            return real_replace(src, dst, *args, **kwargs)
+
+        with patch.object(jobs_mod.os, "replace", flaky_replace):
+            submitted = registry.submit(kind="test", key="k", fn=lambda ctx: {"n": 1})
+            assert _wait_for(
+                lambda: registry.read(submitted["job_id"])["state"] == STATE_SUCCEEDED
+            ), "the retried write must still commit the terminal state"
+        assert len(calls) > 1, "the first refusal should have been retried"
+
+    def test_a_failed_job_seen_through_wait_reports_its_error(self, registry):
+        """The end-to-end shape that broke on CI: a job that raises instantly
+        must be observable as failed, not as 'still running'."""
+        def _boom(ctx):
+            raise RuntimeError("OSGi bundle cache corrupt")
+
+        submitted = registry.submit(kind="test", key="k", fn=_boom)
+        record = registry.wait(submitted["job_id"], timeout=5)
+
+        assert record is not None
+        assert record["state"] == STATE_FAILED
+        assert "OSGi bundle cache corrupt" in record["error"]

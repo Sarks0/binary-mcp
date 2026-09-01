@@ -79,13 +79,16 @@ def server_module(tmp_path_factory, monkeypatch):
 
 
 class _FakeGetAnalysisContext:
-    """Stub for get_analysis_context that simulates incremental decompiles.
+    """Stub for get_analysis_context that simulates targeted decompiles.
 
     The fake is callable like the real function. Initial cache state
-    is provided in ``ctx``. When called with ``incremental=True`` and
-    a ``start_address``, the function at that address has its
-    ``pseudocode`` and ``called_functions`` filled from a planned
-    response in ``decompile_plan`` and the cache state mutates in-place.
+    is provided in ``ctx``. When called with ``target_addresses``, every
+    function at those addresses has its ``pseudocode`` and
+    ``called_functions`` filled from a planned response in
+    ``decompile_plan`` and the cache state mutates in-place.
+
+    A whole frontier arrives in one call now, which is the point: the real
+    path batches them into a single Ghidra run.
     """
 
     def __init__(self, ctx: dict, decompile_plan: dict[str, dict] | None = None):
@@ -93,15 +96,19 @@ class _FakeGetAnalysisContext:
         self.decompile_plan = decompile_plan or {}
         self.calls: list[dict] = []
 
+    @staticmethod
+    def _norm(addr: str | None) -> str:
+        return (addr or "").lower().removeprefix("0x").lstrip("0") or "0"
+
     def __call__(self, *args, **kwargs):
         self.calls.append(dict(kwargs))
-        if not kwargs.get("incremental"):
+        targets = kwargs.get("target_addresses")
+        if not targets:
             return self.ctx
-        target = (kwargs.get("start_address") or "").lower().lstrip("0x") or "0"
+        wanted = {self._norm(t) for t in targets}
         for fn in self.ctx["functions"]:
-            fn_addr = (fn.get("address") or "").lower().lstrip("0x") or "0"
-            if fn_addr == target:
-                planned = self.decompile_plan.get(target, {})
+            if self._norm(fn.get("address")) in wanted:
+                planned = self.decompile_plan.get(self._norm(fn.get("address")), {})
                 fn["pseudocode"] = planned.get("pseudocode", "// decompiled\n")
                 fn["called_functions"] = planned.get("called_functions", [])
         return self.ctx
@@ -148,12 +155,12 @@ def test_expand_skips_external_and_thunk(server_module, monkeypatch):
     assert "Skipped (external/import): 1" in result
     assert "Skipped (thunk): 1" in result
     # external/thunk path doesn't trigger a decompile
-    incremental_calls = [c for c in fake.calls if c.get("incremental")]
-    assert len(incremental_calls) == 0
+    decompile_calls = [c for c in fake.calls if c.get("target_addresses")]
+    assert len(decompile_calls) == 0
 
 
 def test_expand_decompiles_no_pseudocode_frontier(server_module, monkeypatch):
-    """Function in cache but with no pseudocode triggers an incremental decompile."""
+    """Function in cache but with no pseudocode triggers a targeted decompile."""
     fns = [
         _func(
             "root",
@@ -175,9 +182,9 @@ def test_expand_decompiles_no_pseudocode_frontier(server_module, monkeypatch):
 
     result = server_module.expand_callgraph(binary_path="dummy.bin", root="root", depth=1)
     assert "Functions decompiled this run: 1" in result
-    incremental_calls = [c for c in fake.calls if c.get("incremental")]
-    assert len(incremental_calls) == 1
-    assert incremental_calls[0].get("max_functions") == 1
+    decompile_calls = [c for c in fake.calls if c.get("target_addresses")]
+    assert len(decompile_calls) == 1
+    assert decompile_calls[0]["target_addresses"] == ["180002000"]
 
 
 def test_expand_max_functions_cap_returns_partial_cap(server_module, monkeypatch):
@@ -211,6 +218,11 @@ def test_expand_max_functions_cap_returns_partial_cap(server_module, monkeypatch
     assert "**partial-cap**" in result
     assert "max_functions cap of 2" in result
     assert "Functions decompiled this run: 2" in result
+    # The cap bounds the batch, and the batch is ONE Ghidra run -- not one
+    # per function, which is what made a wide frontier expensive.
+    decompile_calls = [c for c in fake.calls if c.get("target_addresses")]
+    assert len(decompile_calls) == 1
+    assert len(decompile_calls[0]["target_addresses"]) == 2
 
 
 def test_expand_root_by_address(server_module, monkeypatch):

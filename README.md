@@ -70,9 +70,9 @@ Analyze the crash dump at C:\Windows\MEMORY.DMP
 Decompile the type MyNamespace.MyClass to C#
 ```
 
-## Capabilities (255 tools)
+## Capabilities (256 tools)
 
-### Static Analysis (Ghidra) - 35 tools
+### Static Analysis (Ghidra) - 36 tools
 
 Analysis, decompilation, cross-references, memory maps, byte pattern search, function renaming, call graphs, API pattern detection (100+ Windows APIs), crypto constant identification, IOC extraction, and binary compatibility checking.
 
@@ -172,6 +172,8 @@ uv run ruff check src/     # Lint
 
 - [Installation Guide](INSTALL.md)
 - [Contributing](CONTRIBUTING.md)
+- [Large binaries: project reuse and targeted decompiles](docs/large-binary-decompile.md)
+- [Background jobs](docs/jobs.md)
 - [WinDbg/Kernel Debugging Guide](docs/windbg-kernel-debugging.md)
 - [x64dbg Architecture](docs/x64dbg-architecture.md)
 - [MCP Protocol](https://modelcontextprotocol.io/)

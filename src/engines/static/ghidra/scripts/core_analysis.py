@@ -516,6 +516,77 @@ def _extract_call_sites(function, listing, function_manager):
     return direct, indirect
 
 
+def _parse_target_addresses(raw):
+    """Parse ``GHIDRA_TARGET_ADDRESSES`` into a list of int offsets.
+
+    Accepts comma- or whitespace-separated hex, with or without ``0x``.
+    Unparseable entries are dropped with a warning rather than failing the
+    run -- one bad address should not cost the caller the whole batch.
+    """
+    if not raw:
+        return []
+    offsets = []
+    seen = set()
+    for token in raw.replace(",", " ").split():
+        value = _parse_hex_addr(token)
+        if value is None:
+            print(safe_format("[!] Ignoring unparseable target address: {}", token))
+            continue
+        if value in seen:
+            continue
+        seen.add(value)
+        offsets.append(value)
+    return offsets
+
+
+def _iter_java(iterator):
+    """Adapt a Ghidra Java iterator to a Python generator."""
+    while iterator.hasNext():
+        yield iterator.next()
+
+
+def _iter_target_functions(program, function_manager, offsets):
+    """Yield exactly the functions at the requested entry points.
+
+    This is what makes a targeted decompile cheap. Walking
+    ``getFunctions(True)`` and filtering costs a full pass over every function
+    in the program -- 30K+ on the binaries this exists for -- before the one
+    function anybody asked for is even reached. Looking each address up
+    directly is O(targets).
+
+    Falls back to ``getFunctionContaining`` so an address taken from the middle
+    of a body (a call site, say) still resolves to its function.
+    """
+    address_space = program.getAddressFactory().getDefaultAddressSpace()
+    emitted = set()
+    for offset in offsets:
+        try:
+            addr = address_space.getAddress(offset)
+        except Exception as e:
+            print(safe_format("[!] Could not build address for 0x{:x}: {}",
+                              offset, safe_unicode(e)))
+            continue
+        function = None
+        try:
+            function = function_manager.getFunctionAt(addr)
+            if function is None:
+                function = function_manager.getFunctionContaining(addr)
+        except Exception as e:
+            print(safe_format("[!] Lookup failed for 0x{:x}: {}",
+                              offset, safe_unicode(e)))
+            continue
+        if function is None:
+            print(safe_format("[!] No function at 0x{:x}", offset))
+            continue
+        entry = safe_unicode(function.getEntryPoint())
+        # Two targets inside one body resolve to the same function;
+        # decompiling it twice would be pure waste.
+        if entry in emitted:
+            continue
+        emitted.add(entry)
+        yield function
+
+
 def _load_resume_manifest(path):
     """
     Load a small ``{"complete_addresses": [...]}`` sidecar.
@@ -568,6 +639,15 @@ def extract_comprehensive_analysis():
     start_addr = _parse_hex_addr(os.environ.get("GHIDRA_START_ADDRESS"))
     end_addr = _parse_hex_addr(os.environ.get("GHIDRA_END_ADDRESS"))
     enable_fid = os.environ.get("GHIDRA_ENABLE_FID", "").lower() in ("1", "true", "yes")
+    # GHIDRA_TARGET_ADDRESSES: process exactly these entry points and nothing
+    # else. Implies a delta run -- the caller merges the result into the
+    # existing cache -- and skips the program-wide extractions below, which
+    # would otherwise re-walk every string, data type and export to produce a
+    # handful of function bodies.
+    target_offsets = _parse_target_addresses(
+        os.environ.get("GHIDRA_TARGET_ADDRESSES")
+    )
+    targeted_mode = bool(target_offsets)
 
     print(safe_format("[*] Analysis settings:"))
     print(safe_format("    Function timeout: {}s", function_timeout))
@@ -584,6 +664,8 @@ def extract_comprehensive_analysis():
         print(safe_format("    End address: 0x{:x}", end_addr))
     if enable_fid:
         print(safe_format("    FID matching: enabled"))
+    if targeted_mode:
+        print(safe_format("    Targeted addresses: {}", len(target_offsets)))
 
     # Lazy-initialise Ghidra's Function ID service. Wrapped because the FID
     # APIs vary slightly across Ghidra versions -- failure here degrades to
@@ -616,7 +698,13 @@ def extract_comprehensive_analysis():
     addr_to_index = {}
     resume_context = None
     skip_addresses = set()
-    if resume_manifest_path:
+    if targeted_mode:
+        # The target list IS the work list: no manifest to consult, no
+        # already-complete set to subtract. Emitting a delta keeps the
+        # server-side merge path, which is what preserves the rest of the
+        # cache this run deliberately did not touch.
+        delta_mode = True
+    elif resume_manifest_path:
         skip_addresses = _load_resume_manifest(resume_manifest_path)
         delta_mode = True
         if skip_addresses:
@@ -730,89 +818,103 @@ def extract_comprehensive_analysis():
         "creation_date": safe_unicode(program.getCreationDate()),
     }
 
-    # Extract memory map
-    print("[*] Extracting memory map...")
-    for block in memory.getBlocks():
-        block_info = {
-            "name": safe_unicode(block.getName()),
-            "start": safe_unicode(block.getStart()),
-            "end": safe_unicode(block.getEnd()),
-            "size": block.getSize(),
-            "read": block.isRead(),
-            "write": block.isWrite(),
-            "execute": block.isExecute(),
-            "initialized": block.isInitialized(),
-            "comment": safe_unicode(block.getComment()) if block.getComment() else u""
-        }
-        context["memory_map"].append(block_info)
-
-    # Extract imports
-    print("[*] Extracting imports...")
-    external_manager = program.getExternalManager()
-    for external_name in external_manager.getExternalLibraryNames():
-        # Skip Ghidra's internal pseudo-library
-        if external_name == "<EXTERNAL>":
-            continue
-        ext_loc_iter = external_manager.getExternalLocations(external_name)
-        while ext_loc_iter.hasNext():
-            ext_loc = ext_loc_iter.next()
-            import_info = {
-                "library": safe_unicode(external_name),
-                "name": safe_unicode(ext_loc.getLabel()),
-                "address": safe_unicode(ext_loc.getAddress()) if ext_loc.getAddress() else None,
-                "is_function": ext_loc.isFunction(),
-                "ordinal": None
+    # Program-wide extractions. A targeted run skips all of them: it exists
+    # to produce a handful of function bodies, and re-walking every memory
+    # block, external location, export, and defined string to do that is the
+    # bulk of what made a one-function decompile expensive. The server-side
+    # merge keeps whatever the cache already holds for these fields.
+    if targeted_mode:
+        print("[*] Targeted run -- skipping program-wide extraction")
+        context["analysis_stats"]["partial_context"] = True
+    else:
+        # Extract memory map
+        print("[*] Extracting memory map...")
+        for block in memory.getBlocks():
+            block_info = {
+                "name": safe_unicode(block.getName()),
+                "start": safe_unicode(block.getStart()),
+                "end": safe_unicode(block.getEnd()),
+                "size": block.getSize(),
+                "read": block.isRead(),
+                "write": block.isWrite(),
+                "execute": block.isExecute(),
+                "initialized": block.isInitialized(),
+                "comment": safe_unicode(block.getComment()) if block.getComment() else u""
             }
-            context["imports"].append(import_info)
+            context["memory_map"].append(block_info)
 
-    # Extract exports
-    print("[*] Extracting exports...")
-    entry_points = symbol_table.getExternalEntryPointIterator()
-    while entry_points.hasNext():
-        address = entry_points.next()
-        # Get symbols at this address
-        symbols = symbol_table.getSymbols(address)
-        for symbol in symbols:
-            export_info = {
-                "name": safe_unicode(symbol.getName()),
-                "address": safe_unicode(address),
-                "type": safe_unicode(symbol.getSymbolType())
-            }
-            context["exports"].append(export_info)
-            break  # Usually only one export per address
-
-    # Extract strings
-    print("[*] Extracting strings...")
-    defined_data = listing.getDefinedData(True)
-    string_count = 0
-    while defined_data.hasNext() and string_count < 10000:  # Limit to prevent memory issues
-        data = defined_data.next()
-        if data.hasStringValue():
-            string_value = data.getValue()
-            # Use safe_unicode to handle non-ASCII characters (like copyright symbols)
-            unicode_value = safe_unicode(string_value)
-            if unicode_value and len(unicode_value) > 0:
-                # Get cross-references to this string
-                refs = []
-                for ref in reference_manager.getReferencesTo(data.getAddress()):
-                    refs.append({
-                        "from": safe_unicode(ref.getFromAddress()),
-                        "type": safe_unicode(ref.getReferenceType())
-                    })
-
-                string_info = {
-                    "address": safe_unicode(data.getAddress()),
-                    "value": unicode_value[:1000],  # Limit string length
-                    "length": len(unicode_value),
-                    "type": safe_unicode(data.getDataType()),
-                    "xrefs": refs[:50]  # Limit xrefs per string
+        # Extract imports
+        print("[*] Extracting imports...")
+        external_manager = program.getExternalManager()
+        for external_name in external_manager.getExternalLibraryNames():
+            # Skip Ghidra's internal pseudo-library
+            if external_name == "<EXTERNAL>":
+                continue
+            ext_loc_iter = external_manager.getExternalLocations(external_name)
+            while ext_loc_iter.hasNext():
+                ext_loc = ext_loc_iter.next()
+                import_info = {
+                    "library": safe_unicode(external_name),
+                    "name": safe_unicode(ext_loc.getLabel()),
+                    "address": safe_unicode(ext_loc.getAddress()) if ext_loc.getAddress() else None,
+                    "is_function": ext_loc.isFunction(),
+                    "ordinal": None
                 }
-                context["strings"].append(string_info)
-                string_count += 1
+                context["imports"].append(import_info)
+
+        # Extract exports
+        print("[*] Extracting exports...")
+        entry_points = symbol_table.getExternalEntryPointIterator()
+        while entry_points.hasNext():
+            address = entry_points.next()
+            # Get symbols at this address
+            symbols = symbol_table.getSymbols(address)
+            for symbol in symbols:
+                export_info = {
+                    "name": safe_unicode(symbol.getName()),
+                    "address": safe_unicode(address),
+                    "type": safe_unicode(symbol.getSymbolType())
+                }
+                context["exports"].append(export_info)
+                break  # Usually only one export per address
+
+        # Extract strings
+        print("[*] Extracting strings...")
+        defined_data = listing.getDefinedData(True)
+        string_count = 0
+        while defined_data.hasNext() and string_count < 10000:  # Limit to prevent memory issues
+            data = defined_data.next()
+            if data.hasStringValue():
+                string_value = data.getValue()
+                # Use safe_unicode to handle non-ASCII characters (like copyright symbols)
+                unicode_value = safe_unicode(string_value)
+                if unicode_value and len(unicode_value) > 0:
+                    # Get cross-references to this string
+                    refs = []
+                    for ref in reference_manager.getReferencesTo(data.getAddress()):
+                        refs.append({
+                            "from": safe_unicode(ref.getFromAddress()),
+                            "type": safe_unicode(ref.getReferenceType())
+                        })
+
+                    string_info = {
+                        "address": safe_unicode(data.getAddress()),
+                        "value": unicode_value[:1000],  # Limit string length
+                        "length": len(unicode_value),
+                        "type": safe_unicode(data.getDataType()),
+                        "xrefs": refs[:50]  # Limit xrefs per string
+                    }
+                    context["strings"].append(string_info)
+                    string_count += 1
 
     # Extract functions
     print("[*] Extracting functions...")
-    function_iterator = function_manager.getFunctions(True)
+    if targeted_mode:
+        function_source = _iter_target_functions(
+            program, function_manager, target_offsets
+        )
+    else:
+        function_source = _iter_java(function_manager.getFunctions(True))
     function_count = 0
     decompile_timeout_count = 0
     decompile_failure_count = 0
@@ -831,16 +933,19 @@ def extract_comprehensive_analysis():
     # When ``existing_index`` is set on the loop, we are extending an already-
     # cached entry rather than appending a new one. Used to fill in pseudocode
     # for functions previously analyzed with skip_decompile=True.
-    while function_iterator.hasNext():
-        function = function_iterator.next()
-
+    for function in function_source:
         entry_point = function.getEntryPoint()
         entry_str = safe_unicode(entry_point)
 
+        # Targeted mode: the caller named these addresses explicitly, so
+        # neither the manifest nor the address-range filter applies -- both
+        # exist to narrow a full sweep, and this is not one.
+        if targeted_mode:
+            existing_index = None
         # Delta mode: a tiny manifest tells us which addresses are already
         # complete. We skip those and emit only NEW or RE-DECOMPILED entries;
         # the Python side merges into the existing cache.
-        if delta_mode:
+        elif delta_mode:
             if entry_str in skip_addresses:
                 skipped_by_resume += 1
                 continue
@@ -882,7 +987,7 @@ def extract_comprehensive_analysis():
                     continue
 
         # Apply address-range filter (chunked analysis)
-        if start_addr is not None or end_addr is not None:
+        if not targeted_mode and (start_addr is not None or end_addr is not None):
             try:
                 ep_int = int(entry_point.getOffset())
             except Exception:
@@ -897,8 +1002,11 @@ def extract_comprehensive_analysis():
 
         function_count += 1
 
-        # Check max functions limit (counts functions analyzed this run only)
-        if max_functions > 0 and function_count > max_functions:
+        # Check max functions limit (counts functions analyzed this run only).
+        # Never applies in targeted mode: the caller asked for a specific set
+        # and silently dropping its tail would return a partial answer that
+        # looks complete.
+        if not targeted_mode and max_functions > 0 and function_count > max_functions:
             print(safe_format("[!] Reached max function limit ({}), stopping analysis", max_functions))
             context["analysis_stats"]["partial_results"] = True
             break
@@ -1197,51 +1305,59 @@ def extract_comprehensive_analysis():
     context["analysis_stats"]["skipped_by_range"] = skipped_by_range
     context["analysis_stats"]["redecompiled"] = redecompiled_count
     context["analysis_stats"]["total_functions_in_cache"] = len(context["functions"])
+    if targeted_mode:
+        context["analysis_stats"]["targeted_run"] = True
+        context["analysis_stats"]["targets_requested"] = len(target_offsets)
+        context["analysis_stats"]["delta_run"] = True
 
-    # Extract data types (structures)
-    print("[*] Extracting data types...")
-    for data_type in data_type_manager.getAllDataTypes():
-        # Skip types from other data type managers (Ghidra built-ins)
-        if data_type.getDataTypeManager() != data_type_manager:
-            continue
+    # Data types are a program-wide sweep too -- getAllDataTypes() on a
+    # symbolized DLL is tens of thousands of entries. A targeted run keeps
+    # whatever the cache already recorded.
+    if not targeted_mode:
+        # Extract data types (structures)
+        print("[*] Extracting data types...")
+        for data_type in data_type_manager.getAllDataTypes():
+            # Skip types from other data type managers (Ghidra built-ins)
+            if data_type.getDataTypeManager() != data_type_manager:
+                continue
 
-        if isinstance(data_type, GhidraStructure):
-            struct_info = {
-                "name": safe_unicode(data_type.getName()),
-                "length": data_type.getLength(),
-                "members": []
-            }
+            if isinstance(data_type, GhidraStructure):
+                struct_info = {
+                    "name": safe_unicode(data_type.getName()),
+                    "length": data_type.getLength(),
+                    "members": []
+                }
 
-            # Get structure members
-            if hasattr(data_type, 'getComponents'):
-                for component in data_type.getComponents():
-                    field_name = component.getFieldName() if component.getFieldName() else component.getDefaultFieldName()
-                    member_info = {
-                        "name": safe_unicode(field_name),
-                        "offset": component.getOffset(),
-                        "datatype": safe_unicode(component.getDataType()),
-                        "length": component.getLength()
-                    }
-                    struct_info["members"].append(member_info)
+                # Get structure members
+                if hasattr(data_type, 'getComponents'):
+                    for component in data_type.getComponents():
+                        field_name = component.getFieldName() if component.getFieldName() else component.getDefaultFieldName()
+                        member_info = {
+                            "name": safe_unicode(field_name),
+                            "offset": component.getOffset(),
+                            "datatype": safe_unicode(component.getDataType()),
+                            "length": component.getLength()
+                        }
+                        struct_info["members"].append(member_info)
 
-            context["data_types"]["structures"].append(struct_info)
+                context["data_types"]["structures"].append(struct_info)
 
-        elif isinstance(data_type, GhidraEnum):
-            enum_info = {
-                "name": safe_unicode(data_type.getName()),
-                "length": data_type.getLength(),
-                "values": []
-            }
+            elif isinstance(data_type, GhidraEnum):
+                enum_info = {
+                    "name": safe_unicode(data_type.getName()),
+                    "length": data_type.getLength(),
+                    "values": []
+                }
 
-            # Get enum values
-            if hasattr(data_type, 'getNames'):
-                for name in data_type.getNames():
-                    enum_info["values"].append({
-                        "name": safe_unicode(name),
-                        "value": data_type.getValue(name)
-                    })
+                # Get enum values
+                if hasattr(data_type, 'getNames'):
+                    for name in data_type.getNames():
+                        enum_info["values"].append({
+                            "name": safe_unicode(name),
+                            "value": data_type.getValue(name)
+                        })
 
-            context["data_types"]["enums"].append(enum_info)
+                context["data_types"]["enums"].append(enum_info)
 
     # Build reverse-xref indices from the per-function call-site lists
     # we captured during the function loop. Inverting in one pass here

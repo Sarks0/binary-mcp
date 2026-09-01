@@ -157,9 +157,8 @@ class TestDecompileJobPath:
         _wait_done(server, _job_id(result))
 
         assert len(calls) == 1
-        assert calls[0]["incremental"] is True
-        assert calls[0]["max_functions"] == 1
-        assert calls[0]["start_address"] == "0x1000"
+        assert calls[0]["target_addresses"] == ["0x1000"]
+        assert calls[0]["force_decompile"] is True
 
     def test_a_second_caller_attaches_to_the_running_decompile(self, server, monkeypatch):
         import threading

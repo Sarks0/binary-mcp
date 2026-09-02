@@ -55,9 +55,6 @@ def _no_real_user_extensions(monkeypatch):
     )
 
 
-# -- helpers ----------------------------------------------------------------
-
-
 def _stub_ghidra_install(
     base_dir,
     *,
@@ -110,9 +107,6 @@ def _stub_ghidra_install(
     return install
 
 
-# -- _get_ghidra_version parsing -------------------------------------------
-
-
 @pytest.mark.parametrize(
     "raw,expected",
     [
@@ -163,9 +157,6 @@ def test_get_ghidra_version_returns_none_when_value_empty(tmp_path):
     runner = GhidraRunner(ghidra_path=str(install))
     assert runner._read_version_string() is None
     assert runner._get_ghidra_version() is None
-
-
-# -- ensure_jython_available -----------------------------------------------
 
 
 def test_old_ghidra_without_extension_does_not_raise(tmp_path):
@@ -260,9 +251,6 @@ def test_missing_application_properties_is_conservative(tmp_path):
     assert diag["jython_available"] is True
 
 
-# -- caching ----------------------------------------------------------------
-
-
 def test_ensure_jython_available_caches_result(tmp_path):
     """After a successful check, subsequently removing the extension dir
     must NOT cause the second call to raise. This proves
@@ -295,9 +283,6 @@ def test_old_ghidra_caches_after_first_call(tmp_path):
     assert runner._jython_check_done is False
     runner.ensure_jython_available()
     assert runner._jython_check_done is True
-
-
-# -- both candidate extension dirs honored ---------------------------------
 
 
 @pytest.mark.parametrize(
@@ -354,9 +339,6 @@ def test_empty_jython_dir_without_jar_does_not_satisfy(tmp_path):
 
     with pytest.raises(UserFacingError):
         runner.ensure_jython_available()
-
-
-# -- per-user settings extension dir (GUI "Install Extensions") -------------
 
 
 def test_user_settings_installed_jython_is_honored(tmp_path, monkeypatch):

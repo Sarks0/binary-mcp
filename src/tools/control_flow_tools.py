@@ -73,6 +73,9 @@ def _get_or_run_analysis(binary_path: str, cache, runner) -> dict:
     # The temp output is run-scoped, so cleanup has to happen on the failure
     # paths too -- otherwise every failed run leaves a fresh copy behind.
     try:
+        # Deliberately NOT the content-keyed project name get_analysis_context
+        # uses -- this path holds no `_delta_run_lock`, so sharing that project
+        # would let it overwrite a database a concurrent reuse run has open.
         runner.analyze(
             binary_path=str(binary_path),
             script_path=str(script_path),

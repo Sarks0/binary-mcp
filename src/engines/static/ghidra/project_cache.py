@@ -16,6 +16,7 @@ import gzip
 import hashlib
 import json
 import logging
+import os
 import re
 import shutil
 import time
@@ -25,6 +26,16 @@ from pathlib import Path
 from src.utils.config import get_cache_dir
 
 logger = logging.getLogger(__name__)
+
+# Longest project name we will hand Ghidra. GhidraRunner.analyze clamps to the
+# same value, and project_name_for reserves the last 9 characters for its
+# "_<hash8>" discriminator so the clamp can never remove it.
+_PROJECT_NAME_MAX = 100
+
+# How long a memoized binary hash may be trusted. Short enough that a rebuild
+# is never served a stale digest, long enough to collapse the many hashes a
+# single analysis performs. See ProjectCache._get_binary_hash.
+_HASH_MEMO_TTL_SECONDS = 5.0
 
 # Side-car suffixes that share the <hash>.<suffix> stem with a cache file.
 # When auto-pruning legacy <hash>.json duplicates we must NOT touch these.
@@ -55,6 +66,9 @@ class ProjectCache:
         else:
             self.cache_dir = Path(cache_dir)
 
+        # (path, mtime_ns, size) -> (sha256, monotonic_stamp). See
+        # _get_binary_hash for why the stamp is load-bearing.
+        self._hash_memo: dict[tuple[str, int, int], tuple[str, float]] = {}
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         pruned = self._prune_legacy_duplicates()
         if pruned:
@@ -95,7 +109,7 @@ class ProjectCache:
         return pruned
 
     def _get_binary_hash(self, binary_path: str) -> str:
-        """Calculate SHA256 hash of binary file, after confining the path.
+        """SHA256 of a binary's contents, memoized on (path, mtime, size).
 
         THE CHOKEPOINT for path confinement in this class (audit F-8 ordering).
 
@@ -107,26 +121,32 @@ class ProjectCache:
         the model and reach this method via ``_load_function_mappings`` /
         ``has_cached`` / ``get_cached`` WITHOUT ever calling
         ``sanitize_binary_path``. This method then did
-        ``open(binary_path, "rb")`` and read the file to the end. Two problems,
-        neither of them "just an ordering nit":
+        ``open(binary_path, "rb")`` and read the file to the end: an arbitrary
+        host path, outside the allow-list governing every other read here, and
+        with none of sanitize_binary_path's 500 MB cap, so a path naming an
+        endless file (``/dev/zero``) span forever inside a tool call.
 
-          * it opened and read an arbitrary host path, outside the allow-list
-            that governs every other read in this server; and
-          * it did so with NO size cap, unlike sanitize_binary_path's 500 MB
-            limit -- so a path naming an endless file (``/dev/zero``) span
-            forever inside a tool call.
+        It is fixed here rather than in the ten tools because that is the
+        lesson this branch learned twice: ``execute_command`` validated while
+        38 sibling methods did not, and one session-ID validator was fixed
+        while its twin was missed. Every public method on this class routes
+        through here, so a new one cannot reintroduce the gap by forgetting.
 
-        The contents never reached the caller (the digest is only used to name
-        a cache file, which will not exist), so this was a read and a resource
-        exhaustion rather than a disclosure. It is fixed here rather than in
-        the ten tools because that is the lesson this branch already learned
-        twice: ``execute_command`` validated while 38 sibling methods did not,
-        and one session-ID validator was fixed while its twin was missed.
-        Every public method on this class routes through here, so a new one
-        cannot reintroduce the gap by forgetting.
+        The memo is the other half. This is the cache key for everything, so it
+        is called many times per operation -- resolving the cache path, the
+        project name, the reuse decision, the job key, then saving. Each call
+        re-read the whole file: a single targeted decompile on a 500 MB binary
+        made nine-plus full passes, seconds of pure I/O on the call whose
+        entire purpose is to be fast.
 
-        Callers that already sanitised (the whole static path) pass an
-        allow-listed absolute path, and re-validating it is a cheap no-op.
+        Keyed on mtime and size, and expired after a few seconds. Both parts
+        matter. Filesystem timestamp granularity is coarse -- ~15.6 ms on
+        Windows -- so a same-size rewrite inside that window is invisible to
+        the fingerprint, and a stale digest here does not merely serve the
+        wrong cache: with project reuse it opens the *previous build's* Ghidra
+        project and decompiles the wrong code, silently. The TTL bounds that to
+        a window far shorter than any edit-rebuild cycle while still collapsing
+        the nine-plus hashes a single operation performs.
 
         Raises:
             PathTraversalError: If the path is outside the allow-list.
@@ -137,15 +157,46 @@ class ProjectCache:
         # imports, and importing it at module scope here would invert that.
         from src.utils.security import get_allowed_dirs, sanitize_binary_path
 
+        # Confinement runs on EVERY call, BEFORE the memo is consulted. The
+        # memo exists to skip re-reading 500 MB, not to skip the allow-list --
+        # returning a cached digest above this line would make the chokepoint
+        # conditional on cache state, which is the same "correct once, absent
+        # the second time" shape this method was made a chokepoint to close.
+        # The cost is a few stats; the expensive part it guards is the read,
+        # and that is still memoized.
         safe_path = sanitize_binary_path(
             str(binary_path), allowed_dirs=get_allowed_dirs()
         )
 
+        # Fingerprint the CONFINED path, so a memo entry can only ever have
+        # been created for a path that passed the allow-list.
+        try:
+            stat = os.stat(safe_path)
+            fingerprint = (str(Path(safe_path).resolve()), stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            # Cannot stat it -- fall through and let the read raise the real
+            # error rather than caching against an unusable key.
+            fingerprint = None
+
+        now = time.monotonic()
+        if fingerprint is not None:
+            entry = self._hash_memo.get(fingerprint)
+            if entry is not None and now - entry[1] <= _HASH_MEMO_TTL_SECONDS:
+                return entry[0]
+
         sha256 = hashlib.sha256()
         with open(safe_path, "rb") as f:
-            for chunk in iter(lambda: f.read(8192), b""):
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
                 sha256.update(chunk)
-        return sha256.hexdigest()
+        digest = sha256.hexdigest()
+
+        if fingerprint is not None:
+            # Bounded: a long-lived server that walks a symbol tree should not
+            # accumulate an entry per binary forever.
+            if len(self._hash_memo) >= 256:
+                self._hash_memo.clear()
+            self._hash_memo[fingerprint] = (digest, now)
+        return digest
 
     def _get_cache_path_gz(self, binary_hash: str) -> Path:
         """Path for the gzipped cache (current format)."""
@@ -352,8 +403,15 @@ class ProjectCache:
     def _get_project_name(self, binary_path: str) -> str:
         """Mirror runner.py's project_name derivation from a binary path.
 
-        Must stay in sync with ``GhidraRunner.analyze`` so cache cleanup
-        targets the same ghidra_projects entries the runner created.
+        This is the *legacy* (pre-project-reuse) name: derived from the file
+        stem alone. It is still the lock key -- two binaries sharing a stem are
+        exactly the pair a same-named old/new build produces, and serialising
+        them costs a queue rather than a corrupted run -- and it is still
+        cleaned up, because installs upgraded from an older version have
+        projects under this name.
+
+        New projects are created under :meth:`project_name_for`, which appends
+        a content-hash discriminator.
         """
         stem = Path(binary_path).stem
         # Flatten dots as well as the illegal set -- MUST match the identical
@@ -363,21 +421,138 @@ class ProjectCache:
         name = re.sub(r'[^a-zA-Z0-9_\-]', '_', stem)
         if name.startswith('-'):
             name = f"proj_{name}"
-        return name
+        # Ghidra writes <name>.gpr / <name>.rep / <name>.lock, so the name has
+        # to leave room for those suffixes inside the filesystem's 255-byte
+        # component limit. Long stems are real (versioned symbol-server paths).
+        return name[:_PROJECT_NAME_MAX]
+
+    def project_name_for(self, binary_path: str) -> str:
+        """Ghidra project name for a binary: ``<stem>_<hash8>``.
+
+        The hash discriminator is what makes project *reuse* safe. A project
+        holds one imported, fully-analyzed program; reusing it instead of
+        re-importing is the difference between a 30-second targeted decompile
+        and a 7-minute one. But the old stem-only name collides for an old and
+        a new build of the same DLL -- the patch-diff case this server exists
+        for -- and reusing a project across that collision would silently
+        decompile the wrong build. Keying on content means each build gets its
+        own project and each is reusable, so the alternating workflow stops
+        paying for a re-import every time it switches sides.
+
+        Falls back to the legacy stem-only name if the file cannot be hashed;
+        the caller then gets today's behaviour rather than an exception.
+        """
+        base = self._get_project_name(binary_path)
+        try:
+            digest = self._get_binary_hash(binary_path)[:8]
+        except OSError as e:
+            logger.warning(f"Could not hash {binary_path} for project name: {e}")
+            return base
+        # Reserve room for "_<hash8>" inside the same 100-char budget the
+        # runner clamps to. Appending first and letting the runner truncate
+        # afterwards silently removes the discriminator: Ghidra creates
+        # `<stem-prefix>_43e6` while project_exists looks for
+        # `<stem>_43e6bd75`, so reuse never engages and the .rep leaks under a
+        # name no cleanup path knows about.
+        return f"{base[:_PROJECT_NAME_MAX - 9]}_{digest}"
 
     def _ghidra_project_paths(self, project_name: str) -> list[Path]:
-        """Return the .gpr / .lock / .rep paths for a project_name."""
+        """Return the .gpr / .lock / .rep / .owner.json paths for a project."""
         project_dir = self.cache_dir / "ghidra_projects"
         return [
             project_dir / f"{project_name}.gpr",
             project_dir / f"{project_name}.lock",
             project_dir / f"{project_name}.rep",
+            self._project_state_path(project_name),
         ]
+
+    def _project_state_path(self, project_name: str) -> Path:
+        """Side-car recording which binary a Ghidra project actually holds."""
+        return self.cache_dir / "ghidra_projects" / f"{project_name}.owner.json"
+
+    def project_exists(self, project_name: str) -> bool:
+        """True iff the on-disk Ghidra project looks importable-into.
+
+        Both the ``.gpr`` and the ``.rep`` directory must be present: a ``.gpr``
+        on its own is a half-deleted project that ``-process`` cannot open.
+        """
+        project_dir = self.cache_dir / "ghidra_projects"
+        return (
+            (project_dir / f"{project_name}.gpr").exists()
+            and (project_dir / f"{project_name}.rep").is_dir()
+        )
+
+    def read_project_state(self, project_name: str) -> dict | None:
+        """Load the project's owner record, or None when absent/unreadable.
+
+        The record is what licenses reuse: it names the binary hash the project
+        was imported from, the program name inside it, and whether Ghidra's
+        auto-analysis actually ran. Treat a missing record as "do not reuse" --
+        the cost is one re-import, whereas trusting an unverified project risks
+        decompiling a different binary entirely.
+        """
+        try:
+            path = self._project_state_path(project_name)
+            if not path.exists():
+                return None
+            with open(path, encoding="utf-8") as f:
+                state = json.load(f)
+            return state if isinstance(state, dict) else None
+        except Exception as e:
+            logger.warning(f"Could not read project state for {project_name}: {e}")
+            return None
+
+    def write_project_state(
+        self,
+        project_name: str,
+        binary_path: str,
+        program_name: str | None,
+        analyzed: bool,
+        pdb_applied: bool = False,
+    ) -> bool:
+        """Record what a freshly-imported Ghidra project contains.
+
+        Written only after an import run succeeded, so the presence of this
+        file means "the project on disk holds this binary, imported and (if
+        ``analyzed``) auto-analyzed".
+        """
+        try:
+            state_path = self._project_state_path(project_name)
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "version": 1,
+                "project_name": project_name,
+                "binary_hash": self._get_binary_hash(binary_path),
+                "binary_path": str(Path(binary_path).resolve()),
+                "program_name": program_name,
+                "analyzed": bool(analyzed),
+                "pdb_applied": bool(pdb_applied),
+                "imported_at": time.time(),
+            }
+            tmp = state_path.with_suffix(".json.tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+            tmp.replace(state_path)
+            return True
+        except Exception as e:
+            logger.warning(f"Could not write project state for {project_name}: {e}")
+            return False
+
+    def clear_project_state(self, project_name: str) -> None:
+        """Drop the owner record so the next run re-imports.
+
+        Called when a reuse attempt failed: whatever is on disk did not answer
+        ``-process``, and the record claiming it would is worse than no record.
+        """
+        try:
+            self._project_state_path(project_name).unlink(missing_ok=True)
+        except OSError as e:
+            logger.debug(f"Could not clear project state for {project_name}: {e}")
 
     def _drop_ghidra_project(self, project_name: str) -> int:
         """Remove a binary's Ghidra project artifacts.
 
-        Returns the number of paths removed (0-3).
+        Returns the number of paths removed (0-4).
         """
         removed = 0
         for p in self._ghidra_project_paths(project_name):
@@ -431,8 +606,15 @@ class ProjectCache:
                     p.unlink()
 
             if include_project:
-                project_name = self._get_project_name(binary_path)
-                self._drop_ghidra_project(project_name)
+                # Drop both the content-keyed project and any legacy
+                # stem-only one left by an install that predates project
+                # reuse -- otherwise "discard the Ghidra project state"
+                # silently leaves half of it behind.
+                for name in {
+                    self.project_name_for(binary_path),
+                    self._get_project_name(binary_path),
+                }:
+                    self._drop_ghidra_project(name)
 
             logger.info(f"Invalidated cache for {binary_path}")
             return True

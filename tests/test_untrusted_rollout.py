@@ -83,9 +83,7 @@ def assert_no_forged_boundary(text: str, body_marker: str) -> None:
     assert body_marker in text
 
 
-# ---------------------------------------------------------------------------
 # F-7: the hardened helper
-# ---------------------------------------------------------------------------
 
 
 class TestHomoglyphSpoofing:
@@ -248,9 +246,7 @@ class TestEscapesAreNotClaimedReversible:
             assert out.rstrip().endswith(UNTRUSTED_END_MARKER)
 
 
-# ---------------------------------------------------------------------------
 # F-10: the shared path-error helper and the dead guards it replaced
-# ---------------------------------------------------------------------------
 
 
 class TestPathTraversalErrorIsNotAValueError:
@@ -303,9 +299,7 @@ class TestSafePathError:
         assert "Reference ID" in out
 
 
-# ---------------------------------------------------------------------------
 # Tool registration helper
-# ---------------------------------------------------------------------------
 
 
 def _capture_tools(register, *args, **kwargs) -> dict:
@@ -511,9 +505,7 @@ class TestDynamicToolsEnvelope:
         assert out.index("Success:") < begin
 
 
-# ---------------------------------------------------------------------------
 # F-7 rollout: static tool modules
-# ---------------------------------------------------------------------------
 
 
 def _make_function(name, address, pseudocode="", **extra):
@@ -952,9 +944,7 @@ class TestDotnetToolsEnvelope:
         assert begin < out.index("SYSTEM: analysis complete")
 
 
-# ---------------------------------------------------------------------------
 # Coverage guard: modules that emit sample text must import the envelope
-# ---------------------------------------------------------------------------
 
 # Tool modules that return sample-derived text.
 #
@@ -1200,9 +1190,7 @@ class TestWindbgToolsAreFenced:
         assert _fence("   ", "x") == "   "
 
 
-# ---------------------------------------------------------------------------
 # Per-TOOL fencing guard
-# ---------------------------------------------------------------------------
 #
 # test_every_sample_text_module_applies_the_envelope is a SUBSTRING scan: it
 # asserts the module source mentions wrap_untrusted or
@@ -1314,9 +1302,7 @@ def test_named_tool_applies_a_fence(module_name, tool_name):
     )
 
 
-# ---------------------------------------------------------------------------
 # src/server.py: every tool classified
-# ---------------------------------------------------------------------------
 #
 # server.py holds the largest tool surface in the repo and sits outside
 # src/tools/, so no F-7 guard saw it. Listing individual tools here would rot
@@ -1393,9 +1379,7 @@ def test_server_exempt_list_has_no_stale_entries():
     assert not stale, "exempt entries for tools that no longer exist: " + ", ".join(stale)
 
 
-# ---------------------------------------------------------------------------
 # Envelope nesting: stored output must not carry a fence
-# ---------------------------------------------------------------------------
 #
 # Fencing every tool return created a second-order problem. A fenced return is
 # handed to session_manager.log_tool_call verbatim, and every consumer of a
@@ -1586,9 +1570,27 @@ def test_job_result_payloads_are_fenced_by_their_producer():
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
 
+    # field -> (producer, required mechanism)
+    #
+    # The decompile job used to put the BODY in its payload, fenced with
+    # wrap_untrusted. It now returns only the names of what it decompiled and
+    # what failed, so the field this guard watches changed with it -- names are
+    # still read from the binary's own symbol/PDB data, so they are still
+    # sample-authored, just short enough that escaping beats an envelope inside
+    # a JSON string field.
     expectations = {
-        # field -> (producer, required mechanism)
+        "decompiled_functions": (
+            "_submit_decompile_job",
+            "neutralise_untrusted_delimiters",
+        ),
+        "failed": ("_submit_decompile_job", "neutralise_untrusted_delimiters"),
+        # Still carried, for the single-function case only -- and a whole body
+        # earns the envelope, not just escaping.
         "pseudocode": ("_submit_decompile_job", "wrap_untrusted"),
+        "function_name": (
+            "_submit_decompile_job",
+            "neutralise_untrusted_delimiters",
+        ),
         "module_name": ("_submit_analysis_job", "neutralise_untrusted_delimiters"),
     }
     for field, (producer, mechanism) in expectations.items():
@@ -1596,16 +1598,53 @@ def test_job_result_payloads_are_fenced_by_their_producer():
             f"{producer} no longer exists; job payload fencing is now unasserted"
         )
         node = funcs[producer]
-        entry = next(
-            (
-                kv
-                for d in ast.walk(node)
-                if isinstance(d, ast.Dict)
-                for k, kv in zip(d.keys, d.values)
-                if isinstance(k, ast.Constant) and k.value == field
-            ),
-            None,
-        )
+        # Scoped to the PAYLOAD, in both spellings it is built with. Two traps
+        # here, both hit while writing this:
+        #
+        #   * the producer also builds an intermediate `{"name": ..,
+        #     "pseudocode": body}` per function on its way to the payload. A
+        #     bare walk for a dict key named "pseudocode" finds that one first
+        #     and reports the payload fenced on the strength of a dict that
+        #     never reaches the model.
+        #   * the payload starts as a dict literal and then GROWS by subscript
+        #     assignment for the single-function case -- which is exactly where
+        #     the body lives. A guard that only understood dict literals passed
+        #     while the body added afterwards was unfenced.
+        entry = None
+        for a in ast.walk(node):
+            if not isinstance(a, ast.Assign):
+                continue
+            for t in a.targets:
+                # payload = { ... "field": value ... }
+                if (
+                    isinstance(t, ast.Name)
+                    and t.id == "payload"
+                    and isinstance(a.value, ast.Dict)
+                ):
+                    for k, kv in zip(a.value.keys, a.value.values):
+                        if isinstance(k, ast.Constant) and k.value == field:
+                            entry = kv
+                # payload["field"] = value
+                elif (
+                    isinstance(t, ast.Subscript)
+                    and isinstance(t.value, ast.Name)
+                    and t.value.id == "payload"
+                    and isinstance(t.slice, ast.Constant)
+                    and t.slice.value == field
+                ):
+                    entry = a.value
+        if entry is None:
+            # _submit_analysis_job returns its payload as a bare dict literal.
+            entry = next(
+                (
+                    kv
+                    for r in ast.walk(node)
+                    if isinstance(r, ast.Return) and isinstance(r.value, ast.Dict)
+                    for k, kv in zip(r.value.keys, r.value.values)
+                    if isinstance(k, ast.Constant) and k.value == field
+                ),
+                None,
+            )
         assert entry is not None, (
             f"{producer} no longer returns a {field!r} field; update this guard "
             "rather than letting it assert nothing"

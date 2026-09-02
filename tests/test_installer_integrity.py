@@ -610,7 +610,6 @@ def test_install_md_no_longer_advertises_a_bare_pipe_to_interpreter_install():
         )
 
 
-# ---------------------------------------------------------------------------
 # F-3, second pass.
 #
 # The first remediation pass left the finding only partly closed. The tests
@@ -624,7 +623,6 @@ def test_install_md_no_longer_advertises_a_bare_pipe_to_interpreter_install():
 #   * the Authenticode result on the elevated Windows SDK bootstrapper was
 #     discarded with `| Out-Null`, so a bad signature did not stop it running;
 #   * failure paths left downloaded scripts/installers on disk.
-# ---------------------------------------------------------------------------
 
 RELEASE_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "release.yml"
 README_PATH = REPO_ROOT / "README.md"

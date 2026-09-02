@@ -34,7 +34,7 @@ import pytest
 
 from src.engines.dynamic.windbg.allowlist import parse_compound, validate_command
 
-# -- H1: a newline is a subcommand separator, validated like ';' --
+# H1: a newline is a subcommand separator, validated like ';'
 
 
 class TestNewlineInjection:
@@ -62,7 +62,7 @@ class TestNewlineInjection:
         assert ok is True, reason
 
 
-# -- H2: script-file include operators are denied --
+# H2: script-file include operators are denied
 
 
 class TestScriptFileInclude:
@@ -82,7 +82,7 @@ class TestScriptFileInclude:
         assert ok is True, reason
 
 
-# -- H3: alias-definition family is denied --
+# H3: alias-definition family is denied
 
 
 class TestAliasDefinition:
@@ -105,7 +105,7 @@ class TestAliasDefinition:
         assert ok is False
 
 
-# -- F-1: single-quoted subcommand bodies are validated --
+# F-1: single-quoted subcommand bodies are validated
 
 # The four payloads from the audit, each verified to have reached the debugger
 # before the fix. Kept verbatim so the regression is unambiguous.
@@ -198,7 +198,7 @@ class TestQuotedSubcommandBody:
         assert ok is True, reason
 
 
-# -- F-1: recursion is depth-capped, not stack-bounded --
+# F-1: recursion is depth-capped, not stack-bounded
 
 
 class TestRecursionDepth:
@@ -239,7 +239,7 @@ class TestRecursionDepth:
         assert ok is True, reason
 
 
-# -- F-2: the rest of the memory-write family --
+# F-2: the rest of the memory-write family
 
 
 class TestMemoryWriteFamily:
@@ -282,7 +282,7 @@ class TestMemoryWriteFamily:
         assert ok is True, f"{cmd!r} should still be allowed; got: {reason}"
 
 
-# -- The include operators are refused by the one authoritative gate --
+# The include operators are refused by the one authoritative gate
 
 
 class TestScriptIncludeRefusedByTheAuthoritativeGate:

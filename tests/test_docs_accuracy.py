@@ -41,9 +41,7 @@ VT_TOOLS = SRC / "tools" / "vt_tools.py"
 PLUGIN_CPP = SRC / "engines" / "dynamic" / "x64dbg" / "plugin" / "plugin.cpp"
 
 
-# ---------------------------------------------------------------------------
 # Helpers
-# ---------------------------------------------------------------------------
 
 
 def _iter_python_sources() -> list[Path]:
@@ -122,9 +120,7 @@ def _plugin_allowlist() -> set[str]:
     return set(re.findall(r'"([^"]+)"', match.group(1)))
 
 
-# ---------------------------------------------------------------------------
 # F-11: tool counts
-# ---------------------------------------------------------------------------
 
 
 def test_readme_headline_tool_count_matches_code():
@@ -214,9 +210,7 @@ def test_every_tool_module_is_registered_from_main():
         )
 
 
-# ---------------------------------------------------------------------------
 # F-11: VirusTotal is lookup-only, samples are never uploaded
-# ---------------------------------------------------------------------------
 
 
 def test_readme_does_not_advertise_virustotal_submission():
@@ -262,9 +256,7 @@ def test_no_vt_caller_uses_post():
                 )
 
 
-# ---------------------------------------------------------------------------
 # F-11: YARA is generation-only, and the dead extra stays gone
-# ---------------------------------------------------------------------------
 
 
 def test_yara_library_is_not_imported_anywhere():
@@ -304,9 +296,7 @@ def test_readme_describes_yara_as_generation_not_scanning():
     assert "yara-python" not in joined, "README still points at the removed extra"
 
 
-# ---------------------------------------------------------------------------
 # F-11: 'analyze in a VM' guidance, and the code that backs it
-# ---------------------------------------------------------------------------
 
 
 def test_readme_carries_isolated_vm_guidance():
@@ -364,9 +354,7 @@ def test_documented_confinement_defaults_match_security_module():
     )
 
 
-# ---------------------------------------------------------------------------
 # F-6: x64dbg_execute_command docstring
-# ---------------------------------------------------------------------------
 
 
 def test_x64dbg_execute_command_docstring_describes_all_three_gates():
@@ -437,9 +425,7 @@ def test_x64dbg_allowlists_still_refuse_process_control():
     assert not (plugin & forbidden), sorted(plugin & forbidden)
 
 
-# ---------------------------------------------------------------------------
 # F-6: windbg_execute_command docstring
-# ---------------------------------------------------------------------------
 
 
 def test_windbg_execute_command_docstring_states_the_restrictions():

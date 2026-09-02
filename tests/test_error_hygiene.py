@@ -53,9 +53,7 @@ def assert_has_reference_id(text: str) -> None:
     assert re.search(r"Reference ID: [0-9a-f]{8}", text), text
 
 
-# ---------------------------------------------------------------------------
 # The helper itself
-# ---------------------------------------------------------------------------
 
 
 class TestSafeToolError:
@@ -142,9 +140,7 @@ class TestCuratedStructuredText:
         assert text == "Error [OPERATION_FAILED]: Operation failed"
 
 
-# ---------------------------------------------------------------------------
 # Tool-level: a representative sample of registered tools
-# ---------------------------------------------------------------------------
 
 
 def _capture_tools(register, *args, **kwargs) -> dict:
@@ -378,9 +374,7 @@ class TestOtherToolModulesDoNotLeak:
         assert_has_reference_id(out)
 
 
-# ---------------------------------------------------------------------------
 # Source-level guard against reintroduction
-# ---------------------------------------------------------------------------
 
 _TOOLS_DIR = Path(__file__).resolve().parent.parent / "src" / "tools"
 
@@ -440,9 +434,7 @@ def test_no_catch_all_handler_echoes_raw_exception_text():
     )
 
 
-# ---------------------------------------------------------------------------
 # AST guard: ANY returned f-string that interpolates a caught exception
-# ---------------------------------------------------------------------------
 #
 # The line-matching guard above only ever recognised ONE spelling -- the exact
 # source line ``return f"Error: {e}"``. An adversarial review of the first
@@ -545,6 +537,24 @@ _SAFE_ERROR_HELPERS = frozenset(
         "safe_path_error",
         "curated_structured_text",
         "format_error_response",
+        # NOT a log-and-reduce helper like the four above -- it deliberately
+        # surfaces str(e) and the curated .diagnostic, because that text is how
+        # an operator learns their JDK is mismatched or the OSGi cache is
+        # poisoned (see test_ghidra_diagnostic_passthrough_is_preserved, which
+        # fails if the diagnostic is swallowed).
+        #
+        # Sanctioned on the strength of its input, which was audited when this
+        # entry was added: GhidraAnalysisError has exactly two raise sites in
+        # src/engines/static/ghidra/runner.py, both with fixed text -- "Ghidra
+        # analysis timed out after <n>s" and "failed with exit code <n>".
+        # Neither interpolates a path or any other host state. Widening this
+        # set requires the same audit.
+        #
+        # It was previously invisible to this guard rather than exempt from it:
+        # the handler built `msg = f"Error: {e}"` and returned the VARIABLE, so
+        # the guard saw a bare Name and passed. Extracting the helper made the
+        # exception flow visible, which is how it should have been all along.
+        "_ghidra_failure_message",
     }
 )
 
@@ -758,9 +768,7 @@ class TestPeToolsStructuredErrorsAreCurated:
         )
 
 
-# ---------------------------------------------------------------------------
 # Self-test: the widened guard must actually catch the non-f-string spellings
-# ---------------------------------------------------------------------------
 
 _LEAKY_SPELLINGS = {
     "f-string": 'return f"Error: {e}"',
@@ -811,9 +819,7 @@ def test_widened_guard_does_not_flag_the_sanctioned_fix(label, body, tmp_path):
     assert not _guard_flags(body, tmp_path), f"{label} wrongly flagged: {body}"
 
 
-# ---------------------------------------------------------------------------
 # AST guard: exception text forwarded through StructuredError.reason
-# ---------------------------------------------------------------------------
 #
 # Both guards above glob src/tools/ ONLY, and both key on RETURNED strings. The
 # src/utils/ producers that raise StructuredBaseError from a path failure are

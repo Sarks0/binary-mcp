@@ -58,9 +58,7 @@ def assert_allowed(command: str) -> None:
     assert ok is True, f"{command!r} should be permitted; refused with: {reason}"
 
 
-# ---------------------------------------------------------------------------
 # (1) Command-string carriers
-# ---------------------------------------------------------------------------
 
 
 class TestBreakpointCommandLists:
@@ -155,9 +153,7 @@ class TestOtherCarriers:
         assert_allowed(cmd)
 
 
-# ---------------------------------------------------------------------------
 # (2) Double-quoted bodies
-# ---------------------------------------------------------------------------
 
 
 class TestDoubleQuotedBodies:
@@ -175,9 +171,7 @@ class TestDoubleQuotedBodies:
         assert_allowed('.printf "it\'s fine"')
 
 
-# ---------------------------------------------------------------------------
 # (3) Unbalanced ${ fails closed
-# ---------------------------------------------------------------------------
 
 
 class TestUnbalancedInterpolation:
@@ -196,9 +190,7 @@ class TestUnbalancedInterpolation:
         assert_allowed(".foreach (a {!process 0 0}) {!handle ${a}}")
 
 
-# ---------------------------------------------------------------------------
 # (4) No invented backslash escape
-# ---------------------------------------------------------------------------
 
 
 class TestBackslashIsNotAnEscape:
@@ -214,9 +206,7 @@ class TestBackslashIsNotAnEscape:
         assert_allowed("!drvobj \\Driver\\ACPI 3")
 
 
-# ---------------------------------------------------------------------------
 # (5) Twins of denied commands
-# ---------------------------------------------------------------------------
 
 
 class TestTwinsOfDeniedCommands:
@@ -254,9 +244,7 @@ class TestTwinsOfDeniedCommands:
         assert_refused(cmd)
 
 
-# ---------------------------------------------------------------------------
 # (6) Write / exec primitives
-# ---------------------------------------------------------------------------
 
 
 class TestWriteAndExecPrimitives:
@@ -294,9 +282,7 @@ class TestWriteAndExecPrimitives:
         assert_allowed(".cxr ffffe000deadbeef")
 
 
-# ---------------------------------------------------------------------------
 # (7) Register writes in every spelling
-# ---------------------------------------------------------------------------
 
 
 class TestRegisterWrites:
@@ -327,9 +313,7 @@ class TestRegisterWrites:
         assert_allowed(cmd)
 
 
-# ---------------------------------------------------------------------------
 # (8) Bang tokens that name a module path
-# ---------------------------------------------------------------------------
 
 
 class TestBangModulePath:
@@ -357,9 +341,7 @@ class TestBangModulePath:
         assert_allowed(cmd)
 
 
-# ---------------------------------------------------------------------------
 # The three rules the review found inert or wrong
-# ---------------------------------------------------------------------------
 
 
 class TestPreviouslyInertRules:
@@ -389,9 +371,7 @@ class TestPreviouslyInertRules:
             assert "search-and-write" not in reason
 
 
-# ---------------------------------------------------------------------------
 # Everything this project actually issues must still work
-# ---------------------------------------------------------------------------
 
 
 # Grepped out of src/tools/windbg_tools.py and src/engines/dynamic/windbg/.
@@ -453,9 +433,7 @@ def test_plain_read_commands_still_pass(cmd):
     assert_allowed(cmd)
 
 
-# ---------------------------------------------------------------------------
 # The raw command tool is opt-in
-# ---------------------------------------------------------------------------
 
 
 class _CapturingApp:
@@ -734,9 +712,7 @@ class TestEscapedQuoteInCarrierBodies:
         assert ok is False
 
 
-# ---------------------------------------------------------------------------
 # Regressions found by the pre-merge review
-# ---------------------------------------------------------------------------
 
 
 class TestAliasInterpolationCannotHideASubcommand:

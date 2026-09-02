@@ -10,6 +10,7 @@ Covers:
 
 import gzip
 import json
+import logging
 import os
 import sys
 from pathlib import Path
@@ -30,8 +31,6 @@ _fastmcp_stub = MagicMock()
 _fastmcp_stub.FastMCP = MagicMock(return_value=_fastmcp_instance)
 sys.modules["fastmcp"] = _fastmcp_stub
 
-
-# -- ProjectCache ------------------------------------------------------------
 
 class TestProjectCacheCompression:
     def _cache(self, tmp_path):
@@ -232,9 +231,6 @@ class TestProjectCacheCompression:
         assert cache.read_notes(str(binary)) == [
             {"function_key": "a", "kind": "plate", "addr": None, "text": "n"}
         ]
-
-
-# -- GhidraRunner env plumbing ----------------------------------------------
 
 
 class _FakeRunResult:
@@ -618,6 +614,76 @@ class TestRunnerEnvPlumbing:
         # User-provided -Xmx16g preserved; runner did not append a second one.
         assert captured["env"]["_JAVA_OPTIONS"] == "-Xmx16g -XX:+UseG1GC"
 
+    def test_inherited_xmx_is_reported_not_just_obeyed(
+        self, runner, tmp_path, monkeypatch, caplog
+    ):
+        """_JAVA_OPTIONS lowers as readily as it raises. A global -Xmx2g caps
+        Ghidra at 2 GB while GHIDRA_MAX_HEAP_MB still reads 4096 -- a silent
+        OOM that gets misdiagnosed as a Ghidra bug, so it has to be said."""
+        binary, script_dir, output = self._prepare(runner, tmp_path)
+        monkeypatch.setenv("_JAVA_OPTIONS", "-Xmx2g")
+
+        with patch("subprocess.Popen", side_effect=lambda *a, **k: _FakeRunResult()):
+            with caplog.at_level(logging.WARNING):
+                runner.analyze(
+                    binary_path=str(binary),
+                    script_path=str(script_dir),
+                    script_name="core_analysis.py",
+                    output_path=str(output),
+                    max_heap_mb=4096,
+                )
+
+        warnings = [r.getMessage() for r in caplog.records
+                    if r.levelno >= logging.WARNING]
+        assert any("-Xmx2g" in m and "4096" in m for m in warnings), (
+            f"expected a warning naming both the inherited and the requested "
+            f"heap, got: {warnings}"
+        )
+
+    def test_effective_heap_is_logged(self, runner, tmp_path, monkeypatch, caplog):
+        """Reading the java command line shows Ghidra's launcher -Xmx, which
+        the JVM then overrides. The log is the only in-band answer to 'what
+        heap did that run actually get'."""
+        binary, script_dir, output = self._prepare(runner, tmp_path)
+        monkeypatch.delenv("_JAVA_OPTIONS", raising=False)
+
+        with patch("subprocess.Popen", side_effect=lambda *a, **k: _FakeRunResult()):
+            with caplog.at_level(logging.INFO):
+                runner.analyze(
+                    binary_path=str(binary),
+                    script_path=str(script_dir),
+                    script_name="core_analysis.py",
+                    output_path=str(output),
+                    max_heap_mb=6144,
+                )
+
+        assert any("6144m" in r.getMessage() for r in caplog.records)
+
+    def test_unparseable_heap_env_var_is_reported(
+        self, runner, tmp_path, monkeypatch, caplog
+    ):
+        """A typo'd GHIDRA_MAX_HEAP_MB silently ran at the default before."""
+        binary, script_dir, output = self._prepare(runner, tmp_path)
+        monkeypatch.delenv("_JAVA_OPTIONS", raising=False)
+        monkeypatch.setenv("GHIDRA_MAX_HEAP_MB", "8gb")
+        captured = {}
+
+        def fake_run(cmd, env, **kwargs):
+            captured["env"] = dict(env)
+            return _FakeRunResult()
+
+        with patch("subprocess.Popen", side_effect=fake_run):
+            with caplog.at_level(logging.WARNING):
+                runner.analyze(
+                    binary_path=str(binary),
+                    script_path=str(script_dir),
+                    script_name="core_analysis.py",
+                    output_path=str(output),
+                )
+
+        assert "-Xmx4096m" in captured["env"]["_JAVA_OPTIONS"]
+        assert any("8gb" in r.getMessage() for r in caplog.records)
+
     def test_resume_manifest_env_var(self, runner, tmp_path):
         binary, script_dir, output = self._prepare(runner, tmp_path)
         captured = {}
@@ -702,8 +768,6 @@ class TestRunnerEnvPlumbing:
             runner._cleanup_pdb(staged)
 
 
-# -- GhidraRunner timeout cleanup -------------------------------------------
-#
 # Regression: subprocess.run on Windows can hang indefinitely after timeout
 # fires because Ghidra's java.exe grandchildren survive the .bat kill and
 # keep the captured pipes open. runner.analyze now uses Popen + manual
@@ -883,9 +947,6 @@ class TestRunnerTimeoutCleanup:
             assert not mock_run.called
 
 
-# -- get_analysis_context incremental wiring --------------------------------
-
-
 @pytest.fixture
 def server_module(tmp_path_factory, monkeypatch):
     """Import src.server with a stubbed Ghidra installation."""
@@ -893,6 +954,10 @@ def server_module(tmp_path_factory, monkeypatch):
     (fake_ghidra / "support").mkdir()
     (fake_ghidra / "support" / "analyzeHeadless").touch()
     monkeypatch.setenv("GHIDRA_HOME", str(fake_ghidra))
+    # The job registry is built at import time from the cache root, and the
+    # decompile paths run through it, so this keeps job records out of the
+    # developer's real ~/ghidra_mcp_cache.
+    monkeypatch.setenv("BINARY_CACHE_DIR", str(tmp_path_factory.mktemp("cache")))
 
     # Ensure a fresh import in case a prior test already loaded it
     sys.modules.pop("src.server", None)
@@ -1355,7 +1420,6 @@ class TestDeltaIntegration:
         assert addrs["0x1040"]["pseudocode"] is None
 
 
-# -- Error propagation through get_analysis_context -------------------------
 # Regression tests for docs/ghidra-mcp-defender-issues.md (Issue 2):
 # get_analysis_context used to wrap every exception in a plain RuntimeError,
 # stripping GhidraAnalysisError.diagnostic and UserFacingError type info so
@@ -1492,8 +1556,8 @@ class TestDecompileOnDemand:
 
         result = server_module.decompile_function(str(binary), "FUN_401000")
 
-        assert captured.get("start_address") == "0x401000"
-        assert captured.get("max_functions") == 1
+        assert captured.get("target_addresses") == ["0x401000"]
+        assert captured.get("force_decompile") is True
         assert "FUN_401000(void) { return; }" in result
 
 

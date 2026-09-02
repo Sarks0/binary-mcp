@@ -76,7 +76,7 @@ def quarantine(tmp_path, monkeypatch):
     reset_confinement_warning()
     return q
 
-# -- H9 / P4: confinement is applied even when the caller omits allowed_dirs --
+# H9 / P4: confinement is applied even when the caller omits allowed_dirs
 
 
 def test_confinement_applied_when_caller_omits_allowed_dirs(tmp_path, monkeypatch):
@@ -109,7 +109,7 @@ def test_explicit_allowed_dirs_still_enforced(tmp_path, monkeypatch):
         sanitize_binary_path(str(outside_file), allowed_dirs=[allowed])
 
 
-# -- F-8: unconfigured is confined-by-default, not open-by-default --------
+# F-8: unconfigured is confined-by-default, not open-by-default
 
 
 def test_unconfigured_confines_to_quarantine_dirs(tmp_path, quarantine):
@@ -301,7 +301,7 @@ def test_require_confinement_allows_inside_configured_dir(tmp_path, monkeypatch)
     assert sanitize_binary_path(str(f)) == f.resolve()
 
 
-# -- F-13: relative output paths anchor to allowed_dir, not the process CWD --
+# F-13: relative output paths anchor to allowed_dir, not the process CWD
 
 
 def test_relative_output_path_resolves_under_allowed_dir(tmp_path):
@@ -366,7 +366,7 @@ def test_absolute_output_path_inside_allowed_dir_accepted(tmp_path):
     )
 
 
-# -- F-14: the symlink-component check must actually be able to fire --
+# F-14: the symlink-component check must actually be able to fire
 
 
 def test_symlinked_output_parent_rejected(tmp_path):
@@ -422,7 +422,7 @@ def test_output_parent_must_exist(tmp_path):
         sanitize_output_path(Path("nope/report.md"), allowed)
 
 
-# -- Hard-link bypass: resolve() cannot see through a second directory entry --
+# Hard-link bypass: resolve() cannot see through a second directory entry
 
 
 @posix_only
@@ -543,7 +543,7 @@ def test_directories_are_not_hardlink_checked(quarantine):
     assert sanitize_binary_path(str(sample)) == sample.resolve()
 
 
-# -- F-18: sanitize_output_dir confines an extraction destination --
+# F-18: sanitize_output_dir confines an extraction destination
 
 
 def test_output_dir_relative_is_created_under_root(tmp_path):
@@ -616,7 +616,8 @@ def test_output_dir_nested_relative_path_is_created(tmp_path):
     assert result.is_dir()
 
 
-# -- H8: read_full must not slurp an unbounded file into memory --
+# H8: read_full must not slurp an unbounded file into memory
+# H8: read_full must not slurp an unbounded file into memory
 
 
 def test_read_full_accepts_within_cap(tmp_path):
@@ -686,9 +687,7 @@ def test_operator_allowlist_still_excludes_everything_else(tmp_path, monkeypatch
     assert sanitize_binary_path(str(inside)) == inside.resolve()
 
 
-# ---------------------------------------------------------------------------
 # F-8 ordering: the Ghidra cache read a raw, unvalidated path
-# ---------------------------------------------------------------------------
 #
 # Ten x64dbg tools in src/tools/dynamic_tools.py take a binary_path straight
 # from the model and reach ProjectCache via _load_function_mappings /

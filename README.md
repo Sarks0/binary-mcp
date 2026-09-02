@@ -99,13 +99,13 @@ Analyze the crash dump at C:\Windows\MEMORY.DMP
 Decompile the type MyNamespace.MyClass to C#
 ```
 
-## Capabilities (289 tools)
+## Capabilities (290 tools)
 
 Counts below are derived from the tools actually registered by `src/server.py`, and `tests/test_docs_accuracy.py` fails if this file and the code disagree.
 
-### Static Analysis (Ghidra) - 19 tools
+### Static Analysis (Ghidra) - 20 tools
 
-Analysis, decompilation, cross-references, memory maps, byte pattern search, function renaming, call graphs, API pattern detection (100+ Windows APIs), crypto constant identification, IOC extraction, PDB loading, and binary compatibility checking.
+Analysis, decompilation (single and batch), cross-references, memory maps, byte pattern search, function renaming, call graphs, API pattern detection (100+ Windows APIs), crypto constant identification, IOC extraction, PDB loading, and binary compatibility checking.
 
 ### Python & Encoding Utilities - 7 tools
 
@@ -270,6 +270,8 @@ uv run ruff check src/     # Lint
 
 - [Installation Guide](INSTALL.md)
 - [Contributing](CONTRIBUTING.md)
+- [Large binaries: project reuse and targeted decompiles](docs/large-binary-decompile.md)
+- [Background jobs](docs/jobs.md)
 - [WinDbg/Kernel Debugging Guide](docs/windbg-kernel-debugging.md)
 - [x64dbg Architecture](docs/x64dbg-architecture.md)
 - [MCP Protocol](https://modelcontextprotocol.io/)

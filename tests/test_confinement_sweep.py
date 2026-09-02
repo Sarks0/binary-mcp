@@ -56,9 +56,7 @@ TRAVERSAL_IDS = (
 )
 
 
-# ---------------------------------------------------------------------------
 # Fixtures
-# ---------------------------------------------------------------------------
 
 
 @pytest.fixture
@@ -164,9 +162,7 @@ def _disable_auto_session(server, monkeypatch):
     monkeypatch.setattr(server.session_manager, "auto_session_enabled", False)
 
 
-# ---------------------------------------------------------------------------
 # F-18: extraction destination is confined
-# ---------------------------------------------------------------------------
 
 
 def _py2exe_sample(path: Path) -> Path:
@@ -301,9 +297,7 @@ def test_extraction_refuses_out_of_bounds_binary(
     assert not (extraction_root / "sample1").exists()
 
 
-# ---------------------------------------------------------------------------
 # F-8 ordering: nothing touches the raw path before confinement
-# ---------------------------------------------------------------------------
 
 
 def test_analyze_binary_does_not_consult_cache_before_confinement(
@@ -346,22 +340,36 @@ def test_analyze_binary_in_bounds_still_reaches_the_cache(
     sample = quarantine / "sample.bin"
     sample.write_bytes(b"MZ\x90\x00" + b"\x00" * 64)
 
-    get_cached = Recorder(result=None)
+    analysed = {"metadata": {"name": "sample.bin"}, "functions": []}
+
+    class CacheReads(Recorder):
+        """Miss first (so analysis runs), hit afterwards.
+
+        analyze_binary no longer builds its summary from get_analysis_context's
+        return value: it runs the analysis and then reads the result back out
+        of the cache. A stub that misses forever therefore describes an
+        impossible state -- analysis succeeded but wrote nothing -- and the
+        tool correctly says the cache could not be read back.
+        """
+
+        def __call__(self, *args, **kwargs):
+            super().__call__(*args, **kwargs)
+            return None if len(self.calls) == 1 else analysed
+
+    get_cached = CacheReads()
     monkeypatch.setattr(server.cache, "get_cached", get_cached)
     monkeypatch.setattr(
         server.compatibility_checker, "check_compatibility", Recorder()
     )
-    monkeypatch.setattr(
-        server,
-        "get_analysis_context",
-        Recorder(result={"metadata": {"name": "sample.bin"}, "functions": []}),
-    )
+    monkeypatch.setattr(server, "get_analysis_context", Recorder(result=analysed))
 
     result = server.analyze_binary(binary_path=str(sample))
 
     assert "Binary Analysis Complete" in result
-    # And the cache saw the RESOLVED path, not the raw argument.
-    assert get_cached.paths == [str(sample.resolve())]
+    # And the cache saw the RESOLVED path, not the raw argument -- on EVERY
+    # read, including the post-analysis read-back added since this was written.
+    assert get_cached.paths, "the cache was never consulted; guard is vacuous"
+    assert set(get_cached.paths) == {str(sample.resolve())}
 
 
 def test_decompile_function_does_not_peek_the_cache_unconfined(
@@ -554,9 +562,7 @@ def test_hardlinked_sample_is_refused_by_the_tool_layer(
     assert check_compat.calls == []
 
 
-# ---------------------------------------------------------------------------
 # F-5: the second, unswept session store
-# ---------------------------------------------------------------------------
 
 
 @pytest.fixture
@@ -625,9 +631,7 @@ def test_ghidra_session_uppercase_uuid_is_accepted(ghidra_sessions, tmp_path):
     assert ghidra_sessions.get_metadata(session_id.upper()) is not None
 
 
-# ---------------------------------------------------------------------------
 # F-5 (UX): a malformed ID must not be reported as a missing/failed session
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("payload", TRAVERSAL_IDS)

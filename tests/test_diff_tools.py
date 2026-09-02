@@ -1318,9 +1318,7 @@ class TestModuleGrouping:
         assert "-- module: (global)" not in report
 
 
-# ---------------------------------------------------------------------------
 # F-7: the diff report is sample-derived on both sides
-# ---------------------------------------------------------------------------
 
 
 def _diff_func(name, address, pseudocode=""):

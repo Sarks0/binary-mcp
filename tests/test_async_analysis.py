@@ -163,10 +163,16 @@ class TestDecompileJobPath:
         record = _wait_done(server, _job_id(result))
         assert record["state"] == "succeeded"
         assert record["result"]["decompiled"] is True
-        # Fenced, not raw: job_result relays this payload to the model, so the
-        # producer wraps the body in the untrusted-content envelope. Assert the
-        # body is there AND that it is fenced -- asserting equality with the
-        # bare string would pin the unfenced behaviour.
+        # The payload reports WHICH functions were decompiled, not their
+        # bodies -- the caller re-reads those from the now-warm cache. Those
+        # names come from the binary's own symbols and job_result relays them
+        # to the model, so they are neutralised: no sentinel can survive in
+        # them, even though a short identifier does not earn a full envelope.
+        assert record["result"]["decompiled_functions"] == ["Parse"]
+        assert record["result"]["failed"] == []
+        # The single-function case also carries the body, and job_result relays
+        # it to the model, so it is enveloped. Assert the body is present AND
+        # fenced -- equality with the bare string would pin the unfenced form.
         body = record["result"]["pseudocode"]
         assert "int Parse(void){return 1;}" in body
         assert body.startswith("\u27e6BEGIN UNTRUSTED SAMPLE DATA")
@@ -179,9 +185,8 @@ class TestDecompileJobPath:
         _wait_done(server, _job_id(result))
 
         assert len(calls) == 1
-        assert calls[0]["incremental"] is True
-        assert calls[0]["max_functions"] == 1
-        assert calls[0]["start_address"] == "0x1000"
+        assert calls[0]["target_addresses"] == ["0x1000"]
+        assert calls[0]["force_decompile"] is True
 
     def test_a_second_caller_attaches_to_the_running_decompile(self, server, monkeypatch):
         import threading
@@ -337,10 +342,16 @@ class TestDecompileJobHonesty:
         record = _wait_done(server, _job_id(result))
         assert record["state"] == "succeeded"
         assert record["result"]["decompiled"] is True
-        # Fenced, not raw: job_result relays this payload to the model, so the
-        # producer wraps the body in the untrusted-content envelope. Assert the
-        # body is there AND that it is fenced -- asserting equality with the
-        # bare string would pin the unfenced behaviour.
+        # The payload reports WHICH functions were decompiled, not their
+        # bodies -- the caller re-reads those from the now-warm cache. Those
+        # names come from the binary's own symbols and job_result relays them
+        # to the model, so they are neutralised: no sentinel can survive in
+        # them, even though a short identifier does not earn a full envelope.
+        assert record["result"]["decompiled_functions"] == ["Parse"]
+        assert record["result"]["failed"] == []
+        # The single-function case also carries the body, and job_result relays
+        # it to the model, so it is enveloped. Assert the body is present AND
+        # fenced -- equality with the bare string would pin the unfenced form.
         body = record["result"]["pseudocode"]
         assert "int Parse(void){return 1;}" in body
         assert body.startswith("\u27e6BEGIN UNTRUSTED SAMPLE DATA")

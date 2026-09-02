@@ -41,9 +41,7 @@ def bridge() -> X64DbgBridge:
     return X64DbgBridge()
 
 
-# ---------------------------------------------------------------------------
 # F-12: empty / whitespace-only commands
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("command", ["", "   ", "\t", "\n", " \t\r\n "])
@@ -79,9 +77,7 @@ def test_execute_command_rejects_empty_before_any_request(bridge):
         bridge.execute_command("   ")
 
 
-# ---------------------------------------------------------------------------
 # Python fast-fail denylist still rejects the dangerous originals
-# ---------------------------------------------------------------------------
 
 
 ORIGINAL_BLOCKED = [
@@ -179,9 +175,7 @@ def test_python_layer_is_a_denylist_not_a_copy_of_the_plugin_allowlist():
     assert blocked != allowed
 
 
-# ---------------------------------------------------------------------------
 # Plugin-side (C++) structural tests -- the allowlist inversion must stick
-# ---------------------------------------------------------------------------
 
 
 def _plugin_source() -> str:
@@ -319,9 +313,7 @@ def test_plugin_documents_which_layer_is_authoritative():
     assert "fail" in lowered and "closed" in lowered
 
 
-# ---------------------------------------------------------------------------
 # F-15: auth token file ACL
-# ---------------------------------------------------------------------------
 
 
 def test_token_file_uses_explicit_user_only_dacl():
@@ -351,7 +343,6 @@ def test_token_file_security_descriptor_is_freed():
     assert "LocalFree(sd)" in setup
 
 
-# ---------------------------------------------------------------------------
 # Second remediation pass -- F-16 / F-17 / F-19 / F-20 / F-27 and the
 # lower-priority memory-safety defects found in the same audit.
 #
@@ -360,7 +351,6 @@ def test_token_file_security_descriptor_is_freed():
 # are deliberately anchored on the *shape* of each control -- the API that
 # enforces it, the branch that rejects -- rather than on formatting, so they
 # survive reflowing but fail if the control itself is removed.
-# ---------------------------------------------------------------------------
 
 
 MAIN_CPP = REPO_ROOT / "src" / "engines" / "dynamic" / "x64dbg" / "server" / "main.cpp"
@@ -398,7 +388,7 @@ def _strip_comments(source: str) -> str:
     return re.sub(r"//[^\n]*", "", source)
 
 
-# --- F-16: the allowlist applies to every ';'-separated segment -------------
+# - F-16: the allowlist applies to every ';'-separated segment
 
 
 def test_command_gate_splits_on_semicolons():
@@ -447,7 +437,7 @@ def test_segment_gate_rejects_empty_segments_and_leading_dollar():
     )
 
 
-# --- F-17: named pipe authentication and DACL ------------------------------
+# - F-17: named pipe authentication and DACL
 
 
 def _create_named_pipe_call() -> str:
@@ -519,7 +509,7 @@ def test_spawned_server_pid_is_recorded_and_cleared():
     assert source.count("g_serverProcessId.store(0)") >= 2
 
 
-# --- F-19: pre-auth request bounds in the HTTP server ----------------------
+# - F-19: pre-auth request bounds in the HTTP server
 
 
 def test_content_length_is_capped():
@@ -583,7 +573,7 @@ def test_response_send_is_looped():
     assert "sent += (size_t)written;" in body
 
 
-# --- F-20: abortable waits and a safe unload -------------------------------
+# - F-20: abortable waits and a safe unload
 
 
 @pytest.mark.parametrize(
@@ -663,7 +653,7 @@ def test_g_running_is_atomic():
     assert "#include <atomic>" in code
 
 
-# --- F-27: confined output paths -------------------------------------------
+# - F-27: confined output paths
 
 
 def _confinement_helper() -> str:
@@ -747,7 +737,7 @@ def test_output_extension_whitelists_exclude_executables(extension_table):
         assert dangerous not in extensions
 
 
-# --- lower-priority defects from the same audit ----------------------------
+# - lower-priority defects from the same audit
 
 
 def test_extract_int_field_honours_the_default_on_parse_failure():

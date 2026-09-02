@@ -75,9 +75,7 @@ NON_UUID_PAYLOADS = [
 ]
 
 
-# ---------------------------------------------------------------------------
 # _validate_session_id itself
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("payload", TRAVERSAL_PAYLOADS)
@@ -120,9 +118,7 @@ def test_validate_error_is_plain_valueerror():
     assert "Invalid session ID format" in str(exc.value)
 
 
-# ---------------------------------------------------------------------------
 # The chokepoint: path builders
-# ---------------------------------------------------------------------------
 
 
 @pytest.fixture
@@ -183,9 +179,7 @@ def test_no_stray_files_written_outside_store(manager, tmp_path):
     assert before == after
 
 
-# ---------------------------------------------------------------------------
 # Legitimate flows still work end to end
-# ---------------------------------------------------------------------------
 
 
 def test_full_round_trip_start_save_resume_delete(tmp_path):

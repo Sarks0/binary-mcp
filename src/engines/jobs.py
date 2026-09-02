@@ -4,11 +4,24 @@ Cross-process job registry for work that outlives an MCP call.
 The problem this solves
 -----------------------
 binary-mcp runs over stdio, so every client gets its **own server process**.
-A Ghidra analysis routinely takes minutes; an MCP client gives up after ~30
-seconds. The server keeps going, finishes, and writes its cache -- but the
-caller is already gone and never learns the result. Worse, nobody is left
-waiting on the subprocess, so ``_kill_process_tree`` never fires and the
+A Ghidra analysis routinely takes minutes, and some MCP clients abandon a call
+long before that. The server keeps going, finishes, and writes its cache --
+but the caller is already gone and never learns the result. Worse, nobody is
+left waiting on the subprocess, so ``_kill_process_tree`` never fires and the
 ``analyzeHeadless`` tree runs on unattended.
+
+How long a client actually waits is a client setting, not a constant, and it
+is worth not guessing: Claude Code's stdio path has no 30-second limit (the
+figure this module was originally written against). Its wall-clock ceiling is
+``MCP_TOOL_TIMEOUT``, ~28 hours when unset, or a per-server ``timeout`` in
+``.mcp.json``; a call still running after two minutes is moved to a background
+task rather than blocking the session; and a call that emits nothing for the
+idle window -- 30 minutes for stdio -- is aborted. Other clients are stricter.
+
+So the server does not assume a number. Tools try to answer inline, give up
+waiting after ``BINARY_MCP_INLINE_DEADLINE`` seconds, and hand back a job
+handle instead. That is correct against a client that waits 30 seconds and
+against one that waits 28 hours, without either being configured anywhere.
 
 Run six agents against the same binary and that compounds: six server
 processes, six independent Ghidra trees on the same input, one saturated box,
@@ -99,6 +112,10 @@ _REAPABLE_MARKERS = ("analyzeheadless",)
 # `src.utils.security.validate_state_id`, which guards the debug-state
 # side-cars for exactly this reason.
 _JOB_ID_RE = re.compile(r"^[0-9a-f]{1,64}$")
+
+
+class _ClaimUnreadableError(Exception):
+    """A claim file exists but could not be read, so ownership is unknown."""
 
 
 def _utc_now() -> str:
@@ -291,10 +308,40 @@ class JobRegistry:
         tmp = path.with_suffix(".tmp")
         try:
             tmp.write_text(json.dumps(record), encoding="utf-8")
-            os.replace(tmp, path)
         except OSError as exc:
             logger.error("could not write job %s: %s", record.get("job_id"), exc)
             tmp.unlink(missing_ok=True)
+            return
+
+        # On Windows os.replace fails if ANY handle is open on the target, and
+        # this file is polled: `wait` reads it every 10-250ms for the whole
+        # inline deadline, and `job_status` from other processes reads it too.
+        # A single collision used to be swallowed by the OSError handler below,
+        # which is the worst possible thing to drop -- if the losing write was
+        # `_finalize`, the job's terminal state is gone, the record says
+        # "running" forever, and a caller waiting on a job that failed
+        # instantly is told it is still going 25 seconds later. That is exactly
+        # how this surfaced on Windows CI.
+        for attempt in range(6):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:
+                # Sharing violation: a reader has it open. Back off and retry;
+                # POSIX never lands here.
+                time.sleep(0.02 * (attempt + 1))
+            except OSError as exc:
+                logger.error(
+                    "could not write job %s: %s", record.get("job_id"), exc
+                )
+                tmp.unlink(missing_ok=True)
+                return
+
+        logger.error(
+            "could not commit job record %s after retries; a reader has held "
+            "it open throughout", record.get("job_id"),
+        )
+        tmp.unlink(missing_ok=True)
 
     def read(self, job_id: str) -> dict | None:
         try:
@@ -310,6 +357,53 @@ class JobRegistry:
         if not isinstance(data, dict) or data.get("schema_version") != SCHEMA_VERSION:
             return None
         return data
+
+    def wait(self, job_id: str, timeout: float) -> dict | None:
+        """Block until ``job_id`` reaches a terminal state, or ``timeout``.
+
+        Returns the record either way -- the caller distinguishes "finished"
+        from "still going" by its ``state``, and ``None`` means no such job.
+
+        This is what lets a tool try to answer inline and fall back to a job
+        handle only when the work is genuinely slow, so a fast call does not
+        cost the caller a poll cycle it did not need.
+
+        The wait polls the record file rather than joining a thread, because
+        the job may be owned by a *different process*: the whole point of the
+        registry is that a second agent attaches to an in-flight run, and it
+        has no thread to join. Polling starts tight and backs off, so a job
+        that finishes in 20 ms is noticed in ~10 ms while a five-minute
+        analysis is not stat-ing the file thousands of times a second.
+        """
+        deadline = time.monotonic() + max(0.0, timeout)
+        interval = 0.01
+        misses = 0
+        while True:
+            record = self.read(job_id)
+            if record is None:
+                # `read` maps every OSError to None, so a transient failure is
+                # indistinguishable from a missing job. On Windows that is not
+                # hypothetical: the heartbeat rewrites this very file via
+                # os.replace while we poll it, and a scanner's handle on the
+                # replacement yields a sharing violation -- the same class the
+                # claim unlink had to be hardened against. Concluding "gone"
+                # on the first miss tells the caller their analysis vanished
+                # while it is in fact running normally.
+                misses += 1
+                if misses > 3:
+                    return None
+            else:
+                misses = 0
+                if record.get("state") in TERMINAL_STATES:
+                    return record
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return record
+            time.sleep(min(interval, remaining))
+            # Starts tight so a job finishing in 20ms is noticed immediately,
+            # then backs well off: every poll opens the record the worker is
+            # trying to replace, and on Windows that contention is not free.
+            interval = min(interval * 2, 0.5)
 
     def _update(self, job_id: str, **fields) -> dict | None:
         with self._lock:
@@ -378,13 +472,58 @@ class JobRegistry:
 
     # claims
 
-    def _read_claim(self, key: str) -> str | None:
-        try:
-            data = json.loads(self._claim_path(key).read_text(encoding="utf-8"))
+    def _claim_state(self, key: str) -> tuple[str | None, str]:
+        """Read a claim, distinguishing *absent* from *could not be read*.
+
+        Collapsing those two into ``None`` is not a tidiness problem, it is the
+        failure this registry exists to prevent. ``_existing_for_key`` responds
+        to an unreadable claim by *releasing* it, so one transient read error
+        frees a key a live owner still holds and the next submit starts a
+        second Ghidra on the same binary. On Windows that is reachable: the
+        claim is a small file written and read constantly, and a scanner's
+        handle on it yields a sharing violation -- the same class that broke
+        the claim unlink and the job-record read.
+
+        Returns ``(job_id, state)`` where state is one of:
+
+        ``absent``      no claim file; the key is free.
+        ``held``        parsed cleanly, ``job_id`` names the owner.
+        ``corrupt``     present but unparseable JSON. A process killed
+                        mid-claim leaves exactly this, and it names no owner,
+                        so it protects nothing and must be cleared or the key
+                        wedges forever.
+        ``unreadable``  present, and the OS would not let us read it after
+                        retries. Says nothing about whether an owner is live,
+                        so the caller must NOT conclude the key is free --
+                        this module's whole liveness rule is that ambiguity
+                        resolves towards waiting, never towards starting a
+                        competing run.
+        """
+        path = self._claim_path(key)
+        for attempt in range(4):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                return None, "absent"
+            except ValueError:
+                # Truncated/garbage JSON never becomes parseable by waiting.
+                return None, "corrupt"
+            except OSError:
+                # Transient in practice; clears in tens of milliseconds.
+                if attempt == 3:
+                    return None, "unreadable"
+                time.sleep(0.02 * (attempt + 1))
+                continue
             job_id = data.get("job_id")
-            return job_id if isinstance(job_id, str) else None
-        except (OSError, ValueError):
-            return None
+            if isinstance(job_id, str):
+                return job_id, "held"
+            return None, "corrupt"
+        return None, "unreadable"
+
+    def _read_claim(self, key: str) -> str | None:
+        """The owning job id for ``key``, or None. See :meth:`_claim_state`."""
+        job_id, _state = self._claim_state(key)
+        return job_id
 
     def _try_claim(self, key: str, job_id: str) -> bool:
         """Atomically take the claim for ``key``. False if somebody has it.
@@ -425,7 +564,42 @@ class JobRegistry:
         """
         if expect is not None and self._read_claim(key) != expect:
             return
-        self._claim_path(key).unlink(missing_ok=True)
+        self._unlink_claim(self._claim_path(key))
+
+    @staticmethod
+    def _unlink_claim(path: Path) -> None:
+        """Delete a claim file, tolerating a Windows sharing violation.
+
+        On Windows, deleting a file any process still holds a handle to fails
+        with ``WinError 32`` -- and something transiently holds a handle to a
+        file that was just written and read, in practice Defender scanning it.
+        The claim we have just read is exactly that file, so the delete races a
+        scanner on every release.
+
+        A failure here is not cosmetic: the claim outlives its job, and the
+        next ``submit`` for that key attaches to a finished job instead of
+        starting the run the caller asked for -- the key stays wedged until the
+        heartbeat staleness window expires. So retry briefly rather than give
+        up on the first refusal, and never propagate: this runs in the job
+        thread's ``finally``, where raising would leave the registry's
+        in-memory state untidied and surface as an unhandled thread exception.
+        """
+        for attempt in range(5):
+            try:
+                path.unlink(missing_ok=True)
+                return
+            except PermissionError:
+                # Windows sharing violation -- back off and let the other
+                # handle close. POSIX never gets here: it happily unlinks an
+                # open file.
+                time.sleep(0.05 * (attempt + 1))
+            except OSError as exc:
+                logger.warning("could not remove claim %s: %s", path, exc)
+                return
+        logger.warning(
+            "claim %s could not be removed after retries; the key stays held "
+            "until its heartbeat goes stale", path,
+        )
 
     # submission
 
@@ -458,7 +632,17 @@ class JobRegistry:
         instead.
         """
         with self._lock:
-            existing = self._existing_for_key(key)
+            try:
+                existing = self._existing_for_key(key)
+            except _ClaimUnreadableError:
+                # Better a caller who retries than two Ghidra runs on one
+                # binary, which is the whole reason this registry exists.
+                return {
+                    "error": (
+                        f"the claim for {key!r} could not be read, so whether a "
+                        f"run is already in flight is unknown. Retry shortly."
+                    )
+                }
             if existing is not None:
                 return {
                     "job_id": existing["job_id"],
@@ -513,15 +697,19 @@ class JobRegistry:
 
     def _existing_for_key(self, key: str) -> dict | None:
         """The live job for ``key``, breaking the claim if its owner died."""
-        job_id = self._read_claim(key)
+        job_id, state = self._claim_state(key)
+        if state == "unreadable":
+            # Ambiguous: somebody may well be running this key. Refuse to
+            # decide rather than free a claim we merely failed to read.
+            raise _ClaimUnreadableError(key)
         if job_id is None:
             # A claim file that exists but cannot be parsed names no owner, so
             # it protects nothing -- and left in place it wedges this key
             # forever, because the exclusive create keeps failing against it.
             # A truncated write from a process killed mid-claim looks exactly
             # like this.
-            if self._claim_path(key).exists():
-                logger.warning("discarding unreadable claim for key %r", key)
+            if state == "corrupt":
+                logger.warning("discarding unparseable claim for key %r", key)
                 self._release_claim(key)
             return None
         record = self.read(job_id)
@@ -559,7 +747,14 @@ class JobRegistry:
             logger.exception("job %s failed", job_id)
             self._finalize(job_id, state=STATE_FAILED, error=str(exc), progress="failed")
         finally:
-            self._release_claim(key, expect=job_id)
+            # Cleanup must not be able to kill the worker thread. The terminal
+            # state is already written by this point, so a failure here is
+            # untidiness, not data loss -- but letting it propagate turns it
+            # into an unhandled thread exception and skips the _local pop.
+            try:
+                self._release_claim(key, expect=job_id)
+            except Exception:
+                logger.exception("releasing claim for job %s failed", job_id)
             with self._lock:
                 self._local.pop(job_id, None)
 

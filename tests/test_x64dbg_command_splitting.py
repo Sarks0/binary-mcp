@@ -145,9 +145,7 @@ def execute_command_tool(monkeypatch):
     return ToolHarness(captured["x64dbg_execute_command"], mock_bridge)
 
 
-# ---------------------------------------------------------------------------
 # The splitter mirrors x64dbg's cmdsplit
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -190,9 +188,7 @@ def test_command_name_extraction():
     assert x64dbg_command_name("log\tx") == "log"
 
 
-# ---------------------------------------------------------------------------
 # Structural rejections
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("command", ["", "   ", "\t", " \t ", None])
@@ -306,9 +302,7 @@ def test_unterminated_quote_is_refused(bridge, execute_command_tool):
     assert not execute_command_tool.reached_x64dbg
 
 
-# ---------------------------------------------------------------------------
 # The verified payloads -- tool layer
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("command", SPLIT_PAYLOADS + DIRECT_PAYLOADS)
@@ -333,9 +327,7 @@ def test_tool_layer_names_the_offending_segment(execute_command_tool):
     assert "'log'" not in result
 
 
-# ---------------------------------------------------------------------------
 # The verified payloads -- bridge layer
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("command", SPLIT_PAYLOADS + DIRECT_PAYLOADS)
@@ -389,9 +381,7 @@ def test_newly_identified_dangerous_commands_are_refused(bridge, dangerous):
         bridge._validate_command(f"log x;{dangerous} 1000")
 
 
-# ---------------------------------------------------------------------------
 # No collateral damage: legitimate commands still work
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("command", LEGITIMATE_COMMANDS)
@@ -438,9 +428,7 @@ def test_multi_segment_legitimate_command_is_allowed(bridge):
     bridge._validate_command("cfanalyze;analxrefs;bplist")
 
 
-# ---------------------------------------------------------------------------
 # List hygiene: the pruned denylist entries, and allowlist relationships
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("dead", ["savefile", "quit", "exit", "exec", "execute"])

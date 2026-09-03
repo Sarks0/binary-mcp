@@ -44,6 +44,17 @@ CC = shutil.which("gcc") or shutil.which("cc")
 
 pytestmark = pytest.mark.skipif(GDB is None, reason="gdb not installed")
 
+# GDB exists on more CI images than expected -- GitHub's windows-latest runner
+# ships one via MinGW, so these tests do run there. The MI grammar checks are
+# worth having against any build, but `startup-with-shell`, `follow-fork-mode`
+# and the shell escape are Unix-only settings that Windows GDB answers with
+# nothing at all. They describe the platform this engine targets, so they are
+# scoped to it rather than loosened into assertions that could not fail.
+linux_only = pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="asserts Unix-only GDB behaviour; the GDB engine is Linux-scoped",
+)
+
 # A target with a named function, a syscall, and a fork, so one binary covers
 # breakpoints, syscall catching and fork-follow.
 _SOURCE = """
@@ -154,7 +165,6 @@ class MISession:
         except Exception:
             self.proc.kill()
 
-    # -- helpers ----------------------------------------------------------
 
     @staticmethod
     def results(records: list, klass: str | None = None) -> list:
@@ -203,9 +213,6 @@ def session():
 
 def _has_symbols(binary: Path) -> bool:
     return CC is not None and binary.name == "t_pie"
-
-
-# --- 1. Parser conformance against live output -----------------------------
 
 
 def test_parser_handles_every_line_of_a_live_session(session, target_binary):
@@ -261,9 +268,6 @@ def test_every_captured_line_reparses_identically(session, target_binary):
             parse_line(line)
         except MIParseError as exc:  # pragma: no cover - failure path
             pytest.fail(f"parser rejected live GDB output:\n  {line!r}\n  {exc}")
-
-
-# --- 2. Findings from the issue #7 review ----------------------------------
 
 
 def test_break_delete_by_address_is_a_silent_no_op(session, target_binary):
@@ -330,6 +334,7 @@ def test_exec_run_start_stops_before_user_code(session, target_binary):
     )
 
 
+@linux_only
 def test_startup_with_shell_defaults_on(session):
     """Security finding S3 -- target argv is shell-expanded unless turned off."""
     records = session.send('-interpreter-exec console "show startup-with-shell"')
@@ -340,6 +345,7 @@ def test_startup_with_shell_defaults_on(session):
     )
 
 
+@linux_only
 def test_follow_fork_defaults_to_parent(session):
     """Review finding 2.9 -- the child of a fork runs untraced by default."""
     fork_mode = MISession.console_text(
@@ -352,6 +358,7 @@ def test_follow_fork_defaults_to_parent(session):
     assert "on" in detach, f"unexpected detach-on-fork: {detach.strip()!r}"
 
 
+@linux_only
 def test_console_shell_escape_is_reachable(session):
     """Security finding S1 -- justifies the allowlist.
 
@@ -390,9 +397,6 @@ def test_pie_breakpoint_address_changes_after_run(session, target_binary):
     assert int(after, 16) > int(before, 16), (
         f"expected relocation, got {before} -> {after}"
     )
-
-
-# --- Standalone environment report -----------------------------------------
 
 
 def _report() -> int:

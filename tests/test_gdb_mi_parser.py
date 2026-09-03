@@ -18,8 +18,6 @@ from src.engines.dynamic.gdb.mi_parser import (
     parse_value,
 )
 
-# --- Captured fixtures -----------------------------------------------------
-
 BREAK_INSERT = (
     '^done,bkpt={number="1",type="breakpoint",disp="keep",enabled="y",'
     'addr="0x00000000000011d4",func="target",file="t.c",fullname="/tmp/t.c",'
@@ -75,9 +73,6 @@ READ_MEMORY = (
 )
 
 
-# --- Result records --------------------------------------------------------
-
-
 def test_break_insert_result():
     rec = parse_line(BREAK_INSERT)
     assert rec.kind is RecordKind.RESULT
@@ -120,9 +115,6 @@ def test_read_memory_contents():
     assert bytes.fromhex(block["contents"])[:3] == b"\x8b\x55\xfc"
 
 
-# --- Errors ----------------------------------------------------------------
-
-
 def test_error_record_exposes_message():
     rec = parse_line('^error,msg="No registers."')
     assert rec.is_error
@@ -140,9 +132,6 @@ def test_error_message_with_embedded_escaped_quotes():
 def test_non_error_records_have_no_error_message():
     assert parse_line("^done").error_message is None
     assert not parse_line(STOPPED_SIGINT).is_error
-
-
-# --- Async records ---------------------------------------------------------
 
 
 def test_stopped_breakpoint_hit():
@@ -198,9 +187,6 @@ def test_status_async_record():
     assert rec.is_async
 
 
-# --- Stream and prompt records --------------------------------------------
-
-
 def test_console_stream_unescapes_text():
     rec = parse_line(r'~"Breakpoint 1, target (x=1) at t.c:4\n"')
     assert rec.kind is RecordKind.CONSOLE
@@ -237,9 +223,6 @@ def test_non_mi_output_is_raw_not_an_error():
 def test_inferior_stdout_is_raw():
     rec = parse_line("uid=0(root) gid=0(root) groups=0(root)")
     assert rec.kind is RecordKind.RAW
-
-
-# --- Value grammar ---------------------------------------------------------
 
 
 def test_empty_tuple_and_list():
@@ -318,9 +301,6 @@ def test_break_delete_by_address_reports_done_but_does_not_delete():
     assert gone.results["BreakpointTable"]["nr_rows"] == "0"
 
 
-# --- C-string escaping -----------------------------------------------------
-
-
 def test_backslash_and_quote_escapes():
     assert parse_value(r'"a\\b"') == "a\\b"
     assert parse_value(r'"say \"hi\""') == 'say "hi"'
@@ -359,9 +339,6 @@ def test_unknown_escape_keeps_the_literal_character():
     assert parse_value(r'"\q"') == "q"
 
 
-# --- Malformed input -------------------------------------------------------
-
-
 @pytest.mark.parametrize(
     "line",
     [
@@ -383,9 +360,6 @@ def test_malformed_records_raise(line):
 def test_parse_value_rejects_trailing_data():
     with pytest.raises(MIParseError):
         parse_value('"a" "b"')
-
-
-# --- Whole-stream parsing --------------------------------------------------
 
 
 def test_parse_lines_over_a_captured_session_fragment():

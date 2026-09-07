@@ -402,6 +402,7 @@ _VALIDATION_ONLY_HANDLERS = {
     "ValueError",
     "BinaryResolutionError",
     "AddressRebaseError",
+    "FeatureUnavailableError",
     "(BinaryResolutionError, AddressRebaseError)",
 }
 
@@ -515,6 +516,14 @@ _AST_ALLOWED_HANDLERS = {
     #     exactly -- were rewritten to basenames when these were added here.
     "BinaryResolutionError",
     "AddressRebaseError",
+    #   * FeatureUnavailableError (src/engines/dynamic/x64dbg/bridge.py) --
+    #     one raise site, one message: "The x64dbg plugin has no handler for
+    #     /api/thread/suspend. This is a plugin capability gap, not a
+    #     connection problem...". The only interpolated value is the internal
+    #     API endpoint path, a literal from this repo -- never a filesystem
+    #     path. Surfacing it verbatim is the point: it is what stops a caller
+    #     retrying and reconnecting against an endpoint that does not exist.
+    "FeatureUnavailableError",
 }
 
 

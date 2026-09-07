@@ -12,7 +12,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.engines.dynamic.x64dbg.bridge import normalize_module
+from src.engines.dynamic.x64dbg.bridge import (
+    FeatureUnavailableError,
+    normalize_module,
+    normalize_thread,
+)
 from src.tools.dynamic_tools import (
     AddressRebaseError,
     BinaryResolutionError,
@@ -349,3 +353,132 @@ class TestMappingCacheKey:
                 assert len(_function_mappings) == 1
         # Second call must have been served from the cache, not re-read.
         assert cache.get_cached.call_count == 1
+
+
+class TestNormalizeThread:
+    """Thread dicts must distinguish "not reported" from a real zero."""
+
+    def test_full_thread_from_current_plugin(self):
+        t = normalize_thread({
+            "id": 4816, "number": 0, "entry": "7ff61a2b1000",
+            "teb": "1a2000", "cip": "7ff61a2b1240", "suspend_count": 0,
+            "priority": 0, "wait_reason": 13, "last_error": 0,
+            "name": "worker", "is_current": True,
+        })
+        assert t["id"] == 4816
+        assert t["entry"] == 0x7FF61A2B1000
+        assert t["cip"] == 0x7FF61A2B1240
+        assert t["wait_reason_name"] == "WrUserRequest"
+        assert t["is_current"] is True
+
+    def test_thread_id_is_decimal_not_hex(self):
+        # The plugin sends id as a JSON number; it must not be read as hex.
+        assert normalize_thread({"id": 1234})["id"] == 1234
+
+    def test_legacy_thread_leaves_detail_unreported(self):
+        # Older builds send only id and is_current. Absent fields must be None
+        # so callers can say "not reported" instead of printing "0xunknown".
+        t = normalize_thread({"id": 4816, "is_current": True})
+        assert t["entry"] is None
+        assert t["cip"] is None
+        assert t["suspend_count"] is None
+        assert t["wait_reason_name"] is None
+
+    def test_suspend_count_zero_is_not_none(self):
+        assert normalize_thread({"id": 1, "suspend_count": 0})["suspend_count"] == 0
+
+    def test_unknown_wait_reason_has_no_name(self):
+        assert normalize_thread({"id": 1, "wait_reason": 999})["wait_reason_name"] is None
+
+
+def make_thread_bridge(threads):
+    """A real X64DbgBridge with only the HTTP layer stubbed out."""
+    from src.engines.dynamic.x64dbg.bridge import X64DbgBridge
+
+    bridge = X64DbgBridge.__new__(X64DbgBridge)
+    bridge._request_with_retry = lambda endpoint, data=None: {
+        "success": True,
+        "threads": list(threads),
+    }
+    return bridge
+
+
+class TestFindThread:
+    def test_finds_by_decimal_id(self):
+        bridge = make_thread_bridge([{"id": 4816}, {"id": 1234}])
+        assert bridge.find_thread("1234")["id"] == 1234
+
+    def test_finds_by_hex_id(self):
+        # x64dbg's own thread view shows ids in hex.
+        bridge = make_thread_bridge([{"id": 4816}])
+        assert bridge.find_thread("0x12D0")["id"] == 4816
+
+    def test_accepts_an_int(self):
+        bridge = make_thread_bridge([{"id": 4816}])
+        assert bridge.find_thread(4816)["id"] == 4816
+
+    def test_unknown_id_returns_none(self):
+        bridge = make_thread_bridge([{"id": 4816}])
+        assert bridge.find_thread("9999") is None
+
+    def test_garbage_id_returns_none(self):
+        bridge = make_thread_bridge([{"id": 4816}])
+        assert bridge.find_thread("not-a-tid") is None
+
+
+class TestFeatureUnavailable:
+    """A 404 is a missing feature, not a dead connection."""
+
+    def _bridge(self, status):
+        import requests
+
+        from src.engines.dynamic.x64dbg.bridge import X64DbgBridge
+
+        bridge = X64DbgBridge.__new__(X64DbgBridge)
+        bridge.base_url = "http://127.0.0.1:8765"
+        bridge.timeout = 5
+        bridge._auth_token = "token"
+        bridge._error_logger = MagicMock()
+
+        response = MagicMock()
+        response.status_code = status
+        response.json.return_value = {}
+        response.text = ""
+        error = requests.HTTPError(f"{status} Client Error")
+        error.response = response
+        response.raise_for_status.side_effect = error
+        return bridge, response
+
+    def test_404_raises_feature_unavailable(self):
+        bridge, response = self._bridge(404)
+        with patch("requests.post", return_value=response):
+            with pytest.raises(FeatureUnavailableError) as exc:
+                bridge._request("/api/thread/suspend", {"thread_id": "1"})
+        assert "no handler" in str(exc.value)
+        # Must not read as a connection problem -- that is what sent callers
+        # into reconnect loops against an endpoint that never existed.
+        assert "Failed to connect" not in str(exc.value)
+
+    def test_other_http_errors_stay_connection_errors(self):
+        bridge, response = self._bridge(500)
+        with patch("requests.post", return_value=response):
+            with pytest.raises(ConnectionError):
+                bridge._request("/api/thread/suspend", {"thread_id": "1"})
+
+    def test_feature_unavailable_is_not_retried(self):
+        from src.engines.dynamic.x64dbg.bridge import X64DbgBridge
+
+        bridge = X64DbgBridge.__new__(X64DbgBridge)
+        bridge._max_retries = 3
+        bridge._max_reconnects = 2
+        bridge._retry_delay = 0
+        calls = []
+
+        def boom(endpoint, data=None):
+            calls.append(endpoint)
+            raise FeatureUnavailableError(endpoint)
+
+        bridge._request = boom
+        with pytest.raises(FeatureUnavailableError):
+            bridge._request_with_retry("/api/thread/suspend")
+        assert len(calls) == 1

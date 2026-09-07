@@ -58,6 +58,65 @@ def _coerce_int(value: Any, default: int = 0) -> int:
     return default
 
 
+# x64dbg's THREADWAITREASON enum, for turning wait_reason into something a
+# reader can act on.
+_WAIT_REASONS = {
+    0: "Executive", 1: "FreePage", 2: "PageIn", 3: "PoolAllocation",
+    4: "DelayExecution", 5: "Suspended", 6: "UserRequest", 7: "WrExecutive",
+    8: "WrFreePage", 9: "WrPageIn", 10: "WrPoolAllocation",
+    11: "WrDelayExecution", 12: "WrSuspended", 13: "WrUserRequest",
+    14: "WrEventPair", 15: "WrQueue", 16: "WrLpcReceive", 17: "WrLpcReply",
+    18: "WrVirtualMemory", 19: "WrPageOut", 20: "WrRendezvous", 21: "Spare2",
+    22: "Spare3", 23: "Spare4", 24: "Spare5", 25: "WrCalloutStack",
+    26: "WrKernel", 27: "WrResource", 28: "WrPushLock", 29: "WrMutex",
+    30: "WrQuantumEnd", 31: "WrDispatchInt", 32: "WrPreempted",
+    33: "WrYieldExecution", 34: "WrFastMutex", 35: "WrGuardedMutex",
+    36: "WrRundown",
+}
+
+
+def normalize_thread(raw: dict[str, Any]) -> dict[str, Any]:
+    """
+    Give a thread dict from the plugin a stable shape.
+
+    Plugin builds before thread enumeration sent only ``id`` and ``is_current``
+    for the single current thread, so every other field has to be optional --
+    ``None`` where the build cannot report it, so callers can say "not
+    reported" rather than printing a fabricated 0.
+    """
+    def opt_int(key: str) -> int | None:
+        """Addresses arrive as bare hex strings; absent means absent."""
+        value = raw.get(key)
+        return None if value is None else _coerce_int(value)
+
+    # The thread id is a JSON number, not one of the hex-string address
+    # fields, so it must not go through the hex-first coercion.
+    raw_id = raw.get("id", 0)
+    try:
+        thread_id = int(raw_id)
+    except (TypeError, ValueError):
+        thread_id = 0
+
+    wait_reason = raw.get("wait_reason")
+    return {
+        **raw,
+        "id": thread_id,
+        "number": raw.get("number"),
+        "name": str(raw.get("name") or ""),
+        "entry": opt_int("entry"),
+        "teb": opt_int("teb"),
+        "cip": opt_int("cip"),
+        "suspend_count": raw.get("suspend_count"),
+        "priority": raw.get("priority"),
+        "wait_reason": wait_reason,
+        "wait_reason_name": (
+            _WAIT_REASONS.get(wait_reason) if isinstance(wait_reason, int) else None
+        ),
+        "last_error": raw.get("last_error"),
+        "is_current": bool(raw.get("is_current", False)),
+    }
+
+
 def normalize_module(raw: dict[str, Any]) -> dict[str, Any]:
     """
     Give a module dict from the plugin a stable shape.
@@ -159,6 +218,28 @@ class X64DbgAPIError(StructuredBaseError):
         self.operation = operation
         self.api_message = api_message
         self.context = context or {}
+
+
+class FeatureUnavailableError(Exception):
+    """
+    Raised when the plugin build has no handler for an endpoint (HTTP 404).
+
+    This used to surface as ConnectionError("Failed to connect to x64dbg: 404
+    Client Error"), which reads as a dead debugger rather than a missing
+    feature -- so callers retried, reconnected, and re-attached against an
+    endpoint that was never going to exist. Keeping it distinct also stops
+    _request_with_retry from burning its reconnect budget on it.
+    """
+
+    def __init__(self, endpoint: str, operation: str = ""):
+        self.endpoint = endpoint
+        self.operation = operation or endpoint.rsplit("/", 1)[-1]
+        super().__init__(
+            f"The x64dbg plugin has no handler for {endpoint}.\n"
+            f"This is a plugin capability gap, not a connection problem -- the "
+            f"debugger is reachable. Update the Obsidian plugin and server to a "
+            f"build that implements it, or use a different tool."
+        )
 
 
 class X64DbgBridge(Debugger):
@@ -333,6 +414,9 @@ class X64DbgBridge(Debugger):
                 raise
             except X64DbgAPIError:
                 # API errors are deterministic -- never retry
+                raise
+            except FeatureUnavailableError:
+                # A missing handler will still be missing on the next attempt.
                 raise
             except (ConnectionError, RuntimeError) as e:
                 last_error = e
@@ -582,6 +666,12 @@ class X64DbgBridge(Debugger):
             )
 
             logger.error(f"HTTP request failed: {e}")
+
+            # A 404 means this plugin build has no handler for the endpoint.
+            # Reporting that as a connection failure sent callers into reconnect
+            # loops against an endpoint that does not exist.
+            if http_status == 404:
+                raise FeatureUnavailableError(endpoint, operation)
 
             # Check if it's an authentication error
             if http_status == 401:
@@ -1092,10 +1182,36 @@ class X64DbgBridge(Debugger):
         Get thread list.
 
         Returns:
-            List of thread dictionaries
+            List of thread dicts with ``id``, ``is_current``, and -- where the
+            plugin build reports them -- ``number``, ``name``, ``entry``,
+            ``teb``, ``cip``, ``suspend_count``, ``priority``, ``wait_reason``
+            and ``last_error``. Fields the build cannot report are None.
         """
         result = self._request_with_retry("/api/threads")
-        return result.get("threads", [])
+        return [normalize_thread(t) for t in result.get("threads", [])]
+
+    def find_thread(self, thread_id: str | int) -> dict[str, Any] | None:
+        """
+        Find a thread by id.
+
+        Accepts a decimal or 0x-prefixed id, since callers copy ids out of
+        both this tool's output and x64dbg's own (hex) thread view.
+
+        Returns:
+            The normalized thread dict, or None if no thread has that id.
+        """
+        text = str(thread_id).strip()
+        if not text:
+            return None
+        try:
+            wanted = int(text, 16) if text.lower().startswith("0x") else int(text)
+        except ValueError:
+            return None
+
+        for thread in self.get_threads():
+            if thread["id"] == wanted:
+                return thread
+        return None
 
     def switch_thread(self, thread_id: str) -> dict[str, Any]:
         """

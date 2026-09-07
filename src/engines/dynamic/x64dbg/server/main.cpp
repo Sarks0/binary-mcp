@@ -520,6 +520,18 @@ std::string HandleHTTPRequest(const std::string& request) {
         requestType = 164;  // GET_COVERAGE_STATS
     } else if (path == "/api/coverage/export") {
         requestType = 165;  // EXPORT_COVERAGE
+
+    // Thread control
+    } else if (path == "/api/thread/switch") {
+        requestType = 170;  // SWITCH_THREAD
+    } else if (path == "/api/thread/suspend") {
+        requestType = 171;  // SUSPEND_THREAD
+    } else if (path == "/api/thread/resume") {
+        requestType = 172;  // RESUME_THREAD
+    } else if (path == "/api/thread/suspend_all") {
+        requestType = 173;  // SUSPEND_ALL_THREADS
+    } else if (path == "/api/thread/resume_all") {
+        requestType = 174;  // RESUME_ALL_THREADS
     }
 
     // If we have a valid endpoint, build request and forward to plugin

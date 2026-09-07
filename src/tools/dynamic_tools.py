@@ -16,6 +16,7 @@ from pathlib import Path
 from fastmcp import FastMCP
 
 from src.engines.dynamic.x64dbg.bridge import (
+    FeatureUnavailableError,
     X64DbgBridge,
 )
 from src.engines.dynamic.x64dbg.commands import X64DbgCommands
@@ -2382,47 +2383,101 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
         """
         Get list of process threads.
 
-        Shows all threads in the debugged process.
+        Shows every thread in the debugged process with its entry point,
+        current instruction pointer, suspend count and wait reason.
 
         Returns:
-            List of threads with ID, entry point, and status
+            Table of threads. The active thread is marked "current".
 
         Example output:
-            Threads:
+            Threads (3):
             ----------------------------------------
-            Thread 1234 (Main)
-              Entry: 0x00401000
-              Status: Running
+            TID 4816  (current)
+              Entry:     0x00007FF61A2B1000
+              CIP:       0x00007FF61A2B1240
+              Suspended: 0
+              Priority:  0
+              Waiting:   UserRequest
 
-            Thread 5678
-              Entry: 0x76D12340
-              Status: Suspended
+        Use Cases:
+            - Find the thread a callback or injected code runs on
+            - Spot threads a packer created before unpacking
+            - Check whether a thread is suspended before resuming it
         """
         try:
             bridge = get_x64dbg_bridge()
             threads = bridge.get_threads()
 
             if not threads:
-                return "No threads found"
+                return (
+                    "No threads reported. Load or attach to a process first "
+                    "(x64dbg_attach)."
+                )
 
-            result = ["Threads:", "-" * 60]
+            result = [f"Threads ({len(threads)}):", "-" * 60]
 
             for thread in threads:
-                tid = thread.get("id", "unknown")
-                entry = thread.get("entry", "unknown")
-                status = thread.get("status", "unknown")
-                is_main = thread.get("main", False)
+                marker = "  (current)" if thread["is_current"] else ""
+                label = f"TID {thread['id']}"
+                if thread["number"] is not None:
+                    label += f"  [#{thread['number']}]"
+                if thread["name"]:
+                    label += f'  "{thread["name"]}"'
+                result.append(f"\n{label}{marker}")
 
-                main_marker = " (Main)" if is_main else ""
-                result.append(f"\nThread {tid}{main_marker}")
-                result.append(f"  Entry: 0x{entry}")
-                result.append(f"  Status: {status}")
+                # Only print what the plugin actually reported. The previous
+                # version read keys the plugin never sent and rendered them as
+                # the literal string "0xunknown".
+                if thread["entry"] is not None:
+                    result.append(f"  Entry:     0x{thread['entry']:016X}")
+                if thread["cip"] is not None:
+                    result.append(f"  CIP:       0x{thread['cip']:016X}")
+                if thread["teb"] is not None:
+                    result.append(f"  TEB:       0x{thread['teb']:016X}")
+                if thread["suspend_count"] is not None:
+                    result.append(f"  Suspended: {thread['suspend_count']}")
+                if thread["priority"] is not None:
+                    result.append(f"  Priority:  {thread['priority']}")
+                if thread["wait_reason_name"]:
+                    result.append(f"  Waiting:   {thread['wait_reason_name']}")
+                if thread["last_error"]:
+                    result.append(f"  LastError: {thread['last_error']}")
+
+            if len(threads) == 1 and threads[0]["entry"] is None:
+                result.append("")
+                result.append(
+                    "Note: this plugin build reports only the current thread and "
+                    "no per-thread detail. Rebuild/update the Obsidian plugin for "
+                    "full thread enumeration."
+                )
 
             return "\n".join(result)
 
+        except FeatureUnavailableError as e:
+            return f"Error: {e}"
         except Exception as e:
             logger.error(f"x64dbg_get_threads failed: {e}")
             return f"Error: {e}"
+
+    def _require_thread(bridge, thread_id: str, action: str) -> dict | None:
+        """
+        Resolve a thread id to a live thread, or return None.
+
+        Checked client-side so an unknown id names the threads that do exist
+        rather than reporting a success the debugger never performed.
+        """
+        thread = bridge.find_thread(thread_id)
+        if thread is not None:
+            return thread
+        try:
+            live = bridge.get_threads()
+        except Exception:
+            live = []
+        known = ", ".join(str(t["id"]) for t in live[:20]) or "(none)"
+        raise ValueError(
+            f"No thread with id '{thread_id}' in the debugged process, so "
+            f"nothing was {action}.\nLive thread ids: {known}"
+        )
 
     @app.tool()
     @log_dynamic_tool
@@ -2430,35 +2485,51 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
         """
         Switch active thread in the debugger.
 
-        Changes the debugger's active thread context to the specified thread.
+        Changes the debugger's active thread context, so subsequent register
+        reads, stack walks and stepping apply to that thread.
 
         Args:
-            thread_id: Thread ID to switch to
+            thread_id: Thread ID to switch to (decimal, or 0x-prefixed hex)
 
         Returns:
-            New thread context information
+            The new active thread's context
 
         Example:
-            x64dbg_switch_thread("1234")  # Switch to thread 1234
+            x64dbg_switch_thread("4816")
         """
         try:
             bridge = get_x64dbg_bridge()
-            result = bridge.switch_thread(thread_id)
+            target = _require_thread(bridge, thread_id, "switched to")
 
-            lines = [f"Switched to thread {thread_id}"]
+            bridge.switch_thread(str(target["id"]))
 
-            # Include thread context if returned by API
-            if "registers" in result:
-                regs = result["registers"]
-                for reg, val in regs.items():
-                    lines.append(f"  {reg}: 0x{val}")
-            if "entry" in result:
-                lines.append(f"  Entry: 0x{result['entry']}")
-            if "status" in result:
-                lines.append(f"  Status: {result['status']}")
+            # Confirm from the debugger rather than asserting the switch
+            # happened because the call returned.
+            active = next(
+                (t for t in bridge.get_threads() if t["is_current"]), None
+            )
+            if active is not None and active["id"] != target["id"]:
+                return (
+                    f"Switch to thread {target['id']} did not take effect -- "
+                    f"thread {active['id']} is still active."
+                )
 
+            lines = [f"Switched to thread {target['id']}"]
+            current = active or target
+            if current["cip"] is not None:
+                lines.append(f"  CIP:       0x{current['cip']:016X}")
+            if current["entry"] is not None:
+                lines.append(f"  Entry:     0x{current['entry']:016X}")
+            if current["suspend_count"] is not None:
+                lines.append(f"  Suspended: {current['suspend_count']}")
+            lines.append("")
+            lines.append("Register and stack reads now apply to this thread.")
             return "\n".join(lines)
 
+        except FeatureUnavailableError as e:
+            return f"Error: {e}"
+        except ValueError as e:
+            return f"Error: {e}"
         except Exception as e:
             logger.error(f"x64dbg_switch_thread failed: {e}")
             return f"Error: {e}"
@@ -2470,19 +2541,30 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
         Suspend a thread in the debugged process.
 
         Args:
-            thread_id: Thread ID to suspend
+            thread_id: Thread ID to suspend (decimal, or 0x-prefixed hex)
 
         Returns:
-            Confirmation message
+            Confirmation with the thread's resulting suspend count
 
         Example:
-            x64dbg_suspend_thread("1234")  # Suspend thread 1234
+            x64dbg_suspend_thread("4816")
         """
         try:
             bridge = get_x64dbg_bridge()
-            bridge.suspend_thread(thread_id)
-            return f"Thread {thread_id} suspended"
+            target = _require_thread(bridge, thread_id, "suspended")
 
+            bridge.suspend_thread(str(target["id"]))
+
+            after = bridge.find_thread(str(target["id"]))
+            count = after["suspend_count"] if after else None
+            if count is not None:
+                return f"Thread {target['id']} suspended (suspend count: {count})"
+            return f"Thread {target['id']} suspended"
+
+        except FeatureUnavailableError as e:
+            return f"Error: {e}"
+        except ValueError as e:
+            return f"Error: {e}"
         except Exception as e:
             logger.error(f"x64dbg_suspend_thread failed: {e}")
             return f"Error: {e}"
@@ -2493,20 +2575,40 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
         """
         Resume a suspended thread in the debugged process.
 
+        A thread suspended N times needs N resumes before it runs, so the
+        resulting suspend count is reported.
+
         Args:
-            thread_id: Thread ID to resume
+            thread_id: Thread ID to resume (decimal, or 0x-prefixed hex)
 
         Returns:
-            Confirmation message
+            Confirmation with the thread's resulting suspend count
 
         Example:
-            x64dbg_resume_thread("1234")  # Resume thread 1234
+            x64dbg_resume_thread("4816")
         """
         try:
             bridge = get_x64dbg_bridge()
-            bridge.resume_thread(thread_id)
-            return f"Thread {thread_id} resumed"
+            target = _require_thread(bridge, thread_id, "resumed")
 
+            bridge.resume_thread(str(target["id"]))
+
+            after = bridge.find_thread(str(target["id"]))
+            count = after["suspend_count"] if after else None
+            if count is None:
+                return f"Thread {target['id']} resumed"
+            if count > 0:
+                return (
+                    f"Thread {target['id']} resumed, but its suspend count is "
+                    f"still {count} -- it stays suspended until that reaches 0. "
+                    f"Call this {count} more time(s)."
+                )
+            return f"Thread {target['id']} resumed and running (suspend count: 0)"
+
+        except FeatureUnavailableError as e:
+            return f"Error: {e}"
+        except ValueError as e:
+            return f"Error: {e}"
         except Exception as e:
             logger.error(f"x64dbg_resume_thread failed: {e}")
             return f"Error: {e}"
@@ -2518,17 +2620,22 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
         Suspend all threads in the debugged process.
 
         Returns:
-            Confirmation with thread count
+            Confirmation with the number of threads affected
 
         Example:
-            x64dbg_suspend_all_threads()  # Suspend all threads
+            x64dbg_suspend_all_threads()
         """
         try:
             bridge = get_x64dbg_bridge()
             result = bridge.suspend_all_threads()
-            count = result.get("count", "unknown")
-            return f"All threads suspended (count: {count})"
+            # The plugin reports thread_count; tolerate count from other builds.
+            count = result.get("thread_count", result.get("count"))
+            if count is None:
+                return "All threads suspended."
+            return f"All threads suspended ({count} thread(s))."
 
+        except FeatureUnavailableError as e:
+            return f"Error: {e}"
         except Exception as e:
             logger.error(f"x64dbg_suspend_all_threads failed: {e}")
             return f"Error: {e}"
@@ -2540,17 +2647,45 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
         Resume all threads in the debugged process.
 
         Returns:
-            Confirmation with thread count
+            Confirmation with the number of threads affected, and any thread
+            still holding a non-zero suspend count.
 
         Example:
-            x64dbg_resume_all_threads()  # Resume all threads
+            x64dbg_resume_all_threads()
         """
         try:
             bridge = get_x64dbg_bridge()
             result = bridge.resume_all_threads()
-            count = result.get("count", "unknown")
-            return f"All threads resumed (count: {count})"
+            count = result.get("thread_count", result.get("count"))
 
+            lines = [
+                "All threads resumed."
+                if count is None
+                else f"All threads resumed ({count} thread(s))."
+            ]
+
+            # A thread suspended more than once is still suspended here, which
+            # is exactly the case a caller would otherwise misread as done.
+            try:
+                still = [
+                    t for t in bridge.get_threads()
+                    if t["suspend_count"] not in (None, 0)
+                ]
+            except Exception:
+                still = []
+            if still:
+                lines.append("")
+                lines.append("Still suspended (nested suspend counts):")
+                for thread in still[:20]:
+                    lines.append(
+                        f"  TID {thread['id']}: suspend count "
+                        f"{thread['suspend_count']}"
+                    )
+
+            return "\n".join(lines)
+
+        except FeatureUnavailableError as e:
+            return f"Error: {e}"
         except Exception as e:
             logger.error(f"x64dbg_resume_all_threads failed: {e}")
             return f"Error: {e}"

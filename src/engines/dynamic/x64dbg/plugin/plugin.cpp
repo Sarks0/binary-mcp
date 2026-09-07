@@ -17,6 +17,7 @@
 // x64dbg SDK headers
 #include "pluginsdk/_plugins.h"
 #include "pluginsdk/bridgemain.h"
+#include "pluginsdk/bridgelist.h"
 #include "pluginsdk/_scriptapi_module.h"
 
 #pragma comment(lib, "advapi32.lib")  // Link Crypto API
@@ -134,7 +135,14 @@ enum RequestType {
     GET_COVERAGE_DATA = 162,
     CLEAR_COVERAGE = 163,
     GET_COVERAGE_STATS = 164,
-    EXPORT_COVERAGE = 165
+    EXPORT_COVERAGE = 165,
+
+    // Thread control
+    SWITCH_THREAD = 170,
+    SUSPEND_THREAD = 171,
+    RESUME_THREAD = 172,
+    SUSPEND_ALL_THREADS = 173,
+    RESUME_ALL_THREADS = 174
 };
 
 // Plugin globals
@@ -931,26 +939,173 @@ std::string HandleGetModules(const std::string& request) {
 }
 
 // Handler: GET_THREADS - List threads
+//
+// Enumerates every thread via DbgGetThreadList. The previous implementation
+// returned only the current thread's id, which made a multi-threaded process
+// look single-threaded and left the thread-control endpoints with nothing
+// meaningful to address.
 std::string HandleGetThreads(const std::string& request) {
     if (!DbgIsDebugging()) {
         return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
     }
 
-    // Get current thread info using available API
-    DWORD currentThreadId = DbgGetThreadId();
-
     std::stringstream data;
     data << "\"threads\":[";
 
-    // Return at least the current thread
-    if (currentThreadId != 0) {
-        data << "{\"id\":" << currentThreadId << ","
-             << "\"is_current\":true}";
+    THREADLIST threadList = {};
+    DbgGetThreadList(&threadList);
+
+    int emitted = 0;
+    if (threadList.list && threadList.count > 0) {
+        for (int i = 0; i < threadList.count; i++) {
+            const THREADALLINFO& t = threadList.list[i];
+
+            if (emitted > 0) data << ",";
+            data << "{\"id\":" << t.BasicInfo.ThreadId << ","
+                 << "\"number\":" << t.BasicInfo.ThreadNumber << ","
+                 << "\"entry\":\"" << std::hex << t.BasicInfo.ThreadStartAddress
+                 << std::dec << "\","
+                 << "\"teb\":\"" << std::hex << t.BasicInfo.ThreadLocalBase
+                 << std::dec << "\","
+                 << "\"cip\":\"" << std::hex << t.ThreadCip << std::dec << "\","
+                 << "\"suspend_count\":" << t.SuspendCount << ","
+                 << "\"priority\":" << (int)t.Priority << ","
+                 << "\"wait_reason\":" << (int)t.WaitReason << ","
+                 << "\"last_error\":" << t.LastError << ","
+                 << "\"name\":\"" << JsonEscape(t.BasicInfo.threadName) << "\","
+                 << "\"is_current\":"
+                 << ((i == threadList.CurrentThread) ? "true" : "false") << "}";
+            emitted++;
+        }
+    }
+
+    if (threadList.list) {
+        BridgeFree(threadList.list);
+    }
+
+    // Degrade to the current thread rather than returning nothing if
+    // enumeration is unavailable.
+    if (emitted == 0) {
+        DWORD currentThreadId = DbgGetThreadId();
+        if (currentThreadId != 0) {
+            data << "{\"id\":" << currentThreadId << ",\"is_current\":true}";
+        }
     }
 
     data << "]";
 
     return BuildJsonResponse(true, data.str());
+}
+
+// Shared implementation for the single-thread control commands.
+static std::string ThreadCommand(
+    const std::string& request,
+    const char* commandName,
+    const char* pastTense
+) {
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+    }
+
+    std::string threadIdStr = ExtractStringField(request, "thread_id");
+    if (threadIdStr.empty()) {
+        return BuildJsonResponse(false, "\"error\":\"Missing thread_id\"");
+    }
+
+    // The id has to name a live thread: x64dbg's thread commands report
+    // success for an unknown id, which would let a caller believe it had
+    // suspended something it had not.
+    duint threadId = 0;
+    try {
+        threadId = (duint)std::stoull(threadIdStr, nullptr, 0);
+    } catch (const std::exception&) {
+        return BuildJsonResponse(false, "\"error\":\"thread_id is not a number\"");
+    }
+
+    bool known = false;
+    THREADLIST threadList = {};
+    DbgGetThreadList(&threadList);
+    if (threadList.list) {
+        for (int i = 0; i < threadList.count; i++) {
+            if (threadList.list[i].BasicInfo.ThreadId == threadId) {
+                known = true;
+                break;
+            }
+        }
+        BridgeFree(threadList.list);
+    }
+
+    if (!known) {
+        std::stringstream err;
+        err << "\"error\":\"No thread with id " << threadId
+            << " in this process\"";
+        return BuildJsonResponse(false, err.str());
+    }
+
+    std::stringstream cmd;
+    cmd << commandName << " " << threadId;
+
+    if (!DbgCmdExecDirect(cmd.str().c_str())) {
+        std::stringstream err;
+        err << "\"error\":\"" << commandName << " failed for thread "
+            << threadId << "\"";
+        return BuildJsonResponse(false, err.str());
+    }
+
+    std::stringstream data;
+    data << "\"thread_id\":" << threadId << ","
+         << "\"action\":\"" << pastTense << "\"";
+    return BuildJsonResponse(true, data.str());
+}
+
+// Shared implementation for the all-thread control commands.
+static std::string AllThreadsCommand(const char* commandName, const char* pastTense) {
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+    }
+
+    THREADLIST threadList = {};
+    DbgGetThreadList(&threadList);
+    int count = threadList.list ? threadList.count : 0;
+    if (threadList.list) {
+        BridgeFree(threadList.list);
+    }
+
+    if (!DbgCmdExecDirect(commandName)) {
+        std::stringstream err;
+        err << "\"error\":\"" << commandName << " failed\"";
+        return BuildJsonResponse(false, err.str());
+    }
+
+    std::stringstream data;
+    data << "\"thread_count\":" << count << ","
+         << "\"action\":\"" << pastTense << "\"";
+    return BuildJsonResponse(true, data.str());
+}
+
+// Handler: SWITCH_THREAD - Make a thread the active context
+std::string HandleSwitchThread(const std::string& request) {
+    return ThreadCommand(request, "switchthread", "switched");
+}
+
+// Handler: SUSPEND_THREAD - Suspend a single thread
+std::string HandleSuspendThread(const std::string& request) {
+    return ThreadCommand(request, "suspendthread", "suspended");
+}
+
+// Handler: RESUME_THREAD - Resume a single thread
+std::string HandleResumeThread(const std::string& request) {
+    return ThreadCommand(request, "resumethread", "resumed");
+}
+
+// Handler: SUSPEND_ALL_THREADS - Suspend every thread in the process
+std::string HandleSuspendAllThreads(const std::string& request) {
+    return AllThreadsCommand("suspendallthreads", "suspended");
+}
+
+// Handler: RESUME_ALL_THREADS - Resume every thread in the process
+std::string HandleResumeAllThreads(const std::string& request) {
+    return AllThreadsCommand("resumeallthreads", "resumed");
 }
 
 // Handler: GET_STACK - Get stack trace
@@ -4081,6 +4236,23 @@ static DWORD WINAPI PipeServerThread(LPVOID lpParam) {
                         break;
                     case EXPORT_COVERAGE:
                         response = HandleExportCoverage(request);
+                        break;
+
+                    // Thread control
+                    case SWITCH_THREAD:
+                        response = HandleSwitchThread(request);
+                        break;
+                    case SUSPEND_THREAD:
+                        response = HandleSuspendThread(request);
+                        break;
+                    case RESUME_THREAD:
+                        response = HandleResumeThread(request);
+                        break;
+                    case SUSPEND_ALL_THREADS:
+                        response = HandleSuspendAllThreads(request);
+                        break;
+                    case RESUME_ALL_THREADS:
+                        response = HandleResumeAllThreads(request);
                         break;
 
                     default:

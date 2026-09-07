@@ -287,11 +287,13 @@ class TestServerToolsRoundTrip:
             str(binary), "0x140001000", "AES-256", kind="plate"
         )
         assert "Note Saved" in result
-        assert "decrypt_string" in result
+        # Keyed by RVA even though the function carries a USER_DEFINED name:
+        # names change when a Ghidra project is re-read, addresses do not.
+        assert "rva:0x1000" in result
 
         listing = server_module.get_notes(str(binary))
         assert "AES-256" in listing
-        assert "decrypt_string" in listing
+        assert "rva:0x1000" in listing
 
         # Filtered get
         single = server_module.get_notes(str(binary), address="0x140001000")
@@ -529,3 +531,63 @@ class TestLoadPdbAllowlist:
         # The fetched PDB was used despite living outside the allowlist.
         assert seen["pdb_path"] == str(fetched_pdb), seen
         assert "PDB applied" in result, result
+
+
+class TestNotesSurviveProjectRename:
+    """A note must survive its function being renamed in the Ghidra GUI.
+
+    Attaching to a Ghidra project makes that project authoritative over
+    function names, so a rename between two re-pulls is routine. Notes are
+    therefore keyed by RVA, not by the name the function happened to have when
+    the note was written -- a name key would simply stop matching, and
+    ``apply_notes_overlay`` fails silently by design (it must never break an
+    analysis), so the note would vanish with no error.
+    """
+
+    def test_note_key_is_rva_not_name(self, server_module, tmp_path, monkeypatch):
+        binary = _binary(tmp_path)
+        ctx = _ctx(functions=[_func("decrypt_string", "0x140001000")])
+        _wire_for_notes(server_module, ctx, monkeypatch)
+        _wire_real_cache(server_module, monkeypatch, tmp_path)
+
+        server_module.add_note(str(binary), "0x140001000", "AES-256", kind="plate")
+
+        notes = server_module.cache.read_notes(str(binary))
+        assert [n["function_key"] for n in notes] == ["rva:0x1000"]
+
+    def test_overlay_still_lands_after_gui_rename(self, tmp_path):
+        """Write a note against one name, re-pull with another, still attached."""
+        binary = _binary(tmp_path)
+        cache = _cache(tmp_path)
+
+        cache.write_notes(str(binary), [{
+            "function_key": "rva:0x1000",
+            "kind": "plate",
+            "text": "AES-256 key schedule",
+        }])
+
+        # The re-pull sees the function under the name the human just gave it
+        # in Ghidra. Same address, different name.
+        renamed = _ctx(functions=[_func("aes_expand_key", "0x140001000")])
+        overlaid = cache.apply_notes_overlay(str(binary), renamed)
+
+        assert overlaid["functions"][0]["notes"]["plate"] == "AES-256 key schedule"
+
+    def test_legacy_name_keyed_notes_still_resolve(self, tmp_path):
+        """Notes written before the RVA switch must keep working."""
+        binary = _binary(tmp_path)
+        cache = _cache(tmp_path)
+
+        cache.write_notes(str(binary), [{
+            "function_key": "decrypt_string",
+            "kind": "plate",
+            "text": "written under the old scheme",
+        }])
+
+        ctx = _ctx(functions=[_func("decrypt_string", "0x140001000")])
+        overlaid = cache.apply_notes_overlay(str(binary), ctx)
+
+        assert (
+            overlaid["functions"][0]["notes"]["plate"]
+            == "written under the old scheme"
+        )

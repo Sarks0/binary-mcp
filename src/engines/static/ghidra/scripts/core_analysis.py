@@ -717,9 +717,22 @@ def extract_comprehensive_analysis():
     except Exception:
         language_desc = language_id
 
+    # SHA256 of the bytes Ghidra imported. The server compares this against
+    # the hash of the file it was asked to analyze: when attaching to a
+    # pre-existing project, nothing else proves the program in that project is
+    # the same binary, and a mismatch would silently file one program's
+    # functions under another binary's cache key. Ghidra populates this at
+    # import time; projects made by very old versions can return null, which
+    # the server treats as "unknown" rather than a mismatch.
+    try:
+        executable_sha256 = safe_unicode(program.getExecutableSHA256() or u"")
+    except Exception:
+        executable_sha256 = u""
+
     context["metadata"] = {
         "name": safe_unicode(program.getName()),
         "executable_path": safe_unicode(program.getExecutablePath()),
+        "executable_sha256": executable_sha256,
         "executable_format": safe_unicode(program.getExecutableFormat()),
         "language": language_id,
         "language_description": language_desc,

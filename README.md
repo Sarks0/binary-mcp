@@ -51,6 +51,12 @@ Decompile the function at 0x401000
 Find all suspicious API calls and crypto constants
 ```
 
+**Continue manual work** - Pick up a Ghidra project you annotated by hand.
+```
+List my Ghidra projects
+Analyze okular.exe using my okular.stage2 project
+```
+
 **Live Debugging** - Control x64dbg from Claude.
 ```
 Connect to x64dbg and set breakpoints on BCryptEncrypt
@@ -70,11 +76,13 @@ Analyze the crash dump at C:\Windows\MEMORY.DMP
 Decompile the type MyNamespace.MyClass to C#
 ```
 
-## Capabilities (255 tools)
+## Capabilities (256 tools)
 
-### Static Analysis (Ghidra) - 35 tools
+### Static Analysis (Ghidra) - 36 tools
 
 Analysis, decompilation, cross-references, memory maps, byte pattern search, function renaming, call graphs, API pattern detection (100+ Windows APIs), crypto constant identification, IOC extraction, and binary compatibility checking.
+
+Analysis can also attach to a Ghidra project you built and annotated in the GUI, picking up your renamed functions and comments instead of importing the binary fresh. The project is opened read-only and is never modified. See [docs/ghidra-project-attach.md](docs/ghidra-project-attach.md).
 
 ### Dynamic Analysis (x64dbg) - 159 tools
 
@@ -154,6 +162,7 @@ Comprehensive PE header, section, import, export, resource, debug, TLS, and Rich
 |----------|-------------|---------|
 | `GHIDRA_HOME` | Ghidra installation path | Auto-detected |
 | `GHIDRA_TIMEOUT` | Analysis timeout (seconds) | 600 |
+| `GHIDRA_PROJECT_DIR` | Extra directories to search for existing Ghidra projects (`os.pathsep`-separated) | `<cache>/ghidra_projects` |
 | `X64DBG_PATH` | x64dbg installation path | Auto-detected |
 | `WINDBG_PATH` | WinDbg/CDB installation path | Auto-detected |
 | `WINDBG_MODE` | Operating mode: `kernel`, `user`, `dump` | `kernel` |
@@ -172,6 +181,7 @@ uv run ruff check src/     # Lint
 
 - [Installation Guide](INSTALL.md)
 - [Contributing](CONTRIBUTING.md)
+- [Attaching to an existing Ghidra project](docs/ghidra-project-attach.md)
 - [WinDbg/Kernel Debugging Guide](docs/windbg-kernel-debugging.md)
 - [x64dbg Architecture](docs/x64dbg-architecture.md)
 - [MCP Protocol](https://modelcontextprotocol.io/)

@@ -369,13 +369,82 @@ class GhidraRunner:
         except OSError as e:
             logger.warning(f"Failed to remove staged PDB {staged_pdb}: {e}")
 
-    def _cleanup_project(self, project_dir: Path, project_name: str) -> None:
+    def _verify_existing_project(self, project_dir: Path, project_name: str) -> None:
+        """
+        Preflight an attach to a project we did not create.
+
+        Ghidra's own failure modes here are miserable to read: pointing
+        ``-process`` at a project that does not exist makes it create an empty
+        one and report success having analyzed nothing, and pointing it at a
+        project the GUI has open produces a Java lock trace. Both are cheap to
+        detect from out here, so we turn them into sentences.
+        """
+        gpr = project_dir / f"{project_name}.gpr"
+        rep = project_dir / f"{project_name}.rep"
+
+        if not project_dir.is_dir():
+            raise UserFacingError(
+                f"Ghidra project directory not found: {project_dir}\n"
+                "Set GHIDRA_PROJECT_DIR to the directory your Ghidra GUI uses, "
+                "or run list_ghidra_projects to see what is discoverable."
+            )
+
+        if not gpr.is_file():
+            available = sorted(p.stem for p in project_dir.glob("*.gpr"))
+            hint = (
+                f" Projects in {project_dir}: {', '.join(available)}"
+                if available
+                else f" No Ghidra projects found in {project_dir}."
+            )
+            raise UserFacingError(
+                f"Ghidra project '{project_name}' not found.{hint}\n"
+                "Run list_ghidra_projects to see every discoverable project."
+            )
+
+        if not rep.is_dir():
+            raise UserFacingError(
+                f"Ghidra project '{project_name}' has a .gpr file but no "
+                f"{project_name}.rep directory, so it holds no programs. "
+                "The project may be mid-creation or partially copied."
+            )
+
+        lock = project_dir / f"{project_name}.lock"
+        if lock.exists() or (project_dir / f"{project_name}.lock~").exists():
+            raise UserFacingError(
+                f"Ghidra project '{project_name}' is locked -- it is open in "
+                "the Ghidra GUI or another headless run has it. Close the "
+                "project in the Ghidra Front End and try again.\n"
+                f"If you are certain nothing is using it, the stale lock is at "
+                f"{lock}.",
+                internal_details=f"Lock file present for {project_dir / project_name}",
+            )
+
+    def _cleanup_project(
+        self, project_dir: Path, project_name: str, self_created: bool = True
+    ) -> None:
         """
         Clean up a Ghidra project directory and lock files.
 
         Called when analysis fails or times out to prevent lock issues.
+
+        Args:
+            self_created: Whether this server created the project. When False
+                this is a no-op, and that is the whole point of the argument:
+                the caller reaches here on timeout and on non-zero exit, and
+                the body below does ``rmtree`` on the ``.rep``. Against a
+                project a human spent weeks annotating, one slow Ghidra run
+                would otherwise destroy it. Defaults to True so existing
+                import-mode callers keep their behaviour.
         """
         import shutil
+
+        if not self_created:
+            logger.info(
+                "Leaving Ghidra project %s in %s alone: not created by this "
+                "server, so its contents are not ours to delete.",
+                project_name, project_dir,
+            )
+            return
 
         project_path = project_dir / f"{project_name}.rep"
         lock_file = project_dir / f"{project_name}.lock"
@@ -611,6 +680,11 @@ class GhidraRunner:
         analysis_depth: str = "full",
         on_spawn=None,
         force_decompile: bool = False,
+        project_dir: str | None = None,
+        use_existing_project: bool = False,
+        program_name: str | None = None,
+        folder_path: str | None = None,
+        read_only: bool = True,
     ) -> dict:
         """
         Run Ghidra headless analysis on a binary.
@@ -636,6 +710,29 @@ class GhidraRunner:
                 Ghidra's PdbUniversalAnalyzer picks it up automatically.
             enable_fid: When True, set GHIDRA_ENABLE_FID=1 so the Jython script
                 runs Function ID library matching per function.
+            project_dir: Directory holding the Ghidra project. Defaults to
+                ``<output_path parent>/ghidra_projects`` -- the managed
+                location this server creates and is free to delete from.
+            use_existing_project: Attach to a project that already exists
+                instead of importing the binary. Switches the command from
+                ``-import`` to ``-process``, which opens the program Ghidra
+                already holds, so anything a human did to it in the GUI
+                (renamed functions, plate and instruction comments, applied
+                types) is what gets extracted. Requires the project to exist;
+                never creates or deletes one.
+            program_name: Which program inside the project to process, i.e.
+                the argument to ``-process``. Ghidra names an imported program
+                after its file, so this defaults to the binary's filename.
+                Supports Ghidra's ``*``/``?`` wildcards. Pass ``"*"`` to take
+                every program in the folder.
+            folder_path: Subfolder within the project holding the program
+                (``"/stage2"``). Appended to the project name as Ghidra's
+                ``project_name/folder_path`` argument.
+            read_only: In ``use_existing_project`` mode, pass ``-readOnly`` so
+                Ghidra discards every change on exit. On by default and worth
+                keeping there: ``-process`` re-runs auto-analysis and then
+                *saves* the result back into the project, so without this an
+                extraction silently rewrites the human's work.
 
         Returns:
             dict with analysis results and metadata
@@ -664,20 +761,64 @@ class GhidraRunner:
 
         if project_name is None:
             project_name = binary_path.stem
-        # Sanitize project name to prevent parameter injection. Dots are
-        # flattened too (not just the illegal set): Ghidra treats a trailing
-        # dotted segment as an extension when it creates <name>.gpr/.rep/.lock,
-        # so a dotted name (e.g. "okular.stage2") diverges from what
-        # _cleanup_project() and ProjectCache reconstruct by concatenation,
-        # leaving an orphaned .lock that fails every later run. Keep this in
-        # sync with ProjectCache._get_project_name.
-        project_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', project_name)
-        if project_name.startswith('-'):
-            project_name = f"proj_{project_name}"
 
-        # Create temporary project directory
-        project_dir = Path(output_path).parent / "ghidra_projects"
-        project_dir.mkdir(parents=True, exist_ok=True)
+        if use_existing_project:
+            # An existing project's name is a fact on disk, not something we
+            # get to normalise -- the sanitiser below would turn "okular.stage2"
+            # into "okular_stage2" and Ghidra would then create a brand new
+            # empty project under that name rather than opening the one the
+            # user asked for. Validate instead of rewriting, and keep the
+            # character set tight enough that the name cannot introduce an
+            # argument.
+            project_name = validate_parameter_pattern(
+                project_name, "project_name",
+                pattern=r'^[a-zA-Z0-9_.\- ]+$',
+                max_length=200,
+            )
+            if project_name.startswith("-"):
+                raise UserFacingError(
+                    f"Refusing to open a Ghidra project whose name starts with "
+                    f"'-' ({project_name!r}); it would be read as a command-line "
+                    "flag."
+                )
+        else:
+            # Sanitize project name to prevent parameter injection. Dots are
+            # flattened too (not just the illegal set): Ghidra treats a trailing
+            # dotted segment as an extension when it creates <name>.gpr/.rep/.lock,
+            # so a dotted name (e.g. "okular.stage2") diverges from what
+            # _cleanup_project() and ProjectCache reconstruct by concatenation,
+            # leaving an orphaned .lock that fails every later run. Keep this in
+            # sync with ProjectCache._get_project_name.
+            project_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', project_name)
+            if project_name.startswith('-'):
+                project_name = f"proj_{project_name}"
+
+        # Resolve the project directory. The default is the managed location
+        # beside the cache, which we created and may therefore clean up; an
+        # explicit project_dir points somewhere the user owns.
+        managed_project_dir = Path(output_path).parent / "ghidra_projects"
+        if project_dir is None:
+            project_dir_path = managed_project_dir
+        else:
+            project_dir_path = Path(project_dir).expanduser()
+
+        # `self_created` is the single gate on every destructive action in this
+        # method. A project is ours to delete only when we are importing into
+        # it (so we created it) *and* it lives in the managed directory. Any
+        # other project belongs to the user: a timeout while reading their
+        # hand-annotated project must never remove it. `resolve()` tolerates
+        # non-existent paths, so this is safe before the mkdir below.
+        self_created = (
+            not use_existing_project
+            and project_dir_path.resolve() == managed_project_dir.resolve()
+        )
+
+        if use_existing_project:
+            self._verify_existing_project(project_dir_path, project_name)
+        else:
+            project_dir_path.mkdir(parents=True, exist_ok=True)
+
+        project_dir = project_dir_path
 
         # Set environment variables for output path and analysis options
         env = os.environ.copy()
@@ -755,13 +896,52 @@ class GhidraRunner:
             f"start_address={start_address}, end_address={end_address}"
         )
 
+        # Ghidra's project argument is "<name>" or "<name>/<folder_path>".
+        project_arg = project_name
+        if folder_path:
+            folder_clean = validate_parameter_pattern(
+                folder_path.strip("/"), "folder_path",
+                pattern=r'^[a-zA-Z0-9_.\-/ ]*$',
+                max_length=400,
+            )
+            # The pattern has to allow '.' (folder names contain it) and '/'
+            # (nesting), which together permit '..'. Ghidra resolves this as a
+            # logical project path rather than a filesystem one, so it is not a
+            # traversal, but a folder argument that walks upwards is a mistake
+            # either way -- refuse it rather than let it resolve to something
+            # the caller did not mean.
+            if any(seg == ".." for seg in folder_clean.split("/")):
+                raise UserFacingError(
+                    f"Invalid folder_path {folder_path!r}: '..' segments are "
+                    "not allowed. Give the folder's path within the project, "
+                    'e.g. "/stage2".'
+                )
+            if folder_clean:
+                project_arg = f"{project_name}/{folder_clean}"
+
         # Build command - processor/loader must come immediately after binary path
         cmd = [
             self._get_analyze_headless_cmd(),
             str(project_dir),
-            project_name,
-            "-import", str(binary_path),
+            project_arg,
         ]
+
+        if use_existing_project:
+            # -process opens what the project already holds. Ghidra rejects
+            # -import and -process together, and -overwrite does not apply to
+            # -process, so neither appears on this path.
+            if program_name is None:
+                program_name = binary_path.name
+            program_arg = validate_parameter_pattern(
+                program_name, "program_name",
+                # Ghidra matches this against domain file names and honours
+                # * / ? as wildcards, so both are permitted here.
+                pattern=r'^[a-zA-Z0-9_.\-*? ]+$',
+                max_length=200,
+            )
+            cmd.extend(["-process", program_arg])
+        else:
+            cmd.extend(["-import", str(binary_path)])
 
         # Add processor/loader if specified (must be before other flags)
         if processor:
@@ -785,8 +965,11 @@ class GhidraRunner:
                 raise ValueError(f"Invalid loader specification: {e}")
             cmd.extend(["-loader", loader])
 
-        # Add remaining flags
-        cmd.append("-overwrite")
+        # Add remaining flags. -overwrite tells Ghidra to replace a program of
+        # the same name on import, which is exactly what must NOT happen when
+        # attaching -- it would discard the annotated program we came for.
+        if not use_existing_project:
+            cmd.append("-overwrite")
         cmd.extend([
             "-scriptPath", str(script_path),
         ])
@@ -805,10 +988,25 @@ class GhidraRunner:
             "-postScript", script_name,
         ])
 
-        if analysis_depth == "shallow":
+        if use_existing_project:
+            # -process re-runs auto-analysis unconditionally (HeadlessAnalyzer
+            # calls reAnalyzeAll regardless of prior state) and then saves the
+            # result back to the project. -readOnly makes Ghidra discard every
+            # change on exit, and -noanalysis skips the re-analysis that would
+            # have produced them: together they turn this into a pure read of
+            # the human's work, which is the only safe way to touch a project
+            # we do not own.
+            if read_only:
+                cmd.append("-readOnly")
+            cmd.append("-noanalysis")
+        elif analysis_depth == "shallow":
             cmd.append("-noanalysis")
 
-        if not keep_project:
+        # -deleteProject destroys the project on exit, so it is gated on
+        # `self_created` like every other destructive step: an import into a
+        # directory the user nominated leaves its project behind rather than
+        # deleting something inside their space.
+        if not keep_project and self_created:
             cmd.append("-deleteProject")
 
         logger.info(f"Running Ghidra analysis: {' '.join(cmd)}")
@@ -884,7 +1082,7 @@ class GhidraRunner:
                             pass
                     drain_stdout, drain_stderr = "", ""
 
-                self._cleanup_project(project_dir, project_name)
+                self._cleanup_project(project_dir, project_name, self_created)
 
                 partial_stdout = (e.stdout.decode("utf-8", errors="replace")
                                   if isinstance(e.stdout, bytes)
@@ -908,7 +1106,7 @@ class GhidraRunner:
                 logger.error(f"stdout: {stdout}")
                 logger.error(f"stderr: {stderr}")
 
-                self._cleanup_project(project_dir, project_name)
+                self._cleanup_project(project_dir, project_name, self_created)
 
                 diagnostic = _extract_ghidra_diagnostic(stdout or "", stderr or "")
                 raise GhidraAnalysisError(
@@ -924,6 +1122,9 @@ class GhidraRunner:
                 "success": True,
                 "binary": str(binary_path),
                 "project_name": project_name,
+                "project_dir": str(project_dir),
+                "attached": use_existing_project,
+                "program_name": program_arg if use_existing_project else None,
                 "output_path": output_path,
                 "elapsed_time": elapsed_time,
                 "stdout": stdout,

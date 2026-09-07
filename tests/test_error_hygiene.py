@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import ast
 import re
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -157,6 +158,16 @@ def _capture_tools(register, *args, **kwargs) -> dict:
     app = MagicMock()
     app.tool = MagicMock(side_effect=_decorator)
     register(app, *args, **kwargs)
+
+    # dynamic_tools registers 16 grouped tools rather than one name per tool;
+    # its 159 implementations are reachable through the registry the grouping
+    # populates. These tests address those implementations, so surface them
+    # under their own names -- what they assert is unchanged.
+    module = sys.modules.get(register.__module__)
+    for group in getattr(module, "_OP_REGISTRY", {}).values():
+        for impl in group.values():
+            captured.setdefault(impl.__name__, impl)
+
     return captured
 
 

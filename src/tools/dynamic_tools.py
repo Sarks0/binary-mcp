@@ -7,6 +7,7 @@ Provides debugger-based analysis capabilities with session logging.
 from __future__ import annotations
 
 import functools
+import inspect
 import json
 import logging
 import os
@@ -48,6 +49,9 @@ _x64dbg_commands: X64DbgCommands | None = None
 
 # Global Ghidra project cache (for static/dynamic cross-reference)
 _ghidra_cache: ProjectCache | None = None
+
+# Grouped operation registry, populated by register_dynamic_tools.
+_OP_REGISTRY: dict[str, dict[str, object]] = {}
 
 # Cache for function mappings (binary_path -> {function_name -> static_address})
 _function_mappings: dict[str, dict[str, dict]] = {}
@@ -822,6 +826,127 @@ def _resolve_function_to_runtime(
     }
 
 
+# Sentinel distinguishing "the caller did not pass this" from a real value.
+# Grouped tools declare the union of their operations' parameters, all
+# optional, so a missing argument must not be forwarded as None -- the
+# underlying implementation's own default has to win.
+_UNSET = object()
+
+
+def _first_doc_line(func) -> str:
+    """First sentence of a function's docstring, for the op catalog."""
+    doc = (func.__doc__ or "").strip()
+    for line in doc.split("\n"):
+        line = line.strip()
+        if line:
+            return line
+    return ""
+
+
+def _op_params(func) -> list[str]:
+    """Parameter names an operation accepts, in declaration order."""
+    return list(inspect.signature(func).parameters)
+
+
+def build_op_catalog(ops: dict[str, object]) -> str:
+    """
+    Render the operation table appended to a grouped tool's docstring.
+
+    Generated from the implementations themselves so the documented
+    parameters cannot drift from the ones actually accepted -- the drift
+    between advertised and real arguments is what made the previous surface
+    hard to call correctly.
+    """
+    lines = ["", "Operations:"]
+    for name in sorted(ops):
+        func = ops[name]
+        params = ", ".join(_op_params(func)) or "no arguments"
+        summary = _first_doc_line(func)
+        lines.append(f"  {name} -- {summary}")
+        lines.append(f"      args: {params}")
+    return "\n".join(lines)
+
+
+def dispatch_op(
+    group: str,
+    ops: dict[str, object],
+    op: str,
+    supplied: dict[str, object],
+) -> str:
+    """
+    Route one grouped-tool call to its implementation.
+
+    Forwards only arguments the target actually accepts, and rejects ones it
+    does not rather than dropping them silently -- a caller that passes
+    ``size`` to an operation that ignores it should be told, not left to
+    believe it took effect.
+    """
+    if not op:
+        return (
+            f"Error: x64dbg_{group} needs an 'op'.\n"
+            f"Valid operations: {', '.join(sorted(ops))}"
+        )
+
+    target = ops.get(op)
+    if target is None:
+        close = [name for name in sorted(ops) if op in name or name in op]
+        hint = f"\nDid you mean: {', '.join(close)}?" if close else ""
+        return (
+            f"Error: '{op}' is not an operation of x64dbg_{group}.\n"
+            f"Valid operations: {', '.join(sorted(ops))}{hint}"
+        )
+
+    accepted = set(_op_params(target))
+    given = {k: v for k, v in supplied.items() if v is not _UNSET}
+
+    unexpected = sorted(set(given) - accepted)
+    if unexpected:
+        expected = ", ".join(_op_params(target)) or "no arguments"
+        return (
+            f"Error: x64dbg_{group}(op=\"{op}\") does not take "
+            f"{', '.join(unexpected)}.\n"
+            f"It takes: {expected}"
+        )
+
+    required = [
+        name for name, param in inspect.signature(target).parameters.items()
+        if param.default is inspect.Parameter.empty
+    ]
+    missing = [name for name in required if name not in given]
+    if missing:
+        # Checked here rather than letting the call raise, so the message names
+        # the operation the caller used instead of the internal function.
+        return (
+            f"Error: x64dbg_{group}(op=\"{op}\") is missing "
+            f"{', '.join(missing)}.\n"
+            f"Required arguments: {', '.join(required)}"
+        )
+
+    return target(**given)
+
+
+# Prose half of each grouped tool's description. The operation catalog is
+# generated from the implementations and appended at registration, so the
+# documented arguments cannot drift from the accepted ones.
+_GROUP_DOCS = {
+    'session': 'Debugger session: connect, attach, process state, anti-debug and privileges.\n\nPass the operation in `op`; pass only the arguments that\noperation takes. Operations and their arguments are listed below.',
+    'state': 'Save and restore debugging state (breakpoints, comments, labels, watches).\n\nPass the operation in `op`; pass only the arguments that\noperation takes. Operations and their arguments are listed below.',
+    'execution': 'Run, step, and wait for the debuggee to reach a state.\n\nPass the operation in `op`; pass only the arguments that\noperation takes. Operations and their arguments are listed below.',
+    'breakpoint': 'Every kind of breakpoint: software, hardware, memory, DLL, exception, conditional.\n\nPass the operation in `op`; pass only the arguments that\noperation takes. Operations and their arguments are listed below.',
+    'memory': 'Read, write, allocate, protect, search and watch process memory.\n\nPass the operation in `op`; pass only the arguments that\noperation takes. Operations and their arguments are listed below.',
+    'context': 'CPU registers and the call stack of the active thread.\n\nPass the operation in `op`; pass only the arguments that\noperation takes. Operations and their arguments are listed below.',
+    'thread': 'List threads and control their execution.\n\nPass the operation in `op`; pass only the arguments that\noperation takes. Operations and their arguments are listed below.',
+    'module': 'Loaded modules and their imports, exports and on-disk dumps.\n\nPass the operation in `op`; pass only the arguments that\noperation takes. Operations and their arguments are listed below.',
+    'disasm': 'Disassemble, evaluate expressions, and navigate the debugger UI.\n\nPass the operation in `op`; pass only the arguments that\noperation takes. Operations and their arguments are listed below.',
+    'search': 'Search the debuggee for instructions, GUIDs, strings and references.\n\nPass the operation in `op`; pass only the arguments that\noperation takes. Operations and their arguments are listed below.',
+    'analyze': "Run x64dbg's analysis passes and inspect exception state.\n\nPass the operation in `op`; pass only the arguments that\noperation takes. Operations and their arguments are listed below.",
+    'types': 'Define, inspect and apply C types and structures.\n\nPass the operation in `op`; pass only the arguments that\noperation takes. Operations and their arguments are listed below.',
+    'trace': 'Instruction and API tracing, trace conditions, and trace logs.\n\nPass the operation in `op`; pass only the arguments that\noperation takes. Operations and their arguments are listed below.',
+    'annotate': 'Comments, bookmarks, user-defined functions, variables and watches.\n\nPass the operation in `op`; pass only the arguments that\noperation takes. Operations and their arguments are listed below.',
+    'symbols': 'Bridge static analysis to the live process: resolve Ghidra functions to runtime addresses.\n\nPass the operation in `op`; pass only the arguments that\noperation takes. Operations and their arguments are listed below.',
+    'hooks': 'Detect, inspect and remove inline/IAT/EAT hooks.\n\nPass the operation in `op`; pass only the arguments that\noperation takes. Operations and their arguments are listed below.',
+}
+
 def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager | None = None) -> None:
     """
     Register all dynamic analysis tools with the MCP server.
@@ -833,7 +958,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
     global _session_manager
     _session_manager = session_manager
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_status() -> str:
         """
@@ -861,7 +985,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 e,
             )
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_connect(host: str = "127.0.0.1", port: int = 8765) -> str:
         """
@@ -921,7 +1044,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 e,
             )
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_attach(pid: int) -> str:
         """
@@ -968,7 +1090,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 e,
             )
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_detach() -> str:
         """
@@ -991,7 +1112,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_detach failed: {e}")
             return safe_error_message("x64dbg_detach failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_create_minidump(output_path: str = "") -> str:
         """
@@ -1049,7 +1169,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_create_minidump failed: {e}")
             return safe_error_message("x64dbg_create_minidump failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_run() -> str:
         """
@@ -1069,7 +1188,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_run failed: {e}")
             return safe_error_message("x64dbg_run failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_wait_paused(timeout_seconds: int = 30) -> str:
         """
@@ -1116,7 +1234,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_wait_paused failed: {e}")
             return safe_error_message("x64dbg_wait_paused failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_wait_running(timeout_seconds: int = 10) -> str:
         """
@@ -1150,7 +1267,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_wait_running failed: {e}")
             return safe_error_message("x64dbg_wait_running failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_wait_debugging(timeout_seconds: int = 30) -> str:
         """
@@ -1186,7 +1302,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_wait_debugging failed: {e}")
             return safe_error_message("x64dbg_wait_debugging failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_run_and_wait(timeout_seconds: int = 30) -> str:
         """
@@ -1236,7 +1351,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_run_and_wait failed: {e}")
             return safe_error_message("x64dbg_run_and_wait failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_pause() -> str:
         """
@@ -1256,7 +1370,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_pause failed: {e}")
             return safe_error_message("x64dbg_pause failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_step_into(steps: int = 1) -> str:
         """
@@ -1290,7 +1403,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_step_into failed: {e}")
             return safe_error_message("x64dbg_step_into failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_step_over(steps: int = 1) -> str:
         """
@@ -1317,7 +1429,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_step_over failed: {e}")
             return safe_error_message("x64dbg_step_over failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_get_registers() -> str:
         """
@@ -1341,7 +1452,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_get_registers failed: {e}")
             return safe_error_message("x64dbg_get_registers failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_set_breakpoint(address: str) -> str:
         """
@@ -1368,7 +1478,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_set_breakpoint failed: {e}")
             return format_error_response(e, "set_breakpoint")
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_delete_breakpoint(address: str) -> str:
         """
@@ -1392,7 +1501,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_delete_breakpoint failed: {e}")
             return format_error_response(e, "delete_breakpoint")
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_set_breakpoints(breakpoints: list[dict]) -> str:
         """
@@ -1479,7 +1587,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_set_breakpoints failed: {e}")
             return safe_error_message("x64dbg_set_breakpoints failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_delete_breakpoints(addresses: list[str]) -> str:
         """
@@ -1527,7 +1634,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_delete_breakpoints failed: {e}")
             return safe_error_message("x64dbg_delete_breakpoints failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_list_breakpoints() -> str:
         """
@@ -1555,7 +1661,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
     # Exception handling control tools
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_set_exception_breakpoint(
         exception_code: str, chance: str = "first"
@@ -1591,7 +1696,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_set_exception_breakpoint failed: {e}")
             return format_error_response(e, "set_exception_breakpoint")
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_delete_exception_breakpoint(exception_code: str) -> str:
         """
@@ -1618,7 +1722,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_delete_exception_breakpoint failed: {e}")
             return format_error_response(e, "delete_exception_breakpoint")
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_list_exception_breakpoints() -> str:
         """
@@ -1646,7 +1749,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_list_exception_breakpoints failed: {e}")
             return safe_error_message("x64dbg_list_exception_breakpoints failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_skip_exception(exception_code: str) -> str:
         """
@@ -1676,7 +1778,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_skip_exception failed: {e}")
             return format_error_response(e, "skip_exception")
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_read_memory(address: str, size: int = 256) -> str:
         """
@@ -1725,7 +1826,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_read_memory failed: {e}")
             return safe_error_message("x64dbg_read_memory failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_disassemble(address: str, count: int = 20) -> str:
         """
@@ -1785,7 +1885,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_disassemble failed: {e}")
             return format_error_response(e, "disassemble")
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_trace_execution(steps: int = 10) -> str:
         """
@@ -1823,7 +1922,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_trace_execution failed: {e}")
             return safe_error_message("x64dbg_trace_execution failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_trace_api_calls(
         apis: list[str],
@@ -1980,7 +2078,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_trace_api_calls failed: {e}")
             return safe_error_message("x64dbg_trace_api_calls failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_start_trace(
         trace_into: bool = True,
@@ -2057,7 +2154,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_start_trace failed: {e}")
             return safe_error_message("x64dbg_start_trace failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_stop_trace() -> str:
         """
@@ -2086,7 +2182,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_stop_trace failed: {e}")
             return safe_error_message("x64dbg_stop_trace failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_get_trace(max_entries: int = 100) -> str:
         """
@@ -2140,7 +2235,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_get_trace failed: {e}")
             return safe_error_message("x64dbg_get_trace failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_clear_trace() -> str:
         """
@@ -2164,7 +2258,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_clear_trace failed: {e}")
             return safe_error_message("x64dbg_clear_trace failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_get_api_params(api_name: str) -> str:
         """
@@ -2330,7 +2423,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_get_api_params failed: {e}")
             return safe_error_message("x64dbg_get_api_params failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_run_to_address(address: str) -> str:
         """
@@ -2354,7 +2446,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_run_to_address failed: {e}")
             return safe_error_message("x64dbg_run_to_address failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_step_out() -> str:
         """
@@ -2378,7 +2469,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_step_out failed: {e}")
             return safe_error_message("x64dbg_step_out failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_get_stack(depth: int = 20) -> str:
         """
@@ -2429,7 +2519,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_get_stack failed: {e}")
             return safe_error_message("x64dbg_get_stack failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_get_modules() -> str:
         r"""
@@ -2497,7 +2586,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_get_modules failed: {e}")
             return safe_error_message("x64dbg_get_modules failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_get_threads() -> str:
         """
@@ -2599,7 +2687,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             f"nothing was {action}.\nLive thread ids: {known}"
         )
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_switch_thread(thread_id: str) -> str:
         """
@@ -2654,7 +2741,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_switch_thread failed: {e}")
             return safe_error_message("x64dbg_switch_thread failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_suspend_thread(thread_id: str) -> str:
         """
@@ -2689,7 +2775,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_suspend_thread failed: {e}")
             return safe_error_message("x64dbg_suspend_thread failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_resume_thread(thread_id: str) -> str:
         """
@@ -2733,7 +2818,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_resume_thread failed: {e}")
             return safe_error_message("x64dbg_resume_thread failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_suspend_all_threads() -> str:
         """
@@ -2760,7 +2844,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_suspend_all_threads failed: {e}")
             return safe_error_message("x64dbg_suspend_all_threads failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_resume_all_threads() -> str:
         """
@@ -2810,7 +2893,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_resume_all_threads failed: {e}")
             return safe_error_message("x64dbg_resume_all_threads failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_write_memory(address: str, data: str) -> str:
         """
@@ -2849,7 +2931,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_write_memory failed: {e}")
             return safe_error_message("x64dbg_write_memory failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_dump_memory(address: str, size: int, output_file: str) -> str:
         """
@@ -2923,7 +3004,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return "Not available: Memory dump is not yet implemented in the x64dbg plugin."
             return safe_error_message("x64dbg_dump_memory failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_search_memory(pattern: str, region: str = "all") -> str:
         """
@@ -2984,7 +3064,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
     # Advanced search tools
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_find_assembly(instruction: str, address: str = "", size: int = 0) -> str:
         """
@@ -3033,7 +3112,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_find_assembly failed: {e}")
             return safe_error_message("x64dbg_find_assembly failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_find_guid(address: str = "", size: int = 0) -> str:
         """
@@ -3079,7 +3157,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_find_guid failed: {e}")
             return safe_error_message("x64dbg_find_guid failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_find_module_calls(module: str = "") -> str:
         """
@@ -3126,7 +3203,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_find_module_calls failed: {e}")
             return safe_error_message("x64dbg_find_module_calls failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_find_references_range(address: str, size: int) -> str:
         """
@@ -3182,7 +3258,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_find_references_range failed: {e}")
             return safe_error_message("x64dbg_find_references_range failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_find_string_references(address: str = "") -> str:
         """
@@ -3239,7 +3314,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_find_string_references failed: {e}")
             return safe_error_message("x64dbg_find_string_references failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_get_memory_map() -> str:
         """
@@ -3308,7 +3382,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return "Not available: Memory map is not yet implemented in the x64dbg plugin."
             return safe_error_message("x64dbg_get_memory_map failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_get_memory_info(address: str) -> str:
         """
@@ -3356,7 +3429,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return "Not available: Memory info is not yet implemented in the x64dbg plugin."
             return safe_error_message("x64dbg_get_memory_info failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_get_instruction(address: str = "") -> str:
         """
@@ -3409,7 +3481,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return "Not available: Get instruction is not yet implemented in the x64dbg plugin."
             return safe_error_message("x64dbg_get_instruction failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_evaluate_expression(expression: str) -> str:
         """
@@ -3458,7 +3529,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return "Not available: Expression evaluation is not yet implemented in the x64dbg plugin."
             return safe_error_message("x64dbg_evaluate_expression failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_set_comment(address: str, comment: str) -> str:
         """
@@ -3497,7 +3567,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return "Not available: Set comment is not yet implemented in the x64dbg plugin."
             return safe_error_message("x64dbg_set_comment failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_get_comment(address: str) -> str:
         """
@@ -3528,7 +3597,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return "Not available: Get comment is not yet implemented in the x64dbg plugin."
             return safe_error_message("x64dbg_get_comment failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_set_bookmark(address: str) -> str:
         """
@@ -3565,7 +3633,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return "Not available: Set bookmark is not yet implemented in the x64dbg plugin."
             return safe_error_message("x64dbg_set_bookmark failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_delete_bookmark(address: str) -> str:
         """
@@ -3593,7 +3660,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return "Not available: Delete bookmark is not yet implemented in the x64dbg plugin."
             return safe_error_message("x64dbg_delete_bookmark failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_list_bookmarks() -> str:
         """
@@ -3635,7 +3701,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return "Not available: List bookmarks is not yet implemented in the x64dbg plugin."
             return safe_error_message("x64dbg_list_bookmarks failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_add_function(start: str, end: str) -> str:
         """
@@ -3674,7 +3739,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return "Not available: Add function is not yet implemented in the x64dbg plugin."
             return safe_error_message("x64dbg_add_function failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_delete_function(address: str) -> str:
         """
@@ -3702,7 +3766,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return "Not available: Delete function is not yet implemented in the x64dbg plugin."
             return safe_error_message("x64dbg_delete_function failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_list_functions() -> str:
         """
@@ -3755,7 +3818,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return "Not available: List functions is not yet implemented in the x64dbg plugin."
             return safe_error_message("x64dbg_list_functions failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_get_module_imports(module_name: str) -> str:
         """
@@ -3837,7 +3899,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return "Not available: Module imports is not yet implemented in the x64dbg plugin."
             return safe_error_message("x64dbg_get_module_imports failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_get_module_exports(module_name: str) -> str:
         """
@@ -3899,7 +3960,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return "Not available: Module exports is not yet implemented in the x64dbg plugin."
             return safe_error_message("x64dbg_get_module_exports failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_dump_module(
         module_name: str,
@@ -4046,7 +4106,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_dump_module failed: {e}")
             return safe_error_message("x64dbg_dump_module failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_set_hardware_bp(address: str, bp_type: str = "execute", size: int = 1) -> str:
         """
@@ -4101,7 +4160,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return "Not available: Hardware breakpoints is not yet implemented in the x64dbg plugin."
             return format_error_response(e, "set_hardware_breakpoint")
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_set_register(register: str, value: str) -> str:
         """
@@ -4141,7 +4199,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return "Not available: Set register is not yet implemented in the x64dbg plugin."
             return safe_error_message("x64dbg_set_register failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_skip(count: int = 1) -> str:
         """
@@ -4180,7 +4237,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return "Not available: Skip instruction is not yet implemented in the x64dbg plugin."
             return safe_error_message("x64dbg_skip failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_run_until_return() -> str:
         """
@@ -4210,7 +4266,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return "Not available: Run until return is not yet implemented in the x64dbg plugin."
             return safe_error_message("x64dbg_run_until_return failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_run_to_user_code() -> str:
         """
@@ -4247,7 +4302,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_run_to_user_code failed: {e}")
             return safe_error_message("x64dbg_run_to_user_code failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_undo_instruction() -> str:
         """
@@ -4352,7 +4406,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
         "dump", "sdump",
     })
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_execute_command(command: str) -> str:
         """
@@ -4515,7 +4568,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_execute_command failed: {e}")
             return safe_error_message("x64dbg_execute_command failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_set_memory_bp(address: str, bp_type: str = "access", size: int = 1) -> str:
         """
@@ -4594,7 +4646,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return "Not available: Memory breakpoints is not yet implemented in the x64dbg plugin."
             return format_error_response(e, "set_memory_breakpoint")
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_delete_memory_bp(address: str) -> str:
         """
@@ -4625,7 +4676,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return "Not available: Delete memory breakpoint is not yet implemented in the x64dbg plugin."
             return format_error_response(e, "delete_memory_breakpoint")
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_hide_debugger() -> str:
         """
@@ -4667,7 +4717,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return "Not available: Hide debugger is not yet implemented in the x64dbg plugin."
             return safe_error_message("x64dbg_hide_debugger failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_apply_antidebug_bypass(
         profile: str = "standard",
@@ -4784,7 +4833,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return "Not available: Anti-debug bypass is not yet implemented in the x64dbg plugin."
             return safe_error_message("x64dbg_apply_antidebug_bypass failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_get_antidebug_status() -> str:
         """
@@ -4839,7 +4887,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
     # Event System Tools
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_get_events(max_events: int = 50) -> str:
         """
@@ -4913,7 +4960,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_get_events failed: {e}")
             return safe_error_message("x64dbg_get_events failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_clear_events() -> str:
         """
@@ -4933,7 +4979,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_clear_events failed: {e}")
             return safe_error_message("x64dbg_clear_events failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_event_status() -> str:
         """
@@ -4963,7 +5008,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_event_status failed: {e}")
             return safe_error_message("x64dbg_event_status failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_run_until_event(
         event_types: str = "breakpoint_hit,exception,paused",
@@ -5030,7 +5074,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
     # Memory Allocation Tools (Phase 3)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_alloc_memory(size: int = 4096, address: str = "") -> str:
         """
@@ -5078,7 +5121,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_alloc_memory failed: {e}")
             return safe_error_message("x64dbg_alloc_memory failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_free_memory(address: str) -> str:
         """
@@ -5106,7 +5148,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_free_memory failed: {e}")
             return safe_error_message("x64dbg_free_memory failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_protect_memory(address: str, protection: str, size: int = 4096) -> str:
         """
@@ -5162,7 +5203,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_protect_memory failed: {e}")
             return safe_error_message("x64dbg_protect_memory failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_memset(address: str, value: int, size: int) -> str:
         """
@@ -5215,7 +5255,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_memset failed: {e}")
             return safe_error_message("x64dbg_memset failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_check_memory(address: str) -> str:
         """
@@ -5249,7 +5288,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
     # Enhanced Breakpoint Tools (Phase 3)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_toggle_breakpoint(address: str, enable: bool = True) -> str:
         """
@@ -5285,7 +5323,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_toggle_breakpoint failed: {e}")
             return safe_error_message("x64dbg_toggle_breakpoint failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_delete_hardware_bp(address: str) -> str:
         """
@@ -5312,7 +5349,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_delete_hardware_bp failed: {e}")
             return safe_error_message("x64dbg_delete_hardware_bp failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_toggle_hardware_bp(address: str, enable: bool = True) -> str:
         """
@@ -5339,7 +5375,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_toggle_hardware_bp failed: {e}")
             return safe_error_message("x64dbg_toggle_hardware_bp failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_toggle_memory_bp(address: str, enable: bool = True) -> str:
         """
@@ -5366,7 +5401,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_toggle_memory_bp failed: {e}")
             return safe_error_message("x64dbg_toggle_memory_bp failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_list_all_breakpoints() -> str:
         """
@@ -5452,7 +5486,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
     # P2: Conditional Breakpoint Logging
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_set_conditional_breakpoint(
         address: str,
@@ -5461,10 +5494,12 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
         action: str = "break"
     ) -> str:
         """
-        Set a breakpoint with optional condition and logging.
+        Set a plain breakpoint plus a condition this server evaluates on demand.
 
-        Sets a breakpoint that can evaluate a condition and log formatted
-        messages when hit. Supports three modes: break, log_and_break, log_and_continue.
+        The debugger does NOT enforce the condition -- it breaks on every hit.
+        The condition and log template are stored here and only applied when
+        you call the check_manual_conditional operation after a hit. For a
+        condition the debugger itself enforces, use set_conditional.
 
         Args:
             address: Breakpoint address (hex string, e.g., "0x401000")
@@ -5564,7 +5599,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_set_conditional_breakpoint failed: {e}")
             return format_error_response(e, "set_conditional_breakpoint")
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_check_conditional_breakpoint(address: str | None = None) -> str:
         """
@@ -5675,14 +5709,14 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_check_conditional_breakpoint failed: {e}")
             return safe_error_message("x64dbg_check_conditional_breakpoint failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_get_breakpoint_logs(address: str | None = None, limit: int = 50) -> str:
         """
-        Get logs from conditional breakpoints.
+        Get logs recorded by check_manual_conditional calls.
 
-        Retrieves log entries generated by conditional breakpoints with
-        log templates. Optionally filter by specific breakpoint address.
+        These entries come from this server, not the debugger: only a
+        check_manual_conditional call appends to them. For logs the debugger
+        produced itself, use get_logs.
 
         Args:
             address: Filter logs to specific breakpoint address. If None, show all.
@@ -5749,7 +5783,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_get_breakpoint_logs failed: {e}")
             return safe_error_message("x64dbg_get_breakpoint_logs failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_clear_breakpoint_logs(address: str | None = None) -> str:
         """
@@ -5788,7 +5821,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
     # P2: Native Conditional Breakpoint with Logging (Enhanced)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_set_conditional_bp(
         address: str,
@@ -5937,7 +5969,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_set_conditional_bp failed: {e}")
             return format_error_response(e, "set_conditional_bp")
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_log_api_params(
         api: str,
@@ -6144,7 +6175,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_log_api_params failed: {e}")
             return format_error_response(e, "log_api_params")
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_get_bp_logs(
         address: str | None = None,
@@ -6277,7 +6307,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
     # P2: Static/Dynamic Cross-Reference
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_resolve_static_address(
         static_address: str,
@@ -6390,7 +6419,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_resolve_static_address failed: {e}")
             return safe_error_message("x64dbg_resolve_static_address failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_set_breakpoint_by_name(
         function_name: str,
@@ -6521,7 +6549,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_set_breakpoint_by_name failed: {e}")
             return format_error_response(e, "set_breakpoint_by_name")
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_goto_address(
         address: str | None = None,
@@ -6599,7 +6626,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_goto_address failed: {e}")
             return safe_error_message("x64dbg_goto_address failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_get_runtime_function_address(
         static_address: str,
@@ -6682,7 +6708,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
     # Static/Dynamic Cross-Reference (Ghidra Cache Integration)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_resolve_function(
         binary_path: str,
@@ -6766,7 +6791,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_resolve_function failed: {e}")
             return safe_error_message("x64dbg_resolve_function failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_set_breakpoint_by_function(
         binary_path: str,
@@ -6826,7 +6850,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_set_breakpoint_by_function failed: {e}")
             return safe_error_message("x64dbg_set_breakpoint_by_function failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_goto_function(binary_path: str, function_name: str) -> str:
         """
@@ -6883,7 +6906,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_goto_function failed: {e}")
             return safe_error_message("x64dbg_goto_function failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_list_function_mappings(
         binary_path: str,
@@ -6968,7 +6990,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_list_function_mappings failed: {e}")
             return safe_error_message("x64dbg_list_function_mappings failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_search_function(binary_path: str, pattern: str) -> str:
         """
@@ -7030,7 +7051,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_search_function failed: {e}")
             return safe_error_message("x64dbg_search_function failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_bulk_resolve_functions(
         binary_path: str,
@@ -7092,7 +7112,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_bulk_resolve_functions failed: {e}")
             return safe_error_message("x64dbg_bulk_resolve_functions failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_set_breakpoints_by_functions(
         binary_path: str,
@@ -7157,7 +7176,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_set_breakpoints_by_functions failed: {e}")
             return safe_error_message("x64dbg_set_breakpoints_by_functions failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_refresh_function_cache(binary_path: str) -> str:
         """
@@ -7196,7 +7214,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
     # P2: Session State Persistence
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_save_debug_state(
         state_name: str | None = None,
@@ -7317,7 +7334,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_save_debug_state failed: {e}")
             return safe_error_message("Failed to save debug state", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_restore_debug_state(
         state_id: str,
@@ -7455,7 +7471,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_restore_debug_state failed: {e}")
             return safe_error_message("x64dbg_restore_debug_state failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_list_debug_states(binary_filter: str | None = None) -> str:
         """
@@ -7549,7 +7564,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_list_debug_states failed: {e}")
             return safe_error_message("Failed to list debug states", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_delete_debug_state(state_id: str) -> str:
         """
@@ -7594,7 +7608,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
     # P2: API Hook Detection
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_detect_hooks(
         modules: list[str] | None = None,
@@ -7734,7 +7747,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_detect_hooks failed: {e}")
             return safe_error_message("x64dbg_detect_hooks failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_check_function_hook(
         function_name: str,
@@ -7855,7 +7867,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_check_function_hook failed: {e}")
             return safe_error_message("x64dbg_check_function_hook failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_unhook_function(
         function_name: str,
@@ -7965,7 +7976,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
     # P2: Memory Watch and Diff
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_watch_memory(
         address: str,
@@ -8058,7 +8068,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_watch_memory failed: {e}")
             return safe_error_message("x64dbg_watch_memory failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_memory_diff(
         watch_id: str,
@@ -8206,7 +8215,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_memory_diff failed: {e}")
             return safe_error_message("x64dbg_memory_diff failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_run_until_memory_changed(
         watch_id: str,
@@ -8432,7 +8440,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 pass
             return safe_error_message("x64dbg_run_until_memory_changed failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_update_memory_snapshot(watch_id: str) -> str:
         """
@@ -8504,7 +8511,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_update_memory_snapshot failed: {e}")
             return safe_error_message("x64dbg_update_memory_snapshot failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_list_memory_watches() -> str:
         """
@@ -8546,7 +8552,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_list_memory_watches failed: {e}")
             return safe_error_message("x64dbg_list_memory_watches failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_delete_memory_watch(watch_id: str) -> str:
         """
@@ -8578,7 +8583,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
     # Watch expression tools
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_add_watch(expression: str, name: str = "") -> str:
         """
@@ -8613,7 +8617,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_add_watch failed: {e}")
             return format_error_response(e, "add_watch")
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_delete_watch(index: int) -> str:
         """
@@ -8637,7 +8640,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_delete_watch failed: {e}")
             return format_error_response(e, "delete_watch")
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_set_watchdog(index: int, mode: str = "changed") -> str:
         """
@@ -8679,7 +8681,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
     # DLL breakpoint tools
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_set_dll_breakpoint(
         dll_name: str, singleshoot: bool = False
@@ -8716,7 +8717,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_set_dll_breakpoint failed: {e}")
             return format_error_response(e, "set_dll_breakpoint")
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_delete_dll_breakpoint(dll_name: str) -> str:
         """
@@ -8740,7 +8740,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_delete_dll_breakpoint failed: {e}")
             return format_error_response(e, "delete_dll_breakpoint")
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_enable_dll_breakpoint(dll_name: str) -> str:
         """
@@ -8764,7 +8763,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_enable_dll_breakpoint failed: {e}")
             return format_error_response(e, "enable_dll_breakpoint")
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_disable_dll_breakpoint(dll_name: str) -> str:
         """
@@ -8788,7 +8786,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_disable_dll_breakpoint failed: {e}")
             return format_error_response(e, "disable_dll_breakpoint")
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_analyze_control_flow() -> str:
         """
@@ -8818,7 +8815,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_analyze_control_flow failed: {e}")
             return safe_error_message("x64dbg_analyze_control_flow failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_analyze_xrefs() -> str:
         """
@@ -8848,7 +8844,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_analyze_xrefs failed: {e}")
             return safe_error_message("x64dbg_analyze_xrefs failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_analyze_recursive() -> str:
         """
@@ -8878,7 +8873,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_analyze_recursive failed: {e}")
             return safe_error_message("x64dbg_analyze_recursive failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_get_exception_handlers() -> str:
         """
@@ -8907,7 +8901,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_get_exception_handlers failed: {e}")
             return safe_error_message("x64dbg_get_exception_handlers failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_get_exception_info() -> str:
         """
@@ -8938,7 +8931,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
     # Variable management tools
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_set_variable(name: str, value: str) -> str:
         """
@@ -8981,7 +8973,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_set_variable failed: {e}")
             return safe_error_message("x64dbg_set_variable failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_delete_variable(name: str) -> str:
         """
@@ -9017,7 +9008,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_delete_variable failed: {e}")
             return safe_error_message("x64dbg_delete_variable failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_list_variables() -> str:
         """
@@ -9053,7 +9043,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
     # GUI navigation tools
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_navigate_disasm(address: str) -> str:
         """
@@ -9085,7 +9074,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_navigate_disasm failed: {e}")
             return safe_error_message("x64dbg_navigate_disasm failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_navigate_dump(address: str) -> str:
         """
@@ -9116,7 +9104,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_navigate_dump failed: {e}")
             return safe_error_message("x64dbg_navigate_dump failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_show_graph(address: str = "") -> str:
         """
@@ -9154,7 +9141,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
     # Privilege management tools
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_enable_privilege(name: str) -> str:
         """
@@ -9192,7 +9178,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_enable_privilege failed: {e}")
             return safe_error_message("x64dbg_enable_privilege failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_disable_privilege(name: str) -> str:
         """
@@ -9231,7 +9216,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
     # Type System Tools
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_add_struct(name: str) -> str:
         """
@@ -9265,7 +9249,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_add_struct failed: {e}")
             return safe_error_message("x64dbg_add_struct failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_add_union(name: str) -> str:
         """
@@ -9300,7 +9283,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_add_union failed: {e}")
             return safe_error_message("x64dbg_add_union failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_add_member(parent: str, type_name: str, member_name: str) -> str:
         """
@@ -9339,7 +9321,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_add_member failed: {e}")
             return safe_error_message("x64dbg_add_member failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_view_type(type_name: str, address: str) -> str:
         """
@@ -9390,7 +9371,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_view_type failed: {e}")
             return safe_error_message("x64dbg_view_type failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_sizeof_type(type_name: str) -> str:
         """
@@ -9424,7 +9404,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_sizeof_type failed: {e}")
             return safe_error_message("x64dbg_sizeof_type failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_remove_type(type_name: str) -> str:
         """
@@ -9456,7 +9435,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_remove_type failed: {e}")
             return safe_error_message("x64dbg_remove_type failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_list_types() -> str:
         """
@@ -9487,7 +9465,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_list_types failed: {e}")
             return safe_error_message("x64dbg_list_types failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_clear_types() -> str:
         """
@@ -9513,7 +9490,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_clear_types failed: {e}")
             return safe_error_message("x64dbg_clear_types failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_load_types(filename: str) -> str:
         """
@@ -9581,7 +9557,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_load_types failed: {e}")
             return safe_error_message("x64dbg_load_types failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_parse_types(definition: str) -> str:
         """
@@ -9626,7 +9601,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
     # Conditional Tracing Tools
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_trace_into_conditional(
         condition: str,
@@ -9729,7 +9703,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_trace_into_conditional failed: {e}")
             return safe_error_message("x64dbg_trace_into_conditional failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_trace_over_conditional(
         condition: str,
@@ -9830,7 +9803,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_trace_over_conditional failed: {e}")
             return safe_error_message("x64dbg_trace_over_conditional failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_trace_to_oep(max_steps: int = 50000) -> str:
         """
@@ -9879,7 +9851,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_trace_to_oep failed: {e}")
             return safe_error_message("x64dbg_trace_to_oep failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_set_trace_log(text: str, condition: str = "") -> str:
         """
@@ -9928,7 +9899,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_set_trace_log failed: {e}")
             return safe_error_message("x64dbg_set_trace_log failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_set_trace_command(command: str, condition: str = "") -> str:
         """
@@ -9970,7 +9940,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_set_trace_command failed: {e}")
             return safe_error_message("x64dbg_set_trace_command failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_set_trace_log_file(path: str) -> str:
         """
@@ -10034,4 +10003,707 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_set_trace_log_file failed: {e}")
             return safe_error_message("x64dbg_set_trace_log_file failed", e)
 
-    logger.info("Registered 112 dynamic analysis tools")
+    # Grouped MCP surface.
+    #
+    # Every operation below is implemented by one of the functions above.
+    # They are deliberately NOT registered individually: 159 tools is well
+    # past the point where a model can pick reliably, and the grouping is
+    # what makes the surface selectable. The implementations keep their own
+    # names in session logs via @log_dynamic_tool.
+    ops: dict[str, dict[str, object]] = {
+        "session": {
+            "antidebug_bypass": x64dbg_apply_antidebug_bypass,
+            "antidebug_status": x64dbg_get_antidebug_status,
+            "attach": x64dbg_attach,
+            "connect": x64dbg_connect,
+            "detach": x64dbg_detach,
+            "disable_privilege": x64dbg_disable_privilege,
+            "enable_privilege": x64dbg_enable_privilege,
+            "exec_command": x64dbg_execute_command,
+            "hide_debugger": x64dbg_hide_debugger,
+            "minidump": x64dbg_create_minidump,
+            "status": x64dbg_status,
+        },
+        "state": {
+            "delete": x64dbg_delete_debug_state,
+            "list": x64dbg_list_debug_states,
+            "restore": x64dbg_restore_debug_state,
+            "save": x64dbg_save_debug_state,
+        },
+        "execution": {
+            "clear_events": x64dbg_clear_events,
+            "event_status": x64dbg_event_status,
+            "get_events": x64dbg_get_events,
+            "pause": x64dbg_pause,
+            "run": x64dbg_run,
+            "run_and_wait": x64dbg_run_and_wait,
+            "run_to_address": x64dbg_run_to_address,
+            "run_to_user_code": x64dbg_run_to_user_code,
+            "run_until_event": x64dbg_run_until_event,
+            "run_until_return": x64dbg_run_until_return,
+            "skip": x64dbg_skip,
+            "step_into": x64dbg_step_into,
+            "step_out": x64dbg_step_out,
+            "step_over": x64dbg_step_over,
+            "undo": x64dbg_undo_instruction,
+            "wait_debugging": x64dbg_wait_debugging,
+            "wait_paused": x64dbg_wait_paused,
+            "wait_running": x64dbg_wait_running,
+        },
+        "breakpoint": {
+            "check_manual_conditional": x64dbg_check_conditional_breakpoint,
+            "clear_manual_logs": x64dbg_clear_breakpoint_logs,
+            "delete": x64dbg_delete_breakpoint,
+            "delete_dll": x64dbg_delete_dll_breakpoint,
+            "delete_exception": x64dbg_delete_exception_breakpoint,
+            "delete_hardware": x64dbg_delete_hardware_bp,
+            "delete_many": x64dbg_delete_breakpoints,
+            "delete_memory": x64dbg_delete_memory_bp,
+            "disable_dll": x64dbg_disable_dll_breakpoint,
+            "enable_dll": x64dbg_enable_dll_breakpoint,
+            "get_logs": x64dbg_get_bp_logs,
+            "get_manual_logs": x64dbg_get_breakpoint_logs,
+            "list": x64dbg_list_breakpoints,
+            "list_all": x64dbg_list_all_breakpoints,
+            "list_exception": x64dbg_list_exception_breakpoints,
+            "set": x64dbg_set_breakpoint,
+            "set_by_name": x64dbg_set_breakpoint_by_name,
+            "set_conditional": x64dbg_set_conditional_bp,
+            "set_dll": x64dbg_set_dll_breakpoint,
+            "set_exception": x64dbg_set_exception_breakpoint,
+            "set_hardware": x64dbg_set_hardware_bp,
+            "set_manual_conditional": x64dbg_set_conditional_breakpoint,
+            "set_many": x64dbg_set_breakpoints,
+            "set_memory": x64dbg_set_memory_bp,
+            "skip_exception": x64dbg_skip_exception,
+            "toggle": x64dbg_toggle_breakpoint,
+            "toggle_hardware": x64dbg_toggle_hardware_bp,
+            "toggle_memory": x64dbg_toggle_memory_bp,
+        },
+        "memory": {
+            "alloc": x64dbg_alloc_memory,
+            "check": x64dbg_check_memory,
+            "delete_watch": x64dbg_delete_memory_watch,
+            "diff": x64dbg_memory_diff,
+            "dump": x64dbg_dump_memory,
+            "fill": x64dbg_memset,
+            "free": x64dbg_free_memory,
+            "info": x64dbg_get_memory_info,
+            "list_watches": x64dbg_list_memory_watches,
+            "map": x64dbg_get_memory_map,
+            "protect": x64dbg_protect_memory,
+            "read": x64dbg_read_memory,
+            "run_until_changed": x64dbg_run_until_memory_changed,
+            "search": x64dbg_search_memory,
+            "update_snapshot": x64dbg_update_memory_snapshot,
+            "watch": x64dbg_watch_memory,
+            "write": x64dbg_write_memory,
+        },
+        "context": {
+            "registers": x64dbg_get_registers,
+            "set_register": x64dbg_set_register,
+            "stack": x64dbg_get_stack,
+        },
+        "thread": {
+            "list": x64dbg_get_threads,
+            "resume": x64dbg_resume_thread,
+            "resume_all": x64dbg_resume_all_threads,
+            "suspend": x64dbg_suspend_thread,
+            "suspend_all": x64dbg_suspend_all_threads,
+            "switch": x64dbg_switch_thread,
+        },
+        "module": {
+            "dump": x64dbg_dump_module,
+            "exports": x64dbg_get_module_exports,
+            "imports": x64dbg_get_module_imports,
+            "list": x64dbg_get_modules,
+        },
+        "disasm": {
+            "disassemble": x64dbg_disassemble,
+            "evaluate": x64dbg_evaluate_expression,
+            "goto": x64dbg_goto_address,
+            "graph": x64dbg_show_graph,
+            "instruction": x64dbg_get_instruction,
+            "navigate_disasm": x64dbg_navigate_disasm,
+            "navigate_dump": x64dbg_navigate_dump,
+        },
+        "search": {
+            "assembly": x64dbg_find_assembly,
+            "guid": x64dbg_find_guid,
+            "module_calls": x64dbg_find_module_calls,
+            "references": x64dbg_find_references_range,
+            "strings": x64dbg_find_string_references,
+        },
+        "analyze": {
+            "control_flow": x64dbg_analyze_control_flow,
+            "exception_handlers": x64dbg_get_exception_handlers,
+            "exception_info": x64dbg_get_exception_info,
+            "recursive": x64dbg_analyze_recursive,
+            "xrefs": x64dbg_analyze_xrefs,
+        },
+        "types": {
+            "add_member": x64dbg_add_member,
+            "add_struct": x64dbg_add_struct,
+            "add_union": x64dbg_add_union,
+            "clear": x64dbg_clear_types,
+            "list": x64dbg_list_types,
+            "load": x64dbg_load_types,
+            "parse": x64dbg_parse_types,
+            "remove": x64dbg_remove_type,
+            "sizeof": x64dbg_sizeof_type,
+            "view": x64dbg_view_type,
+        },
+        "trace": {
+            "api_calls": x64dbg_trace_api_calls,
+            "api_params": x64dbg_get_api_params,
+            "clear": x64dbg_clear_trace,
+            "execution": x64dbg_trace_execution,
+            "get": x64dbg_get_trace,
+            "into_conditional": x64dbg_trace_into_conditional,
+            "log_api_params": x64dbg_log_api_params,
+            "over_conditional": x64dbg_trace_over_conditional,
+            "set_command": x64dbg_set_trace_command,
+            "set_log": x64dbg_set_trace_log,
+            "set_log_file": x64dbg_set_trace_log_file,
+            "start": x64dbg_start_trace,
+            "stop": x64dbg_stop_trace,
+            "to_oep": x64dbg_trace_to_oep,
+        },
+        "annotate": {
+            "add_function": x64dbg_add_function,
+            "add_watch": x64dbg_add_watch,
+            "delete_bookmark": x64dbg_delete_bookmark,
+            "delete_function": x64dbg_delete_function,
+            "delete_variable": x64dbg_delete_variable,
+            "delete_watch": x64dbg_delete_watch,
+            "get_comment": x64dbg_get_comment,
+            "list_bookmarks": x64dbg_list_bookmarks,
+            "list_functions": x64dbg_list_functions,
+            "list_variables": x64dbg_list_variables,
+            "set_bookmark": x64dbg_set_bookmark,
+            "set_comment": x64dbg_set_comment,
+            "set_variable": x64dbg_set_variable,
+            "set_watchdog": x64dbg_set_watchdog,
+        },
+        "symbols": {
+            "bulk_resolve": x64dbg_bulk_resolve_functions,
+            "goto": x64dbg_goto_function,
+            "list_mappings": x64dbg_list_function_mappings,
+            "refresh_cache": x64dbg_refresh_function_cache,
+            "resolve_address": x64dbg_resolve_static_address,
+            "resolve_function": x64dbg_resolve_function,
+            "runtime_address": x64dbg_get_runtime_function_address,
+            "search": x64dbg_search_function,
+            "set_breakpoint": x64dbg_set_breakpoint_by_function,
+            "set_breakpoints": x64dbg_set_breakpoints_by_functions,
+        },
+        "hooks": {
+            "check": x64dbg_check_function_hook,
+            "detect": x64dbg_detect_hooks,
+            "unhook": x64dbg_unhook_function,
+        },
+    }
+
+    @app.tool(
+        description=_GROUP_DOCS["session"] + build_op_catalog(ops["session"]),
+    )
+    def x64dbg_session(
+        op: str,
+        profile: str | None = None,
+        hide_peb: bool | None = None,
+        patch_ntquery: bool | None = None,
+        fix_heap_flags: bool | None = None,
+        hide_threads: bool | None = None,
+        pid: int | None = None,
+        host: str | None = None,
+        port: int | None = None,
+        name: str | None = None,
+        command: str | None = None,
+        output_path: str | None = None,
+    ) -> str:
+        """
+        Debugger session: connect, attach, process state, anti-debug and privileges.
+
+        Pass the operation in `op`; pass only the arguments that
+        operation takes. Operations and their arguments are listed below.
+        """
+        return dispatch_op("session", ops["session"], op, {
+            "profile": _UNSET if profile is None else profile,
+            "hide_peb": _UNSET if hide_peb is None else hide_peb,
+            "patch_ntquery": _UNSET if patch_ntquery is None else patch_ntquery,
+            "fix_heap_flags": _UNSET if fix_heap_flags is None else fix_heap_flags,
+            "hide_threads": _UNSET if hide_threads is None else hide_threads,
+            "pid": _UNSET if pid is None else pid,
+            "host": _UNSET if host is None else host,
+            "port": _UNSET if port is None else port,
+            "name": _UNSET if name is None else name,
+            "command": _UNSET if command is None else command,
+            "output_path": _UNSET if output_path is None else output_path,
+        })
+
+    @app.tool(
+        description=_GROUP_DOCS["state"] + build_op_catalog(ops["state"]),
+    )
+    def x64dbg_state(
+        op: str,
+        state_id: str | None = None,
+        binary_filter: str | None = None,
+        restore_breakpoints: bool | None = None,
+        restore_comments: bool | None = None,
+        restore_labels: bool | None = None,
+        clear_existing: bool | None = None,
+        state_name: str | None = None,
+        include_breakpoints: bool | None = None,
+        include_comments: bool | None = None,
+        include_labels: bool | None = None,
+        include_watches: bool | None = None,
+    ) -> str:
+        """
+        Save and restore debugging state (breakpoints, comments, labels, watches).
+
+        Pass the operation in `op`; pass only the arguments that
+        operation takes. Operations and their arguments are listed below.
+        """
+        return dispatch_op("state", ops["state"], op, {
+            "state_id": _UNSET if state_id is None else state_id,
+            "binary_filter": _UNSET if binary_filter is None else binary_filter,
+            "restore_breakpoints": _UNSET if restore_breakpoints is None else restore_breakpoints,
+            "restore_comments": _UNSET if restore_comments is None else restore_comments,
+            "restore_labels": _UNSET if restore_labels is None else restore_labels,
+            "clear_existing": _UNSET if clear_existing is None else clear_existing,
+            "state_name": _UNSET if state_name is None else state_name,
+            "include_breakpoints": _UNSET if include_breakpoints is None else include_breakpoints,
+            "include_comments": _UNSET if include_comments is None else include_comments,
+            "include_labels": _UNSET if include_labels is None else include_labels,
+            "include_watches": _UNSET if include_watches is None else include_watches,
+        })
+
+    @app.tool(
+        description=_GROUP_DOCS["execution"] + build_op_catalog(ops["execution"]),
+    )
+    def x64dbg_execution(
+        op: str,
+        max_events: int | None = None,
+        timeout_seconds: int | None = None,
+        address: str | None = None,
+        event_types: str | None = None,
+        count: int | None = None,
+        steps: int | None = None,
+    ) -> str:
+        """
+        Run, step, and wait for the debuggee to reach a state.
+
+        Pass the operation in `op`; pass only the arguments that
+        operation takes. Operations and their arguments are listed below.
+        """
+        return dispatch_op("execution", ops["execution"], op, {
+            "max_events": _UNSET if max_events is None else max_events,
+            "timeout_seconds": _UNSET if timeout_seconds is None else timeout_seconds,
+            "address": _UNSET if address is None else address,
+            "event_types": _UNSET if event_types is None else event_types,
+            "count": _UNSET if count is None else count,
+            "steps": _UNSET if steps is None else steps,
+        })
+
+    @app.tool(
+        description=_GROUP_DOCS["breakpoint"] + build_op_catalog(ops["breakpoint"]),
+    )
+    def x64dbg_breakpoint(
+        op: str,
+        address: str | None = None,
+        dll_name: str | None = None,
+        exception_code: str | None = None,
+        addresses: list[str] | None = None,
+        limit: int | None = None,
+        function_name: str | None = None,
+        module: str | None = None,
+        condition: str | None = None,
+        log_template: str | None = None,
+        action: str | None = None,
+        singleshoot: bool | None = None,
+        chance: str | None = None,
+        bp_type: str | None = None,
+        size: int | None = None,
+        breakpoints: list[dict] | None = None,
+        enable: bool | None = None,
+    ) -> str:
+        """
+        Every kind of breakpoint: software, hardware, memory, DLL, exception, conditional.
+
+        Pass the operation in `op`; pass only the arguments that
+        operation takes. Operations and their arguments are listed below.
+        """
+        return dispatch_op("breakpoint", ops["breakpoint"], op, {
+            "address": _UNSET if address is None else address,
+            "dll_name": _UNSET if dll_name is None else dll_name,
+            "exception_code": _UNSET if exception_code is None else exception_code,
+            "addresses": _UNSET if addresses is None else addresses,
+            "limit": _UNSET if limit is None else limit,
+            "function_name": _UNSET if function_name is None else function_name,
+            "module": _UNSET if module is None else module,
+            "condition": _UNSET if condition is None else condition,
+            "log_template": _UNSET if log_template is None else log_template,
+            "action": _UNSET if action is None else action,
+            "singleshoot": _UNSET if singleshoot is None else singleshoot,
+            "chance": _UNSET if chance is None else chance,
+            "bp_type": _UNSET if bp_type is None else bp_type,
+            "size": _UNSET if size is None else size,
+            "breakpoints": _UNSET if breakpoints is None else breakpoints,
+            "enable": _UNSET if enable is None else enable,
+        })
+
+    @app.tool(
+        description=_GROUP_DOCS["memory"] + build_op_catalog(ops["memory"]),
+    )
+    def x64dbg_memory(
+        op: str,
+        size: int | None = None,
+        address: str | None = None,
+        watch_id: str | None = None,
+        show_bytes: bool | None = None,
+        max_diff_bytes: int | None = None,
+        output_file: str | None = None,
+        value: int | None = None,
+        protection: str | None = None,
+        timeout_seconds: int | None = None,
+        poll_interval_ms: int | None = None,
+        pattern: str | None = None,
+        region: str | None = None,
+        name: str | None = None,
+        data: str | None = None,
+    ) -> str:
+        """
+        Read, write, allocate, protect, search and watch process memory.
+
+        Pass the operation in `op`; pass only the arguments that
+        operation takes. Operations and their arguments are listed below.
+        """
+        return dispatch_op("memory", ops["memory"], op, {
+            "size": _UNSET if size is None else size,
+            "address": _UNSET if address is None else address,
+            "watch_id": _UNSET if watch_id is None else watch_id,
+            "show_bytes": _UNSET if show_bytes is None else show_bytes,
+            "max_diff_bytes": _UNSET if max_diff_bytes is None else max_diff_bytes,
+            "output_file": _UNSET if output_file is None else output_file,
+            "value": _UNSET if value is None else value,
+            "protection": _UNSET if protection is None else protection,
+            "timeout_seconds": _UNSET if timeout_seconds is None else timeout_seconds,
+            "poll_interval_ms": _UNSET if poll_interval_ms is None else poll_interval_ms,
+            "pattern": _UNSET if pattern is None else pattern,
+            "region": _UNSET if region is None else region,
+            "name": _UNSET if name is None else name,
+            "data": _UNSET if data is None else data,
+        })
+
+    @app.tool(
+        description=_GROUP_DOCS["context"] + build_op_catalog(ops["context"]),
+    )
+    def x64dbg_context(
+        op: str,
+        register: str | None = None,
+        value: str | None = None,
+        depth: int | None = None,
+    ) -> str:
+        """
+        CPU registers and the call stack of the active thread.
+
+        Pass the operation in `op`; pass only the arguments that
+        operation takes. Operations and their arguments are listed below.
+        """
+        return dispatch_op("context", ops["context"], op, {
+            "register": _UNSET if register is None else register,
+            "value": _UNSET if value is None else value,
+            "depth": _UNSET if depth is None else depth,
+        })
+
+    @app.tool(
+        description=_GROUP_DOCS["thread"] + build_op_catalog(ops["thread"]),
+    )
+    def x64dbg_thread(
+        op: str,
+        thread_id: str | None = None,
+    ) -> str:
+        """
+        List threads and control their execution.
+
+        Pass the operation in `op`; pass only the arguments that
+        operation takes. Operations and their arguments are listed below.
+        """
+        return dispatch_op("thread", ops["thread"], op, {
+            "thread_id": _UNSET if thread_id is None else thread_id,
+        })
+
+    @app.tool(
+        description=_GROUP_DOCS["module"] + build_op_catalog(ops["module"]),
+    )
+    def x64dbg_module(
+        op: str,
+        module_name: str | None = None,
+        output_path: str | None = None,
+        fix_pe: bool | None = None,
+        unmap_sections: bool | None = None,
+        rebuild_iat: bool | None = None,
+    ) -> str:
+        """
+        Loaded modules and their imports, exports and on-disk dumps.
+
+        Pass the operation in `op`; pass only the arguments that
+        operation takes. Operations and their arguments are listed below.
+        """
+        return dispatch_op("module", ops["module"], op, {
+            "module_name": _UNSET if module_name is None else module_name,
+            "output_path": _UNSET if output_path is None else output_path,
+            "fix_pe": _UNSET if fix_pe is None else fix_pe,
+            "unmap_sections": _UNSET if unmap_sections is None else unmap_sections,
+            "rebuild_iat": _UNSET if rebuild_iat is None else rebuild_iat,
+        })
+
+    @app.tool(
+        description=_GROUP_DOCS["disasm"] + build_op_catalog(ops["disasm"]),
+    )
+    def x64dbg_disasm(
+        op: str,
+        address: str | None = None,
+        count: int | None = None,
+        expression: str | None = None,
+        function_name: str | None = None,
+        module: str | None = None,
+    ) -> str:
+        """
+        Disassemble, evaluate expressions, and navigate the debugger UI.
+
+        Pass the operation in `op`; pass only the arguments that
+        operation takes. Operations and their arguments are listed below.
+        """
+        return dispatch_op("disasm", ops["disasm"], op, {
+            "address": _UNSET if address is None else address,
+            "count": _UNSET if count is None else count,
+            "expression": _UNSET if expression is None else expression,
+            "function_name": _UNSET if function_name is None else function_name,
+            "module": _UNSET if module is None else module,
+        })
+
+    @app.tool(
+        description=_GROUP_DOCS["search"] + build_op_catalog(ops["search"]),
+    )
+    def x64dbg_search(
+        op: str,
+        instruction: str | None = None,
+        address: str | None = None,
+        size: int | None = None,
+        module: str | None = None,
+    ) -> str:
+        """
+        Search the debuggee for instructions, GUIDs, strings and references.
+
+        Pass the operation in `op`; pass only the arguments that
+        operation takes. Operations and their arguments are listed below.
+        """
+        return dispatch_op("search", ops["search"], op, {
+            "instruction": _UNSET if instruction is None else instruction,
+            "address": _UNSET if address is None else address,
+            "size": _UNSET if size is None else size,
+            "module": _UNSET if module is None else module,
+        })
+
+    @app.tool(
+        description=_GROUP_DOCS["analyze"] + build_op_catalog(ops["analyze"]),
+    )
+    def x64dbg_analyze(
+        op: str,
+    ) -> str:
+        """
+        Run x64dbg's analysis passes and inspect exception state.
+
+        Pass the operation in `op`; pass only the arguments that
+        operation takes. Operations and their arguments are listed below.
+        """
+        return dispatch_op("analyze", ops["analyze"], op, {
+        })
+
+    @app.tool(
+        description=_GROUP_DOCS["types"] + build_op_catalog(ops["types"]),
+    )
+    def x64dbg_types(
+        op: str,
+        parent: str | None = None,
+        type_name: str | None = None,
+        member_name: str | None = None,
+        name: str | None = None,
+        filename: str | None = None,
+        definition: str | None = None,
+        address: str | None = None,
+    ) -> str:
+        """
+        Define, inspect and apply C types and structures.
+
+        Pass the operation in `op`; pass only the arguments that
+        operation takes. Operations and their arguments are listed below.
+        """
+        return dispatch_op("types", ops["types"], op, {
+            "parent": _UNSET if parent is None else parent,
+            "type_name": _UNSET if type_name is None else type_name,
+            "member_name": _UNSET if member_name is None else member_name,
+            "name": _UNSET if name is None else name,
+            "filename": _UNSET if filename is None else filename,
+            "definition": _UNSET if definition is None else definition,
+            "address": _UNSET if address is None else address,
+        })
+
+    @app.tool(
+        description=_GROUP_DOCS["trace"] + build_op_catalog(ops["trace"]),
+    )
+    def x64dbg_trace(
+        op: str,
+        apis: list[str] | None = None,
+        max_calls: int | None = None,
+        include_stack: bool | None = None,
+        api_name: str | None = None,
+        steps: int | None = None,
+        max_entries: int | None = None,
+        condition: str | None = None,
+        max_steps: int | None = None,
+        log_text: str | None = None,
+        log_condition: str | None = None,
+        command_text: str | None = None,
+        command_condition: str | None = None,
+        log_file: str | None = None,
+        api: str | None = None,
+        command: str | None = None,
+        text: str | None = None,
+        path: str | None = None,
+        trace_into: bool | None = None,
+    ) -> str:
+        """
+        Instruction and API tracing, trace conditions, and trace logs.
+
+        Pass the operation in `op`; pass only the arguments that
+        operation takes. Operations and their arguments are listed below.
+        """
+        return dispatch_op("trace", ops["trace"], op, {
+            "apis": _UNSET if apis is None else apis,
+            "max_calls": _UNSET if max_calls is None else max_calls,
+            "include_stack": _UNSET if include_stack is None else include_stack,
+            "api_name": _UNSET if api_name is None else api_name,
+            "steps": _UNSET if steps is None else steps,
+            "max_entries": _UNSET if max_entries is None else max_entries,
+            "condition": _UNSET if condition is None else condition,
+            "max_steps": _UNSET if max_steps is None else max_steps,
+            "log_text": _UNSET if log_text is None else log_text,
+            "log_condition": _UNSET if log_condition is None else log_condition,
+            "command_text": _UNSET if command_text is None else command_text,
+            "command_condition": _UNSET if command_condition is None else command_condition,
+            "log_file": _UNSET if log_file is None else log_file,
+            "api": _UNSET if api is None else api,
+            "command": _UNSET if command is None else command,
+            "text": _UNSET if text is None else text,
+            "path": _UNSET if path is None else path,
+            "trace_into": _UNSET if trace_into is None else trace_into,
+        })
+
+    @app.tool(
+        description=_GROUP_DOCS["annotate"] + build_op_catalog(ops["annotate"]),
+    )
+    def x64dbg_annotate(
+        op: str,
+        start: str | None = None,
+        end: str | None = None,
+        expression: str | None = None,
+        name: str | None = None,
+        address: str | None = None,
+        index: int | None = None,
+        comment: str | None = None,
+        value: str | None = None,
+        mode: str | None = None,
+    ) -> str:
+        """
+        Comments, bookmarks, user-defined functions, variables and watches.
+
+        Pass the operation in `op`; pass only the arguments that
+        operation takes. Operations and their arguments are listed below.
+        """
+        return dispatch_op("annotate", ops["annotate"], op, {
+            "start": _UNSET if start is None else start,
+            "end": _UNSET if end is None else end,
+            "expression": _UNSET if expression is None else expression,
+            "name": _UNSET if name is None else name,
+            "address": _UNSET if address is None else address,
+            "index": _UNSET if index is None else index,
+            "comment": _UNSET if comment is None else comment,
+            "value": _UNSET if value is None else value,
+            "mode": _UNSET if mode is None else mode,
+        })
+
+    @app.tool(
+        description=_GROUP_DOCS["symbols"] + build_op_catalog(ops["symbols"]),
+    )
+    def x64dbg_symbols(
+        op: str,
+        binary_path: str | None = None,
+        function_names: list[str] | None = None,
+        function_name: str | None = None,
+        filter_pattern: str | None = None,
+        limit: int | None = None,
+        show_external: bool | None = None,
+        static_address: str | None = None,
+        image_base: str | None = None,
+        pattern: str | None = None,
+        breakpoint_type: str | None = None,
+    ) -> str:
+        """
+        Bridge static analysis to the live process: resolve Ghidra functions to runtime addresses.
+
+        Pass the operation in `op`; pass only the arguments that
+        operation takes. Operations and their arguments are listed below.
+        """
+        return dispatch_op("symbols", ops["symbols"], op, {
+            "binary_path": _UNSET if binary_path is None else binary_path,
+            "function_names": _UNSET if function_names is None else function_names,
+            "function_name": _UNSET if function_name is None else function_name,
+            "filter_pattern": _UNSET if filter_pattern is None else filter_pattern,
+            "limit": _UNSET if limit is None else limit,
+            "show_external": _UNSET if show_external is None else show_external,
+            "static_address": _UNSET if static_address is None else static_address,
+            "image_base": _UNSET if image_base is None else image_base,
+            "pattern": _UNSET if pattern is None else pattern,
+            "breakpoint_type": _UNSET if breakpoint_type is None else breakpoint_type,
+        })
+
+    @app.tool(
+        description=_GROUP_DOCS["hooks"] + build_op_catalog(ops["hooks"]),
+    )
+    def x64dbg_hooks(
+        op: str,
+        function_name: str | None = None,
+        module: str | None = None,
+        modules: list[str] | None = None,
+        methods: list[str] | None = None,
+        check_inline: bool | None = None,
+        check_iat: bool | None = None,
+        check_eat: bool | None = None,
+        original_bytes: str | None = None,
+    ) -> str:
+        """
+        Detect, inspect and remove inline/IAT/EAT hooks.
+
+        Pass the operation in `op`; pass only the arguments that
+        operation takes. Operations and their arguments are listed below.
+        """
+        return dispatch_op("hooks", ops["hooks"], op, {
+            "function_name": _UNSET if function_name is None else function_name,
+            "module": _UNSET if module is None else module,
+            "modules": _UNSET if modules is None else modules,
+            "methods": _UNSET if methods is None else methods,
+            "check_inline": _UNSET if check_inline is None else check_inline,
+            "check_iat": _UNSET if check_iat is None else check_iat,
+            "check_eat": _UNSET if check_eat is None else check_eat,
+            "original_bytes": _UNSET if original_bytes is None else original_bytes,
+        })
+
+    global _OP_REGISTRY
+    _OP_REGISTRY = ops
+
+    logger.info(
+        f"Registered {len(ops)} grouped dynamic analysis tools "
+        f"covering {sum(len(v) for v in ops.values())} operations"
+    )

@@ -48,9 +48,6 @@ _x64dbg_commands: X64DbgCommands | None = None
 # Global Ghidra project cache (for static/dynamic cross-reference)
 _ghidra_cache: ProjectCache | None = None
 
-# Track the binary being debugged (for session correlation)
-_current_debug_binary: str | None = None
-
 # Cache for function mappings (binary_path -> {function_name -> static_address})
 _function_mappings: dict[str, dict[str, dict]] = {}
 
@@ -422,6 +419,110 @@ def get_ghidra_cache() -> ProjectCache:
     return _ghidra_cache
 
 
+class BinaryResolutionError(Exception):
+    """Raised when a caller-supplied binary reference cannot be tied to a cache entry."""
+
+
+def resolve_cached_binary(binary_ref: str) -> str:
+    """
+    Turn a caller-supplied binary reference into a path the Ghidra cache knows.
+
+    The cache is keyed on the SHA256 of the binary's *contents*, so every cache
+    lookup needs a path that can actually be opened. Callers -- and the examples
+    in these tools' own docstrings -- routinely pass a bare name like
+    "sample.exe", which cannot be hashed; the lookup then failed and reported
+    "no Ghidra analysis cached", sending the caller off to re-analyze a binary
+    that was already analyzed. Resolving the name against the cache's own
+    metadata index removes that dead end.
+
+    Resolution order: usable as given, then exact resolved path, then
+    case-insensitive basename, then path suffix.
+
+    Args:
+        binary_ref: Path or name of the binary
+
+    Returns:
+        A path that ``ProjectCache`` can hash.
+
+    Raises:
+        BinaryResolutionError: If nothing matches, or several entries do.
+    """
+    ref = str(binary_ref or "").strip()
+    if not ref:
+        raise BinaryResolutionError("No binary specified.")
+
+    # Already usable -- the common case, and the only one that costs nothing.
+    if os.path.isfile(ref):
+        return ref
+
+    cache = get_ghidra_cache()
+    try:
+        entries = [e for e in cache.list_cached() if e.get("binary_path")]
+    except Exception as e:
+        raise BinaryResolutionError(f"Could not read the analysis cache index: {e}")
+
+    if not entries:
+        raise BinaryResolutionError(
+            f"'{ref}' is not a readable file and no binaries are analyzed yet.\n"
+            f"Run analyze_binary(binary_path=...) with a full path first."
+        )
+
+    normalized = ref.replace("\\", "/")
+    ref_name = os.path.basename(normalized).lower()
+
+    def cached_path(entry: dict) -> str:
+        return str(entry["binary_path"])
+
+    def accept(matches: list[dict]) -> str:
+        """Return the single match's path, checking it is still readable."""
+        path = cached_path(matches[0])
+        if not os.path.isfile(path):
+            # The cache is content-addressed, so a moved or deleted binary
+            # cannot be looked up at all. Say so rather than reporting the
+            # binary as never analyzed.
+            raise BinaryResolutionError(
+                f"'{ref}' was analyzed, but the file recorded for it is no "
+                f"longer readable. The analysis cache is keyed on file "
+                f"contents, so the binary has to exist somewhere -- restore "
+                f"it, or pass the path where it lives now."
+            )
+        return path
+
+    exact = [e for e in entries if cached_path(e).replace("\\", "/") == normalized]
+    if len(exact) == 1:
+        return accept(exact)
+
+    by_name = [
+        e for e in entries
+        if str(e.get("binary_name") or os.path.basename(cached_path(e))).lower() == ref_name
+    ]
+    if len(by_name) == 1:
+        return accept(by_name)
+
+    if not by_name:
+        by_name = [
+            e for e in entries
+            if cached_path(e).replace("\\", "/").lower().endswith("/" + normalized.lower())
+        ]
+        if len(by_name) == 1:
+            return accept(by_name)
+
+    if not by_name:
+        known = ", ".join(
+            sorted({str(e.get("binary_name") or "?") for e in entries})[:10]
+        )
+        raise BinaryResolutionError(
+            f"No analyzed binary matches '{ref}'.\n"
+            f"Analyzed binaries: {known or '(none)'}\n"
+            f"Pass the full path, or run analyze_binary first."
+        )
+
+    raise BinaryResolutionError(
+        f"'{ref}' matches {len(by_name)} analyzed binaries. Pass the full path "
+        f"you used with analyze_binary to say which one you mean."
+    )
+
+
 def _load_function_mappings(binary_path: str) -> dict[str, dict]:
     """
     Load function mappings from Ghidra cache for a binary.
@@ -430,13 +531,17 @@ def _load_function_mappings(binary_path: str) -> dict[str, dict]:
         binary_path: Path to the binary file
 
     Returns:
-        Dictionary mapping function names to their info (address, signature, etc.)
+        Dictionary mapping each function's real name to its info (address,
+        signature, etc.). Names are kept exactly as Ghidra reports them --
+        use :func:`_lookup_function` for case-insensitive lookup.
     """
     global _function_mappings
 
+    key = os.path.normcase(os.path.abspath(binary_path))
+
     # Check if already cached
-    if binary_path in _function_mappings:
-        return _function_mappings[binary_path]
+    if key in _function_mappings:
+        return _function_mappings[key]
 
     cache = get_ghidra_cache()
     cached_data = cache.get_cached(binary_path)
@@ -469,16 +574,28 @@ def _load_function_mappings(binary_path: str) -> dict[str, dict]:
                 "size": func.get("size", 0),
             }
 
-    # Also add lowercase versions for case-insensitive lookup
-    lowercase_mappings = {}
-    for name, info in mappings.items():
-        lowercase_mappings[name.lower()] = info
-
-    mappings.update(lowercase_mappings)
-
-    _function_mappings[binary_path] = mappings
-    logger.info(f"Loaded {len(functions)} function mappings from Ghidra cache for {binary_path}")
+    # Case-insensitive lookup used to be done by merging a lowercased copy of
+    # every entry back into this same dict. That doubled the apparent function
+    # count, let one function silently overwrite another whose name differed
+    # only in case, and forced name-suggestion code to filter out anything
+    # equal to its own lowercase -- which quietly hid every genuinely
+    # lowercase function name. The lowercase index lives beside the table now.
+    _function_mappings[key] = mappings
+    logger.info(
+        f"Loaded {len(mappings)} function mappings from Ghidra cache for {binary_path}"
+    )
     return mappings
+
+
+def _lookup_function(mappings: dict[str, dict], function_name: str) -> dict | None:
+    """Find a function by name, exact match first then case-insensitive."""
+    if function_name in mappings:
+        return mappings[function_name]
+    wanted = function_name.lower()
+    for name, info in mappings.items():
+        if name.lower() == wanted:
+            return info
+    return None
 
 
 def _get_image_base_from_cache(binary_path: str) -> int | None:
@@ -516,6 +633,109 @@ def _get_image_base_from_cache(binary_path: str) -> int | None:
     return None
 
 
+class AddressRebaseError(Exception):
+    """Raised when a static address cannot be honestly rebased to a runtime one."""
+
+
+def _format_addr(value: int, width: int = 8) -> str:
+    """Format an address, widening rather than mangling values that do not fit."""
+    return f"0x{value:0{width}X}"
+
+
+def rebase_static_address(
+    static_addr: int,
+    image_base: int,
+    module_base: int,
+) -> int:
+    """
+    Apply ``runtime = static - image_base + module_base``.
+
+    Raises:
+        AddressRebaseError: If the address does not lie above the image base.
+            A negative offset means the two numbers describe different things
+            -- typically an RVA passed as a virtual address, or an image base
+            that belongs to a different module. Previously this was formatted
+            straight into the output as a negative hex string and the caller
+            was handed a runtime address pointing outside the module.
+    """
+    offset = static_addr - image_base
+    if offset < 0:
+        raise AddressRebaseError(
+            f"Static address {_format_addr(static_addr)} is below the image base "
+            f"{_format_addr(image_base)}, so it cannot be an address in this module.\n"
+            f"If {_format_addr(static_addr)} is already a file/RVA offset, add the "
+            f"image base to it first, or pass the correct image_base."
+        )
+    return module_base + offset
+
+
+def _read_image_base_from_memory(bridge: X64DbgBridge, module_base: int) -> int | None:
+    """
+    Read a loaded module's preferred ImageBase out of its in-memory PE header.
+
+    Returns None if the headers cannot be read or do not look like a PE, so
+    callers can say so rather than substituting a guess.
+    """
+    try:
+        dos_header = bridge.read_memory(f"0x{module_base:X}", 64)
+        if not dos_header or len(dos_header) < 64 or dos_header[0:2] != b"MZ":
+            return None
+
+        e_lfanew = int.from_bytes(dos_header[0x3C:0x40], "little")
+        # A sane e_lfanew is small; a wild one means we are not looking at a PE.
+        if not 0 < e_lfanew < 0x1000:
+            return None
+
+        pe_header = bridge.read_memory(f"0x{module_base + e_lfanew:X}", 0x100)
+        if not pe_header or len(pe_header) < 0x40 or pe_header[0:4] != b"PE\x00\x00":
+            return None
+
+        opt_header = pe_header[0x18:]
+        magic = int.from_bytes(opt_header[0:2], "little")
+        if magic == 0x20B:  # PE32+
+            return int.from_bytes(opt_header[24:32], "little")
+        if magic == 0x10B:  # PE32
+            return int.from_bytes(opt_header[28:32], "little")
+        return None
+    except Exception as e:
+        logger.debug(f"Could not read image base at 0x{module_base:X}: {e}")
+        return None
+
+
+def _resolve_module_for_binary(
+    binary_path: str,
+    bridge: X64DbgBridge,
+) -> dict:
+    """
+    Find the loaded module that corresponds to a binary.
+
+    Raises:
+        AddressRebaseError: If the module is not loaded. This used to fall back
+            to ``modules[0]``, which rebased every address against whatever
+            module happened to come first -- for a DLL loaded into a host
+            process, that is the host executable, and every resulting
+            breakpoint address was wrong while still being reported as
+            successfully set.
+    """
+    module = bridge.find_module(binary_path)
+    if module is not None:
+        return module
+
+    modules = bridge.get_modules()
+    if not modules:
+        raise AddressRebaseError(
+            "No modules are loaded in x64dbg. Load or attach to the target first "
+            "(x64dbg_attach), then retry."
+        )
+
+    loaded = ", ".join(m["display_name"] for m in modules[:20])
+    raise AddressRebaseError(
+        f"'{os.path.basename(binary_path)}' is not loaded in x64dbg.\n"
+        f"Loaded modules: {loaded}\n"
+        f"Addresses cannot be rebased against a module that is not loaded."
+    )
+
+
 def _resolve_function_to_runtime(
     function_name: str,
     binary_path: str,
@@ -530,12 +750,18 @@ def _resolve_function_to_runtime(
 
     Args:
         function_name: Function name from Ghidra analysis
-        binary_path: Path to the binary file
+        binary_path: Path to the binary file (already resolved to a real path)
         bridge: X64DbgBridge instance
 
     Returns:
-        Dictionary with static_address, runtime_address, module_base, image_base
-        or None if resolution failed
+        Dictionary with static_address, runtime_address, module_base, image_base,
+        or None if the function is not in the Ghidra cache.
+
+    Raises:
+        AddressRebaseError: If the function is known but cannot be rebased --
+            the module is not loaded, or the image base is unknown. These are
+            reported rather than papered over with a guess, because a wrong
+            runtime address costs far more to debug than a missing one.
     """
     # Load function mappings from Ghidra cache
     mappings = _load_function_mappings(binary_path)
@@ -543,8 +769,7 @@ def _resolve_function_to_runtime(
     if not mappings:
         return None
 
-    # Look up function (case-insensitive)
-    func_info = mappings.get(function_name) or mappings.get(function_name.lower())
+    func_info = _lookup_function(mappings, function_name)
 
     if not func_info:
         return None
@@ -553,63 +778,45 @@ def _resolve_function_to_runtime(
     if not static_addr_str:
         return None
 
-    # Parse static address
-    if static_addr_str.startswith("0x"):
+    try:
         static_addr = int(static_addr_str, 16)
-    else:
-        static_addr = int(static_addr_str, 16)
+    except (TypeError, ValueError):
+        raise AddressRebaseError(
+            f"Ghidra cache holds an unparseable address for '{function_name}': "
+            f"{static_addr_str!r}"
+        )
 
-    # Get image base from Ghidra cache
+    # Get image base from Ghidra cache. There is no safe default here: guessing
+    # 0x400000/0x10000000 silently produces a plausible-looking but wrong
+    # runtime address whenever the guess is off (a 64-bit PE defaults to
+    # 0x140000000, and any ASLR-aware image may sit elsewhere).
     image_base = _get_image_base_from_cache(binary_path)
     if image_base is None:
-        # Default to common values
-        if binary_path.lower().endswith(".dll"):
-            image_base = 0x10000000
-        else:
-            image_base = 0x400000
+        raise AddressRebaseError(
+            f"No image base recorded in the Ghidra cache for "
+            f"'{os.path.basename(binary_path)}', so static addresses cannot be "
+            f"rebased.\n"
+            f"Re-run analyze_binary(binary_path=...) to refresh the cache, or use "
+            f"x64dbg_resolve_static_address with an explicit image_base."
+        )
 
-    # Get module base from x64dbg
-    modules = bridge.get_modules()
-    binary_name = os.path.basename(binary_path).lower()
+    module = _resolve_module_for_binary(binary_path, bridge)
+    module_base = module["base"]
+    module_name = module["display_name"]
 
-    module_base = None
-    module_name = None
-    for mod in modules:
-        mod_name = mod.get("name", "").lower()
-        if binary_name in mod_name or mod_name in binary_name:
-            base = mod.get("base", 0)
-            if isinstance(base, str):
-                module_base = int(base, 16) if base.startswith("0x") else int(base)
-            else:
-                module_base = base
-            module_name = mod.get("name", "unknown")
-            break
-
-    if module_base is None:
-        # Try using first module as fallback
-        if modules:
-            mod = modules[0]
-            base = mod.get("base", 0)
-            if isinstance(base, str):
-                module_base = int(base, 16) if base.startswith("0x") else int(base)
-            else:
-                module_base = base
-            module_name = mod.get("name", "unknown")
-        else:
-            return None
-
-    # Calculate runtime address
+    runtime_addr = rebase_static_address(static_addr, image_base, module_base)
     offset = static_addr - image_base
-    runtime_addr = module_base + offset
+
+    width = 16 if max(static_addr, runtime_addr, module_base) > 0xFFFFFFFF else 8
 
     return {
         "function_name": function_name,
-        "static_address": f"0x{static_addr:08X}",
-        "image_base": f"0x{image_base:08X}",
-        "module_base": f"0x{module_base:08X}",
+        "static_address": _format_addr(static_addr, width),
+        "image_base": _format_addr(image_base, width),
+        "module_base": _format_addr(module_base, width),
         "module_name": module_name,
-        "offset": f"0x{offset:08X}",
-        "runtime_address": f"0x{runtime_addr:08X}",
+        "offset": _format_addr(offset, 8),
+        "runtime_address": _format_addr(runtime_addr, width),
         "signature": func_info.get("signature", ""),
     }
 
@@ -667,16 +874,41 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             Connection status message
         """
         try:
-            bridge = X64DbgBridge(host, port)
+            # Honour X64DBG_TIMEOUT here too; rebuilding the bridge with the
+            # constructor default silently dropped a configured timeout.
+            timeout = int(os.getenv("X64DBG_TIMEOUT", "30"))
+            bridge = X64DbgBridge(host, port, timeout=timeout)
             bridge.connect()
 
             # Update global instance
-            global _x64dbg_bridge, _x64dbg_commands
+            global _x64dbg_bridge, _x64dbg_commands, _function_mappings
             _x64dbg_bridge = bridge
             _x64dbg_commands = X64DbgCommands(bridge)
+            # Function mappings are only meaningful against the modules of the
+            # session we just replaced.
+            _function_mappings = {}
 
             location = bridge.get_current_location()
-            return f"Connected to x64dbg at {host}:{port}\nState: {location['state']}"
+            lines = [
+                f"Connected to x64dbg at {host}:{port}",
+                f"State: {location['state']}",
+            ]
+            try:
+                main_module = bridge.get_main_module()
+            except Exception:
+                # Nothing being debugged yet -- the connection is still good.
+                main_module = None
+            if main_module:
+                lines.append(
+                    f"Main module: {main_module['display_name']} "
+                    f"@ 0x{main_module['base']:X}"
+                )
+            else:
+                lines.append(
+                    "No process loaded yet. Use x64dbg_attach(pid) or load a "
+                    "binary in x64dbg before setting breakpoints."
+                )
+            return "\n".join(lines)
 
         except Exception as e:
             logger.error(f"x64dbg_connect failed: {e}")
@@ -2235,22 +2467,28 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             # is the server's.
             body = []
             for mod in modules:
-                name = mod.get("name", "unknown")
-                base = mod.get("base", "unknown")
-                size = mod.get("size", "unknown")
-                path = mod.get("path", "")
-
-                body.append(f"\n{name}")
-                body.append(f"  Base: 0x{base}")
-                body.append(f"  Size: 0x{size}")
-                if path:
-                    body.append(f"  Path: {path}")
+                marker = "  (main module)" if mod["is_main"] else ""
+                body.append(f"\n{mod['display_name']}{marker}")
+                body.append(f"  Base: 0x{mod['base']:X}")
+                body.append(f"  Size: 0x{mod['size']:X}")
+                if mod["path"] and mod["path"] != mod["display_name"]:
+                    body.append(f"  Path: {mod['path']}")
             result.append(
                 wrap_untrusted(
                     "\n".join(body).strip("\n"),
                     kind="module names and paths from the debugged process",
                 )
             )
+
+            # Server-generated diagnostic, so it stays outside the fence.
+            if len(modules) == 1 and modules[0]["is_main"]:
+                result.append("")
+                result.append(
+                    "Note: only the main module is listed. Plugin builds before "
+                    "the module-enumeration fix report just the debuggee image, "
+                    "not its loaded DLLs. Rebuild/update the Obsidian plugin to "
+                    "see the full module list."
+                )
 
             return "\n".join(result)
 
@@ -3420,7 +3658,13 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             imports = bridge.get_module_imports(module_name)
 
             if not imports:
-                return f"No imports found for {module_name}"
+                return (
+                    f"No imports returned for {module_name}.\n"
+                    f"Import enumeration is not implemented in the x64dbg plugin "
+                    f"(it always returns an empty list), so this is not evidence "
+                    f"that {module_name} has no imports.\n"
+                    f"Use get_imports(binary_path=...) for the static import table."
+                )
 
             result = [f"Imports for {module_name} ({len(imports)} functions):", "-" * 70]
 
@@ -3484,7 +3728,12 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             exports = bridge.get_module_exports(module_name)
 
             if not exports:
-                return f"No exports found for {module_name}"
+                return (
+                    f"No exports returned for {module_name}.\n"
+                    f"Export enumeration is not implemented in the x64dbg plugin "
+                    f"(it always returns an empty list), so this is not evidence "
+                    f"that {module_name} has no exports."
+                )
 
             result = [f"Exports for {module_name} ({len(exports)} functions):", "-" * 70]
 
@@ -5910,9 +6159,9 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         Args:
             static_address: Address from static analysis (hex string, e.g., "0x401234")
-            binary_path: Optional binary name or path. If None, uses main module.
-            image_base: Optional static image base. If None, auto-detect from PE header.
-                       Common values: 0x400000 (EXE), 0x10000000 (DLL)
+            binary_path: Optional module name or path. If None, uses the main module.
+            image_base: Optional static image base. If None, read from the loaded
+                       module's PE header.
 
         Returns:
             Runtime address and conversion details
@@ -5922,98 +6171,80 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             x64dbg_resolve_static_address("0x004025B0")
             # Returns: "Runtime address: 0x012425B0 (module base: 0x01200000)"
 
-            # DLL with custom image base
+            # DLL loaded alongside the main executable
             x64dbg_resolve_static_address("0x10001234", binary_path="evil.dll")
         """
         try:
             bridge = get_x64dbg_bridge()
 
-            # Parse static address
-            if static_address.startswith("0x") or static_address.startswith("0X"):
+            try:
                 static_addr = int(static_address, 16)
-            else:
-                static_addr = int(static_address, 16)
+            except (TypeError, ValueError):
+                return (
+                    f"Error: '{static_address}' is not a hex address. "
+                    f"Pass something like \"0x401234\"."
+                )
 
-            # Get modules
-            modules = bridge.get_modules()
-
-            # Find target module
-            target_module = None
+            # Find the module. This used to substring-match on a key the plugin
+            # never sends, which made every comparison succeed and silently
+            # rebased against whichever module came first -- so binary_path was
+            # effectively ignored.
             if binary_path:
-                # Search by name
-                binary_name = os.path.basename(binary_path).lower()
-                for mod in modules:
-                    mod_name = mod.get("name", "").lower()
-                    if binary_name in mod_name or mod_name in binary_name:
-                        target_module = mod
-                        break
+                target_module = bridge.find_module(binary_path)
+                if target_module is None:
+                    modules = bridge.get_modules()
+                    loaded = ", ".join(m["display_name"] for m in modules[:20]) or "(none)"
+                    return (
+                        f"Module '{binary_path}' is not loaded in x64dbg.\n"
+                        f"Loaded modules: {loaded}"
+                    )
             else:
-                # Use first module (main executable)
-                if modules:
-                    target_module = modules[0]
+                target_module = bridge.get_main_module()
+                if target_module is None:
+                    return (
+                        "No modules are loaded in x64dbg. Load or attach to the "
+                        "target first (x64dbg_attach)."
+                    )
 
-            if not target_module:
-                return f"Module not found: {binary_path if binary_path else 'main module'}"
-
-            module_base = target_module.get("base", 0)
-            if isinstance(module_base, str):
-                module_base = int(module_base, 16) if module_base.startswith("0x") else int(module_base)
-
-            module_name = target_module.get("name", "unknown")
+            module_base = target_module["base"]
+            module_name = target_module["display_name"]
 
             # Determine image base (from PE header or provided)
+            img_base = None
+            base_source = "provided"
             if image_base:
-                if isinstance(image_base, str):
-                    img_base = int(image_base, 16) if image_base.startswith("0x") else int(image_base)
-                else:
-                    img_base = image_base
-            else:
-                # Try to read PE header to get image base
                 try:
-                    # Read DOS header to find PE header
-                    dos_header = bridge.read_memory(f"0x{module_base:X}", 64)
-                    if dos_header and len(dos_header) >= 64:
-                        # Get e_lfanew (offset to PE header) at offset 0x3C
-                        e_lfanew = int.from_bytes(dos_header[0x3C:0x40], 'little')
-                        # Read PE header
-                        pe_header = bridge.read_memory(f"0x{module_base + e_lfanew:X}", 256)
-                        if pe_header and len(pe_header) >= 256:
-                            # Image base is at offset 0x30 from PE signature in PE32+
-                            # Check PE signature
-                            if pe_header[0:4] == b'PE\x00\x00':
-                                # Check machine type at offset 4
-                                # Optional header offset is at 0x18
-                                opt_header = pe_header[0x18:]
-                                magic = int.from_bytes(opt_header[0:2], 'little')
-                                if magic == 0x20B:  # PE32+ (64-bit)
-                                    img_base = int.from_bytes(opt_header[24:32], 'little')
-                                else:  # PE32 (32-bit)
-                                    img_base = int.from_bytes(opt_header[28:32], 'little')
-                            else:
-                                img_base = 0x400000  # Default
-                        else:
-                            img_base = 0x400000
-                    else:
-                        img_base = 0x400000  # Default for EXE
-                except Exception:
-                    # Default image bases
-                    if module_name.lower().endswith(".dll"):
-                        img_base = 0x10000000
-                    else:
-                        img_base = 0x400000
+                    img_base = int(str(image_base), 16)
+                except ValueError:
+                    return f"Error: image_base '{image_base}' is not a hex value."
+            else:
+                img_base = _read_image_base_from_memory(bridge, module_base)
+                base_source = "PE header"
 
-            # Calculate runtime address
+            if img_base is None:
+                return (
+                    f"Could not read the image base from {module_name}'s PE header "
+                    f"at 0x{module_base:X}.\n"
+                    f"Pass image_base explicitly (the ImageBase field from the "
+                    f"optional header of the on-disk file)."
+                )
+
+            try:
+                runtime_addr = rebase_static_address(static_addr, img_base, module_base)
+            except AddressRebaseError as e:
+                return f"Error: {e}"
+
             offset = static_addr - img_base
-            runtime_addr = module_base + offset
+            width = 16 if max(static_addr, runtime_addr, module_base) > 0xFFFFFFFF else 8
 
             output = [
                 "Address Conversion:",
-                f"  Static address:  0x{static_addr:08X}",
-                f"  Image base:      0x{img_base:08X}",
-                f"  Offset:          0x{offset:08X}",
+                f"  Static address:  {_format_addr(static_addr, width)}",
+                f"  Image base:      {_format_addr(img_base, width)} ({base_source})",
+                f"  Offset:          {_format_addr(offset, 8)}",
                 f"  Module:          {module_name}",
-                f"  Module base:     0x{module_base:08X}",
-                f"  Runtime address: 0x{runtime_addr:08X}",
+                f"  Module base:     {_format_addr(module_base, width)}",
+                f"  Runtime address: {_format_addr(runtime_addr, width)}",
                 "",
                 f"Use 0x{runtime_addr:X} for breakpoints in x64dbg"
             ]
@@ -6344,10 +6575,11 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             )
 
         Prerequisites:
-            - Binary must be analyzed with Ghidra (use ghidra_analyze first)
+            - Binary must be analyzed first (use analyze_binary)
             - Binary must be loaded in x64dbg debugger
         """
         try:
+            binary_path = resolve_cached_binary(binary_path)
             bridge = get_x64dbg_bridge()
             result = _resolve_function_to_runtime(function_name, binary_path, bridge)
 
@@ -6357,7 +6589,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                     return (
                         f"No Ghidra analysis cache found for '{binary_path}'.\n\n"
                         f"To analyze this binary:\n"
-                        f"  1. Use ghidra_analyze(binary_path=\"{binary_path}\")\n"
+                        f"  1. Use analyze_binary(binary_path=\"{binary_path}\")\n"
                         f"  2. Wait for analysis to complete\n"
                         f"  3. Try this command again"
                     )
@@ -6365,9 +6597,9 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 similar = []
                 search_lower = function_name.lower()
                 for name in mappings.keys():
-                    if search_lower in name.lower() or name.lower() in search_lower:
-                        if name != name.lower():
-                            similar.append(name)
+                    lowered = name.lower()
+                    if search_lower in lowered or lowered in search_lower:
+                        similar.append(name)
                 suggestion = ""
                 if similar:
                     suggestion = "\n\nSimilar function names found:\n"
@@ -6393,6 +6625,8 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             output.append(f"Use {result['runtime_address']} for breakpoints")
             return "\n".join(output)
 
+        except (BinaryResolutionError, AddressRebaseError) as e:
+            return f"Error: {e}"
         except Exception as e:
             logger.error(f"x64dbg_resolve_function failed: {e}")
             return safe_error_message("x64dbg_resolve_function failed", e)
@@ -6422,6 +6656,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             )
         """
         try:
+            binary_path = resolve_cached_binary(binary_path)
             bridge = get_x64dbg_bridge()
             result = _resolve_function_to_runtime(function_name, binary_path, bridge)
 
@@ -6450,6 +6685,8 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except StructuredBaseError as e:
             return format_error_response(e, "set_breakpoint_by_function")
+        except (BinaryResolutionError, AddressRebaseError) as e:
+            return f"Error: {e}"
         except Exception as e:
             logger.error(f"x64dbg_set_breakpoint_by_function failed: {e}")
             return safe_error_message("x64dbg_set_breakpoint_by_function failed", e)
@@ -6468,6 +6705,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             Function location and disassembly preview
         """
         try:
+            binary_path = resolve_cached_binary(binary_path)
             bridge = get_x64dbg_bridge()
             result = _resolve_function_to_runtime(function_name, binary_path, bridge)
 
@@ -6504,6 +6742,8 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 output.append("  (Could not disassemble)")
             return "\n".join(output)
 
+        except (BinaryResolutionError, AddressRebaseError) as e:
+            return f"Error: {e}"
         except Exception as e:
             logger.error(f"x64dbg_goto_function failed: {e}")
             return safe_error_message("x64dbg_goto_function failed", e)
@@ -6529,6 +6769,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             List of functions with their static addresses
         """
         try:
+            binary_path = resolve_cached_binary(binary_path)
             cache = get_ghidra_cache()
             if not cache.has_cached(binary_path):
                 return f"No Ghidra analysis cache found for '{binary_path}'."
@@ -6539,12 +6780,8 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
             image_base = _get_image_base_from_cache(binary_path)
             filtered = []
-            seen_names: set = set()
 
             for name, info in mappings.items():
-                if name.lower() in seen_names:
-                    continue
-                seen_names.add(name.lower())
                 if not show_external and info.get("is_external", False):
                     continue
                 if filter_pattern and filter_pattern.lower() not in name.lower():
@@ -6590,6 +6827,8 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 output.append(f"... and {total_count - limit} more functions")
             return "\n".join(output)
 
+        except (BinaryResolutionError, AddressRebaseError) as e:
+            return f"Error: {e}"
         except Exception as e:
             logger.error(f"x64dbg_list_function_mappings failed: {e}")
             return safe_error_message("x64dbg_list_function_mappings failed", e)
@@ -6608,6 +6847,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             List of matching functions with address information
         """
         try:
+            binary_path = resolve_cached_binary(binary_path)
             cache = get_ghidra_cache()
             if not cache.has_cached(binary_path):
                 return f"No Ghidra analysis cache found for '{binary_path}'."
@@ -6615,12 +6855,8 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             mappings = _load_function_mappings(binary_path)
             pattern_lower = pattern.lower()
             matches = []
-            seen_names: set = set()
 
             for name, info in mappings.items():
-                if name.lower() in seen_names:
-                    continue
-                seen_names.add(name.lower())
                 if pattern_lower in name.lower():
                     matches.append((name, info))
 
@@ -6653,6 +6889,8 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 output.append(f"... and {len(matches) - 30} more matches")
             return "\n".join(output)
 
+        except (BinaryResolutionError, AddressRebaseError) as e:
+            return f"Error: {e}"
         except Exception as e:
             logger.error(f"x64dbg_search_function failed: {e}")
             return safe_error_message("x64dbg_search_function failed", e)
@@ -6674,6 +6912,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             Table of function names with static and runtime addresses
         """
         try:
+            binary_path = resolve_cached_binary(binary_path)
             bridge = get_x64dbg_bridge()
             cache = get_ghidra_cache()
             if not cache.has_cached(binary_path):
@@ -6712,6 +6951,8 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 output.append(f"{r['name']:<30} {r['static']:<16} {r['runtime']:<16} {status}")
             return "\n".join(output)
 
+        except (BinaryResolutionError, AddressRebaseError) as e:
+            return f"Error: {e}"
         except Exception as e:
             logger.error(f"x64dbg_bulk_resolve_functions failed: {e}")
             return safe_error_message("x64dbg_bulk_resolve_functions failed", e)
@@ -6735,6 +6976,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             Summary of breakpoints set with success/failure count
         """
         try:
+            binary_path = resolve_cached_binary(binary_path)
             bridge = get_x64dbg_bridge()
             cache = get_ghidra_cache()
             if not cache.has_cached(binary_path):
@@ -6774,6 +7016,8 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 output.append(f"  ... and {len(results['details']) - 20} more")
             return "\n".join(output)
 
+        except (BinaryResolutionError, AddressRebaseError) as e:
+            return f"Error: {e}"
         except Exception as e:
             logger.error(f"x64dbg_set_breakpoints_by_functions failed: {e}")
             return safe_error_message("x64dbg_set_breakpoints_by_functions failed", e)
@@ -6794,18 +7038,23 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             Confirmation with count of functions loaded
         """
         try:
-            global _function_mappings
-            if binary_path in _function_mappings:
-                del _function_mappings[binary_path]
+            binary_path = resolve_cached_binary(binary_path)
+            # Evict under the same normalized key _load_function_mappings
+            # stores against, or the reload is a no-op and this tool silently
+            # returns the stale table it was called to replace.
+            _function_mappings.pop(
+                os.path.normcase(os.path.abspath(binary_path)), None
+            )
             cache = get_ghidra_cache()
             if not cache.has_cached(binary_path):
                 return f"No Ghidra analysis cache found for '{binary_path}'."
             mappings = _load_function_mappings(binary_path)
-            unique_count = len(set(name.lower() for name in mappings.keys()))
             return (
                 f"Function cache refreshed for {os.path.basename(binary_path)}.\n"
-                f"Loaded {unique_count} unique functions from Ghidra cache."
+                f"Loaded {len(mappings)} functions from Ghidra cache."
             )
+        except (BinaryResolutionError, AddressRebaseError) as e:
+            return f"Error: {e}"
         except Exception as e:
             logger.error(f"x64dbg_refresh_function_cache failed: {e}")
             return safe_error_message("x64dbg_refresh_function_cache failed", e)

@@ -394,7 +394,16 @@ def _guarded_sources() -> list[Path]:
 # Those are deliberately echoed verbatim (see the F-10 comments in the tool
 # modules); anything broader has to go through safe_error_message /
 # safe_tool_error instead.
-_VALIDATION_ONLY_HANDLERS = {"ValueError"}
+# Kept in step with _AST_ALLOWED_HANDLERS below, which carries the audit for
+# each entry. The two crossover types are bounded the same way ValueError is:
+# every raise site quotes the caller's own argument, a basename, a debuggee
+# module name or an address -- never a resolved host path.
+_VALIDATION_ONLY_HANDLERS = {
+    "ValueError",
+    "BinaryResolutionError",
+    "AddressRebaseError",
+    "(BinaryResolutionError, AddressRebaseError)",
+}
 
 
 def _raw_error_returns(path: Path) -> list[tuple[int, str]]:
@@ -494,6 +503,18 @@ _AST_ALLOWED_HANDLERS = {
     # only thing that tells a user their "PE" is actually a script or a
     # truncated download, so it is worth keeping.
     "pefile.PEFormatError",
+    #   * BinaryResolutionError / AddressRebaseError
+    #     (src/tools/dynamic_tools.py) -- the static/dynamic crossover's two
+    #     module-private types, audited on the same terms. Every raise site
+    #     quotes the caller's own argument, a basename, a debuggee module
+    #     name, or an address: "'evil.dll' is not loaded in x64dbg. Loaded
+    #     modules: host.exe", "Static address 0x100 is below the image base
+    #     0x400000", "'x.exe' matches 2 analyzed binaries. Pass the full path
+    #     you used with analyze_binary". The two messages that used to
+    #     interpolate a resolved absolute cache path -- the F-10 disclosure
+    #     exactly -- were rewritten to basenames when these were added here.
+    "BinaryResolutionError",
+    "AddressRebaseError",
 }
 
 

@@ -241,6 +241,63 @@ def x64dbg_command_name(segment: str) -> str:
     return head.split("(")[0].split(",")[0].lower()
 
 
+def _coerce_int(value: Any, default: int = 0) -> int:
+    """
+    Parse a numeric field from the plugin.
+
+    The plugin streams addresses as *bare hex strings* (``std::hex`` with no
+    "0x") and counts as JSON numbers. So a string is always hex -- reading
+    "140000000" as decimal yields 140000000 instead of 0x140000000, an address
+    off by a factor of 38 that still looks like a plausible base.
+    """
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return default
+        try:
+            return int(text, 16)
+        except ValueError:
+            return default
+    return default
+
+
+def normalize_module(raw: dict[str, Any]) -> dict[str, Any]:
+    """
+    Give a module dict from the plugin a stable shape.
+
+    Older plugin builds emit only ``base``/``size``/``entry``/``path``, where
+    ``path`` is really the module *name* that ``DbgGetModuleAt`` filled in --
+    there is no ``name`` key at all. Callers that read ``name`` therefore got
+    ``""``, which made every substring comparison against it succeed and turned
+    "find the module I asked for" into "take whatever came first". Deriving the
+    name here means one place understands the wire format, and both old and new
+    plugin builds present the same keys to the rest of the codebase.
+
+    Returns a dict with ``name`` (lowercased basename), ``display_name``,
+    ``path``, and integer ``base``/``size``/``entry``.
+    """
+    path = str(raw.get("path") or "")
+    display_name = str(raw.get("name") or "").strip()
+    if not display_name and path:
+        # path may be a full path or a bare module name; both end in the name.
+        display_name = path.replace("\\", "/").rsplit("/", 1)[-1]
+
+    return {
+        **raw,
+        "name": display_name.lower(),
+        "display_name": display_name or "unknown",
+        "path": path,
+        "base": _coerce_int(raw.get("base")),
+        "size": _coerce_int(raw.get("size")),
+        "entry": _coerce_int(raw.get("entry")),
+        "is_main": bool(raw.get("is_main", False)),
+    }
+
+
 class AddressValidationError(StructuredBaseError):
     """
     Raised when an address parameter is invalid or missing.
@@ -774,15 +831,23 @@ class X64DbgBridge(Debugger):
         Raises:
             ConnectionError: If connection fails
         """
+        previous_timeout = self.timeout
         try:
             self._arch = None  # Reset cached architecture on new connection
+            # The handshake gets its own (usually shorter) timeout so a dead
+            # plugin fails fast instead of hanging for the request timeout.
+            self.timeout = timeout
             result = self._request("/api/status")
             self.connected = True
             logger.info(f"Connected to x64dbg - state: {result.get('state')}")
             return True
         except Exception as e:
             logger.error(f"Failed to connect: {e}")
-            raise ConnectionError(f"Cannot connect to x64dbg plugin at {self.base_url}")
+            raise ConnectionError(
+                f"Cannot connect to x64dbg plugin at {self.base_url}: {e}"
+            )
+        finally:
+            self.timeout = previous_timeout
 
     def disconnect(self) -> None:
         """Disconnect from x64dbg plugin."""
@@ -947,7 +1012,7 @@ class X64DbgBridge(Debugger):
         Returns:
             List of breakpoint dictionaries
         """
-        result = self._request("/api/breakpoint/list")
+        result = self._request_with_retry("/api/breakpoint/list")
         return result.get("breakpoints", [])
 
     # Exception handling control
@@ -1020,7 +1085,7 @@ class X64DbgBridge(Debugger):
         Returns:
             List of exception breakpoint dictionaries
         """
-        result = self._request("/api/exception/list")
+        result = self._request_with_retry("/api/exception/list")
         return result.get("exceptions", [])
 
     def skip_exception(self, exception_code: str) -> bool:
@@ -1129,7 +1194,7 @@ class X64DbgBridge(Debugger):
         Returns:
             Dictionary mapping register names to hex values
         """
-        result = self._request("/api/registers")
+        result = self._request_with_retry("/api/registers")
 
         # Extract register values (remove 'success' key)
         registers = {k: v for k, v in result.items() if k != "success"}
@@ -1153,7 +1218,7 @@ class X64DbgBridge(Debugger):
             call frames)
         """
         data = {"depth": depth}
-        result = self._request("/api/stack", data)
+        result = self._request_with_retry("/api/stack", data)
         frames = result.get("frames", [])
 
         if frames:
@@ -1194,10 +1259,59 @@ class X64DbgBridge(Debugger):
         Get loaded modules.
 
         Returns:
-            List of module dictionaries
+            List of module dictionaries, each with ``name`` (lowercased),
+            ``display_name``, ``path``, and integer ``base``/``size``/``entry``.
+            The first entry is the main module when the plugin reports one.
         """
-        result = self._request("/api/modules")
-        return result.get("modules", [])
+        result = self._request_with_retry("/api/modules")
+        modules = [normalize_module(m) for m in result.get("modules", [])]
+
+        # Older plugin builds only ever return the main module and never set
+        # is_main; the first entry is it. Newer builds flag it explicitly.
+        if modules and not any(m["is_main"] for m in modules):
+            modules[0]["is_main"] = True
+
+        return modules
+
+    def find_module(self, name_or_path: str) -> dict[str, Any] | None:
+        """
+        Find a loaded module by name or path.
+
+        Matching is deliberately strict -- exact name, then name with the
+        extension dropped. A loose substring match here silently resolves
+        addresses against the wrong module, which is worse than not finding it.
+
+        Args:
+            name_or_path: Module name or a path whose basename names the module
+
+        Returns:
+            The normalized module dict, or None if no module matches.
+        """
+        wanted = os.path.basename(str(name_or_path or "").replace("\\", "/")).lower()
+        if not wanted:
+            return None
+
+        modules = self.get_modules()
+
+        for mod in modules:
+            if mod["name"] == wanted:
+                return mod
+
+        # "sample" should still find "sample.exe", and vice versa.
+        wanted_stem = wanted.rsplit(".", 1)[0]
+        for mod in modules:
+            if mod["name"].rsplit(".", 1)[0] == wanted_stem:
+                return mod
+
+        return None
+
+    def get_main_module(self) -> dict[str, Any] | None:
+        """Return the main (debuggee) module, or None if nothing is loaded."""
+        modules = self.get_modules()
+        for mod in modules:
+            if mod["is_main"]:
+                return mod
+        return modules[0] if modules else None
 
     def get_threads(self) -> list[dict[str, Any]]:
         """
@@ -1206,7 +1320,7 @@ class X64DbgBridge(Debugger):
         Returns:
             List of thread dictionaries
         """
-        result = self._request("/api/threads")
+        result = self._request_with_retry("/api/threads")
         return result.get("threads", [])
 
     def switch_thread(self, thread_id: str) -> dict[str, Any]:
@@ -1322,7 +1436,7 @@ class X64DbgBridge(Debugger):
             "size": size
         }
 
-        result = self._request("/api/memory/read", data)
+        result = self._request_with_retry("/api/memory/read", data)
         hex_data = result.get("data", "")
 
         # Convert hex string to bytes
@@ -1465,7 +1579,7 @@ class X64DbgBridge(Debugger):
         Returns:
             Current state
         """
-        result = self._request("/api/status")
+        result = self._request_with_retry("/api/status")
         state_str = result.get("state", "not_loaded")
         return self._parse_state(state_str)
 
@@ -1476,7 +1590,7 @@ class X64DbgBridge(Debugger):
         Returns:
             Dictionary with address, instruction, module, etc.
         """
-        result = self._request("/api/status")
+        result = self._request_with_retry("/api/status")
 
         return {
             "address": result.get("current_address", "unknown"),
@@ -1594,7 +1708,7 @@ class X64DbgBridge(Debugger):
         Note:
             Requires C++ plugin implementation of /api/memory/map
         """
-        result = self._request("/api/memory/map")
+        result = self._request_with_retry("/api/memory/map")
         regions = result.get("regions", [])
 
         logger.debug(f"Got {len(regions)} memory regions")
@@ -1616,7 +1730,7 @@ class X64DbgBridge(Debugger):
         address = self._normalize_address(address)
 
         data = {"address": address}
-        result = self._request("/api/memory/info", data)
+        result = self._request_with_retry("/api/memory/info", data)
 
         return {
             "base": result.get("base", "unknown"),
@@ -1644,7 +1758,7 @@ class X64DbgBridge(Debugger):
             data["address"] = address
 
         try:
-            result = self._request("/api/instruction", data)
+            result = self._request_with_retry("/api/instruction", data)
             api_result = {
                 "address": result.get("address", "unknown"),
                 "bytes": result.get("bytes", ""),
@@ -1740,7 +1854,7 @@ class X64DbgBridge(Debugger):
         # Try plugin first
         try:
             data = {"expression": expression}
-            result = self._request("/api/evaluate", data)
+            result = self._request_with_retry("/api/evaluate", data)
             if result.get("valid", False):
                 return {
                     "value": result.get("value", "unknown"),
@@ -1862,7 +1976,7 @@ class X64DbgBridge(Debugger):
             - Module containing symbol is loaded
         """
         data = {"expression": expression}
-        result = self._request("/api/resolve", data)
+        result = self._request_with_retry("/api/resolve", data)
         return result
 
     def set_comment(self, address: str, comment: str) -> bool:
@@ -2018,7 +2132,7 @@ class X64DbgBridge(Debugger):
         Note:
             Requires C++ plugin implementation of /api/function/list
         """
-        result = self._request("/api/function/list")
+        result = self._request_with_retry("/api/function/list")
 
         functions = result.get("functions", [])
         logger.debug(f"Got {len(functions)} functions")
@@ -2038,7 +2152,7 @@ class X64DbgBridge(Debugger):
             Requires C++ plugin implementation of /api/module/imports
         """
         data = {"module": module_name}
-        result = self._request("/api/module/imports", data)
+        result = self._request_with_retry("/api/module/imports", data)
 
         imports = result.get("imports", [])
         logger.debug(f"Got {len(imports)} imports for {module_name}")
@@ -2058,7 +2172,7 @@ class X64DbgBridge(Debugger):
             Requires C++ plugin implementation of /api/module/exports
         """
         data = {"module": module_name}
-        result = self._request("/api/module/exports", data)
+        result = self._request_with_retry("/api/module/exports", data)
 
         exports = result.get("exports", [])
         logger.debug(f"Got {len(exports)} exports for {module_name}")

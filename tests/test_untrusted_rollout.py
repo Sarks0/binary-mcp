@@ -34,6 +34,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from src.engines.dynamic.x64dbg.bridge import normalize_module
 from src.tools.error_hygiene import safe_path_error
 from src.utils.formatters import (
     UNTRUSTED_CLOSE_SENTINEL,
@@ -415,13 +416,18 @@ class TestDynamicToolsEnvelope:
         self._bridge(
             mod,
             monkeypatch,
+            # X64DbgBridge.get_modules() normalizes what the plugin sends
+            # before any caller sees it, so the stub has to do the same or it
+            # is testing a shape the bridge never returns.
             get_modules=[
-                {
-                    "name": f"{INJECTION}.dll",
-                    "base": "400000",
-                    "size": "10000",
-                    "path": "C:\\Users\\victim\\dropper.dll",
-                }
+                normalize_module(
+                    {
+                        "name": f"{INJECTION}.dll",
+                        "base": "400000",
+                        "size": "10000",
+                        "path": "C:\\Users\\victim\\dropper.dll",
+                    }
+                )
             ],
         )
 

@@ -47,6 +47,22 @@ class X64DbgCommands:
         if location['binary_path']:
             status.append(f"Binary: {Path(location['binary_path']).name}")
 
+        # The main module's name and base are what every static->runtime
+        # address conversion needs; surfacing them here saves a round trip and
+        # tells the caller straight away whether a process is loaded at all.
+        try:
+            main_module = self.bridge.get_main_module()
+        except Exception:
+            main_module = None
+
+        if main_module:
+            status.append(
+                f"Main module: {main_module['display_name']} "
+                f"@ 0x{main_module['base']:X}"
+            )
+        else:
+            status.append("Main module: none (no process loaded)")
+
         return "\n".join(status)
 
     def run_to_address(self, address: str) -> dict[str, Any]:

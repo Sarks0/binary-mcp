@@ -17,6 +17,7 @@
 // x64dbg SDK headers
 #include "pluginsdk/_plugins.h"
 #include "pluginsdk/bridgemain.h"
+#include "pluginsdk/_scriptapi_module.h"
 
 #pragma comment(lib, "advapi32.lib")  // Link Crypto API
 
@@ -875,29 +876,53 @@ std::string HandleListBreakpoints(const std::string& request) {
 }
 
 // Handler: GET_MODULES - List loaded modules
+//
+// Enumerates every loaded module, not just the debuggee image, and emits a
+// "name" field. The previous implementation returned only the main module and
+// put its name under "path" with no "name" key at all, so clients reading
+// "name" got an empty string -- which made substring matching against it
+// always succeed and silently rebased addresses against the wrong module.
 std::string HandleGetModules(const std::string& request) {
     if (!DbgIsDebugging()) {
         return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
     }
 
-    // Use script command to get module info
-    // Get main module info as a starting point
     duint mainBase = DbgValFromString("mod.main()");
-    char mainPath[MAX_PATH] = "";
-    DbgGetModuleAt(mainBase, mainPath);
 
     std::stringstream data;
     data << "\"modules\":[";
 
-    // Get the main module
-    if (mainBase != 0) {
+    int emitted = 0;
+    BridgeList<Script::Module::ModuleInfo> modList;
+    if (Script::Module::GetList(&modList)) {
+        for (int i = 0; i < modList.Count(); i++) {
+            const Script::Module::ModuleInfo& mod = modList[i];
+
+            if (emitted > 0) data << ",";
+            data << "{\"base\":\"" << std::hex << mod.base << std::dec << "\","
+                 << "\"size\":" << mod.size << ","
+                 << "\"entry\":\"" << std::hex << mod.entry << std::dec << "\","
+                 << "\"name\":\"" << JsonEscape(mod.name) << "\","
+                 << "\"path\":\"" << JsonEscape(mod.path) << "\","
+                 << "\"is_main\":" << ((mod.base == mainBase) ? "true" : "false") << "}";
+            emitted++;
+        }
+    }
+
+    // Fall back to the main module alone if enumeration is unavailable, so the
+    // endpoint degrades rather than returning nothing at all.
+    if (emitted == 0 && mainBase != 0) {
+        char mainPath[MAX_PATH] = "";
+        DbgGetModuleAt(mainBase, mainPath);
         duint modSize = DbgValFromString("mod.size(mod.main())");
         duint modEntry = DbgValFromString("mod.entry(mod.main())");
 
         data << "{\"base\":\"" << std::hex << mainBase << std::dec << "\","
              << "\"size\":" << modSize << ","
              << "\"entry\":\"" << std::hex << modEntry << std::dec << "\","
-             << "\"path\":\"" << JsonEscape(mainPath) << "\"}";
+             << "\"name\":\"" << JsonEscape(mainPath) << "\","
+             << "\"path\":\"" << JsonEscape(mainPath) << "\","
+             << "\"is_main\":true}";
     }
 
     data << "]";

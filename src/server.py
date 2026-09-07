@@ -1,7 +1,7 @@
 """
 Binary MCP Server for comprehensive binary analysis.
 
-Provides 290 tools for static and dynamic binary analysis:
+Provides 291 tools for static and dynamic binary analysis:
 - Static analysis via Ghidra (headless mode) for native binaries
 - Static analysis via ILSpyCmd for .NET assemblies
 - Dynamic analysis via x64dbg (native plugin)
@@ -41,6 +41,10 @@ from src.engines.session import AnalysisType, UnifiedSessionManager
 from src.engines.static.ghidra.coverage_store import CoverageStore, has_reviewable_body
 from src.engines.static.ghidra.coverage_store import auto_mark as auto_mark_reviewed
 from src.engines.static.ghidra.project_cache import ProjectCache
+from src.engines.static.ghidra.project_discovery import (
+    discover_projects,
+    find_project,
+)
 from src.engines.static.ghidra.runner import GhidraAnalysisError, GhidraRunner
 from src.tools.control_flow_tools import register_control_flow_tools
 from src.tools.coverage_tools import register_coverage_tools
@@ -65,7 +69,7 @@ from src.utils.compatibility import (
     BinaryCompatibilityChecker,
     CompatibilityLevel,
 )
-from src.utils.config import get_config_int
+from src.utils.config import get_config_int, get_ghidra_project_dirs
 from src.utils.formatters import (
     neutralise_untrusted_delimiters,
     strip_untrusted_envelope,
@@ -594,6 +598,115 @@ def _rebuild_xref_indices(context: dict) -> None:
     context["xrefs_to_import"] = xrefs_to_import
     context["xrefs_to_function_indirect"] = xrefs_to_function_indirect
 
+def _verify_attached_program(
+    context: dict, binary_path: str, project_name: str, program_name: str | None
+) -> str | None:
+    """
+    Confirm the program pulled out of a Ghidra project is the binary we were asked about.
+
+    The analysis cache is keyed on the SHA256 of ``binary_path``. Nothing about
+    ``-process`` guarantees the program that answered to the given name holds
+    those same bytes -- a project can contain several binaries, names repeat
+    across versions, and a wildcard match takes whatever it finds. Without this
+    check, attaching to the wrong program files one binary's functions under
+    another's key, and every later tool call reports confidently on the wrong
+    file.
+
+    Returns a warning string when identity could not be confirmed, None when it
+    matched. Raises UserFacingError on a definite mismatch -- that is a wrong
+    answer, not a degraded one, so it must not be cached.
+    """
+    ghidra_sha = (context.get("metadata") or {}).get("executable_sha256") or ""
+    ghidra_sha = str(ghidra_sha).strip().lower()
+    program_label = (context.get("metadata") or {}).get("name") or program_name or "?"
+
+    if not ghidra_sha:
+        return (
+            f"Could not verify that program '{program_label}' in project "
+            f"'{project_name}' is the same file as {Path(binary_path).name}: "
+            "the project records no SHA256 for it (typical for projects made "
+            "by older Ghidra versions). Results were cached anyway -- confirm "
+            "the program is the right one if anything looks unfamiliar."
+        )
+
+    try:
+        actual_sha = cache._get_binary_hash(binary_path)
+    except OSError:
+        # The reason lands in the log rather than the reply: this string is
+        # returned to the caller, and an errno/path from a caught exception is
+        # exactly what audit F-10 keeps out of returned text.
+        logger.exception("Could not hash %s to verify the attached program", binary_path)
+        return (
+            f"Could not read {Path(binary_path).name} to verify it matches the "
+            f"program in project '{project_name}'. Results were cached anyway; "
+            "see the server log for the read error."
+        )
+
+    if ghidra_sha == actual_sha.lower():
+        return None
+
+    raise UserFacingError(
+        f"Refusing to cache: program '{program_label}' in Ghidra project "
+        f"'{project_name}' is not the same binary as "
+        f"{Path(binary_path).name}.\n\n"
+        f"  project program SHA256: {ghidra_sha}\n"
+        f"  {Path(binary_path).name} SHA256: {actual_sha}\n\n"
+        "The analysis cache is keyed on the file's hash, so saving this would "
+        "file one binary's functions under another's. Pass ghidra_program to "
+        "name the right program in the project (list_ghidra_projects shows "
+        "what it holds), or point binary_path at the file the project was "
+        "built from.",
+        internal_details=(
+            f"attach identity mismatch: project={project_name} "
+            f"program={program_label} ghidra_sha={ghidra_sha} actual={actual_sha}"
+        ),
+    )
+
+
+def _count_rename_clobbers(existing: dict | None, incoming: dict) -> tuple[int, list[str]]:
+    """
+    Count cached function names the incoming project analysis overwrites.
+
+    Renames made through ``rename_function`` live only in the analysis cache;
+    nothing writes them back into the .gpr. Since the project is authoritative,
+    a re-pull replaces them. That is the agreed contract, but it must not be
+    silent -- a name you set an hour ago disappearing with no mention is
+    indistinguishable from a bug.
+
+    Only names carrying the ``cache_only_rename`` marker that
+    ``rename_function`` stamps are counted. Comparing names alone would be
+    wrong in the common case: renaming a function in the Ghidra GUI and
+    re-pulling also changes the name at that address, and reporting *that* as a
+    lost rename would advise the user to go and do the thing they just did.
+    Only a name this server invented can be lost by deferring to the project.
+
+    Returns ``(count, samples)`` where samples are up to five
+    ``"old -> new"`` strings for the report.
+    """
+    if not existing:
+        return 0, []
+
+    incoming_by_addr = {
+        f.get("address"): f.get("name")
+        for f in incoming.get("functions") or []
+        if f.get("address")
+    }
+
+    clobbered: list[str] = []
+    for func in existing.get("functions") or []:
+        if not func.get("cache_only_rename"):
+            continue
+        addr = func.get("address")
+        if not addr or addr not in incoming_by_addr:
+            continue
+        old_name = func.get("name") or ""
+        new_name = incoming_by_addr[addr] or ""
+        if not old_name or old_name == new_name:
+            continue
+        clobbered.append(f"{old_name} -> {new_name}")
+
+    return len(clobbered), clobbered[:5]
+
 
 def _merge_delta_into_cache(existing: dict, delta: dict) -> dict:
     """
@@ -675,12 +788,14 @@ def _acceptable_cached_context(
     enable_fid: bool = False,
     analysis_depth: str = "structural",
     skip_decompile: bool = False,
+    ghidra_project: str | None = None,
 ) -> dict | None:
     """The cached context, if it satisfies this request without a Ghidra run.
 
     Returns ``None`` when a run is unavoidable -- the caller asked to
     re-analyze, is overriding the loader, is extending coverage, needs a PDB or
-    FID pass, or the cache was built shallower than what was asked for.
+    FID pass, is attaching to a Ghidra project, or the cache was built
+    shallower than what was asked for.
 
     Shared by :func:`get_analysis_context` (which short-circuits on it) and by
     ``analyze_binary`` (which uses it to keep a warm read off the job registry
@@ -689,6 +804,12 @@ def _acceptable_cached_context(
     """
     extending = incremental or start_address or end_address
     if force_reanalyze or processor or loader or extending or pdb_path or enable_fid:
+        return None
+    # Attaching to a pre-existing Ghidra project always runs: the whole point
+    # is to pull in work the human has done in the GUI since the cache was
+    # built, so serving the cache would return exactly the stale answer the
+    # caller is trying to replace.
+    if ghidra_project:
         return None
     cached = cache.get_cached(binary_path)
     if not cached:
@@ -783,6 +904,9 @@ def get_analysis_context(
     analysis_depth: str = "structural",
     force_decompile: bool = False,
     target_addresses: list[str] | None = None,
+    ghidra_project: str | None = None,
+    ghidra_program: str | None = None,
+    ghidra_folder: str | None = None,
     job_context=None,
 ) -> dict:
     """
@@ -863,6 +987,7 @@ def get_analysis_context(
         enable_fid=enable_fid,
         analysis_depth=analysis_depth,
         skip_decompile=skip_decompile,
+        ghidra_project=ghidra_project,
     )
     if cached_context is not None:
         logger.info("Using cached analysis for %s", binary_path)
@@ -888,6 +1013,56 @@ def get_analysis_context(
                 "to incremental to avoid overwriting the existing cache."
             )
             incremental = True
+
+    # Resolve an attach target before taking the run lock, so a typo'd project
+    # name fails immediately instead of after acquiring a lock and starting a JVM.
+    attach_project = None
+    attach_project_dir = None
+    if ghidra_project:
+        # These only take effect while Ghidra imports a binary. An attach does
+        # not import -- it opens what the project already holds -- so honouring
+        # the request while quietly dropping them would hand back a program
+        # that does not reflect what was asked for. The runner refuses the
+        # combination too; saying it here names the parameter the caller
+        # actually passed.
+        conflicting = [
+            name for name, value in (
+                ("processor", processor),
+                ("loader", loader),
+                ("pdb_path", pdb_path),
+            ) if value
+        ]
+        if conflicting:
+            raise UserFacingError(
+                f"ghidra_project cannot be combined with "
+                f"{', '.join(conflicting)}: those apply when Ghidra imports a "
+                "binary, and attaching to an existing project skips the "
+                "import. The project already holds the program as it was "
+                "imported and analyzed."
+            )
+        attach_project = find_project(ghidra_project)
+        if attach_project is None:
+            available = ", ".join(p.name for p in discover_projects(
+                include_programs=False, include_sizes=False
+            )) or "none found"
+            raise UserFacingError(
+                f"Ghidra project '{ghidra_project}' not found. "
+                f"Discoverable projects: {available}.\n"
+                "Run list_ghidra_projects to see where the server is looking, "
+                "and set GHIDRA_PROJECT_DIR if your projects live elsewhere."
+            )
+        attach_project_dir = str(attach_project.directory)
+        # Incremental resume merges a delta into an existing cache. An attach
+        # is a full re-read of the project's current state and is authoritative
+        # over the cache, so the two are contradictory -- resume would preserve
+        # cache entries the project no longer agrees with.
+        if incremental:
+            logger.info(
+                "Ignoring incremental=True: attaching to project %s re-reads "
+                "every function, and the project is authoritative.",
+                attach_project.name,
+            )
+            incremental = False
 
     resume_from_cache = None
     resume_manifest_path = None
@@ -920,10 +1095,18 @@ def get_analysis_context(
     else:
         run_lock_wait = 0.0
 
+    # The lock has to name the project actually being opened, not the one
+    # derived from the binary's filename: Ghidra permits a single holder per
+    # project, so two different binaries attaching to one shared project must
+    # serialise, while a normal import keyed on the binary must not start
+    # waiting on an unrelated attach.
     delta_lock_cm = _delta_run_lock(
         cache.cache_dir,
         binary_path,
-        lock_key=cache._get_project_name(binary_path),
+        lock_key=(
+            f"proj_{attach_project.name}" if attach_project
+            else cache._get_project_name(binary_path)
+        ),
         wait_seconds=run_lock_wait,
     )
     delta_lock_cm.__enter__()
@@ -967,21 +1150,35 @@ def get_analysis_context(
         # under the lock on purpose: the owner record it reads is rewritten by
         # any import run on this binary.
         project_name = cache.project_name_for(binary_path)
-        reuse_project, reuse_reason, project_state = _project_reuse_decision(
-            binary_path,
-            project_name,
-            analysis_depth=analysis_depth,
-            force_reanalyze=force_reanalyze,
-            processor=processor,
-            loader=loader,
-            pdb_path=pdb_path,
-        )
-        logger.info(
-            "Ghidra project %s: %s (%s)",
-            project_name,
-            "reusing analyzed program" if reuse_project else "importing",
-            reuse_reason,
-        )
+        if attach_project is not None:
+            # An attach is a reuse run by construction: the caller named a
+            # project and asked us to read the program in it. The owner-record
+            # decision below is about *managed* projects and has nothing to say
+            # here -- there is no owner record for a project we did not create,
+            # so consulting it would answer "import", which is the one thing an
+            # attach must never do.
+            reuse_project = True
+            project_state = None
+            logger.info(
+                "Ghidra project %s: attaching to user project in %s",
+                attach_project.name, attach_project.directory,
+            )
+        else:
+            reuse_project, reuse_reason, project_state = _project_reuse_decision(
+                binary_path,
+                project_name,
+                analysis_depth=analysis_depth,
+                force_reanalyze=force_reanalyze,
+                processor=processor,
+                loader=loader,
+                pdb_path=pdb_path,
+            )
+            logger.info(
+                "Ghidra project %s: %s (%s)",
+                project_name,
+                "reusing analyzed program" if reuse_project else "importing",
+                reuse_reason,
+            )
     except BaseException:
         # Release the lock AND drop a manifest this block may already have
         # written -- the `finally` further down that normally cleans it up is
@@ -1033,9 +1230,20 @@ def get_analysis_context(
                 pdb_path=None if reuse else pdb_path,
                 enable_fid=enable_fid,
                 target_addresses=target_addresses,
-                project_name=project_name,
+                # Attaching and managed reuse are the same Ghidra mechanism
+                # (`-process`), differing only in whose project it is: an
+                # attach names the user's project and its directory, a managed
+                # reuse uses the content-keyed one beside the cache.
+                project_name=(
+                    attach_project.name if attach_project else project_name
+                ),
+                project_dir=attach_project_dir,
                 reuse_project=reuse,
-                program_name=(project_state or {}).get("program_name"),
+                program_name=(
+                    ghidra_program if attach_project
+                    else (project_state or {}).get("program_name")
+                ),
+                folder_path=ghidra_folder,
                 # Report the headless pid into the job record so a sweep from
                 # another process can reap it if this one dies mid-analysis.
                 on_spawn=(
@@ -1060,9 +1268,16 @@ def get_analysis_context(
         except GhidraAnalysisError as e:
             if not reuse_project:
                 raise
+            # An attach names a specific project the caller asked to read.
+            # Falling back to a fresh import would quietly analyze the binary
+            # from scratch and return a context with none of the work they
+            # came for -- and, since the fallback would import into their
+            # directory, the runner refuses it anyway. Surface the failure.
+            if attach_project is not None:
+                raise
             reuse_failure = str(e)
 
-        if reuse_failure is not None:
+        if reuse_failure is not None and attach_project is None:
             logger.warning(
                 "Project reuse for %s failed (%s); falling back to a fresh "
                 "import.", project_name, reuse_failure,
@@ -1071,6 +1286,15 @@ def get_analysis_context(
             reuse_project = False
             project_state = None
             result = _run(False)
+        elif reuse_failure is not None:
+            raise UserFacingError(
+                f"Reading Ghidra project '{attach_project.name}' produced no "
+                f"output ({reuse_failure}). The project may not contain a "
+                f"program matching "
+                f"{ghidra_program or Path(binary_path).name!r}; "
+                "run list_ghidra_projects to see what it holds, then pass "
+                "ghidra_program with the right name."
+            )
 
         # Save Ghidra output to debug file for inspection
         debug_file = cache.cache_dir / "ghidra_debug.log"
@@ -1134,6 +1358,32 @@ def get_analysis_context(
         # Load analysis results
         with open(output_path, encoding="utf-8") as f:
             context = json.load(f)
+
+        # Confirm the project handed us the binary we were asked about, before
+        # anything reaches the cache. Raises on a definite mismatch.
+        if attach_project is not None:
+            attach_warning = _verify_attached_program(
+                context, binary_path, attach_project.name, ghidra_program
+            )
+            if attach_warning:
+                logger.warning(attach_warning)
+            attach_clobbers, attach_clobber_samples = _count_rename_clobbers(
+                cache.get_cached(binary_path), context
+            )
+            # Record where this cache came from so tools that write only to the
+            # cache (rename_function, add_note) can tell the user their edit is
+            # living somewhere a re-pull will overwrite.
+            context.setdefault("metadata", {})
+            context["metadata"]["source_project"] = attach_project.name
+            context["metadata"]["source_project_dir"] = str(attach_project.directory)
+            context["analysis_stats"] = context.get("analysis_stats") or {}
+            context["analysis_stats"]["attached_to_project"] = True
+            context["analysis_stats"]["renames_overwritten"] = attach_clobbers
+            context["analysis_stats"]["renames_overwritten_samples"] = (
+                attach_clobber_samples
+            )
+            if attach_warning:
+                context["analysis_stats"]["attach_warning"] = attach_warning
 
         # If the Ghidra script ran in delta mode (manifest-based resume),
         # ``context`` holds only NEW or RE-DECOMPILED functions plus refreshed
@@ -1662,6 +1912,9 @@ def analyze_binary(
     pdb_path: str | None = None,
     enable_fid: bool = False,
     analysis_depth: str = "full",
+    ghidra_project: str | None = None,
+    ghidra_program: str | None = None,
+    ghidra_folder: str | None = None,
     wait: bool = True,
 ) -> str:
     """
@@ -1691,6 +1944,28 @@ def analyze_binary(
             fresh. Previously-analyzed functions are skipped and preserved.
         start_address / end_address: Hex bounds to restrict the run to an
             address range (e.g. ``"0x61abbc"``).
+        ghidra_project: Name of an existing Ghidra project to read instead of
+            importing the binary fresh. Use this to pick up work you did by
+            hand in the Ghidra GUI -- renamed functions, plate and instruction
+            comments, applied types all come through. Call
+            ``list_ghidra_projects`` to see what is available, and set
+            ``GHIDRA_PROJECT_DIR`` if your projects live outside the server's
+            own directory.
+
+            The project is opened read-only, so this can never modify it.
+
+            **The project is the source of truth.** Everything it says replaces
+            what is in the analysis cache, including function names you set
+            with ``rename_function`` -- those live only in the cache and are
+            overwritten by a re-pull. The reply reports how many were replaced.
+            Notes added with ``add_note`` are keyed by address and survive.
+        ghidra_program: Which program inside the project to read. Defaults to
+            the binary's filename, which is what Ghidra names an imported
+            program. Accepts Ghidra's ``*``/``?`` wildcards; omit it (or pass
+            ``"*"``) to process every program in the project folder.
+        ghidra_folder: Subfolder inside the project holding the program, e.g.
+            ``"/stage2"``. Only needed if you organised the project into
+            folders.
         pdb_path: Path to a Windows PDB file. Staged next to the binary so
             Ghidra's PdbUniversalAnalyzer can apply symbolic function names.
         enable_fid: Run Ghidra's Function ID library fingerprinting; matches
@@ -1774,7 +2049,8 @@ def analyze_binary(
         binary_path = confine_binary_path(binary_path)
 
         # Pre-analysis compatibility check (unless skipped or using cache)
-        if not skip_compatibility_check and not cache.get_cached(binary_path):
+        if (not skip_compatibility_check and not ghidra_project
+                and not cache.get_cached(binary_path)):
             try:
                 compat_info = compatibility_checker.check_compatibility(binary_path)
 
@@ -1807,6 +2083,9 @@ Format: {compat_info.format.value}
             pdb_path=pdb_path,
             enable_fid=enable_fid,
             analysis_depth=analysis_depth,
+            ghidra_project=ghidra_project,
+            ghidra_program=ghidra_program,
+            ghidra_folder=ghidra_folder,
         )
 
         # A warm cache needs no Ghidra run, so it must not pay for the job
@@ -1821,6 +2100,10 @@ Format: {compat_info.format.value}
             **{k: analysis_kwargs[k] for k in (
                 "incremental", "start_address", "end_address",
                 "pdb_path", "enable_fid", "analysis_depth", "skip_decompile",
+                # Without this an attach against a warm cache is answered from
+                # the cache and Ghidra never runs -- returning exactly the
+                # stale names the caller asked to refresh.
+                "ghidra_project",
             )},
         )
 
@@ -1929,6 +2212,40 @@ def _format_analysis_summary(context: dict, compat_warning: str | None) -> str:
 
     # Surface incremental / partial-run stats when present
     stats = context.get("analysis_stats", {})
+
+    # Report the attach: which project answered, how many user-defined names
+    # came across, and what a re-pull overwrote.
+    if stats.get("attached_to_project"):
+        named = sum(
+            1 for f in functions
+            if (f.get("name_source") or "") not in ("", "DEFAULT", "UNKNOWN")
+        )
+        commented = sum(
+            1 for f in functions
+            if f.get("plate_comment") or f.get("instruction_comments")
+        )
+        summary += (
+            f"\n**Read from Ghidra project "
+            f"'{metadata.get('source_project', '?')}'** (opened read-only)\n"
+            f"- Functions with non-default names: {named}\n"
+            f"- Functions carrying comments: {commented}\n"
+        )
+        clobbered = stats.get("renames_overwritten") or 0
+        if clobbered:
+            samples = stats.get("renames_overwritten_samples") or []
+            detail = ""
+            if samples:
+                detail = f" ({', '.join(samples)}"
+                detail += ", ...)" if clobbered > len(samples) else ")"
+            summary += (
+                f"- Replaced {clobbered} cache-only function name(s){detail}. "
+                "The project is authoritative, so names set with "
+                "rename_function do not survive a re-pull -- rename in the "
+                "Ghidra GUI to make one stick.\n"
+            )
+        if stats.get("attach_warning"):
+            summary += f"\n**Note:** {stats['attach_warning']}\n"
+
     if (
         stats.get("resumed") or stats.get("partial_results")
         or stats.get("skipped_by_range") or stats.get("redecompiled")
@@ -2146,6 +2463,129 @@ def load_pdb(
     except Exception as e:
         logger.exception(f"load_pdb failed: {e}")
         return safe_error_message("Failed to apply PDB", e)
+
+
+def _format_size(num_bytes: int) -> str:
+    """Human-readable byte size for listing output."""
+    size = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} GB"
+
+
+@app.tool()
+@log_to_session
+def list_ghidra_projects(include_programs: bool = True) -> str:
+    """
+    List Ghidra projects on disk that ``analyze_binary`` can attach to.
+
+    Use this to find a project you built and annotated in the Ghidra GUI, then
+    pass its name to ``analyze_binary(ghidra_project=...)`` to pull your
+    renamed functions and comments into the analysis cache instead of
+    importing the binary fresh.
+
+    Searches the server's own project directory plus anything listed in the
+    ``GHIDRA_PROJECT_DIR`` environment variable (``os.pathsep``-separated).
+    Point that at the directory your Ghidra GUI uses so the projects you make
+    by hand show up here.
+
+    Args:
+        include_programs: List the programs inside each project. Set False for
+            a faster bare inventory.
+
+    Returns:
+        One entry per project: name, location, whether this server created it,
+        whether it is currently locked, size, last-modified time, and the
+        programs it holds.
+
+    Note:
+        A project marked LOCKED is open in the Ghidra GUI (or another headless
+        run). Attaching to it will fail until you close it in the Ghidra Front
+        End -- Ghidra allows only one holder of a project at a time.
+
+        "managed" projects are ones this server created by importing a binary.
+        They are safe to delete via ``clean_cache(include_ghidra_projects=True)``.
+        Projects anywhere else are yours; this server never deletes them.
+    """
+    try:
+        search_dirs = get_ghidra_project_dirs()
+        projects = discover_projects(include_programs=include_programs)
+
+        header = "**Ghidra Projects**\n\nSearched:\n" + "\n".join(
+            f"- `{d}`" + ("" if d.is_dir() else "  (does not exist)")
+            for d in search_dirs
+        )
+
+        if not projects:
+            return (
+                f"{header}\n\nNo Ghidra projects found.\n\n"
+                "If you keep projects elsewhere, set `GHIDRA_PROJECT_DIR` to "
+                "that directory (os.pathsep-separated for several) and call "
+                "this again."
+            )
+
+        lines = [header, f"\nFound {len(projects)} project(s):\n"]
+        for proj in projects:
+            flags = []
+            flags.append("managed" if proj.managed else "user-owned")
+            if proj.locked:
+                flags.append("**LOCKED**")
+            modified = (
+                time.strftime("%Y-%m-%d %H:%M", time.localtime(proj.modified))
+                if proj.modified
+                else "unknown"
+            )
+            lines.append(f"### {proj.name}  ({', '.join(flags)})")
+            lines.append(f"- Location: `{proj.directory}`")
+            lines.append(f"- Modified: {modified}")
+            if proj.size_bytes:
+                lines.append(f"- Size: {_format_size(proj.size_bytes)}")
+
+            if not include_programs:
+                pass
+            elif proj.programs:
+                shown = proj.programs[:25]
+                rendered = ", ".join(
+                    f"`{p.path}`"
+                    + ("" if p.content_type in (None, "Program") else f" [{p.content_type}]")
+                    for p in shown
+                )
+                more = (
+                    f" (+{len(proj.programs) - len(shown)} more)"
+                    if len(proj.programs) > len(shown)
+                    else ""
+                )
+                # Ghidra names an imported program after the file it came
+                # from, so these strings originate in sample filenames -- a
+                # sample can be named anything its author likes. The count and
+                # label are ours and stay outside the envelope.
+                lines.append(f"- Programs ({len(proj.programs)}):")
+                lines.append(
+                    wrap_untrusted(
+                        f"{rendered}{more}", "Ghidra project program names"
+                    )
+                )
+            else:
+                lines.append(
+                    f"- Programs: could not enumerate ({proj.program_error}). "
+                    "Attaching still works -- omit `ghidra_program` to process "
+                    "every program in the project."
+                )
+            lines.append("")
+
+        lines.append(
+            "**To use one:** `analyze_binary(binary_path=..., "
+            "ghidra_project=\"<name>\")`. The project is the source of truth: "
+            "its function names and comments replace whatever is in the "
+            "analysis cache."
+        )
+        return "\n".join(lines)
+
+    except Exception as e:
+        logger.exception(f"list_ghidra_projects failed: {e}")
+        return safe_error_message("Failed to list Ghidra projects", e)
 
 
 @app.tool()
@@ -2459,15 +2899,25 @@ def _resolve_function_note_key(
 ) -> tuple[dict | None, str | None]:
     """Resolve an address to ``(function_dict, function_key)``.
 
-    The returned key is the function's symbolic name when its
-    ``name_source`` is anything other than ``"DEFAULT"``, and
-    ``"rva:0xHEX"`` (computed against ``metadata.image_base``) otherwise
-    -- the same scheme :class:`ProjectCache` overlay uses, so notes
-    written under one rebuild reattach correctly after another.
+    The key is ``"rva:0xHEX"``, computed against ``metadata.image_base``,
+    falling back to the function's name only when no usable image base makes
+    an RVA computable.
 
-    Falls back to whichever key form is computable when only one is
-    available. Returns ``(None, None)`` if no function in the cache
-    contains the supplied address.
+    RVA is preferred unconditionally because renaming is now an expected
+    event: attaching to a Ghidra project re-reads the human's current function
+    names, and the project is authoritative. A note keyed on the name a
+    function had when the note was written would stop resolving the moment
+    that function was renamed in the GUI -- silently, since
+    ``apply_notes_overlay`` simply finds no match and moves on. The RVA is
+    stable for the life of the side-car: notes are stored per binary *content
+    hash*, so the image base and every function address are fixed.
+
+    Old name-keyed notes keep resolving --
+    :meth:`ProjectCache._function_key_for` registers each function under both
+    its name and its RVA, so both key forms match.
+
+    Returns ``(None, None)`` if no function in the cache contains the
+    supplied address.
     """
     if not address:
         return None, None
@@ -2513,9 +2963,6 @@ def _resolve_function_note_key(
         return None, None
 
     name = target_fn.get("name") or ""
-    name_source = target_fn.get("name_source") or ""
-    if name and name_source and name_source != "DEFAULT":
-        return target_fn, name
 
     metadata = context.get("metadata") or {}
     raw_base = metadata.get("image_base") or ""
@@ -4344,6 +4791,13 @@ def rename_function(
         # Update the function name
         target_function['name'] = new_name
 
+        # Mark this as a name that exists only in the cache. Nothing writes it
+        # back into a Ghidra project, so when the cache is later rebuilt from
+        # one, this is the marker that tells the rebuild a *user* name is being
+        # replaced -- as opposed to the project's own name simply having
+        # changed, which is the ordinary case and not worth reporting.
+        target_function['cache_only_rename'] = True
+
         # Update the signature if it contains the old name
         old_signature = target_function.get('signature', '')
         if original_name in old_signature:
@@ -4377,6 +4831,23 @@ def rename_function(
         result += f"- **New Signature:** `{target_function.get('signature', 'N/A')}`\n\n"
         result += "*The rename is saved in the analysis cache and will be reflected in all subsequent tool calls.*"
 
+        # When this cache was read out of a Ghidra project, that project is the
+        # source of truth and the next re-pull overwrites this name. Say so
+        # here rather than letting the rename quietly disappear later.
+        source_project = (context.get("metadata") or {}).get("source_project")
+        if source_project:
+            result += (
+                f"\n\n**Note:** this cache was read from Ghidra project "
+                f"`{source_project}`, which is authoritative. This rename lives "
+                f"only in the analysis cache -- re-reading the project "
+                f"(`analyze_binary(..., ghidra_project=\"{source_project}\")`) "
+                f"will replace it with whatever the project calls "
+                f"`{func_address}`. Rename it in the Ghidra GUI to make it "
+                f"permanent."
+            )
+
+        # Fenced last, so the note is inside the envelope like the rest of the
+        # result rather than trailing outside it.
         return wrap_untrusted(result, "function rename result")
 
     except Exception as e:

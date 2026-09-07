@@ -80,6 +80,12 @@ Decompile the function at 0x401000
 Find all suspicious API calls and crypto constants
 ```
 
+**Continue manual work** - Pick up a Ghidra project you annotated by hand.
+```
+List my Ghidra projects
+Analyze okular.exe using my okular.stage2 project
+```
+
 **Live Debugging** - Control x64dbg from Claude.
 ```
 Connect to x64dbg and set breakpoints on BCryptEncrypt
@@ -99,11 +105,11 @@ Analyze the crash dump at C:\Windows\MEMORY.DMP
 Decompile the type MyNamespace.MyClass to C#
 ```
 
-## Capabilities (290 tools)
+## Capabilities (291 tools)
 
 Counts below are derived from the tools actually registered by `src/server.py`, and `tests/test_docs_accuracy.py` fails if this file and the code disagree.
 
-### Static Analysis (Ghidra) - 20 tools
+### Static Analysis (Ghidra) - 21 tools
 
 Analysis, decompilation (single and batch), cross-references, memory maps, byte pattern search, function renaming, call graphs, API pattern detection (100+ Windows APIs), crypto constant identification, IOC extraction, PDB loading, and binary compatibility checking.
 
@@ -114,6 +120,8 @@ Python bytecode (`.pyc`) analysis, PyInstaller/py2exe packer detection and extra
 ### Sessions & Server Utilities - 15 tools
 
 Persistent analysis sessions (create, save, load, list, delete, summarise, relate), analyst notes, auto-session configuration, cache cleanup, and a setup diagnostic.
+
+Analysis can also attach to a Ghidra project you built and annotated in the GUI, picking up your renamed functions and comments instead of importing the binary fresh. The project is opened read-only and is never modified. See [docs/ghidra-project-attach.md](docs/ghidra-project-attach.md).
 
 ### Dynamic Analysis (x64dbg) - 159 tools
 
@@ -247,6 +255,7 @@ worth being precise about which parts:
 |----------|-------------|---------|
 | `GHIDRA_HOME` | Ghidra installation path | Auto-detected |
 | `GHIDRA_TIMEOUT` | Analysis timeout (seconds) | 600 |
+| `GHIDRA_PROJECT_DIR` | Extra directories to search for existing Ghidra projects (`os.pathsep`-separated) | `<cache>/ghidra_projects` |
 | `X64DBG_PATH` | x64dbg installation path | Auto-detected |
 | `WINDBG_PATH` | WinDbg/CDB installation path | Auto-detected |
 | `WINDBG_MODE` | Operating mode: `kernel`, `user`, `dump` | `kernel` |
@@ -271,6 +280,7 @@ uv run ruff check src/     # Lint
 - [Installation Guide](INSTALL.md)
 - [Contributing](CONTRIBUTING.md)
 - [Large binaries: project reuse and targeted decompiles](docs/large-binary-decompile.md)
+- [Attaching to an existing Ghidra project](docs/ghidra-project-attach.md)
 - [Background jobs](docs/jobs.md)
 - [WinDbg/Kernel Debugging Guide](docs/windbg-kernel-debugging.md)
 - [x64dbg Architecture](docs/x64dbg-architecture.md)

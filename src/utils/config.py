@@ -151,6 +151,58 @@ def get_cache_dir() -> Path:
     return Path.home() / "ghidra_mcp_cache"
 
 
+def get_ghidra_project_dirs() -> list[Path]:
+    """Resolve the directories to search for Ghidra projects.
+
+    Returns the managed directory first, then any directory named in
+    ``$GHIDRA_PROJECT_DIR`` (``os.pathsep``-separated, so a Windows user can
+    list several). The managed directory -- ``<cache>/ghidra_projects``, the
+    one :class:`GhidraRunner` creates projects in -- is always included and
+    always first, so a caller that only wants "projects we made" can take
+    ``[0]`` and a caller listing everything gets the managed ones ranked
+    ahead of hand-made ones.
+
+    Duplicates are collapsed while preserving order: pointing
+    ``GHIDRA_PROJECT_DIR`` at the managed directory (a reasonable thing to do
+    if you save GUI projects there deliberately) must not list it twice.
+    Non-existent entries are kept rather than filtered -- discovery reports
+    them as empty, which is more useful than silently ignoring a typo'd path.
+    """
+    dirs = [get_cache_dir() / "ghidra_projects"]
+
+    configured = get_config("GHIDRA_PROJECT_DIR")
+    if configured:
+        for raw in configured.split(os.pathsep):
+            raw = raw.strip()
+            if raw:
+                dirs.append(Path(raw).expanduser())
+
+    seen: set[str] = set()
+    unique: list[Path] = []
+    for d in dirs:
+        # resolve() so ~/x and /home/me/x collapse, but fall back to the
+        # unresolved path when the directory does not exist yet.
+        try:
+            key = str(d.resolve())
+        except OSError:
+            key = str(d)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(d)
+    return unique
+
+
+def get_managed_project_dir() -> Path:
+    """The directory this server creates its own Ghidra projects in.
+
+    Projects here are ours to delete on a failed run; projects anywhere else
+    are the user's and must never be cleaned up. See
+    ``GhidraRunner._cleanup_project``.
+    """
+    return get_cache_dir() / "ghidra_projects"
+
+
 def get_config_bool(key: str, default: bool = False) -> bool:
     """Get a boolean configuration value."""
     value = get_config(key)
@@ -188,6 +240,7 @@ CONFIG_KEYS = {
     "GHIDRA_ENABLE_FID": "Enable Function ID library matching during analysis (1/true/yes)",
     "GHIDRA_MAX_HEAP_MB": "JVM max heap for Ghidra subprocess in MB (default 4096). Bump to 6144-8192 for very large binaries.",
     "BINARY_MCP_INLINE_DEADLINE": "Seconds a Ghidra-invoking tool may block before returning a job handle instead (default 25, max 900). Raise it if your MCP client is patient -- under Claude Code, where long calls move to a background task after 2 min, 90-120 returns more answers inline.",
+    "GHIDRA_PROJECT_DIR": "Extra directories to search for existing Ghidra projects (os.pathsep-separated). Point this at the project dir your Ghidra GUI uses to attach analysis to a project you annotated by hand. The managed <cache>/ghidra_projects is always searched too.",
 
     # x64dbg
     "X64DBG_BRIDGE_URL": "URL for x64dbg HTTP bridge (default: http://localhost:27042)",

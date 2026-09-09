@@ -103,6 +103,7 @@ set(SERVER_SOURCES
 
 set(SERVER_HEADERS
     ../pipe_protocol.h
+    ../server/activity_log.h
 )
 
 # Create the server executable

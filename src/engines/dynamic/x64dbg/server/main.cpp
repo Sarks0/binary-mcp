@@ -11,12 +11,26 @@
 #include <cerrno>   // for errno / ERANGE (F-19 Content-Length bounds check)
 #include <cstring>  // for strrchr
 #include "../pipe_protocol.h"
+#include "activity_log.h"
+
+// Reported in the activity log's server.start event so a log can be tied to
+// the build that produced it.
+#define OBSIDIAN_SERVER_VERSION "1.1.0-rc1"
 
 // Global authentication token
 static std::string g_authToken;
 
+// Id of the request currently being served, so the pipe layer can tag its
+// events with it. Safe as a plain global: the server handles one connection at
+// a time in its accept loop. Zero means "no request in flight".
+static unsigned long long g_currentRequestId = 0;
+
 // Log file handle for diagnostics (server runs without console window)
 static FILE* g_logFile = nullptr;
+
+// Directory the executable lives in, with a trailing slash. Captured during
+// InitLogging so the JSONL activity log can be opened alongside the text one.
+static std::string g_exeDir;
 
 // Initialize file-based logging next to the executable
 static void InitLogging() {
@@ -27,7 +41,8 @@ static void InitLogging() {
         if (lastSlash) {
             *(lastSlash + 1) = '\0';
         }
-        std::string logPath = std::string(exePath) + "obsidian_server.log";
+        g_exeDir = std::string(exePath);
+        std::string logPath = g_exeDir + "obsidian_server.log";
         g_logFile = fopen(logPath.c_str(), "w");
     }
     // If log file can't be opened, logging still works via stdout (if console exists)
@@ -48,6 +63,12 @@ void Log(const char* format, ...) {
     if (g_logFile) {
         fprintf(g_logFile, "[Obsidian] %s\n", buffer);
         fflush(g_logFile);  // Flush immediately so logs survive crashes
+    }
+
+    // Mirror into the JSONL so it is a complete record. This text already goes
+    // to obsidian_server.log, so nothing new reaches disk here.
+    if (ActivityLog::Active()) {
+        ActivityLog::Event("log").Str("msg", buffer);
     }
 }
 
@@ -304,7 +325,26 @@ public:
         return false;
     }
 
+    // The plugin round-trip is where hangs and stalls actually happen, and it
+    // was previously invisible: nothing recorded how long it took or whether
+    // it failed. Timed here rather than at each of the five return paths.
     bool SendRequest(const std::string& jsonRequest, std::string& jsonResponse) {
+        const unsigned long long startMs = ActivityLog::NowMs();
+        bool ok = SendRequestInner(jsonRequest, jsonResponse);
+
+        ActivityLog::Event(ok ? "pipe.roundtrip" : "pipe.error")
+            .Num("id", static_cast<long long>(g_currentRequestId))
+            .Num("req_bytes", static_cast<long long>(jsonRequest.size()))
+            .Num("resp_bytes", static_cast<long long>(jsonResponse.size()))
+            .Num("ms", static_cast<long long>(ActivityLog::NowMs() - startMs))
+            .Num("win_err", ok ? 0 : static_cast<long long>(GetLastError()))
+            .Body("request", jsonRequest)
+            .Body("response", jsonResponse);
+        return ok;
+    }
+
+private:
+    bool SendRequestInner(const std::string& jsonRequest, std::string& jsonResponse) {
         if (!m_connected || m_pipe == INVALID_HANDLE_VALUE) {
             return false;
         }
@@ -347,6 +387,8 @@ public:
         jsonResponse = std::string(buffer.data(), responseLength);
         return true;
     }
+
+public:
 
     void Disconnect() {
         if (m_pipe != INVALID_HANDLE_VALUE) {
@@ -496,7 +538,7 @@ std::string BuildHTTPResponse(int statusCode, const std::string& statusText,
 }
 
 // HTTP request handler
-std::string HandleHTTPRequest(const std::string& request) {
+static std::string HandleHTTPRequestInner(const std::string& request) {
     // Parse HTTP method and path
     size_t methodEnd = request.find(' ');
     if (methodEnd == std::string::npos) {
@@ -511,11 +553,29 @@ std::string HandleHTTPRequest(const std::string& request) {
 
     std::string path = request.substr(methodEnd + 1, pathEnd - methodEnd - 1);
 
+    // Correlates every event this request produces. Without it a pipe error or
+    // a slow response cannot be attributed to the call that caused it.
+    const unsigned long long reqId = ActivityLog::NextRequestId();
+    const unsigned long long reqStartMs = ActivityLog::NowMs();
+    g_currentRequestId = reqId;
+
+    ActivityLog::Event("request.received")
+        .Num("id", static_cast<long long>(reqId))
+        .Str("method", method)
+        .Str("path", path)
+        .Num("req_bytes", static_cast<long long>(request.size()));
+
     Log("HTTP %s %s", method.c_str(), path.c_str());
 
     // Validate authentication (except for OPTIONS preflight)
     if (method != "OPTIONS" && !ValidateAuthHeader(request)) {
         Log("Authentication failed for %s %s", method.c_str(), path.c_str());
+        ActivityLog::Event("auth.failed")
+            .Num("id", static_cast<long long>(reqId))
+            .Str("method", method)
+            .Str("path", path)
+            .Num("ms", static_cast<long long>(ActivityLog::NowMs() - reqStartMs));
+        g_currentRequestId = 0;
         return BuildHTTPResponse(401, "Unauthorized", "application/json",
                                 "{\"error\":\"Invalid or missing authentication token\"}");
     }
@@ -779,6 +839,33 @@ std::string HandleHTTPRequest(const std::string& request) {
 }
 
 // HTTP Server implementation
+// Wraps the handler so every return path produces one request.completed
+// event. Instrumenting the eight returns individually would work until someone
+// adds a ninth.
+std::string HandleHTTPRequest(const std::string& request) {
+    g_currentRequestId = 0;
+    const unsigned long long startMs = ActivityLog::NowMs();
+
+    std::string response = HandleHTTPRequestInner(request);
+
+    // Status comes back out of the response line ("HTTP/1.1 200 OK"), which is
+    // the only place it exists by this point.
+    long long status = 0;
+    size_t firstSpace = response.find(' ');
+    if (firstSpace != std::string::npos) {
+        status = atoi(response.c_str() + firstSpace + 1);
+    }
+
+    ActivityLog::Event("request.completed")
+        .Num("id", static_cast<long long>(g_currentRequestId))
+        .Num("status", status)
+        .Num("resp_bytes", static_cast<long long>(response.size()))
+        .Num("ms", static_cast<long long>(ActivityLog::NowMs() - startMs));
+
+    g_currentRequestId = 0;
+    return response;
+}
+
 bool StartHTTPServer(int port) {
     Log("Starting HTTP server on port %d...", port);
 
@@ -974,18 +1061,23 @@ int main(int argc, char* argv[]) {
     // Initialize file-based logging (persists even if console is unavailable)
     InitLogging();
 
-    Log("Obsidian HTTP Server starting...");
-
     // Parse command line arguments
     int port = 8765;  // Default port
     if (argc > 1) {
         port = atoi(argv[1]);
     }
 
+    // Opened before anything that can fail, so a start-up failure is itself
+    // recorded rather than leaving an empty folder.
+    ActivityLog::Init(g_exeDir, OBSIDIAN_SERVER_VERSION, port);
+
+    Log("Obsidian HTTP Server starting...");
+
     // Initialize Winsock
     WSADATA wsaData;
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
         Log("WSAStartup failed: %d", GetLastError());
+        ActivityLog::Shutdown(false, "WSAStartup failed");
         if (g_logFile) fclose(g_logFile);
         return 1;
     }
@@ -993,6 +1085,7 @@ int main(int argc, char* argv[]) {
     // Connect to plugin via Named Pipe
     if (!g_pipeClient.Connect()) {
         Log("Failed to connect to plugin - make sure x64dbg is running with plugin loaded");
+        ActivityLog::Shutdown(false, "pipe connect failed");
         WSACleanup();
         if (g_logFile) fclose(g_logFile);
         return 1;
@@ -1002,6 +1095,7 @@ int main(int argc, char* argv[]) {
     if (!LoadAuthToken()) {
         Log("ERROR: Could not load auth token - refusing to start without authentication");
         Log("Make sure the x64dbg plugin is loaded and has generated the token file.");
+        ActivityLog::Shutdown(false, "auth token unavailable");
         g_pipeClient.Disconnect();
         WSACleanup();
         if (g_logFile) fclose(g_logFile);
@@ -1018,6 +1112,7 @@ int main(int argc, char* argv[]) {
 
     // Cleanup
     Log("Server shutting down (success=%d)", success);
+    ActivityLog::Shutdown(success, success ? "normal shutdown" : "http server failed to start");
     g_pipeClient.Disconnect();
     WSACleanup();
     if (g_logFile) fclose(g_logFile);

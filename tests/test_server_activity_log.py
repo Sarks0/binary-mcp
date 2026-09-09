@@ -20,7 +20,10 @@ Two properties matter beyond "it runs":
   remediation keeps that out of model context, and it has no more business
   sitting in plaintext on disk.
 
-Skips when no C++ compiler is available, e.g. on the Windows CI runner.
+Skips only when no C++ compiler is present. Note that windows-latest DOES
+ship MinGW g++ at C:\\mingw64, so this runs there -- the shim below has to
+build under MinGW as well as Linux gcc/clang. Assuming otherwise is the same
+mistake the GDB tests made in #8.
 """
 
 from __future__ import annotations
@@ -45,7 +48,11 @@ WINDOWS_H = """
 #include <cstring>
 #include <cstdlib>
 #include <string>
+#ifdef _WIN32
+#include <direct.h>
+#else
 #include <sys/stat.h>
+#endif
 typedef unsigned long DWORD; typedef void* HANDLE; typedef int BOOL;
 #define MAX_PATH 260
 #define INVALID_HANDLE_VALUE ((HANDLE)-1)
@@ -62,7 +69,11 @@ inline DWORD GetCurrentProcessId(){ return 8124; }
 inline DWORD GetLastError(){ return 0; }
 inline unsigned long long GetTickCount64(){ static unsigned long long t=1000;
     return t += 13; }
+#ifdef _WIN32
+inline BOOL CreateDirectoryA(const char* p, void*){ return _mkdir(p)==0; }
+#else
 inline BOOL CreateDirectoryA(const char* p, void*){ return mkdir(p,0755)==0; }
+#endif
 inline HANDLE FindFirstFileA(const char*, WIN32_FIND_DATAA*){
     return INVALID_HANDLE_VALUE; }
 inline BOOL FindNextFileA(HANDLE, WIN32_FIND_DATAA*){ return 0; }

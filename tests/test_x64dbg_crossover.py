@@ -482,3 +482,62 @@ class TestFeatureUnavailable:
         with pytest.raises(FeatureUnavailableError):
             bridge._request_with_retry("/api/thread/suspend")
         assert len(calls) == 1
+
+
+class TestPluginVersionReporting:
+    """The loaded plugin build must be checkable from the tools.
+
+    The module and thread fixes only exist in a rebuilt plugin, so a build that
+    cannot name itself has to be reported as such rather than passed over.
+    """
+
+    def _bridge(self, status):
+        from src.engines.dynamic.x64dbg.bridge import X64DbgBridge
+
+        bridge = X64DbgBridge.__new__(X64DbgBridge)
+        bridge._request_with_retry = lambda endpoint, data=None: {
+            "success": True, **status
+        }
+        return bridge
+
+    def test_version_is_surfaced_from_status(self):
+        bridge = self._bridge({
+            "state": "paused", "current_address": "401000",
+            "binary_path": "s.exe", "plugin_version": "1.1.0-rc1",
+        })
+        assert bridge.get_current_location()["plugin_version"] == "1.1.0-rc1"
+        assert bridge.get_plugin_version() == "1.1.0-rc1"
+
+    def test_older_build_reports_none_not_a_guess(self):
+        # Plugin builds before this change simply omit the field.
+        bridge = self._bridge({
+            "state": "paused", "current_address": "401000", "binary_path": "",
+        })
+        assert bridge.get_current_location()["plugin_version"] is None
+        assert bridge.get_plugin_version() is None
+
+    def test_empty_string_is_treated_as_not_reported(self):
+        bridge = self._bridge({"state": "paused", "plugin_version": ""})
+        assert bridge.get_plugin_version() is None
+
+    def _commands(self, status):
+        from src.engines.dynamic.x64dbg.commands import X64DbgCommands
+
+        bridge = self._bridge(status)
+        bridge.is_connected = lambda: True
+        bridge.get_main_module = lambda: None
+        return X64DbgCommands(bridge)
+
+    def test_status_summary_names_the_build(self):
+        out = self._commands({
+            "state": "paused", "current_address": "401000",
+            "binary_path": "", "plugin_version": "1.1.0-rc1",
+        }).get_status_summary()
+        assert "Plugin: v1.1.0-rc1" in out
+
+    def test_status_summary_flags_a_stale_build(self):
+        out = self._commands({
+            "state": "paused", "current_address": "401000", "binary_path": "",
+        }).get_status_summary()
+        assert "version not reported" in out
+        assert "Rebuild" in out

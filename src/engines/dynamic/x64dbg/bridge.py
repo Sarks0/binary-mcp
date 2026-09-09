@@ -1711,8 +1711,21 @@ class X64DbgBridge(Debugger):
         return {
             "address": result.get("current_address", "unknown"),
             "binary_path": result.get("binary_path", ""),
-            "state": result.get("state", "unknown")
+            "state": result.get("state", "unknown"),
+            # Absent on plugin builds from before the version was reported.
+            # None means "this build cannot say", which is itself the answer to
+            # "am I running the rebuilt plugin?" -- do not fill it with a guess.
+            "plugin_version": result.get("plugin_version") or None,
         }
+
+    def get_plugin_version(self) -> str | None:
+        """
+        Version string of the loaded x64dbg plugin.
+
+        Returns:
+            The version, or None if the plugin build does not report one.
+        """
+        return self.get_current_location().get("plugin_version")
 
     def _parse_state(self, state_str: str) -> DebuggerState:
         """Convert string state to DebuggerState enum."""

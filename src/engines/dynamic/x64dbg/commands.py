@@ -44,6 +44,19 @@ class X64DbgCommands:
         status.append(f"State: {location['state']}")
         status.append(f"Address: 0x{location['address']}")
 
+        # A build that cannot report its version is one from before the module
+        # and thread fixes, so say so rather than omitting the line: a missing
+        # field would read as "fine" when it is the thing to act on.
+        version = location.get("plugin_version")
+        if version:
+            status.append(f"Plugin: v{version}")
+        else:
+            status.append(
+                "Plugin: version not reported -- this build predates the "
+                "module/thread fixes. Rebuild and reinstall the plugin and "
+                "obsidian_server.exe together."
+            )
+
         if location['binary_path']:
             status.append(f"Binary: {Path(location['binary_path']).name}")
 

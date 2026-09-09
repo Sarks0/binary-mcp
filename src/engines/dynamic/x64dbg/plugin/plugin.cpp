@@ -936,6 +936,13 @@ std::string BuildAddressError(const std::string& errorMsg, const std::string& ad
 std::string HandleGetState(const std::string& request) {
     std::stringstream data;
 
+    // The build identifier goes out on every status reply, including the
+    // not-debugging one. The module and thread fixes only exist in a rebuilt
+    // plugin, so "which build is loaded?" is the first question when the tools
+    // report one unnamed module -- and until now it could only be answered by
+    // reading x64dbg's log by hand.
+    data << "\"plugin_version\":\"" << PLUGIN_VERSION_STR << "\",";
+
     // Check if debugger is active
     if (!DbgIsDebugging()) {
         data << "\"state\":\"not_loaded\","

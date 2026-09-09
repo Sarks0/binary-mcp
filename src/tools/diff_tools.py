@@ -38,6 +38,7 @@ from src.tools.function_hash_tools import (
     _compute_function_hash,
     _get_capstone_mode,
 )
+from src.utils.formatters import wrap_untrusted
 
 logger = logging.getLogger(__name__)
 
@@ -657,11 +658,21 @@ def _format_report(
         lines.append(f"  Full untruncated report: {full_report_path}")
     lines.append("")
 
-    def _name_section(title: str, entries: list[str], total: int, noun: str) -> None:
+    def _name_section(
+        title: str, entries: list[str], total: int, noun: str, kind: str
+    ) -> None:
         shown = entries if list_limit <= 0 else entries[:list_limit]
         suffix = f", showing {len(shown)}" if len(shown) < total else ""
         lines.append(f"### {title} ({total}{suffix})")
-        lines.extend(shown)
+        # Audit F-7: every row names a function in one of the two binaries
+        # under comparison, and those names come from the binaries' own symbol
+        # / PDB data -- attacker-authored for a malware sample, and equally so
+        # for the "patched" side when both inputs are untrusted. The bucket
+        # counts and the elision note are this tool's own arithmetic and stay
+        # outside the fence. Fencing here rather than at the three call sites
+        # means a fourth section cannot be added unfenced.
+        if shown:
+            lines.append(wrap_untrusted("\n".join(shown), kind=kind))
         if len(shown) < total:
             lines.append(_elide(total, len(shown), noun))
         lines.append("")
@@ -671,12 +682,14 @@ def _format_report(
         [f"- {f.get('name')} @ {f.get('address')}" for f in added],
         len(added),
         "added function(s)",
+        "function names from the new binary",
     )
     _name_section(
         "REMOVED",
         [f"- {f.get('name')} @ {f.get('address')}" for f in removed],
         len(removed),
         "removed function(s)",
+        "function names from the old binary",
     )
     # Renamed-but-otherwise-unchanged: hash-identical phase-2 pairs whose
     # names differ. Surfaced separately so they don't pollute the MODIFIED
@@ -690,6 +703,7 @@ def _format_report(
         ],
         len(unchanged_renamed),
         "rename(s)",
+        "function names from both binaries",
     )
 
     if len(shown_modified) < len(modified_sorted):
@@ -702,19 +716,35 @@ def _format_report(
         header = f"### MODIFIED ({len(modified_sorted)})"
     lines.append(header)
 
+    # Audit F-7: the MODIFIED bucket is the richest sample-derived block in
+    # this report -- besides the names it prints the first changed line of
+    # decompiled pseudocode from BOTH binaries. The "-- module:" sub-headings
+    # are derived from those names too (``A::B::method`` -> ``A::B``), so they
+    # belong inside the fence rather than framing it. One envelope around the
+    # whole bucket, not one per entry: a bounded report can still hold
+    # hundreds of pairs, and a per-entry fence would cost more boilerplate
+    # than content.
+    body: list[str] = []
     if group_by == "module":
         groups: dict[str, list[tuple[dict, dict, str, dict]]] = {}
         for entry in shown_modified:
             old_func, _, _, _ = entry
             groups.setdefault(_module_prefix(old_func), []).append(entry)
         for module, entries in sorted(groups.items()):
-            lines.append(f"-- module: {module} ({len(entries)})")
+            body.append(f"-- module: {module} ({len(entries)})")
             for entry in entries:
-                lines.extend(_format_modified_entry(entry, old_ctx, new_ctx))
-            lines.append("")
+                body.extend(_format_modified_entry(entry, old_ctx, new_ctx))
+            body.append("")
     else:
         for entry in shown_modified:
-            lines.extend(_format_modified_entry(entry, old_ctx, new_ctx))
+            body.extend(_format_modified_entry(entry, old_ctx, new_ctx))
+    if body:
+        lines.append(
+            wrap_untrusted(
+                "\n".join(body).rstrip("\n"),
+                kind="function names and decompiled excerpts from both binaries",
+            )
+        )
 
     if len(shown_modified) < len(modified_sorted):
         lines.append(_elide(len(modified_sorted), len(shown_modified), "modified pair(s)"))

@@ -11,6 +11,7 @@ from pathlib import Path
 from fastmcp import FastMCP
 
 from src.engines.static.dotnet.ilspy_runner import get_ilspy_runner
+from src.utils.formatters import wrap_untrusted
 from src.utils.security import (
     FileSizeError,
     PathTraversalError,
@@ -101,10 +102,14 @@ After installation, restart your MCP client.
 **Types by Namespace:**
 
 """
-            # Show types grouped by namespace
+            # Audit F-7: namespace and type names are metadata strings chosen
+            # by whoever built the assembly. The statistics above and the
+            # "Next Steps" guidance below are server-authored and stay outside
+            # the fence; only the recovered names go inside it.
+            listing = ""
             for ns in sorted(by_namespace.keys()):
                 types = by_namespace[ns]
-                result += f"### {ns} ({len(types)} types)\n\n"
+                listing += f"### {ns} ({len(types)} types)\n\n"
 
                 # Group by kind
                 classes = [t for t in types if t.kind == "class"]
@@ -114,38 +119,38 @@ After installation, restart your MCP client.
                 delegates = [t for t in types if t.kind == "delegate"]
 
                 if classes:
-                    result += f"**Classes:** {', '.join(t.name for t in classes[:10])}"
+                    listing += f"**Classes:** {', '.join(t.name for t in classes[:10])}"
                     if len(classes) > 10:
-                        result += f" ... (+{len(classes) - 10} more)"
-                    result += "\n"
+                        listing += f" ... (+{len(classes) - 10} more)"
+                    listing += "\n"
 
                 if interfaces:
-                    result += f"**Interfaces:** {', '.join(t.name for t in interfaces[:10])}"
+                    listing += f"**Interfaces:** {', '.join(t.name for t in interfaces[:10])}"
                     if len(interfaces) > 10:
-                        result += f" ... (+{len(interfaces) - 10} more)"
-                    result += "\n"
+                        listing += f" ... (+{len(interfaces) - 10} more)"
+                    listing += "\n"
 
                 if enums:
-                    result += f"**Enums:** {', '.join(t.name for t in enums[:10])}"
+                    listing += f"**Enums:** {', '.join(t.name for t in enums[:10])}"
                     if len(enums) > 10:
-                        result += f" ... (+{len(enums) - 10} more)"
-                    result += "\n"
+                        listing += f" ... (+{len(enums) - 10} more)"
+                    listing += "\n"
 
                 if structs:
-                    result += f"**Structs:** {', '.join(t.name for t in structs[:10])}"
+                    listing += f"**Structs:** {', '.join(t.name for t in structs[:10])}"
                     if len(structs) > 10:
-                        result += f" ... (+{len(structs) - 10} more)"
-                    result += "\n"
+                        listing += f" ... (+{len(structs) - 10} more)"
+                    listing += "\n"
 
                 if delegates:
-                    result += f"**Delegates:** {', '.join(t.name for t in delegates[:10])}"
+                    listing += f"**Delegates:** {', '.join(t.name for t in delegates[:10])}"
                     if len(delegates) > 10:
-                        result += f" ... (+{len(delegates) - 10} more)"
-                    result += "\n"
+                        listing += f" ... (+{len(delegates) - 10} more)"
+                    listing += "\n"
 
-                result += "\n"
+                listing += "\n"
 
-            result += """
+            listing += """
 **Next Steps:**
 - `get_dotnet_types(assembly_path)` - Get detailed type list
 - `decompile_dotnet_type(assembly_path, "Namespace.ClassName")` - Decompile a class to C#
@@ -155,7 +160,11 @@ After installation, restart your MCP client.
             return result
 
         except FileNotFoundError as e:
-            return f"Error: {e}"
+            # Audit F-10: the assembly path itself is already validated and
+            # reported above; a FileNotFoundError escaping this far comes from
+            # the ILSpy runner (missing ilspycmd, missing cached output) and
+            # its message contains the runner's own host paths.
+            return safe_error_message("Failed to analyze .NET assembly", e)
         except Exception as e:
             logger.error(f"analyze_dotnet failed: {e}")
             return safe_error_message("Failed to analyze .NET assembly", e)
@@ -210,12 +219,19 @@ After installation, restart your MCP client.
 
             result = f"**Types: {total} found ({len(types)} shown)**\n\n"
 
+            # Audit F-7: type / namespace names come out of the assembly's
+            # metadata tables, which the sample author controls completely.
+            listing = ""
             for t in types:
-                result += f"- **{t.name}** ({t.kind})\n"
-                result += f"  - Full Name: `{t.full_name}`\n"
+                listing += f"- **{t.name}** ({t.kind})\n"
+                listing += f"  - Full Name: `{t.full_name}`\n"
                 if t.namespace:
-                    result += f"  - Namespace: `{t.namespace}`\n"
-                result += "\n"
+                    listing += f"  - Namespace: `{t.namespace}`\n"
+                listing += "\n"
+            result += wrap_untrusted(
+                listing.rstrip("\n"),
+                kind="type names from the .NET assembly",
+            ) + "\n"
 
             if total > limit:
                 result += f"\n*Showing {limit} of {total} types. Use filters or increase limit.*"
@@ -261,10 +277,16 @@ After installation, restart your MCP client.
 
             source_code = ilspy.decompile_type(assembly_path, type_name)
 
+            # Audit F-7: ILSpy output is the SAMPLE'S OWN SOURCE, recovered.
+            # Identifiers, string literals and comments are all written by
+            # whoever compiled the assembly, so the C# body is fenced while
+            # the "Decompiled: <type>" heading stays server-authored.
+            body = "```csharp\n" + source_code + "\n```"
             result = f"**Decompiled: {type_name}**\n\n"
-            result += "```csharp\n"
-            result += source_code
-            result += "\n```\n"
+            result += wrap_untrusted(
+                body, kind="decompiled C# from the .NET assembly"
+            )
+            result += "\n"
 
             return result
 
@@ -273,8 +295,17 @@ After installation, restart your MCP client.
             try:
                 matches = ilspy.search_types(assembly_path, type_name.split(".")[-1])
                 if matches:
+                    # Audit F-7: the suggestions are type names lifted out of
+                    # the assembly's metadata, so they are sample-authored even
+                    # though the sentence around them is ours.
                     suggestions = ", ".join(m.full_name for m in matches[:5])
-                    return f"Error: Type '{type_name}' not found.\n\nDid you mean: {suggestions}?"
+                    return (
+                        f"Error: Type '{type_name}' not found.\n\nDid you mean:\n"
+                        + wrap_untrusted(
+                            suggestions,
+                            kind="type names from the .NET assembly",
+                        )
+                    )
             except Exception:
                 pass
             return f"Error: {e}"
@@ -329,8 +360,12 @@ After installation, restart your MCP client.
                 result += "No types found matching the pattern.\n"
                 return result
 
-            for t in matches:
-                result += f"- **{t.full_name}** ({t.kind})\n"
+            # Audit F-7: matched type names are assembly metadata the
+            # sample author wrote; the query echo and the counts are ours.
+            result += wrap_untrusted(
+                "\n".join(f"- **{t.full_name}** ({t.kind})" for t in matches),
+                kind="type names from the .NET assembly",
+            ) + "\n"
 
             if total > limit:
                 result += f"\n*Showing {limit} of {total} matches.*"
@@ -395,9 +430,15 @@ After installation, restart your MCP client.
 
 **Sample Files:**
 """
-            for cs_file in cs_files[:10]:
-                relative = cs_file.relative_to(output_dir)
-                result += f"- `{relative}`\n"
+            # Audit F-7: ILSpy names each output file after the type it
+            # decompiled, so these relative paths are assembly metadata --
+            # sample-authored text -- not host paths.
+            listing = "\n".join(
+                f"- `{cs_file.relative_to(output_dir)}`" for cs_file in cs_files[:10]
+            )
+            result += wrap_untrusted(
+                listing, kind="decompiled file names from the .NET assembly"
+            ) + "\n"
 
             if len(cs_files) > 10:
                 result += f"- ... and {len(cs_files) - 10} more files\n"
@@ -454,16 +495,19 @@ After installation, restart your MCP client.
 
             title = f"IL Disassembly: {type_name or Path(assembly_path).name}"
             result = f"**{title}**\n\n"
-            result += "```il\n"
 
-            # Truncate if too long
-            if len(il_code) > 50000:
-                result += il_code[:50000]
-                result += "\n\n... (truncated, IL output too long)\n"
-            else:
-                result += il_code
-
-            result += "\n```\n"
+            # Audit F-7: IL carries the assembly's user strings and metadata
+            # names verbatim -- ``ldstr`` operands ARE the sample's text.
+            # Note the truncation notice is emitted OUTSIDE the fence: it is
+            # this server speaking about the block, not part of it.
+            truncated = len(il_code) > 50000
+            body = "```il\n" + (il_code[:50000] if truncated else il_code) + "\n```"
+            result += wrap_untrusted(
+                body, kind="IL disassembly from the .NET assembly"
+            )
+            if truncated:
+                result += "\n\n... (truncated, IL output too long)"
+            result += "\n"
 
             return result
 

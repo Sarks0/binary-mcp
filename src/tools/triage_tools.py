@@ -14,6 +14,8 @@ import logging
 import struct
 from pathlib import Path
 
+from src.utils.formatters import wrap_untrusted
+
 logger = logging.getLogger(__name__)
 
 
@@ -638,25 +640,42 @@ def register_triage_tools(app, session_manager=None):
             if has_strings:
                 output.append("Suspicious Strings:")
 
+                # F-7: URLs, IPs, paths and registry keys below are byte
+                # sequences the malware author put in the file. Build them into
+                # their own block and fence it once, so the counts and section
+                # header above stay recognisable as server text while the
+                # sample's own words are marked as data, not instructions.
+                # Keyword hits (commands / crypto) are echoes of OUR keyword
+                # list, not sample text, so they stay outside the fence.
+                sample_lines: list[str] = []
+
                 if strings["urls"]:
-                    output.append(f"  URLs ({len(strings['urls'])}):")
+                    sample_lines.append(f"  URLs ({len(strings['urls'])}):")
                     for url in strings["urls"][:5]:
-                        output.append(f"    - {url[:80]}")
+                        sample_lines.append(f"    - {url[:80]}")
 
                 if strings["ips"]:
-                    output.append(f"  IP Addresses ({len(strings['ips'])}):")
+                    sample_lines.append(f"  IP Addresses ({len(strings['ips'])}):")
                     for ip in strings["ips"][:5]:
-                        output.append(f"    - {ip}")
+                        sample_lines.append(f"    - {ip}")
 
                 if strings["file_paths"]:
-                    output.append(f"  File Paths ({len(strings['file_paths'])}):")
+                    sample_lines.append(f"  File Paths ({len(strings['file_paths'])}):")
                     for fp in strings["file_paths"][:5]:
-                        output.append(f"    - {fp[:60]}")
+                        sample_lines.append(f"    - {fp[:60]}")
 
                 if strings["registry_keys"]:
-                    output.append(f"  Registry Keys ({len(strings['registry_keys'])}):")
+                    sample_lines.append(f"  Registry Keys ({len(strings['registry_keys'])}):")
                     for rk in strings["registry_keys"][:5]:
-                        output.append(f"    - {rk[:60]}")
+                        sample_lines.append(f"    - {rk[:60]}")
+
+                if sample_lines:
+                    output.append(
+                        wrap_untrusted(
+                            "\n".join(sample_lines),
+                            kind="strings extracted from the sample",
+                        )
+                    )
 
                 if strings["commands"]:
                     output.append("  Command Keywords:")
@@ -784,34 +803,51 @@ def register_triage_tools(app, session_manager=None):
                 output.append(f"Extracted {total_iocs} potential IOCs:")
                 output.append("")
 
+                # F-7: every IOC printed here is raw sample content. Collect
+                # the whole listing and fence it once -- the hashes, counts and
+                # the "Extracted N" line above remain server-authored text
+                # outside the envelope, which is what gives the boundary
+                # meaning. Nothing is truncated: the analyst still needs to
+                # read every indicator.
+                ioc_lines: list[str] = []
+
                 if strings["urls"]:
-                    output.append(f"URLs ({len(strings['urls'])}):")
+                    ioc_lines.append(f"URLs ({len(strings['urls'])}):")
                     for url in strings["urls"]:
-                        output.append(f"  {url}")
-                    output.append("")
+                        ioc_lines.append(f"  {url}")
+                    ioc_lines.append("")
 
                 if strings["ips"]:
-                    output.append(f"IP Addresses ({len(strings['ips'])}):")
+                    ioc_lines.append(f"IP Addresses ({len(strings['ips'])}):")
                     for ip in strings["ips"]:
-                        output.append(f"  {ip}")
-                    output.append("")
+                        ioc_lines.append(f"  {ip}")
+                    ioc_lines.append("")
 
                 if strings["emails"]:
-                    output.append(f"Email Addresses ({len(strings['emails'])}):")
+                    ioc_lines.append(f"Email Addresses ({len(strings['emails'])}):")
                     for email in strings["emails"]:
-                        output.append(f"  {email}")
-                    output.append("")
+                        ioc_lines.append(f"  {email}")
+                    ioc_lines.append("")
 
                 if strings["file_paths"]:
-                    output.append(f"File Paths ({len(strings['file_paths'])}):")
+                    ioc_lines.append(f"File Paths ({len(strings['file_paths'])}):")
                     for fp in strings["file_paths"]:
-                        output.append(f"  {fp}")
-                    output.append("")
+                        ioc_lines.append(f"  {fp}")
+                    ioc_lines.append("")
 
                 if strings["registry_keys"]:
-                    output.append(f"Registry Keys ({len(strings['registry_keys'])}):")
+                    ioc_lines.append(f"Registry Keys ({len(strings['registry_keys'])}):")
                     for rk in strings["registry_keys"]:
-                        output.append(f"  {rk}")
+                        ioc_lines.append(f"  {rk}")
+                    ioc_lines.append("")
+
+                if ioc_lines:
+                    output.append(
+                        wrap_untrusted(
+                            "\n".join(ioc_lines).rstrip("\n"),
+                            kind="IOCs extracted from the sample",
+                        )
+                    )
                     output.append("")
 
             else:

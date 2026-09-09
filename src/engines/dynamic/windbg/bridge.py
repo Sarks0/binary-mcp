@@ -84,8 +84,27 @@ _CDB_TIMEOUT = 30
 # actionable error instead of hanging forever.  Override with KDNET_TIMEOUT env.
 _KDNET_TIMEOUT = int(os.environ.get("KDNET_TIMEOUT", "60"))
 
-# Dangerous WinDbg meta-commands that must never be executed via the bridge.
-# Checked case-insensitively via substring match (commands can follow semicolons).
+# LEGACY, AND NO LONGER A GATE.
+#
+# This tuple used to be a case-insensitive SUBSTRING blocklist applied by
+# ``windbg_tools.windbg_execute_command`` on top of the bridge validator. Two
+# layers with different shapes disagreed in both directions -- this one refused
+# ``.printf`` / ``.foreach`` / ``.outmask`` / ``.formats`` / ``.tlist`` /
+# ``.bugcheck`` (read-only commands the validator permits) while being blind to
+# every token only the bridge knew about, and being a substring match it also
+# refused benign commands whose ARGUMENT text merely contained one of these
+# words.
+#
+# The authoritative gate is now the fail-closed allowlist in
+# ``src/engines/dynamic/windbg/allowlist.py``, applied by
+# :meth:`WinDbgBridge._validate_command_safety` to every command that reaches
+# the engine. A denylist in front of an allowlist can only subtract from the
+# allowlist's decisions, i.e. produce false refusals; it cannot make anything
+# safer. So this list is no longer consulted by any code path.
+#
+# It is retained as a named constant because ``tests/test_docs_accuracy.py``
+# imports it to pin the historical over-block set. Do not reintroduce it as a
+# gate: add to (or argue about) the allowlist instead.
 _BLOCKED_COMMANDS = (
     # Process/session control
     ".shell",
@@ -114,6 +133,17 @@ _BLOCKED_COMMANDS = (
     ".foreach",
     ".block",
     ".printf",
+    # Script-file include operators (audit F-1/H2).  '$<', '$><', '$$<',
+    # '$$><' and '$$>a<' each run an arbitrary debugger command file from
+    # disk, which chains straight to '.shell' and therefore to RCE on the
+    # analyst host.  The allowlist refuses them in two independent ways (a
+    # _DENY_ARGFORM rule, and the fact that no allowlisted command name can
+    # start with '$'), which is what actually protects the bridge now.
+    "$$>a<",
+    "$$><",
+    "$$<",
+    "$><",
+    "$<",
     # Module loading
     ".load",
     ".loadby",
@@ -503,6 +533,7 @@ class WinDbgBridge(Debugger):
             # combinations refuse SetInterrupt but honour the meta-command.
             logger.info("SetInterrupt did not break target; trying .break")
             try:
+                self._validate_command_safety(".break")
                 self._dbg.cmd(".break")
             except Exception as exc:
                 logger.debug(".break command raised: %s", exc)
@@ -547,16 +578,30 @@ class WinDbgBridge(Debugger):
         """
         self._require_connected()
         frames = max(1, min(256, frames))
+        # The structured primitives below build their own command strings and
+        # historically went straight to the engine, bypassing the gate that
+        # execute_command() applies. Routing them through the same validator
+        # keeps ONE authoritative allowlist for the whole bridge: if a caller
+        # ever manages to steer an argument (a thread id, a type name, an
+        # address) somewhere unexpected, the gate sees it. It also means the
+        # allowlist is provably wide enough for everything this project issues
+        # -- an over-tight entry breaks these calls loudly, in tests, rather
+        # than silently in the field.
+        thread_cmd = f"~{int(thread_id)}s" if thread_id is not None else ""
+        stack_cmd = f"kn 0x{frames:x}"
+        if thread_cmd:
+            self._validate_command_safety(thread_cmd)
+        self._validate_command_safety(stack_cmd)
         if thread_id is not None:
             try:
-                self._dbg.cmd(f"~{int(thread_id)}s")
+                self._dbg.cmd(thread_cmd)
                 self._session.current_thread_id = int(thread_id)
             except Exception as exc:
                 raise WinDbgBridgeError(
                     "get_stack", f"thread switch to {thread_id} failed: {exc}"
                 ) from exc
         try:
-            output = self._dbg.cmd(f"kn 0x{frames:x}")
+            output = self._dbg.cmd(stack_cmd)
         except Exception as exc:
             raise WinDbgBridgeError("get_stack", str(exc)) from exc
         return WinDbgOutputParser.parse_stack(output or "")
@@ -576,6 +621,7 @@ class WinDbgBridge(Debugger):
         """
         self._require_connected()
         cmd = "!thread" if not thread else f"!thread {thread}"
+        self._validate_command_safety(cmd)
         try:
             output = self._dbg.cmd(cmd)
         except Exception as exc:
@@ -600,6 +646,7 @@ class WinDbgBridge(Debugger):
         self._require_connected()
         target = process if process else "0"
         cmd = f"!process {target} 0x{flags:x}"
+        self._validate_command_safety(cmd)
         try:
             output = self._dbg.cmd(cmd)
         except Exception as exc:
@@ -642,6 +689,7 @@ class WinDbgBridge(Debugger):
         if address:
             cmd_parts.append(address)
         cmd = " ".join(cmd_parts)
+        self._validate_command_safety(cmd)
         try:
             output = self._dbg.cmd(cmd) or ""
         except Exception as exc:
@@ -701,8 +749,10 @@ class WinDbgBridge(Debugger):
             )
         # Reuse the address validator from windbg_tools' allow patterns
         # by routing through the shared bridge command-safety layer.
+        ba_cmd = f"ba {kind} {size} {address}"
+        self._validate_command_safety(ba_cmd)
         try:
-            self._dbg.cmd(f"ba {kind} {size} {address}")
+            self._dbg.cmd(ba_cmd)
         except Exception as exc:
             raise WinDbgBridgeError("set_hardware_breakpoint", str(exc)) from exc
         # Track for matching disconnect/cleanup. Hardware bps are
@@ -718,8 +768,10 @@ class WinDbgBridge(Debugger):
         so subsequent ``get_session_state`` calls reflect the change.
         """
         self._require_connected()
+        switch_cmd = f"~{int(thread_id)}s"
+        self._validate_command_safety(switch_cmd)
         try:
-            output = self._dbg.cmd(f"~{int(thread_id)}s") or ""
+            output = self._dbg.cmd(switch_cmd) or ""
         except Exception as exc:
             raise WinDbgBridgeError("switch_thread", str(exc)) from exc
         self._session.current_thread_id = int(thread_id)
@@ -1637,16 +1689,22 @@ class WinDbgBridge(Debugger):
             )
 
     def _validate_command_safety(self, command: str) -> None:
-        """Block dangerous WinDbg meta-commands for defense-in-depth.
+        """Apply the authoritative command gate.
 
-        Delegates to the token-aware :func:`allowlist.validate_command`
-        which understands compound commands, quoted regions, and
-        ``.foreach``/``.for`` block bodies. The legacy substring matcher
-        was simultaneously over- and under-blocking; see ``allowlist.py``
-        for the current rule set.
+        Delegates to :func:`allowlist.validate_command`, which is a
+        FAIL-CLOSED ALLOWLIST: a subcommand runs only if its command name is
+        one of the curated read-only/inspection verbs, in an allowed argument
+        form. It understands compound commands, quoted regions, ``{...}``
+        block bodies and the command-string arguments of breakpoint/control-
+        flow carriers.
+
+        This method is the single decision point. Every command that reaches
+        the engine passes through it -- the structured tools included -- so no
+        second, differently-shaped filter is layered above it at the tool
+        level; see ``_BLOCKED_COMMANDS`` above for why the old one is gone.
 
         Raises:
-            WinDbgBridgeError: If a blocked command is detected.
+            WinDbgBridgeError: If the command is not permitted.
         """
         from .allowlist import validate_command
 

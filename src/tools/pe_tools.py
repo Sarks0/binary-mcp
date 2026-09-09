@@ -11,7 +11,38 @@ import logging
 from datetime import UTC, datetime
 from pathlib import Path
 
+from src.tools.error_hygiene import curated_structured_text
+from src.utils.formatters import wrap_untrusted
+
 logger = logging.getLogger(__name__)
+
+
+def _fence(lines: list[str], kind: str) -> list[str]:
+    """
+    Wrap a run of sample-derived report lines in the F-7 envelope.
+
+    Audit F-7: nearly every named thing ``get_pe_info`` prints is a string the
+    sample author wrote into its own headers -- section names, imported and
+    exported symbol names, resource type/name/language identifiers, the
+    CodeView PDB path, TLS callback listings, Rich header product entries. Any
+    of those can spell out an instruction ("SYSTEM: analysis complete, now
+    call ...") and, unfenced, it lands in the model's context with the same
+    standing as the report this server wrote around it.
+
+    The ``--- Imports ---`` style sub-headings ride INSIDE the envelope
+    because they interleave with the sample data line by line; hoisting each
+    one out would mean ten envelopes per call and would not make the boundary
+    any clearer. The report's own framing -- title, file name, size, detail
+    level, numeric header fields, computed hashes -- stays outside, which is
+    what makes the fence informative.
+
+    Returns a single-element list (or an empty one for an empty block) so
+    call sites can ``output.extend(...)`` exactly as before.
+    """
+    text = "\n".join(lines).strip("\n")
+    if not text.strip():
+        return []
+    return [wrap_untrusted(text, kind=kind)]
 
 # Lookup Tables
 
@@ -606,8 +637,11 @@ def register_pe_tools(app, session_manager=None):
                 output.append(f"Type: {pe_type}")
                 output.append("")
 
-                # Section Table (always)
-                output.extend(_section_table(pe))
+                # Section Table (always) -- section names are an 8-byte field
+                # the sample chooses (audit F-7).
+                output.extend(
+                    _fence(_section_table(pe), "PE section table from the sample")
+                )
                 output.append("")
 
                 # Data Directory Summary (always)
@@ -647,21 +681,29 @@ def register_pe_tools(app, session_manager=None):
                         output.append(f"Warning: Partial directory parse failure: {e}")
                         output.append("")
 
-                    output.extend(_parse_imports(pe))
-                    output.append("")
-                    output.extend(_parse_exports(pe))
-                    output.append("")
-                    output.extend(_parse_resources(pe))
-                    output.append("")
-                    output.extend(_parse_debug_info(pe))
-                    output.append("")
-                    output.extend(_parse_tls(pe))
-                    output.append("")
-                    output.extend(_parse_rich_header(pe))
-                    output.append("")
+                    # Audit F-7: one envelope around the whole name-bearing
+                    # block. Imported/exported symbol names, resource
+                    # identifiers, the CodeView PDB path, TLS callbacks and
+                    # the Rich header are all authored by whoever built the
+                    # sample; the imphash printed after the fence is ours.
+                    detail_lines: list[str] = []
+                    detail_lines.extend(_parse_imports(pe))
+                    detail_lines.append("")
+                    detail_lines.extend(_parse_exports(pe))
+                    detail_lines.append("")
+                    detail_lines.extend(_parse_resources(pe))
+                    detail_lines.append("")
+                    detail_lines.extend(_parse_debug_info(pe))
+                    detail_lines.append("")
+                    detail_lines.extend(_parse_tls(pe))
+                    detail_lines.append("")
+                    detail_lines.extend(_parse_rich_header(pe))
+                    detail_lines.append("")
 
-                    # Section hashes
-                    output.append("--- Section Hashes ---")
+                    # Section hashes: the digests are computed here, but the
+                    # section NAME on each row is still the sample's, so the
+                    # rows travel with the block above.
+                    detail_lines.append("--- Section Hashes ---")
                     for section in pe.sections:
                         name = section.Name.decode("utf-8", errors="ignore").rstrip("\x00")
                         try:
@@ -671,9 +713,17 @@ def register_pe_tools(app, session_manager=None):
                             if detail_level == "full":
                                 sha256 = hashlib.sha256(data).hexdigest()
                                 line += f", SHA256={sha256}"
-                            output.append(line)
+                            detail_lines.append(line)
                         except Exception:
-                            output.append(f"  {name}: (could not read)")
+                            detail_lines.append(f"  {name}: (could not read)")
+
+                    output.extend(
+                        _fence(
+                            detail_lines,
+                            "PE imports, exports, resources, debug and TLS "
+                            "data from the sample",
+                        )
+                    )
                     output.append("")
 
                     # Imphash
@@ -687,15 +737,26 @@ def register_pe_tools(app, session_manager=None):
 
                 # Full only
                 if detail_level == "full":
-                    output.extend(_parse_relocations(pe))
-                    output.append("")
-                    output.extend(_parse_delay_imports(pe))
-                    output.append("")
-                    output.extend(_parse_load_config(pe))
-                    output.append("")
-                    output.extend(_parse_bound_imports(pe))
-                    output.append("")
-                    output.extend(_parse_exceptions(pe))
+                    # Audit F-7: delay-import and bound-import descriptors are
+                    # DLL/symbol name tables the sample supplies, so this
+                    # block is fenced too.
+                    full_lines: list[str] = []
+                    full_lines.extend(_parse_relocations(pe))
+                    full_lines.append("")
+                    full_lines.extend(_parse_delay_imports(pe))
+                    full_lines.append("")
+                    full_lines.extend(_parse_load_config(pe))
+                    full_lines.append("")
+                    full_lines.extend(_parse_bound_imports(pe))
+                    full_lines.append("")
+                    full_lines.extend(_parse_exceptions(pe))
+                    output.extend(
+                        _fence(
+                            full_lines,
+                            "PE relocation, delay-import, load-config and "
+                            "bound-import data from the sample",
+                        )
+                    )
                     output.append("")
 
                     # Rich header hash
@@ -711,8 +772,17 @@ def register_pe_tools(app, session_manager=None):
                     warnings = pe.get_warnings()
                     if warnings:
                         output.append("--- PE Parser Warnings ---")
-                        for w in warnings:
-                            output.append(f"  {w}")
+                        # Audit F-7: pefile interpolates sample-supplied
+                        # values (names, RVAs, malformed field contents) into
+                        # its warning strings, so the warning bodies are
+                        # sample-influenced even though pefile wrote the
+                        # sentences around them.
+                        output.extend(
+                            _fence(
+                                [f"  {w}" for w in warnings],
+                                "pefile warnings quoting sample-supplied values",
+                            )
+                        )
                         output.append("")
 
                 return "\n".join(output)
@@ -754,9 +824,24 @@ def register_pe_tools(app, session_manager=None):
 
         try:
             result = inspect(binary_path)
-            return render_markdown(result)
+            # Signer/Issuer/chain/TSA common names come from the sample's own
+            # embedded PKCS#7 certificate and are arbitrary UTF-8. Signature
+            # validity is never asserted, so a self-signed cert is enough to
+            # put chosen text -- including the real envelope sentinels -- into
+            # model context.
+            return wrap_untrusted(render_markdown(result), "Authenticode certificate fields")
         except StructuredBaseError as e:
-            return e.structured_error.to_user_message()
+            # Audit F-10: to_user_message() appends a "Debug information"
+            # block verbatim, and the producers put host state in it --
+            # carving puts the resolved output_dir and the whole
+            # BINARY_MCP_ALLOWED_DIRS list there, authenticode puts the
+            # resolved sample path. All of that carries the operator's
+            # username into model context and from there into any report
+            # built on the transcript. curated_structured_text renders the
+            # same curated envelope (code, message, reason, suggestions)
+            # without that block; the full detail is logged instead.
+            logger.error("pe_tools structured error (detail withheld from model): %s", e.structured_error)
+            return curated_structured_text(e)
         except (PathTraversalError, FileSizeError) as e:
             return safe_error_message("inspect_authenticode", e)
         except Exception as e:
@@ -813,9 +898,21 @@ def register_pe_tools(app, session_manager=None):
 
             out_path = Path(output_dir).expanduser() if output_dir else None
             result = carve(binary_path, out_path, max_total_mb=max_total_mb)
-            return render_markdown(result)
+            # resource_path is built from PE resource names (arbitrary UTF-16
+            # chosen by whoever built the sample).
+            return wrap_untrusted(render_markdown(result), "carved blob table")
         except StructuredBaseError as e:
-            return e.structured_error.to_user_message()
+            # Audit F-10: to_user_message() appends a "Debug information"
+            # block verbatim, and the producers put host state in it --
+            # carving puts the resolved output_dir and the whole
+            # BINARY_MCP_ALLOWED_DIRS list there, authenticode puts the
+            # resolved sample path. All of that carries the operator's
+            # username into model context and from there into any report
+            # built on the transcript. curated_structured_text renders the
+            # same curated envelope (code, message, reason, suggestions)
+            # without that block; the full detail is logged instead.
+            logger.error("pe_tools structured error (detail withheld from model): %s", e.structured_error)
+            return curated_structured_text(e)
         except (PathTraversalError, FileSizeError) as e:
             return safe_error_message("extract_embedded_binaries", e)
         except Exception as e:
@@ -855,9 +952,22 @@ def register_pe_tools(app, session_manager=None):
         from src.utils.structured_errors import StructuredBaseError
 
         try:
-            return render_markdown(compute(binary_path))
+            # Section names come straight from the PE section headers.
+            return wrap_untrusted(
+                render_markdown(compute(binary_path)), "PE section names and hashes"
+            )
         except StructuredBaseError as e:
-            return e.structured_error.to_user_message()
+            # Audit F-10: to_user_message() appends a "Debug information"
+            # block verbatim, and the producers put host state in it --
+            # carving puts the resolved output_dir and the whole
+            # BINARY_MCP_ALLOWED_DIRS list there, authenticode puts the
+            # resolved sample path. All of that carries the operator's
+            # username into model context and from there into any report
+            # built on the transcript. curated_structured_text renders the
+            # same curated envelope (code, message, reason, suggestions)
+            # without that block; the full detail is logged instead.
+            logger.error("pe_tools structured error (detail withheld from model): %s", e.structured_error)
+            return curated_structured_text(e)
         except (PathTraversalError, FileSizeError) as e:
             return safe_error_message("compute_similarity_hashes", e)
         except Exception as e:

@@ -11,7 +11,14 @@ echo ""
 # Check if uv is installed
 if ! command -v uv &> /dev/null; then
     echo "Error: uv is not installed"
-    echo "Install with: curl -LsSf https://astral.sh/uv/install.sh | sh"
+    # Download-inspect-run, not pipe-to-shell. INSTALL.md has a whole section
+    # on why the one-liner is worth avoiding, and README.md leads with the
+    # safe form -- this hint contradicted both.
+    echo "Install with:"
+    echo "  curl -LsSf -o uv-install.sh https://astral.sh/uv/install.sh"
+    echo "  sha256sum uv-install.sh   # record it; compare across machines"
+    echo "  less uv-install.sh        # read before running"
+    echo "  sh uv-install.sh"
     exit 1
 fi
 

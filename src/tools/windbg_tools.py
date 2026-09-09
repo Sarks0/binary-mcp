@@ -17,11 +17,21 @@ from fastmcp import FastMCP
 from src.engines.dynamic.windbg.bridge import WinDbgBridge, WinDbgBridgeError
 from src.engines.dynamic.windbg.commands import WinDbgCommands
 from src.engines.session import AnalysisType, UnifiedSessionManager
+from src.tools.error_hygiene import safe_tool_error
+from src.utils.formatters import wrap_untrusted
 from src.utils.structured_errors import StructuredBaseError
 
 logger = logging.getLogger(__name__)
 
-# Session manager reference (set during registration)
+# Audit F-10: every tool below reports failures through
+# ``error_hygiene.safe_tool_error`` rather than ``f"Error: {e}"``. WinDbg is
+# the worst offender for information disclosure in this server:
+# ``WinDbgBridgeError`` stores raw CDB stdout in ``debug_info["output"]``, and
+# CDB echoes the symbol path (``srv*C:\\Users\\<user>\\symbols*...``), the dump
+# path, and module load diagnostics on almost every failure. ``safe_tool_error``
+# keeps the curated half of the structured error -- code, message, reason and
+# suggested actions, which is what lets the model recover -- and logs the
+# debug_info block against a reference ID instead of returning it.
 _session_manager: UnifiedSessionManager | None = None
 
 # Global WinDbg instances (initialized on first use)
@@ -32,6 +42,67 @@ _PLATFORM_MSG = (
     "WinDbg tools require Windows with Pybag installed.\n"
     "Install with: pip install binary-mcp[windbg]"
 )
+
+# Opt-in switch for the raw command tool. windbg_execute_command is the entry
+# point behind every critical WinDbg finding in this audit: it is the only tool
+# that takes an attacker-influenceable command string (prompt-injected sample
+# output, an LLM's own improvisation) and hands it to a debugger attached to a
+# live kernel. The 32 structured tools cover the analysis workflows and build
+# their own command strings from validated parameters, so the raw tool is now
+# DISABLED unless the operator explicitly turns it on.
+#
+# Note the gate is on the TOOL, not on WinDbgBridge.execute_command: the
+# structured tools call the bridge directly (windbg_list_breakpoints ->
+# "bl", windbg_disassemble -> "u <addr> L<n>", the conditional-breakpoint
+# string, ...) and must keep working with this variable unset.
+_RAW_WINDBG_ENV = "BINARY_MCP_ENABLE_RAW_WINDBG"
+
+_RAW_WINDBG_DISABLED_MSG = (
+    "windbg_execute_command is disabled by default.\n"
+    f"Set {_RAW_WINDBG_ENV}=1 in the server environment to enable raw WinDbg "
+    "command execution.\n"
+    "The 32 structured WinDbg tools are unaffected and are the supported way "
+    "to drive the debugger: windbg_status, windbg_get_stack, windbg_get_thread, "
+    "windbg_get_process, windbg_dt, windbg_get_registers, windbg_read_memory, "
+    "windbg_disassemble, windbg_get_modules, windbg_list_breakpoints, "
+    "windbg_set_breakpoint, windbg_set_conditional_breakpoint, "
+    "windbg_set_hardware_breakpoint, windbg_switch_thread, windbg_step_into, "
+    "windbg_step_over and the connection/session tools."
+)
+
+
+def _raw_windbg_enabled() -> bool:
+    """True if the operator opted in to the raw WinDbg command tool.
+
+    Read at call time rather than at import time so the setting can be changed
+    (and tested) without re-importing the server.
+    """
+    return os.environ.get(_RAW_WINDBG_ENV, "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _fence(text: str, kind: str) -> str:
+    """Fence debugger output that reflects the analysed target (audit F-7).
+
+    Everything WinDbg prints about a live kernel target or a crash dump --
+    disassembly, memory bytes and their ASCII column, module names and paths,
+    stack symbols, structure contents, raw command output -- originates in the
+    thing under analysis, which for this server is hostile by definition. A
+    sample can put text into any of them (a crafted module name, a string in
+    memory that lands in the ASCII column) and it arrives in model context
+    looking exactly like server-authored analysis.
+
+    This module previously had ZERO fences across all of its tools, and the
+    F-7 coverage guard did not catch it because windbg_tools was never added
+    to the module set the guard checks. Both halves are fixed together; fixing
+    only the fences would have left the guard still blind to the next module.
+
+    Empty output is returned unchanged: an empty fence is pure noise.
+    """
+    if not text or not text.strip():
+        return text
+    return wrap_untrusted(text, kind=kind)
 
 
 def _is_windows() -> bool:
@@ -68,11 +139,21 @@ def _validate_condition(condition: str) -> str:
         return "Error: Condition too long (max 200 characters)."
     if not _SAFE_CONDITION_RE.match(cond):
         return "Error: Invalid condition expression. Only comparison expressions are allowed (e.g. 'rcx==0x100')."
-    # Extra check for dangerous commands that might slip through
+    # Belt and braces. _SAFE_CONDITION_RE already excludes '.', ';', quotes,
+    # braces and newlines, so no command name can appear here at all and the
+    # substring scan below can never fire on the real syntax. It stays as a
+    # tripwire in case the charset is ever widened. The authoritative check
+    # happens further down: the assembled
+    # ``bp <addr> ".if (<cond>) {} .else {gc}"`` string goes through the bridge
+    # allowlist like every other command, which re-validates the quoted
+    # breakpoint command list as a command in its own right.
+    # ('.writevirtmem' used to head this list. It is not a command in current
+    #  WinDbg at all, so it protected against nothing; naming it made the
+    #  control look broader than it was. Dropped.)
     cond_lower = cond.lower()
     blocked_in_condition = (
         '.shell', '.create', '.script', '!runscript', '.writemem',
-        '.writevirtmem', '.dump', '.kill', '.restart', '.foreach',
+        '.dump', '.kill', '.restart', '.foreach',
         '.block', '.printf', '.remote', '.sympath', '.load', '.call',
         '.open', '.opendump',
     )
@@ -141,9 +222,13 @@ def register_windbg_tools(
             return _PLATFORM_MSG
         try:
             commands = get_windbg_commands()
-            return commands.get_status_summary()
+            # get_status_summary() appends the current instruction, which is
+            # target disassembly (commands.py). Server-authored status text is
+            # inside the same block, so the whole summary is fenced rather than
+            # split -- over-fencing is safe, under-fencing is the bug.
+            return _fence(commands.get_status_summary(), "debugger status and current instruction")
         except (WinDbgBridgeError, StructuredBaseError) as e:
-            return f"Error: {e}"
+            return safe_tool_error("windbg_status", e)
 
     @app.tool()
     @log_windbg_tool
@@ -202,7 +287,7 @@ def register_windbg_tools(
                 )
             return f"Connected to kernel target via KDNET{v6} (port={port}, broken-in)"
         except (WinDbgBridgeError, StructuredBaseError) as e:
-            return f"Error: {e}"
+            return safe_tool_error("windbg_connect_kernel", e)
 
     @app.tool()
     @log_windbg_tool
@@ -239,7 +324,7 @@ def register_windbg_tools(
                 )
             return f"Connected via {label} (broken-in)"
         except (WinDbgBridgeError, StructuredBaseError) as e:
-            return f"Error: {e}"
+            return safe_tool_error("windbg_connect_kernel_serial", e)
 
     @app.tool()
     @log_windbg_tool
@@ -271,7 +356,7 @@ def register_windbg_tools(
                 )
             return f"Connected via {label} (broken-in)"
         except (WinDbgBridgeError, StructuredBaseError) as e:
-            return f"Error: {e}"
+            return safe_tool_error("windbg_connect_kernel_pipe", e)
 
     @app.tool()
     @log_windbg_tool
@@ -297,7 +382,7 @@ def register_windbg_tools(
             bridge.connect_kernel_local()
             return "Connected to local kernel (read-only)"
         except (WinDbgBridgeError, StructuredBaseError) as e:
-            return f"Error: {e}"
+            return safe_tool_error("windbg_connect_local_kernel", e)
 
     @app.tool()
     @log_windbg_tool
@@ -319,7 +404,7 @@ def register_windbg_tools(
             bridge.open_dump(Path(dump_path))
             return f"Opened crash dump: {dump_path}\nMode: dump_analysis"
         except (WinDbgBridgeError, StructuredBaseError) as e:
-            return f"Error opening dump: {e}"
+            return safe_tool_error("windbg_open_dump", e)
 
     @app.tool()
     @log_windbg_tool
@@ -338,7 +423,7 @@ def register_windbg_tools(
             _windbg_commands = None
             return "Disconnected from WinDbg"
         except Exception as e:
-            return f"Error: {e}"
+            return safe_tool_error("windbg_disconnect", e)
 
     # Execution tools (6)
 
@@ -356,7 +441,7 @@ def register_windbg_tools(
             state = bridge.run()
             return f"Execution resumed. State: {state.value}"
         except (WinDbgBridgeError, StructuredBaseError) as e:
-            return f"Error: {e}"
+            return safe_tool_error("windbg_run", e)
 
     @app.tool()
     @log_windbg_tool
@@ -369,7 +454,7 @@ def register_windbg_tools(
             bridge.pause()
             return "Execution paused"
         except (WinDbgBridgeError, StructuredBaseError) as e:
-            return f"Error: {e}"
+            return safe_tool_error("windbg_pause", e)
 
     @app.tool()
     @log_windbg_tool
@@ -397,7 +482,7 @@ def register_windbg_tools(
             snap = bridge.get_session_state()
             return f"Target broke in. Session: {snap}"
         except (WinDbgBridgeError, StructuredBaseError) as e:
-            return f"Error: {e}"
+            return safe_tool_error("windbg_break", e)
 
     @app.tool()
     @log_windbg_tool
@@ -415,7 +500,7 @@ def register_windbg_tools(
             bridge = get_windbg_bridge()
             return f"{bridge.get_session_state()}"
         except (WinDbgBridgeError, StructuredBaseError) as e:
-            return f"Error: {e}"
+            return safe_tool_error("windbg_session_status", e)
 
     @app.tool()
     @log_windbg_tool
@@ -435,7 +520,7 @@ def register_windbg_tools(
                 return "Engine has no _NT_SYMBOL_PATH set."
             return current
         except (WinDbgBridgeError, StructuredBaseError) as e:
-            return f"Error: {e}"
+            return safe_tool_error("windbg_get_sympath", e)
 
     @app.tool()
     @log_windbg_tool
@@ -469,7 +554,7 @@ def register_windbg_tools(
             bridge = get_windbg_bridge()
             return bridge.set_sympath(elements)
         except (WinDbgBridgeError, StructuredBaseError) as e:
-            return f"Error: {e}"
+            return safe_tool_error("windbg_set_sympath", e)
 
     # Structured kernel primitives (6)
 
@@ -496,12 +581,17 @@ def register_windbg_tools(
             stack = bridge.get_stack(thread_id=thread_id, frames=frames)
             if not stack:
                 return "Stack walk returned no frames."
-            return "\n".join(
-                f"{f['frame']}  {f['child_sp']}  {f['ret_addr']}  {f['call_site']}"
-                for f in stack
+            # call_site resolves through the target's own module and export
+            # names, which a malicious driver chooses.
+            return _fence(
+                "\n".join(
+                    f"{f['frame']}  {f['child_sp']}  {f['ret_addr']}  {f['call_site']}"
+                    for f in stack
+                ),
+                "stack frames and call-site symbols",
             )
         except (WinDbgBridgeError, StructuredBaseError) as e:
-            return f"Error: {e}"
+            return safe_tool_error("windbg_get_stack", e)
 
     @app.tool()
     @log_windbg_tool
@@ -525,9 +615,9 @@ def register_windbg_tools(
         try:
             bridge = get_windbg_bridge()
             result = bridge.get_thread(thread=thread or None)
-            return f"$ {result['command']}\n\n{result['output']}"
+            return f"$ {result['command']}\n\n" + _fence(result["output"], "WinDbg thread output")
         except (WinDbgBridgeError, StructuredBaseError) as e:
-            return f"Error: {e}"
+            return safe_tool_error("windbg_get_thread", e)
 
     @app.tool()
     @log_windbg_tool
@@ -550,9 +640,9 @@ def register_windbg_tools(
         try:
             bridge = get_windbg_bridge()
             result = bridge.get_process(process=process or None, flags=flags)
-            return f"$ {result['command']}\n\n{result['output']}"
+            return f"$ {result['command']}\n\n" + _fence(result["output"], "WinDbg process output")
         except (WinDbgBridgeError, StructuredBaseError) as e:
-            return f"Error: {e}"
+            return safe_tool_error("windbg_get_process", e)
 
     @app.tool()
     @log_windbg_tool
@@ -593,9 +683,9 @@ def register_windbg_tools(
             lines.append("")
             lines.append("--- raw ---")
             lines.append(result["raw"])
-            return "\n".join(lines)
+            return _fence("\n".join(lines), "target structure contents")
         except (WinDbgBridgeError, StructuredBaseError) as e:
-            return f"Error: {e}"
+            return safe_tool_error("windbg_dt", e)
 
     @app.tool()
     @log_windbg_tool
@@ -624,7 +714,7 @@ def register_windbg_tools(
             bridge.set_hardware_breakpoint(address=address, kind=kind, size=size)
             return f"Hardware breakpoint armed: ba {kind} {size} {address}"
         except (WinDbgBridgeError, StructuredBaseError) as e:
-            return f"Error: {e}"
+            return safe_tool_error("windbg_set_hardware_breakpoint", e)
 
     @app.tool()
     @log_windbg_tool
@@ -640,9 +730,14 @@ def register_windbg_tools(
         try:
             bridge = get_windbg_bridge()
             result = bridge.switch_thread(thread_id=thread_id)
-            return f"Switched to thread {result['thread_id']}.\n{result['output']}"
+            # The confirmation line is ours; result['output'] is raw debugger
+            # output about the target, so only that half is fenced.
+            return (
+                f"Switched to thread {result['thread_id']}.\n"
+                + _fence(result["output"], "debugger output")
+            )
         except (WinDbgBridgeError, StructuredBaseError) as e:
-            return f"Error: {e}"
+            return safe_tool_error("windbg_switch_thread", e)
 
     @app.tool()
     @log_windbg_tool
@@ -658,10 +753,14 @@ def register_windbg_tools(
             loc = bridge.step_into()
             parts = [f"Address: 0x{loc.get('address', '?')}"]
             if loc.get("instruction"):
-                parts.append(f"Instruction: {loc['instruction']}")
+                # Target disassembly: operand text can carry sample-chosen
+                # symbol and string references.
+                parts.append(
+                    "Instruction: " + _fence(loc["instruction"], "target disassembly")
+                )
             return "\n".join(parts)
         except (WinDbgBridgeError, StructuredBaseError) as e:
-            return f"Error: {e}"
+            return safe_tool_error("windbg_step_into", e)
 
     @app.tool()
     @log_windbg_tool
@@ -677,10 +776,14 @@ def register_windbg_tools(
             loc = bridge.step_over()
             parts = [f"Address: 0x{loc.get('address', '?')}"]
             if loc.get("instruction"):
-                parts.append(f"Instruction: {loc['instruction']}")
+                # Target disassembly: operand text can carry sample-chosen
+                # symbol and string references.
+                parts.append(
+                    "Instruction: " + _fence(loc["instruction"], "target disassembly")
+                )
             return "\n".join(parts)
         except (WinDbgBridgeError, StructuredBaseError) as e:
-            return f"Error: {e}"
+            return safe_tool_error("windbg_step_over", e)
 
     @app.tool()
     @log_windbg_tool
@@ -711,7 +814,7 @@ def register_windbg_tools(
             except Exception:
                 return f"Timeout after {timeout}s -- target still running"
         except (WinDbgBridgeError, StructuredBaseError) as e:
-            return f"Error: {e}"
+            return safe_tool_error("windbg_run_and_wait", e)
 
     @app.tool()
     @log_windbg_tool
@@ -741,7 +844,7 @@ def register_windbg_tools(
             except Exception:
                 return f"Timeout after {timeout}s -- target not paused"
         except (WinDbgBridgeError, StructuredBaseError) as e:
-            return f"Error: {e}"
+            return safe_tool_error("windbg_wait_paused", e)
 
     # Breakpoint tools (4)
 
@@ -763,7 +866,7 @@ def register_windbg_tools(
             bridge.set_breakpoint(address)
             return f"Breakpoint set at {address}"
         except (WinDbgBridgeError, StructuredBaseError) as e:
-            return f"Error: {e}"
+            return safe_tool_error("windbg_set_breakpoint", e)
 
     @app.tool()
     @log_windbg_tool
@@ -783,7 +886,7 @@ def register_windbg_tools(
             bridge.delete_breakpoint(address)
             return f"Breakpoint deleted at {address}"
         except (WinDbgBridgeError, StructuredBaseError) as e:
-            return f"Error: {e}"
+            return safe_tool_error("windbg_delete_breakpoint", e)
 
     @app.tool()
     @log_windbg_tool
@@ -798,9 +901,9 @@ def register_windbg_tools(
         try:
             bridge = get_windbg_bridge()
             output = bridge.execute_command("bl")
-            return output or "No breakpoints set"
+            return _fence(output, "WinDbg breakpoint list") or "No breakpoints set"
         except (WinDbgBridgeError, StructuredBaseError) as e:
-            return f"Error: {e}"
+            return safe_tool_error("windbg_list_breakpoints", e)
 
     @app.tool()
     @log_windbg_tool
@@ -825,7 +928,7 @@ def register_windbg_tools(
             bridge.execute_command(cmd)
             return f"Conditional breakpoint set at {address} when {condition}"
         except (WinDbgBridgeError, StructuredBaseError) as e:
-            return f"Error: {e}"
+            return safe_tool_error("windbg_set_conditional_breakpoint", e)
 
     # Inspection tools (6)
 
@@ -841,9 +944,9 @@ def register_windbg_tools(
             return _PLATFORM_MSG
         try:
             commands = get_windbg_commands()
-            return commands.dump_registers()
+            return _fence(commands.dump_registers(), "target register state")
         except (WinDbgBridgeError, StructuredBaseError) as e:
-            return f"Error: {e}"
+            return safe_tool_error("windbg_get_registers", e)
 
     @app.tool()
     @log_windbg_tool
@@ -877,9 +980,9 @@ def register_windbg_tools(
                     chr(b) if 32 <= b < 127 else "." for b in chunk
                 )
                 lines.append(f"{base_addr + i:016x}  {hex_part:<48}  {ascii_part}")
-            return "\n".join(lines)
+            return _fence("\n".join(lines), "target memory contents")
         except (WinDbgBridgeError, StructuredBaseError) as e:
-            return f"Error: {e}"
+            return safe_tool_error("windbg_read_memory", e)
 
     @app.tool()
     @log_windbg_tool
@@ -904,7 +1007,7 @@ def register_windbg_tools(
             bridge.write_memory(address, raw)
             return f"Wrote {len(raw)} bytes to {address}"
         except (WinDbgBridgeError, StructuredBaseError) as e:
-            return f"Error: {e}"
+            return safe_tool_error("windbg_write_memory", e)
 
     @app.tool()
     @log_windbg_tool
@@ -926,9 +1029,9 @@ def register_windbg_tools(
         try:
             bridge = get_windbg_bridge()
             output = bridge.execute_command(f"u {address} L{count}")
-            return output
+            return _fence(output, "target disassembly")
         except (WinDbgBridgeError, StructuredBaseError) as e:
-            return f"Error: {e}"
+            return safe_tool_error("windbg_disassemble", e)
 
     @app.tool()
     @log_windbg_tool
@@ -951,35 +1054,105 @@ def register_windbg_tools(
                     f"{mod['start']:<20} {mod['end']:<20} "
                     f"{mod['name']:<20} {mod['symbol_status']}"
                 )
-            return "\n".join(lines)
+            return _fence("\n".join(lines), "loaded module names and paths")
         except (WinDbgBridgeError, StructuredBaseError) as e:
-            return f"Error: {e}"
+            return safe_tool_error("windbg_get_modules", e)
 
     @app.tool()
     @log_windbg_tool
     def windbg_execute_command(command: str) -> str:
-        """Execute a raw WinDbg command.
+        """Execute a raw WinDbg command against the live target.
 
-        Supports both regular commands (lm, r, k) and extension commands
-        (!analyze, !process, !drvobj). Use this for any WinDbg command not
-        covered by the dedicated tools.
+        Supports both regular commands (lm, r, k, dt, u, db/dd/dq) and
+        extension commands (!analyze, !process, !drvobj). Use this for any
+        WinDbg command not covered by the dedicated tools.
+
+        DISABLED BY DEFAULT. This tool returns a refusal unless the operator
+        sets ``BINARY_MCP_ENABLE_RAW_WINDBG=1`` in the server environment. The
+        32 structured windbg_* tools do NOT need that variable and are the
+        supported way to drive the debugger.
+
+        SECURITY MODEL -- audit finding F-6, second remediation pass.
+
+        ONE LAYER IS AUTHORITATIVE: ``allowlist.validate_command`` in
+        ``src/engines/dynamic/windbg/allowlist.py``, applied by
+        ``WinDbgBridge._validate_command_safety`` to every command that reaches
+        the engine (structured tools included). It is a FAIL-CLOSED ALLOWLIST:
+        each subcommand's command name must appear in a curated set of
+        read-only/inspection verbs, in an allowed argument form, or the command
+        is refused. It splits compound commands on ``;`` and on raw newlines
+        outside quoted regions and ``{...}`` blocks, refuses extension tokens
+        that name a module path (``!c:\\tmp\\evil.dll.export`` would make dbgeng
+        LoadLibrary that path into the debugger process), and recurses into the
+        command-string arguments of the breakpoint and control-flow carriers --
+        both ``'...'`` and ``"..."`` bodies -- so a breakpoint command list
+        cannot smuggle a refused command. Commands over 4096 chars, with more
+        than 16 subcommands, or nested more than 8 levels deep are rejected.
+
+        The tool layer no longer runs a second gate. It used to apply a
+        case-insensitive SUBSTRING scan of ``_BLOCKED_COMMANDS`` (still present
+        in the bridge module, no longer consulted), which disagreed with the
+        validator in both directions: it refused ``.printf`` / ``.foreach`` /
+        ``.outmask`` / ``.formats`` / ``.tlist`` / ``.bugcheck``, and refused
+        benign commands whose argument text merely contained one of those
+        words, while being blind to every token only the bridge knew about. A
+        denylist in front of an allowlist can only add false refusals.
+
+        Refused classes (non-exhaustive -- refusal is by ABSENCE from the
+        allowlist, so this list can never be complete and does not need to be):
+
+          - Process/session control: .shell, .create, .kill, .restart,
+            .detach, .attach, .abandon, .reboot, .crash, q / qq / qd
+          - Host file I/O: .dump, .writemem, .readmem, .logopen, .logappend,
+            .write_cmd_hist, .open, .opendump, .dumpcab, .send_file, .copysym
+          - Scripting / command-file execution: .script, .scriptrun,
+            .scriptload, .scriptdebug, !runscript, .call, .block, .cmdtree,
+            .pcmd, .idle_cmd, .ocommand, .browse, dx (the object model exposes
+            ExecuteCommand and the file system), and the ``$<`` / ``$$<`` /
+            ``$$><`` / ``$$>a<`` include operators
+          - Module loading: .load, .loadby, .cordll, .setdll, .extpath, and
+            any ``!<path-or-dotted-module>.<export>`` form
+          - Network / symbol path: .remote, .server, .netsyms, .netuse,
+            .sympath, .symfix, .settings (use windbg_set_sympath /
+            windbg_get_sympath instead)
+          - Target writes and code injection: the e/eb/ed/ew/eq/ep/eu/ea
+            Enter family, f/fp (fill), m (move), a (assemble), wrmsr,
+            ob/ow/od (I/O ports), !eb/!ed (physical memory), !ecb/!ecd/!ecw
+            (PCI config), register writes in every spelling (``r @rip=..``,
+            ``r@rip=..``, ``rrax=..``, ``rF``/``rM``/``rX``, ``r$.u0=..``),
+            .dvalloc / .dvfree (RWX in the target), .pagein, .fiximports,
+            .closehandle, .allow_exec_cmds, .apply_dbp, .thread, .trap,
+            ``!chkimg -f``, ``.process /i``, ``.cxr /w``
+          - Execution redirects and command-string carriers: ``g =Address``,
+            the trailing Command argument of p/t/pa/pc/ph/pt/ta/tb/tc/th/tt/wt,
+            ``~*e`` and ``~0 e`` (the command string is the rest of the line),
+            sxe/sxd/sxi/sxn ``-c``/``-c2``, !list ``-x``, the !for_each_*
+            family, and j / z
+          - Alias definition, which WinDbg expands before command resolution:
+            as, aS, al, ad
+
+        NOT A SANDBOX. Permitted commands still run against the live target
+        with the debugger's full read access (kernel memory included in kernel
+        mode), argument text beyond the rules above is not interpreted, and
+        anything the debugger prints is untrusted sample-derived data. Prefer
+        the dedicated tools where one exists.
 
         Args:
-            command: WinDbg command string.
+            command: WinDbg command string. Refused unless every subcommand is
+                on the allowlist in an allowed argument form.
 
         Returns:
-            Raw command output text.
+            Raw command output text, or an error string naming what was blocked.
         """
+        if not _raw_windbg_enabled():
+            # Checked before the platform check on purpose: the answer to
+            # "is this tool available?" is a policy decision, not an OS one,
+            # and the message must be the same everywhere.
+            return _RAW_WINDBG_DISABLED_MSG
         if not _is_windows():
             return _PLATFORM_MSG
-        # Tool-layer blocklist for dangerous WinDbg meta-commands
-        cmd_lower = command.strip().lower()
-        from src.engines.dynamic.windbg.bridge import _BLOCKED_COMMANDS
-        for blocked in _BLOCKED_COMMANDS:
-            if blocked in cmd_lower:
-                return f"Error: Command '{blocked}' is blocked for security reasons."
         try:
             bridge = get_windbg_bridge()
-            return bridge.execute_command(command)
+            return _fence(bridge.execute_command(command), "raw WinDbg command output")
         except (WinDbgBridgeError, StructuredBaseError) as e:
-            return f"Error: {e}"
+            return safe_tool_error("windbg_execute_command", e)

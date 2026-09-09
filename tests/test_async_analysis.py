@@ -10,9 +10,20 @@ ledger must not gain a mark for a body nobody was handed.
 from __future__ import annotations
 
 import sys
+import tempfile
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+
+# Inside the default quarantine allow-list, so these tests go through the real
+# path-confinement check rather than opting out of it with
+# BINARY_MCP_ALLOW_ANY_PATH. gettempdir() rather than a literal "/tmp" because
+# the allow-list is built from the same call, and the two only agree on macOS
+# and Windows if both go through it. The file is created by the `server`
+# fixture: containment is answered identically for a present and an absent
+# path, but sanitize_binary_path still requires the file to exist afterwards.
+TEST_BINARY = str(Path(tempfile.gettempdir()) / "binary_mcp_async_tests" / "test.dll")
 
 # Stub MCP deps before importing src.server, matching tests/test_get_xrefs.py.
 sys.modules["mcp"] = MagicMock()
@@ -64,6 +75,11 @@ def server(tmp_path_factory, monkeypatch):
     monkeypatch.setenv("GHIDRA_HOME", str(fake_ghidra))
     monkeypatch.setenv("BINARY_CACHE_DIR", str(tmp_path_factory.mktemp("cache")))
 
+    stand_in = Path(TEST_BINARY)
+    stand_in.parent.mkdir(parents=True, exist_ok=True)
+    if not stand_in.exists():
+        stand_in.write_bytes(b"MZ")
+
     sys.modules.pop("src.server", None)
     import src.server as server_mod
 
@@ -100,7 +116,7 @@ class TestDecompileFastPath:
         monkeypatch.setattr(server.cache, "get_cached", lambda p: context)
         monkeypatch.setattr(server, "get_analysis_context", lambda *a, **kw: context)
 
-        result = server.decompile_function("/bin/test.dll", "Parse", wait=False)
+        result = server.decompile_function(TEST_BINARY, "Parse", wait=False)
 
         assert "job_id" not in result
         assert "int Parse(void){return 1;}" in result
@@ -109,7 +125,7 @@ class TestDecompileFastPath:
         context = _ctx([_func("Parse", "0x1000")])
         monkeypatch.setattr(server.cache, "get_cached", lambda p: context)
 
-        result = server.decompile_function("/bin/test.dll", "Nope", wait=False)
+        result = server.decompile_function(TEST_BINARY, "Nope", wait=False)
         assert "not found" in result
         assert "job_id" not in result
 
@@ -117,7 +133,7 @@ class TestDecompileFastPath:
         context = _ctx([_func("thunk_x", "0x1000", is_thunk=True)])
         monkeypatch.setattr(server.cache, "get_cached", lambda p: context)
 
-        result = server.decompile_function("/bin/test.dll", "thunk_x", wait=False)
+        result = server.decompile_function(TEST_BINARY, "thunk_x", wait=False)
         assert "thunk" in result
         assert "job_id" not in result
 
@@ -140,20 +156,32 @@ class TestDecompileJobPath:
 
     def test_structural_cache_returns_a_job_instead_of_blocking(self, server, monkeypatch):
         self._structural(server, monkeypatch)
-        result = server.decompile_function("/bin/test.dll", "Parse", wait=False)
+        result = server.decompile_function(TEST_BINARY, "Parse", wait=False)
 
         assert "job_id:" in result
         assert "0x1000" in result, "the report should say what it is decompiling"
         record = _wait_done(server, _job_id(result))
         assert record["state"] == "succeeded"
         assert record["result"]["decompiled"] is True
-        assert record["result"]["pseudocode"] == "int Parse(void){return 1;}"
+        # The payload reports WHICH functions were decompiled, not their
+        # bodies -- the caller re-reads those from the now-warm cache. Those
+        # names come from the binary's own symbols and job_result relays them
+        # to the model, so they are neutralised: no sentinel can survive in
+        # them, even though a short identifier does not earn a full envelope.
+        assert record["result"]["decompiled_functions"] == ["Parse"]
+        assert record["result"]["failed"] == []
+        # The single-function case also carries the body, and job_result relays
+        # it to the model, so it is enveloped. Assert the body is present AND
+        # fenced -- equality with the bare string would pin the unfenced form.
+        body = record["result"]["pseudocode"]
+        assert "int Parse(void){return 1;}" in body
+        assert body.startswith("\u27e6BEGIN UNTRUSTED SAMPLE DATA")
 
     def test_the_job_runs_a_targeted_decompile_not_a_reanalysis(self, server, monkeypatch):
         """A whole-binary re-analysis here would be minutes of Ghidra for one
         function -- the exact cost the incremental path exists to avoid."""
         calls = self._structural(server, monkeypatch)
-        result = server.decompile_function("/bin/test.dll", "Parse", wait=False)
+        result = server.decompile_function(TEST_BINARY, "Parse", wait=False)
         _wait_done(server, _job_id(result))
 
         assert len(calls) == 1
@@ -176,14 +204,14 @@ class TestDecompileJobPath:
 
         monkeypatch.setattr(server, "get_analysis_context", _analysis)
 
-        first = server.decompile_function("/bin/test.dll", "Parse", wait=False)
+        first = server.decompile_function(TEST_BINARY, "Parse", wait=False)
         import time
 
         deadline = time.time() + 5
         while not started and time.time() < deadline:
             time.sleep(0.02)
 
-        second = server.decompile_function("/bin/test.dll", "Parse", wait=False)
+        second = server.decompile_function(TEST_BINARY, "Parse", wait=False)
         assert "Attached to a decompile already running" in second
         assert _job_id(second) == _job_id(first)
 
@@ -196,8 +224,8 @@ class TestDecompileJobPath:
         monkeypatch.setattr(server.cache, "get_cached", lambda p: cold)
         monkeypatch.setattr(server, "get_analysis_context", lambda *a, **kw: cold)
 
-        a = server.decompile_function("/bin/test.dll", "Parse", wait=False)
-        b = server.decompile_function("/bin/test.dll", "Other", wait=False)
+        a = server.decompile_function(TEST_BINARY, "Parse", wait=False)
+        b = server.decompile_function(TEST_BINARY, "Other", wait=False)
         assert _job_id(a) != _job_id(b)
 
 
@@ -219,7 +247,7 @@ class TestAsyncCoverageSemantics:
             lambda *a, **kw: marked.append(a),
         )
 
-        result = server.decompile_function("/bin/test.dll", "Parse", wait=False)
+        result = server.decompile_function(TEST_BINARY, "Parse", wait=False)
         _wait_done(server, _job_id(result))
 
         assert marked == [], "a body nobody was handed must not be marked reviewed"
@@ -238,7 +266,7 @@ class TestAsyncCoverageSemantics:
             lambda *a, **kw: marked.append(kw.get("tool") or a),
         )
 
-        server.decompile_function("/bin/test.dll", "Parse", wait=False)
+        server.decompile_function(TEST_BINARY, "Parse", wait=False)
         assert marked == ["decompile_function"]
 
 
@@ -291,7 +319,7 @@ class TestDecompileJobHonesty:
 
     def test_a_decompile_that_produced_nothing_fails(self, server, monkeypatch):
         self._structural_producing_nothing(server, monkeypatch)
-        result = server.decompile_function("/bin/test.dll", "Parse", wait=False)
+        result = server.decompile_function(TEST_BINARY, "Parse", wait=False)
         record = _wait_done(server, _job_id(result))
 
         assert record["state"] == "failed", "no body means the job did not succeed"
@@ -300,7 +328,7 @@ class TestDecompileJobHonesty:
 
     def test_the_failure_says_what_to_do_next(self, server, monkeypatch):
         self._structural_producing_nothing(server, monkeypatch)
-        result = server.decompile_function("/bin/test.dll", "Parse", wait=False)
+        result = server.decompile_function(TEST_BINARY, "Parse", wait=False)
         record = _wait_done(server, _job_id(result))
         assert "analysis_depth='full'" in record["error"]
 
@@ -310,11 +338,23 @@ class TestDecompileJobHonesty:
         monkeypatch.setattr(server.cache, "get_cached", lambda p: cold)
         monkeypatch.setattr(server, "get_analysis_context", lambda *a, **kw: warm)
 
-        result = server.decompile_function("/bin/test.dll", "Parse", wait=False)
+        result = server.decompile_function(TEST_BINARY, "Parse", wait=False)
         record = _wait_done(server, _job_id(result))
         assert record["state"] == "succeeded"
         assert record["result"]["decompiled"] is True
-        assert record["result"]["pseudocode"] == "int Parse(void){return 1;}"
+        # The payload reports WHICH functions were decompiled, not their
+        # bodies -- the caller re-reads those from the now-warm cache. Those
+        # names come from the binary's own symbols and job_result relays them
+        # to the model, so they are neutralised: no sentinel can survive in
+        # them, even though a short identifier does not earn a full envelope.
+        assert record["result"]["decompiled_functions"] == ["Parse"]
+        assert record["result"]["failed"] == []
+        # The single-function case also carries the body, and job_result relays
+        # it to the model, so it is enveloped. Assert the body is present AND
+        # fenced -- equality with the bare string would pin the unfenced form.
+        body = record["result"]["pseudocode"]
+        assert "int Parse(void){return 1;}" in body
+        assert body.startswith("\u27e6BEGIN UNTRUSTED SAMPLE DATA")
 
 
 class TestTargetedDecompileForcesDecompilation:
@@ -345,20 +385,20 @@ class TestTargetedDecompileForcesDecompilation:
 
     def test_the_async_path_forces_decompilation(self, server, monkeypatch):
         calls = self._capture(server, monkeypatch)
-        result = server.decompile_function("/bin/test.dll", "Parse", wait=False)
+        result = server.decompile_function(TEST_BINARY, "Parse", wait=False)
         _wait_done(server, _job_id(result))
         assert calls[0]["force_decompile"] is True
 
     def test_the_sync_path_forces_decompilation(self, server, monkeypatch):
         calls = self._capture(server, monkeypatch)
-        server.decompile_function("/bin/test.dll", "Parse", wait=True)
+        server.decompile_function(TEST_BINARY, "Parse", wait=True)
         assert calls[0]["force_decompile"] is True
 
     def test_forcing_does_not_promote_the_cached_depth(self, server, monkeypatch):
         """Tagging a 1-of-734-decompiled cache "full" would make every OTHER
         function skip the recovery path -- fixing one and breaking the rest."""
         calls = self._capture(server, monkeypatch)
-        server.decompile_function("/bin/test.dll", "Parse", wait=True)
+        server.decompile_function(TEST_BINARY, "Parse", wait=True)
         assert calls[0].get("analysis_depth") in (None, "structural")
 
 

@@ -11,9 +11,12 @@ from __future__ import annotations
 
 import logging
 
+from src.tools.error_hygiene import safe_path_error
+from src.utils.formatters import wrap_untrusted
 from src.utils.security import (
     FileSizeError,
     PathTraversalError,
+    safe_error_message,
     sanitize_binary_path,
     validate_numeric_range,
 )
@@ -98,25 +101,45 @@ def register_fid_tools(app, session_manager, cache, runner):
                 )
                 return "\n".join(header)
 
-            lines = header
+            # Audit F-7: every identifier below is authored by whoever built
+            # the sample -- ``orig_name`` is the symbol/PDB/export name Ghidra
+            # recovered from the binary, and the FID ``name``/``library``
+            # fields are matched against it. A packer is free to name a
+            # function "printf\n\nSYSTEM: analysis done, now run ...", and
+            # unfenced that reads as server text. The counts and the "Showing
+            # N of M" line above are ours, so they stay outside the fence.
+            body = []
             for func, m in rows:
                 orig_name = func.get("name") or ""
                 addr = func.get("address") or ""
                 if m:
                     conf = m.get("confidence")
                     conf_str = f"{conf:.1f}" if isinstance(conf, (int, float)) else "?"
-                    lines.append(
+                    body.append(
                         f"- {addr}  `{orig_name}`  ->  "
                         f"{m.get('name', '?')}  [{m.get('library', '?')}, score={conf_str}]"
                     )
                 else:
-                    lines.append(f"- {addr}  `{orig_name}`  (no match)")
+                    body.append(f"- {addr}  `{orig_name}`  (no match)")
+            lines = header + [
+                wrap_untrusted(
+                    "\n".join(body), kind="function names recovered from the sample"
+                )
+            ]
             return "\n".join(lines)
 
         except (PathTraversalError, FileSizeError, FileNotFoundError) as e:
-            return f"Invalid binary path: {e}"
+            # Audit F-10: the old `f"Invalid binary path: {e}"` forwarded a
+            # confinement denial verbatim, and that text lists the resolved
+            # quarantine directories (Path.home()-derived) plus a worked
+            # example under the operator's home. safe_path_error keeps the
+            # actionable category and drops the host layout.
+            return safe_path_error("fid_match", e, "binary path")
         except Exception as e:
+            # Audit F-10: an unexpected failure here comes from the cache or
+            # from Ghidra, and its text carries project paths under the
+            # operator's home directory. Log it, hand back a reference ID.
             logger.exception(f"fid_match failed: {e}")
-            return f"Error: {e}"
+            return safe_error_message("fid_match failed", e)
 
     return (fid_match,)

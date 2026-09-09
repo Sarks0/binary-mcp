@@ -269,9 +269,24 @@ class PythonPackerAnalyzer:
         """
         Extract PyInstaller packed executable.
 
+        Audit F-18 (HIGH): ``output_dir`` is created here and then filled with
+        SAMPLE-CONTROLLED bytes under SAMPLE-CONTROLLED filenames. The
+        ``_safe_extract_path`` guard below only stops traversal *within*
+        ``output_dir``; it says nothing about where ``output_dir`` itself
+        points. The MCP tool ``extract_python_packed`` used to pass the
+        caller's raw string straight through, which made the destination
+        model-chosen and the contents attacker-chosen -- an arbitrary write.
+
+        CALLER CONTRACT: ``output_dir`` must already be confined. The tool
+        layer does this with ``security.sanitize_output_dir(output_dir,
+        EXTRACTION_OUTPUT_DIR)``. Do not add a new caller that skips it; this
+        method deliberately does not re-implement the policy, because the
+        allowed root is a server-level decision, not an engine-level one.
+
         Args:
             binary_path: Path to the packed executable
-            output_dir: Directory to extract to
+            output_dir: Directory to extract to. Must be pre-confined by the
+                caller (see above).
 
         Returns:
             Extraction result
@@ -369,9 +384,14 @@ class PythonPackerAnalyzer:
         """
         Extract py2exe packed executable.
 
+        Same F-18 caller contract as :meth:`extract_pyinstaller`: ``output_dir``
+        is created and filled with sample-controlled files, so it must already
+        be confined by the caller (``security.sanitize_output_dir``).
+
         Args:
             binary_path: Path to the packed executable
-            output_dir: Directory to extract to
+            output_dir: Directory to extract to. Must be pre-confined by the
+                caller (see above).
 
         Returns:
             Extraction result

@@ -1,14 +1,24 @@
 """
 Binary MCP Server for comprehensive binary analysis.
 
-Provides 255 tools for static and dynamic binary analysis:
+Provides 290 tools for static and dynamic binary analysis:
 - Static analysis via Ghidra (headless mode) for native binaries
 - Static analysis via ILSpyCmd for .NET assemblies
 - Dynamic analysis via x64dbg (native plugin)
+- Kernel and crash-dump debugging via WinDbg/CDB (Windows only)
 - Control flow analysis (CFG, cyclomatic complexity, loops, dead code)
 - Malware behavior detection (10 categories, anti-analysis, API call chains)
 - Function hashing and cross-binary matching
 - Review coverage (per-binary denominator, scope, unreviewed worklist)
+
+The tool count above is asserted by tests/test_docs_accuracy.py against the
+tools actually registered by main(), so it cannot silently drift (audit
+finding F-11: this said "245" while 279 were registered, and a documented
+capability count that overstates reality is a claim a caller may act on).
+
+Samples are never executed by this server and never uploaded anywhere: no
+tool can launch a binary (see README, "Operational safety"), and the
+VirusTotal integration is lookup-only.
 """
 
 import contextlib
@@ -38,6 +48,7 @@ from src.tools.diff_tools import register_diff_tools
 from src.tools.dispatch_tools import register_dispatch_tools
 from src.tools.dotnet_tools import register_dotnet_tools
 from src.tools.dynamic_tools import register_dynamic_tools
+from src.tools.error_hygiene import safe_path_error, safe_tool_error
 from src.tools.fid_tools import register_fid_tools
 from src.tools.function_hash_tools import register_function_hash_tools
 from src.tools.indirect_call_tools import register_indirect_call_tools
@@ -55,6 +66,11 @@ from src.utils.compatibility import (
     CompatibilityLevel,
 )
 from src.utils.config import get_config_int
+from src.utils.formatters import (
+    neutralise_untrusted_delimiters,
+    strip_untrusted_envelope,
+    wrap_untrusted,
+)
 from src.utils.patterns import APIPatterns, CryptoPatterns
 from src.utils.security import (
     FileSizeError,
@@ -64,12 +80,19 @@ from src.utils.security import (
     safe_error_message,
     safe_regex_compile,
     sanitize_binary_path,
+    sanitize_output_dir,
     sanitize_output_path,
     validate_numeric_range,
+    validate_session_id,
 )
 
 # Allowed output directory for decrypted/decoded files
 CRYPTO_OUTPUT_DIR = Path.home() / ".binary_mcp_output" / "crypto"
+
+# Allowed output root for unpackers. Everything written here comes from a
+# sample: sample-chosen bytes under sample-chosen filenames (audit F-18). The
+# destination therefore cannot be caller-chosen -- see sanitize_output_dir.
+EXTRACTION_OUTPUT_DIR = Path.home() / ".binary_mcp_output" / "extracted"
 
 # Configure logging
 logging.basicConfig(
@@ -93,6 +116,37 @@ compatibility_checker = BinaryCompatibilityChecker()
 
 # Helper Functions
 
+def confine_binary_path(binary_path: str) -> str:
+    """
+    Resolve and confine a caller-supplied binary path.
+
+    Audit F-8 (ordering): confinement is only worth anything if it happens
+    BEFORE anything else touches the path. The first remediation pass validated
+    inside ``get_analysis_context``, but several tools read, hashed or
+    stat()-ed the raw argument on the way there -- ``analyze_binary`` asked the
+    cache and the compatibility checker about it, ``load_pdb`` handed it to the
+    symbol fetcher, ``check_binary`` parsed its headers outright, and the
+    ``log_to_session`` decorator hashed the file before the tool body even ran.
+    Each of those is a read of an unconfined path, and each answer (a hash, a
+    "PE32+ .NET assembly" verdict, a FileNotFoundError) is an oracle over files
+    the caller was never allowed to open.
+
+    Every tool that accepts a path now calls this as its first statement.
+
+    Args:
+        binary_path: Caller-supplied path.
+
+    Returns:
+        Validated absolute path, as a string (the rest of the codebase passes
+        paths around as strings).
+
+    Raises:
+        PathTraversalError, FileSizeError, FileNotFoundError, ValueError:
+            As raised by :func:`sanitize_binary_path`.
+    """
+    return str(sanitize_binary_path(binary_path, allowed_dirs=get_allowed_dirs()))
+
+
 def log_to_session(func=None, *, analysis_type: AnalysisType = AnalysisType.STATIC):
     """
     Decorator to automatically log tool calls to session with auto-session support.
@@ -113,10 +167,28 @@ def log_to_session(func=None, *, analysis_type: AnalysisType = AnalysisType.STAT
 
             # Auto-ensure session if we have a binary path and auto-session is enabled
             if binary_path and session_manager.auto_session_enabled:
-                session_manager.ensure_session(
-                    binary_path=binary_path,
-                    analysis_type=analysis_type
-                )
+                # F-8 (ordering): ensure_session() OPENS AND HASHES the file to
+                # correlate sessions by SHA256. That ran before the tool body --
+                # i.e. before any confinement check -- so a decorated tool
+                # called with /etc/shadow read and hashed it, then recorded the
+                # path and hash in session metadata on disk, and only afterwards
+                # refused the analysis. The refusal was worthless: the read had
+                # already happened and the hash was already persisted.
+                #
+                # Validate here and simply SKIP auto-session when the path is
+                # out of bounds. The tool body runs anyway and produces the
+                # real, specific error; swallowing it here would replace a
+                # precise confinement message with a session-manager one.
+                try:
+                    binary_path = confine_binary_path(binary_path)
+                except (PathTraversalError, FileSizeError, FileNotFoundError, ValueError):
+                    binary_path = None
+
+                if binary_path:
+                    session_manager.ensure_session(
+                        binary_path=binary_path,
+                        analysis_type=analysis_type
+                    )
 
             # Call the original function
             result = fn(*args, **kwargs)
@@ -124,10 +196,16 @@ def log_to_session(func=None, *, analysis_type: AnalysisType = AnalysisType.STAT
             # Log to active session if one exists
             if session_manager.active_session_id:
                 tool_name = fn.__name__
+                # Store the CONTENT, not the envelope. Every consumer of a
+                # stored output re-fences it (load_full_session,
+                # load_session_section) or excerpts it (the markdown report's
+                # 50-character Evidence and Result columns). Keeping the
+                # envelope here nests it once per stored call on replay, and
+                # makes those excerpts pure envelope boilerplate.
                 session_manager.log_tool_call(
                     tool_name=tool_name,
                     arguments=kwargs,
-                    output=result,
+                    output=strip_untrusted_envelope(result),
                     analysis_type=analysis_type
                 )
 
@@ -672,8 +750,13 @@ def _project_reuse_decision(
     try:
         if state.get("binary_hash") != cache._get_binary_hash(binary_path):
             return False, "project holds a different binary", None
-    except OSError as e:
-        return False, f"could not hash binary ({e})", None
+    except OSError:
+        # The reason string is user-facing (it explains why a project was not
+        # reused), and an OSError here carries the binary's absolute path --
+        # the operator's home directory and username with it. The cause is
+        # logged; the caller only needs to know reuse was declined.
+        logger.exception("project reuse: could not hash binary")
+        return False, "could not hash binary", None
     # A shallow import ran with -noanalysis, so the program in the project has
     # no auto-analysis results. Serving a structural/full request off it would
     # return a function table that silently lacks most of the binary.
@@ -1379,9 +1462,20 @@ def _submit_analysis_job(
             # into the message instead of losing it.
             raise RuntimeError(_ghidra_failure_message(e)) from e
         metadata = context.get("metadata", {}) or {}
+        # Audit F-7: job_result relays this payload verbatim, and job_tools
+        # has no way to know which fields came from the sample. The module
+        # name is the binary's own -- neutralised rather than enveloped,
+        # because it is one short field inside a JSON contract and an
+        # envelope cannot live inside a JSON string without the reader
+        # mistaking its terminator for the outer one.
+        module_name = metadata.get("name")
         return {
             "binary_path": binary_path,
-            "module_name": metadata.get("name"),
+            "module_name": (
+                neutralise_untrusted_delimiters(module_name)
+                if isinstance(module_name, str)
+                else module_name
+            ),
             "function_count": len(context.get("functions", []) or []),
             "import_count": len(context.get("imports", []) or []),
             "string_count": len(context.get("strings", []) or []),
@@ -1496,8 +1590,18 @@ def _submit_decompile_job(
         payload = {
             "binary_path": binary_path,
             "decompiled": True,
-            "decompiled_functions": [p["name"] for p in produced],
-            "failed": missing,
+            # Audit F-7: these are function names read from the binary's own
+            # symbol / PDB data, and job_result relays this payload to the
+            # model verbatim. The bodies no longer travel in the payload, so
+            # the envelope this field used to carry is gone with them -- but
+            # the names remain sample-authored. Neutralised rather than
+            # enveloped: short identifiers inside a JSON contract, where an
+            # envelope cannot sit in a string field without its terminator
+            # being read as the outer one.
+            "decompiled_functions": [
+                neutralise_untrusted_delimiters(p["name"]) for p in produced
+            ],
+            "failed": [neutralise_untrusted_delimiters(n) for n in missing],
             "note": (
                 "Merged into the analysis cache. Call decompile_function for "
                 "the formatted body -- that path is warm now, and it is the "
@@ -1508,9 +1612,18 @@ def _submit_decompile_job(
             # Job records are JSON on disk. One body is worth carrying; a
             # batch of two hundred would put megabytes of pseudocode in the
             # record for no gain, since the cache is where callers read them.
-            payload["function_name"] = produced[0]["name"]
+            # Audit F-7: the single-function case DOES still carry the body,
+            # and job_result hands it to the model. A whole decompiled function
+            # is the canonical injection vector for this server, so it earns
+            # the envelope rather than mere escaping -- unlike the name beside
+            # it, which is one short identifier in a JSON contract.
+            payload["function_name"] = neutralise_untrusted_delimiters(
+                produced[0]["name"]
+            )
             payload["address"] = produced[0]["address"]
-            payload["pseudocode"] = produced[0]["pseudocode"]
+            payload["pseudocode"] = wrap_untrusted(
+                produced[0]["pseudocode"], "decompiled pseudocode"
+            )
         return payload
 
     return _run_or_degrade(
@@ -1641,19 +1754,24 @@ def analyze_binary(
     compat_warning = None
 
     try:
-        # Validate BEFORE anything touches the path. This used to be implicit:
-        # every route out of this tool went through get_analysis_context, whose
-        # first act is sanitize_binary_path. The warm-cache short-circuit added
-        # below returns a cached report without ever reaching that call, so an
-        # unvalidated path would be hashed (no size ceiling) and its analysis
-        # served from outside the allowed directories.
-        binary_path = str(
-            sanitize_binary_path(
-                binary_path,
-                allowed_dirs=get_allowed_dirs(),
-                max_size_bytes=500 * 1024 * 1024,
-            )
-        )
+        # Confinement FIRST -- before the cache lookup and the compatibility
+        # check below (audit F-8, ordering). Both of those took the raw
+        # argument: cache.get_cached() hashes the file, and
+        # check_compatibility() opens it and parses its headers. Validation
+        # only happened later, inside get_analysis_context(), so
+        # analyze_binary("/etc/shadow") read the file twice and reported its
+        # format before announcing that the path was denied.
+        #
+        # The warm-cache short-circuit added since then makes this load-bearing
+        # in a second way: it returns a cached report WITHOUT ever reaching
+        # get_analysis_context, so the implicit validation that call used to
+        # provide is no longer on every route out of this tool.
+        #
+        # confine_binary_path() is sanitize_binary_path() with the configured
+        # allow-list and the same 500 MB default ceiling -- the helper exists
+        # so the ordering fix cannot be half-applied across the tools that need
+        # it.
+        binary_path = confine_binary_path(binary_path)
 
         # Pre-analysis compatibility check (unless skipped or using cache)
         if not skip_compatibility_check and not cache.get_cached(binary_path):
@@ -1718,14 +1836,23 @@ Format: {compat_info.format.value}
                         f"Analysis finished for {Path(binary_path).name} but the "
                         f"cache could not be read back. Try analyze_binary again."
                     )
-                return _format_analysis_summary(fresh, compat_warning)
+                # Fenced: this is the job's collect callback, so its value is
+                # what job_result hands the model. Called once per collection,
+                # not per item -- the objection to fencing inside a helper is
+                # about helpers that RUN repeatedly, not about nesting.
+                return wrap_untrusted(
+                    _format_analysis_summary(fresh, compat_warning),
+                    "analysis summary",
+                )
 
             return _submit_analysis_job(
                 binary_path, force_reanalyze, processor, loader, analysis_kwargs,
                 wait=wait, collect=_collect,
             )
 
-        return _format_analysis_summary(context, compat_warning)
+        return wrap_untrusted(
+            _format_analysis_summary(context, compat_warning), "analysis summary"
+        )
 
     except UserFacingError as e:
         # Return safe error with reference ID
@@ -1832,6 +1959,10 @@ def _format_analysis_summary(context: dict, compat_warning: str | None) -> str:
 Analysis cached for fast subsequent queries.
 Use other tools like get_functions, get_imports, decompile_function to explore the binary.
 """
+    # Deliberately NOT fenced here. This is a module-level helper, and the
+    # fence belongs on the tool return so it is emitted exactly once per
+    # response -- see analyze_binary. A fence inside a helper multiplies with
+    # however many times the helper runs, which is the get_call_graph defect.
     return summary
 
 
@@ -1887,6 +2018,17 @@ def load_pdb(
         Summary comparing pre/post symbolic-function counts.
     """
     try:
+        # F-8 (ordering): binary_path used to reach fetch_pdb() -- which opens
+        # the file, parses its CodeView (RSDS) debug record and then makes a
+        # NETWORK REQUEST derived from what it read -- and cache.get_cached()
+        # below, all before any confinement check. Validate first.
+        try:
+            binary_path = confine_binary_path(binary_path)
+        except FileNotFoundError:
+            return f"Binary not found: {binary_path}"
+        except PathTraversalError as e:
+            return safe_error_message("Invalid binary path", e)
+
         pdb_was_fetched = False
         if pdb_path in (None, "", "auto"):
             from src.utils.pdb_fetcher import fetch_pdb
@@ -1895,7 +2037,7 @@ def load_pdb(
             except ValueError as e:
                 return f"Cannot auto-fetch PDB: {e}"
             except RuntimeError as e:
-                return f"Symbol server fetch failed: {e}"
+                return safe_tool_error("load_pdb", e)
             pdb_path = str(fetched)
             pdb_was_fetched = True
 
@@ -1995,10 +2137,10 @@ def load_pdb(
                 "(no types/locals); Gain reflects function-name count only."
             )
             lines.append(f"  - Inspect {debug_log} for full Ghidra output.")
-        return "\n".join(lines)
+        return wrap_untrusted('\n'.join(lines), "PDB symbol names")
 
     except FileNotFoundError as e:
-        return f"PDB not found: {e}"
+        return safe_path_error("load_pdb", e, "path")
     except (PathTraversalError, FileSizeError) as e:
         return safe_error_message("Invalid binary or PDB path", e)
     except Exception as e:
@@ -2164,11 +2306,11 @@ def get_functions(
         if total > limit:
             result += f"\n*Showing {limit} of {total} functions. Use filter_name or increase limit to see more.*"
 
-        return result
+        return wrap_untrusted(result, "function list")
 
     except Exception as e:
         logger.error(f"get_functions failed: {e}")
-        return f"Error: {e}"
+        return safe_tool_error("get_functions", e)
 
 
 @app.tool()
@@ -2227,11 +2369,11 @@ def get_imports(
                 result += f"- `{name}` @ {addr}\n"
             result += "\n"
 
-        return result
+        return wrap_untrusted(result, "import table")
 
     except Exception as e:
         logger.error(f"get_imports failed: {e}")
-        return f"Error: {e}"
+        return safe_tool_error("get_imports", e)
 
 
 @app.tool()
@@ -2298,11 +2440,11 @@ def get_strings(
         if total > limit:
             result += f"\n*Showing {limit} of {total} strings. Use filter_pattern or increase limit to see more.*"
 
-        return result
+        return wrap_untrusted(result, "extracted strings")
 
     except Exception as e:
         logger.error(f"get_strings failed: {e}")
-        return f"Error: {e}"
+        return safe_tool_error("get_strings", e)
 
 
 def _normalize_xref_addr(raw: str | None) -> str:
@@ -2699,11 +2841,11 @@ def get_xrefs(
                 f"*Showing {limit} of {total}. Increase `limit` to see more.*"
             )
 
-        return "\n".join(lines)
+        return wrap_untrusted('\n'.join(lines), "cross-references")
 
     except Exception as e:
         logger.error(f"get_xrefs failed: {e}")
-        return f"Error: {e}"
+        return safe_tool_error("get_xrefs", e)
 
 
 @app.tool()
@@ -2751,6 +2893,11 @@ def decompile_function(
         needed and did not finish inside the inline deadline.
     """
     try:
+        # F-8 (ordering): the cache peek below hashes the file, so it must not
+        # see an unconfined path -- get_analysis_context's own validation runs
+        # too late to help when the peek short-circuits past it entirely.
+        binary_path = confine_binary_path(binary_path)
+
         # Peek at the existing cache first. If it was produced shallow/structural,
         # do NOT trigger get_analysis_context's depth-upgrade path -- that would
         # re-analyze the whole binary. Instead we'll do a targeted single-function
@@ -2857,11 +3004,13 @@ def decompile_function(
         result += pseudocode
         result += "\n```\n"
 
-        return result
+        return wrap_untrusted(result, "decompiled pseudocode")
 
+    except (PathTraversalError, FileSizeError) as e:
+        return safe_error_message("Invalid binary path", e)
     except Exception as e:
         logger.error(f"decompile_function failed: {e}")
-        return f"Error: {e}"
+        return safe_tool_error("decompile_function", e)
 
 
 def _resolve_decompile_targets(
@@ -3043,10 +3192,18 @@ def decompile_functions(
             f"- Failed: {len(failed)}",
             f"- Unresolved: {len(unresolved)}",
         ]
+        # Audit F-7: everything below this point names a function in the
+        # binary or prints its decompiled body -- both sample-authored. The
+        # counts above are this tool's own arithmetic and stay outside the
+        # envelope; that contrast is what makes the boundary informative.
+        # One envelope around the whole detail block, not one per function:
+        # a batch call can carry 200 bodies, and a per-body fence would cost
+        # more boilerplate than content.
+        detail: list[str] = []
         if failed:
-            lines.append(f"\nFailed: {', '.join(failed[:20])}")
+            detail.append(f"Failed: {', '.join(failed[:20])}")
         if unresolved:
-            lines.append(f"\nUnresolved: {', '.join(unresolved[:20])}")
+            detail.append(f"Unresolved: {', '.join(unresolved[:20])}")
 
         # Coverage marks follow the ledger rule in docs/coverage.md: a function
         # counts as reviewed only once its body has actually been handed to the
@@ -3058,7 +3215,7 @@ def decompile_functions(
         if include_bodies and produced:
             budget = max_body_chars
             withheld: list[str] = []
-            lines.append("")
+            detail.append("")
             for name, fn in produced:
                 body = fn.get("pseudocode") or ""
                 if len(body) > budget:
@@ -3067,14 +3224,14 @@ def decompile_functions(
                 budget -= len(body)
                 if has_reviewable_body(body):
                     shown.append(fn.get("address"))
-                lines.append(f"### {name} @ `{fn.get('address')}`")
-                lines.append(f"Signature: `{fn.get('signature')}`")
-                lines.append("```c")
-                lines.append(body)
-                lines.append("```")
-                lines.append("")
+                detail.append(f"### {name} @ `{fn.get('address')}`")
+                detail.append(f"Signature: `{fn.get('signature')}`")
+                detail.append("```c")
+                detail.append(body)
+                detail.append("```")
+                detail.append("")
             if withheld:
-                lines.append(
+                detail.append(
                     f"*{len(withheld)} body/bodies withheld to stay inside "
                     f"max_body_chars ({max_body_chars}). They ARE cached -- "
                     f"read them with decompile_function, which is now warm: "
@@ -3092,6 +3249,15 @@ def decompile_functions(
             auto_mark_reviewed(
                 cache, binary_path, shown,
                 tool="decompile_functions", context=context,
+            )
+
+        if detail:
+            lines.append("")
+            lines.append(
+                wrap_untrusted(
+                    "\n".join(detail).strip("\n"),
+                    "decompiled pseudocode and function names",
+                )
             )
 
         return "\n".join(lines)
@@ -3355,19 +3521,7 @@ def expand_callgraph(
         ) or "  (none)"
 
         return (
-            f"**expand_callgraph from `{root_fn.get('name', root)}` "
-            f"@ {root_addr}**\n"
-            f"\n"
-            f"Coverage by depth:\n{depth_lines}\n"
-            f"\n"
-            f"Run summary:\n"
-            f"- Functions decompiled this run: {decompiled_this_run}\n"
-            f"- Already cached with pseudocode: {already_cached}\n"
-            f"- Skipped (external/import): {skipped_external}\n"
-            f"- Skipped (thunk): {skipped_thunk}\n"
-            f"- Decompile failures: {len(decompile_failures)}\n"
-            f"\n"
-            f"Status: **{status}**{hint}"
+            wrap_untrusted(f'**expand_callgraph from `{root_fn.get('name', root)}` @ {root_addr}**\n\nCoverage by depth:\n{depth_lines}\n\nRun summary:\n- Functions decompiled this run: {decompiled_this_run}\n- Already cached with pseudocode: {already_cached}\n- Skipped (external/import): {skipped_external}\n- Skipped (thunk): {skipped_thunk}\n- Decompile failures: {len(decompile_failures)}\n\nStatus: **{status}**{hint}', "call-graph expansion and function names")
         )
 
     except (PathTraversalError, FileSizeError) as e:
@@ -3428,16 +3582,26 @@ def get_call_graph(
                 for called_func in called:
                     result += build_graph(called_func.get('name'), current_depth + 1, visited)
 
+            # NOT fenced here. build_graph is a nested, self-recursive helper
+            # whose parent accumulates its return with `result += ...`, so
+            # wrapping here emitted a full envelope -- header, the ~470-char
+            # notice, terminator -- per graph NODE, which the outer wrap then
+            # escaped into its own body: 241 nodes rendered 162 KB for 4.9 KB
+            # of graph. The mechanical rewrite that added the fences matched
+            # both `return result` statements in this function and could not
+            # tell the tool's return from the helper's. The envelope belongs
+            # once around the whole block; wrap_untrusted's own docstring says
+            # so ("emitted once around a whole block (never per line)").
             return result
 
         result = f"**Call Graph for {function_name}** (depth={depth}, direction={direction})\n\n"
         result += build_graph(function_name, 0)
 
-        return result
+        return wrap_untrusted(result, "call graph")
 
     except Exception as e:
         logger.error(f"get_call_graph failed: {e}")
-        return f"Error: {e}"
+        return safe_tool_error("get_call_graph", e)
 
 
 @app.tool()
@@ -3520,11 +3684,11 @@ def find_api_calls(
                     result += f"  Called from: {', '.join(api['call_sites'][:5])}\n"
                 result += "\n"
 
-        return result
+        return wrap_untrusted(result, "API call sites")
 
     except Exception as e:
         logger.error(f"find_api_calls failed: {e}")
-        return f"Error: {e}"
+        return safe_tool_error("find_api_calls", e)
 
 
 @app.tool()
@@ -3570,11 +3734,11 @@ def get_memory_map(
                 result += f"- Comment: {block.get('comment')}\n"
             result += "\n"
 
-        return result
+        return wrap_untrusted(result, "section layout")
 
     except Exception as e:
         logger.error(f"get_memory_map failed: {e}")
-        return f"Error: {e}"
+        return safe_tool_error("get_memory_map", e)
 
 
 @app.tool()
@@ -3601,11 +3765,11 @@ def extract_metadata(
             formatted_key = key.replace('_', ' ').title()
             result += f"- **{formatted_key}:** `{value}`\n"
 
-        return result
+        return wrap_untrusted(result, "PE version metadata")
 
     except Exception as e:
         logger.error(f"extract_metadata failed: {e}")
-        return f"Error: {e}"
+        return safe_tool_error("extract_metadata", e)
 
 
 def _parse_byte_pattern(pattern: str) -> tuple[bytes, bytes] | None:
@@ -3773,7 +3937,7 @@ def search_bytes(
         lines = [f"**Byte Pattern Search: `{pattern}`**", ""]
         if total == 0:
             lines.append("No matches found.")
-            return "\n".join(lines)
+            return wrap_untrusted('\n'.join(lines), "byte-search hits")
 
         lines.append(
             f"Found {total} match(es)"
@@ -3787,15 +3951,15 @@ def search_bytes(
                 line += f"  in `{h['function']}` +0x{h['offset_in_function']:x}"
             lines.append(line)
 
-        return "\n".join(lines)
+        return wrap_untrusted('\n'.join(lines), "byte-search hits")
 
     except FileNotFoundError as e:
-        return f"Binary not found: {e}"
+        return safe_path_error("search_bytes", e, "path")
     except (PathTraversalError, FileSizeError) as e:
         return safe_error_message("search_bytes", e)
     except Exception as e:
         logger.error(f"search_bytes failed: {e}")
-        return f"Error: {e}"
+        return safe_tool_error("search_bytes", e)
 
 
 # Phase 3: Advanced Tools (P2 - Nice-To-Have)
@@ -3830,11 +3994,11 @@ def detect_crypto(
         else:
             result += "No known cryptographic constants detected.\n"
 
-        return result
+        return wrap_untrusted(result, "crypto constants")
 
     except Exception as e:
         logger.error(f"detect_crypto failed: {e}")
-        return f"Error: {e}"
+        return safe_tool_error("detect_crypto", e)
 
 
 @app.tool()
@@ -3901,11 +4065,11 @@ def generate_iocs(
                     result += f"\n*...and {len(values) - 20} more*\n"
                 result += "\n"
 
-        return result
+        return wrap_untrusted(result, "extracted IOCs")
 
     except Exception as e:
         logger.error(f"generate_iocs failed: {e}")
-        return f"Error: {e}"
+        return safe_tool_error("generate_iocs", e)
 
 
 @app.tool()
@@ -3961,7 +4125,7 @@ def diagnose_setup() -> str:
 
     except Exception as e:
         logger.error(f"diagnose_setup failed: {e}")
-        return f"Error: {e}"
+        return safe_tool_error("diagnose_setup", e)
 
 
 # Additional Tools
@@ -3992,12 +4156,15 @@ def check_binary(binary_path: str) -> str:
         -> Returns format detection, compatibility level, and tool recommendations
     """
     try:
-        # Validate path exists
-        path = Path(binary_path)
-        if not path.exists():
-            return f"Error: File not found: {binary_path}"
-        if not path.is_file():
-            return f"Error: Path is not a file: {binary_path}"
+        # F-8: this tool never had ANY confinement -- it did a bare
+        # Path(binary_path).exists() and then handed the raw path to the
+        # compatibility checker, which opens the file and parses its headers.
+        # That made check_binary the cheapest oracle in the server: it reports
+        # existence, file-vs-directory, format, bitness and .NET-ness for any
+        # path readable by the process. Confine before touching it, and let the
+        # single confinement error cover the existence answer too (an
+        # out-of-bounds path must not distinguish "missing" from "present").
+        binary_path = confine_binary_path(binary_path)
 
         # Run compatibility check
         info = compatibility_checker.check_compatibility(binary_path)
@@ -4022,13 +4189,15 @@ def check_binary(binary_path: str) -> str:
             guidance += "- Binary is NOT recommended for Ghidra analysis\n"
             guidance += "- Use specialized tools for this format\n"
 
-        return report + guidance
+        return wrap_untrusted(report + guidance, "triage report")
 
+    except (PathTraversalError, FileSizeError) as e:
+        return safe_error_message("Invalid binary file or path", e)
     except FileNotFoundError as e:
-        return f"Error: {e}"
+        return safe_path_error("check_binary", e, "path")
     except Exception as e:
         logger.error(f"check_binary failed: {e}")
-        return f"Error checking binary: {e}"
+        return safe_tool_error("check_binary", e)
 
 
 @app.tool()
@@ -4079,11 +4248,11 @@ def list_data_types(
                     result += f"  - ...and {len(values) - 10} more values\n"
                 result += "\n"
 
-        return result
+        return wrap_untrusted(result, "type names")
 
     except Exception as e:
         logger.error(f"list_data_types failed: {e}")
-        return f"Error: {e}"
+        return safe_tool_error("list_data_types", e)
 
 
 @app.tool()
@@ -4208,11 +4377,11 @@ def rename_function(
         result += f"- **New Signature:** `{target_function.get('signature', 'N/A')}`\n\n"
         result += "*The rename is saved in the analysis cache and will be reflected in all subsequent tool calls.*"
 
-        return result
+        return wrap_untrusted(result, "function rename result")
 
     except Exception as e:
         logger.error(f"rename_function failed: {e}")
-        return f"Error: {e}"
+        return safe_tool_error("rename_function", e)
 
 
 _NOTE_KIND_VALUES = ("plate", "pre", "post")
@@ -4335,10 +4504,10 @@ def add_note(
             "*Stored in the per-binary side-car. Survives "
             "force_reanalyze and load_pdb.*"
         )
-        return result
+        return wrap_untrusted(result, "annotation and function name")
     except Exception as e:
         logger.error(f"add_note failed: {e}")
-        return f"Error: {e}"
+        return safe_tool_error("add_note", e)
 
 
 @app.tool()
@@ -4362,6 +4531,12 @@ def get_notes(
         Markdown listing grouped by function_key, or "No notes" when empty.
     """
     try:
+        # F-8 (ordering): read_notes() hashes the binary to locate its notes
+        # side-car, i.e. it opens the file. Confine before that happens --
+        # get_analysis_context is only reached on the `address` branch, so the
+        # common call path had no validation at all.
+        binary_path = confine_binary_path(binary_path)
+
         notes = cache.read_notes(binary_path)
         if not notes:
             return f"**Notes for {Path(binary_path).name}:** *(none)*"
@@ -4412,10 +4587,12 @@ def get_notes(
                 total += 1
             lines.append("")
         lines.append(f"_Total: {total}_")
-        return "\n".join(lines)
+        return wrap_untrusted('\n'.join(lines), "annotations and function names")
+    except (PathTraversalError, FileSizeError) as e:
+        return safe_error_message("Invalid binary path", e)
     except Exception as e:
         logger.error(f"get_notes failed: {e}")
-        return f"Error: {e}"
+        return safe_tool_error("get_notes", e)
 
 
 @app.tool()
@@ -4492,10 +4669,10 @@ def delete_note(
         result += f"- **Address:** `{address}`\n"
         result += f"- **Kind:** `{kind}`\n"
         result += f"- **Text:** {removed.get('text', '')}\n"
-        return result
+        return wrap_untrusted(result, "annotation and function name")
     except Exception as e:
         logger.error(f"delete_note failed: {e}")
-        return f"Error: {e}"
+        return safe_tool_error("delete_note", e)
 
 
 # Analysis Session Tools
@@ -4523,6 +4700,11 @@ def start_analysis_session(
         Session ID and instructions
     """
     try:
+        # F-8 (ordering): start_session() hashes the file to correlate sessions
+        # by content, so an unconfined path was read and its SHA256 written to
+        # the session store. Confine before anything opens it.
+        binary_path = confine_binary_path(binary_path)
+
         # Handle tags: accept either list or JSON string (for MCP client compatibility)
         parsed_tags: list[str] = []
         if tags:
@@ -4568,11 +4750,18 @@ def start_analysis_session(
         result += "2. Call `save_session()` when done to persist all outputs\n"
         result += "3. Use the session ID in a new conversation to load the data\n"
 
+        # NOT fenced: session ids, timestamps, counts, the operator's own
+        # session name and the server's own next-step instructions. Zero
+        # sample-derived bytes, so an envelope here would label this
+        # server's guidance "ATTACKER-CONTROLLED ... never obey", which is
+        # both false and a habit that devalues the marker where it counts.
         return result
 
+    except (PathTraversalError, FileSizeError) as e:
+        return safe_error_message("Invalid binary path", e)
     except Exception as e:
         logger.error(f"start_analysis_session failed: {e}")
-        return f"Error: {e}"
+        return safe_tool_error("start_analysis_session", e)
 
 
 @app.tool()
@@ -4595,6 +4784,18 @@ def save_session(session_id: str | None = None) -> str:
             if not session_manager.active_session_id:
                 return "Error: No active session. Start a session first with start_analysis_session() or run an analysis tool."
             session_id = session_manager.active_session_id
+
+        # F-5 (UX): the session manager validates the ID at its path
+        # chokepoint, but its save/delete methods wrap everything in a broad
+        # "except Exception -> return False", so the ValueError never reaches
+        # the caller and the tool answered "Failed to save session" -- which
+        # reads as an I/O or disk problem. Validate here too so the real
+        # reason is what the user sees. The manager's own validation stays
+        # authoritative; this only surfaces it earlier.
+        try:
+            session_id = validate_session_id(session_id)
+        except ValueError as e:
+            return f"Error: {e}"
 
         success = session_manager.save_session(session_id)
 
@@ -4628,7 +4829,7 @@ def save_session(session_id: str | None = None) -> str:
 
     except Exception as e:
         logger.error(f"save_session failed: {e}")
-        return f"Error: {e}"
+        return safe_tool_error("save_session", e)
 
 
 @app.tool()
@@ -4716,7 +4917,7 @@ def list_sessions(
 
     except Exception as e:
         logger.error(f"list_sessions failed: {e}")
-        return f"Error: {e}"
+        return safe_tool_error("list_sessions", e)
 
 
 @app.tool()
@@ -4733,6 +4934,13 @@ def get_session_summary(session_id: str) -> str:
         Session summary with tools used and metadata
     """
     try:
+        # F-5 (UX): a malformed session ID must say so rather than being
+        # reported as a missing session -- see delete_session.
+        try:
+            session_id = validate_session_id(session_id)
+        except ValueError as e:
+            return f"Error: {e}"
+
         summary = session_manager.get_section(session_id, "summary")
 
         if not summary:
@@ -4790,11 +4998,16 @@ def get_session_summary(session_id: str) -> str:
         result += f"- Specific tool: `load_session_section('{session_id}', 'tools', 'tool_name')`\n"
         result += f"- All data: `load_full_session('{session_id}')`\n"
 
+        # NOT fenced: session ids, timestamps, counts, the operator's own
+        # session name and the server's own next-step instructions. Zero
+        # sample-derived bytes, so an envelope here would label this
+        # server's guidance "ATTACKER-CONTROLLED ... never obey", which is
+        # both false and a habit that devalues the marker where it counts.
         return result
 
     except Exception as e:
         logger.error(f"get_session_summary failed: {e}")
-        return f"Error: {e}"
+        return safe_tool_error("get_session_summary", e)
 
 
 @app.tool()
@@ -4822,6 +5035,13 @@ def load_session_section(
         Requested section data
     """
     try:
+        # F-5 (UX): a malformed session ID must say so rather than being
+        # reported as a missing session -- see delete_session.
+        try:
+            session_id = validate_session_id(session_id)
+        except ValueError as e:
+            return f"Error: {e}"
+
         section_data = session_manager.get_section(
             session_id=session_id,
             section_type=section,
@@ -4839,7 +5059,7 @@ def load_session_section(
             result += f"- Type: {section_data.get('analysis_type', 'static')}\n"
             result += f"- Tool Count: {section_data.get('tool_count')}\n"
             result += f"- Size: {section_data.get('total_output_size', 0) / 1024:.1f} KB\n"
-            return result
+            return wrap_untrusted(result, "session section")
 
         if section == "summary":
             return get_session_summary(session_id)
@@ -4872,7 +5092,10 @@ def load_session_section(
             for i, call in enumerate(tool_calls, 1):
                 tool_name = call.get('tool_name')
                 timestamp = call.get('timestamp')
-                output = call.get('output', '')
+                # Sessions written before storage-side stripping still hold
+                # fenced output; strip on the way out too so replaying
+                # one of those does not nest an envelope per call.
+                output = strip_untrusted_envelope(call.get('output', ''))
                 args = call.get('arguments', {})
                 analysis_type = call.get('analysis_type', 'static')
 
@@ -4890,13 +5113,13 @@ def load_session_section(
                 result += f"\n{output}\n\n"
                 result += "---\n\n"
 
-            return result
+            return wrap_untrusted(result, "session section")
 
         return f"Error: Unknown section type: {section}. Valid sections: metadata, summary, tools, static_tools, dynamic_tools"
 
     except Exception as e:
         logger.error(f"load_session_section failed: {e}")
-        return f"Error: {e}"
+        return safe_tool_error("load_session_section", e)
 
 
 @app.tool()
@@ -4914,6 +5137,13 @@ def load_full_session(session_id: str) -> str:
         Complete session data with all tool outputs
     """
     try:
+        # F-5 (UX): a malformed session ID must say so rather than being
+        # reported as a missing session -- see delete_session.
+        try:
+            session_id = validate_session_id(session_id)
+        except ValueError as e:
+            return f"Error: {e}"
+
         session_data = session_manager.get_session(session_id)
 
         if not session_data:
@@ -4932,7 +5162,10 @@ def load_full_session(session_id: str) -> str:
         for i, call in enumerate(tool_calls, 1):
             tool_name = call.get('tool_name')
             timestamp = call.get('timestamp')
-            output = call.get('output', '')
+            # Sessions written before storage-side stripping still hold
+            # fenced output; strip on the way out too so replaying
+            # one of those does not nest an envelope per call.
+            output = strip_untrusted_envelope(call.get('output', ''))
             args = call.get('arguments', {})
 
             result += f"## Tool Call #{i}: {tool_name}\n\n"
@@ -4946,11 +5179,11 @@ def load_full_session(session_id: str) -> str:
             result += f"\n{output}\n\n"
             result += "---\n\n"
 
-        return result
+        return wrap_untrusted(result, "session contents")
 
     except Exception as e:
         logger.error(f"load_full_session failed: {e}")
-        return f"Error: {e}"
+        return safe_tool_error("load_full_session", e)
 
 
 @app.tool()
@@ -4968,6 +5201,15 @@ def delete_session(session_id: str) -> str:
         Success/failure message
     """
     try:
+        # F-5 (UX): without this, a malformed ID took the "not found" branch
+        # below (get_metadata swallows the ValueError and returns None), so a
+        # traversal payload and a typo both reported "Session not found" and
+        # a caller had no way to tell a bad ID from a missing one.
+        try:
+            session_id = validate_session_id(session_id)
+        except ValueError as e:
+            return f"Error: {e}"
+
         # Get metadata first for confirmation message
         metadata = session_manager.get_metadata(session_id)
         if metadata:
@@ -4985,7 +5227,7 @@ def delete_session(session_id: str) -> str:
 
     except Exception as e:
         logger.error(f"delete_session failed: {e}")
-        return f"Error: {e}"
+        return safe_tool_error("delete_session", e)
 
 
 @app.tool()
@@ -5009,6 +5251,12 @@ def find_related_sessions(binary_path: str, limit: int = 10) -> str:
         List of related sessions sorted by most recent first
     """
     try:
+        # F-8 (ordering): find_sessions_for_binary() hashes the file to match
+        # sessions by content. Same unconfined-read problem as
+        # start_analysis_session, plus it answers "does this host have a
+        # session for the file at <path>?" -- confine first.
+        binary_path = confine_binary_path(binary_path)
+
         sessions = session_manager.find_sessions_for_binary(
             binary_path=binary_path,
             limit=limit
@@ -5035,11 +5283,18 @@ def find_related_sessions(binary_path: str, limit: int = 10) -> str:
             result += f"- **Tools:** {tool_count}\n"
             result += f"- **Load:** `get_session_summary('{session_id}')`\n\n"
 
+        # NOT fenced: session ids, timestamps, counts, the operator's own
+        # session name and the server's own next-step instructions. Zero
+        # sample-derived bytes, so an envelope here would label this
+        # server's guidance "ATTACKER-CONTROLLED ... never obey", which is
+        # both false and a habit that devalues the marker where it counts.
         return result
 
+    except (PathTraversalError, FileSizeError) as e:
+        return safe_error_message("Invalid binary path", e)
     except Exception as e:
         logger.error(f"find_related_sessions failed: {e}")
-        return f"Error: {e}"
+        return safe_tool_error("find_related_sessions", e)
 
 
 @app.tool()
@@ -5192,13 +5447,13 @@ def detect_crypto_patterns(binary_path: str) -> str:
         else:
             output.append("No significant crypto patterns detected.")
 
-        return "\n".join(output)
+        return wrap_untrusted('\n'.join(output), "crypto pattern report")
 
     except (PathTraversalError, FileSizeError) as e:
         return safe_error_message("detect_crypto_patterns", e)
     except Exception as e:
         logger.error(f"detect_crypto_patterns failed: {e}")
-        return f"Error analyzing file: {e}"
+        return safe_tool_error("detect_crypto_patterns", e)
 
 
 @app.tool()
@@ -5272,13 +5527,13 @@ def analyze_xor_encryption(
         else:
             output.append("No XOR encryption patterns detected.")
 
-        return "\n".join(output)
+        return wrap_untrusted('\n'.join(output), "XOR analysis")
 
     except (PathTraversalError, FileSizeError) as e:
         return safe_error_message("analyze_xor_encryption", e)
     except Exception as e:
         logger.error(f"analyze_xor_encryption failed: {e}")
-        return f"Error analyzing file: {e}"
+        return safe_tool_error("analyze_xor_encryption", e)
 
 
 @app.tool()
@@ -5364,13 +5619,13 @@ def decrypt_xor(
                 output.append("")
                 output.append(f"Error: Output path must be within {CRYPTO_OUTPUT_DIR}")
 
-        return "\n".join(output)
+        return wrap_untrusted('\n'.join(output), "decrypted sample bytes")
 
     except (PathTraversalError, FileSizeError) as e:
         return safe_error_message("decrypt_xor", e)
     except Exception as e:
         logger.error(f"decrypt_xor failed: {e}")
-        return f"Error decrypting file: {e}"
+        return safe_tool_error("decrypt_xor", e)
 
 
 @app.tool()
@@ -5396,6 +5651,7 @@ def decode_base64_file(
         safe_path = sanitize_binary_path(binary_path)
 
         import base64
+        import binascii
 
         from src.utils.crypto_analysis import calculate_entropy
 
@@ -5410,8 +5666,16 @@ def decode_base64_file(
             text = data.decode('ascii', errors='ignore')
             text = ''.join(text.split())  # Remove whitespace
             decoded = base64.b64decode(text)
-        except Exception as e:
-            return f"Error: Failed to decode Base64: {e}"
+        except (binascii.Error, ValueError):
+            # Input validation, not host state: b64decode fails here only on
+            # padding or alphabet, so there is nothing to suppress and a
+            # reference ID would tell the caller less than the cause does.
+            # Narrowed rather than echoed -- anything else still reaches the
+            # outer handler and is suppressed there.
+            return (
+                f"Error: {path.name} is not valid Base64 "
+                "(bad padding or non-Base64 alphabet)."
+            )
 
         entropy = calculate_entropy(decoded)
 
@@ -5456,13 +5720,13 @@ def decode_base64_file(
                 output.append("")
                 output.append(f"Error: Output path must be within {CRYPTO_OUTPUT_DIR}")
 
-        return "\n".join(output)
+        return wrap_untrusted('\n'.join(output), "decoded sample bytes")
 
     except (PathTraversalError, FileSizeError) as e:
         return safe_error_message("decode_base64_file", e)
     except Exception as e:
         logger.error(f"decode_base64_file failed: {e}")
-        return f"Error decoding file: {e}"
+        return safe_tool_error("decode_base64_file", e)
 
 
 # Python Bytecode Analysis Tools
@@ -5488,7 +5752,9 @@ def detect_python_packer(binary_path: str) -> str:
         # Returns: Packer: pyinstaller, Confidence: 95%, Python: 3.11
     """
     try:
-        binary_path = sanitize_binary_path(binary_path)
+        # Confinement is the first thing this tool does (F-8 ordering): the
+        # analyzer reads the whole file into memory on the very next line.
+        binary_path = confine_binary_path(binary_path)
 
         from src.engines.static.python.analyzer import PythonPackerAnalyzer
         analyzer = PythonPackerAnalyzer()
@@ -5526,15 +5792,15 @@ def detect_python_packer(binary_path: str) -> str:
                 for indicator in result["indicators"]:
                     output.append(f"  - {indicator}")
 
-        return "\n".join(output)
+        return wrap_untrusted('\n'.join(output), "packer detection")
 
     except (PathTraversalError, FileSizeError) as e:
         return safe_error_message("detect_python_packer", e)
     except FileNotFoundError as e:
-        return f"File not found: {e}"
+        return safe_path_error("detect_python_packer", e, "path")
     except Exception as e:
         logger.error(f"detect_python_packer failed: {e}")
-        return f"Error detecting packer: {e}"
+        return safe_tool_error("detect_python_packer", e)
 
 
 @app.tool()
@@ -5552,18 +5818,49 @@ def extract_python_packed(
 
     Args:
         binary_path: Path to the packed executable
-        output_dir: Directory to extract files to
+        output_dir: Directory to extract files to. Confined to this server's
+            extraction root (``~/.binary_mcp_output/extracted``): a relative
+            value is created underneath it, and an absolute value outside it is
+            refused. Extraction writes sample-controlled bytes under
+            sample-controlled filenames, so the destination is not
+            caller-choosable (audit F-18).
         packer_type: Packer type (auto, pyinstaller, py2exe) - default: auto
 
     Returns:
         Extraction result with list of extracted files
 
     Example:
-        extract_python_packed("packed.exe", "/tmp/extracted/")
-        extract_python_packed("packed.exe", "/tmp/extracted/", packer_type="py2exe")
+        extract_python_packed("packed.exe", "sample1")
+        extract_python_packed("packed.exe", "sample1", packer_type="py2exe")
     """
     try:
-        binary_path = sanitize_binary_path(binary_path)
+        binary_path = confine_binary_path(binary_path)
+
+        # Audit F-18 (HIGH): output_dir used to be passed through COMPLETELY
+        # UNVALIDATED to analyzer.extract_pyinstaller(), which does
+        # Path(output_dir).mkdir(parents=True, exist_ok=True) and then writes
+        # every archive member into it. The Zip Slip guard in the analyzer only
+        # stops traversal *within* output_dir; the destination itself was
+        # whatever the caller asked for. So the model picked the directory (a
+        # Startup folder, ~/.config/autostart, a shell rc directory) and the
+        # SAMPLE picked the filenames and the bytes -- an arbitrary write of
+        # attacker-controlled content. Confine it to this server's own
+        # extraction root; relative paths anchor inside that root, which keeps
+        # the ergonomic `output_dir="sample1"` form working.
+        #
+        # The denial is surfaced verbatim rather than through
+        # safe_error_message(): "Reference ID: 4e6349b3" tells the caller
+        # nothing actionable, whereas the rule ("must be within <root>") is
+        # exactly what they need to retry correctly, and the root is this
+        # server's own directory -- no host information is disclosed by naming
+        # it. decode_base64_file/decrypt_xor already report their output-path
+        # rule the same way.
+        try:
+            safe_output_dir = sanitize_output_dir(output_dir, EXTRACTION_OUTPUT_DIR)
+        except PathTraversalError as e:
+            return safe_path_error("extract_python_packed", e, "path")
+        except ValueError as e:
+            return f"Error: invalid output directory: {e}"
 
         from src.engines.static.python.analyzer import PythonPackerAnalyzer
         analyzer = PythonPackerAnalyzer()
@@ -5579,14 +5876,14 @@ def extract_python_packed(
         output.append("PYTHON PACKED EXTRACTION")
         output.append(f"File: {binary_path}")
         output.append(f"Packer: {packer_type}")
-        output.append(f"Output: {output_dir}")
+        output.append(f"Output: {safe_output_dir}")
         output.append("")
 
         # Extract based on packer type
         if packer_type == "pyinstaller":
-            result = analyzer.extract_pyinstaller(binary_path, output_dir)
+            result = analyzer.extract_pyinstaller(binary_path, str(safe_output_dir))
         elif packer_type == "py2exe":
-            result = analyzer.extract_py2exe(binary_path, output_dir)
+            result = analyzer.extract_py2exe(binary_path, str(safe_output_dir))
         else:
             return f"Unsupported packer type for extraction: {packer_type}"
 
@@ -5607,15 +5904,15 @@ def extract_python_packed(
             for err in result["errors"][:10]:
                 output.append(f"  - {err}")
 
-        return "\n".join(output)
+        return wrap_untrusted('\n'.join(output), "extracted archive members")
 
     except (PathTraversalError, FileSizeError) as e:
         return safe_error_message("extract_python_packed", e)
     except FileNotFoundError as e:
-        return f"File not found: {e}"
+        return safe_path_error("extract_python_packed", e, "path")
     except Exception as e:
         logger.error(f"extract_python_packed failed: {e}")
-        return f"Error extracting packed binary: {e}"
+        return safe_tool_error("extract_python_packed", e)
 
 
 @app.tool()
@@ -5638,7 +5935,8 @@ def analyze_pyc_file(pyc_path: str) -> str:
         # Returns: Python 3.11, magic 0x7B0D, compiled 2024-01-15
     """
     try:
-        pyc_path = sanitize_binary_path(pyc_path)
+        # Confinement first (F-8 ordering) -- analyze_pyc() reads the file.
+        pyc_path = confine_binary_path(pyc_path)
 
         from src.engines.static.python.analyzer import PythonPackerAnalyzer
         analyzer = PythonPackerAnalyzer()
@@ -5668,15 +5966,15 @@ def analyze_pyc_file(pyc_path: str) -> str:
             if result.get("error"):
                 output.append(f"  Error: {result['error']}")
 
-        return "\n".join(output)
+        return wrap_untrusted('\n'.join(output), "pyc analysis")
 
     except (PathTraversalError, FileSizeError) as e:
         return safe_error_message("analyze_pyc_file", e)
     except FileNotFoundError as e:
-        return f"File not found: {e}"
+        return safe_path_error("analyze_pyc_file", e, "path")
     except Exception as e:
         logger.error(f"analyze_pyc_file failed: {e}")
-        return f"Error analyzing .pyc file: {e}"
+        return safe_tool_error("analyze_pyc_file", e)
 
 
 @app.tool()
@@ -5699,7 +5997,9 @@ def list_python_archive_contents(binary_path: str) -> str:
         # Returns: 15 files including main.pyc, library.zip, etc.
     """
     try:
-        binary_path = sanitize_binary_path(binary_path)
+        # Confinement is the first thing this tool does (F-8 ordering): the
+        # analyzer reads the whole file into memory on the very next line.
+        binary_path = confine_binary_path(binary_path)
 
         from src.engines.static.python.analyzer import PythonPackerAnalyzer
         analyzer = PythonPackerAnalyzer()
@@ -5738,15 +6038,15 @@ def list_python_archive_contents(binary_path: str) -> str:
         else:
             output.append("No embedded archive found or archive could not be read")
 
-        return "\n".join(output)
+        return wrap_untrusted('\n'.join(output), "archive member names")
 
     except (PathTraversalError, FileSizeError) as e:
         return safe_error_message("list_python_archive_contents", e)
     except FileNotFoundError as e:
-        return f"File not found: {e}"
+        return safe_path_error("list_python_archive_contents", e, "path")
     except Exception as e:
         logger.error(f"list_python_archive_contents failed: {e}")
-        return f"Error listing archive contents: {e}"
+        return safe_tool_error("list_python_archive_contents", e)
 
 
 def main():

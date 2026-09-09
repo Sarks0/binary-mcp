@@ -17,6 +17,7 @@ import tempfile
 from pathlib import Path
 
 from src.engines.static.ghidra.coverage_store import auto_mark, has_reviewable_body
+from src.utils.formatters import wrap_untrusted
 
 logger = logging.getLogger(__name__)
 
@@ -160,6 +161,21 @@ class FunctionHashCache:
             self._dirty = False
         except OSError as exc:
             logger.debug("could not write function-hash side-car %s: %s", self._path, exc)
+
+
+def _fence_banner(name: str, address: str) -> str:
+    """
+    Fence a per-function banner (audit F-7).
+
+    ``batch_decompile`` prints ``--- <name> @ <addr> ---`` above each result.
+    When there is pseudocode the banner rides inside that block's envelope;
+    when there is not (thunk, external, failed decompile) the banner is the
+    only sample-derived text on the line, and a function NAME is a string the
+    sample author chose, so it still needs the boundary.
+    """
+    return wrap_untrusted(
+        f"--- {name} @ {address} ---", kind="function name from the sample"
+    )
 
 
 def _get_capstone_mode(binary_path: str):
@@ -663,14 +679,26 @@ def register_function_hash_tools(app, session_manager, cache, runner):
                 address = func.get("address", "unknown")
                 pseudocode = func.get("pseudocode")
 
-                output.append(f"--- {name} @ {address} ---")
-
+                # Audit F-7: this is the single largest sample-authored blob
+                # the static tools return -- Ghidra pseudocode reproduces the
+                # sample's string literals and, where symbols exist, its own
+                # identifiers. The per-function "--- name @ addr ---" banner
+                # is fenced with it because the NAME in that banner is
+                # sample-derived too; the batch header and the success/failure
+                # tally stay outside.
                 if pseudocode:
                     signature = func.get("signature", "")
+                    block = [f"--- {name} @ {address} ---"]
                     if signature:
-                        output.append(f"Signature: {signature}")
-                    output.append("")
-                    output.append(pseudocode)
+                        block.append(f"Signature: {signature}")
+                    block.append("")
+                    block.append(pseudocode)
+                    output.append(
+                        wrap_untrusted(
+                            "\n".join(block),
+                            kind="decompiled pseudocode from the sample",
+                        )
+                    )
                     succeeded += 1
                     # Printed either way -- a banner-comment-only body is still
                     # worth showing -- but only actual code advances the
@@ -678,13 +706,16 @@ def register_function_hash_tools(app, session_manager, cache, runner):
                     if has_reviewable_body(pseudocode):
                         decompiled.append(address)
                 elif func.get("is_thunk"):
+                    output.append(_fence_banner(name, address))
                     output.append("(thunk function - no pseudocode)")
                     failed += 1
                 elif func.get("is_external"):
+                    output.append(_fence_banner(name, address))
                     output.append("(external function - no pseudocode)")
                     failed += 1
                 else:
                     status = func.get("decompile_status", "unknown")
+                    output.append(_fence_banner(name, address))
                     output.append(f"(decompilation not available - status: {status})")
                     failed += 1
 
@@ -1168,20 +1199,38 @@ def register_function_hash_tools(app, session_manager, cache, runner):
             output.append(f"Threshold: {threshold:.0%}")
             output.append("")
 
+            # Audit F-7: the match rows are pairs of function names taken
+            # from the two binaries' symbol tables. The similarity scores next
+            # to them are ours, but they are per-row, so the rows are fenced
+            # as a block and the counts / threshold stay outside.
             if exact_matches:
                 output.append(f"Exact Matches ({len(exact_matches)}):")
+                rows = []
                 for name_a, name_b, score in exact_matches:
                     addr_a = hashes_a[name_a]["func"].get("address", "?")
                     addr_b = hashes_b[name_b]["func"].get("address", "?")
-                    output.append(f"  {name_a} ({addr_a})  <->  {name_b} ({addr_b})  [100%]")
+                    rows.append(f"  {name_a} ({addr_a})  <->  {name_b} ({addr_b})  [100%]")
+                output.append(
+                    wrap_untrusted(
+                        "\n".join(rows), kind="function names from both binaries"
+                    )
+                )
                 output.append("")
 
             if fuzzy_matches:
                 output.append(f"Fuzzy Matches ({len(fuzzy_matches)}):")
+                rows = []
                 for name_a, name_b, score in fuzzy_matches:
                     addr_a = hashes_a[name_a]["func"].get("address", "?")
                     addr_b = hashes_b[name_b]["func"].get("address", "?")
-                    output.append(f"  {name_a} ({addr_a})  <->  {name_b} ({addr_b})  [{score:.0%}]")
+                    rows.append(
+                        f"  {name_a} ({addr_a})  <->  {name_b} ({addr_b})  [{score:.0%}]"
+                    )
+                output.append(
+                    wrap_untrusted(
+                        "\n".join(rows), kind="function names from both binaries"
+                    )
+                )
                 output.append("")
 
             total = len(exact_matches) + len(fuzzy_matches)
@@ -1325,26 +1374,36 @@ def register_function_hash_tools(app, session_manager, cache, runner):
                 )
                 output.append(f"Hash: {cluster['hash']}")
                 output.append("")
-                output.append("Members:")
+                # Audit F-7: member names, imported API names and the
+                # representative pseudocode are all sample-authored. The
+                # cluster size / instruction count / opcode hash printed above
+                # are this tool's own measurements and stay outside the fence.
+                block = ["Members:"]
                 for member in cluster["members"]:
-                    output.append(f"  {member['address']}  {member['name']}")
-                output.append("")
+                    block.append(f"  {member['address']}  {member['name']}")
+                block.append("")
                 if cluster["called_apis"]:
-                    output.append(
+                    block.append(
                         f"Called APIs ({len(cluster['called_apis'])}): "
                         + ", ".join(cluster["called_apis"])
                     )
                 else:
-                    output.append("Called APIs: (leaf body)")
-                output.append("")
+                    block.append("Called APIs: (leaf body)")
+                block.append("")
                 pseudocode = cluster["representative_pseudocode"]
                 if pseudocode:
-                    output.append(
+                    block.append(
                         f"Representative pseudocode (from {cluster['representative_address']}):"
                     )
-                    output.append(pseudocode)
+                    block.append(pseudocode)
                 else:
-                    output.append("(no pseudocode available for representative)")
+                    block.append("(no pseudocode available for representative)")
+                output.append(
+                    wrap_untrusted(
+                        "\n".join(block),
+                        kind="function names and decompiled pseudocode from the sample",
+                    )
+                )
                 output.append("")
 
             output.append(

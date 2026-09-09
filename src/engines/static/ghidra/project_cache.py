@@ -111,12 +111,33 @@ class ProjectCache:
     def _get_binary_hash(self, binary_path: str) -> str:
         """SHA256 of a binary's contents, memoized on (path, mtime, size).
 
-        This is the cache key for everything, so it is called many times per
-        operation -- resolving the cache path, the project name, the reuse
-        decision, the job key, then saving. Each call re-read the whole file:
-        a single targeted decompile on a 500 MB binary made nine-plus full
-        passes, seconds of pure I/O on the call whose entire purpose is to be
-        fast.
+        THE CHOKEPOINT for path confinement in this class (audit F-8 ordering).
+
+        Ten x64dbg tools in ``src/tools/dynamic_tools.py`` -- resolve_function,
+        set_breakpoint_by_function, goto_function, list_function_mappings,
+        search_function, bulk_resolve_functions, set_breakpoints_by_functions,
+        refresh_function_cache, resolve_static_address and
+        get_runtime_function_address -- accept a ``binary_path`` straight from
+        the model and reach this method via ``_load_function_mappings`` /
+        ``has_cached`` / ``get_cached`` WITHOUT ever calling
+        ``sanitize_binary_path``. This method then did
+        ``open(binary_path, "rb")`` and read the file to the end: an arbitrary
+        host path, outside the allow-list governing every other read here, and
+        with none of sanitize_binary_path's 500 MB cap, so a path naming an
+        endless file (``/dev/zero``) span forever inside a tool call.
+
+        It is fixed here rather than in the ten tools because that is the
+        lesson this branch learned twice: ``execute_command`` validated while
+        38 sibling methods did not, and one session-ID validator was fixed
+        while its twin was missed. Every public method on this class routes
+        through here, so a new one cannot reintroduce the gap by forgetting.
+
+        The memo is the other half. This is the cache key for everything, so it
+        is called many times per operation -- resolving the cache path, the
+        project name, the reuse decision, the job key, then saving. Each call
+        re-read the whole file: a single targeted decompile on a 500 MB binary
+        made nine-plus full passes, seconds of pure I/O on the call whose
+        entire purpose is to be fast.
 
         Keyed on mtime and size, and expired after a few seconds. Both parts
         matter. Filesystem timestamp granularity is coarse -- ~15.6 ms on
@@ -126,10 +147,32 @@ class ProjectCache:
         project and decompiles the wrong code, silently. The TTL bounds that to
         a window far shorter than any edit-rebuild cycle while still collapsing
         the nine-plus hashes a single operation performs.
+
+        Raises:
+            PathTraversalError: If the path is outside the allow-list.
+            FileSizeError: If the file exceeds the analysis size limit.
+            FileNotFoundError: If the file does not exist.
         """
+        # Local import: security.py is deliberately free of intra-package
+        # imports, and importing it at module scope here would invert that.
+        from src.utils.security import get_allowed_dirs, sanitize_binary_path
+
+        # Confinement runs on EVERY call, BEFORE the memo is consulted. The
+        # memo exists to skip re-reading 500 MB, not to skip the allow-list --
+        # returning a cached digest above this line would make the chokepoint
+        # conditional on cache state, which is the same "correct once, absent
+        # the second time" shape this method was made a chokepoint to close.
+        # The cost is a few stats; the expensive part it guards is the read,
+        # and that is still memoized.
+        safe_path = sanitize_binary_path(
+            str(binary_path), allowed_dirs=get_allowed_dirs()
+        )
+
+        # Fingerprint the CONFINED path, so a memo entry can only ever have
+        # been created for a path that passed the allow-list.
         try:
-            stat = os.stat(binary_path)
-            fingerprint = (str(Path(binary_path).resolve()), stat.st_mtime_ns, stat.st_size)
+            stat = os.stat(safe_path)
+            fingerprint = (str(Path(safe_path).resolve()), stat.st_mtime_ns, stat.st_size)
         except OSError:
             # Cannot stat it -- fall through and let the read raise the real
             # error rather than caching against an unusable key.
@@ -142,7 +185,7 @@ class ProjectCache:
                 return entry[0]
 
         sha256 = hashlib.sha256()
-        with open(binary_path, "rb") as f:
+        with open(safe_path, "rb") as f:
             for chunk in iter(lambda: f.read(1024 * 1024), b""):
                 sha256.update(chunk)
         digest = sha256.hexdigest()

@@ -332,12 +332,19 @@ public:
         const unsigned long long startMs = ActivityLog::NowMs();
         bool ok = SendRequestInner(jsonRequest, jsonResponse);
 
+        // Captured before anything else runs. GetLastError() is thread-local
+        // and clobbered by the next API call that sets it, so reading it from
+        // inside the Event chain -- after the constructor, GetTickCount64 and
+        // several snprintf calls -- recorded whatever those left behind
+        // rather than the failure being logged.
+        const DWORD winErr = ok ? 0 : GetLastError();
+
         ActivityLog::Event(ok ? "pipe.roundtrip" : "pipe.error")
             .Num("id", static_cast<long long>(g_currentRequestId))
             .Num("req_bytes", static_cast<long long>(jsonRequest.size()))
             .Num("resp_bytes", static_cast<long long>(jsonResponse.size()))
             .Num("ms", static_cast<long long>(ActivityLog::NowMs() - startMs))
-            .Num("win_err", ok ? 0 : static_cast<long long>(GetLastError()))
+            .Num("win_err", static_cast<long long>(winErr))
             .Body("request", jsonRequest)
             .Body("response", jsonResponse);
         return ok;
@@ -575,7 +582,11 @@ static std::string HandleHTTPRequestInner(const std::string& request) {
             .Str("method", method)
             .Str("path", path)
             .Num("ms", static_cast<long long>(ActivityLog::NowMs() - reqStartMs));
-        g_currentRequestId = 0;
+        // The id is deliberately left set: HandleHTTPRequest clears it after
+        // emitting request.completed. Clearing it here logged every auth
+        // failure as id:0, so the 401 could not be tied back to the
+        // request.received that produced it -- exactly the correlation an
+        // auth problem needs.
         return BuildHTTPResponse(401, "Unauthorized", "application/json",
                                 "{\"error\":\"Invalid or missing authentication token\"}");
     }

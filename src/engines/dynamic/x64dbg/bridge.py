@@ -4685,35 +4685,29 @@ class X64DbgBridge(Debugger):
             result["warnings"].append(f"Invalid output path: {e}")
             return result
 
-        # Find the module
-        modules = self.get_modules()
+        # Find the module, by base address first and then by name.
+        #
+        # normalize_module() coerces "base" and "size" to int, so the string
+        # handling this used to do (.startswith("0x") on the base) raised
+        # AttributeError on every call -- and at the address branch it escaped
+        # the surrounding "except ValueError" rather than falling through to
+        # the name lookup. Both paths now go through the same normalised
+        # accessors that the rest of the bridge uses.
         target_module = None
 
-        # Check if module_name is an address
         try:
-            if module_name.lower().startswith("0x"):
-                base_addr = int(module_name, 16)
-            else:
-                base_addr = int(module_name, 16)
+            base_addr = int(module_name, 16)
+        except (TypeError, ValueError):
+            base_addr = None
 
-            # Search by base address
-            for mod in modules:
-                mod_base_str = mod.get("base", "0")
-                if mod_base_str.startswith("0x"):
-                    mod_base = int(mod_base_str, 16)
-                else:
-                    mod_base = int(mod_base_str, 16)
-
-                if mod_base == base_addr:
+        if base_addr is not None:
+            for mod in self.get_modules():
+                if _coerce_int(mod.get("base")) == base_addr:
                     target_module = mod
                     break
-        except ValueError:
-            # It's a module name, not an address
-            module_name_lower = module_name.lower()
-            for mod in modules:
-                if mod.get("name", "").lower() == module_name_lower:
-                    target_module = mod
-                    break
+
+        if target_module is None:
+            target_module = self.find_module(module_name)
 
         if not target_module:
             raise RuntimeError(
@@ -4721,19 +4715,8 @@ class X64DbgBridge(Debugger):
                 f"Use get_modules() to list available modules."
             )
 
-        # Get module details
-        base_str = target_module.get("base", "0")
-        if base_str.startswith("0x"):
-            base_addr = int(base_str, 16)
-        else:
-            base_addr = int(base_str, 16)
-
-        size = target_module.get("size", 0)
-        if isinstance(size, str):
-            if size.startswith("0x"):
-                size = int(size, 16)
-            else:
-                size = int(size, 16)
+        base_addr = _coerce_int(target_module.get("base"))
+        size = _coerce_int(target_module.get("size"))
 
         result["original_base"] = f"0x{base_addr:X}"
         result["size"] = size

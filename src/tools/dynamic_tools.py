@@ -29,7 +29,7 @@ from src.tools.error_hygiene import (
     safe_path_error,
     safe_tool_error,
 )
-from src.utils.formatters import wrap_untrusted
+from src.utils.formatters import neutralise_untrusted_delimiters, wrap_untrusted
 from src.utils.security import (
     PathTraversalError,
     safe_error_message,
@@ -733,11 +733,17 @@ def _resolve_module_for_binary(
             "(x64dbg_attach), then retry."
         )
 
+    # Audit F-7: the sample decides what it loads and what a dropped or
+    # side-loaded DLL is called, so these names are attacker text. This
+    # message is returned to the model verbatim by the handlers that catch
+    # AddressRebaseError, so the list is fenced here; the advice around it is
+    # the server's.
     loaded = ", ".join(m["display_name"] for m in modules[:20])
     raise AddressRebaseError(
         f"'{os.path.basename(binary_path)}' is not loaded in x64dbg.\n"
-        f"Loaded modules: {loaded}\n"
-        f"Addresses cannot be rebased against a module that is not loaded."
+        f"Loaded modules:\n"
+        + wrap_untrusted(loaded, kind="module names from the debugged process")
+        + "\nAddresses cannot be rebased against a module that is not loaded."
     )
 
 
@@ -807,7 +813,10 @@ def _resolve_function_to_runtime(
 
     module = _resolve_module_for_binary(binary_path, bridge)
     module_base = module["base"]
-    module_name = module["display_name"]
+    # Audit F-7: display only, and the callers render it inline in a labelled
+    # field rather than as a block, so neutralise the envelope sentinels
+    # instead of fencing -- a one-line field cannot then forge a boundary.
+    module_name = neutralise_untrusted_delimiters(module["display_name"])
 
     runtime_addr = rebase_static_address(static_addr, image_base, module_base)
     offset = static_addr - image_base
@@ -1023,9 +1032,16 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 # Nothing being debugged yet -- the connection is still good.
                 main_module = None
             if main_module:
+                # Audit F-7: the module name is the sample's own filename.
+                # The base address is a number the debugger computed, so it
+                # stays outside the fence.
+                lines.append(f"Main module base: 0x{main_module['base']:X}")
+                lines.append("Main module name:")
                 lines.append(
-                    f"Main module: {main_module['display_name']} "
-                    f"@ 0x{main_module['base']:X}"
+                    wrap_untrusted(
+                        main_module["display_name"],
+                        kind="module name from the debugged process",
+                    )
                 )
             else:
                 lines.append(
@@ -2624,6 +2640,11 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
             result = [f"Threads ({len(threads)}):", "-" * 60]
 
+            # Audit F-7: a thread's name is set by the debuggee itself, via
+            # SetThreadDescription or the 0x406D1388 naming exception, so it is
+            # attacker text exactly as a dropped DLL's filename is. Fence the
+            # listing; the "Threads (N)" banner is the server's.
+            body = []
             for thread in threads:
                 marker = "  (current)" if thread["is_current"] else ""
                 label = f"TID {thread['id']}"
@@ -2631,26 +2652,33 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                     label += f"  [#{thread['number']}]"
                 if thread["name"]:
                     label += f'  "{thread["name"]}"'
-                result.append(f"\n{label}{marker}")
+                body.append(f"\n{label}{marker}")
 
                 # Only print what the plugin actually reported. The previous
                 # version read keys the plugin never sent and rendered them as
                 # the literal string "0xunknown".
                 if thread["entry"] is not None:
-                    result.append(f"  Entry:     0x{thread['entry']:016X}")
+                    body.append(f"  Entry:     0x{thread['entry']:016X}")
                 if thread["cip"] is not None:
-                    result.append(f"  CIP:       0x{thread['cip']:016X}")
+                    body.append(f"  CIP:       0x{thread['cip']:016X}")
                 if thread["teb"] is not None:
-                    result.append(f"  TEB:       0x{thread['teb']:016X}")
+                    body.append(f"  TEB:       0x{thread['teb']:016X}")
                 if thread["suspend_count"] is not None:
-                    result.append(f"  Suspended: {thread['suspend_count']}")
+                    body.append(f"  Suspended: {thread['suspend_count']}")
                 if thread["priority"] is not None:
-                    result.append(f"  Priority:  {thread['priority']}")
+                    body.append(f"  Priority:  {thread['priority']}")
                 if thread["wait_reason_name"]:
-                    result.append(f"  Waiting:   {thread['wait_reason_name']}")
+                    body.append(f"  Waiting:   {thread['wait_reason_name']}")
                 if thread["last_error"]:
-                    result.append(f"  LastError: {thread['last_error']}")
+                    body.append(f"  LastError: {thread['last_error']}")
+            result.append(
+                wrap_untrusted(
+                    "\n".join(body).strip("\n"),
+                    kind="thread names and context from the debugged process",
+                )
+            )
 
+            # Server-generated diagnostic, so it stays outside the fence.
             if len(threads) == 1 and threads[0]["entry"] is None:
                 result.append("")
                 result.append(
@@ -6357,10 +6385,20 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 target_module = bridge.find_module(binary_path)
                 if target_module is None:
                     modules = bridge.get_modules()
-                    loaded = ", ".join(m["display_name"] for m in modules[:20]) or "(none)"
+                    # Audit F-7: sample-chosen module names -- fence the list,
+                    # keep the server's sentence outside it.
+                    loaded = ", ".join(m["display_name"] for m in modules[:20])
                     return (
-                        f"Module '{binary_path}' is not loaded in x64dbg.\n"
-                        f"Loaded modules: {loaded}"
+                        f"Module '{os.path.basename(binary_path)}' is not "
+                        f"loaded in x64dbg.\nLoaded modules:\n"
+                        + (
+                            wrap_untrusted(
+                                loaded,
+                                kind="module names from the debugged process",
+                            )
+                            if loaded
+                            else "(none)"
+                        )
                     )
             else:
                 target_module = bridge.get_main_module()
@@ -6371,7 +6409,12 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                     )
 
             module_base = target_module["base"]
-            module_name = target_module["display_name"]
+            # Audit F-7: sample-chosen name, rendered inline in a labelled
+            # field below -- neutralise the sentinels so it cannot forge an
+            # envelope boundary.
+            module_name = neutralise_untrusted_delimiters(
+                target_module["display_name"]
+            )
 
             # Determine image base (from PE header or provided)
             img_base = None
@@ -6739,6 +6782,12 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             - Binary must be loaded in x64dbg debugger
         """
         try:
+            # Audit F-10: resolve_cached_binary rebinds this to an absolute
+            # host path out of the cache index, so keep what the caller
+            # actually asked for -- the hint below has to echo something they
+            # can paste back, and a resolved path would disclose the
+            # operator's directory layout.
+            requested = binary_path
             binary_path = resolve_cached_binary(binary_path)
             bridge = get_x64dbg_bridge()
             result = _resolve_function_to_runtime(function_name, binary_path, bridge)
@@ -6747,9 +6796,10 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 cache = get_ghidra_cache()
                 if not cache.has_cached(binary_path):
                     return (
-                        f"No Ghidra analysis cache found for '{binary_path}'.\n\n"
+                        f"No Ghidra analysis cache found for "
+                        f"'{os.path.basename(binary_path)}'.\n\n"
                         f"To analyze this binary:\n"
-                        f"  1. Use analyze_binary(binary_path=\"{binary_path}\")\n"
+                        f"  1. Use analyze_binary(binary_path=\"{requested}\")\n"
                         f"  2. Wait for analysis to complete\n"
                         f"  3. Try this command again"
                     )
@@ -6822,7 +6872,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             if not result:
                 cache = get_ghidra_cache()
                 if not cache.has_cached(binary_path):
-                    return f"No Ghidra cache found for '{binary_path}'."
+                    return f"No Ghidra cache found for '{os.path.basename(binary_path)}'."
                 return f"Function '{function_name}' not found in Ghidra cache."
 
             runtime_addr = result["runtime_address"]
@@ -6870,7 +6920,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             if not result:
                 cache = get_ghidra_cache()
                 if not cache.has_cached(binary_path):
-                    return f"No Ghidra cache found for '{binary_path}'."
+                    return f"No Ghidra cache found for '{os.path.basename(binary_path)}'."
                 return f"Function '{function_name}' not found in Ghidra cache."
 
             runtime_addr = result["runtime_address"]
@@ -6929,11 +6979,11 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             binary_path = resolve_cached_binary(binary_path)
             cache = get_ghidra_cache()
             if not cache.has_cached(binary_path):
-                return f"No Ghidra analysis cache found for '{binary_path}'."
+                return f"No Ghidra analysis cache found for '{os.path.basename(binary_path)}'."
 
             mappings = _load_function_mappings(binary_path)
             if not mappings:
-                return f"No functions found in Ghidra cache for '{binary_path}'."
+                return f"No functions found in Ghidra cache for '{os.path.basename(binary_path)}'."
 
             image_base = _get_image_base_from_cache(binary_path)
             filtered = []
@@ -7006,7 +7056,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             binary_path = resolve_cached_binary(binary_path)
             cache = get_ghidra_cache()
             if not cache.has_cached(binary_path):
-                return f"No Ghidra analysis cache found for '{binary_path}'."
+                return f"No Ghidra analysis cache found for '{os.path.basename(binary_path)}'."
 
             mappings = _load_function_mappings(binary_path)
             pattern_lower = pattern.lower()
@@ -7071,7 +7121,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             bridge = get_x64dbg_bridge()
             cache = get_ghidra_cache()
             if not cache.has_cached(binary_path):
-                return f"No Ghidra analysis cache found for '{binary_path}'."
+                return f"No Ghidra analysis cache found for '{os.path.basename(binary_path)}'."
 
             results = []
             for func_name in function_names:
@@ -7134,7 +7184,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             bridge = get_x64dbg_bridge()
             cache = get_ghidra_cache()
             if not cache.has_cached(binary_path):
-                return f"No Ghidra analysis cache found for '{binary_path}'."
+                return f"No Ghidra analysis cache found for '{os.path.basename(binary_path)}'."
 
             results = {"success": 0, "failed": 0, "not_found": 0, "details": []}
             for func_name in function_names:
@@ -7200,7 +7250,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             )
             cache = get_ghidra_cache()
             if not cache.has_cached(binary_path):
-                return f"No Ghidra analysis cache found for '{binary_path}'."
+                return f"No Ghidra analysis cache found for '{os.path.basename(binary_path)}'."
             mappings = _load_function_mappings(binary_path)
             return (
                 f"Function cache refreshed for {os.path.basename(binary_path)}.\n"
@@ -7252,11 +7302,21 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
             # Get current debug info
             status = bridge.get_current_location()
-            modules = bridge.get_modules()
 
+            # The debuggee image, not modules[0]. Now that every loaded module
+            # is enumerated, the first entry is no longer guaranteed to be the
+            # target -- for a DLL under a host process it is the host, which
+            # would file the saved state under the wrong binary.
+            main_module = bridge.get_main_module()
             binary_name = "unknown"
-            if modules:
-                binary_name = modules[0].get("name", "unknown")
+            if main_module:
+                # Audit F-7: the image name is the sample's own filename and is
+                # echoed inline in the summary below, so neutralise the
+                # envelope sentinels. It reaches no filesystem path -- the
+                # state file is named after the SHA-256 state_id.
+                binary_name = neutralise_untrusted_delimiters(
+                    main_module.get("display_name") or ""
+                ) or "unknown"
 
             # Generate state name if not provided
             if not state_name:

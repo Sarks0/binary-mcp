@@ -8,6 +8,8 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from src.utils.formatters import neutralise_untrusted_delimiters
+
 from .bridge import X64DbgBridge
 
 logger = logging.getLogger(__name__)
@@ -69,8 +71,13 @@ class X64DbgCommands:
             main_module = None
 
         if main_module:
+            # Audit F-7: the module name is the sample's own filename, so it is
+            # attacker text. It is one inline field rather than a block, so
+            # neutralise the envelope sentinels rather than fencing. The base
+            # is a number the debugger computed and needs no treatment.
             status.append(
-                f"Main module: {main_module['display_name']} "
+                f"Main module: "
+                f"{neutralise_untrusted_delimiters(main_module['display_name'])} "
                 f"@ 0x{main_module['base']:X}"
             )
         else:

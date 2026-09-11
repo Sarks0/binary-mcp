@@ -1004,3 +1004,149 @@ def test_reason_guard_allows_format_only_handlers(clause, tmp_path):
     """PE-parser and internal-state messages name no host path -- and the model
     needs them to tell a malformed sample from a bad path."""
     assert not _reason_guard_flags("        raise E(S(reason=str(e)))", tmp_path, clause)
+
+
+# --------------------------------------------------------------------------
+# Audit F-10, third form: a parameter rebound to a RESOLVED path.
+#
+# The two guards above both key off an exception: one matches the literal
+# `return f"Error: {e}"`, the other looks for a caught exception name
+# interpolated into a return INSIDE an except handler. Neither can see a leak
+# on the normal control-flow path, and `resolve_cached_binary()` creates
+# exactly that shape:
+#
+#     binary_path = resolve_cached_binary(binary_path)   # now an ABSOLUTE path
+#     ...
+#     return f"No Ghidra cache found for '{binary_path}'."   # leaks it
+#
+# The caller passed "sample.exe"; what comes back is the operator's own tree,
+# because the cache index records where the sample actually lives. The two
+# branches are not mutually exclusive -- resolution matches on NAME while
+# has_cached() matches on file CONTENTS, so a re-dumped or repacked sample
+# resolves and then misses -- so these returns are reachable with a resolved
+# path in hand. Echo os.path.basename(...), or keep the caller's own
+# reference in a separate name and echo that.
+# --------------------------------------------------------------------------
+
+_PATH_RESOLVERS = {"resolve_cached_binary"}
+
+
+def _bare_interpolations(node: ast.expr) -> set[str]:
+    """Names interpolated into an f-string *bare*, i.e. not through a call.
+
+    ``{binary_path}`` counts; ``{os.path.basename(binary_path)}`` does not --
+    that is the fix, and flagging it would make the guard unsatisfiable.
+    """
+    if not isinstance(node, ast.JoinedStr):
+        return set()
+    names: set[str] = set()
+    for piece in node.values:
+        if isinstance(piece, ast.FormattedValue) and isinstance(piece.value, ast.Name):
+            names.add(piece.value.id)
+    return names
+
+
+def _resolved_path_echoing_returns(path: Path) -> list[tuple[int, str, str]]:
+    """Find returns that echo a name rebound from a path resolver."""
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    offenders: list[tuple[int, str, str]] = []
+
+    for func in ast.walk(tree):
+        if not isinstance(func, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+
+        # name -> line it was rebound to a resolved path on.
+        rebound: dict[str, int] = {}
+        for node in ast.walk(func):
+            if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
+                continue
+            called = node.value.func
+            name = called.id if isinstance(called, ast.Name) else getattr(called, "attr", "")
+            if name not in _PATH_RESOLVERS:
+                continue
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    rebound[target.id] = node.lineno
+
+        if not rebound:
+            continue
+
+        for node in ast.walk(func):
+            if not isinstance(node, ast.Return) or node.value is None:
+                continue
+            for leaked in _bare_interpolations(node.value) & rebound.keys():
+                # Only after the rebinding; before it the name is still the
+                # caller's own argument and echoing it discloses nothing.
+                if node.lineno > rebound[leaked]:
+                    offenders.append(
+                        (node.lineno, leaked, ast.unparse(node)[:120])
+                    )
+
+    return offenders
+
+
+def test_no_returned_fstring_echoes_a_resolved_binary_path():
+    """
+    Audit F-10 guard, resolved-path form.
+
+    A tool that accepts a bare "sample.exe" resolves it against the Ghidra
+    cache index, which stores absolute paths under the operator's own tree.
+    Echoing the resolved value back puts the analyst's username and case
+    directory names into model context and into generated reports -- the
+    disclosure F-10 exists to prevent. Interpolate a basename instead, or keep
+    the caller's original reference in its own variable.
+    """
+    offenders = []
+    for path in _guarded_sources():
+        for line_no, name, source in _resolved_path_echoing_returns(path):
+            offenders.append(f"{path.name}:{line_no} ({name}) -> {source}")
+
+    assert not offenders, (
+        "returned f-string echoes a resolved host path (audit F-10):\n  "
+        + "\n  ".join(offenders)
+    )
+
+
+def _resolved_guard_flags(body: str, tmp_path: Path) -> bool:
+    source = (
+        "def f(binary_path):\n"
+        "    requested = binary_path\n"
+        "    binary_path = resolve_cached_binary(binary_path)\n"
+        f"{body}\n"
+    )
+    path = tmp_path / "probe.py"
+    path.write_text(source, encoding="utf-8")
+    return bool(_resolved_path_echoing_returns(path))
+
+
+# Real leaks this guard was written for: both shipped, and both are invisible
+# to the two exception-keyed guards above.
+_LEAKY_RESOLVED = {
+    "bare echo": '    return f"No Ghidra cache found for \'{binary_path}\'."',
+    "implicit concatenation": (
+        '    return (f"No cache for {binary_path}.\\n" "Run analyze_binary first.")'
+    ),
+    "nested in a longer message": (
+        '    return f"1. Use analyze_binary(binary_path={binary_path})"'
+    ),
+}
+
+_SAFE_RESOLVED = {
+    "basename": (
+        '    return f"No cache found for \'{os.path.basename(binary_path)}\'."'
+    ),
+    # The caller's own reference, captured before the rebinding.
+    "original reference": '    return f"Use analyze_binary({requested})"',
+    "no interpolation at all": '    return "No Ghidra cache found."',
+}
+
+
+@pytest.mark.parametrize("label,body", sorted(_LEAKY_RESOLVED.items()))
+def test_resolved_path_guard_catches_the_spellings_that_shipped(label, body, tmp_path):
+    """A guard that passes because it recognises nothing is worse than none."""
+    assert _resolved_guard_flags(body, tmp_path), f"{label} not flagged: {body}"
+
+
+@pytest.mark.parametrize("label,body", sorted(_SAFE_RESOLVED.items()))
+def test_resolved_path_guard_allows_the_sanctioned_fix(label, body, tmp_path):
+    assert not _resolved_guard_flags(body, tmp_path), f"{label} wrongly flagged: {body}"

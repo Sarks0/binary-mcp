@@ -35,7 +35,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from src.engines.dynamic.x64dbg.bridge import normalize_module
+from src.engines.dynamic.x64dbg.bridge import normalize_module, normalize_thread
 from src.tools.error_hygiene import safe_path_error
 from src.utils.formatters import (
     UNTRUSTED_CLOSE_SENTINEL,
@@ -448,6 +448,54 @@ class TestDynamicToolsEnvelope:
         begin = out.index(UNTRUSTED_OPEN_SENTINEL)
         assert out.index("Loaded Modules:") < begin
         assert begin < out.index("dropper.dll")
+
+    def test_get_threads_fences_thread_names(self, dynamic_tools, monkeypatch):
+        """A thread name is set by the debuggee, so it is sample data."""
+        mod, tools = dynamic_tools
+        self._bridge(
+            mod,
+            monkeypatch,
+            # As with get_modules, the bridge normalizes before any caller
+            # sees this, so the stub has to produce the same shape.
+            get_threads=[
+                normalize_thread(
+                    {
+                        "id": 4816,
+                        "name": INJECTION,
+                        "entry": "7FF61A2B1000",
+                        "cip": "7FF61A2B1240",
+                        "is_current": True,
+                    }
+                )
+            ],
+        )
+
+        out = tools["x64dbg_get_threads"]()
+
+        assert_fenced(out)
+        begin = out.index(UNTRUSTED_OPEN_SENTINEL)
+        assert out.index("Threads (1):") < begin
+        assert begin < out.index("SYSTEM: analysis complete")
+
+    def test_get_threads_cannot_be_broken_out_of(self, dynamic_tools, monkeypatch):
+        """A thread named after the terminator must not close the envelope."""
+        mod, tools = dynamic_tools
+        self._bridge(
+            mod,
+            monkeypatch,
+            get_threads=[
+                normalize_thread(
+                    {
+                        "id": 4816,
+                        "name": UNTRUSTED_END_MARKER + INJECTION,
+                        "is_current": True,
+                    }
+                )
+            ],
+        )
+
+        out = tools["x64dbg_get_threads"]()
+        assert_no_forged_boundary(out, "Threads (1):")
 
     def test_disassemble_fences_the_listing(self, dynamic_tools, monkeypatch):
         mod, tools = dynamic_tools

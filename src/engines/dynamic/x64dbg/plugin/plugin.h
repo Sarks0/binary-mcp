@@ -11,7 +11,7 @@
 
 #define PLUGIN_NAME "Obsidian"
 #define PLUGIN_VERSION 1
-#define PLUGIN_VERSION_STR "1.1.0-rc1"
+#define PLUGIN_VERSION_STR "1.1.0"
 #define PLUGIN_DESCRIPTION "AI-Powered Debugging Bridge for x64dbg"
 #define PLUGIN_AUTHOR "Binary MCP Project"
 #define PLUGIN_WEBSITE "https://github.com/Sarks0/binary-mcp"

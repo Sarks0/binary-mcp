@@ -8,6 +8,8 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from src.utils.formatters import neutralise_untrusted_delimiters
+
 from .bridge import X64DbgBridge
 
 logger = logging.getLogger(__name__)
@@ -44,8 +46,42 @@ class X64DbgCommands:
         status.append(f"State: {location['state']}")
         status.append(f"Address: 0x{location['address']}")
 
+        # A build that cannot report its version is one from before the module
+        # and thread fixes, so say so rather than omitting the line: a missing
+        # field would read as "fine" when it is the thing to act on.
+        version = location.get("plugin_version")
+        if version:
+            status.append(f"Plugin: v{version}")
+        else:
+            status.append(
+                "Plugin: version not reported -- this build predates the "
+                "module/thread fixes. Rebuild and reinstall the plugin and "
+                "obsidian_server.exe together."
+            )
+
         if location['binary_path']:
             status.append(f"Binary: {Path(location['binary_path']).name}")
+
+        # The main module's name and base are what every static->runtime
+        # address conversion needs; surfacing them here saves a round trip and
+        # tells the caller straight away whether a process is loaded at all.
+        try:
+            main_module = self.bridge.get_main_module()
+        except Exception:
+            main_module = None
+
+        if main_module:
+            # Audit F-7: the module name is the sample's own filename, so it is
+            # attacker text. It is one inline field rather than a block, so
+            # neutralise the envelope sentinels rather than fencing. The base
+            # is a number the debugger computed and needs no treatment.
+            status.append(
+                f"Main module: "
+                f"{neutralise_untrusted_delimiters(main_module['display_name'])} "
+                f"@ 0x{main_module['base']:X}"
+            )
+        else:
+            status.append("Main module: none (no process loaded)")
 
         return "\n".join(status)
 

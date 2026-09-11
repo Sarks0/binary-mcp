@@ -99,7 +99,7 @@ Analyze the crash dump at C:\Windows\MEMORY.DMP
 Decompile the type MyNamespace.MyClass to C#
 ```
 
-## Capabilities (290 tools)
+## Capabilities (147 tools)
 
 Counts below are derived from the tools actually registered by `src/server.py`, and `tests/test_docs_accuracy.py` fails if this file and the code disagree.
 
@@ -115,7 +115,7 @@ Python bytecode (`.pyc`) analysis, PyInstaller/py2exe packer detection and extra
 
 Persistent analysis sessions (create, save, load, list, delete, summarise, relate), analyst notes, auto-session configuration, cache cleanup, and a setup diagnostic.
 
-### Dynamic Analysis (x64dbg) - 159 tools
+### Dynamic Analysis (x64dbg) - 16 tools
 
 | Category | What It Does |
 |----------|-------------|

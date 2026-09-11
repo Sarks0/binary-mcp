@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import ast
 import re
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -157,6 +158,16 @@ def _capture_tools(register, *args, **kwargs) -> dict:
     app = MagicMock()
     app.tool = MagicMock(side_effect=_decorator)
     register(app, *args, **kwargs)
+
+    # dynamic_tools registers 16 grouped tools rather than one name per tool;
+    # its 159 implementations are reachable through the registry the grouping
+    # populates. These tests address those implementations, so surface them
+    # under their own names -- what they assert is unchanged.
+    module = sys.modules.get(register.__module__)
+    for group in getattr(module, "_OP_REGISTRY", {}).values():
+        for impl in group.values():
+            captured.setdefault(impl.__name__, impl)
+
     return captured
 
 
@@ -394,7 +405,17 @@ def _guarded_sources() -> list[Path]:
 # Those are deliberately echoed verbatim (see the F-10 comments in the tool
 # modules); anything broader has to go through safe_error_message /
 # safe_tool_error instead.
-_VALIDATION_ONLY_HANDLERS = {"ValueError"}
+# Kept in step with _AST_ALLOWED_HANDLERS below, which carries the audit for
+# each entry. The two crossover types are bounded the same way ValueError is:
+# every raise site quotes the caller's own argument, a basename, a debuggee
+# module name or an address -- never a resolved host path.
+_VALIDATION_ONLY_HANDLERS = {
+    "ValueError",
+    "BinaryResolutionError",
+    "AddressRebaseError",
+    "FeatureUnavailableError",
+    "(BinaryResolutionError, AddressRebaseError)",
+}
 
 
 def _raw_error_returns(path: Path) -> list[tuple[int, str]]:
@@ -494,6 +515,26 @@ _AST_ALLOWED_HANDLERS = {
     # only thing that tells a user their "PE" is actually a script or a
     # truncated download, so it is worth keeping.
     "pefile.PEFormatError",
+    #   * BinaryResolutionError / AddressRebaseError
+    #     (src/tools/dynamic_tools.py) -- the static/dynamic crossover's two
+    #     module-private types, audited on the same terms. Every raise site
+    #     quotes the caller's own argument, a basename, a debuggee module
+    #     name, or an address: "'evil.dll' is not loaded in x64dbg. Loaded
+    #     modules: host.exe", "Static address 0x100 is below the image base
+    #     0x400000", "'x.exe' matches 2 analyzed binaries. Pass the full path
+    #     you used with analyze_binary". The two messages that used to
+    #     interpolate a resolved absolute cache path -- the F-10 disclosure
+    #     exactly -- were rewritten to basenames when these were added here.
+    "BinaryResolutionError",
+    "AddressRebaseError",
+    #   * FeatureUnavailableError (src/engines/dynamic/x64dbg/bridge.py) --
+    #     one raise site, one message: "The x64dbg plugin has no handler for
+    #     /api/thread/suspend. This is a plugin capability gap, not a
+    #     connection problem...". The only interpolated value is the internal
+    #     API endpoint path, a literal from this repo -- never a filesystem
+    #     path. Surfacing it verbatim is the point: it is what stops a caller
+    #     retrying and reconnecting against an endpoint that does not exist.
+    "FeatureUnavailableError",
 }
 
 
@@ -963,3 +1004,149 @@ def test_reason_guard_allows_format_only_handlers(clause, tmp_path):
     """PE-parser and internal-state messages name no host path -- and the model
     needs them to tell a malformed sample from a bad path."""
     assert not _reason_guard_flags("        raise E(S(reason=str(e)))", tmp_path, clause)
+
+
+# --------------------------------------------------------------------------
+# Audit F-10, third form: a parameter rebound to a RESOLVED path.
+#
+# The two guards above both key off an exception: one matches the literal
+# `return f"Error: {e}"`, the other looks for a caught exception name
+# interpolated into a return INSIDE an except handler. Neither can see a leak
+# on the normal control-flow path, and `resolve_cached_binary()` creates
+# exactly that shape:
+#
+#     binary_path = resolve_cached_binary(binary_path)   # now an ABSOLUTE path
+#     ...
+#     return f"No Ghidra cache found for '{binary_path}'."   # leaks it
+#
+# The caller passed "sample.exe"; what comes back is the operator's own tree,
+# because the cache index records where the sample actually lives. The two
+# branches are not mutually exclusive -- resolution matches on NAME while
+# has_cached() matches on file CONTENTS, so a re-dumped or repacked sample
+# resolves and then misses -- so these returns are reachable with a resolved
+# path in hand. Echo os.path.basename(...), or keep the caller's own
+# reference in a separate name and echo that.
+# --------------------------------------------------------------------------
+
+_PATH_RESOLVERS = {"resolve_cached_binary"}
+
+
+def _bare_interpolations(node: ast.expr) -> set[str]:
+    """Names interpolated into an f-string *bare*, i.e. not through a call.
+
+    ``{binary_path}`` counts; ``{os.path.basename(binary_path)}`` does not --
+    that is the fix, and flagging it would make the guard unsatisfiable.
+    """
+    if not isinstance(node, ast.JoinedStr):
+        return set()
+    names: set[str] = set()
+    for piece in node.values:
+        if isinstance(piece, ast.FormattedValue) and isinstance(piece.value, ast.Name):
+            names.add(piece.value.id)
+    return names
+
+
+def _resolved_path_echoing_returns(path: Path) -> list[tuple[int, str, str]]:
+    """Find returns that echo a name rebound from a path resolver."""
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    offenders: list[tuple[int, str, str]] = []
+
+    for func in ast.walk(tree):
+        if not isinstance(func, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+
+        # name -> line it was rebound to a resolved path on.
+        rebound: dict[str, int] = {}
+        for node in ast.walk(func):
+            if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
+                continue
+            called = node.value.func
+            name = called.id if isinstance(called, ast.Name) else getattr(called, "attr", "")
+            if name not in _PATH_RESOLVERS:
+                continue
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    rebound[target.id] = node.lineno
+
+        if not rebound:
+            continue
+
+        for node in ast.walk(func):
+            if not isinstance(node, ast.Return) or node.value is None:
+                continue
+            for leaked in _bare_interpolations(node.value) & rebound.keys():
+                # Only after the rebinding; before it the name is still the
+                # caller's own argument and echoing it discloses nothing.
+                if node.lineno > rebound[leaked]:
+                    offenders.append(
+                        (node.lineno, leaked, ast.unparse(node)[:120])
+                    )
+
+    return offenders
+
+
+def test_no_returned_fstring_echoes_a_resolved_binary_path():
+    """
+    Audit F-10 guard, resolved-path form.
+
+    A tool that accepts a bare "sample.exe" resolves it against the Ghidra
+    cache index, which stores absolute paths under the operator's own tree.
+    Echoing the resolved value back puts the analyst's username and case
+    directory names into model context and into generated reports -- the
+    disclosure F-10 exists to prevent. Interpolate a basename instead, or keep
+    the caller's original reference in its own variable.
+    """
+    offenders = []
+    for path in _guarded_sources():
+        for line_no, name, source in _resolved_path_echoing_returns(path):
+            offenders.append(f"{path.name}:{line_no} ({name}) -> {source}")
+
+    assert not offenders, (
+        "returned f-string echoes a resolved host path (audit F-10):\n  "
+        + "\n  ".join(offenders)
+    )
+
+
+def _resolved_guard_flags(body: str, tmp_path: Path) -> bool:
+    source = (
+        "def f(binary_path):\n"
+        "    requested = binary_path\n"
+        "    binary_path = resolve_cached_binary(binary_path)\n"
+        f"{body}\n"
+    )
+    path = tmp_path / "probe.py"
+    path.write_text(source, encoding="utf-8")
+    return bool(_resolved_path_echoing_returns(path))
+
+
+# Real leaks this guard was written for: both shipped, and both are invisible
+# to the two exception-keyed guards above.
+_LEAKY_RESOLVED = {
+    "bare echo": '    return f"No Ghidra cache found for \'{binary_path}\'."',
+    "implicit concatenation": (
+        '    return (f"No cache for {binary_path}.\\n" "Run analyze_binary first.")'
+    ),
+    "nested in a longer message": (
+        '    return f"1. Use analyze_binary(binary_path={binary_path})"'
+    ),
+}
+
+_SAFE_RESOLVED = {
+    "basename": (
+        '    return f"No cache found for \'{os.path.basename(binary_path)}\'."'
+    ),
+    # The caller's own reference, captured before the rebinding.
+    "original reference": '    return f"Use analyze_binary({requested})"',
+    "no interpolation at all": '    return "No Ghidra cache found."',
+}
+
+
+@pytest.mark.parametrize("label,body", sorted(_LEAKY_RESOLVED.items()))
+def test_resolved_path_guard_catches_the_spellings_that_shipped(label, body, tmp_path):
+    """A guard that passes because it recognises nothing is worse than none."""
+    assert _resolved_guard_flags(body, tmp_path), f"{label} not flagged: {body}"
+
+
+@pytest.mark.parametrize("label,body", sorted(_SAFE_RESOLVED.items()))
+def test_resolved_path_guard_allows_the_sanctioned_fix(label, body, tmp_path):
+    assert not _resolved_guard_flags(body, tmp_path), f"{label} wrongly flagged: {body}"

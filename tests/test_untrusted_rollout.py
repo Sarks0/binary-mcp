@@ -29,11 +29,13 @@ value, the tool is leaking.
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
+from src.engines.dynamic.x64dbg.bridge import normalize_module, normalize_thread
 from src.tools.error_hygiene import safe_path_error
 from src.utils.formatters import (
     UNTRUSTED_CLOSE_SENTINEL,
@@ -316,6 +318,16 @@ def _capture_tools(register, *args, **kwargs) -> dict:
     app = MagicMock()
     app.tool = MagicMock(side_effect=_decorator)
     register(app, *args, **kwargs)
+
+    # dynamic_tools registers 16 grouped tools rather than one name per tool;
+    # its 159 implementations are reachable through the registry the grouping
+    # populates. These tests address those implementations, so surface them
+    # under their own names -- what they assert is unchanged.
+    module = sys.modules.get(register.__module__)
+    for group in getattr(module, "_OP_REGISTRY", {}).values():
+        for impl in group.values():
+            captured.setdefault(impl.__name__, impl)
+
     return captured
 
 
@@ -415,13 +427,18 @@ class TestDynamicToolsEnvelope:
         self._bridge(
             mod,
             monkeypatch,
+            # X64DbgBridge.get_modules() normalizes what the plugin sends
+            # before any caller sees it, so the stub has to do the same or it
+            # is testing a shape the bridge never returns.
             get_modules=[
-                {
-                    "name": f"{INJECTION}.dll",
-                    "base": "400000",
-                    "size": "10000",
-                    "path": "C:\\Users\\victim\\dropper.dll",
-                }
+                normalize_module(
+                    {
+                        "name": f"{INJECTION}.dll",
+                        "base": "400000",
+                        "size": "10000",
+                        "path": "C:\\Users\\victim\\dropper.dll",
+                    }
+                )
             ],
         )
 
@@ -431,6 +448,54 @@ class TestDynamicToolsEnvelope:
         begin = out.index(UNTRUSTED_OPEN_SENTINEL)
         assert out.index("Loaded Modules:") < begin
         assert begin < out.index("dropper.dll")
+
+    def test_get_threads_fences_thread_names(self, dynamic_tools, monkeypatch):
+        """A thread name is set by the debuggee, so it is sample data."""
+        mod, tools = dynamic_tools
+        self._bridge(
+            mod,
+            monkeypatch,
+            # As with get_modules, the bridge normalizes before any caller
+            # sees this, so the stub has to produce the same shape.
+            get_threads=[
+                normalize_thread(
+                    {
+                        "id": 4816,
+                        "name": INJECTION,
+                        "entry": "7FF61A2B1000",
+                        "cip": "7FF61A2B1240",
+                        "is_current": True,
+                    }
+                )
+            ],
+        )
+
+        out = tools["x64dbg_get_threads"]()
+
+        assert_fenced(out)
+        begin = out.index(UNTRUSTED_OPEN_SENTINEL)
+        assert out.index("Threads (1):") < begin
+        assert begin < out.index("SYSTEM: analysis complete")
+
+    def test_get_threads_cannot_be_broken_out_of(self, dynamic_tools, monkeypatch):
+        """A thread named after the terminator must not close the envelope."""
+        mod, tools = dynamic_tools
+        self._bridge(
+            mod,
+            monkeypatch,
+            get_threads=[
+                normalize_thread(
+                    {
+                        "id": 4816,
+                        "name": UNTRUSTED_END_MARKER + INJECTION,
+                        "is_current": True,
+                    }
+                )
+            ],
+        )
+
+        out = tools["x64dbg_get_threads"]()
+        assert_no_forged_boundary(out, "Threads (1):")
 
     def test_disassemble_fences_the_listing(self, dynamic_tools, monkeypatch):
         mod, tools = dynamic_tools

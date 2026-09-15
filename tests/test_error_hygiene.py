@@ -480,6 +480,15 @@ _AST_ALLOWED_HANDLERS = {
     # with one. Widening this set requires the same audit.
     "CfgBuildError",
     "VirusTotalError",
+    #   * MalwareBazaarError (src/tools/mb_tools.py) -- the same construction
+    #     as VirusTotalError, audited the same way. Its raise sites are: the
+    #     curated Auth-Key / rate-limit / response-cap / "not JSON" / "not a
+    #     zip archive" sentences written in that module; the HTTP status line
+    #     (``{e.code} {e.reason}``) and the URLError reason, neither of which
+    #     can carry a filesystem path for an https:// request; and
+    #     ``_status_message()``, whose only variable part is a ``query_status``
+    #     token already constrained to ``[a-z0-9_]{1,64}`` before it is echoed.
+    "MalwareBazaarError",
     #   * CoverageError (src/engines/static/ghidra/coverage_store.py) -- every
     #     raise site was audited when it was added here: "invariant violated:
     #     remaining != total - reviewed", "unknown examination kind 'x';

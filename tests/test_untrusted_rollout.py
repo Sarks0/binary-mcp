@@ -965,6 +965,7 @@ _SAMPLE_TEXT_MODULES = {
     "function_hash_tools",
     "indirect_call_tools",
     "malware_tools",
+    "mb_tools",
     "pe_tools",
     "reporting",
     "review_tools",

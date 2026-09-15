@@ -174,6 +174,13 @@ def get_config_int(key: str, default: int = 0) -> int:
 CONFIG_KEYS = {
     # VirusTotal
     "VT_API_KEY": "VirusTotal API key for hash lookups and file analysis",
+    "VT_API_TIMEOUT": "Socket timeout for VirusTotal API calls (seconds, 5-300, default 30)",
+
+    # MalwareBazaar (abuse.ch)
+    "MB_API_KEY": "MalwareBazaar Auth-Key, required for every MalwareBazaar call (free from https://auth.abuse.ch/)",
+    "MB_API_TIMEOUT": "Socket timeout for MalwareBazaar API calls (seconds, 5-300, default 30)",
+    "MB_ALLOW_DOWNLOAD": "Enable mb_download, the only tool that writes a sample to disk (1/true/yes). Archives are stored encrypted and never extracted",
+    "MB_MAX_DOWNLOAD_MB": "Ceiling on a downloaded MalwareBazaar archive in MB (1-2048, default 128)",
 
     # Ghidra
     "GHIDRA_HOME": "Path to Ghidra installation directory",

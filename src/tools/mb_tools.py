@@ -44,17 +44,17 @@ import json
 import logging
 import re
 from pathlib import Path
-from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+from urllib.error import HTTPError
 
+from src.integrations import IntegrationClient, IntegrationError, ProviderConfig
+from src.integrations.hashes import normalise_hash as _normalise_hash
 from src.tools.error_hygiene import safe_path_error
 from src.utils.formatters import wrap_untrusted
 
 logger = logging.getLogger(__name__)
 
 
-class MalwareBazaarError(RuntimeError):
+class MalwareBazaarError(IntegrationError):
     """
     A MalwareBazaar failure whose message this module wrote itself.
 
@@ -88,7 +88,6 @@ MB_MAX_JSON_BYTES = 64 * 1024 * 1024
 
 MB_DEFAULT_MAX_DOWNLOAD_MB = 128
 
-_HASH_RE = re.compile(r"\A(?:[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z")
 
 #: ``query_status`` is an API-authored enum, but it still arrives over the
@@ -155,14 +154,40 @@ _STATUS_MESSAGES: dict[str, str] = {
 }
 
 
+class _MalwareBazaarClient(IntegrationClient):
+    """abuse.ch's status codes; most failures arrive inside a 200 instead."""
+
+    def map_http_error(self, error: HTTPError) -> Exception:
+        if error.code == 401:
+            return MalwareBazaarError(
+                f"MalwareBazaar rejected the Auth-Key. Check {MB_API_KEY_ENV}."
+            )
+        if error.code == 429:
+            return MalwareBazaarError(
+                "MalwareBazaar rate limit reached. The API is free under fair "
+                "use; slow down and retry."
+            )
+        return super().map_http_error(error)
+
+
+_client = _MalwareBazaarClient(
+    ProviderConfig(
+        name="MalwareBazaar",
+        base_url=MB_API_BASE,
+        auth_header="Auth-Key",
+        credential_noun="Auth-Key",
+        key_config_keys=(MB_API_KEY_ENV,),
+        timeout_config_key=MB_TIMEOUT_ENV,
+        key_hint="Get one free at https://auth.abuse.ch/.",
+        default_timeout=MB_DEFAULT_TIMEOUT,
+        max_response_bytes=MB_MAX_JSON_BYTES,
+    ),
+    MalwareBazaarError,
+)
+
+
 def _get_api_key() -> str | None:
-    from src.utils.config import get_config
-    return get_config(MB_API_KEY_ENV)
-
-
-def _get_timeout() -> int:
-    from src.utils.config import get_config_int
-    return max(5, min(get_config_int(MB_TIMEOUT_ENV, MB_DEFAULT_TIMEOUT), 300))
+    return _client.api_key()
 
 
 def _download_allowed() -> bool:
@@ -178,29 +203,12 @@ def _max_download_bytes() -> int:
 
 def normalise_hash(file_hash: str, sha256_only: bool = False) -> str:
     """
-    Lower-case, strip and validate a hash before it becomes a request field.
+    Validate a hash before it becomes a request field.
 
-    Args:
-        file_hash: MD5, SHA-1 or SHA-256 (SHA-256 only when ``sha256_only``).
-        sha256_only: Enforce SHA-256, which ``get_file`` requires.
-
-    Raises:
-        ValueError: If the value is not the expected hex digest. Kept specific
-            (audit F-10 retains validation messages) -- it quotes no host state.
+    Thin wrapper over the shared validator so this module's public surface is
+    unchanged; see :func:`src.integrations.hashes.normalise_hash`.
     """
-    candidate = (file_hash or "").strip().lower()
-    pattern = _SHA256_RE if sha256_only else _HASH_RE
-    if not pattern.match(candidate):
-        expected = (
-            "a hex SHA256 (64 characters)"
-            if sha256_only
-            else "a hex MD5 (32), SHA1 (40) or SHA256 (64)"
-        )
-        raise ValueError(
-            f"Invalid hash: {len(candidate)} characters. Expected {expected} "
-            "with no other characters."
-        )
-    return candidate
+    return _normalise_hash(file_hash, sha256_only=sha256_only)
 
 
 def _request(fields: dict[str, str | int], expect_json: bool = True) -> tuple[dict, bytes]:
@@ -209,8 +217,8 @@ def _request(fields: dict[str, str | int], expect_json: bool = True) -> tuple[di
 
     Args:
         fields: Form fields. Every value is coerced to ``str`` and urlencoded
-            here; callers never build the body themselves, which is what keeps
-            file content structurally unable to reach it.
+            by the shared client; callers never build the body themselves,
+            which is what keeps file content structurally unable to reach it.
         expect_json: ``False`` for ``get_file``, whose success body is a zip.
 
     Returns:
@@ -221,62 +229,12 @@ def _request(fields: dict[str, str | int], expect_json: bool = True) -> tuple[di
         ValueError: If the Auth-Key is not configured.
         MalwareBazaarError: On a transport or protocol failure.
     """
-    api_key = _get_api_key()
-    if not api_key:
-        raise ValueError(
-            f"MalwareBazaar Auth-Key not configured. Set {MB_API_KEY_ENV} "
-            "(get one free at https://auth.abuse.ch/)."
-        )
-
-    body = urlencode({key: str(value) for key, value in fields.items()}).encode("utf-8")
-    request = Request(
-        MB_API_BASE,
-        data=body,
-        headers={
-            "Auth-Key": api_key,
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Accept": "application/json",
-            "User-Agent": "binary-mcp",
-        },
-        method="POST",
+    response = _client.request(
+        form=fields,
+        expect_json=expect_json,
+        max_bytes=None if expect_json else _max_download_bytes(),
     )
-
-    cap = MB_MAX_JSON_BYTES if expect_json else _max_download_bytes()
-
-    try:
-        with urlopen(request, timeout=_get_timeout()) as response:  # nosec B310 - hardcoded https API base
-            raw = response.read(cap + 1)
-    except HTTPError as e:
-        if e.code == 401:
-            raise MalwareBazaarError(
-                f"MalwareBazaar rejected the Auth-Key. Check {MB_API_KEY_ENV}."
-            )
-        if e.code == 429:
-            raise MalwareBazaarError(
-                "MalwareBazaar rate limit reached. The API is free under fair "
-                "use; slow down and retry."
-            )
-        raise MalwareBazaarError(f"MalwareBazaar API error: {e.code} {e.reason}")
-    except URLError as e:
-        raise MalwareBazaarError(f"Network error connecting to MalwareBazaar: {e.reason}")
-
-    if len(raw) > cap:
-        raise MalwareBazaarError(
-            f"MalwareBazaar response exceeded the {cap // (1024 * 1024)}MB cap"
-        )
-
-    try:
-        parsed = json.loads(raw.decode("utf-8"))
-        if not isinstance(parsed, dict):
-            parsed = {}
-    except (ValueError, UnicodeDecodeError):
-        if expect_json:
-            raise MalwareBazaarError(
-                "MalwareBazaar returned a response that was not JSON"
-            )
-        parsed = {}
-
-    return parsed, raw
+    return response.payload, response.raw
 
 
 def _status(payload: dict) -> str:

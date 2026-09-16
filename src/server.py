@@ -1,7 +1,7 @@
 """
 Binary MCP Server for comprehensive binary analysis.
 
-Provides 147 tools for static and dynamic binary analysis:
+Provides 166 tools for static and dynamic binary analysis:
 - Static analysis via Ghidra (headless mode) for native binaries
 - Static analysis via ILSpyCmd for .NET assemblies
 - Dynamic analysis via x64dbg (native plugin)
@@ -17,8 +17,11 @@ finding F-11: this said "245" while 279 were registered, and a documented
 capability count that overstates reality is a claim a caller may act on).
 
 Samples are never executed by this server and never uploaded anywhere: no
-tool can launch a binary (see README, "Operational safety"), and the
-VirusTotal integration is lookup-only.
+tool can launch a binary (see README, "Operational safety"), the VirusTotal
+integration is lookup-only, and the MalwareBazaar integration sends hashes and
+search terms but never file content. MalwareBazaar can DOWNLOAD a sample, and
+is the one place this server writes malware to disk -- that tool is off unless
+the operator sets MB_ALLOW_DOWNLOAD=1, and it leaves the archive encrypted.
 """
 
 import contextlib
@@ -42,6 +45,8 @@ from src.engines.static.ghidra.coverage_store import CoverageStore, has_reviewab
 from src.engines.static.ghidra.coverage_store import auto_mark as auto_mark_reviewed
 from src.engines.static.ghidra.project_cache import ProjectCache
 from src.engines.static.ghidra.runner import GhidraAnalysisError, GhidraRunner
+from src.tools.abusech_tools import register_abusech_tools
+from src.tools.attack_tools import register_attack_tools
 from src.tools.control_flow_tools import register_control_flow_tools
 from src.tools.coverage_tools import register_coverage_tools
 from src.tools.diff_tools import register_diff_tools
@@ -54,6 +59,7 @@ from src.tools.function_hash_tools import register_function_hash_tools
 from src.tools.indirect_call_tools import register_indirect_call_tools
 from src.tools.job_tools import register_job_tools
 from src.tools.malware_tools import register_malware_tools
+from src.tools.mb_tools import register_mb_tools
 from src.tools.pe_tools import register_pe_tools
 from src.tools.reporting import register_reporting_tools
 from src.tools.review_tools import register_review_tools
@@ -6066,6 +6072,16 @@ def main():
 
     # Register VirusTotal tools
     register_vt_tools(app, session_manager)
+
+    # Register MalwareBazaar tools (sample lookup, corpus pivots, opt-in download)
+    register_mb_tools(app, session_manager)
+
+    # Register the rest of abuse.ch: ThreatFox IOCs, URLhaus distribution,
+    # YARAify rule matching -- all on the same Auth-Key as MalwareBazaar
+    register_abusech_tools(app, session_manager)
+
+    # Register MITRE ATT&CK lookups (no API key; cached locally after first fetch)
+    register_attack_tools(app, session_manager)
 
     # Register triage tools
     register_triage_tools(app, session_manager)

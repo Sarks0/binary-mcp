@@ -174,6 +174,22 @@ def get_config_int(key: str, default: int = 0) -> int:
 CONFIG_KEYS = {
     # VirusTotal
     "VT_API_KEY": "VirusTotal API key for hash lookups and file analysis",
+    "VT_API_TIMEOUT": "Socket timeout for VirusTotal API calls (seconds, 5-300, default 30)",
+
+    # abuse.ch (MalwareBazaar, ThreatFox, URLhaus, YARAify)
+    "ABUSECH_API_KEY": "abuse.ch Auth-Key. One key covers MalwareBazaar, ThreatFox, URLhaus and YARAify; mandatory for all of them (free from https://auth.abuse.ch/)",
+    "MB_API_KEY": "Alias for ABUSECH_API_KEY, kept because it shipped first. ABUSECH_API_KEY wins if both are set",
+    "ABUSECH_API_TIMEOUT": "Socket timeout for ThreatFox/URLhaus/YARAify calls (seconds, 5-300, default 30)",
+
+    # MITRE ATT&CK (no API key; static STIX bundles from a public repository)
+    "ATTACK_DOMAIN": "ATT&CK matrix: enterprise-attack (default), mobile-attack or ics-attack",
+    "ATTACK_DATA_DIR": "Where the distilled ATT&CK index is cached (default $BINARY_CACHE_DIR/attack)",
+    "ATTACK_OFFLINE": "Set to 1 to refuse downloading ATT&CK data and serve only the local cache",
+    "ATTACK_MAX_BUNDLE_MB": "Ceiling on the downloaded STIX bundle in MB (8-1024, default 128)",
+    "ATTACK_TIMEOUT": "Socket timeout for the ATT&CK download (seconds, 5-600, default 120)",
+    "MB_API_TIMEOUT": "Socket timeout for MalwareBazaar API calls (seconds, 5-300, default 30)",
+    "MB_ALLOW_DOWNLOAD": "Enable mb_download, the only tool that writes a sample to disk (1/true/yes). Archives are stored encrypted and never extracted",
+    "MB_MAX_DOWNLOAD_MB": "Ceiling on a downloaded MalwareBazaar archive in MB (1-2048, default 128)",
 
     # Ghidra
     "GHIDRA_HOME": "Path to Ghidra installation directory",

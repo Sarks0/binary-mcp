@@ -22,6 +22,7 @@ from src.engines.dynamic.gdb.mi_session import (
     MISessionError,
     MITimeoutError,
     find_gdb,
+    quote_mi_argument,
 )
 
 __all__ = [
@@ -39,4 +40,5 @@ __all__ = [
     "MISessionError",
     "MITimeoutError",
     "find_gdb",
+    "quote_mi_argument",
 ]

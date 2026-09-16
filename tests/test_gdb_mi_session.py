@@ -21,10 +21,12 @@ import pytest
 
 from src.engines.dynamic.gdb.mi_parser import MIRecord, RecordKind
 from src.engines.dynamic.gdb.mi_session import (
+    MIResponse,
     MISession,
     MISessionClosedError,
     MISessionError,
     MITimeoutError,
+    _setting_holds,
     find_gdb,
 )
 
@@ -187,6 +189,106 @@ class TestTimeout:
         assert "secret-malware.elf" not in message
 
 
+class TestSettingVerification:
+    """_setting_holds: what counts as a setting having taken effect."""
+
+    @staticmethod
+    def _response(results, error=False):
+        record = MIRecord(
+            kind=RecordKind.RESULT,
+            raw="",
+            klass="error" if error else "done",
+            results=results,
+        )
+        return MIResponse(record=record)
+
+    def test_scalar_setting(self):
+        assert _setting_holds(self._response({"value": "off"}), "off")
+        assert not _setting_holds(self._response({"value": "on"}), "off")
+
+    def test_error_reply_never_counts_as_applied(self):
+        assert not _setting_holds(self._response({}, error=True), "off")
+
+    def test_prefix_setting_requires_every_toggle(self):
+        holds = self._response(
+            {"showlist": {"option": [
+                {"name": "gdb-scripts", "value": "off"},
+                {"name": "local-gdbinit", "value": "off"},
+            ]}}
+        )
+        assert _setting_holds(holds, "off")
+
+        partial = self._response(
+            {"showlist": {"option": [
+                {"name": "gdb-scripts", "value": "off"},
+                {"name": "local-gdbinit", "value": "on"},
+            ]}}
+        )
+        assert not _setting_holds(partial, "off")
+
+    def test_path_sub_options_are_not_toggles(self):
+        """`set auto-load off` leaves safe-path and scripts-directory as paths.
+
+        Verified on GNU gdb 15.1. Demanding "off" from them would fail a
+        session that is correctly hardened.
+        """
+        response = self._response(
+            {"showlist": {"option": [
+                {"name": "gdb-scripts", "value": "off"},
+                {"name": "libthread-db", "value": "off"},
+                {"name": "local-gdbinit", "value": "off"},
+                {"name": "python-scripts", "value": "off"},
+                {"name": "safe-path", "value": "$debugdir:$datadir/auto-load"},
+                {"name": "scripts-directory", "value": "$debugdir:$datadir/auto-load"},
+            ]}}
+        )
+        assert _setting_holds(response, "off")
+
+
+class TestHardeningPolicy:
+    """start() decides what an absent setting means, per platform."""
+
+    @staticmethod
+    def _session_with_missing_setting(monkeypatch, platform):
+        session = MISession(gdb_path="/nonexistent/gdb", timeout=1)
+        monkeypatch.setattr(
+            "src.engines.dynamic.gdb.mi_session.sys.platform", platform
+        )
+        monkeypatch.setattr(session, "stop", lambda: None)
+
+        def fake_send(command, timeout=None):
+            error = command == "-gdb-show startup-with-shell"
+            record = MIRecord(
+                kind=RecordKind.RESULT,
+                raw="",
+                klass="error" if error else "done",
+                results={"msg": "Undefined show command."} if error
+                else {"value": "off"},
+            )
+            return MIResponse(record=record)
+
+        monkeypatch.setattr(session, "send", fake_send)
+        return session
+
+    def test_absent_posix_setting_is_tolerated_off_linux(self, monkeypatch):
+        """Windows GDB has no startup-with-shell; the risk is absent too."""
+        session = self._session_with_missing_setting(monkeypatch, "win32")
+        from src.engines.dynamic.gdb.mi_session import _HARDENING
+
+        setting = next(h for h in _HARDENING if h.name == "startup-with-shell")
+        session._apply_hardening(setting)
+        assert session.hardening_report["startup-with-shell"] == "absent"
+
+    def test_absent_posix_setting_is_fatal_on_linux(self, monkeypatch):
+        """On Linux the shell-launch path is real, so absence fails closed."""
+        session = self._session_with_missing_setting(monkeypatch, "linux")
+        from src.engines.dynamic.gdb.mi_session import _HARDENING
+
+        setting = next(h for h in _HARDENING if h.name == "startup-with-shell")
+        with pytest.raises(MISessionError, match="startup-with-shell"):
+            session._apply_hardening(setting)
+
+
 live = pytest.mark.skipif(GDB is None, reason="gdb not installed")
 
 
@@ -222,14 +324,34 @@ def session():
 
 @live
 class TestLiveSession:
-    def test_start_applies_the_hardening_settings(self, session):
-        for setting, expected in (
-            ("startup-with-shell", "off"),
-            ("confirm", "off"),
-            ("mi-async", "on"),
-        ):
+    def test_start_applies_the_portable_hardening_settings(self, session):
+        for setting, expected in (("confirm", "off"), ("mi-async", "on")):
             response = session.send(f"-gdb-show {setting}")
             assert response.results.get("value") == expected, setting
+
+    @pytest.mark.skipif(sys.platform != "linux", reason="POSIX-only setting")
+    def test_startup_with_shell_is_off_on_linux(self, session):
+        """The setting that stops the inferior being launched via /bin/sh.
+
+        Windows GDB has no such command -- it creates the process directly --
+        so this is asserted only where the shell-launch path exists.
+        """
+        assert session.send("-gdb-show startup-with-shell").results["value"] == "off"
+        assert session.hardening_report["startup-with-shell"] == "applied"
+
+    def test_hardening_report_covers_every_setting(self, session):
+        report = session.hardening_report
+        assert set(report) == {
+            "confirm",
+            "startup-with-shell",
+            "auto-load",
+            "mi-async",
+        }
+        assert all(state in ("applied", "absent") for state in report.values())
+        # Only the POSIX-only one may be absent, and only off Linux.
+        for name, state in report.items():
+            if state == "absent":
+                assert name == "startup-with-shell" and sys.platform != "linux"
 
     @pytest.mark.skipif(sys.platform != "linux", reason="Unix-only auto-load prefix")
     def test_auto_load_is_off_which_nx_alone_does_not_achieve(self, session):

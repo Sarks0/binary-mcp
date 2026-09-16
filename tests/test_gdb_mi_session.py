@@ -28,6 +28,7 @@ from src.engines.dynamic.gdb.mi_session import (
     MITimeoutError,
     _setting_holds,
     find_gdb,
+    quote_mi_argument,
 )
 
 GDB = shutil.which("gdb")
@@ -189,6 +190,44 @@ class TestTimeout:
         assert "secret-malware.elf" not in message
 
 
+class TestArgumentQuoting:
+    """Paths must survive MI's argument splitting and C-escape handling."""
+
+    def test_plain_path_is_quoted(self):
+        assert quote_mi_argument("/tmp/a/b") == '"/tmp/a/b"'
+
+    def test_space_is_contained_by_the_quotes(self):
+        """Unquoted, GDB takes only the first word and treats the rest as args."""
+        assert quote_mi_argument("/tmp/dir with space/x") == '"/tmp/dir with space/x"'
+
+    def test_backslashes_are_escaped(self):
+        """Verified on gdb 15.1: single backslashes are eaten as C escapes.
+
+        "C:\\temp\\abc\\t_pie.exe" written unescaped resolves to
+        C:tempabct_pie.exe -- \\t became a tab. Doubling them preserves the
+        path, which is what makes Windows paths work at all.
+        """
+        assert quote_mi_argument(r"C:\temp\abc") == r'"C:\\temp\\abc"'
+
+    def test_embedded_quote_is_escaped(self):
+        """A filename may contain a quote, and a sample's name is chosen by
+        whoever built it -- unescaped it would end the argument early."""
+        assert quote_mi_argument('/tmp/ev"il.elf') == r'"/tmp/ev\"il.elf"'
+
+    def test_round_trips_through_the_mi_parser(self):
+        """Quoting must be the exact inverse of this repo's own MI unescaping."""
+        from src.engines.dynamic.gdb.mi_parser import parse_value
+
+        for raw in (
+            "/tmp/plain",
+            "/tmp/dir with space/x",
+            r"C:\Users\analyst\temp\sample.exe",
+            '/tmp/ev"il.elf',
+            "/tmp/back\\slash",
+        ):
+            assert parse_value(quote_mi_argument(raw)) == raw
+
+
 class TestSettingVerification:
     """_setting_holds: what counts as a setting having taken effect."""
 
@@ -310,7 +349,11 @@ def compiled_targets():
         )
         if proc.returncode != 0:
             pytest.skip(f"compiler failed: {proc.stderr.strip()[:200]}")
-        built[name] = out
+        # MinGW appends .exe even when -o names the file without one.
+        produced = out if out.exists() else out.with_suffix(".exe")
+        if not produced.exists():
+            pytest.skip("compiler produced no binary at the expected path")
+        built[name] = produced
     return built
 
 
@@ -376,9 +419,12 @@ class TestLiveSession:
         assert response.error_message
 
     def test_run_to_breakpoint_and_wait_for_stop(self, session, compiled_targets):
-        session.send(f"-file-exec-and-symbols {compiled_targets['t_pie']}")
+        loaded = session.send(
+            f"-file-exec-and-symbols {quote_mi_argument(str(compiled_targets['t_pie']))}"
+        )
+        assert not loaded.is_error, loaded.error_message
         inserted = session.send("-break-insert target")
-        assert not inserted.is_error
+        assert not inserted.is_error, inserted.error_message
 
         session.send("-exec-run")
         stop = session.wait_for_stop(timeout=20)
@@ -392,7 +438,10 @@ class TestLiveSession:
         *stopped record follows. A request/response transport would read the
         wrong record or block.
         """
-        session.send(f"-file-exec-and-symbols {compiled_targets['spin']}")
+        loaded = session.send(
+            f"-file-exec-and-symbols {quote_mi_argument(str(compiled_targets['spin']))}"
+        )
+        assert not loaded.is_error, loaded.error_message
         session.send("-exec-run")
         time.sleep(0.5)
 
@@ -404,8 +453,12 @@ class TestLiveSession:
         ), "the stop was consumed as the command reply"
 
         stop = session.wait_for_stop(timeout=20)
-        assert stop is not None
-        assert stop.results.get("reason") == "signal-received"
+        assert stop is not None, "the inferior never halted after -exec-interrupt"
+        if sys.platform == "linux":
+            # The ordering above is the cross-platform property under test.
+            # The stop *reason* is not: SIGINT delivery is POSIX semantics, and
+            # Windows GDB interrupts a target by another route.
+            assert stop.results.get("reason") == "signal-received"
 
     def test_stop_terminates_the_process(self, compiled_targets):
         s = MISession(timeout=20)

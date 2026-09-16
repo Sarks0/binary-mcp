@@ -120,6 +120,28 @@ DEFAULT_TIMEOUT = 30
 _EXIT_GRACE_SECONDS = 5.0
 
 
+def quote_mi_argument(value: str) -> str:
+    """Render *value* as a quoted MI argument, safe for paths.
+
+    MI splits a command's arguments on whitespace and processes C escapes
+    inside quotes, so a raw path is wrong twice over. Verified on GNU gdb
+    15.1:
+
+    - Unquoted, ``-file-exec-and-symbols /tmp/dir with space/x`` resolves to
+      ``/tmp/dir`` and the rest becomes further arguments.
+    - Quoted but unescaped, ``"C:\\temp\\abc\\t_pie.exe"`` written with single
+      backslashes resolves to ``C:tempabct_pie.exe`` -- every ``\\x`` is eaten
+      as an escape, which is why ``\\t`` silently became a tab.
+
+    Escaping backslashes and quotes fixes both. This matters beyond Windows:
+    a Linux filename may legally contain a space, a quote or a backslash, and
+    a malware sample's filename is attacker-influenced -- unquoted, it could
+    mangle the target or append arguments the caller never wrote.
+    """
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
 def _setting_holds(response: MIResponse, expected: str) -> bool:
     """True if a -gdb-show reply reports *expected*.
 

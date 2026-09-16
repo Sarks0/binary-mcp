@@ -139,6 +139,14 @@ def execute_command_tool(monkeypatch):
     monkeypatch.setattr(mod, "_session_manager", None, raising=False)
     mod.register_dynamic_tools(app, None)
 
+    # The 159 x64dbg tools are no longer registered one name each; they are
+    # operations of 16 grouped tools. These tests address the implementations,
+    # which still exist, so reach them through the registry the grouping
+    # populates. Nothing about what they assert changes.
+    for _group in getattr(mod, "_OP_REGISTRY", {}).values():
+        for _impl in _group.values():
+            captured.setdefault(_impl.__name__, _impl)
+
     mock_bridge = MagicMock()
     mock_bridge.execute_command.return_value = {"success": True, "message": "ok"}
     monkeypatch.setattr(mod, "get_x64dbg_bridge", lambda: mock_bridge)
@@ -704,6 +712,10 @@ class TestStartTraceReportsResolvedLogPath:
 
         with patch.object(dynamic_tools, "get_x64dbg_bridge", lambda: bridge):
             dynamic_tools.register_dynamic_tools(App(), MagicMock())
+            # Grouped registration: reach the implementation via the registry.
+            for _group in getattr(dynamic_tools, "_OP_REGISTRY", {}).values():
+                for _impl in _group.values():
+                    captured.setdefault(_impl.__name__, _impl)
             yield captured["x64dbg_start_trace"]
 
     def test_resolved_path_is_reported(self):

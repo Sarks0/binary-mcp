@@ -16,6 +16,19 @@ Please delete options that are not relevant.
 - [ ] Performance improvement
 - [ ] Test addition/improvement
 
+If you ticked **Breaking change**, put a footer in the commit message — its own
+line, at the start of the line, continuing over wrapped lines until a blank one:
+
+```
+BREAKING CHANGE: the 159 individual x64dbg tool names are no longer registered;
+call the 16 grouped tools with an `op=` argument instead.
+```
+
+The release workflow collects these across every commit since the previous
+release and puts them at the top of the release notes. Written any other way —
+mid-sentence in a paragraph, or only in the PR description — it will not be
+collected, and the first a user hears of the break is their own broken call.
+
 ## Changes Made
 
 -

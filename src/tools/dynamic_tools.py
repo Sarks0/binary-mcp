@@ -7,6 +7,7 @@ Provides debugger-based analysis capabilities with session logging.
 from __future__ import annotations
 
 import functools
+import inspect
 import json
 import logging
 import os
@@ -17,6 +18,7 @@ from pathlib import Path
 from fastmcp import FastMCP
 
 from src.engines.dynamic.x64dbg.bridge import (
+    FeatureUnavailableError,
     X64DbgBridge,
 )
 from src.engines.dynamic.x64dbg.commands import X64DbgCommands
@@ -27,7 +29,7 @@ from src.tools.error_hygiene import (
     safe_path_error,
     safe_tool_error,
 )
-from src.utils.formatters import wrap_untrusted
+from src.utils.formatters import neutralise_untrusted_delimiters, wrap_untrusted
 from src.utils.security import (
     PathTraversalError,
     safe_error_message,
@@ -48,8 +50,8 @@ _x64dbg_commands: X64DbgCommands | None = None
 # Global Ghidra project cache (for static/dynamic cross-reference)
 _ghidra_cache: ProjectCache | None = None
 
-# Track the binary being debugged (for session correlation)
-_current_debug_binary: str | None = None
+# Grouped operation registry, populated by register_dynamic_tools.
+_OP_REGISTRY: dict[str, dict[str, object]] = {}
 
 # Cache for function mappings (binary_path -> {function_name -> static_address})
 _function_mappings: dict[str, dict[str, dict]] = {}
@@ -422,6 +424,110 @@ def get_ghidra_cache() -> ProjectCache:
     return _ghidra_cache
 
 
+class BinaryResolutionError(Exception):
+    """Raised when a caller-supplied binary reference cannot be tied to a cache entry."""
+
+
+def resolve_cached_binary(binary_ref: str) -> str:
+    """
+    Turn a caller-supplied binary reference into a path the Ghidra cache knows.
+
+    The cache is keyed on the SHA256 of the binary's *contents*, so every cache
+    lookup needs a path that can actually be opened. Callers -- and the examples
+    in these tools' own docstrings -- routinely pass a bare name like
+    "sample.exe", which cannot be hashed; the lookup then failed and reported
+    "no Ghidra analysis cached", sending the caller off to re-analyze a binary
+    that was already analyzed. Resolving the name against the cache's own
+    metadata index removes that dead end.
+
+    Resolution order: usable as given, then exact resolved path, then
+    case-insensitive basename, then path suffix.
+
+    Args:
+        binary_ref: Path or name of the binary
+
+    Returns:
+        A path that ``ProjectCache`` can hash.
+
+    Raises:
+        BinaryResolutionError: If nothing matches, or several entries do.
+    """
+    ref = str(binary_ref or "").strip()
+    if not ref:
+        raise BinaryResolutionError("No binary specified.")
+
+    # Already usable -- the common case, and the only one that costs nothing.
+    if os.path.isfile(ref):
+        return ref
+
+    cache = get_ghidra_cache()
+    try:
+        entries = [e for e in cache.list_cached() if e.get("binary_path")]
+    except Exception as e:
+        raise BinaryResolutionError(f"Could not read the analysis cache index: {e}")
+
+    if not entries:
+        raise BinaryResolutionError(
+            f"'{ref}' is not a readable file and no binaries are analyzed yet.\n"
+            f"Run analyze_binary(binary_path=...) with a full path first."
+        )
+
+    normalized = ref.replace("\\", "/")
+    ref_name = os.path.basename(normalized).lower()
+
+    def cached_path(entry: dict) -> str:
+        return str(entry["binary_path"])
+
+    def accept(matches: list[dict]) -> str:
+        """Return the single match's path, checking it is still readable."""
+        path = cached_path(matches[0])
+        if not os.path.isfile(path):
+            # The cache is content-addressed, so a moved or deleted binary
+            # cannot be looked up at all. Say so rather than reporting the
+            # binary as never analyzed.
+            raise BinaryResolutionError(
+                f"'{ref}' was analyzed, but the file recorded for it is no "
+                f"longer readable. The analysis cache is keyed on file "
+                f"contents, so the binary has to exist somewhere -- restore "
+                f"it, or pass the path where it lives now."
+            )
+        return path
+
+    exact = [e for e in entries if cached_path(e).replace("\\", "/") == normalized]
+    if len(exact) == 1:
+        return accept(exact)
+
+    by_name = [
+        e for e in entries
+        if str(e.get("binary_name") or os.path.basename(cached_path(e))).lower() == ref_name
+    ]
+    if len(by_name) == 1:
+        return accept(by_name)
+
+    if not by_name:
+        by_name = [
+            e for e in entries
+            if cached_path(e).replace("\\", "/").lower().endswith("/" + normalized.lower())
+        ]
+        if len(by_name) == 1:
+            return accept(by_name)
+
+    if not by_name:
+        known = ", ".join(
+            sorted({str(e.get("binary_name") or "?") for e in entries})[:10]
+        )
+        raise BinaryResolutionError(
+            f"No analyzed binary matches '{ref}'.\n"
+            f"Analyzed binaries: {known or '(none)'}\n"
+            f"Pass the full path, or run analyze_binary first."
+        )
+
+    raise BinaryResolutionError(
+        f"'{ref}' matches {len(by_name)} analyzed binaries. Pass the full path "
+        f"you used with analyze_binary to say which one you mean."
+    )
+
+
 def _load_function_mappings(binary_path: str) -> dict[str, dict]:
     """
     Load function mappings from Ghidra cache for a binary.
@@ -430,13 +536,17 @@ def _load_function_mappings(binary_path: str) -> dict[str, dict]:
         binary_path: Path to the binary file
 
     Returns:
-        Dictionary mapping function names to their info (address, signature, etc.)
+        Dictionary mapping each function's real name to its info (address,
+        signature, etc.). Names are kept exactly as Ghidra reports them --
+        use :func:`_lookup_function` for case-insensitive lookup.
     """
     global _function_mappings
 
+    key = os.path.normcase(os.path.abspath(binary_path))
+
     # Check if already cached
-    if binary_path in _function_mappings:
-        return _function_mappings[binary_path]
+    if key in _function_mappings:
+        return _function_mappings[key]
 
     cache = get_ghidra_cache()
     cached_data = cache.get_cached(binary_path)
@@ -469,16 +579,28 @@ def _load_function_mappings(binary_path: str) -> dict[str, dict]:
                 "size": func.get("size", 0),
             }
 
-    # Also add lowercase versions for case-insensitive lookup
-    lowercase_mappings = {}
-    for name, info in mappings.items():
-        lowercase_mappings[name.lower()] = info
-
-    mappings.update(lowercase_mappings)
-
-    _function_mappings[binary_path] = mappings
-    logger.info(f"Loaded {len(functions)} function mappings from Ghidra cache for {binary_path}")
+    # Case-insensitive lookup used to be done by merging a lowercased copy of
+    # every entry back into this same dict. That doubled the apparent function
+    # count, let one function silently overwrite another whose name differed
+    # only in case, and forced name-suggestion code to filter out anything
+    # equal to its own lowercase -- which quietly hid every genuinely
+    # lowercase function name. The lowercase index lives beside the table now.
+    _function_mappings[key] = mappings
+    logger.info(
+        f"Loaded {len(mappings)} function mappings from Ghidra cache for {binary_path}"
+    )
     return mappings
+
+
+def _lookup_function(mappings: dict[str, dict], function_name: str) -> dict | None:
+    """Find a function by name, exact match first then case-insensitive."""
+    if function_name in mappings:
+        return mappings[function_name]
+    wanted = function_name.lower()
+    for name, info in mappings.items():
+        if name.lower() == wanted:
+            return info
+    return None
 
 
 def _get_image_base_from_cache(binary_path: str) -> int | None:
@@ -516,6 +638,115 @@ def _get_image_base_from_cache(binary_path: str) -> int | None:
     return None
 
 
+class AddressRebaseError(Exception):
+    """Raised when a static address cannot be honestly rebased to a runtime one."""
+
+
+def _format_addr(value: int, width: int = 8) -> str:
+    """Format an address, widening rather than mangling values that do not fit."""
+    return f"0x{value:0{width}X}"
+
+
+def rebase_static_address(
+    static_addr: int,
+    image_base: int,
+    module_base: int,
+) -> int:
+    """
+    Apply ``runtime = static - image_base + module_base``.
+
+    Raises:
+        AddressRebaseError: If the address does not lie above the image base.
+            A negative offset means the two numbers describe different things
+            -- typically an RVA passed as a virtual address, or an image base
+            that belongs to a different module. Previously this was formatted
+            straight into the output as a negative hex string and the caller
+            was handed a runtime address pointing outside the module.
+    """
+    offset = static_addr - image_base
+    if offset < 0:
+        raise AddressRebaseError(
+            f"Static address {_format_addr(static_addr)} is below the image base "
+            f"{_format_addr(image_base)}, so it cannot be an address in this module.\n"
+            f"If {_format_addr(static_addr)} is already a file/RVA offset, add the "
+            f"image base to it first, or pass the correct image_base."
+        )
+    return module_base + offset
+
+
+def _read_image_base_from_memory(bridge: X64DbgBridge, module_base: int) -> int | None:
+    """
+    Read a loaded module's preferred ImageBase out of its in-memory PE header.
+
+    Returns None if the headers cannot be read or do not look like a PE, so
+    callers can say so rather than substituting a guess.
+    """
+    try:
+        dos_header = bridge.read_memory(f"0x{module_base:X}", 64)
+        if not dos_header or len(dos_header) < 64 or dos_header[0:2] != b"MZ":
+            return None
+
+        e_lfanew = int.from_bytes(dos_header[0x3C:0x40], "little")
+        # A sane e_lfanew is small; a wild one means we are not looking at a PE.
+        if not 0 < e_lfanew < 0x1000:
+            return None
+
+        pe_header = bridge.read_memory(f"0x{module_base + e_lfanew:X}", 0x100)
+        if not pe_header or len(pe_header) < 0x40 or pe_header[0:4] != b"PE\x00\x00":
+            return None
+
+        opt_header = pe_header[0x18:]
+        magic = int.from_bytes(opt_header[0:2], "little")
+        if magic == 0x20B:  # PE32+
+            return int.from_bytes(opt_header[24:32], "little")
+        if magic == 0x10B:  # PE32
+            return int.from_bytes(opt_header[28:32], "little")
+        return None
+    except Exception as e:
+        logger.debug(f"Could not read image base at 0x{module_base:X}: {e}")
+        return None
+
+
+def _resolve_module_for_binary(
+    binary_path: str,
+    bridge: X64DbgBridge,
+) -> dict:
+    """
+    Find the loaded module that corresponds to a binary.
+
+    Raises:
+        AddressRebaseError: If the module is not loaded. This used to fall back
+            to ``modules[0]``, which rebased every address against whatever
+            module happened to come first -- for a DLL loaded into a host
+            process, that is the host executable, and every resulting
+            breakpoint address was wrong while still being reported as
+            successfully set.
+    """
+    module = bridge.find_module(binary_path)
+    if module is not None:
+        return module
+
+    modules = bridge.get_modules()
+    if not modules:
+        raise AddressRebaseError(
+            "No modules are loaded in x64dbg. Load or attach to the target first "
+            "(x64dbg_attach), then retry."
+        )
+
+    # Audit F-7: the sample decides what it loads and what a dropped or
+    # side-loaded DLL is called, so these names are attacker text. This
+    # message is returned to the model verbatim by the handlers that catch
+    # AddressRebaseError, so the list is fenced here; the advice around it is
+    # the server's.
+    loaded = ", ".join(m["display_name"] for m in modules[:20])
+    raise AddressRebaseError(
+        f"'{os.path.basename(binary_path)}' is not loaded in x64dbg.\n"
+        f"Loaded modules:\n"
+        + wrap_untrusted(loaded, kind="module names from the debugged process")
+        + "\nAddresses cannot be rebased against a module that is not loaded."
+    )
+
+
 def _resolve_function_to_runtime(
     function_name: str,
     binary_path: str,
@@ -530,12 +761,18 @@ def _resolve_function_to_runtime(
 
     Args:
         function_name: Function name from Ghidra analysis
-        binary_path: Path to the binary file
+        binary_path: Path to the binary file (already resolved to a real path)
         bridge: X64DbgBridge instance
 
     Returns:
-        Dictionary with static_address, runtime_address, module_base, image_base
-        or None if resolution failed
+        Dictionary with static_address, runtime_address, module_base, image_base,
+        or None if the function is not in the Ghidra cache.
+
+    Raises:
+        AddressRebaseError: If the function is known but cannot be rebased --
+            the module is not loaded, or the image base is unknown. These are
+            reported rather than papered over with a guess, because a wrong
+            runtime address costs far more to debug than a missing one.
     """
     # Load function mappings from Ghidra cache
     mappings = _load_function_mappings(binary_path)
@@ -543,8 +780,7 @@ def _resolve_function_to_runtime(
     if not mappings:
         return None
 
-    # Look up function (case-insensitive)
-    func_info = mappings.get(function_name) or mappings.get(function_name.lower())
+    func_info = _lookup_function(mappings, function_name)
 
     if not func_info:
         return None
@@ -553,66 +789,172 @@ def _resolve_function_to_runtime(
     if not static_addr_str:
         return None
 
-    # Parse static address
-    if static_addr_str.startswith("0x"):
+    try:
         static_addr = int(static_addr_str, 16)
-    else:
-        static_addr = int(static_addr_str, 16)
+    except (TypeError, ValueError):
+        raise AddressRebaseError(
+            f"Ghidra cache holds an unparseable address for '{function_name}': "
+            f"{static_addr_str!r}"
+        )
 
-    # Get image base from Ghidra cache
+    # Get image base from Ghidra cache. There is no safe default here: guessing
+    # 0x400000/0x10000000 silently produces a plausible-looking but wrong
+    # runtime address whenever the guess is off (a 64-bit PE defaults to
+    # 0x140000000, and any ASLR-aware image may sit elsewhere).
     image_base = _get_image_base_from_cache(binary_path)
     if image_base is None:
-        # Default to common values
-        if binary_path.lower().endswith(".dll"):
-            image_base = 0x10000000
-        else:
-            image_base = 0x400000
+        raise AddressRebaseError(
+            f"No image base recorded in the Ghidra cache for "
+            f"'{os.path.basename(binary_path)}', so static addresses cannot be "
+            f"rebased.\n"
+            f"Re-run analyze_binary(binary_path=...) to refresh the cache, or use "
+            f"x64dbg_resolve_static_address with an explicit image_base."
+        )
 
-    # Get module base from x64dbg
-    modules = bridge.get_modules()
-    binary_name = os.path.basename(binary_path).lower()
+    module = _resolve_module_for_binary(binary_path, bridge)
+    module_base = module["base"]
+    # Audit F-7: display only, and the callers render it inline in a labelled
+    # field rather than as a block, so neutralise the envelope sentinels
+    # instead of fencing -- a one-line field cannot then forge a boundary.
+    module_name = neutralise_untrusted_delimiters(module["display_name"])
 
-    module_base = None
-    module_name = None
-    for mod in modules:
-        mod_name = mod.get("name", "").lower()
-        if binary_name in mod_name or mod_name in binary_name:
-            base = mod.get("base", 0)
-            if isinstance(base, str):
-                module_base = int(base, 16) if base.startswith("0x") else int(base)
-            else:
-                module_base = base
-            module_name = mod.get("name", "unknown")
-            break
-
-    if module_base is None:
-        # Try using first module as fallback
-        if modules:
-            mod = modules[0]
-            base = mod.get("base", 0)
-            if isinstance(base, str):
-                module_base = int(base, 16) if base.startswith("0x") else int(base)
-            else:
-                module_base = base
-            module_name = mod.get("name", "unknown")
-        else:
-            return None
-
-    # Calculate runtime address
+    runtime_addr = rebase_static_address(static_addr, image_base, module_base)
     offset = static_addr - image_base
-    runtime_addr = module_base + offset
+
+    width = 16 if max(static_addr, runtime_addr, module_base) > 0xFFFFFFFF else 8
 
     return {
         "function_name": function_name,
-        "static_address": f"0x{static_addr:08X}",
-        "image_base": f"0x{image_base:08X}",
-        "module_base": f"0x{module_base:08X}",
+        "static_address": _format_addr(static_addr, width),
+        "image_base": _format_addr(image_base, width),
+        "module_base": _format_addr(module_base, width),
         "module_name": module_name,
-        "offset": f"0x{offset:08X}",
-        "runtime_address": f"0x{runtime_addr:08X}",
+        "offset": _format_addr(offset, 8),
+        "runtime_address": _format_addr(runtime_addr, width),
         "signature": func_info.get("signature", ""),
     }
 
+
+# Sentinel distinguishing "the caller did not pass this" from a real value.
+# Grouped tools declare the union of their operations' parameters, all
+# optional, so a missing argument must not be forwarded as None -- the
+# underlying implementation's own default has to win.
+_UNSET = object()
+
+
+def _first_doc_line(func) -> str:
+    """First sentence of a function's docstring, for the op catalog."""
+    doc = (func.__doc__ or "").strip()
+    for line in doc.split("\n"):
+        line = line.strip()
+        if line:
+            return line
+    return ""
+
+
+def _op_params(func) -> list[str]:
+    """Parameter names an operation accepts, in declaration order."""
+    return list(inspect.signature(func).parameters)
+
+
+def build_op_catalog(ops: dict[str, object]) -> str:
+    """
+    Render the operation table appended to a grouped tool's docstring.
+
+    Generated from the implementations themselves so the documented
+    parameters cannot drift from the ones actually accepted -- the drift
+    between advertised and real arguments is what made the previous surface
+    hard to call correctly.
+    """
+    lines = ["", "Operations:"]
+    for name in sorted(ops):
+        func = ops[name]
+        params = ", ".join(_op_params(func)) or "no arguments"
+        summary = _first_doc_line(func)
+        lines.append(f"  {name} -- {summary}")
+        lines.append(f"      args: {params}")
+    return "\n".join(lines)
+
+
+def dispatch_op(
+    group: str,
+    ops: dict[str, object],
+    op: str,
+    supplied: dict[str, object],
+) -> str:
+    """
+    Route one grouped-tool call to its implementation.
+
+    Forwards only arguments the target actually accepts, and rejects ones it
+    does not rather than dropping them silently -- a caller that passes
+    ``size`` to an operation that ignores it should be told, not left to
+    believe it took effect.
+    """
+    if not op:
+        return (
+            f"Error: x64dbg_{group} needs an 'op'.\n"
+            f"Valid operations: {', '.join(sorted(ops))}"
+        )
+
+    target = ops.get(op)
+    if target is None:
+        close = [name for name in sorted(ops) if op in name or name in op]
+        hint = f"\nDid you mean: {', '.join(close)}?" if close else ""
+        return (
+            f"Error: '{op}' is not an operation of x64dbg_{group}.\n"
+            f"Valid operations: {', '.join(sorted(ops))}{hint}"
+        )
+
+    accepted = set(_op_params(target))
+    given = {k: v for k, v in supplied.items() if v is not _UNSET}
+
+    unexpected = sorted(set(given) - accepted)
+    if unexpected:
+        expected = ", ".join(_op_params(target)) or "no arguments"
+        return (
+            f"Error: x64dbg_{group}(op=\"{op}\") does not take "
+            f"{', '.join(unexpected)}.\n"
+            f"It takes: {expected}"
+        )
+
+    required = [
+        name for name, param in inspect.signature(target).parameters.items()
+        if param.default is inspect.Parameter.empty
+    ]
+    missing = [name for name in required if name not in given]
+    if missing:
+        # Checked here rather than letting the call raise, so the message names
+        # the operation the caller used instead of the internal function.
+        return (
+            f"Error: x64dbg_{group}(op=\"{op}\") is missing "
+            f"{', '.join(missing)}.\n"
+            f"Required arguments: {', '.join(required)}"
+        )
+
+    return target(**given)
+
+
+# Prose half of each grouped tool's description. The operation catalog is
+# generated from the implementations and appended at registration, so the
+# documented arguments cannot drift from the accepted ones.
+_GROUP_DOCS = {
+    'session': 'Debugger session: connect, attach, process state, anti-debug and privileges.\n\nPass the operation in `op`; pass only the arguments that\noperation takes. Operations and their arguments are listed below.',
+    'state': 'Save and restore debugging state (breakpoints, comments, labels, watches).\n\nPass the operation in `op`; pass only the arguments that\noperation takes. Operations and their arguments are listed below.',
+    'execution': 'Run, step, and wait for the debuggee to reach a state.\n\nPass the operation in `op`; pass only the arguments that\noperation takes. Operations and their arguments are listed below.',
+    'breakpoint': 'Every kind of breakpoint: software, hardware, memory, DLL, exception, conditional.\n\nPass the operation in `op`; pass only the arguments that\noperation takes. Operations and their arguments are listed below.',
+    'memory': 'Read, write, allocate, protect, search and watch process memory.\n\nPass the operation in `op`; pass only the arguments that\noperation takes. Operations and their arguments are listed below.',
+    'context': 'CPU registers and the call stack of the active thread.\n\nPass the operation in `op`; pass only the arguments that\noperation takes. Operations and their arguments are listed below.',
+    'thread': 'List threads and control their execution.\n\nPass the operation in `op`; pass only the arguments that\noperation takes. Operations and their arguments are listed below.',
+    'module': 'Loaded modules and their imports, exports and on-disk dumps.\n\nPass the operation in `op`; pass only the arguments that\noperation takes. Operations and their arguments are listed below.',
+    'disasm': 'Disassemble, evaluate expressions, and navigate the debugger UI.\n\nPass the operation in `op`; pass only the arguments that\noperation takes. Operations and their arguments are listed below.',
+    'search': 'Search the debuggee for instructions, GUIDs, strings and references.\n\nPass the operation in `op`; pass only the arguments that\noperation takes. Operations and their arguments are listed below.',
+    'analyze': "Run x64dbg's analysis passes and inspect exception state.\n\nPass the operation in `op`; pass only the arguments that\noperation takes. Operations and their arguments are listed below.",
+    'types': 'Define, inspect and apply C types and structures.\n\nPass the operation in `op`; pass only the arguments that\noperation takes. Operations and their arguments are listed below.',
+    'trace': 'Instruction and API tracing, trace conditions, and trace logs.\n\nPass the operation in `op`; pass only the arguments that\noperation takes. Operations and their arguments are listed below.',
+    'annotate': 'Comments, bookmarks, user-defined functions, variables and watches.\n\nPass the operation in `op`; pass only the arguments that\noperation takes. Operations and their arguments are listed below.',
+    'symbols': 'Bridge static analysis to the live process: resolve Ghidra functions to runtime addresses.\n\nPass the operation in `op`; pass only the arguments that\noperation takes. Operations and their arguments are listed below.',
+    'hooks': 'Detect, inspect and remove inline/IAT/EAT hooks.\n\nPass the operation in `op`; pass only the arguments that\noperation takes. Operations and their arguments are listed below.',
+}
 
 def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager | None = None) -> None:
     """
@@ -625,7 +967,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
     global _session_manager
     _session_manager = session_manager
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_status() -> str:
         """
@@ -653,7 +994,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 e,
             )
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_connect(host: str = "127.0.0.1", port: int = 8765) -> str:
         """
@@ -667,16 +1007,48 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             Connection status message
         """
         try:
-            bridge = X64DbgBridge(host, port)
+            # Honour X64DBG_TIMEOUT here too; rebuilding the bridge with the
+            # constructor default silently dropped a configured timeout.
+            timeout = int(os.getenv("X64DBG_TIMEOUT", "30"))
+            bridge = X64DbgBridge(host, port, timeout=timeout)
             bridge.connect()
 
             # Update global instance
-            global _x64dbg_bridge, _x64dbg_commands
+            global _x64dbg_bridge, _x64dbg_commands, _function_mappings
             _x64dbg_bridge = bridge
             _x64dbg_commands = X64DbgCommands(bridge)
+            # Function mappings are only meaningful against the modules of the
+            # session we just replaced.
+            _function_mappings = {}
 
             location = bridge.get_current_location()
-            return f"Connected to x64dbg at {host}:{port}\nState: {location['state']}"
+            lines = [
+                f"Connected to x64dbg at {host}:{port}",
+                f"State: {location['state']}",
+            ]
+            try:
+                main_module = bridge.get_main_module()
+            except Exception:
+                # Nothing being debugged yet -- the connection is still good.
+                main_module = None
+            if main_module:
+                # Audit F-7: the module name is the sample's own filename.
+                # The base address is a number the debugger computed, so it
+                # stays outside the fence.
+                lines.append(f"Main module base: 0x{main_module['base']:X}")
+                lines.append("Main module name:")
+                lines.append(
+                    wrap_untrusted(
+                        main_module["display_name"],
+                        kind="module name from the debugged process",
+                    )
+                )
+            else:
+                lines.append(
+                    "No process loaded yet. Use x64dbg_attach(pid) or load a "
+                    "binary in x64dbg before setting breakpoints."
+                )
+            return "\n".join(lines)
 
         except Exception as e:
             logger.error(f"x64dbg_connect failed: {e}")
@@ -688,7 +1060,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 e,
             )
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_attach(pid: int) -> str:
         """
@@ -735,7 +1106,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 e,
             )
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_detach() -> str:
         """
@@ -758,7 +1128,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_detach failed: {e}")
             return safe_error_message("x64dbg_detach failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_create_minidump(output_path: str = "") -> str:
         """
@@ -816,7 +1185,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_create_minidump failed: {e}")
             return safe_error_message("x64dbg_create_minidump failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_run() -> str:
         """
@@ -836,7 +1204,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_run failed: {e}")
             return safe_error_message("x64dbg_run failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_wait_paused(timeout_seconds: int = 30) -> str:
         """
@@ -883,7 +1250,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_wait_paused failed: {e}")
             return safe_error_message("x64dbg_wait_paused failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_wait_running(timeout_seconds: int = 10) -> str:
         """
@@ -917,7 +1283,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_wait_running failed: {e}")
             return safe_error_message("x64dbg_wait_running failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_wait_debugging(timeout_seconds: int = 30) -> str:
         """
@@ -953,7 +1318,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_wait_debugging failed: {e}")
             return safe_error_message("x64dbg_wait_debugging failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_run_and_wait(timeout_seconds: int = 30) -> str:
         """
@@ -1003,7 +1367,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_run_and_wait failed: {e}")
             return safe_error_message("x64dbg_run_and_wait failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_pause() -> str:
         """
@@ -1023,7 +1386,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_pause failed: {e}")
             return safe_error_message("x64dbg_pause failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_step_into(steps: int = 1) -> str:
         """
@@ -1057,7 +1419,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_step_into failed: {e}")
             return safe_error_message("x64dbg_step_into failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_step_over(steps: int = 1) -> str:
         """
@@ -1084,7 +1445,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_step_over failed: {e}")
             return safe_error_message("x64dbg_step_over failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_get_registers() -> str:
         """
@@ -1108,7 +1468,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_get_registers failed: {e}")
             return safe_error_message("x64dbg_get_registers failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_set_breakpoint(address: str) -> str:
         """
@@ -1135,7 +1494,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_set_breakpoint failed: {e}")
             return format_error_response(e, "set_breakpoint")
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_delete_breakpoint(address: str) -> str:
         """
@@ -1159,7 +1517,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_delete_breakpoint failed: {e}")
             return format_error_response(e, "delete_breakpoint")
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_set_breakpoints(breakpoints: list[dict]) -> str:
         """
@@ -1246,7 +1603,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_set_breakpoints failed: {e}")
             return safe_error_message("x64dbg_set_breakpoints failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_delete_breakpoints(addresses: list[str]) -> str:
         """
@@ -1294,7 +1650,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_delete_breakpoints failed: {e}")
             return safe_error_message("x64dbg_delete_breakpoints failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_list_breakpoints() -> str:
         """
@@ -1322,7 +1677,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
     # Exception handling control tools
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_set_exception_breakpoint(
         exception_code: str, chance: str = "first"
@@ -1358,7 +1712,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_set_exception_breakpoint failed: {e}")
             return format_error_response(e, "set_exception_breakpoint")
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_delete_exception_breakpoint(exception_code: str) -> str:
         """
@@ -1385,7 +1738,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_delete_exception_breakpoint failed: {e}")
             return format_error_response(e, "delete_exception_breakpoint")
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_list_exception_breakpoints() -> str:
         """
@@ -1413,7 +1765,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_list_exception_breakpoints failed: {e}")
             return safe_error_message("x64dbg_list_exception_breakpoints failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_skip_exception(exception_code: str) -> str:
         """
@@ -1443,7 +1794,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_skip_exception failed: {e}")
             return format_error_response(e, "skip_exception")
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_read_memory(address: str, size: int = 256) -> str:
         """
@@ -1492,7 +1842,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_read_memory failed: {e}")
             return safe_error_message("x64dbg_read_memory failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_disassemble(address: str, count: int = 20) -> str:
         """
@@ -1552,7 +1901,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_disassemble failed: {e}")
             return format_error_response(e, "disassemble")
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_trace_execution(steps: int = 10) -> str:
         """
@@ -1590,7 +1938,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_trace_execution failed: {e}")
             return safe_error_message("x64dbg_trace_execution failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_trace_api_calls(
         apis: list[str],
@@ -1747,7 +2094,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_trace_api_calls failed: {e}")
             return safe_error_message("x64dbg_trace_api_calls failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_start_trace(
         trace_into: bool = True,
@@ -1824,7 +2170,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_start_trace failed: {e}")
             return safe_error_message("x64dbg_start_trace failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_stop_trace() -> str:
         """
@@ -1853,7 +2198,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_stop_trace failed: {e}")
             return safe_error_message("x64dbg_stop_trace failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_get_trace(max_entries: int = 100) -> str:
         """
@@ -1907,7 +2251,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_get_trace failed: {e}")
             return safe_error_message("x64dbg_get_trace failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_clear_trace() -> str:
         """
@@ -1931,7 +2274,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_clear_trace failed: {e}")
             return safe_error_message("x64dbg_clear_trace failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_get_api_params(api_name: str) -> str:
         """
@@ -2097,7 +2439,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_get_api_params failed: {e}")
             return safe_error_message("x64dbg_get_api_params failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_run_to_address(address: str) -> str:
         """
@@ -2121,7 +2462,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_run_to_address failed: {e}")
             return safe_error_message("x64dbg_run_to_address failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_step_out() -> str:
         """
@@ -2145,7 +2485,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_step_out failed: {e}")
             return safe_error_message("x64dbg_step_out failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_get_stack(depth: int = 20) -> str:
         """
@@ -2196,7 +2535,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_get_stack failed: {e}")
             return safe_error_message("x64dbg_get_stack failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_get_modules() -> str:
         r"""
@@ -2235,16 +2573,12 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             # is the server's.
             body = []
             for mod in modules:
-                name = mod.get("name", "unknown")
-                base = mod.get("base", "unknown")
-                size = mod.get("size", "unknown")
-                path = mod.get("path", "")
-
-                body.append(f"\n{name}")
-                body.append(f"  Base: 0x{base}")
-                body.append(f"  Size: 0x{size}")
-                if path:
-                    body.append(f"  Path: {path}")
+                marker = "  (main module)" if mod["is_main"] else ""
+                body.append(f"\n{mod['display_name']}{marker}")
+                body.append(f"  Base: 0x{mod['base']:X}")
+                body.append(f"  Size: 0x{mod['size']:X}")
+                if mod["path"] and mod["path"] != mod["display_name"]:
+                    body.append(f"  Path: {mod['path']}")
             result.append(
                 wrap_untrusted(
                     "\n".join(body).strip("\n"),
@@ -2252,192 +2586,341 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 )
             )
 
+            # Server-generated diagnostic, so it stays outside the fence.
+            if len(modules) == 1 and modules[0]["is_main"]:
+                result.append("")
+                result.append(
+                    "Note: only the main module is listed. Plugin builds before "
+                    "the module-enumeration fix report just the debuggee image, "
+                    "not its loaded DLLs. Rebuild/update the Obsidian plugin to "
+                    "see the full module list."
+                )
+
             return "\n".join(result)
 
         except Exception as e:
             logger.error(f"x64dbg_get_modules failed: {e}")
             return safe_error_message("x64dbg_get_modules failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_get_threads() -> str:
         """
         Get list of process threads.
 
-        Shows all threads in the debugged process.
+        Shows every thread in the debugged process with its entry point,
+        current instruction pointer, suspend count and wait reason.
 
         Returns:
-            List of threads with ID, entry point, and status
+            Table of threads. The active thread is marked "current".
 
         Example output:
-            Threads:
+            Threads (3):
             ----------------------------------------
-            Thread 1234 (Main)
-              Entry: 0x00401000
-              Status: Running
+            TID 4816  (current)
+              Entry:     0x00007FF61A2B1000
+              CIP:       0x00007FF61A2B1240
+              Suspended: 0
+              Priority:  0
+              Waiting:   UserRequest
 
-            Thread 5678
-              Entry: 0x76D12340
-              Status: Suspended
+        Use Cases:
+            - Find the thread a callback or injected code runs on
+            - Spot threads a packer created before unpacking
+            - Check whether a thread is suspended before resuming it
         """
         try:
             bridge = get_x64dbg_bridge()
             threads = bridge.get_threads()
 
             if not threads:
-                return "No threads found"
+                return (
+                    "No threads reported. Load or attach to a process first "
+                    "(x64dbg_attach)."
+                )
 
-            result = ["Threads:", "-" * 60]
+            result = [f"Threads ({len(threads)}):", "-" * 60]
 
+            # Audit F-7: a thread's name is set by the debuggee itself, via
+            # SetThreadDescription or the 0x406D1388 naming exception, so it is
+            # attacker text exactly as a dropped DLL's filename is. Fence the
+            # listing; the "Threads (N)" banner is the server's.
+            body = []
             for thread in threads:
-                tid = thread.get("id", "unknown")
-                entry = thread.get("entry", "unknown")
-                status = thread.get("status", "unknown")
-                is_main = thread.get("main", False)
+                marker = "  (current)" if thread["is_current"] else ""
+                label = f"TID {thread['id']}"
+                if thread["number"] is not None:
+                    label += f"  [#{thread['number']}]"
+                if thread["name"]:
+                    label += f'  "{thread["name"]}"'
+                body.append(f"\n{label}{marker}")
 
-                main_marker = " (Main)" if is_main else ""
-                result.append(f"\nThread {tid}{main_marker}")
-                result.append(f"  Entry: 0x{entry}")
-                result.append(f"  Status: {status}")
+                # Only print what the plugin actually reported. The previous
+                # version read keys the plugin never sent and rendered them as
+                # the literal string "0xunknown".
+                if thread["entry"] is not None:
+                    body.append(f"  Entry:     0x{thread['entry']:016X}")
+                if thread["cip"] is not None:
+                    body.append(f"  CIP:       0x{thread['cip']:016X}")
+                if thread["teb"] is not None:
+                    body.append(f"  TEB:       0x{thread['teb']:016X}")
+                if thread["suspend_count"] is not None:
+                    body.append(f"  Suspended: {thread['suspend_count']}")
+                if thread["priority"] is not None:
+                    body.append(f"  Priority:  {thread['priority']}")
+                if thread["wait_reason_name"]:
+                    body.append(f"  Waiting:   {thread['wait_reason_name']}")
+                if thread["last_error"]:
+                    body.append(f"  LastError: {thread['last_error']}")
+            result.append(
+                wrap_untrusted(
+                    "\n".join(body).strip("\n"),
+                    kind="thread names and context from the debugged process",
+                )
+            )
+
+            # Server-generated diagnostic, so it stays outside the fence.
+            if len(threads) == 1 and threads[0]["entry"] is None:
+                result.append("")
+                result.append(
+                    "Note: this plugin build reports only the current thread and "
+                    "no per-thread detail. Rebuild/update the Obsidian plugin for "
+                    "full thread enumeration."
+                )
 
             return "\n".join(result)
 
+        except FeatureUnavailableError as e:
+            return f"Error: {e}"
         except Exception as e:
             logger.error(f"x64dbg_get_threads failed: {e}")
             return safe_error_message("x64dbg_get_threads failed", e)
 
-    @app.tool()
+    def _require_thread(bridge, thread_id: str, action: str) -> dict | None:
+        """
+        Resolve a thread id to a live thread, or return None.
+
+        Checked client-side so an unknown id names the threads that do exist
+        rather than reporting a success the debugger never performed.
+        """
+        thread = bridge.find_thread(thread_id)
+        if thread is not None:
+            return thread
+        try:
+            live = bridge.get_threads()
+        except Exception:
+            live = []
+        known = ", ".join(str(t["id"]) for t in live[:20]) or "(none)"
+        raise ValueError(
+            f"No thread with id '{thread_id}' in the debugged process, so "
+            f"nothing was {action}.\nLive thread ids: {known}"
+        )
+
     @log_dynamic_tool
     def x64dbg_switch_thread(thread_id: str) -> str:
         """
         Switch active thread in the debugger.
 
-        Changes the debugger's active thread context to the specified thread.
+        Changes the debugger's active thread context, so subsequent register
+        reads, stack walks and stepping apply to that thread.
 
         Args:
-            thread_id: Thread ID to switch to
+            thread_id: Thread ID to switch to (decimal, or 0x-prefixed hex)
 
         Returns:
-            New thread context information
+            The new active thread's context
 
         Example:
-            x64dbg_switch_thread("1234")  # Switch to thread 1234
+            x64dbg_switch_thread("4816")
         """
         try:
             bridge = get_x64dbg_bridge()
-            result = bridge.switch_thread(thread_id)
+            target = _require_thread(bridge, thread_id, "switched to")
 
-            lines = [f"Switched to thread {thread_id}"]
+            bridge.switch_thread(str(target["id"]))
 
-            # Include thread context if returned by API
-            if "registers" in result:
-                regs = result["registers"]
-                for reg, val in regs.items():
-                    lines.append(f"  {reg}: 0x{val}")
-            if "entry" in result:
-                lines.append(f"  Entry: 0x{result['entry']}")
-            if "status" in result:
-                lines.append(f"  Status: {result['status']}")
+            # Confirm from the debugger rather than asserting the switch
+            # happened because the call returned.
+            active = next(
+                (t for t in bridge.get_threads() if t["is_current"]), None
+            )
+            if active is not None and active["id"] != target["id"]:
+                return (
+                    f"Switch to thread {target['id']} did not take effect -- "
+                    f"thread {active['id']} is still active."
+                )
 
+            lines = [f"Switched to thread {target['id']}"]
+            current = active or target
+            if current["cip"] is not None:
+                lines.append(f"  CIP:       0x{current['cip']:016X}")
+            if current["entry"] is not None:
+                lines.append(f"  Entry:     0x{current['entry']:016X}")
+            if current["suspend_count"] is not None:
+                lines.append(f"  Suspended: {current['suspend_count']}")
+            lines.append("")
+            lines.append("Register and stack reads now apply to this thread.")
             return "\n".join(lines)
 
+        except FeatureUnavailableError as e:
+            return f"Error: {e}"
+        except ValueError as e:
+            return f"Error: {e}"
         except Exception as e:
             logger.error(f"x64dbg_switch_thread failed: {e}")
             return safe_error_message("x64dbg_switch_thread failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_suspend_thread(thread_id: str) -> str:
         """
         Suspend a thread in the debugged process.
 
         Args:
-            thread_id: Thread ID to suspend
+            thread_id: Thread ID to suspend (decimal, or 0x-prefixed hex)
 
         Returns:
-            Confirmation message
+            Confirmation with the thread's resulting suspend count
 
         Example:
-            x64dbg_suspend_thread("1234")  # Suspend thread 1234
+            x64dbg_suspend_thread("4816")
         """
         try:
             bridge = get_x64dbg_bridge()
-            bridge.suspend_thread(thread_id)
-            return f"Thread {thread_id} suspended"
+            target = _require_thread(bridge, thread_id, "suspended")
 
+            bridge.suspend_thread(str(target["id"]))
+
+            after = bridge.find_thread(str(target["id"]))
+            count = after["suspend_count"] if after else None
+            if count is not None:
+                return f"Thread {target['id']} suspended (suspend count: {count})"
+            return f"Thread {target['id']} suspended"
+
+        except FeatureUnavailableError as e:
+            return f"Error: {e}"
+        except ValueError as e:
+            return f"Error: {e}"
         except Exception as e:
             logger.error(f"x64dbg_suspend_thread failed: {e}")
             return safe_error_message("x64dbg_suspend_thread failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_resume_thread(thread_id: str) -> str:
         """
         Resume a suspended thread in the debugged process.
 
+        A thread suspended N times needs N resumes before it runs, so the
+        resulting suspend count is reported.
+
         Args:
-            thread_id: Thread ID to resume
+            thread_id: Thread ID to resume (decimal, or 0x-prefixed hex)
 
         Returns:
-            Confirmation message
+            Confirmation with the thread's resulting suspend count
 
         Example:
-            x64dbg_resume_thread("1234")  # Resume thread 1234
+            x64dbg_resume_thread("4816")
         """
         try:
             bridge = get_x64dbg_bridge()
-            bridge.resume_thread(thread_id)
-            return f"Thread {thread_id} resumed"
+            target = _require_thread(bridge, thread_id, "resumed")
 
+            bridge.resume_thread(str(target["id"]))
+
+            after = bridge.find_thread(str(target["id"]))
+            count = after["suspend_count"] if after else None
+            if count is None:
+                return f"Thread {target['id']} resumed"
+            if count > 0:
+                return (
+                    f"Thread {target['id']} resumed, but its suspend count is "
+                    f"still {count} -- it stays suspended until that reaches 0. "
+                    f"Call this {count} more time(s)."
+                )
+            return f"Thread {target['id']} resumed and running (suspend count: 0)"
+
+        except FeatureUnavailableError as e:
+            return f"Error: {e}"
+        except ValueError as e:
+            return f"Error: {e}"
         except Exception as e:
             logger.error(f"x64dbg_resume_thread failed: {e}")
             return safe_error_message("x64dbg_resume_thread failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_suspend_all_threads() -> str:
         """
         Suspend all threads in the debugged process.
 
         Returns:
-            Confirmation with thread count
+            Confirmation with the number of threads affected
 
         Example:
-            x64dbg_suspend_all_threads()  # Suspend all threads
+            x64dbg_suspend_all_threads()
         """
         try:
             bridge = get_x64dbg_bridge()
             result = bridge.suspend_all_threads()
-            count = result.get("count", "unknown")
-            return f"All threads suspended (count: {count})"
+            # The plugin reports thread_count; tolerate count from other builds.
+            count = result.get("thread_count", result.get("count"))
+            if count is None:
+                return "All threads suspended."
+            return f"All threads suspended ({count} thread(s))."
 
+        except FeatureUnavailableError as e:
+            return f"Error: {e}"
         except Exception as e:
             logger.error(f"x64dbg_suspend_all_threads failed: {e}")
             return safe_error_message("x64dbg_suspend_all_threads failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_resume_all_threads() -> str:
         """
         Resume all threads in the debugged process.
 
         Returns:
-            Confirmation with thread count
+            Confirmation with the number of threads affected, and any thread
+            still holding a non-zero suspend count.
 
         Example:
-            x64dbg_resume_all_threads()  # Resume all threads
+            x64dbg_resume_all_threads()
         """
         try:
             bridge = get_x64dbg_bridge()
             result = bridge.resume_all_threads()
-            count = result.get("count", "unknown")
-            return f"All threads resumed (count: {count})"
+            count = result.get("thread_count", result.get("count"))
 
+            lines = [
+                "All threads resumed."
+                if count is None
+                else f"All threads resumed ({count} thread(s))."
+            ]
+
+            # A thread suspended more than once is still suspended here, which
+            # is exactly the case a caller would otherwise misread as done.
+            try:
+                still = [
+                    t for t in bridge.get_threads()
+                    if t["suspend_count"] not in (None, 0)
+                ]
+            except Exception:
+                still = []
+            if still:
+                lines.append("")
+                lines.append("Still suspended (nested suspend counts):")
+                for thread in still[:20]:
+                    lines.append(
+                        f"  TID {thread['id']}: suspend count "
+                        f"{thread['suspend_count']}"
+                    )
+
+            return "\n".join(lines)
+
+        except FeatureUnavailableError as e:
+            return f"Error: {e}"
         except Exception as e:
             logger.error(f"x64dbg_resume_all_threads failed: {e}")
             return safe_error_message("x64dbg_resume_all_threads failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_write_memory(address: str, data: str) -> str:
         """
@@ -2476,7 +2959,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_write_memory failed: {e}")
             return safe_error_message("x64dbg_write_memory failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_dump_memory(address: str, size: int, output_file: str) -> str:
         """
@@ -2550,7 +3032,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return "Not available: Memory dump is not yet implemented in the x64dbg plugin."
             return safe_error_message("x64dbg_dump_memory failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_search_memory(pattern: str, region: str = "all") -> str:
         """
@@ -2611,7 +3092,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
     # Advanced search tools
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_find_assembly(instruction: str, address: str = "", size: int = 0) -> str:
         """
@@ -2660,7 +3140,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_find_assembly failed: {e}")
             return safe_error_message("x64dbg_find_assembly failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_find_guid(address: str = "", size: int = 0) -> str:
         """
@@ -2706,7 +3185,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_find_guid failed: {e}")
             return safe_error_message("x64dbg_find_guid failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_find_module_calls(module: str = "") -> str:
         """
@@ -2753,7 +3231,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_find_module_calls failed: {e}")
             return safe_error_message("x64dbg_find_module_calls failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_find_references_range(address: str, size: int) -> str:
         """
@@ -2809,7 +3286,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_find_references_range failed: {e}")
             return safe_error_message("x64dbg_find_references_range failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_find_string_references(address: str = "") -> str:
         """
@@ -2866,7 +3342,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_find_string_references failed: {e}")
             return safe_error_message("x64dbg_find_string_references failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_get_memory_map() -> str:
         """
@@ -2935,7 +3410,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return "Not available: Memory map is not yet implemented in the x64dbg plugin."
             return safe_error_message("x64dbg_get_memory_map failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_get_memory_info(address: str) -> str:
         """
@@ -2983,7 +3457,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return "Not available: Memory info is not yet implemented in the x64dbg plugin."
             return safe_error_message("x64dbg_get_memory_info failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_get_instruction(address: str = "") -> str:
         """
@@ -3036,7 +3509,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return "Not available: Get instruction is not yet implemented in the x64dbg plugin."
             return safe_error_message("x64dbg_get_instruction failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_evaluate_expression(expression: str) -> str:
         """
@@ -3085,7 +3557,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return "Not available: Expression evaluation is not yet implemented in the x64dbg plugin."
             return safe_error_message("x64dbg_evaluate_expression failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_set_comment(address: str, comment: str) -> str:
         """
@@ -3124,7 +3595,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return "Not available: Set comment is not yet implemented in the x64dbg plugin."
             return safe_error_message("x64dbg_set_comment failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_get_comment(address: str) -> str:
         """
@@ -3155,7 +3625,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return "Not available: Get comment is not yet implemented in the x64dbg plugin."
             return safe_error_message("x64dbg_get_comment failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_set_bookmark(address: str) -> str:
         """
@@ -3192,7 +3661,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return "Not available: Set bookmark is not yet implemented in the x64dbg plugin."
             return safe_error_message("x64dbg_set_bookmark failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_delete_bookmark(address: str) -> str:
         """
@@ -3220,7 +3688,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return "Not available: Delete bookmark is not yet implemented in the x64dbg plugin."
             return safe_error_message("x64dbg_delete_bookmark failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_list_bookmarks() -> str:
         """
@@ -3262,7 +3729,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return "Not available: List bookmarks is not yet implemented in the x64dbg plugin."
             return safe_error_message("x64dbg_list_bookmarks failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_add_function(start: str, end: str) -> str:
         """
@@ -3301,7 +3767,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return "Not available: Add function is not yet implemented in the x64dbg plugin."
             return safe_error_message("x64dbg_add_function failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_delete_function(address: str) -> str:
         """
@@ -3329,7 +3794,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return "Not available: Delete function is not yet implemented in the x64dbg plugin."
             return safe_error_message("x64dbg_delete_function failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_list_functions() -> str:
         """
@@ -3382,7 +3846,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return "Not available: List functions is not yet implemented in the x64dbg plugin."
             return safe_error_message("x64dbg_list_functions failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_get_module_imports(module_name: str) -> str:
         """
@@ -3420,7 +3883,13 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             imports = bridge.get_module_imports(module_name)
 
             if not imports:
-                return f"No imports found for {module_name}"
+                return (
+                    f"No imports returned for {module_name}.\n"
+                    f"Import enumeration is not implemented in the x64dbg plugin "
+                    f"(it always returns an empty list), so this is not evidence "
+                    f"that {module_name} has no imports.\n"
+                    f"Use get_imports(binary_path=...) for the static import table."
+                )
 
             result = [f"Imports for {module_name} ({len(imports)} functions):", "-" * 70]
 
@@ -3458,7 +3927,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return "Not available: Module imports is not yet implemented in the x64dbg plugin."
             return safe_error_message("x64dbg_get_module_imports failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_get_module_exports(module_name: str) -> str:
         """
@@ -3484,7 +3952,12 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             exports = bridge.get_module_exports(module_name)
 
             if not exports:
-                return f"No exports found for {module_name}"
+                return (
+                    f"No exports returned for {module_name}.\n"
+                    f"Export enumeration is not implemented in the x64dbg plugin "
+                    f"(it always returns an empty list), so this is not evidence "
+                    f"that {module_name} has no exports."
+                )
 
             result = [f"Exports for {module_name} ({len(exports)} functions):", "-" * 70]
 
@@ -3515,7 +3988,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return "Not available: Module exports is not yet implemented in the x64dbg plugin."
             return safe_error_message("x64dbg_get_module_exports failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_dump_module(
         module_name: str,
@@ -3662,7 +4134,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_dump_module failed: {e}")
             return safe_error_message("x64dbg_dump_module failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_set_hardware_bp(address: str, bp_type: str = "execute", size: int = 1) -> str:
         """
@@ -3717,7 +4188,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return "Not available: Hardware breakpoints is not yet implemented in the x64dbg plugin."
             return format_error_response(e, "set_hardware_breakpoint")
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_set_register(register: str, value: str) -> str:
         """
@@ -3757,7 +4227,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return "Not available: Set register is not yet implemented in the x64dbg plugin."
             return safe_error_message("x64dbg_set_register failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_skip(count: int = 1) -> str:
         """
@@ -3796,7 +4265,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return "Not available: Skip instruction is not yet implemented in the x64dbg plugin."
             return safe_error_message("x64dbg_skip failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_run_until_return() -> str:
         """
@@ -3826,7 +4294,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return "Not available: Run until return is not yet implemented in the x64dbg plugin."
             return safe_error_message("x64dbg_run_until_return failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_run_to_user_code() -> str:
         """
@@ -3863,7 +4330,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_run_to_user_code failed: {e}")
             return safe_error_message("x64dbg_run_to_user_code failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_undo_instruction() -> str:
         """
@@ -3968,7 +4434,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
         "dump", "sdump",
     })
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_execute_command(command: str) -> str:
         """
@@ -4131,7 +4596,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_execute_command failed: {e}")
             return safe_error_message("x64dbg_execute_command failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_set_memory_bp(address: str, bp_type: str = "access", size: int = 1) -> str:
         """
@@ -4210,7 +4674,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return "Not available: Memory breakpoints is not yet implemented in the x64dbg plugin."
             return format_error_response(e, "set_memory_breakpoint")
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_delete_memory_bp(address: str) -> str:
         """
@@ -4241,7 +4704,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return "Not available: Delete memory breakpoint is not yet implemented in the x64dbg plugin."
             return format_error_response(e, "delete_memory_breakpoint")
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_hide_debugger() -> str:
         """
@@ -4283,7 +4745,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return "Not available: Hide debugger is not yet implemented in the x64dbg plugin."
             return safe_error_message("x64dbg_hide_debugger failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_apply_antidebug_bypass(
         profile: str = "standard",
@@ -4400,7 +4861,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 return "Not available: Anti-debug bypass is not yet implemented in the x64dbg plugin."
             return safe_error_message("x64dbg_apply_antidebug_bypass failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_get_antidebug_status() -> str:
         """
@@ -4455,7 +4915,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
     # Event System Tools
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_get_events(max_events: int = 50) -> str:
         """
@@ -4529,7 +4988,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_get_events failed: {e}")
             return safe_error_message("x64dbg_get_events failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_clear_events() -> str:
         """
@@ -4549,7 +5007,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_clear_events failed: {e}")
             return safe_error_message("x64dbg_clear_events failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_event_status() -> str:
         """
@@ -4579,7 +5036,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_event_status failed: {e}")
             return safe_error_message("x64dbg_event_status failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_run_until_event(
         event_types: str = "breakpoint_hit,exception,paused",
@@ -4646,7 +5102,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
     # Memory Allocation Tools (Phase 3)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_alloc_memory(size: int = 4096, address: str = "") -> str:
         """
@@ -4694,7 +5149,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_alloc_memory failed: {e}")
             return safe_error_message("x64dbg_alloc_memory failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_free_memory(address: str) -> str:
         """
@@ -4722,7 +5176,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_free_memory failed: {e}")
             return safe_error_message("x64dbg_free_memory failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_protect_memory(address: str, protection: str, size: int = 4096) -> str:
         """
@@ -4778,7 +5231,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_protect_memory failed: {e}")
             return safe_error_message("x64dbg_protect_memory failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_memset(address: str, value: int, size: int) -> str:
         """
@@ -4831,7 +5283,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_memset failed: {e}")
             return safe_error_message("x64dbg_memset failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_check_memory(address: str) -> str:
         """
@@ -4865,7 +5316,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
     # Enhanced Breakpoint Tools (Phase 3)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_toggle_breakpoint(address: str, enable: bool = True) -> str:
         """
@@ -4901,7 +5351,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_toggle_breakpoint failed: {e}")
             return safe_error_message("x64dbg_toggle_breakpoint failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_delete_hardware_bp(address: str) -> str:
         """
@@ -4928,7 +5377,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_delete_hardware_bp failed: {e}")
             return safe_error_message("x64dbg_delete_hardware_bp failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_toggle_hardware_bp(address: str, enable: bool = True) -> str:
         """
@@ -4955,7 +5403,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_toggle_hardware_bp failed: {e}")
             return safe_error_message("x64dbg_toggle_hardware_bp failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_toggle_memory_bp(address: str, enable: bool = True) -> str:
         """
@@ -4982,7 +5429,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_toggle_memory_bp failed: {e}")
             return safe_error_message("x64dbg_toggle_memory_bp failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_list_all_breakpoints() -> str:
         """
@@ -5068,7 +5514,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
     # P2: Conditional Breakpoint Logging
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_set_conditional_breakpoint(
         address: str,
@@ -5077,10 +5522,12 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
         action: str = "break"
     ) -> str:
         """
-        Set a breakpoint with optional condition and logging.
+        Set a plain breakpoint plus a condition this server evaluates on demand.
 
-        Sets a breakpoint that can evaluate a condition and log formatted
-        messages when hit. Supports three modes: break, log_and_break, log_and_continue.
+        The debugger does NOT enforce the condition -- it breaks on every hit.
+        The condition and log template are stored here and only applied when
+        you call the check_manual_conditional operation after a hit. For a
+        condition the debugger itself enforces, use set_conditional.
 
         Args:
             address: Breakpoint address (hex string, e.g., "0x401000")
@@ -5180,7 +5627,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_set_conditional_breakpoint failed: {e}")
             return format_error_response(e, "set_conditional_breakpoint")
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_check_conditional_breakpoint(address: str | None = None) -> str:
         """
@@ -5291,14 +5737,14 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_check_conditional_breakpoint failed: {e}")
             return safe_error_message("x64dbg_check_conditional_breakpoint failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_get_breakpoint_logs(address: str | None = None, limit: int = 50) -> str:
         """
-        Get logs from conditional breakpoints.
+        Get logs recorded by check_manual_conditional calls.
 
-        Retrieves log entries generated by conditional breakpoints with
-        log templates. Optionally filter by specific breakpoint address.
+        These entries come from this server, not the debugger: only a
+        check_manual_conditional call appends to them. For logs the debugger
+        produced itself, use get_logs.
 
         Args:
             address: Filter logs to specific breakpoint address. If None, show all.
@@ -5365,7 +5811,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_get_breakpoint_logs failed: {e}")
             return safe_error_message("x64dbg_get_breakpoint_logs failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_clear_breakpoint_logs(address: str | None = None) -> str:
         """
@@ -5404,7 +5849,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
     # P2: Native Conditional Breakpoint with Logging (Enhanced)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_set_conditional_bp(
         address: str,
@@ -5553,7 +5997,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_set_conditional_bp failed: {e}")
             return format_error_response(e, "set_conditional_bp")
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_log_api_params(
         api: str,
@@ -5760,7 +6203,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_log_api_params failed: {e}")
             return format_error_response(e, "log_api_params")
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_get_bp_logs(
         address: str | None = None,
@@ -5893,7 +6335,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
     # P2: Static/Dynamic Cross-Reference
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_resolve_static_address(
         static_address: str,
@@ -5910,9 +6351,9 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         Args:
             static_address: Address from static analysis (hex string, e.g., "0x401234")
-            binary_path: Optional binary name or path. If None, uses main module.
-            image_base: Optional static image base. If None, auto-detect from PE header.
-                       Common values: 0x400000 (EXE), 0x10000000 (DLL)
+            binary_path: Optional module name or path. If None, uses the main module.
+            image_base: Optional static image base. If None, read from the loaded
+                       module's PE header.
 
         Returns:
             Runtime address and conversion details
@@ -5922,98 +6363,95 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             x64dbg_resolve_static_address("0x004025B0")
             # Returns: "Runtime address: 0x012425B0 (module base: 0x01200000)"
 
-            # DLL with custom image base
+            # DLL loaded alongside the main executable
             x64dbg_resolve_static_address("0x10001234", binary_path="evil.dll")
         """
         try:
             bridge = get_x64dbg_bridge()
 
-            # Parse static address
-            if static_address.startswith("0x") or static_address.startswith("0X"):
+            try:
                 static_addr = int(static_address, 16)
-            else:
-                static_addr = int(static_address, 16)
+            except (TypeError, ValueError):
+                return (
+                    f"Error: '{static_address}' is not a hex address. "
+                    f"Pass something like \"0x401234\"."
+                )
 
-            # Get modules
-            modules = bridge.get_modules()
-
-            # Find target module
-            target_module = None
+            # Find the module. This used to substring-match on a key the plugin
+            # never sends, which made every comparison succeed and silently
+            # rebased against whichever module came first -- so binary_path was
+            # effectively ignored.
             if binary_path:
-                # Search by name
-                binary_name = os.path.basename(binary_path).lower()
-                for mod in modules:
-                    mod_name = mod.get("name", "").lower()
-                    if binary_name in mod_name or mod_name in binary_name:
-                        target_module = mod
-                        break
+                target_module = bridge.find_module(binary_path)
+                if target_module is None:
+                    modules = bridge.get_modules()
+                    # Audit F-7: sample-chosen module names -- fence the list,
+                    # keep the server's sentence outside it.
+                    loaded = ", ".join(m["display_name"] for m in modules[:20])
+                    return (
+                        f"Module '{os.path.basename(binary_path)}' is not "
+                        f"loaded in x64dbg.\nLoaded modules:\n"
+                        + (
+                            wrap_untrusted(
+                                loaded,
+                                kind="module names from the debugged process",
+                            )
+                            if loaded
+                            else "(none)"
+                        )
+                    )
             else:
-                # Use first module (main executable)
-                if modules:
-                    target_module = modules[0]
+                target_module = bridge.get_main_module()
+                if target_module is None:
+                    return (
+                        "No modules are loaded in x64dbg. Load or attach to the "
+                        "target first (x64dbg_attach)."
+                    )
 
-            if not target_module:
-                return f"Module not found: {binary_path if binary_path else 'main module'}"
-
-            module_base = target_module.get("base", 0)
-            if isinstance(module_base, str):
-                module_base = int(module_base, 16) if module_base.startswith("0x") else int(module_base)
-
-            module_name = target_module.get("name", "unknown")
+            module_base = target_module["base"]
+            # Audit F-7: sample-chosen name, rendered inline in a labelled
+            # field below -- neutralise the sentinels so it cannot forge an
+            # envelope boundary.
+            module_name = neutralise_untrusted_delimiters(
+                target_module["display_name"]
+            )
 
             # Determine image base (from PE header or provided)
+            img_base = None
+            base_source = "provided"
             if image_base:
-                if isinstance(image_base, str):
-                    img_base = int(image_base, 16) if image_base.startswith("0x") else int(image_base)
-                else:
-                    img_base = image_base
-            else:
-                # Try to read PE header to get image base
                 try:
-                    # Read DOS header to find PE header
-                    dos_header = bridge.read_memory(f"0x{module_base:X}", 64)
-                    if dos_header and len(dos_header) >= 64:
-                        # Get e_lfanew (offset to PE header) at offset 0x3C
-                        e_lfanew = int.from_bytes(dos_header[0x3C:0x40], 'little')
-                        # Read PE header
-                        pe_header = bridge.read_memory(f"0x{module_base + e_lfanew:X}", 256)
-                        if pe_header and len(pe_header) >= 256:
-                            # Image base is at offset 0x30 from PE signature in PE32+
-                            # Check PE signature
-                            if pe_header[0:4] == b'PE\x00\x00':
-                                # Check machine type at offset 4
-                                # Optional header offset is at 0x18
-                                opt_header = pe_header[0x18:]
-                                magic = int.from_bytes(opt_header[0:2], 'little')
-                                if magic == 0x20B:  # PE32+ (64-bit)
-                                    img_base = int.from_bytes(opt_header[24:32], 'little')
-                                else:  # PE32 (32-bit)
-                                    img_base = int.from_bytes(opt_header[28:32], 'little')
-                            else:
-                                img_base = 0x400000  # Default
-                        else:
-                            img_base = 0x400000
-                    else:
-                        img_base = 0x400000  # Default for EXE
-                except Exception:
-                    # Default image bases
-                    if module_name.lower().endswith(".dll"):
-                        img_base = 0x10000000
-                    else:
-                        img_base = 0x400000
+                    img_base = int(str(image_base), 16)
+                except ValueError:
+                    return f"Error: image_base '{image_base}' is not a hex value."
+            else:
+                img_base = _read_image_base_from_memory(bridge, module_base)
+                base_source = "PE header"
 
-            # Calculate runtime address
+            if img_base is None:
+                return (
+                    f"Could not read the image base from {module_name}'s PE header "
+                    f"at 0x{module_base:X}.\n"
+                    f"Pass image_base explicitly (the ImageBase field from the "
+                    f"optional header of the on-disk file)."
+                )
+
+            try:
+                runtime_addr = rebase_static_address(static_addr, img_base, module_base)
+            except AddressRebaseError as e:
+                return f"Error: {e}"
+
             offset = static_addr - img_base
-            runtime_addr = module_base + offset
+            width = 16 if max(static_addr, runtime_addr, module_base) > 0xFFFFFFFF else 8
 
             output = [
                 "Address Conversion:",
-                f"  Static address:  0x{static_addr:08X}",
-                f"  Image base:      0x{img_base:08X}",
-                f"  Offset:          0x{offset:08X}",
+                f"  Static address:  {_format_addr(static_addr, width)}",
+                f"  Image base:      {_format_addr(img_base, width)} ({base_source})",
+                f"  Offset:          {_format_addr(offset, 8)}",
                 f"  Module:          {module_name}",
-                f"  Module base:     0x{module_base:08X}",
-                f"  Runtime address: 0x{runtime_addr:08X}",
+                f"  Module base:     {_format_addr(module_base, width)}",
+                f"  Runtime address: {_format_addr(runtime_addr, width)}",
                 "",
                 f"Use 0x{runtime_addr:X} for breakpoints in x64dbg"
             ]
@@ -6024,7 +6462,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_resolve_static_address failed: {e}")
             return safe_error_message("x64dbg_resolve_static_address failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_set_breakpoint_by_name(
         function_name: str,
@@ -6155,7 +6592,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_set_breakpoint_by_name failed: {e}")
             return format_error_response(e, "set_breakpoint_by_name")
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_goto_address(
         address: str | None = None,
@@ -6233,7 +6669,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_goto_address failed: {e}")
             return safe_error_message("x64dbg_goto_address failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_get_runtime_function_address(
         static_address: str,
@@ -6316,7 +6751,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
     # Static/Dynamic Cross-Reference (Ghidra Cache Integration)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_resolve_function(
         binary_path: str,
@@ -6344,10 +6778,17 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             )
 
         Prerequisites:
-            - Binary must be analyzed with Ghidra (use ghidra_analyze first)
+            - Binary must be analyzed first (use analyze_binary)
             - Binary must be loaded in x64dbg debugger
         """
         try:
+            # Audit F-10: resolve_cached_binary rebinds this to an absolute
+            # host path out of the cache index, so keep what the caller
+            # actually asked for -- the hint below has to echo something they
+            # can paste back, and a resolved path would disclose the
+            # operator's directory layout.
+            requested = binary_path
+            binary_path = resolve_cached_binary(binary_path)
             bridge = get_x64dbg_bridge()
             result = _resolve_function_to_runtime(function_name, binary_path, bridge)
 
@@ -6355,9 +6796,10 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 cache = get_ghidra_cache()
                 if not cache.has_cached(binary_path):
                     return (
-                        f"No Ghidra analysis cache found for '{binary_path}'.\n\n"
+                        f"No Ghidra analysis cache found for "
+                        f"'{os.path.basename(binary_path)}'.\n\n"
                         f"To analyze this binary:\n"
-                        f"  1. Use ghidra_analyze(binary_path=\"{binary_path}\")\n"
+                        f"  1. Use analyze_binary(binary_path=\"{requested}\")\n"
                         f"  2. Wait for analysis to complete\n"
                         f"  3. Try this command again"
                     )
@@ -6365,9 +6807,9 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 similar = []
                 search_lower = function_name.lower()
                 for name in mappings.keys():
-                    if search_lower in name.lower() or name.lower() in search_lower:
-                        if name != name.lower():
-                            similar.append(name)
+                    lowered = name.lower()
+                    if search_lower in lowered or lowered in search_lower:
+                        similar.append(name)
                 suggestion = ""
                 if similar:
                     suggestion = "\n\nSimilar function names found:\n"
@@ -6393,11 +6835,12 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             output.append(f"Use {result['runtime_address']} for breakpoints")
             return "\n".join(output)
 
+        except (BinaryResolutionError, AddressRebaseError) as e:
+            return f"Error: {e}"
         except Exception as e:
             logger.error(f"x64dbg_resolve_function failed: {e}")
             return safe_error_message("x64dbg_resolve_function failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_set_breakpoint_by_function(
         binary_path: str,
@@ -6422,13 +6865,14 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             )
         """
         try:
+            binary_path = resolve_cached_binary(binary_path)
             bridge = get_x64dbg_bridge()
             result = _resolve_function_to_runtime(function_name, binary_path, bridge)
 
             if not result:
                 cache = get_ghidra_cache()
                 if not cache.has_cached(binary_path):
-                    return f"No Ghidra cache found for '{binary_path}'."
+                    return f"No Ghidra cache found for '{os.path.basename(binary_path)}'."
                 return f"Function '{function_name}' not found in Ghidra cache."
 
             runtime_addr = result["runtime_address"]
@@ -6450,11 +6894,12 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except StructuredBaseError as e:
             return format_error_response(e, "set_breakpoint_by_function")
+        except (BinaryResolutionError, AddressRebaseError) as e:
+            return f"Error: {e}"
         except Exception as e:
             logger.error(f"x64dbg_set_breakpoint_by_function failed: {e}")
             return safe_error_message("x64dbg_set_breakpoint_by_function failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_goto_function(binary_path: str, function_name: str) -> str:
         """
@@ -6468,13 +6913,14 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             Function location and disassembly preview
         """
         try:
+            binary_path = resolve_cached_binary(binary_path)
             bridge = get_x64dbg_bridge()
             result = _resolve_function_to_runtime(function_name, binary_path, bridge)
 
             if not result:
                 cache = get_ghidra_cache()
                 if not cache.has_cached(binary_path):
-                    return f"No Ghidra cache found for '{binary_path}'."
+                    return f"No Ghidra cache found for '{os.path.basename(binary_path)}'."
                 return f"Function '{function_name}' not found in Ghidra cache."
 
             runtime_addr = result["runtime_address"]
@@ -6504,11 +6950,12 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 output.append("  (Could not disassemble)")
             return "\n".join(output)
 
+        except (BinaryResolutionError, AddressRebaseError) as e:
+            return f"Error: {e}"
         except Exception as e:
             logger.error(f"x64dbg_goto_function failed: {e}")
             return safe_error_message("x64dbg_goto_function failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_list_function_mappings(
         binary_path: str,
@@ -6529,22 +6976,19 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             List of functions with their static addresses
         """
         try:
+            binary_path = resolve_cached_binary(binary_path)
             cache = get_ghidra_cache()
             if not cache.has_cached(binary_path):
-                return f"No Ghidra analysis cache found for '{binary_path}'."
+                return f"No Ghidra analysis cache found for '{os.path.basename(binary_path)}'."
 
             mappings = _load_function_mappings(binary_path)
             if not mappings:
-                return f"No functions found in Ghidra cache for '{binary_path}'."
+                return f"No functions found in Ghidra cache for '{os.path.basename(binary_path)}'."
 
             image_base = _get_image_base_from_cache(binary_path)
             filtered = []
-            seen_names: set = set()
 
             for name, info in mappings.items():
-                if name.lower() in seen_names:
-                    continue
-                seen_names.add(name.lower())
                 if not show_external and info.get("is_external", False):
                     continue
                 if filter_pattern and filter_pattern.lower() not in name.lower():
@@ -6590,11 +7034,12 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 output.append(f"... and {total_count - limit} more functions")
             return "\n".join(output)
 
+        except (BinaryResolutionError, AddressRebaseError) as e:
+            return f"Error: {e}"
         except Exception as e:
             logger.error(f"x64dbg_list_function_mappings failed: {e}")
             return safe_error_message("x64dbg_list_function_mappings failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_search_function(binary_path: str, pattern: str) -> str:
         """
@@ -6608,19 +7053,16 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             List of matching functions with address information
         """
         try:
+            binary_path = resolve_cached_binary(binary_path)
             cache = get_ghidra_cache()
             if not cache.has_cached(binary_path):
-                return f"No Ghidra analysis cache found for '{binary_path}'."
+                return f"No Ghidra analysis cache found for '{os.path.basename(binary_path)}'."
 
             mappings = _load_function_mappings(binary_path)
             pattern_lower = pattern.lower()
             matches = []
-            seen_names: set = set()
 
             for name, info in mappings.items():
-                if name.lower() in seen_names:
-                    continue
-                seen_names.add(name.lower())
                 if pattern_lower in name.lower():
                     matches.append((name, info))
 
@@ -6653,11 +7095,12 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 output.append(f"... and {len(matches) - 30} more matches")
             return "\n".join(output)
 
+        except (BinaryResolutionError, AddressRebaseError) as e:
+            return f"Error: {e}"
         except Exception as e:
             logger.error(f"x64dbg_search_function failed: {e}")
             return safe_error_message("x64dbg_search_function failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_bulk_resolve_functions(
         binary_path: str,
@@ -6674,10 +7117,11 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             Table of function names with static and runtime addresses
         """
         try:
+            binary_path = resolve_cached_binary(binary_path)
             bridge = get_x64dbg_bridge()
             cache = get_ghidra_cache()
             if not cache.has_cached(binary_path):
-                return f"No Ghidra analysis cache found for '{binary_path}'."
+                return f"No Ghidra analysis cache found for '{os.path.basename(binary_path)}'."
 
             results = []
             for func_name in function_names:
@@ -6712,11 +7156,12 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 output.append(f"{r['name']:<30} {r['static']:<16} {r['runtime']:<16} {status}")
             return "\n".join(output)
 
+        except (BinaryResolutionError, AddressRebaseError) as e:
+            return f"Error: {e}"
         except Exception as e:
             logger.error(f"x64dbg_bulk_resolve_functions failed: {e}")
             return safe_error_message("x64dbg_bulk_resolve_functions failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_set_breakpoints_by_functions(
         binary_path: str,
@@ -6735,10 +7180,11 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             Summary of breakpoints set with success/failure count
         """
         try:
+            binary_path = resolve_cached_binary(binary_path)
             bridge = get_x64dbg_bridge()
             cache = get_ghidra_cache()
             if not cache.has_cached(binary_path):
-                return f"No Ghidra analysis cache found for '{binary_path}'."
+                return f"No Ghidra analysis cache found for '{os.path.basename(binary_path)}'."
 
             results = {"success": 0, "failed": 0, "not_found": 0, "details": []}
             for func_name in function_names:
@@ -6774,11 +7220,12 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 output.append(f"  ... and {len(results['details']) - 20} more")
             return "\n".join(output)
 
+        except (BinaryResolutionError, AddressRebaseError) as e:
+            return f"Error: {e}"
         except Exception as e:
             logger.error(f"x64dbg_set_breakpoints_by_functions failed: {e}")
             return safe_error_message("x64dbg_set_breakpoints_by_functions failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_refresh_function_cache(binary_path: str) -> str:
         """
@@ -6794,25 +7241,29 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             Confirmation with count of functions loaded
         """
         try:
-            global _function_mappings
-            if binary_path in _function_mappings:
-                del _function_mappings[binary_path]
+            binary_path = resolve_cached_binary(binary_path)
+            # Evict under the same normalized key _load_function_mappings
+            # stores against, or the reload is a no-op and this tool silently
+            # returns the stale table it was called to replace.
+            _function_mappings.pop(
+                os.path.normcase(os.path.abspath(binary_path)), None
+            )
             cache = get_ghidra_cache()
             if not cache.has_cached(binary_path):
-                return f"No Ghidra analysis cache found for '{binary_path}'."
+                return f"No Ghidra analysis cache found for '{os.path.basename(binary_path)}'."
             mappings = _load_function_mappings(binary_path)
-            unique_count = len(set(name.lower() for name in mappings.keys()))
             return (
                 f"Function cache refreshed for {os.path.basename(binary_path)}.\n"
-                f"Loaded {unique_count} unique functions from Ghidra cache."
+                f"Loaded {len(mappings)} functions from Ghidra cache."
             )
+        except (BinaryResolutionError, AddressRebaseError) as e:
+            return f"Error: {e}"
         except Exception as e:
             logger.error(f"x64dbg_refresh_function_cache failed: {e}")
             return safe_error_message("x64dbg_refresh_function_cache failed", e)
 
     # P2: Session State Persistence
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_save_debug_state(
         state_name: str | None = None,
@@ -6851,11 +7302,21 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
             # Get current debug info
             status = bridge.get_current_location()
-            modules = bridge.get_modules()
 
+            # The debuggee image, not modules[0]. Now that every loaded module
+            # is enumerated, the first entry is no longer guaranteed to be the
+            # target -- for a DLL under a host process it is the host, which
+            # would file the saved state under the wrong binary.
+            main_module = bridge.get_main_module()
             binary_name = "unknown"
-            if modules:
-                binary_name = modules[0].get("name", "unknown")
+            if main_module:
+                # Audit F-7: the image name is the sample's own filename and is
+                # echoed inline in the summary below, so neutralise the
+                # envelope sentinels. It reaches no filesystem path -- the
+                # state file is named after the SHA-256 state_id.
+                binary_name = neutralise_untrusted_delimiters(
+                    main_module.get("display_name") or ""
+                ) or "unknown"
 
             # Generate state name if not provided
             if not state_name:
@@ -6933,7 +7394,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_save_debug_state failed: {e}")
             return safe_error_message("Failed to save debug state", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_restore_debug_state(
         state_id: str,
@@ -7071,7 +7531,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_restore_debug_state failed: {e}")
             return safe_error_message("x64dbg_restore_debug_state failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_list_debug_states(binary_filter: str | None = None) -> str:
         """
@@ -7165,7 +7624,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_list_debug_states failed: {e}")
             return safe_error_message("Failed to list debug states", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_delete_debug_state(state_id: str) -> str:
         """
@@ -7210,7 +7668,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
     # P2: API Hook Detection
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_detect_hooks(
         modules: list[str] | None = None,
@@ -7350,7 +7807,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_detect_hooks failed: {e}")
             return safe_error_message("x64dbg_detect_hooks failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_check_function_hook(
         function_name: str,
@@ -7471,7 +7927,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_check_function_hook failed: {e}")
             return safe_error_message("x64dbg_check_function_hook failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_unhook_function(
         function_name: str,
@@ -7581,7 +8036,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
     # P2: Memory Watch and Diff
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_watch_memory(
         address: str,
@@ -7674,7 +8128,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_watch_memory failed: {e}")
             return safe_error_message("x64dbg_watch_memory failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_memory_diff(
         watch_id: str,
@@ -7822,7 +8275,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_memory_diff failed: {e}")
             return safe_error_message("x64dbg_memory_diff failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_run_until_memory_changed(
         watch_id: str,
@@ -8048,7 +8500,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                 pass
             return safe_error_message("x64dbg_run_until_memory_changed failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_update_memory_snapshot(watch_id: str) -> str:
         """
@@ -8120,7 +8571,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_update_memory_snapshot failed: {e}")
             return safe_error_message("x64dbg_update_memory_snapshot failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_list_memory_watches() -> str:
         """
@@ -8162,7 +8612,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_list_memory_watches failed: {e}")
             return safe_error_message("x64dbg_list_memory_watches failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_delete_memory_watch(watch_id: str) -> str:
         """
@@ -8194,7 +8643,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
     # Watch expression tools
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_add_watch(expression: str, name: str = "") -> str:
         """
@@ -8229,7 +8677,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_add_watch failed: {e}")
             return format_error_response(e, "add_watch")
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_delete_watch(index: int) -> str:
         """
@@ -8253,7 +8700,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_delete_watch failed: {e}")
             return format_error_response(e, "delete_watch")
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_set_watchdog(index: int, mode: str = "changed") -> str:
         """
@@ -8295,7 +8741,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
     # DLL breakpoint tools
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_set_dll_breakpoint(
         dll_name: str, singleshoot: bool = False
@@ -8332,7 +8777,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_set_dll_breakpoint failed: {e}")
             return format_error_response(e, "set_dll_breakpoint")
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_delete_dll_breakpoint(dll_name: str) -> str:
         """
@@ -8356,7 +8800,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_delete_dll_breakpoint failed: {e}")
             return format_error_response(e, "delete_dll_breakpoint")
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_enable_dll_breakpoint(dll_name: str) -> str:
         """
@@ -8380,7 +8823,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_enable_dll_breakpoint failed: {e}")
             return format_error_response(e, "enable_dll_breakpoint")
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_disable_dll_breakpoint(dll_name: str) -> str:
         """
@@ -8404,7 +8846,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_disable_dll_breakpoint failed: {e}")
             return format_error_response(e, "disable_dll_breakpoint")
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_analyze_control_flow() -> str:
         """
@@ -8434,7 +8875,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_analyze_control_flow failed: {e}")
             return safe_error_message("x64dbg_analyze_control_flow failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_analyze_xrefs() -> str:
         """
@@ -8464,7 +8904,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_analyze_xrefs failed: {e}")
             return safe_error_message("x64dbg_analyze_xrefs failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_analyze_recursive() -> str:
         """
@@ -8494,7 +8933,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_analyze_recursive failed: {e}")
             return safe_error_message("x64dbg_analyze_recursive failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_get_exception_handlers() -> str:
         """
@@ -8523,7 +8961,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_get_exception_handlers failed: {e}")
             return safe_error_message("x64dbg_get_exception_handlers failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_get_exception_info() -> str:
         """
@@ -8554,7 +8991,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
     # Variable management tools
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_set_variable(name: str, value: str) -> str:
         """
@@ -8597,7 +9033,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_set_variable failed: {e}")
             return safe_error_message("x64dbg_set_variable failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_delete_variable(name: str) -> str:
         """
@@ -8633,7 +9068,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_delete_variable failed: {e}")
             return safe_error_message("x64dbg_delete_variable failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_list_variables() -> str:
         """
@@ -8669,7 +9103,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
     # GUI navigation tools
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_navigate_disasm(address: str) -> str:
         """
@@ -8701,7 +9134,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_navigate_disasm failed: {e}")
             return safe_error_message("x64dbg_navigate_disasm failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_navigate_dump(address: str) -> str:
         """
@@ -8732,7 +9164,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_navigate_dump failed: {e}")
             return safe_error_message("x64dbg_navigate_dump failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_show_graph(address: str = "") -> str:
         """
@@ -8770,7 +9201,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
     # Privilege management tools
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_enable_privilege(name: str) -> str:
         """
@@ -8808,7 +9238,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_enable_privilege failed: {e}")
             return safe_error_message("x64dbg_enable_privilege failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_disable_privilege(name: str) -> str:
         """
@@ -8847,7 +9276,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
     # Type System Tools
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_add_struct(name: str) -> str:
         """
@@ -8881,7 +9309,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_add_struct failed: {e}")
             return safe_error_message("x64dbg_add_struct failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_add_union(name: str) -> str:
         """
@@ -8916,7 +9343,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_add_union failed: {e}")
             return safe_error_message("x64dbg_add_union failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_add_member(parent: str, type_name: str, member_name: str) -> str:
         """
@@ -8955,7 +9381,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_add_member failed: {e}")
             return safe_error_message("x64dbg_add_member failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_view_type(type_name: str, address: str) -> str:
         """
@@ -9006,7 +9431,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_view_type failed: {e}")
             return safe_error_message("x64dbg_view_type failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_sizeof_type(type_name: str) -> str:
         """
@@ -9040,7 +9464,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_sizeof_type failed: {e}")
             return safe_error_message("x64dbg_sizeof_type failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_remove_type(type_name: str) -> str:
         """
@@ -9072,7 +9495,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_remove_type failed: {e}")
             return safe_error_message("x64dbg_remove_type failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_list_types() -> str:
         """
@@ -9103,7 +9525,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_list_types failed: {e}")
             return safe_error_message("x64dbg_list_types failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_clear_types() -> str:
         """
@@ -9129,7 +9550,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_clear_types failed: {e}")
             return safe_error_message("x64dbg_clear_types failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_load_types(filename: str) -> str:
         """
@@ -9197,7 +9617,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_load_types failed: {e}")
             return safe_error_message("x64dbg_load_types failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_parse_types(definition: str) -> str:
         """
@@ -9242,7 +9661,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
     # Conditional Tracing Tools
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_trace_into_conditional(
         condition: str,
@@ -9345,7 +9763,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_trace_into_conditional failed: {e}")
             return safe_error_message("x64dbg_trace_into_conditional failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_trace_over_conditional(
         condition: str,
@@ -9446,7 +9863,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_trace_over_conditional failed: {e}")
             return safe_error_message("x64dbg_trace_over_conditional failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_trace_to_oep(max_steps: int = 50000) -> str:
         """
@@ -9495,7 +9911,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_trace_to_oep failed: {e}")
             return safe_error_message("x64dbg_trace_to_oep failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_set_trace_log(text: str, condition: str = "") -> str:
         """
@@ -9544,7 +9959,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_set_trace_log failed: {e}")
             return safe_error_message("x64dbg_set_trace_log failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_set_trace_command(command: str, condition: str = "") -> str:
         """
@@ -9586,7 +10000,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_set_trace_command failed: {e}")
             return safe_error_message("x64dbg_set_trace_command failed", e)
 
-    @app.tool()
     @log_dynamic_tool
     def x64dbg_set_trace_log_file(path: str) -> str:
         """
@@ -9650,4 +10063,707 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_set_trace_log_file failed: {e}")
             return safe_error_message("x64dbg_set_trace_log_file failed", e)
 
-    logger.info("Registered 112 dynamic analysis tools")
+    # Grouped MCP surface.
+    #
+    # Every operation below is implemented by one of the functions above.
+    # They are deliberately NOT registered individually: 159 tools is well
+    # past the point where a model can pick reliably, and the grouping is
+    # what makes the surface selectable. The implementations keep their own
+    # names in session logs via @log_dynamic_tool.
+    ops: dict[str, dict[str, object]] = {
+        "session": {
+            "antidebug_bypass": x64dbg_apply_antidebug_bypass,
+            "antidebug_status": x64dbg_get_antidebug_status,
+            "attach": x64dbg_attach,
+            "connect": x64dbg_connect,
+            "detach": x64dbg_detach,
+            "disable_privilege": x64dbg_disable_privilege,
+            "enable_privilege": x64dbg_enable_privilege,
+            "exec_command": x64dbg_execute_command,
+            "hide_debugger": x64dbg_hide_debugger,
+            "minidump": x64dbg_create_minidump,
+            "status": x64dbg_status,
+        },
+        "state": {
+            "delete": x64dbg_delete_debug_state,
+            "list": x64dbg_list_debug_states,
+            "restore": x64dbg_restore_debug_state,
+            "save": x64dbg_save_debug_state,
+        },
+        "execution": {
+            "clear_events": x64dbg_clear_events,
+            "event_status": x64dbg_event_status,
+            "get_events": x64dbg_get_events,
+            "pause": x64dbg_pause,
+            "run": x64dbg_run,
+            "run_and_wait": x64dbg_run_and_wait,
+            "run_to_address": x64dbg_run_to_address,
+            "run_to_user_code": x64dbg_run_to_user_code,
+            "run_until_event": x64dbg_run_until_event,
+            "run_until_return": x64dbg_run_until_return,
+            "skip": x64dbg_skip,
+            "step_into": x64dbg_step_into,
+            "step_out": x64dbg_step_out,
+            "step_over": x64dbg_step_over,
+            "undo": x64dbg_undo_instruction,
+            "wait_debugging": x64dbg_wait_debugging,
+            "wait_paused": x64dbg_wait_paused,
+            "wait_running": x64dbg_wait_running,
+        },
+        "breakpoint": {
+            "check_manual_conditional": x64dbg_check_conditional_breakpoint,
+            "clear_manual_logs": x64dbg_clear_breakpoint_logs,
+            "delete": x64dbg_delete_breakpoint,
+            "delete_dll": x64dbg_delete_dll_breakpoint,
+            "delete_exception": x64dbg_delete_exception_breakpoint,
+            "delete_hardware": x64dbg_delete_hardware_bp,
+            "delete_many": x64dbg_delete_breakpoints,
+            "delete_memory": x64dbg_delete_memory_bp,
+            "disable_dll": x64dbg_disable_dll_breakpoint,
+            "enable_dll": x64dbg_enable_dll_breakpoint,
+            "get_logs": x64dbg_get_bp_logs,
+            "get_manual_logs": x64dbg_get_breakpoint_logs,
+            "list": x64dbg_list_breakpoints,
+            "list_all": x64dbg_list_all_breakpoints,
+            "list_exception": x64dbg_list_exception_breakpoints,
+            "set": x64dbg_set_breakpoint,
+            "set_by_name": x64dbg_set_breakpoint_by_name,
+            "set_conditional": x64dbg_set_conditional_bp,
+            "set_dll": x64dbg_set_dll_breakpoint,
+            "set_exception": x64dbg_set_exception_breakpoint,
+            "set_hardware": x64dbg_set_hardware_bp,
+            "set_manual_conditional": x64dbg_set_conditional_breakpoint,
+            "set_many": x64dbg_set_breakpoints,
+            "set_memory": x64dbg_set_memory_bp,
+            "skip_exception": x64dbg_skip_exception,
+            "toggle": x64dbg_toggle_breakpoint,
+            "toggle_hardware": x64dbg_toggle_hardware_bp,
+            "toggle_memory": x64dbg_toggle_memory_bp,
+        },
+        "memory": {
+            "alloc": x64dbg_alloc_memory,
+            "check": x64dbg_check_memory,
+            "delete_watch": x64dbg_delete_memory_watch,
+            "diff": x64dbg_memory_diff,
+            "dump": x64dbg_dump_memory,
+            "fill": x64dbg_memset,
+            "free": x64dbg_free_memory,
+            "info": x64dbg_get_memory_info,
+            "list_watches": x64dbg_list_memory_watches,
+            "map": x64dbg_get_memory_map,
+            "protect": x64dbg_protect_memory,
+            "read": x64dbg_read_memory,
+            "run_until_changed": x64dbg_run_until_memory_changed,
+            "search": x64dbg_search_memory,
+            "update_snapshot": x64dbg_update_memory_snapshot,
+            "watch": x64dbg_watch_memory,
+            "write": x64dbg_write_memory,
+        },
+        "context": {
+            "registers": x64dbg_get_registers,
+            "set_register": x64dbg_set_register,
+            "stack": x64dbg_get_stack,
+        },
+        "thread": {
+            "list": x64dbg_get_threads,
+            "resume": x64dbg_resume_thread,
+            "resume_all": x64dbg_resume_all_threads,
+            "suspend": x64dbg_suspend_thread,
+            "suspend_all": x64dbg_suspend_all_threads,
+            "switch": x64dbg_switch_thread,
+        },
+        "module": {
+            "dump": x64dbg_dump_module,
+            "exports": x64dbg_get_module_exports,
+            "imports": x64dbg_get_module_imports,
+            "list": x64dbg_get_modules,
+        },
+        "disasm": {
+            "disassemble": x64dbg_disassemble,
+            "evaluate": x64dbg_evaluate_expression,
+            "goto": x64dbg_goto_address,
+            "graph": x64dbg_show_graph,
+            "instruction": x64dbg_get_instruction,
+            "navigate_disasm": x64dbg_navigate_disasm,
+            "navigate_dump": x64dbg_navigate_dump,
+        },
+        "search": {
+            "assembly": x64dbg_find_assembly,
+            "guid": x64dbg_find_guid,
+            "module_calls": x64dbg_find_module_calls,
+            "references": x64dbg_find_references_range,
+            "strings": x64dbg_find_string_references,
+        },
+        "analyze": {
+            "control_flow": x64dbg_analyze_control_flow,
+            "exception_handlers": x64dbg_get_exception_handlers,
+            "exception_info": x64dbg_get_exception_info,
+            "recursive": x64dbg_analyze_recursive,
+            "xrefs": x64dbg_analyze_xrefs,
+        },
+        "types": {
+            "add_member": x64dbg_add_member,
+            "add_struct": x64dbg_add_struct,
+            "add_union": x64dbg_add_union,
+            "clear": x64dbg_clear_types,
+            "list": x64dbg_list_types,
+            "load": x64dbg_load_types,
+            "parse": x64dbg_parse_types,
+            "remove": x64dbg_remove_type,
+            "sizeof": x64dbg_sizeof_type,
+            "view": x64dbg_view_type,
+        },
+        "trace": {
+            "api_calls": x64dbg_trace_api_calls,
+            "api_params": x64dbg_get_api_params,
+            "clear": x64dbg_clear_trace,
+            "execution": x64dbg_trace_execution,
+            "get": x64dbg_get_trace,
+            "into_conditional": x64dbg_trace_into_conditional,
+            "log_api_params": x64dbg_log_api_params,
+            "over_conditional": x64dbg_trace_over_conditional,
+            "set_command": x64dbg_set_trace_command,
+            "set_log": x64dbg_set_trace_log,
+            "set_log_file": x64dbg_set_trace_log_file,
+            "start": x64dbg_start_trace,
+            "stop": x64dbg_stop_trace,
+            "to_oep": x64dbg_trace_to_oep,
+        },
+        "annotate": {
+            "add_function": x64dbg_add_function,
+            "add_watch": x64dbg_add_watch,
+            "delete_bookmark": x64dbg_delete_bookmark,
+            "delete_function": x64dbg_delete_function,
+            "delete_variable": x64dbg_delete_variable,
+            "delete_watch": x64dbg_delete_watch,
+            "get_comment": x64dbg_get_comment,
+            "list_bookmarks": x64dbg_list_bookmarks,
+            "list_functions": x64dbg_list_functions,
+            "list_variables": x64dbg_list_variables,
+            "set_bookmark": x64dbg_set_bookmark,
+            "set_comment": x64dbg_set_comment,
+            "set_variable": x64dbg_set_variable,
+            "set_watchdog": x64dbg_set_watchdog,
+        },
+        "symbols": {
+            "bulk_resolve": x64dbg_bulk_resolve_functions,
+            "goto": x64dbg_goto_function,
+            "list_mappings": x64dbg_list_function_mappings,
+            "refresh_cache": x64dbg_refresh_function_cache,
+            "resolve_address": x64dbg_resolve_static_address,
+            "resolve_function": x64dbg_resolve_function,
+            "runtime_address": x64dbg_get_runtime_function_address,
+            "search": x64dbg_search_function,
+            "set_breakpoint": x64dbg_set_breakpoint_by_function,
+            "set_breakpoints": x64dbg_set_breakpoints_by_functions,
+        },
+        "hooks": {
+            "check": x64dbg_check_function_hook,
+            "detect": x64dbg_detect_hooks,
+            "unhook": x64dbg_unhook_function,
+        },
+    }
+
+    @app.tool(
+        description=_GROUP_DOCS["session"] + build_op_catalog(ops["session"]),
+    )
+    def x64dbg_session(
+        op: str,
+        profile: str | None = None,
+        hide_peb: bool | None = None,
+        patch_ntquery: bool | None = None,
+        fix_heap_flags: bool | None = None,
+        hide_threads: bool | None = None,
+        pid: int | None = None,
+        host: str | None = None,
+        port: int | None = None,
+        name: str | None = None,
+        command: str | None = None,
+        output_path: str | None = None,
+    ) -> str:
+        """
+        Debugger session: connect, attach, process state, anti-debug and privileges.
+
+        Pass the operation in `op`; pass only the arguments that
+        operation takes. Operations and their arguments are listed below.
+        """
+        return dispatch_op("session", ops["session"], op, {
+            "profile": _UNSET if profile is None else profile,
+            "hide_peb": _UNSET if hide_peb is None else hide_peb,
+            "patch_ntquery": _UNSET if patch_ntquery is None else patch_ntquery,
+            "fix_heap_flags": _UNSET if fix_heap_flags is None else fix_heap_flags,
+            "hide_threads": _UNSET if hide_threads is None else hide_threads,
+            "pid": _UNSET if pid is None else pid,
+            "host": _UNSET if host is None else host,
+            "port": _UNSET if port is None else port,
+            "name": _UNSET if name is None else name,
+            "command": _UNSET if command is None else command,
+            "output_path": _UNSET if output_path is None else output_path,
+        })
+
+    @app.tool(
+        description=_GROUP_DOCS["state"] + build_op_catalog(ops["state"]),
+    )
+    def x64dbg_state(
+        op: str,
+        state_id: str | None = None,
+        binary_filter: str | None = None,
+        restore_breakpoints: bool | None = None,
+        restore_comments: bool | None = None,
+        restore_labels: bool | None = None,
+        clear_existing: bool | None = None,
+        state_name: str | None = None,
+        include_breakpoints: bool | None = None,
+        include_comments: bool | None = None,
+        include_labels: bool | None = None,
+        include_watches: bool | None = None,
+    ) -> str:
+        """
+        Save and restore debugging state (breakpoints, comments, labels, watches).
+
+        Pass the operation in `op`; pass only the arguments that
+        operation takes. Operations and their arguments are listed below.
+        """
+        return dispatch_op("state", ops["state"], op, {
+            "state_id": _UNSET if state_id is None else state_id,
+            "binary_filter": _UNSET if binary_filter is None else binary_filter,
+            "restore_breakpoints": _UNSET if restore_breakpoints is None else restore_breakpoints,
+            "restore_comments": _UNSET if restore_comments is None else restore_comments,
+            "restore_labels": _UNSET if restore_labels is None else restore_labels,
+            "clear_existing": _UNSET if clear_existing is None else clear_existing,
+            "state_name": _UNSET if state_name is None else state_name,
+            "include_breakpoints": _UNSET if include_breakpoints is None else include_breakpoints,
+            "include_comments": _UNSET if include_comments is None else include_comments,
+            "include_labels": _UNSET if include_labels is None else include_labels,
+            "include_watches": _UNSET if include_watches is None else include_watches,
+        })
+
+    @app.tool(
+        description=_GROUP_DOCS["execution"] + build_op_catalog(ops["execution"]),
+    )
+    def x64dbg_execution(
+        op: str,
+        max_events: int | None = None,
+        timeout_seconds: int | None = None,
+        address: str | None = None,
+        event_types: str | None = None,
+        count: int | None = None,
+        steps: int | None = None,
+    ) -> str:
+        """
+        Run, step, and wait for the debuggee to reach a state.
+
+        Pass the operation in `op`; pass only the arguments that
+        operation takes. Operations and their arguments are listed below.
+        """
+        return dispatch_op("execution", ops["execution"], op, {
+            "max_events": _UNSET if max_events is None else max_events,
+            "timeout_seconds": _UNSET if timeout_seconds is None else timeout_seconds,
+            "address": _UNSET if address is None else address,
+            "event_types": _UNSET if event_types is None else event_types,
+            "count": _UNSET if count is None else count,
+            "steps": _UNSET if steps is None else steps,
+        })
+
+    @app.tool(
+        description=_GROUP_DOCS["breakpoint"] + build_op_catalog(ops["breakpoint"]),
+    )
+    def x64dbg_breakpoint(
+        op: str,
+        address: str | None = None,
+        dll_name: str | None = None,
+        exception_code: str | None = None,
+        addresses: list[str] | None = None,
+        limit: int | None = None,
+        function_name: str | None = None,
+        module: str | None = None,
+        condition: str | None = None,
+        log_template: str | None = None,
+        action: str | None = None,
+        singleshoot: bool | None = None,
+        chance: str | None = None,
+        bp_type: str | None = None,
+        size: int | None = None,
+        breakpoints: list[dict] | None = None,
+        enable: bool | None = None,
+    ) -> str:
+        """
+        Every kind of breakpoint: software, hardware, memory, DLL, exception, conditional.
+
+        Pass the operation in `op`; pass only the arguments that
+        operation takes. Operations and their arguments are listed below.
+        """
+        return dispatch_op("breakpoint", ops["breakpoint"], op, {
+            "address": _UNSET if address is None else address,
+            "dll_name": _UNSET if dll_name is None else dll_name,
+            "exception_code": _UNSET if exception_code is None else exception_code,
+            "addresses": _UNSET if addresses is None else addresses,
+            "limit": _UNSET if limit is None else limit,
+            "function_name": _UNSET if function_name is None else function_name,
+            "module": _UNSET if module is None else module,
+            "condition": _UNSET if condition is None else condition,
+            "log_template": _UNSET if log_template is None else log_template,
+            "action": _UNSET if action is None else action,
+            "singleshoot": _UNSET if singleshoot is None else singleshoot,
+            "chance": _UNSET if chance is None else chance,
+            "bp_type": _UNSET if bp_type is None else bp_type,
+            "size": _UNSET if size is None else size,
+            "breakpoints": _UNSET if breakpoints is None else breakpoints,
+            "enable": _UNSET if enable is None else enable,
+        })
+
+    @app.tool(
+        description=_GROUP_DOCS["memory"] + build_op_catalog(ops["memory"]),
+    )
+    def x64dbg_memory(
+        op: str,
+        size: int | None = None,
+        address: str | None = None,
+        watch_id: str | None = None,
+        show_bytes: bool | None = None,
+        max_diff_bytes: int | None = None,
+        output_file: str | None = None,
+        value: int | None = None,
+        protection: str | None = None,
+        timeout_seconds: int | None = None,
+        poll_interval_ms: int | None = None,
+        pattern: str | None = None,
+        region: str | None = None,
+        name: str | None = None,
+        data: str | None = None,
+    ) -> str:
+        """
+        Read, write, allocate, protect, search and watch process memory.
+
+        Pass the operation in `op`; pass only the arguments that
+        operation takes. Operations and their arguments are listed below.
+        """
+        return dispatch_op("memory", ops["memory"], op, {
+            "size": _UNSET if size is None else size,
+            "address": _UNSET if address is None else address,
+            "watch_id": _UNSET if watch_id is None else watch_id,
+            "show_bytes": _UNSET if show_bytes is None else show_bytes,
+            "max_diff_bytes": _UNSET if max_diff_bytes is None else max_diff_bytes,
+            "output_file": _UNSET if output_file is None else output_file,
+            "value": _UNSET if value is None else value,
+            "protection": _UNSET if protection is None else protection,
+            "timeout_seconds": _UNSET if timeout_seconds is None else timeout_seconds,
+            "poll_interval_ms": _UNSET if poll_interval_ms is None else poll_interval_ms,
+            "pattern": _UNSET if pattern is None else pattern,
+            "region": _UNSET if region is None else region,
+            "name": _UNSET if name is None else name,
+            "data": _UNSET if data is None else data,
+        })
+
+    @app.tool(
+        description=_GROUP_DOCS["context"] + build_op_catalog(ops["context"]),
+    )
+    def x64dbg_context(
+        op: str,
+        register: str | None = None,
+        value: str | None = None,
+        depth: int | None = None,
+    ) -> str:
+        """
+        CPU registers and the call stack of the active thread.
+
+        Pass the operation in `op`; pass only the arguments that
+        operation takes. Operations and their arguments are listed below.
+        """
+        return dispatch_op("context", ops["context"], op, {
+            "register": _UNSET if register is None else register,
+            "value": _UNSET if value is None else value,
+            "depth": _UNSET if depth is None else depth,
+        })
+
+    @app.tool(
+        description=_GROUP_DOCS["thread"] + build_op_catalog(ops["thread"]),
+    )
+    def x64dbg_thread(
+        op: str,
+        thread_id: str | None = None,
+    ) -> str:
+        """
+        List threads and control their execution.
+
+        Pass the operation in `op`; pass only the arguments that
+        operation takes. Operations and their arguments are listed below.
+        """
+        return dispatch_op("thread", ops["thread"], op, {
+            "thread_id": _UNSET if thread_id is None else thread_id,
+        })
+
+    @app.tool(
+        description=_GROUP_DOCS["module"] + build_op_catalog(ops["module"]),
+    )
+    def x64dbg_module(
+        op: str,
+        module_name: str | None = None,
+        output_path: str | None = None,
+        fix_pe: bool | None = None,
+        unmap_sections: bool | None = None,
+        rebuild_iat: bool | None = None,
+    ) -> str:
+        """
+        Loaded modules and their imports, exports and on-disk dumps.
+
+        Pass the operation in `op`; pass only the arguments that
+        operation takes. Operations and their arguments are listed below.
+        """
+        return dispatch_op("module", ops["module"], op, {
+            "module_name": _UNSET if module_name is None else module_name,
+            "output_path": _UNSET if output_path is None else output_path,
+            "fix_pe": _UNSET if fix_pe is None else fix_pe,
+            "unmap_sections": _UNSET if unmap_sections is None else unmap_sections,
+            "rebuild_iat": _UNSET if rebuild_iat is None else rebuild_iat,
+        })
+
+    @app.tool(
+        description=_GROUP_DOCS["disasm"] + build_op_catalog(ops["disasm"]),
+    )
+    def x64dbg_disasm(
+        op: str,
+        address: str | None = None,
+        count: int | None = None,
+        expression: str | None = None,
+        function_name: str | None = None,
+        module: str | None = None,
+    ) -> str:
+        """
+        Disassemble, evaluate expressions, and navigate the debugger UI.
+
+        Pass the operation in `op`; pass only the arguments that
+        operation takes. Operations and their arguments are listed below.
+        """
+        return dispatch_op("disasm", ops["disasm"], op, {
+            "address": _UNSET if address is None else address,
+            "count": _UNSET if count is None else count,
+            "expression": _UNSET if expression is None else expression,
+            "function_name": _UNSET if function_name is None else function_name,
+            "module": _UNSET if module is None else module,
+        })
+
+    @app.tool(
+        description=_GROUP_DOCS["search"] + build_op_catalog(ops["search"]),
+    )
+    def x64dbg_search(
+        op: str,
+        instruction: str | None = None,
+        address: str | None = None,
+        size: int | None = None,
+        module: str | None = None,
+    ) -> str:
+        """
+        Search the debuggee for instructions, GUIDs, strings and references.
+
+        Pass the operation in `op`; pass only the arguments that
+        operation takes. Operations and their arguments are listed below.
+        """
+        return dispatch_op("search", ops["search"], op, {
+            "instruction": _UNSET if instruction is None else instruction,
+            "address": _UNSET if address is None else address,
+            "size": _UNSET if size is None else size,
+            "module": _UNSET if module is None else module,
+        })
+
+    @app.tool(
+        description=_GROUP_DOCS["analyze"] + build_op_catalog(ops["analyze"]),
+    )
+    def x64dbg_analyze(
+        op: str,
+    ) -> str:
+        """
+        Run x64dbg's analysis passes and inspect exception state.
+
+        Pass the operation in `op`; pass only the arguments that
+        operation takes. Operations and their arguments are listed below.
+        """
+        return dispatch_op("analyze", ops["analyze"], op, {
+        })
+
+    @app.tool(
+        description=_GROUP_DOCS["types"] + build_op_catalog(ops["types"]),
+    )
+    def x64dbg_types(
+        op: str,
+        parent: str | None = None,
+        type_name: str | None = None,
+        member_name: str | None = None,
+        name: str | None = None,
+        filename: str | None = None,
+        definition: str | None = None,
+        address: str | None = None,
+    ) -> str:
+        """
+        Define, inspect and apply C types and structures.
+
+        Pass the operation in `op`; pass only the arguments that
+        operation takes. Operations and their arguments are listed below.
+        """
+        return dispatch_op("types", ops["types"], op, {
+            "parent": _UNSET if parent is None else parent,
+            "type_name": _UNSET if type_name is None else type_name,
+            "member_name": _UNSET if member_name is None else member_name,
+            "name": _UNSET if name is None else name,
+            "filename": _UNSET if filename is None else filename,
+            "definition": _UNSET if definition is None else definition,
+            "address": _UNSET if address is None else address,
+        })
+
+    @app.tool(
+        description=_GROUP_DOCS["trace"] + build_op_catalog(ops["trace"]),
+    )
+    def x64dbg_trace(
+        op: str,
+        apis: list[str] | None = None,
+        max_calls: int | None = None,
+        include_stack: bool | None = None,
+        api_name: str | None = None,
+        steps: int | None = None,
+        max_entries: int | None = None,
+        condition: str | None = None,
+        max_steps: int | None = None,
+        log_text: str | None = None,
+        log_condition: str | None = None,
+        command_text: str | None = None,
+        command_condition: str | None = None,
+        log_file: str | None = None,
+        api: str | None = None,
+        command: str | None = None,
+        text: str | None = None,
+        path: str | None = None,
+        trace_into: bool | None = None,
+    ) -> str:
+        """
+        Instruction and API tracing, trace conditions, and trace logs.
+
+        Pass the operation in `op`; pass only the arguments that
+        operation takes. Operations and their arguments are listed below.
+        """
+        return dispatch_op("trace", ops["trace"], op, {
+            "apis": _UNSET if apis is None else apis,
+            "max_calls": _UNSET if max_calls is None else max_calls,
+            "include_stack": _UNSET if include_stack is None else include_stack,
+            "api_name": _UNSET if api_name is None else api_name,
+            "steps": _UNSET if steps is None else steps,
+            "max_entries": _UNSET if max_entries is None else max_entries,
+            "condition": _UNSET if condition is None else condition,
+            "max_steps": _UNSET if max_steps is None else max_steps,
+            "log_text": _UNSET if log_text is None else log_text,
+            "log_condition": _UNSET if log_condition is None else log_condition,
+            "command_text": _UNSET if command_text is None else command_text,
+            "command_condition": _UNSET if command_condition is None else command_condition,
+            "log_file": _UNSET if log_file is None else log_file,
+            "api": _UNSET if api is None else api,
+            "command": _UNSET if command is None else command,
+            "text": _UNSET if text is None else text,
+            "path": _UNSET if path is None else path,
+            "trace_into": _UNSET if trace_into is None else trace_into,
+        })
+
+    @app.tool(
+        description=_GROUP_DOCS["annotate"] + build_op_catalog(ops["annotate"]),
+    )
+    def x64dbg_annotate(
+        op: str,
+        start: str | None = None,
+        end: str | None = None,
+        expression: str | None = None,
+        name: str | None = None,
+        address: str | None = None,
+        index: int | None = None,
+        comment: str | None = None,
+        value: str | None = None,
+        mode: str | None = None,
+    ) -> str:
+        """
+        Comments, bookmarks, user-defined functions, variables and watches.
+
+        Pass the operation in `op`; pass only the arguments that
+        operation takes. Operations and their arguments are listed below.
+        """
+        return dispatch_op("annotate", ops["annotate"], op, {
+            "start": _UNSET if start is None else start,
+            "end": _UNSET if end is None else end,
+            "expression": _UNSET if expression is None else expression,
+            "name": _UNSET if name is None else name,
+            "address": _UNSET if address is None else address,
+            "index": _UNSET if index is None else index,
+            "comment": _UNSET if comment is None else comment,
+            "value": _UNSET if value is None else value,
+            "mode": _UNSET if mode is None else mode,
+        })
+
+    @app.tool(
+        description=_GROUP_DOCS["symbols"] + build_op_catalog(ops["symbols"]),
+    )
+    def x64dbg_symbols(
+        op: str,
+        binary_path: str | None = None,
+        function_names: list[str] | None = None,
+        function_name: str | None = None,
+        filter_pattern: str | None = None,
+        limit: int | None = None,
+        show_external: bool | None = None,
+        static_address: str | None = None,
+        image_base: str | None = None,
+        pattern: str | None = None,
+        breakpoint_type: str | None = None,
+    ) -> str:
+        """
+        Bridge static analysis to the live process: resolve Ghidra functions to runtime addresses.
+
+        Pass the operation in `op`; pass only the arguments that
+        operation takes. Operations and their arguments are listed below.
+        """
+        return dispatch_op("symbols", ops["symbols"], op, {
+            "binary_path": _UNSET if binary_path is None else binary_path,
+            "function_names": _UNSET if function_names is None else function_names,
+            "function_name": _UNSET if function_name is None else function_name,
+            "filter_pattern": _UNSET if filter_pattern is None else filter_pattern,
+            "limit": _UNSET if limit is None else limit,
+            "show_external": _UNSET if show_external is None else show_external,
+            "static_address": _UNSET if static_address is None else static_address,
+            "image_base": _UNSET if image_base is None else image_base,
+            "pattern": _UNSET if pattern is None else pattern,
+            "breakpoint_type": _UNSET if breakpoint_type is None else breakpoint_type,
+        })
+
+    @app.tool(
+        description=_GROUP_DOCS["hooks"] + build_op_catalog(ops["hooks"]),
+    )
+    def x64dbg_hooks(
+        op: str,
+        function_name: str | None = None,
+        module: str | None = None,
+        modules: list[str] | None = None,
+        methods: list[str] | None = None,
+        check_inline: bool | None = None,
+        check_iat: bool | None = None,
+        check_eat: bool | None = None,
+        original_bytes: str | None = None,
+    ) -> str:
+        """
+        Detect, inspect and remove inline/IAT/EAT hooks.
+
+        Pass the operation in `op`; pass only the arguments that
+        operation takes. Operations and their arguments are listed below.
+        """
+        return dispatch_op("hooks", ops["hooks"], op, {
+            "function_name": _UNSET if function_name is None else function_name,
+            "module": _UNSET if module is None else module,
+            "modules": _UNSET if modules is None else modules,
+            "methods": _UNSET if methods is None else methods,
+            "check_inline": _UNSET if check_inline is None else check_inline,
+            "check_iat": _UNSET if check_iat is None else check_iat,
+            "check_eat": _UNSET if check_eat is None else check_eat,
+            "original_bytes": _UNSET if original_bytes is None else original_bytes,
+        })
+
+    global _OP_REGISTRY
+    _OP_REGISTRY = ops
+
+    logger.info(
+        f"Registered {len(ops)} grouped dynamic analysis tools "
+        f"covering {sum(len(v) for v in ops.values())} operations"
+    )

@@ -68,11 +68,18 @@ class ProviderConfig:
     base_url: str
 
     #: Header the key travels in: "x-apikey" (VirusTotal), "Auth-Key" (abuse.ch).
+    #: Empty for a provider that needs no credential at all.
     auth_header: str
 
     #: Config keys tried in order; the first one set wins. A tuple rather than
     #: a string so a provider can accept a new canonical name while still
     #: honouring the one an operator already has in their .env.
+    #:
+    #: EMPTY means the provider needs no credential -- MITRE ATT&CK is served
+    #: as static files from a public repository. A keyless provider still wants
+    #: everything else this client does (clamped timeout, bounded read, mapped
+    #: errors), so "no key" is a configuration, not a reason to hand-roll
+    #: another transport.
     key_config_keys: tuple[str, ...]
 
     #: Config key holding a socket-timeout override.
@@ -143,7 +150,12 @@ class IntegrationClient:
         ValueError rather than IntegrationError on purpose: an unconfigured
         key is the caller's problem to fix, and the tool handlers render it as
         "Configuration error: ..." rather than as a provider failure.
+
+        Returns "" for a keyless provider, which is not an error.
         """
+        if not self.config.key_config_keys:
+            return ""
+
         key = self.api_key()
         if key:
             return key
@@ -217,11 +229,12 @@ class IntegrationClient:
         api_key = self.require_key()
 
         headers = {
-            self.config.auth_header: api_key,
             "Accept": "application/json",
             "User-Agent": self.config.user_agent,
             **self.config.extra_headers,
         }
+        if api_key and self.config.auth_header:
+            headers[self.config.auth_header] = api_key
 
         body: bytes | None = None
         if form is not None:

@@ -535,6 +535,14 @@ _AST_ALLOWED_HANDLERS = {
     #     `_status_message()`, whose only variable part is a `query_status`
     #     token already constrained to `[a-z0-9_]{1,64}` before it is echoed.
     "AbuseChError",
+    #   * AttackDataError (src/tools/attack_tools.py) -- MITRE ATT&CK. Raise
+    #     sites: the curated sentences in that module (no bundle for <matrix>,
+    #     index pointed somewhere unexpected, bundle contained no objects, the
+    #     offline-without-cache message) plus the shared client's status-line
+    #     and network messages. The one path that could quote a filesystem path
+    #     -- a failed cache write -- is an OSError routed through
+    #     safe_path_error in the handler, not through this type.
+    "AttackDataError",
     #   * CoverageError (src/engines/static/ghidra/coverage_store.py) -- every
     #     raise site was audited when it was added here: "invariant violated:
     #     remaining != total - reviewed", "unknown examination kind 'x';

@@ -395,11 +395,29 @@ _TOOLS_DIR = Path(__file__).resolve().parent.parent / "src" / "tools"
 # including one this branch itself added that returned the Path.home()-derived
 # extraction root. Scanning it here is what stops that recurring.
 _SERVER_PY = Path(__file__).resolve().parent.parent / "src" / "server.py"
+_INTEGRATIONS_DIR = Path(__file__).resolve().parent.parent / "src" / "integrations"
 
 
 def _guarded_sources() -> list[Path]:
-    """Every file the F-10 guards must inspect: src/tools/*.py plus server.py."""
-    return sorted(_TOOLS_DIR.glob("*.py")) + [_SERVER_PY]
+    """
+    Every file the F-10 guards must inspect.
+
+    src/tools/*.py plus server.py, plus src/integrations/*.py.
+
+    The integrations package was added when the per-provider HTTP plumbing was
+    factored out of vt_tools and mb_tools. Both of those are inside the guard;
+    the shared layer they moved INTO was not, so the refactor would have
+    silently carried error-message construction out of scope -- and the
+    transport is precisely where a raw urllib exception, with whatever host
+    detail it carries, is most likely to get interpolated into a message. A
+    guard that a refactor can walk out of is the hole this file already warns
+    about elsewhere.
+    """
+    return (
+        sorted(_TOOLS_DIR.glob("*.py"))
+        + sorted(_INTEGRATIONS_DIR.glob("*.py"))
+        + [_SERVER_PY]
+    )
 
 # Exception types whose messages are raised by this project's own validators.
 # Those are deliberately echoed verbatim (see the F-10 comments in the tool

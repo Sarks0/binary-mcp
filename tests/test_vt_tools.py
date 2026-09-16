@@ -21,6 +21,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from src.integrations import base as integration_base
 from src.tools import vt_tools
 from src.tools.vt_tools import (
     VirusTotalError,
@@ -30,10 +31,29 @@ from src.tools.vt_tools import (
     normalise_hash,
     render_observation,
 )
+from tests.integration_stubs import (
+    FakeResponse,
+    capture_requests,
+    raise_http,
+    shrink_response_cap,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _capture_requests(monkeypatch, payload: dict | None = None) -> list:
+    """Record requests vt_tools builds, answering each with payload."""
+    return capture_requests(
+        monkeypatch, vt_tools._client,
+        payload if payload is not None else {"data": {}},
+        api_key="k" * 64,
+    )
+
+
+def _raise_http(monkeypatch, code, payload: dict | None = None) -> None:
+    raise_http(monkeypatch, vt_tools._client, int(code), payload, api_key="k" * 64)
 
 
 def _register(monkeypatch) -> dict:
@@ -50,40 +70,6 @@ def _register(monkeypatch) -> dict:
     app.tool = MagicMock(side_effect=tool_decorator)
     vt_tools.register_vt_tools(app, MagicMock())
     return registered
-
-
-class _FakeResponse:
-    def __init__(self, payload: bytes):
-        self._payload = payload
-
-    def read(self, amount: int | None = None) -> bytes:
-        return self._payload if amount is None else self._payload[:amount]
-
-    def close(self) -> None:
-        # HTTPError wraps the fp it is handed in a tempfile closer, which calls
-        # close() on garbage collection; without it pytest reports an
-        # unraisable AttributeError from the finaliser.
-        return None
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_exc):
-        return False
-
-
-def _capture_requests(monkeypatch, payload: dict | None = None) -> list:
-    """Record every urllib Request vt_tools builds, answering each with payload."""
-    seen: list = []
-    body = json.dumps(payload if payload is not None else {"data": {}}).encode()
-
-    def fake_urlopen(req, timeout=None):
-        seen.append(req)
-        return _FakeResponse(body)
-
-    monkeypatch.setattr(vt_tools, "urlopen", fake_urlopen)
-    monkeypatch.setattr(vt_tools, "_get_api_key", lambda: "k" * 64)
-    return seen
 
 
 # ---------------------------------------------------------------------------
@@ -401,22 +387,6 @@ def test_vt_error_detail_tolerates_a_non_conforming_body(body):
     assert _vt_error_detail(body) == ""
 
 
-def _raise_http(monkeypatch, code: str | int, payload: dict | None = None):
-    from urllib.error import HTTPError
-
-    def fake_urlopen(req, timeout=None):
-        raise HTTPError(
-            req.full_url,
-            int(code),
-            "Status",
-            {},
-            None if payload is None else _FakeResponse(json.dumps(payload).encode()),
-        )
-
-    monkeypatch.setattr(vt_tools, "urlopen", fake_urlopen)
-    monkeypatch.setattr(vt_tools, "_get_api_key", lambda: "k" * 64)
-
-
 def test_premium_only_endpoint_reports_a_missing_privilege(monkeypatch):
     """
     /intelligence/search is Enterprise-only; a public key gets 403.
@@ -447,19 +417,21 @@ def test_missing_hash_still_reports_not_found(monkeypatch):
 
 
 def test_oversize_response_is_refused(monkeypatch):
-    monkeypatch.setattr(vt_tools, "_get_api_key", lambda: "k" * 64)
-    monkeypatch.setattr(vt_tools, "VT_MAX_RESPONSE_BYTES", 16)
+    _capture_requests(monkeypatch)
+    shrink_response_cap(monkeypatch, vt_tools._client, 16)
     monkeypatch.setattr(
-        vt_tools, "urlopen", lambda req, timeout=None: _FakeResponse(b"x" * 64)
+        integration_base, "urlopen", lambda req, timeout=None: FakeResponse(b"x" * 64)
     )
     with pytest.raises(VirusTotalError, match="response cap"):
         vt_tools.lookup_hash("a" * 64)
 
 
 def test_non_json_response_is_reported_as_such(monkeypatch):
-    monkeypatch.setattr(vt_tools, "_get_api_key", lambda: "k" * 64)
+    _capture_requests(monkeypatch)
     monkeypatch.setattr(
-        vt_tools, "urlopen", lambda req, timeout=None: _FakeResponse(b"<html>502</html>")
+        integration_base,
+        "urlopen",
+        lambda req, timeout=None: FakeResponse(b"<html>502</html>"),
     )
     with pytest.raises(VirusTotalError, match="not JSON"):
         vt_tools.lookup_hash("a" * 64)

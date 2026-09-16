@@ -6,8 +6,85 @@ on:
       - 'v*.*.*'
 
 jobs:
+  # A tag is the only thing standing between a commit and releases/latest, and
+  # until this job existed nothing checked WHICH commit it pointed at. Both
+  # v1.1.0-rc1 and v1.1.0-rc2 were tagged on branch commits that were not on
+  # main, and each published a real release -- which was deliberate for a
+  # release candidate, and would have been an accident for a full one.
+  #
+  # So the rule matches how this repo actually works rather than forbidding it:
+  # a PRERELEASE may be cut from any commit, because trialling an unmerged
+  # branch build is the entire point of one. A FULL release must be an ancestor
+  # of main, because it takes over releases/latest and the installers serve it
+  # to everyone.
+  guard:
+    name: Verify the tag is releasable
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        # The ancestry test needs real history; the default depth-1 checkout
+        # has no main to compare against.
+        fetch-depth: 0
+
+    - name: Reject a full release that is not on main
+      run: |
+        set -euo pipefail
+        # Semver's own definition: a version carrying a hyphen suffix is a
+        # pre-release. Matching on the tag NAME, not the full ref, so nothing
+        # in refs/tags/ can accidentally satisfy it.
+        if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
+          echo "Prerelease tag ${GITHUB_REF_NAME}: any commit may be released."
+          exit 0
+        fi
+
+        git fetch --no-tags origin main
+        if git merge-base --is-ancestor "${GITHUB_SHA}" origin/main; then
+          echo "${GITHUB_REF_NAME} (${GITHUB_SHA}) is on main."
+        else
+          echo "::error::${GITHUB_REF_NAME} points at ${GITHUB_SHA}, which is not an ancestor of main." >&2
+          echo "A full release takes over releases/latest, so it must be a commit that was merged." >&2
+          echo "Merge it first, or cut a prerelease (a tag carrying a '-' suffix) instead." >&2
+          exit 1
+        fi
+
+  # The suite that gates every PR did not gate the release: create-release
+  # needed only build-plugin, so a tag on a commit whose tests fail shipped
+  # anyway. The tagged commit is usually one CI already passed, but "usually"
+  # is not a check -- and nothing tied the tag to that run.
+  test:
+    name: Test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v5
+      with:
+        enable-cache: true
+
+    - name: Install dependencies
+      run: uv sync --extra dev
+
+    - name: Lint with ruff
+      run: uv run ruff check src/ tests/
+
+    - name: Run tests
+      run: uv run pytest -q
+
   build-plugin:
     name: Build x64dbg Plugin
+    needs: [guard, test]
     runs-on: windows-latest
 
     steps:
@@ -142,6 +219,10 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
+      with:
+        # Release notes are derived from the commits since the previous tag,
+        # which a depth-1 checkout cannot see.
+        fetch-depth: 0
 
     - name: Download Build Artifacts
       uses: actions/download-artifact@v4
@@ -282,23 +363,94 @@ jobs:
         sha256sum -c SHA256SUMS
         cat SHA256SUMS
 
+    # These notes used to be a static heredoc: every release shipped the same
+    # body, so nothing told a reader what changed between two versions. It also
+    # rotted -- it still advertised "15+ analysis tools" long after the count
+    # moved -- and, worst of all, v1.1.0 removed 159 tool names and the notes
+    # said nothing at all about it. A user upgrading found out when their calls
+    # started failing.
+    #
+    # What stays hardcoded is only what is TRUE OF EVERY RELEASE: how to verify
+    # the assets and how to install them. Anything version-specific is derived
+    # from the commits, so it cannot drift from what actually shipped.
     - name: Create Release Notes
+      env:
+        VERSION: ${{ steps.version.outputs.version }}
       run: |
-        cat > release_notes.md << 'NOTES_EOF'
-        ## Binary MCP Server Release
+        set -euo pipefail
 
-        ### Complete Package
+        # The previous release to describe changes against. Two rules:
+        #
+        # Same kind: a FULL release spans from the last full release, not from
+        # its own release candidate, or the notes would cover only the
+        # rc-to-final delta and omit everything the rc itself introduced.
+        #
+        # Strictly below: walk down from this tag's own position in version
+        # order rather than taking "the highest tag that is not this one" --
+        # otherwise a patch tagged on an older line would compare against a
+        # NEWER release and describe the range backwards.
+        if [[ "${VERSION}" == *-* ]]; then FULL_ONLY=0; else FULL_ONLY=1; fi
+        # versionsort.suffix=- makes git order a hyphen-suffixed tag BELOW the
+        # release it precedes (1.2.0-rc1 < 1.2.0), which is semver's rule and
+        # the opposite of git's default -- by default the longer string sorts
+        # higher, so an rc would be treated as newer than its own final.
+        PREV=$(git -c versionsort.suffix=- tag --list --sort=-v:refname | awk \
+          -v cur="${VERSION}" -v full_only="${FULL_ONLY}" '
+            seen && (full_only == 0 || $0 !~ /-/) { print; exit }
+            $0 == cur { seen = 1 }
+          ')
+        echo "Previous tag: ${PREV:-<none>}"
 
-        This release includes everything you need:
-        - **MCP Server source code** - Full binary analysis server
-        - **Obsidian** - Pre-built x64dbg plugins in `obsidian-plugins/` directory
-          - `obsidian.dp64` - 64-bit debugger plugin
-          - `obsidian.dp32` - 32-bit debugger plugin
-          - `obsidian_server.exe` - HTTP server (external process architecture)
+        # Commit subjects and bodies in range, for the breaking-change scan.
+        if [[ -n "${PREV}" ]]; then
+          RANGE="${PREV}..HEAD"
+        else
+          RANGE="HEAD"
+        fi
 
-        ### Verifying this release
+        # A breaking change is the one thing a reader MUST not miss, and it is
+        # exactly what an auto-generated commit list buries: the squash commit
+        # that deleted 159 tool names has a title about consolidation, and the
+        # word BREAKING appears only in its body.
+        #
+        # Read as a conventional-commits footer: a line BEGINNING with
+        # "BREAKING CHANGE:" or "BREAKING:", continuing over wrapped lines
+        # until a blank line, so a footer that runs to three lines is not
+        # clipped to its first. Anchored at the line start deliberately -- the
+        # token mid-sentence in running prose is a description of a break, not
+        # a declaration of one, and matching it would pull out fragments.
+        git log "${RANGE}" --format='%B%n~~COMMIT~~' \
+          | awk '
+              /^~~COMMIT~~$/ { if (buf != "") { print buf; buf = "" } ; next }
+              /^[[:space:]]*$/ { if (buf != "") { print buf; buf = "" } ; next }
+              {
+                line = $0
+                if (buf != "") { sub(/^[[:space:]]+/, "", line); buf = buf " " line; next }
+                if (match(line, /^BREAKING( CHANGE)?:[[:space:]]*/)) {
+                  buf = "- " substr(line, RSTART + RLENGTH)
+                }
+              }
+              END { if (buf != "") print buf }
+            ' \
+          | sed -E 's/[[:space:]]+$//' \
+          | sort -u > breaking.txt || true
 
-        `SHA256SUMS` lists the SHA-256 of every asset above. Download it
+        : > release_notes.md
+        if [[ -s breaking.txt ]]; then
+          {
+            echo "## Breaking changes"
+            echo
+            cat breaking.txt
+            echo
+            echo "Read these before upgrading."
+            echo
+          } >> release_notes.md
+        fi
+
+        cat >> release_notes.md << 'NOTES_EOF'
+        ## Verifying this release
+
+        `SHA256SUMS` lists the SHA-256 of every asset below. Download it
         alongside the assets and check them before running anything:
 
         ```bash
@@ -313,7 +465,7 @@ jobs:
         `obsidian_server.exe` against this manifest automatically, and refuses to
         install a plugin the manifest does not cover.
 
-        ### Installation
+        ## Installing
 
         **Option 1: Clone the repository (recommended)**
         ```bash
@@ -334,45 +486,50 @@ jobs:
         network returned with no copy on disk to inspect, and on Windows it runs
         elevated. See `INSTALL.md` -> Supply-Chain Integrity.
 
-        **Option 3: Manual Installation**
-        1. Download and extract `binary-mcp-${{ steps.version.outputs.version }}.zip` (verify it against `SHA256SUMS` first)
-        2. Follow instructions in `INSTALL.md`
-        3. For Obsidian x64dbg plugins, see `obsidian-plugins/README.md`
-
-        ### Features
-
-        **Static Analysis (Ghidra):**
-        - 15+ analysis tools
-        - Function decompilation
-        - API call detection
-        - Crypto constant identification
-
-        **Dynamic Analysis (Obsidian for x64dbg):**
-        - Live debugging control
-        - Breakpoint management
-        - Memory inspection
-        - Instruction tracing & API logging
-        - Anti-debug bypass
-        - Code coverage analysis
-
-        ### Requirements
-
-        - Python 3.12+
-        - Java 21+ (for Ghidra)
-        - Ghidra (auto-detected or set GHIDRA_HOME)
-        - x64dbg (optional, for dynamic analysis on Windows)
-
-        ### Documentation
-
-        - [Installation Guide](https://github.com/Sarks0/binary-mcp/blob/main/INSTALL.md)
-        - [README](https://github.com/Sarks0/binary-mcp/blob/main/README.md)
+        **Option 3: Manual installation**
         NOTES_EOF
+
+        {
+          echo "1. Download and extract \`binary-mcp-${VERSION}.zip\` (verify it against \`SHA256SUMS\` first)"
+          echo "2. Follow the instructions in \`INSTALL.md\`"
+          echo "3. For the Obsidian x64dbg plugins, see \`obsidian-plugins/README.md\`"
+          echo
+          echo "The x64dbg plugin binaries in this release report version"
+          echo "\`${VERSION#v}\` over \`/api/status\`, so you can confirm which build"
+          echo "a debugger has actually loaded."
+          echo
+          echo "## Requirements"
+          echo
+          echo "- Python 3.12+"
+          echo "- Java 21+ (for Ghidra)"
+          echo "- Ghidra (auto-detected, or set GHIDRA_HOME)"
+          echo "- x64dbg (optional, for dynamic analysis on Windows)"
+          echo
+          echo "## Documentation"
+          echo
+          echo "- [Installation guide](https://github.com/Sarks0/binary-mcp/blob/main/INSTALL.md)"
+          echo "- [README](https://github.com/Sarks0/binary-mcp/blob/main/README.md)"
+        } >> release_notes.md
+
+        if [[ -n "${PREV}" ]]; then
+          echo >> release_notes.md
+          echo "**Full diff**: https://github.com/Sarks0/binary-mcp/compare/${PREV}...${VERSION}" >> release_notes.md
+        fi
+
+        echo "--- release_notes.md ---"
+        cat release_notes.md
 
     - name: Create Release
       uses: softprops/action-gh-release@v2
       with:
         name: obsidian-${{ steps.version.outputs.version }}
         body_path: release_notes.md
+        # Appends GitHub's own "What's Changed" -- the merged PRs and commits
+        # since the previous release -- underneath the body above. This is the
+        # part that was missing entirely: the notes are now derived from what
+        # shipped rather than restating a fixed feature list that nobody
+        # remembers to update.
+        generate_release_notes: true
         # F-3: upload from dist/ - the exact directory the SHA256SUMS step
         # hashed - so the published manifest cannot describe a different copy of
         # the assets than the one users download.
@@ -383,6 +540,11 @@ jobs:
           dist/obsidian.dp32
           dist/obsidian_server.exe
         draft: false
-        prerelease: ${{ contains(github.ref, '-rc') }}
+        # Any hyphen suffix means pre-release, per semver -- not just '-rc'.
+        # The guard job decides what may be released on the same rule, and the
+        # two disagreeing would be worse than either: a 'v1.2.0-beta' tag would
+        # clear the guard as a prerelease and then publish as a full release,
+        # taking over releases/latest.
+        prerelease: ${{ contains(steps.version.outputs.version, '-') }}
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

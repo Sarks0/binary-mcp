@@ -26,20 +26,20 @@ Requires the VT_API_KEY environment variable (or a .env entry).
 import hashlib
 import json
 import logging
-import re
 from datetime import UTC, datetime
 from pathlib import Path
-from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlencode
-from urllib.request import Request, urlopen
+from urllib.error import HTTPError
+from urllib.parse import quote
 
+from src.integrations import IntegrationClient, IntegrationError, ProviderConfig
+from src.integrations.hashes import normalise_hash
 from src.tools.error_hygiene import safe_path_error
 from src.utils.formatters import wrap_untrusted
 
 logger = logging.getLogger(__name__)
 
 
-class VirusTotalError(RuntimeError):
+class VirusTotalError(IntegrationError):
     """
     A VirusTotal API failure whose message this module wrote itself.
 
@@ -68,18 +68,6 @@ VT_DEFAULT_TIMEOUT = 30
 #: unbounded into memory is the failure mode worth refusing outright.
 VT_MAX_RESPONSE_BYTES = 32 * 1024 * 1024
 
-#: VT accepts an MD5, SHA-1 or SHA-256 as a file object's ``id``.
-#:
-#: The length check this replaces (``len(h) not in (32, 40, 64)``) let any
-#: 32/40/64-character string through and then interpolated it straight into
-#: the request path. ``"a" * 30 + "/x?"`` is 33 characters, so it failed --
-#: but ``"..%2f" * n``-style values, or anything containing ``/``, ``?`` or
-#: ``#`` at one of the three accepted lengths, reached the URL builder and
-#: could address a different endpoint (or append query parameters) on VT's
-#: API. The host is hardcoded so this is not SSRF, but "this argument is a
-#: hash" is a claim the code should actually enforce, not merely measure.
-_HASH_RE = re.compile(r"\A(?:[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64})\Z")
-
 #: Maximum ``limit`` VT accepts on an Intelligence search page.
 VT_SEARCH_MAX_LIMIT = 300
 
@@ -90,42 +78,59 @@ _BEHAVIOUR_SECTION_LIMIT = 10
 _DETECTIONS_SHOWN = 15
 
 
+class _VirusTotalClient(IntegrationClient):
+    """VirusTotal's status codes, which say more than the shared defaults."""
+
+    def map_http_error(self, error: HTTPError) -> Exception:
+        # Read the body once: VT's own error sentence is more useful than the
+        # status line, and on 4xx it is the only thing that distinguishes
+        # "wrong key" from "key without this privilege".
+        detail = _vt_error_detail(self.read_error_body(error))
+        suffix = f" ({detail})" if detail else ""
+
+        if error.code == 404:
+            return VirusTotalError("Hash not found in VirusTotal database")
+        if error.code == 400:
+            return VirusTotalError(f"VirusTotal rejected the request{suffix}")
+        if error.code == 401:
+            return VirusTotalError(f"Invalid VirusTotal API key{suffix}")
+        if error.code == 403:
+            return VirusTotalError(
+                "VirusTotal denied this request: the API key lacks the "
+                f"privilege it needs{suffix}"
+            )
+        if error.code == 429:
+            return VirusTotalError(
+                "VirusTotal API rate limit exceeded. The public API allows "
+                f"4 requests/minute and 500/day; wait and retry{suffix}"
+            )
+        if error.code in (503, 504):
+            return VirusTotalError(
+                f"VirusTotal is temporarily unavailable ({error.code}){suffix}"
+            )
+        return VirusTotalError(
+            f"VirusTotal API error: {error.code} {error.reason}{suffix}"
+        )
+
+
+_client = _VirusTotalClient(
+    ProviderConfig(
+        name="VirusTotal",
+        base_url=VT_API_BASE,
+        auth_header="x-apikey",
+        key_config_keys=(VT_API_KEY_ENV,),
+        timeout_config_key=VT_TIMEOUT_ENV,
+        key_hint="Get a key from https://www.virustotal.com/gui/my-apikey",
+        default_timeout=VT_DEFAULT_TIMEOUT,
+        max_response_bytes=VT_MAX_RESPONSE_BYTES,
+    ),
+    VirusTotalError,
+)
+
+
 def _get_api_key() -> str | None:
     """Get VirusTotal API key from .env file or environment."""
-    from src.utils.config import get_config
-    return get_config(VT_API_KEY_ENV)
-
-
-def _get_timeout() -> int:
-    """Socket timeout for VT calls, clamped to a sane range."""
-    from src.utils.config import get_config_int
-    timeout = get_config_int(VT_TIMEOUT_ENV, VT_DEFAULT_TIMEOUT)
-    return max(5, min(timeout, 300))
-
-
-def normalise_hash(file_hash: str) -> str:
-    """
-    Lower-case, strip and validate a file hash used as a VT object id.
-
-    Args:
-        file_hash: MD5, SHA-1 or SHA-256, in any case, optionally padded.
-
-    Returns:
-        The canonical lower-case hash.
-
-    Raises:
-        ValueError: If the value is not a hex MD5/SHA-1/SHA-256. The message
-            is a validation message the model needs in order to correct its
-            own call, so it is deliberately specific (audit F-10 keeps this
-            class of message; it quotes no host state).
-    """
-    candidate = (file_hash or "").strip().lower()
-    if not _HASH_RE.match(candidate):
-        raise ValueError(
-            f"Invalid hash: {len(candidate)} characters. Expected a hex "
-            "MD5 (32), SHA1 (40) or SHA256 (64) with no other characters."
-        )
-    return candidate
+    return _client.api_key()
 
 
 def _vt_error_detail(body: bytes) -> str:
@@ -157,18 +162,22 @@ def _vt_error_detail(body: bytes) -> str:
 def _vt_request(
     endpoint: str,
     method: str = "GET",
-    data: bytes | None = None,
     params: dict | None = None,
 ) -> dict:
     """
-    Make a request to VirusTotal API.
+    Make a request to the VirusTotal API.
+
+    Transport, auth, timeout, the response cap and error mapping all live in
+    :class:`src.integrations.base.IntegrationClient` now; this stays as the
+    module's single call site so ``tests/test_docs_accuracy.py`` still has one
+    place to assert that no caller ever passes a non-GET method -- the check
+    that backs the README's "samples are never uploaded" claim.
 
     Args:
         endpoint: API endpoint path, already URL-safe (e.g. "/files/{id}")
         method: HTTP method
-        data: Request body for POST
-        params: Query-string parameters; encoded here rather than by the
-            caller so no caller has to remember to escape them.
+        params: Query-string parameters; encoded by the client rather than by
+            the caller so no caller has to remember to escape them.
 
     Returns:
         JSON response as dict
@@ -177,74 +186,7 @@ def _vt_request(
         ValueError: If API key not configured
         VirusTotalError: If the API request fails
     """
-    api_key = _get_api_key()
-    if not api_key:
-        raise ValueError(
-            f"VirusTotal API key not configured. "
-            f"Set {VT_API_KEY_ENV} environment variable."
-        )
-
-    url = f"{VT_API_BASE}{endpoint}"
-    if params:
-        url = f"{url}?{urlencode(params)}"
-
-    headers = {
-        "x-apikey": api_key,
-        "Accept": "application/json",
-        "User-Agent": "binary-mcp",
-    }
-
-    if data:
-        headers["Content-Type"] = "application/json"
-
-    req = Request(url, data=data, headers=headers, method=method)
-
-    try:
-        with urlopen(req, timeout=_get_timeout()) as response:  # nosec B310 - VT API URL is hardcoded
-            body = response.read(VT_MAX_RESPONSE_BYTES + 1)
-        if len(body) > VT_MAX_RESPONSE_BYTES:
-            raise VirusTotalError(
-                "VirusTotal response exceeded the "
-                f"{VT_MAX_RESPONSE_BYTES // (1024 * 1024)}MB response cap"
-            )
-        return json.loads(body.decode("utf-8"))
-    except HTTPError as e:
-        # Read the body once: VT's own error sentence is more useful than the
-        # status line, and on 4xx it is the only thing that distinguishes
-        # "wrong key" from "key without this privilege".
-        try:
-            detail = _vt_error_detail(e.read())
-        except Exception:  # nosec B110 - detail is best-effort enrichment
-            detail = ""
-        suffix = f" ({detail})" if detail else ""
-
-        if e.code == 404:
-            raise VirusTotalError("Hash not found in VirusTotal database")
-        elif e.code == 400:
-            raise VirusTotalError(f"VirusTotal rejected the request{suffix}")
-        elif e.code == 401:
-            raise VirusTotalError(f"Invalid VirusTotal API key{suffix}")
-        elif e.code == 403:
-            raise VirusTotalError(
-                "VirusTotal denied this request: the API key lacks the "
-                f"privilege it needs{suffix}"
-            )
-        elif e.code == 429:
-            raise VirusTotalError(
-                "VirusTotal API rate limit exceeded. The public API allows "
-                "4 requests/minute and 500/day; wait and retry"
-                f"{suffix}"
-            )
-        elif e.code in (503, 504):
-            raise VirusTotalError(
-                f"VirusTotal is temporarily unavailable ({e.code}){suffix}"
-            )
-        else:
-            raise VirusTotalError(f"VirusTotal API error: {e.code} {e.reason}{suffix}")
-    except URLError as e:
-        raise VirusTotalError(f"Network error connecting to VirusTotal: {e.reason}")
-    except json.JSONDecodeError:
-        raise VirusTotalError("VirusTotal returned a response that was not JSON")
+    return _client.request(endpoint, method=method, params=params).payload
 
 
 def calculate_file_hashes(file_path: str) -> dict:

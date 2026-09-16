@@ -1049,6 +1049,13 @@ _SAMPLE_TEXT_MODULES = {
 # a module drifting into neither set and being silently unasserted.
 _NO_SAMPLE_TEXT_MODULES: dict[str, str] = {
     "error_hygiene": "helper module, defines no tools and returns no sample text",
+    # ATT&CK is the one network source in this server whose content is NOT
+    # attacker-authored: it is a curated knowledge base written by MITRE and
+    # served as static STIX files, in the same category as the sandbox-vendor
+    # verdicts vt_behavior deliberately leaves outside its envelope. Nothing
+    # from a sample reaches these tools -- their inputs are an ATT&CK ID
+    # validated against a regex, or a search term supplied by the caller.
+    "attack_tools": "renders MITRE-authored knowledge-base text, not sample-derived content",
     # job_tools constructs no sample-derived text of its own: job_result hands
     # back the payload the PRODUCING tool put in the job record, and job_tools
     # cannot know which of a payload's fields came from the binary. The fence

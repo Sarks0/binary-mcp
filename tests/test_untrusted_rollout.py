@@ -1021,6 +1021,7 @@ class TestDotnetToolsEnvelope:
 # module genuinely does not emit sample text, take it out of this set with a
 # comment saying why, rather than leaving it in and unasserted.
 _SAMPLE_TEXT_MODULES = {
+    "abusech_tools",
     "control_flow_tools",
     "diff_tools",
     "dispatch_tools",

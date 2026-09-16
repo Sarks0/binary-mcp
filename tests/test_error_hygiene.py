@@ -528,6 +528,13 @@ _AST_ALLOWED_HANDLERS = {
     #     ``_status_message()``, whose only variable part is a ``query_status``
     #     token already constrained to ``[a-z0-9_]{1,64}`` before it is echoed.
     "MalwareBazaarError",
+    #   * AbuseChError (src/tools/abusech_tools.py) -- ThreatFox, URLhaus and
+    #     YARAify, audited together because they share one transport and one
+    #     failure vocabulary. Raise sites: the curated sentences in that
+    #     module, the shared client's status-line and network messages, and
+    #     `_status_message()`, whose only variable part is a `query_status`
+    #     token already constrained to `[a-z0-9_]{1,64}` before it is echoed.
+    "AbuseChError",
     #   * CoverageError (src/engines/static/ghidra/coverage_store.py) -- every
     #     raise site was audited when it was added here: "invariant violated:
     #     remaining != total - reviewed", "unknown examination kind 'x';

@@ -1,7 +1,7 @@
 """
 Binary MCP Server for comprehensive binary analysis.
 
-Provides 152 tools for static and dynamic binary analysis:
+Provides 161 tools for static and dynamic binary analysis:
 - Static analysis via Ghidra (headless mode) for native binaries
 - Static analysis via ILSpyCmd for .NET assemblies
 - Dynamic analysis via x64dbg (native plugin)
@@ -45,6 +45,7 @@ from src.engines.static.ghidra.coverage_store import CoverageStore, has_reviewab
 from src.engines.static.ghidra.coverage_store import auto_mark as auto_mark_reviewed
 from src.engines.static.ghidra.project_cache import ProjectCache
 from src.engines.static.ghidra.runner import GhidraAnalysisError, GhidraRunner
+from src.tools.abusech_tools import register_abusech_tools
 from src.tools.control_flow_tools import register_control_flow_tools
 from src.tools.coverage_tools import register_coverage_tools
 from src.tools.diff_tools import register_diff_tools
@@ -6073,6 +6074,10 @@ def main():
 
     # Register MalwareBazaar tools (sample lookup, corpus pivots, opt-in download)
     register_mb_tools(app, session_manager)
+
+    # Register the rest of abuse.ch: ThreatFox IOCs, URLhaus distribution,
+    # YARAify rule matching -- all on the same Auth-Key as MalwareBazaar
+    register_abusech_tools(app, session_manager)
 
     # Register triage tools
     register_triage_tools(app, session_manager)

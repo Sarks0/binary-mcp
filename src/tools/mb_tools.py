@@ -65,6 +65,12 @@ class MalwareBazaarError(IntegrationError):
 
 
 MB_API_BASE = "https://mb-api.abuse.ch/api/v1/"
+
+#: One abuse.ch Auth-Key covers MalwareBazaar, ThreatFox, URLhaus, YARAify
+#: and SSLBL, so the canonical variable is service-neutral. MB_API_KEY is
+#: still honoured: it shipped first, and silently ignoring a variable an
+#: operator already set is a worse failure than carrying an alias.
+ABUSECH_API_KEY_ENV = "ABUSECH_API_KEY"
 MB_API_KEY_ENV = "MB_API_KEY"
 MB_TIMEOUT_ENV = "MB_API_TIMEOUT"
 MB_ALLOW_DOWNLOAD_ENV = "MB_ALLOW_DOWNLOAD"
@@ -139,17 +145,17 @@ _STATUS_MESSAGES: dict[str, str] = {
         "MalwareBazaar expected a POST. This is a bug in binary-mcp, not in your input."
     ),
     "no_auth_key": (
-        f"MalwareBazaar requires an Auth-Key. Set {MB_API_KEY_ENV} "
+        f"MalwareBazaar requires an Auth-Key. Set {ABUSECH_API_KEY_ENV} "
         "(free from https://auth.abuse.ch/)."
     ),
     "unknown_auth_key": (
-        f"MalwareBazaar rejected the Auth-Key. Check {MB_API_KEY_ENV}."
+        f"MalwareBazaar rejected the Auth-Key. Check {ABUSECH_API_KEY_ENV}."
     ),
     "invalid_auth_key": (
-        f"MalwareBazaar rejected the Auth-Key. Check {MB_API_KEY_ENV}."
+        f"MalwareBazaar rejected the Auth-Key. Check {ABUSECH_API_KEY_ENV}."
     ),
     "unauthorized": (
-        f"MalwareBazaar rejected the Auth-Key. Check {MB_API_KEY_ENV}."
+        f"MalwareBazaar rejected the Auth-Key. Check {ABUSECH_API_KEY_ENV}."
     ),
 }
 
@@ -160,7 +166,7 @@ class _MalwareBazaarClient(IntegrationClient):
     def map_http_error(self, error: HTTPError) -> Exception:
         if error.code == 401:
             return MalwareBazaarError(
-                f"MalwareBazaar rejected the Auth-Key. Check {MB_API_KEY_ENV}."
+                f"MalwareBazaar rejected the Auth-Key. Check {ABUSECH_API_KEY_ENV}."
             )
         if error.code == 429:
             return MalwareBazaarError(
@@ -176,7 +182,7 @@ _client = _MalwareBazaarClient(
         base_url=MB_API_BASE,
         auth_header="Auth-Key",
         credential_noun="Auth-Key",
-        key_config_keys=(MB_API_KEY_ENV,),
+        key_config_keys=(ABUSECH_API_KEY_ENV, MB_API_KEY_ENV),
         timeout_config_key=MB_TIMEOUT_ENV,
         key_hint="Get one free at https://auth.abuse.ch/.",
         default_timeout=MB_DEFAULT_TIMEOUT,

@@ -60,6 +60,7 @@ import logging
 import queue
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from collections import deque
@@ -75,14 +76,41 @@ from src.utils.config import get_config, get_config_int
 
 logger = logging.getLogger(__name__)
 
+@dataclass(frozen=True)
+class _Hardening:
+    """One setting start() must establish before the session is usable.
+
+    ``linux_only`` marks a setting that does not exist on every GDB build.
+    ``startup-with-shell`` is the case in point: it is a POSIX notion, and
+    Windows GDB has no such command because it creates the inferior directly
+    rather than through a shell. Its absence there means the risk is absent,
+    not that hardening failed -- but on Linux an absent setting is treated as
+    fatal, because that is where the shell-launch path is real.
+    """
+
+    name: str
+    value: str
+    purpose: str
+    linux_only: bool = False
+
+
 # Applied in order by start(). Every one is a plain MI command -- no console
 # escape is needed to harden the session, which is what keeps this module free
 # of an execution surface.
-_HARDENING: tuple[tuple[str, str], ...] = (
-    ("-gdb-set confirm off", "suppress interactive confirmation prompts"),
-    ("-gdb-set startup-with-shell off", "launch the inferior without a shell"),
-    ("-gdb-set auto-load off", "refuse auto-loaded scripts from the sample directory"),
-    ("-gdb-set mi-async on", "allow -exec-interrupt while the inferior runs"),
+_HARDENING: tuple[_Hardening, ...] = (
+    _Hardening("confirm", "off", "suppress interactive confirmation prompts"),
+    _Hardening(
+        "startup-with-shell",
+        "off",
+        "launch the inferior without a shell",
+        linux_only=True,
+    ),
+    _Hardening(
+        "auto-load",
+        "off",
+        "refuse auto-loaded scripts from the sample directory",
+    ),
+    _Hardening("mi-async", "on", "allow -exec-interrupt while the inferior runs"),
 )
 
 # Kept for diagnostics only; bounded so a chatty GDB cannot grow it without end.
@@ -90,6 +118,36 @@ _STDERR_LINES = 200
 
 DEFAULT_TIMEOUT = 30
 _EXIT_GRACE_SECONDS = 5.0
+
+
+def _setting_holds(response: MIResponse, expected: str) -> bool:
+    """True if a -gdb-show reply reports *expected*.
+
+    Scalar settings answer ``value="off"``. Prefix settings such as
+    ``auto-load`` answer a ``showlist`` of sub-options instead, and only the
+    boolean ones are toggles: verified on GNU gdb 15.1, ``set auto-load off``
+    leaves ``gdb-scripts``, ``libthread-db``, ``local-gdbinit`` and
+    ``python-scripts`` all ``off`` while ``safe-path`` and
+    ``scripts-directory`` keep their directory lists, because those two are
+    paths rather than switches. Every boolean must match; the paths are not
+    part of the question.
+    """
+    if response.is_error:
+        return False
+    value = response.results.get("value")
+    if isinstance(value, str):
+        return value == expected
+    showlist = response.results.get("showlist")
+    if isinstance(showlist, dict):
+        options = showlist.get("option")
+        entries = options if isinstance(options, list) else [options]
+        toggles = [
+            entry["value"]
+            for entry in entries
+            if isinstance(entry, dict) and entry.get("value") in ("on", "off")
+        ]
+        return bool(toggles) and all(v == expected for v in toggles)
+    return False
 
 
 class MISessionError(Exception):
@@ -212,6 +270,7 @@ class MISession:
         self._events: queue.Queue[MIRecord] = queue.Queue()
         self._stderr: deque[str] = deque(maxlen=_STDERR_LINES)
 
+        self._hardening_report: dict[str, str] = {}
         self._closed = threading.Event()
         self._exit_status: int | None = None
 
@@ -266,16 +325,64 @@ class MISession:
         )
         self._stderr_reader.start()
 
-        for command, purpose in _HARDENING:
-            response = self.send(command)
-            if response.is_error:
-                operation = command.split(" ", 1)[0]
+        self._hardening_report = {}
+        for setting in _HARDENING:
+            self._apply_hardening(setting)
+
+    def _apply_hardening(self, setting: _Hardening) -> None:
+        """Establish one setting, or fail the session trying.
+
+        Existence is probed with ``-gdb-show`` rather than inferred from a
+        failed ``-gdb-set``: verified on GNU gdb 15.1, setting an unknown name
+        does not report it as unknown. ``set`` doubles as ``set var``, so GDB
+        parses the name as an expression and answers with the thoroughly
+        misleading *"No symbol table is loaded."* ``show`` answers
+        *"Undefined show command"*, which is unambiguous.
+
+        The value is then read back. This module tells its callers that a
+        ``^done`` means accepted rather than performed; hardening is
+        state-changing, so it holds itself to the same rule.
+        """
+        probe = self.send(f"-gdb-show {setting.name}")
+        if probe.is_error:
+            if not setting.linux_only or sys.platform == "linux":
                 self.stop()
                 raise MISessionError(
-                    f"GDB rejected a required security setting ({purpose}); "
-                    f"{operation} failed. Refusing to continue with an "
-                    "unhardened debugger."
+                    f"This GDB has no '{setting.name}' setting, which is "
+                    f"required to {setting.purpose}. Refusing to continue "
+                    "with an unhardened debugger."
                 )
+            logger.info(
+                "GDB has no '%s' setting on this platform; the risk it guards "
+                "against does not apply here",
+                setting.name,
+            )
+            self._hardening_report[setting.name] = "absent"
+            return
+
+        applied = self.send(f"-gdb-set {setting.name} {setting.value}")
+        if applied.is_error:
+            self.stop()
+            raise MISessionError(
+                f"GDB rejected a required security setting ({setting.purpose}); "
+                f"could not set '{setting.name}'. Refusing to continue with an "
+                "unhardened debugger."
+            )
+
+        verify = self.send(f"-gdb-show {setting.name}")
+        if not _setting_holds(verify, setting.value):
+            self.stop()
+            raise MISessionError(
+                f"GDB accepted '{setting.name}' but it did not take effect "
+                f"({setting.purpose}). Refusing to continue with an unhardened "
+                "debugger."
+            )
+        self._hardening_report[setting.name] = "applied"
+
+    @property
+    def hardening_report(self) -> dict[str, str]:
+        """What start() established: setting name -> "applied" or "absent"."""
+        return dict(self._hardening_report)
 
     def stop(self) -> None:
         """Shut the session down, killing GDB if it will not exit."""

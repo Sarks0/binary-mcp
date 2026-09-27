@@ -19,8 +19,8 @@
   "facets": {
     "code-output": "The response can contain decompiled code, pseudocode excerpts, C# source or IL/disassembly listings -- including replays of earlier tool output. Gate on this to keep code out of the model's context.",
     "pseudocode-derived": "Results are computed from Ghidra's decompiler output, so they inherit its artifacts (unaff_* values, collapsed variadic args) and are empty on a structural-only cache.",
-    "runs-engine": "May launch Ghidra headless or ILSpy -- by design, or on a cache miss. Can take minutes on a large binary.",
-    "network": "Contacts an external service (VirusTotal, a symbol server)."
+    "runs-engine": "May launch Ghidra headless or ILSpy -- by design, or on a cache miss. Can take minutes on a large binary. A first import of a PE may also fetch its PDB from the symbol server (BINARY_MCP_AUTO_PDB).",
+    "network": "Always contacts an external service (VirusTotal, a symbol server). runs-engine tools can too, on a first import, per BINARY_MCP_AUTO_PDB."
   },
   "by_facet": {
     "code-output": [

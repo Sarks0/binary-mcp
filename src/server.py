@@ -61,6 +61,7 @@ from src.utils.decompiler_caveats import render_c_block
 from src.utils.file_lock import release_lock as _release_lock
 from src.utils.file_lock import try_lock as _try_lock
 from src.utils.patterns import APIPatterns, CryptoPatterns
+from src.utils.pdb_fetcher import auto_fetch_pdb
 from src.utils.security import (
     FileSizeError,
     PathTraversalError,
@@ -813,6 +814,10 @@ def get_analysis_context(
     else:
         run_lock_wait = 0.0
 
+    # What this run did about symbols, recorded in the cache metadata so the
+    # summary can say why functions are (or are not) named.
+    pdb_note = None
+
     delta_lock_cm = _delta_run_lock(
         cache.cache_dir,
         binary_path,
@@ -875,6 +880,24 @@ def get_analysis_context(
             "reusing analyzed program" if reuse_project else "importing",
             reuse_reason,
         )
+
+        # A PDB only applies at import, so a fresh import is the one chance to
+        # name everything. Try the symbol server before settling for FUN_*
+        # placeholders. Not on a shallow import (-noanalysis never runs the
+        # PDB analyzer) and not on a delta run, which would have to re-import.
+        if pdb_path:
+            pdb_note = {"source": "explicit", "status": "applied", "pdb_path": str(pdb_path)}
+        elif (
+            not reuse_project
+            and resume_from_cache is None
+            and not target_addresses
+            and analysis_depth != "shallow"
+        ):
+            if job_context is not None:
+                job_context.set_progress("fetching PDB from the symbol server")
+            pdb_path, pdb_note = auto_fetch_pdb(binary_path)
+            if pdb_note is not None:
+                logger.info("Auto PDB for %s: %s", binary_path, pdb_note.get("status"))
     except BaseException:
         # Release the lock AND drop a manifest this block may already have
         # written -- the `finally` further down that normally cleans it up is
@@ -1111,6 +1134,11 @@ def get_analysis_context(
         ) > _DEPTH_RANK.get(effective_depth, 0):
             effective_depth = prior_depth
         meta["analysis_depth"] = effective_depth
+        if pdb_note is not None:
+            meta["pdb"] = pdb_note
+        elif (existing_cache_data or {}).get("metadata", {}).get("pdb"):
+            # A delta run touched no symbols; keep what the import recorded.
+            meta.setdefault("pdb", existing_cache_data["metadata"]["pdb"])
 
         # Record what the project now holds so the next run can skip the
         # import. Only an import run may write this: it is the statement
@@ -1556,6 +1584,11 @@ def analyze_binary(
             address range (e.g. ``"0x61abbc"``).
         pdb_path: Path to a Windows PDB file. Staged next to the binary so
             Ghidra's PdbUniversalAnalyzer can apply symbolic function names.
+            When omitted, a first (non-shallow) import of a PE tries the
+            symbol server first, per ``BINARY_MCP_AUTO_PDB`` (default: only
+            binaries whose version info names Microsoft). The summary's
+            **Symbols** line says what happened; "fetch FAILED" is not the
+            same as "not published".
         enable_fid: Run Ghidra's Function ID library fingerprinting; matches
             are stored per-function in ``fid_match``. Query via ``fid_match``
             tool after analysis.
@@ -1722,6 +1755,35 @@ Format: {compat_info.format.value}
         return safe_error_message("Analysis failed unexpectedly", e)
 
 
+def _pdb_summary_line(note: dict | None) -> str | None:
+    """One line on what the analysis did about a PDB, from ``metadata["pdb"]``."""
+    if not note:
+        return None
+    status = note.get("status")
+    detail = (note.get("detail") or "").splitlines()
+    first = detail[0] if detail else ""
+    rest = "; ".join(line.strip() for line in detail[1:] if line.strip())
+    if status == "applied":
+        return f"PDB applied ({note.get('pdb_path')})."
+    if status == "fetched":
+        return f"PDB fetched from the symbol server and applied ({note.get('pdb_path')})."
+    if status == "not_published":
+        return (
+            "no PDB applied -- the symbol server says it is not published "
+            "(404), so FUN_* names are all there is."
+        )
+    if status == "fetch_failed":
+        return (
+            f"no PDB applied -- the symbol server fetch FAILED ({rest or first}). "
+            f"That is not evidence the PDB is unpublished; retry with load_pdb."
+        )
+    if status == "no_codeview":
+        return "no PDB applied -- the binary carries no CodeView record to look one up by."
+    if status == "skipped":
+        return f"no PDB fetch attempted -- {first}."
+    return None
+
+
 def _format_analysis_summary(context: dict, compat_warning: str | None) -> str:
     """Render the analyze_binary report from a context.
 
@@ -1770,6 +1832,10 @@ def _format_analysis_summary(context: dict, compat_warning: str | None) -> str:
 - Structures: {structure_count}
 - Enums: {len(context.get('data_types', {}).get('enums', []))}
 """
+
+    pdb_line = _pdb_summary_line(metadata.get("pdb"))
+    if pdb_line:
+        summary += f"\n**Symbols:** {pdb_line}\n"
 
     if warnings:
         summary += "\n**Analysis Warnings:**\n"

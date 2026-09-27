@@ -83,9 +83,13 @@ FACETS: dict[str, str] = {
     ),
     "runs-engine": (
         "May launch Ghidra headless or ILSpy -- by design, or on a cache "
-        "miss. Can take minutes on a large binary."
+        "miss. Can take minutes on a large binary. A first import of a PE may "
+        "also fetch its PDB from the symbol server (BINARY_MCP_AUTO_PDB)."
     ),
-    "network": "Contacts an external service (VirusTotal, a symbol server).",
+    "network": (
+        "Always contacts an external service (VirusTotal, a symbol server). "
+        "runs-engine tools can too, on a first import, per BINARY_MCP_AUTO_PDB."
+    ),
 }
 
 

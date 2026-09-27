@@ -58,6 +58,8 @@ from src.utils.compatibility import (
 )
 from src.utils.config import get_config_int
 from src.utils.decompiler_caveats import render_c_block
+from src.utils.file_lock import release_lock as _release_lock
+from src.utils.file_lock import try_lock as _try_lock
 from src.utils.patterns import APIPatterns, CryptoPatterns
 from src.utils.security import (
     FileSizeError,
@@ -361,23 +363,6 @@ _RUN_LOCK_WAIT_SECONDS = 3600.0
 _TARGETED_RUN_LOCK_WAIT_SECONDS = 300.0
 
 
-def _try_lock(fd: int) -> bool:
-    """Take an exclusive advisory lock without blocking. False if held."""
-    if sys.platform == "win32":
-        import msvcrt
-        try:
-            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-            return True
-        except OSError:
-            return False
-    import fcntl
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return True
-    except (BlockingIOError, OSError):
-        return False
-
-
 @contextlib.contextmanager
 def _delta_run_lock(
     cache_dir: Path,
@@ -437,19 +422,7 @@ def _delta_run_lock(
         yield
     finally:
         if locked:
-            try:
-                if sys.platform == "win32":
-                    import msvcrt
-                    try:
-                        os.lseek(fd, 0, os.SEEK_SET)
-                        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-                    except OSError:
-                        pass
-                else:
-                    import fcntl
-                    fcntl.flock(fd, fcntl.LOCK_UN)
-            except Exception:
-                pass
+            _release_lock(fd)
         try:
             os.close(fd)
         except OSError:

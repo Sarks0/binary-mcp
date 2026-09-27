@@ -1203,3 +1203,175 @@ class TestStalenessProbe:
         assert record["schema_version"] == SCHEMA_VERSION
         assert "source_index_count" in record
         assert record["functions"]["0x140001000"]["reviewed"] is True
+
+
+# Concurrency: lock + seq
+
+
+def _mark_worker(cache_dir, binary_id, addresses):
+    store = CoverageStore(ProjectCache(cache_dir=cache_dir))
+    for addr in addresses:
+        store.mark_reviewed(binary_id, [addr], tool="worker")
+
+
+class TestConcurrentWrites:
+    def _index_many(self, lab, n):
+        funcs = [_func(f"f{i}", f"{0x140001000 + i * 0x100:x}") for i in range(n)]
+        lab.analyze(_context(funcs))
+        lab.store.index(lab.binary_id, lab.path)
+        return [canon_addr(f["address"]) for f in funcs]
+
+    def test_seq_increments_on_every_write(self, lab):
+        addrs = self._index_many(lab, 3)
+        assert lab.store.read(lab.binary_id)["seq"] == 1
+        lab.store.mark_reviewed(lab.binary_id, [addrs[0]], tool="t")
+        lab.store.mark_reviewed(lab.binary_id, [addrs[1]], tool="t")
+        assert lab.store.read(lab.binary_id)["seq"] == 3
+        # An idempotent re-mark writes nothing and moves nothing.
+        lab.store.mark_reviewed(lab.binary_id, [addrs[1]], tool="t")
+        assert lab.store.read(lab.binary_id)["seq"] == 3
+
+    def test_rebuild_continues_the_sequence(self, lab):
+        self._index_many(lab, 2)
+        lab.store.index(lab.binary_id, lab.path)
+        assert lab.store.read(lab.binary_id)["seq"] == 2
+
+    def test_stale_write_is_refused(self, lab):
+        addrs = self._index_many(lab, 2)
+        stale = lab.store.read(lab.binary_id)
+        lab.store.mark_reviewed(lab.binary_id, [addrs[0]], tool="first")
+        stale["functions"][addrs[1]]["reviewed"] = True
+        with pytest.raises(CoverageError, match="stale coverage write"):
+            lab.store.write(stale)
+        record = lab.store.read(lab.binary_id)
+        assert record["functions"][addrs[0]]["reviewed"] is True
+        assert record["functions"][addrs[1]]["reviewed"] is False
+
+    def test_a_pre_seq_record_is_writable_and_starts_counting(self, lab):
+        addrs = self._index_many(lab, 1)
+        path = lab.store._coverage_path(lab.binary_id)
+        stored = json.loads(path.read_text())
+        stored.pop("seq")
+        path.write_text(json.dumps(stored))
+        lab.store.mark_reviewed(lab.binary_id, [addrs[0]], tool="t")
+        assert lab.store.read(lab.binary_id)["seq"] == 1
+
+    def test_lock_is_reentrant_within_a_thread(self, lab):
+        self._index_many(lab, 1)
+        with lab.store.locked(lab.binary_id):
+            with lab.store.locked(lab.binary_id):
+                lab.store.index(lab.binary_id, lab.path)
+
+    def test_a_held_lock_times_out_with_coverage_error(self, lab, monkeypatch):
+        import threading
+
+        import src.engines.static.ghidra.coverage_store as cs
+
+        addrs = self._index_many(lab, 1)
+        monkeypatch.setattr(cs, "COVERAGE_LOCK_WAIT_SECONDS", 0.2)
+        holding, release = threading.Event(), threading.Event()
+
+        def hold():
+            with lab.store.locked(lab.binary_id):
+                holding.set()
+                release.wait(5)
+
+        t = threading.Thread(target=hold)
+        t.start()
+        try:
+            assert holding.wait(5)
+            with pytest.raises(CoverageError, match="locked by another session"):
+                lab.store.mark_reviewed(lab.binary_id, [addrs[0]], tool="t")
+        finally:
+            release.set()
+            t.join()
+
+    def test_concurrent_threads_lose_no_marks(self, lab):
+        import threading
+
+        addrs = self._index_many(lab, 40)
+        stores = [CoverageStore(lab.cache) for _ in range(4)]
+        threads = [
+            threading.Thread(
+                target=lambda s=s, chunk=addrs[i::4]: [
+                    s.mark_reviewed(lab.binary_id, [a], tool="t") for a in chunk
+                ]
+            )
+            for i, s in enumerate(stores)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        record = lab.store.read(lab.binary_id)
+        assert lab.store.counts(record)["reviewed"] == 40
+        assert record["seq"] == 41
+
+    def test_concurrent_processes_lose_no_marks(self, lab):
+        import multiprocessing
+
+        # spawn, not fork: pytest's process is multi-threaded by now.
+        ctx = multiprocessing.get_context("spawn")
+        addrs = self._index_many(lab, 40)
+        procs = [
+            ctx.Process(
+                target=_mark_worker,
+                args=(str(lab.cache.cache_dir), lab.binary_id, addrs[i::4]),
+            )
+            for i in range(4)
+        ]
+        for p in procs:
+            p.start()
+        for p in procs:
+            p.join(30)
+            assert p.exitcode == 0
+        record = lab.store.read(lab.binary_id)
+        assert lab.store.counts(record)["reviewed"] == 40
+        assert record["seq"] == 41
+
+
+class TestReachOrigin:
+    def test_origins_and_breakdown(self, lab):
+        lab.analyze(_context(
+            [
+                _func("entry", "140001000", called=["140002000"]),
+                _func("callee", "140002000"),
+                # No caller anywhere: an address-taken / callback root.
+                _func("callback", "140003000", called=["140004000"]),
+                _func("cb_child", "140004000"),
+                # A cycle nothing calls into: promoted as a cycle root.
+                _func("cyc_a", "140005000", called=["140006000"]),
+                _func("cyc_b", "140006000", called=["140005000"]),
+            ],
+            exports=[{"address": "140001000", "name": "entry", "type": "Function"}],
+        ))
+        record = lab.store.index(lab.binary_id, lab.path)
+        origin = {a: e["reach_origin"] for a, e in record["functions"].items()}
+        assert origin["0x140001000"] == origin["0x140002000"] == "export"
+        assert origin["0x140003000"] == origin["0x140004000"] == "indirect_root"
+        assert origin["0x140005000"] == origin["0x140006000"] == "cycle_root"
+
+        lab.store.mark_reviewed(lab.binary_id, ["0x140003000"], tool="t")
+        breakdown = lab.store.origin_breakdown(lab.store.read(lab.binary_id))
+        assert breakdown["export"] == {"in_scope": 2, "remaining": 2}
+        assert breakdown["indirect_root"] == {"in_scope": 2, "remaining": 1}
+        assert breakdown["cycle_root"] == {"in_scope": 2, "remaining": 2}
+        assert breakdown["ioctl_dispatch"] == {"in_scope": 0, "remaining": 0}
+
+    def test_a_v4_record_is_rebuilt_with_origins_and_marks_kept(self, lab):
+        lab.analyze(_context([_func("a", "140001000")]))
+        lab.store.index(lab.binary_id, lab.path)
+        lab.store.mark_reviewed(lab.binary_id, ["140001000"], tool="decompile_function")
+        path = lab.store._coverage_path(lab.binary_id)
+        stored = json.loads(path.read_text())
+        stored["schema_version"] = 4
+        stored.pop("seq")
+        for entry in stored["functions"].values():
+            entry.pop("reach_origin")
+        path.write_text(json.dumps(stored))
+
+        record, status = lab.store.ensure_indexed(lab.binary_id, lab.path)
+        assert status == "ready"
+        assert record["schema_version"] == SCHEMA_VERSION
+        assert record["functions"]["0x140001000"]["reach_origin"] is not None
+        assert record["functions"]["0x140001000"]["reviewed"] is True

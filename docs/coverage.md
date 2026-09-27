@@ -51,6 +51,13 @@ Errors use the same flat shape, carrying an `error` key.
   "examined_in_scope": 31,
   "examined_unreviewed": 27,
   "examined_by_kind": { "diff": 31, "sweep": 0, "external": 0 },
+  "in_scope_by_origin": {
+    "export": { "in_scope": 201, "remaining": 196 },
+    "ioctl_dispatch": { "in_scope": 0, "remaining": 0 },
+    "indirect_root": { "in_scope": 39, "remaining": 38 },
+    "cycle_root": { "in_scope": 8, "remaining": 8 }
+  },
+  "seq": 17,
   "dropped_address_count": 0,
   "scope_description": "forward BFS over cached called_functions from …",
   "scope_version": "fwd-bfs-v2",
@@ -354,6 +361,26 @@ producing the identical record each time.
 `remaining_in_scope == 0` therefore means the in-scope worklist is finished,
 **not** that the binary is. Full closure still consults `remaining`.
 
+### `in_scope_by_origin`
+
+Every in-scope function carries `reach_origin`: the kind of root the walk first
+reached it from. The status payload sums them, with `in_scope` and `remaining`
+per origin:
+
+| origin | reached by |
+|---|---|
+| `export` | direct calls from an export-table entry |
+| `ioctl_dispatch` | direct calls from a recovered dispatch entry |
+| `indirect_root` | nothing calls it directly — promoted as an address-taken / callback root |
+| `cycle_root` | a call cycle nothing enters directly — promoted to break it |
+
+The last two rows are the part of the denominator that the call graph can't
+explain: in scope because the fixpoint refuses to shrink the denominator, not
+because a direct path reaches them. They count toward `remaining_in_scope` like
+everything else. A large `indirect_root` / `cycle_root` share means a lot of the
+binary is reached through function pointers, so check them deliberately
+rather than letting a walk from the exports order them last.
+
 `scope_version` records the method (`fwd-bfs-v2`). It changes whenever scope
 logic changes, and a consumer should invalidate its mirror when it does. It
 is also the rebuild trigger: a stored record carrying an older string is
@@ -377,10 +404,18 @@ root (`$BINARY_CACHE_DIR`, else `~/ghidra_mcp_cache`) and the same sha stem as
   These are loader virtual addresses at the image base as loaded — not file
   offsets, not RVAs, not runtime-rebased debugger addresses. `image_base` is
   reported so a mismatch is detectable rather than silent.
-- **Writes** — whole-file and atomic (`os.replace`). There is no lock: two
-  clients marking the same binary concurrently race read-modify-write in the
-  classic way, later write wins. That matches the surrounding cache and is
-  acceptable at one-session-per-binary usage; a lock is the fix if that changes.
+- **Writes** — whole-file and atomic (`os.replace`), under a per-binary lock
+  file (`.<sha>.coverage.lock`, `flock` / `msvcrt.locking`). Every
+  read-modify-write (marking, examining, resetting, re-indexing) holds it, so
+  two sessions on the same binary serialize instead of the later write dropping
+  the earlier one's marks. A writer that can't get the lock within 30 s gets an
+  error rather than writing anyway.
+- **`seq`** — bumped by one on every write and reported in the status payload.
+  `write()` refuses a record whose `seq` isn't the one on disk (it was read
+  before someone else wrote), which catches any writer that bypasses the lock.
+  A consumer mirroring the counts should refuse a snapshot with a lower `seq`
+  than the one it already holds, which stops an out-of-order sync from
+  winding the mirror backwards.
 - **Lifecycle** — survives `ProjectCache.invalidate` (so `force_reanalyze` and
   `load_pdb` do not destroy a review history; the key is a content hash, so
   addresses cannot have shifted). Dropped by `clear_all`.
@@ -403,7 +438,9 @@ Two independent version stamps:
 - `schema_version` — the on-disk layout. Validated on read.
 - `scope_version` — how scope was computed. Any mismatch rebuilds.
 
-The current `schema_version` is **4**; the minimum readable is 1. A v2 record
+The current `schema_version` is **5**; the minimum readable is 1. A v4 record
+has no `seq` and no per-function `reach_origin`; it is rebuilt once, marks
+preserved, and its sequence starts from 0. A v2 record
 cannot say a function was machine-examined, so every function in one reads as
 never-examined. That is the safe direction — it under-states the leads rather
 than over-stating the reviews — so v2 records are read and rebuilt with an empty

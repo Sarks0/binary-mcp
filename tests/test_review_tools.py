@@ -751,6 +751,22 @@ class TestGetReviewPackage:
         result = tools["get_review_package"]("/bin/test.exe", "missing")
         assert "not found" in result.lower()
 
+    def test_decompiler_artifacts_are_flagged(self, monkeypatch):
+        target = _make_function(
+            name="handler",
+            address="0x1000",
+            pseudocode=(
+                "undefined8 handler(void)\n{\n"
+                "  wsprintfW(buf, L\"%s %d %d %d\");\n"
+                "  return unaff_RBX;\n}\n"
+            ),
+        )
+        tools = _register(monkeypatch, _make_context(functions=[target]))
+        result = tools["get_review_package"]("/bin/test.exe", "handler")
+        assert "return unaff_RBX;  /* [caveat] " in result
+        assert "**Decompiler caveats (2)**" in result
+        assert "variadic-call: `wsprintfW`" in result
+
 
 class TestGetSwitchTables:
     def test_no_field_in_cache(self, monkeypatch):

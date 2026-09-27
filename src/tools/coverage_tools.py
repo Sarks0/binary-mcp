@@ -206,6 +206,16 @@ def register_coverage_tools(app, session_manager, cache, runner=None):
             ``remaining_in_scope == 0`` means the in-scope worklist is finished,
             not that the binary is. Indirect calls are invisible to a forward
             call-graph walk, so full closure still consults ``remaining``.
+            ``in_scope_by_origin`` splits the in-scope set by how the walk
+            reached each function: ``export`` / ``ioctl_dispatch`` by direct
+            calls from an entry point, ``indirect_root`` / ``cycle_root`` only
+            because unreached functions were promoted to roots (callback and
+            function-pointer targets). Each row carries ``in_scope`` and
+            ``remaining``.
+
+            ``seq`` increases by one on every write to the record. A consumer
+            mirroring these counts should refuse a snapshot whose ``seq`` is
+            lower than the one it already holds.
 
             ``dropped_address_count`` is how many functions the analysis cache
             listed that are missing from ``total`` because their address could
@@ -242,6 +252,8 @@ def register_coverage_tools(app, session_manager, cache, runner=None):
             "image_base": None,
             **_null_counts(),
             "examined_by_kind": None,
+            "in_scope_by_origin": None,
+            "seq": None,
             "dropped_address_count": None,
             "scope_description": None,
             "scope_version": SCOPE_VERSION,
@@ -274,6 +286,8 @@ def register_coverage_tools(app, session_manager, cache, runner=None):
                 "indexed_at": record.get("indexed_at"),
                 "dropped_address_count": record.get("dropped_address_count"),
                 "examined_by_kind": store.examination_breakdown(record),
+                "in_scope_by_origin": store.origin_breakdown(record),
+                "seq": record.get("seq"),
                 "status": status,
             }
         )
@@ -458,6 +472,8 @@ def register_coverage_tools(app, session_manager, cache, runner=None):
             "indexed_at": record.get("indexed_at"),
             "dropped_address_count": record.get("dropped_address_count"),
             "examined_by_kind": store.examination_breakdown(record),
+            "in_scope_by_origin": store.origin_breakdown(record),
+            "seq": record.get("seq"),
             "status": "ready",
         }
         payload.update(store.counts(record))

@@ -176,12 +176,15 @@ def test_every_tool_module_is_registered_from_main():
     # Which register_* functions does main() actually call?
     called: set[str] = set()
     for node in ast.walk(server_tree):
-        if isinstance(node, ast.FunctionDef) and node.name == "main":
+        # Registration was moved out of main() into register_all_tools(),
+        # which main() calls; collect register_* calls from both so the
+        # invariant still covers every module's entry point.
+        if isinstance(node, ast.FunctionDef) and node.name in ("main", "register_all_tools"):
             for call in ast.walk(node):
                 if isinstance(call, ast.Call) and isinstance(call.func, ast.Name):
                     if call.func.id.startswith("register_"):
                         called.add(call.func.id)
-    assert called, "main() no longer calls any register_*_tools function"
+    assert called, "main()/register_all_tools() no longer calls any register_*_tools function"
 
     for path in _iter_python_sources():
         if path == SERVER_PY:

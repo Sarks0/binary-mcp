@@ -42,6 +42,16 @@ MAX_PDB_DOWNLOAD_BYTES = 256 * 1024 * 1024
 ALLOW_PRIVATE_SERVERS_ENV = "BINARY_MCP_ALLOW_PRIVATE_SYMBOL_SERVERS"
 
 
+class PdbNotPublishedError(RuntimeError):
+    """Every symbol server answered 404: the PDB is genuinely not published.
+
+    Raised only when *every* server said "not found". A network error, a
+    size-cap refusal, or an empty body (a redirect that landed nowhere) is not
+    evidence the PDB doesn't exist, and surfaces as a plain ``RuntimeError``
+    so a caller doesn't record "no PDB available" on a transient failure.
+    """
+
+
 def _is_private_or_local_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     """Return True if the IP is non-routable/sensitive from the agent's POV.
 
@@ -490,8 +500,9 @@ def fetch_pdb(
     Raises:
         ValueError: if the binary has no usable CodeView record OR the cache
             path would escape ``cache_dir``.
-        RuntimeError: if every configured server fails or the cache dir is
-            not writable.
+        PdbNotPublishedError: if every configured server answered 404.
+        RuntimeError: if every configured server fails for any other reason
+            (network, empty body, size cap) or the cache dir is not writable.
     """
     cv = extract_codeview_record(binary_path)
     if cv is None:
@@ -542,6 +553,9 @@ def fetch_pdb(
     opener = urllib.request.build_opener(_SafeRedirectHandler())
 
     errors: list[str] = []
+    # Did every server positively say "not found"? Anything else leaves the
+    # question open, and the caller must not report "not published".
+    all_not_found = True
     for srv in servers:
         url = build_symbol_server_url(cv, srv)
         logger.info(f"Trying symbol server: {url}")
@@ -557,6 +571,7 @@ def fetch_pdb(
                 code = resp.getcode()
                 if code != 200:
                     errors.append(f"{url} -> HTTP {code}")
+                    all_not_found = False
                     continue
 
                 # Reject before streaming if the server advertises a size
@@ -574,6 +589,7 @@ def fetch_pdb(
                                 f"{url} -> Content-Length {content_length} "
                                 f"exceeds cap {MAX_PDB_DOWNLOAD_BYTES}"
                             )
+                            all_not_found = False
                             continue
 
                 try:
@@ -595,7 +611,19 @@ def fetch_pdb(
                             f"{url} -> response exceeded size cap "
                             f"({MAX_PDB_DOWNLOAD_BYTES} bytes)"
                         )
+                        all_not_found = False
                         # Cleanup happens in the finally below.
+                        continue
+                    if bytes_written == 0:
+                        # Typically a 302 whose target served nothing. Caching
+                        # a zero-byte "PDB" would hand Ghidra garbage, and it
+                        # is not a "not published" answer either.
+                        errors.append(
+                            f"{url} -> empty response body (HTTP {code}, final "
+                            f"URL {resp.geturl() if hasattr(resp, 'geturl') else url}); "
+                            f"not evidence the PDB is unpublished -- retry"
+                        )
+                        all_not_found = False
                         continue
                     os.replace(part_path, cache_path)
                 finally:
@@ -606,15 +634,126 @@ def fetch_pdb(
                         pass
         except urllib.error.HTTPError as e:
             errors.append(f"{url} -> {e.code} {e.reason}")
+            if e.code != 404:
+                all_not_found = False
             continue
         except urllib.error.URLError as e:
             errors.append(f"{url} -> network error: {e.reason}")
+            all_not_found = False
             continue
 
         size = cache_path.stat().st_size
         logger.info(f"PDB cached at {cache_path} ({size} bytes)")
         return cache_path
 
-    raise RuntimeError(
-        "All configured symbol servers failed:\n  " + "\n  ".join(errors)
-    )
+    message = "All configured symbol servers failed:\n  " + "\n  ".join(errors)
+    if all_not_found and errors:
+        raise PdbNotPublishedError(message)
+    raise RuntimeError(message)
+
+
+# Automatic fetch on first analysis
+#
+# Fetching sends the PDB name and GUID to the symbol server, which for a
+# malware sample tells a third party what you are looking at. The default
+# therefore only reaches out for binaries that claim to be Microsoft's --
+# the case the symbol server can actually answer -- and the operator can
+# widen or disable it.
+AUTO_PDB_ENV = "BINARY_MCP_AUTO_PDB"
+AUTO_PDB_POLICIES = ("microsoft", "always", "never")
+AUTO_PDB_DEFAULT = "microsoft"
+AUTO_PDB_TIMEOUT_SECONDS = 120
+
+
+def auto_pdb_policy() -> str:
+    """The configured policy, falling back to the default on a bad value."""
+    value = (os.environ.get(AUTO_PDB_ENV) or AUTO_PDB_DEFAULT).strip().lower()
+    if value not in AUTO_PDB_POLICIES:
+        logger.warning(
+            "%s=%r is not one of %s; using %r",
+            AUTO_PDB_ENV, value, ", ".join(AUTO_PDB_POLICIES), AUTO_PDB_DEFAULT,
+        )
+        return AUTO_PDB_DEFAULT
+    return value
+
+
+def version_info_company(binary_path: str | Path) -> str | None:
+    """``CompanyName`` from the PE's version resource, or None."""
+    try:
+        import pefile
+    except ImportError:
+        return None
+    try:
+        pe = pefile.PE(str(binary_path), fast_load=True)
+        try:
+            pe.parse_data_directories(
+                directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_RESOURCE"]]
+            )
+            for file_info_list in getattr(pe, "FileInfo", None) or []:
+                for entry in file_info_list:
+                    for table in getattr(entry, "StringTable", None) or []:
+                        for key, value in table.entries.items():
+                            k = key.decode("utf-8", "ignore") if isinstance(key, bytes) else str(key)
+                            if k == "CompanyName":
+                                v = value.decode("utf-8", "ignore") if isinstance(value, bytes) else str(value)
+                                return v.strip() or None
+        finally:
+            pe.close()
+    except Exception as e:
+        logger.debug(f"Could not read version info from {binary_path}: {e}")
+    return None
+
+
+def auto_fetch_pdb(
+    binary_path: str | Path,
+    policy: str | None = None,
+    timeout: int = AUTO_PDB_TIMEOUT_SECONDS,
+) -> tuple[str | None, dict | None]:
+    """Try to fetch the PDB for a first analysis. Never raises.
+
+    Returns ``(pdb_path_or_None, note)``; ``note`` is None for a non-PE. ``note`` is recorded in the analysis
+    metadata so the summary can say why names are or aren't there:
+    ``{"source": "auto", "status": ..., "detail": ...}`` where status is one
+    of ``fetched``, ``not_published``, ``fetch_failed``, ``no_codeview`` or
+    ``skipped``. Only ``not_published`` means the PDB doesn't exist;
+    ``fetch_failed`` means nobody knows yet.
+    """
+    try:
+        with open(binary_path, "rb") as fh:
+            if fh.read(2) != b"MZ":
+                return None, None  # not a PE: PDBs don't apply, nothing to report
+    except OSError:
+        return None, None
+
+    policy = policy or auto_pdb_policy()
+    note: dict = {"source": "auto", "policy": policy}
+
+    if policy == "never":
+        return None, {**note, "status": "skipped", "detail": f"{AUTO_PDB_ENV}=never"}
+
+    if extract_codeview_record(binary_path) is None:
+        return None, {
+            **note,
+            "status": "no_codeview",
+            "detail": "binary has no CodeView (RSDS) record, so there is no PDB to look up",
+        }
+
+    if policy == "microsoft":
+        company = version_info_company(binary_path)
+        if not company or "microsoft" not in company.lower():
+            return None, {
+                **note,
+                "status": "skipped",
+                "detail": (
+                    f"not a Microsoft binary (CompanyName={company!r}); set "
+                    f"{AUTO_PDB_ENV}=always to fetch anyway, or call load_pdb"
+                ),
+            }
+
+    try:
+        path = fetch_pdb(binary_path, timeout=timeout)
+    except PdbNotPublishedError as e:
+        return None, {**note, "status": "not_published", "detail": str(e)}
+    except (RuntimeError, ValueError, OSError) as e:
+        return None, {**note, "status": "fetch_failed", "detail": str(e)}
+    return str(path), {**note, "status": "fetched", "pdb_path": str(path)}

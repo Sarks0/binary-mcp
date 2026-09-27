@@ -15,6 +15,7 @@ from pathlib import Path
 
 from src.engines.static.ghidra.coverage_store import auto_mark, has_reviewable_body
 from src.tools.error_hygiene import safe_path_error
+from src.utils.decompiler_caveats import render_c_block
 from src.utils.formatters import wrap_untrusted
 from src.utils.pseudocode_rules import (
     SINK_HINTS,
@@ -940,14 +941,13 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
             lines.append("## Pseudocode")
             if pseudo:
                 # F-7: decompiled pseudocode is the malware author's own code,
-                # comments and string constants rendered as C. This is the
-                # highest-volume untrusted block in the whole server, so it is
-                # fenced in full -- never truncated, the reviewer needs all of
-                # it -- with the markdown code fence kept inside the envelope
-                # so the block still renders as code for the analyst.
+                # comments and string constants rendered as C -- the
+                # highest-volume untrusted block in the server, fenced in full
+                # (never truncated) with the ```c fence and the decompiler
+                # caveat annotations kept inside the envelope.
                 lines.append(
                     wrap_untrusted(
-                        "```c\n" + pseudo + "\n```",
+                        "\n".join(render_c_block(pseudo)),
                         kind="decompiled pseudocode from the sample",
                     )
                 )

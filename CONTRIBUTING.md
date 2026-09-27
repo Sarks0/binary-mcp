@@ -211,11 +211,25 @@ def your_new_tool(
         return f"Error: {e}"
 ```
 
-2. **Add tests** in `tests/test_server.py`
+2. **Catalog it** in `src/tool_catalog.py`: one category plus any facets
+   (`code-output` if the response can contain decompiled/disassembled code,
+   `pseudocode-derived`, `runs-engine`, `network`). These become the tool's
+   tags, which integrators such as campaign-mcp's kill guard use to select
+   tools. Then regenerate the checked-in manifest:
 
-3. **Update README.md** with tool documentation
+   ```bash
+   uv run python -m src.tool_catalog > docs/tool-catalog.json
+   ```
 
-4. **Update CLAUDE.md** if it affects architecture
+   `tests/test_tool_catalog.py` fails if a tool is uncatalogued, if the
+   manifest is stale, or if a tool reads pseudocode or launches an engine
+   without the matching facet.
+
+3. **Add tests** in `tests/test_server.py`
+
+4. **Update README.md** with tool documentation
+
+5. **Update CLAUDE.md** if it affects architecture
 
 ## Extending Pattern Databases
 

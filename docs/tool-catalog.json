@@ -1,0 +1,816 @@
+{
+  "catalog_version": 1,
+  "categories": {
+    "decompile": "Produces decompiled source, pseudocode or IL listings for specific functions/types. Reading the binary's code in earnest.",
+    "review": "Per-function review bundles and pseudocode scans. Built on the decompiler output; most return excerpts of it.",
+    "analysis-run": "Starts or extends an engine analysis of a whole binary (import, auto-analysis, PDB application).",
+    "census": "Structural listings from the analysis cache: functions, imports, strings, xrefs, call graph, sections, types. No code bodies.",
+    "detection": "Heuristic detectors and metrics over the analysis cache (behaviour, crypto, anti-analysis, control flow, similarity, diffing).",
+    "triage": "File-level inspection that parses the file directly, without an analysis engine (PE headers, packers, signatures, carving, XOR/Base64, Python packers).",
+    "annotation": "Reads or writes user annotations (renames, notes) on the analysis cache.",
+    "coverage": "Per-binary review coverage ledger: denominator, worklist, marks.",
+    "session": "Analysis-session bookkeeping: start, save, list, replay, delete.",
+    "reporting": "Reports, IOC exports and YARA rule generation.",
+    "jobs": "Background job control for long-running analysis calls.",
+    "admin": "Setup diagnostics and cache maintenance.",
+    "threat-intel": "External reputation / sandbox lookups (VirusTotal).",
+    "debugger": "Live debugging via x64dbg or WinDbg against a running target or dump."
+  },
+  "facets": {
+    "code-output": "The response can contain decompiled code, pseudocode excerpts, C# source or IL/disassembly listings -- including replays of earlier tool output. Gate on this to keep code out of the model's context.",
+    "pseudocode-derived": "Results are computed from Ghidra's decompiler output, so they inherit its artifacts (unaff_* values, collapsed variadic args) and are empty on a structural-only cache.",
+    "runs-engine": "May launch Ghidra headless or ILSpy -- by design, or on a cache miss. Can take minutes on a large binary. A first import of a PE may also fetch its PDB from the symbol server (BINARY_MCP_AUTO_PDB).",
+    "network": "Always contacts an external service (VirusTotal, a symbol server). runs-engine tools can too, on a first import, per BINARY_MCP_AUTO_PDB."
+  },
+  "by_facet": {
+    "code-output": [
+      "batch_decompile",
+      "decompile_dotnet_type",
+      "decompile_function",
+      "decompile_functions",
+      "find_inlined_clones",
+      "get_dotnet_il",
+      "get_param_sinks",
+      "get_review_package",
+      "load_full_session",
+      "load_session_section",
+      "scan_pseudocode",
+      "windbg_disassemble",
+      "x64dbg_disasm"
+    ],
+    "pseudocode-derived": [
+      "detect_dynamic_api_resolution",
+      "diff_binaries",
+      "find_anti_analysis",
+      "find_inlined_clones",
+      "find_ioctl_handlers",
+      "find_stack_strings",
+      "get_param_sinks",
+      "get_review_package",
+      "get_xrefs",
+      "scan_pseudocode"
+    ],
+    "runs-engine": [
+      "add_note",
+      "analyze_api_call_chains",
+      "analyze_binary",
+      "analyze_control_flow",
+      "analyze_dotnet",
+      "decompile_dotnet_assembly",
+      "decompile_dotnet_type",
+      "decompile_function",
+      "decompile_functions",
+      "delete_note",
+      "detect_crypto",
+      "detect_dynamic_api_resolution",
+      "detect_loops",
+      "detect_malware_behaviors",
+      "expand_callgraph",
+      "extract_iocs_with_context",
+      "extract_metadata",
+      "find_anti_analysis",
+      "find_api_calls",
+      "find_dead_code",
+      "find_stack_strings",
+      "generate_iocs",
+      "get_call_graph",
+      "get_dotnet_il",
+      "get_dotnet_types",
+      "get_function_callers",
+      "get_function_complexity",
+      "get_functions",
+      "get_imports",
+      "get_memory_map",
+      "get_notes",
+      "get_param_sinks",
+      "get_review_package",
+      "get_strings",
+      "get_switch_tables",
+      "get_xrefs",
+      "list_data_types",
+      "load_pdb",
+      "rename_function",
+      "scan_pseudocode",
+      "search_dotnet_types"
+    ],
+    "network": [
+      "load_pdb",
+      "vt_behavior",
+      "vt_check_api",
+      "vt_lookup",
+      "vt_search"
+    ]
+  },
+  "tools": {
+    "add_note": {
+      "category": "annotation",
+      "facets": [
+        "runs-engine"
+      ]
+    },
+    "analyze_api_call_chains": {
+      "category": "detection",
+      "facets": [
+        "runs-engine"
+      ]
+    },
+    "analyze_binary": {
+      "category": "analysis-run",
+      "facets": [
+        "runs-engine"
+      ]
+    },
+    "analyze_control_flow": {
+      "category": "detection",
+      "facets": [
+        "runs-engine"
+      ]
+    },
+    "analyze_dotnet": {
+      "category": "analysis-run",
+      "facets": [
+        "runs-engine"
+      ]
+    },
+    "analyze_function_completeness": {
+      "category": "detection",
+      "facets": []
+    },
+    "analyze_pyc_file": {
+      "category": "triage",
+      "facets": []
+    },
+    "analyze_xor_encryption": {
+      "category": "triage",
+      "facets": []
+    },
+    "batch_decompile": {
+      "category": "decompile",
+      "facets": [
+        "code-output"
+      ]
+    },
+    "check_binary": {
+      "category": "triage",
+      "facets": []
+    },
+    "clean_cache": {
+      "category": "admin",
+      "facets": []
+    },
+    "compute_similarity_hashes": {
+      "category": "triage",
+      "facets": []
+    },
+    "configure_auto_session": {
+      "category": "session",
+      "facets": []
+    },
+    "coverage_index": {
+      "category": "coverage",
+      "facets": []
+    },
+    "decode_base64_file": {
+      "category": "triage",
+      "facets": []
+    },
+    "decompile_dotnet_assembly": {
+      "category": "decompile",
+      "facets": [
+        "runs-engine"
+      ]
+    },
+    "decompile_dotnet_type": {
+      "category": "decompile",
+      "facets": [
+        "code-output",
+        "runs-engine"
+      ]
+    },
+    "decompile_function": {
+      "category": "decompile",
+      "facets": [
+        "code-output",
+        "runs-engine"
+      ]
+    },
+    "decompile_functions": {
+      "category": "decompile",
+      "facets": [
+        "code-output",
+        "runs-engine"
+      ]
+    },
+    "decrypt_xor": {
+      "category": "triage",
+      "facets": []
+    },
+    "delete_note": {
+      "category": "annotation",
+      "facets": [
+        "runs-engine"
+      ]
+    },
+    "delete_session": {
+      "category": "session",
+      "facets": []
+    },
+    "detect_crypto": {
+      "category": "detection",
+      "facets": [
+        "runs-engine"
+      ]
+    },
+    "detect_crypto_patterns": {
+      "category": "triage",
+      "facets": []
+    },
+    "detect_dynamic_api_resolution": {
+      "category": "detection",
+      "facets": [
+        "pseudocode-derived",
+        "runs-engine"
+      ]
+    },
+    "detect_loops": {
+      "category": "detection",
+      "facets": [
+        "runs-engine"
+      ]
+    },
+    "detect_malware_behaviors": {
+      "category": "detection",
+      "facets": [
+        "runs-engine"
+      ]
+    },
+    "detect_packers": {
+      "category": "triage",
+      "facets": []
+    },
+    "detect_python_packer": {
+      "category": "triage",
+      "facets": []
+    },
+    "diagnose_dotnet_setup": {
+      "category": "admin",
+      "facets": []
+    },
+    "diagnose_setup": {
+      "category": "admin",
+      "facets": []
+    },
+    "diff_binaries": {
+      "category": "detection",
+      "facets": [
+        "pseudocode-derived"
+      ]
+    },
+    "expand_callgraph": {
+      "category": "decompile",
+      "facets": [
+        "runs-engine"
+      ]
+    },
+    "export_iocs": {
+      "category": "reporting",
+      "facets": []
+    },
+    "extract_embedded_binaries": {
+      "category": "triage",
+      "facets": []
+    },
+    "extract_iocs": {
+      "category": "triage",
+      "facets": []
+    },
+    "extract_iocs_with_context": {
+      "category": "detection",
+      "facets": [
+        "runs-engine"
+      ]
+    },
+    "extract_metadata": {
+      "category": "census",
+      "facets": [
+        "runs-engine"
+      ]
+    },
+    "extract_python_packed": {
+      "category": "triage",
+      "facets": []
+    },
+    "fid_match": {
+      "category": "census",
+      "facets": []
+    },
+    "find_anti_analysis": {
+      "category": "detection",
+      "facets": [
+        "pseudocode-derived",
+        "runs-engine"
+      ]
+    },
+    "find_api_calls": {
+      "category": "census",
+      "facets": [
+        "runs-engine"
+      ]
+    },
+    "find_dead_code": {
+      "category": "detection",
+      "facets": [
+        "runs-engine"
+      ]
+    },
+    "find_inlined_clones": {
+      "category": "detection",
+      "facets": [
+        "code-output",
+        "pseudocode-derived"
+      ]
+    },
+    "find_ioctl_handlers": {
+      "category": "detection",
+      "facets": [
+        "pseudocode-derived"
+      ]
+    },
+    "find_related_sessions": {
+      "category": "session",
+      "facets": []
+    },
+    "find_similar_functions": {
+      "category": "detection",
+      "facets": []
+    },
+    "find_stack_strings": {
+      "category": "detection",
+      "facets": [
+        "pseudocode-derived",
+        "runs-engine"
+      ]
+    },
+    "find_vtables": {
+      "category": "census",
+      "facets": []
+    },
+    "generate_iocs": {
+      "category": "detection",
+      "facets": [
+        "runs-engine"
+      ]
+    },
+    "generate_report": {
+      "category": "reporting",
+      "facets": []
+    },
+    "generate_yara_rule_from_session": {
+      "category": "reporting",
+      "facets": []
+    },
+    "generate_yara_rule_from_strings": {
+      "category": "reporting",
+      "facets": []
+    },
+    "get_active_session": {
+      "category": "session",
+      "facets": []
+    },
+    "get_call_graph": {
+      "category": "census",
+      "facets": [
+        "runs-engine"
+      ]
+    },
+    "get_coverage_status": {
+      "category": "coverage",
+      "facets": []
+    },
+    "get_dotnet_il": {
+      "category": "decompile",
+      "facets": [
+        "code-output",
+        "runs-engine"
+      ]
+    },
+    "get_dotnet_types": {
+      "category": "census",
+      "facets": [
+        "runs-engine"
+      ]
+    },
+    "get_function_callers": {
+      "category": "review",
+      "facets": [
+        "runs-engine"
+      ]
+    },
+    "get_function_complexity": {
+      "category": "detection",
+      "facets": [
+        "runs-engine"
+      ]
+    },
+    "get_function_hash": {
+      "category": "detection",
+      "facets": []
+    },
+    "get_functions": {
+      "category": "census",
+      "facets": [
+        "runs-engine"
+      ]
+    },
+    "get_imports": {
+      "category": "census",
+      "facets": [
+        "runs-engine"
+      ]
+    },
+    "get_memory_map": {
+      "category": "census",
+      "facets": [
+        "runs-engine"
+      ]
+    },
+    "get_next_unreviewed": {
+      "category": "coverage",
+      "facets": []
+    },
+    "get_notes": {
+      "category": "annotation",
+      "facets": [
+        "runs-engine"
+      ]
+    },
+    "get_param_sinks": {
+      "category": "review",
+      "facets": [
+        "code-output",
+        "pseudocode-derived",
+        "runs-engine"
+      ]
+    },
+    "get_pe_info": {
+      "category": "triage",
+      "facets": []
+    },
+    "get_review_package": {
+      "category": "review",
+      "facets": [
+        "code-output",
+        "pseudocode-derived",
+        "runs-engine"
+      ]
+    },
+    "get_session_summary": {
+      "category": "session",
+      "facets": []
+    },
+    "get_strings": {
+      "category": "census",
+      "facets": [
+        "runs-engine"
+      ]
+    },
+    "get_switch_tables": {
+      "category": "review",
+      "facets": [
+        "runs-engine"
+      ]
+    },
+    "get_xrefs": {
+      "category": "census",
+      "facets": [
+        "pseudocode-derived",
+        "runs-engine"
+      ]
+    },
+    "inspect_authenticode": {
+      "category": "triage",
+      "facets": []
+    },
+    "job_cancel": {
+      "category": "jobs",
+      "facets": []
+    },
+    "job_list": {
+      "category": "jobs",
+      "facets": []
+    },
+    "job_result": {
+      "category": "jobs",
+      "facets": []
+    },
+    "job_status": {
+      "category": "jobs",
+      "facets": []
+    },
+    "list_data_types": {
+      "category": "census",
+      "facets": [
+        "runs-engine"
+      ]
+    },
+    "list_python_archive_contents": {
+      "category": "triage",
+      "facets": []
+    },
+    "list_sessions": {
+      "category": "session",
+      "facets": []
+    },
+    "load_full_session": {
+      "category": "session",
+      "facets": [
+        "code-output"
+      ]
+    },
+    "load_pdb": {
+      "category": "analysis-run",
+      "facets": [
+        "network",
+        "runs-engine"
+      ]
+    },
+    "load_session_section": {
+      "category": "session",
+      "facets": [
+        "code-output"
+      ]
+    },
+    "mark_function_reviewed": {
+      "category": "coverage",
+      "facets": []
+    },
+    "mark_functions_examined": {
+      "category": "coverage",
+      "facets": []
+    },
+    "quick_scan": {
+      "category": "triage",
+      "facets": []
+    },
+    "rename_function": {
+      "category": "annotation",
+      "facets": [
+        "runs-engine"
+      ]
+    },
+    "reset_coverage": {
+      "category": "coverage",
+      "facets": []
+    },
+    "save_session": {
+      "category": "session",
+      "facets": []
+    },
+    "scan_pseudocode": {
+      "category": "review",
+      "facets": [
+        "code-output",
+        "pseudocode-derived",
+        "runs-engine"
+      ]
+    },
+    "search_bytes": {
+      "category": "census",
+      "facets": []
+    },
+    "search_dotnet_types": {
+      "category": "census",
+      "facets": [
+        "runs-engine"
+      ]
+    },
+    "start_analysis_session": {
+      "category": "session",
+      "facets": []
+    },
+    "vt_behavior": {
+      "category": "threat-intel",
+      "facets": [
+        "network"
+      ]
+    },
+    "vt_check_api": {
+      "category": "threat-intel",
+      "facets": [
+        "network"
+      ]
+    },
+    "vt_lookup": {
+      "category": "threat-intel",
+      "facets": [
+        "network"
+      ]
+    },
+    "vt_search": {
+      "category": "threat-intel",
+      "facets": [
+        "network"
+      ]
+    },
+    "windbg_break": {
+      "category": "debugger",
+      "facets": []
+    },
+    "windbg_connect_kernel": {
+      "category": "debugger",
+      "facets": []
+    },
+    "windbg_connect_kernel_pipe": {
+      "category": "debugger",
+      "facets": []
+    },
+    "windbg_connect_kernel_serial": {
+      "category": "debugger",
+      "facets": []
+    },
+    "windbg_connect_local_kernel": {
+      "category": "debugger",
+      "facets": []
+    },
+    "windbg_delete_breakpoint": {
+      "category": "debugger",
+      "facets": []
+    },
+    "windbg_disassemble": {
+      "category": "debugger",
+      "facets": [
+        "code-output"
+      ]
+    },
+    "windbg_disconnect": {
+      "category": "debugger",
+      "facets": []
+    },
+    "windbg_dt": {
+      "category": "debugger",
+      "facets": []
+    },
+    "windbg_execute_command": {
+      "category": "debugger",
+      "facets": []
+    },
+    "windbg_get_modules": {
+      "category": "debugger",
+      "facets": []
+    },
+    "windbg_get_process": {
+      "category": "debugger",
+      "facets": []
+    },
+    "windbg_get_registers": {
+      "category": "debugger",
+      "facets": []
+    },
+    "windbg_get_stack": {
+      "category": "debugger",
+      "facets": []
+    },
+    "windbg_get_sympath": {
+      "category": "debugger",
+      "facets": []
+    },
+    "windbg_get_thread": {
+      "category": "debugger",
+      "facets": []
+    },
+    "windbg_list_breakpoints": {
+      "category": "debugger",
+      "facets": []
+    },
+    "windbg_open_dump": {
+      "category": "debugger",
+      "facets": []
+    },
+    "windbg_pause": {
+      "category": "debugger",
+      "facets": []
+    },
+    "windbg_read_memory": {
+      "category": "debugger",
+      "facets": []
+    },
+    "windbg_run": {
+      "category": "debugger",
+      "facets": []
+    },
+    "windbg_run_and_wait": {
+      "category": "debugger",
+      "facets": []
+    },
+    "windbg_session_status": {
+      "category": "debugger",
+      "facets": []
+    },
+    "windbg_set_breakpoint": {
+      "category": "debugger",
+      "facets": []
+    },
+    "windbg_set_conditional_breakpoint": {
+      "category": "debugger",
+      "facets": []
+    },
+    "windbg_set_hardware_breakpoint": {
+      "category": "debugger",
+      "facets": []
+    },
+    "windbg_set_sympath": {
+      "category": "debugger",
+      "facets": []
+    },
+    "windbg_status": {
+      "category": "debugger",
+      "facets": []
+    },
+    "windbg_step_into": {
+      "category": "debugger",
+      "facets": []
+    },
+    "windbg_step_over": {
+      "category": "debugger",
+      "facets": []
+    },
+    "windbg_switch_thread": {
+      "category": "debugger",
+      "facets": []
+    },
+    "windbg_wait_paused": {
+      "category": "debugger",
+      "facets": []
+    },
+    "windbg_write_memory": {
+      "category": "debugger",
+      "facets": []
+    },
+    "x64dbg_analyze": {
+      "category": "debugger",
+      "facets": []
+    },
+    "x64dbg_annotate": {
+      "category": "debugger",
+      "facets": []
+    },
+    "x64dbg_breakpoint": {
+      "category": "debugger",
+      "facets": []
+    },
+    "x64dbg_context": {
+      "category": "debugger",
+      "facets": []
+    },
+    "x64dbg_disasm": {
+      "category": "debugger",
+      "facets": [
+        "code-output"
+      ]
+    },
+    "x64dbg_execution": {
+      "category": "debugger",
+      "facets": []
+    },
+    "x64dbg_hooks": {
+      "category": "debugger",
+      "facets": []
+    },
+    "x64dbg_memory": {
+      "category": "debugger",
+      "facets": []
+    },
+    "x64dbg_module": {
+      "category": "debugger",
+      "facets": []
+    },
+    "x64dbg_search": {
+      "category": "debugger",
+      "facets": []
+    },
+    "x64dbg_session": {
+      "category": "debugger",
+      "facets": []
+    },
+    "x64dbg_state": {
+      "category": "debugger",
+      "facets": []
+    },
+    "x64dbg_symbols": {
+      "category": "debugger",
+      "facets": []
+    },
+    "x64dbg_thread": {
+      "category": "debugger",
+      "facets": []
+    },
+    "x64dbg_trace": {
+      "category": "debugger",
+      "facets": []
+    },
+    "x64dbg_types": {
+      "category": "debugger",
+      "facets": []
+    }
+  }
+}

@@ -17,6 +17,7 @@ import tempfile
 from pathlib import Path
 
 from src.engines.static.ghidra.coverage_store import auto_mark, has_reviewable_body
+from src.utils.decompiler_caveats import render_c_block
 from src.utils.formatters import wrap_untrusted
 
 logger = logging.getLogger(__name__)
@@ -692,7 +693,7 @@ def register_function_hash_tools(app, session_manager, cache, runner):
                     if signature:
                         block.append(f"Signature: {signature}")
                     block.append("")
-                    block.append(pseudocode)
+                    block.extend(render_c_block(pseudocode, fence=False))
                     output.append(
                         wrap_untrusted(
                             "\n".join(block),

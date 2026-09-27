@@ -21,6 +21,7 @@ tool can launch a binary (see README, "Operational safety"), and the
 VirusTotal integration is lookup-only.
 """
 
+import asyncio
 import contextlib
 import functools
 import json
@@ -42,6 +43,7 @@ from src.engines.static.ghidra.coverage_store import CoverageStore, has_reviewab
 from src.engines.static.ghidra.coverage_store import auto_mark as auto_mark_reviewed
 from src.engines.static.ghidra.project_cache import ProjectCache
 from src.engines.static.ghidra.runner import GhidraAnalysisError, GhidraRunner
+from src.tool_catalog import apply_catalog as apply_tool_catalog
 from src.tools.control_flow_tools import register_control_flow_tools
 from src.tools.coverage_tools import register_coverage_tools
 from src.tools.diff_tools import register_diff_tools
@@ -66,12 +68,16 @@ from src.utils.compatibility import (
     CompatibilityLevel,
 )
 from src.utils.config import get_config_int
+from src.utils.decompiler_caveats import render_c_block
+from src.utils.file_lock import release_lock as _release_lock
+from src.utils.file_lock import try_lock as _try_lock
 from src.utils.formatters import (
     neutralise_untrusted_delimiters,
     strip_untrusted_envelope,
     wrap_untrusted,
 )
 from src.utils.patterns import APIPatterns, CryptoPatterns
+from src.utils.pdb_fetcher import auto_fetch_pdb
 from src.utils.security import (
     FileSizeError,
     PathTraversalError,
@@ -85,6 +91,7 @@ from src.utils.security import (
     validate_numeric_range,
     validate_session_id,
 )
+from src.utils.table_refs import find_table_base_refs
 
 # Allowed output directory for decrypted/decoded files
 CRYPTO_OUTPUT_DIR = Path.home() / ".binary_mcp_output" / "crypto"
@@ -436,23 +443,6 @@ _RUN_LOCK_WAIT_SECONDS = 3600.0
 _TARGETED_RUN_LOCK_WAIT_SECONDS = 300.0
 
 
-def _try_lock(fd: int) -> bool:
-    """Take an exclusive advisory lock without blocking. False if held."""
-    if sys.platform == "win32":
-        import msvcrt
-        try:
-            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-            return True
-        except OSError:
-            return False
-    import fcntl
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return True
-    except (BlockingIOError, OSError):
-        return False
-
-
 @contextlib.contextmanager
 def _delta_run_lock(
     cache_dir: Path,
@@ -512,19 +502,7 @@ def _delta_run_lock(
         yield
     finally:
         if locked:
-            try:
-                if sys.platform == "win32":
-                    import msvcrt
-                    try:
-                        os.lseek(fd, 0, os.SEEK_SET)
-                        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-                    except OSError:
-                        pass
-                else:
-                    import fcntl
-                    fcntl.flock(fd, fcntl.LOCK_UN)
-            except Exception:
-                pass
+            _release_lock(fd)
         try:
             os.close(fd)
         except OSError:
@@ -920,6 +898,10 @@ def get_analysis_context(
     else:
         run_lock_wait = 0.0
 
+    # What this run did about symbols, recorded in the cache metadata so the
+    # summary can say why functions are (or are not) named.
+    pdb_note = None
+
     delta_lock_cm = _delta_run_lock(
         cache.cache_dir,
         binary_path,
@@ -982,6 +964,24 @@ def get_analysis_context(
             "reusing analyzed program" if reuse_project else "importing",
             reuse_reason,
         )
+
+        # A PDB only applies at import, so a fresh import is the one chance to
+        # name everything. Try the symbol server before settling for FUN_*
+        # placeholders. Not on a shallow import (-noanalysis never runs the
+        # PDB analyzer) and not on a delta run, which would have to re-import.
+        if pdb_path:
+            pdb_note = {"source": "explicit", "status": "applied", "pdb_path": str(pdb_path)}
+        elif (
+            not reuse_project
+            and resume_from_cache is None
+            and not target_addresses
+            and analysis_depth != "shallow"
+        ):
+            if job_context is not None:
+                job_context.set_progress("fetching PDB from the symbol server")
+            pdb_path, pdb_note = auto_fetch_pdb(binary_path)
+            if pdb_note is not None:
+                logger.info("Auto PDB for %s: %s", binary_path, pdb_note.get("status"))
     except BaseException:
         # Release the lock AND drop a manifest this block may already have
         # written -- the `finally` further down that normally cleans it up is
@@ -1218,6 +1218,11 @@ def get_analysis_context(
         ) > _DEPTH_RANK.get(effective_depth, 0):
             effective_depth = prior_depth
         meta["analysis_depth"] = effective_depth
+        if pdb_note is not None:
+            meta["pdb"] = pdb_note
+        elif (existing_cache_data or {}).get("metadata", {}).get("pdb"):
+            # A delta run touched no symbols; keep what the import recorded.
+            meta.setdefault("pdb", existing_cache_data["metadata"]["pdb"])
 
         # Record what the project now holds so the next run can skip the
         # import. Only an import run may write this: it is the statement
@@ -1693,6 +1698,11 @@ def analyze_binary(
             address range (e.g. ``"0x61abbc"``).
         pdb_path: Path to a Windows PDB file. Staged next to the binary so
             Ghidra's PdbUniversalAnalyzer can apply symbolic function names.
+            When omitted, a first (non-shallow) import of a PE tries the
+            symbol server first, per ``BINARY_MCP_AUTO_PDB`` (default: only
+            binaries whose version info names Microsoft). The summary's
+            **Symbols** line says what happened; "fetch FAILED" is not the
+            same as "not published".
         enable_fid: Run Ghidra's Function ID library fingerprinting; matches
             are stored per-function in ``fid_match``. Query via ``fid_match``
             tool after analysis.
@@ -1873,6 +1883,35 @@ Format: {compat_info.format.value}
         return safe_error_message("Analysis failed unexpectedly", e)
 
 
+def _pdb_summary_line(note: dict | None) -> str | None:
+    """One line on what the analysis did about a PDB, from ``metadata["pdb"]``."""
+    if not note:
+        return None
+    status = note.get("status")
+    detail = (note.get("detail") or "").splitlines()
+    first = detail[0] if detail else ""
+    rest = "; ".join(line.strip() for line in detail[1:] if line.strip())
+    if status == "applied":
+        return f"PDB applied ({note.get('pdb_path')})."
+    if status == "fetched":
+        return f"PDB fetched from the symbol server and applied ({note.get('pdb_path')})."
+    if status == "not_published":
+        return (
+            "no PDB applied -- the symbol server says it is not published "
+            "(404), so FUN_* names are all there is."
+        )
+    if status == "fetch_failed":
+        return (
+            f"no PDB applied -- the symbol server fetch FAILED ({rest or first}). "
+            f"That is not evidence the PDB is unpublished; retry with load_pdb."
+        )
+    if status == "no_codeview":
+        return "no PDB applied -- the binary carries no CodeView record to look one up by."
+    if status == "skipped":
+        return f"no PDB fetch attempted -- {first}."
+    return None
+
+
 def _format_analysis_summary(context: dict, compat_warning: str | None) -> str:
     """Render the analyze_binary report from a context.
 
@@ -1921,6 +1960,10 @@ def _format_analysis_summary(context: dict, compat_warning: str | None) -> str:
 - Structures: {structure_count}
 - Enums: {len(context.get('data_types', {}).get('enums', []))}
 """
+
+    pdb_line = _pdb_summary_line(metadata.get("pdb"))
+    if pdb_line:
+        summary += f"\n**Symbols:** {pdb_line}\n"
 
     if warnings:
         summary += "\n**Analysis Warnings:**\n"
@@ -2447,6 +2490,34 @@ def get_strings(
         return safe_tool_error("get_strings", e)
 
 
+def _function_containing(functions: list[dict], va: int) -> dict | None:
+    """The cached function whose body holds ``va``, or None.
+
+    Basic blocks when the cache has them (bodies can be non-contiguous),
+    otherwise ``[address, address + size)``.
+    """
+    fallback = None
+    for fn in functions:
+        blocks = fn.get("basic_blocks") or []
+        for block in blocks:
+            try:
+                start = int(str(block.get("start")), 16)
+                end = int(str(block.get("end")), 16)
+            except (TypeError, ValueError):
+                continue
+            if start <= va <= end:
+                return fn
+        if blocks or fallback is not None:
+            continue
+        try:
+            start = int(str(fn.get("address")), 16)
+        except (TypeError, ValueError):
+            continue
+        if start <= va < start + int(fn.get("size") or 0):
+            fallback = fn
+    return fallback
+
+
 def _normalize_xref_addr(raw: str | None) -> str:
     """Normalize an address for xref comparison: lowercase, no 0x, no leading zeros."""
     if not raw:
@@ -2549,6 +2620,7 @@ def get_xrefs(
     function_name: str | None = None,
     direction: str = "to",
     limit: int = 200,
+    table_window: int = 0x800,
 ) -> str:
     """
     Get cross-references for a function or arbitrary address.
@@ -2560,6 +2632,13 @@ def get_xrefs(
       * String xrefs (existing per-string ``xrefs`` list).
       * Pseudocode-mention scan as a last resort, surfacing any function
         whose decompiled body references the target address literal.
+      * Table-base references, for a non-function address with
+        ``direction="to"``: code that references an address at or up to
+        ``table_window`` bytes below the target. A dispatch-table slot is
+        indexed at runtime (``lea rcx,[table]; call [rcx+rdx*8]``), so only
+        the table's base is referenced statically -- this is how callers of
+        a slot are found. Read straight from the file, confirmed by
+        disassembly (x86 / x64 PE).
 
     Args:
         binary_path: Path to analyzed binary
@@ -2568,6 +2647,8 @@ def get_xrefs(
             function's entry point
         direction: "to" (references inbound) or "from" (outbound)
         limit: Max xref rows to list (default 200)
+        table_window: How far below a data address to look for a table base
+            (bytes, default 0x800 = 256 pointer slots). 0 disables the scan.
 
     Returns:
         Structured listing grouped by xref source, or a clear "no xrefs"
@@ -2715,12 +2796,31 @@ def get_xrefs(
                         "type": "PSEUDOCODE_MENTION",
                     })
 
+        # table-base references (direction=to, data addresses only)
+        table_hits: list[dict] = []
+        if direction == "to" and target_fn is None and table_window > 0:
+            try:
+                target_int = int(target_norm, 16)
+            except ValueError:
+                target_int = None
+            if target_int is not None:
+                for hit in find_table_base_refs(
+                    binary_path, target_int, window=min(int(table_window), 0x10000)
+                ):
+                    owner = _function_containing(functions, hit["insn_address"])
+                    table_hits.append({
+                        **hit,
+                        "from_name": owner.get("name") if owner else None,
+                        "from_func": owner.get("address") if owner else None,
+                    })
+
         total = (
             len(function_xrefs)
             + len(string_xrefs)
             + len(pseudocode_xrefs)
             + len(indirect_xrefs)
             + len(vtable_hits)
+            + len(table_hits)
         )
         if total == 0:
             target_label = (
@@ -2792,6 +2892,30 @@ def get_xrefs(
                     break
                 lines.append(
                     f"- {x['from_name']} @ {x['from']}  [{x['type']}]"
+                )
+                shown += 1
+            lines.append("")
+
+        if table_hits and shown < limit:
+            lines.append(
+                f"### Table-base references ({len(table_hits)}) -- the target "
+                f"is a slot in a table these instructions reference"
+            )
+            for x in table_hits:
+                if shown >= limit:
+                    break
+                owner = (
+                    f"{x['from_name']} @ {x['from_func']}" if x.get("from_name")
+                    else "(no containing function in the cache)"
+                )
+                ptr = x.get("pointer_size") or 8
+                slot = (
+                    f", slot {x['offset'] // ptr} of {ptr}-byte entries"
+                    if x["offset"] % ptr == 0 else ""
+                )
+                lines.append(
+                    f"- 0x{x['insn_address']:x} `{x['instruction']}` in {owner}: "
+                    f"base 0x{x['base']:x}, target at +0x{x['offset']:x}{slot}"
                 )
                 shown += 1
             lines.append("")
@@ -2890,7 +3014,10 @@ def decompile_function(
 
     Returns:
         Decompiled C pseudocode, or a ``job_id`` when a targeted decompile was
-        needed and did not finish inside the inline deadline.
+        needed and did not finish inside the inline deadline. Known decompiler
+        artifacts (``unaff_*`` returns, ``extraout_*`` values, truncated
+        variadic calls, CFG/GS helpers, Ghidra warnings) are marked inline with
+        ``/* [caveat] ... */`` and listed under the code.
     """
     try:
         # F-8 (ordering): the cache peek below hashes the file, so it must not
@@ -3000,9 +3127,7 @@ def decompile_function(
         result = f"**Decompiled: {function_name}**\n\n"
         result += f"Address: `{function.get('address')}`\n"
         result += f"Signature: `{function.get('signature')}`\n\n"
-        result += "```c\n"
-        result += pseudocode
-        result += "\n```\n"
+        result += "\n".join(render_c_block(pseudocode)) + "\n"
 
         return wrap_untrusted(result, "decompiled pseudocode")
 
@@ -3226,9 +3351,7 @@ def decompile_functions(
                     shown.append(fn.get("address"))
                 detail.append(f"### {name} @ `{fn.get('address')}`")
                 detail.append(f"Signature: `{fn.get('signature')}`")
-                detail.append("```c")
-                detail.append(body)
-                detail.append("```")
+                detail.extend(render_c_block(body))
                 detail.append("")
             if withheld:
                 detail.append(
@@ -6049,11 +6172,18 @@ def list_python_archive_contents(binary_path: str) -> str:
         return safe_tool_error("list_python_archive_contents", e)
 
 
-def main():
-    """Run the MCP server."""
-    logger.info("Starting Binary MCP Server...")
-    logger.info(f"Ghidra Path: {runner.ghidra_path}")
-    logger.info(f"Cache Directory: {cache.cache_dir}")
+_tools_registered = False
+
+
+def register_all_tools() -> None:
+    """Register every tool module on ``app`` and tag the roster from the catalog.
+
+    Idempotent: ``main()`` and ``python -m src.tool_catalog`` both call it.
+    """
+    global _tools_registered
+    if _tools_registered:
+        return
+    _tools_registered = True
 
     # Register .NET analysis tools
     register_dotnet_tools(app)
@@ -6108,6 +6238,24 @@ def main():
 
     # Register job-control tools (the poll side of the async transport)
     register_job_tools(app, jobs)
+
+    # Category/facet tags so integrators can select tools by what they do
+    # (see src/tool_catalog.py). An unclassified tool is a catalog bug.
+    uncategorized = apply_tool_catalog(asyncio.run(app.get_tools()))
+    if uncategorized:
+        logger.error(
+            "Tools missing from src/tool_catalog.py (tagged uncategorized): %s",
+            ", ".join(uncategorized),
+        )
+
+
+def main():
+    """Run the MCP server."""
+    logger.info("Starting Binary MCP Server...")
+    logger.info(f"Ghidra Path: {runner.ghidra_path}")
+    logger.info(f"Cache Directory: {cache.cache_dir}")
+
+    register_all_tools()
 
     # Reap anything a previously-abandoned client left running before we
     # add load of our own.

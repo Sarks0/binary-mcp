@@ -27,6 +27,16 @@ stem as ``<sha>.json.gz`` / ``<sha>.funcidx.json`` / ``<sha>.notes.json``. This
 inherits the cache's eviction and ``clean_cache`` story for free, and needs no
 new dependency. Writes are whole-file and atomic (``os.replace``).
 
+Concurrency
+-----------
+Every read-modify-write holds a per-binary lock file
+(``.<sha>.coverage.lock``), so two sessions marking the same binary serialize
+instead of the later write silently dropping the earlier one's marks. Each
+record also carries ``seq``, bumped on every write; :meth:`CoverageStore.write`
+refuses a record whose ``seq`` is not the one on disk, which catches a writer
+that read before someone else wrote. ``seq`` is reported in the status payload
+so a mirror can refuse to apply an older snapshot over a newer one.
+
 Like the notes side-car, coverage survives :meth:`ProjectCache.invalidate` --
 re-running Ghidra on the *same bytes* must not destroy a review history, and
 because the key is a content hash the addresses cannot shift underneath it.
@@ -49,13 +59,18 @@ silent.
 
 from __future__ import annotations
 
+import contextlib
+import functools
 import json
 import logging
 import os
 import re
 import tempfile
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
+
+from src.utils.file_lock import LockTimeoutError, exclusive_lock
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +94,12 @@ logger = logging.getLogger(__name__)
 # probe read stale on every poll and re-indexed forever, decompressing the
 # whole analysis cache each time. A v3 record has no comparable count, so it
 # is rebuilt once to acquire one.
-SCHEMA_VERSION = 4
+#
+# v5: records carry `seq` (bumped on every write, so a mirror can refuse to go
+# backwards) and entries carry `reach_origin` (which kind of root the scope
+# walk reached them from). A v4 record has neither; it is rebuilt once, marks
+# preserved, and starts from seq 0.
+SCHEMA_VERSION = 5
 
 # Oldest layout this reader can still parse well enough to salvage review marks
 # from. Anything in [MIN..SCHEMA_VERSION) is readable but stale -- rebuilt on
@@ -103,6 +123,21 @@ MIN_READABLE_SCHEMA_VERSION = 1
 SCOPE_VERSION = "fwd-bfs-v2"
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+# How long a coverage write waits for another session's write on the same
+# binary. The critical section is a JSON read and write, milliseconds even on
+# a large binary; the wait only has to outlast a rebuild of a big index.
+COVERAGE_LOCK_WAIT_SECONDS = 30.0
+
+# Lock files this thread already holds, so a locked method can call another
+# (ensure_indexed -> index -> write) without deadlocking on its own flock.
+_held_locks = threading.local()
+
+# Which kind of root each in-scope function was first reached from. Anything
+# other than `export` / `ioctl_dispatch` is in scope only because the walk
+# promoted it: nothing reaches it by direct calls from an evidenced entry, so
+# it is typically an indirect-call or callback target.
+REACH_ORIGINS = ("export", "ioctl_dispatch", "indirect_root", "cycle_root")
 
 # Examination: the second, deliberately separate dimension
 #
@@ -312,6 +347,9 @@ def compute_scope(context: dict) -> tuple[dict[str, dict], str]:
     # labelled a dispatcher rather than being swallowed as a plain callee.
     # Membership is unaffected either way -- this is provenance only.
     reasons: dict[str, str] = dict(entries)
+    # Which root kind first reached each function, carried down the walk.
+    # Provenance only, like `reasons`: it never changes membership.
+    origins: dict[str, str] = {a: r.split(":", 1)[1] for a, r in entries.items()}
     for layer in ("reachable:export", "reachable:ioctl_dispatch", "reachable:indirect_root"):
         frontier = [a for a, r in entries.items() if r == layer]
         while frontier:
@@ -323,6 +361,7 @@ def compute_scope(context: dict) -> tuple[dict[str, dict], str]:
                 c_addr = canon_addr(callee.get("address"))
                 if c_addr and c_addr in by_addr and c_addr not in reasons:
                     reasons[c_addr] = "reachable:callee"
+                    origins[c_addr] = origins[addr]
                     frontier.append(c_addr)
 
     # The layered walk above cannot enter a call cycle that is only reachable
@@ -376,6 +415,7 @@ def compute_scope(context: dict) -> tuple[dict[str, dict], str]:
             if root in reasons:
                 continue
             reasons[root] = "reachable:cycle_root"
+            origins[root] = "cycle_root"
             frontier = [root]
             while frontier:
                 addr = frontier.pop()
@@ -386,6 +426,7 @@ def compute_scope(context: dict) -> tuple[dict[str, dict], str]:
                     c_addr = canon_addr(callee.get("address"))
                     if c_addr and c_addr in by_addr and c_addr not in reasons:
                         reasons[c_addr] = "reachable:callee"
+                        origins[c_addr] = "cycle_root"
                         frontier.append(c_addr)
 
     records: dict[str, dict] = {}
@@ -421,6 +462,7 @@ def compute_scope(context: dict) -> tuple[dict[str, dict], str]:
             "size": int(func.get("size") or 0),
             "in_scope": in_scope,
             "scope_reason": scope_reason,
+            "reach_origin": origins.get(addr) if in_scope else None,
         }
 
     description = (
@@ -459,6 +501,17 @@ def compute_scope(context: dict) -> tuple[dict[str, dict], str]:
 # Store
 
 
+def _under_binary_lock(method):
+    """Run a ``CoverageStore`` method holding the lock for its ``binary_id``."""
+
+    @functools.wraps(method)
+    def wrapper(self, binary_id, *args, **kwargs):
+        with self.locked(binary_id):
+            return method(self, binary_id, *args, **kwargs)
+
+    return wrapper
+
+
 class CoverageStore:
     """Reads and writes ``<sha>.coverage.json`` beside the Ghidra cache."""
 
@@ -478,6 +531,63 @@ class CoverageStore:
 
     def _coverage_path(self, binary_id: str) -> Path:
         return self.cache_dir / f"{binary_id}.coverage.json"
+
+    @contextlib.contextmanager
+    def locked(self, binary_id: str):
+        """Hold this binary's coverage lock; re-entrant within a thread.
+
+        Wrap any read-modify-write in this. Without it two sessions marking
+        the same binary race, and the later write drops the earlier marks.
+        """
+        cache_dir = self.cache_dir
+        if not isinstance(cache_dir, (str, Path)) or not Path(cache_dir).is_dir():
+            # No real cache root, so no record a write could land in either.
+            # Taking the lock anyway is how a mocked cache (whose `cache_dir /
+            # x` is a MagicMock) sprays lock files named `<MagicMock ...>`
+            # into the working directory.
+            yield
+            return
+        lock_path = Path(cache_dir) / f".{binary_id}.coverage.lock"
+        held = getattr(_held_locks, "paths", None)
+        if held is None:
+            held = _held_locks.paths = {}
+        key = str(lock_path)
+        if held.get(key):
+            held[key] += 1
+            try:
+                yield
+            finally:
+                held[key] -= 1
+            return
+        try:
+            with exclusive_lock(lock_path, COVERAGE_LOCK_WAIT_SECONDS):
+                held[key] = 1
+                try:
+                    yield
+                finally:
+                    held.pop(key, None)
+        except LockTimeoutError as exc:
+            raise CoverageError(
+                f"coverage record for {binary_id[:12]} is locked by another "
+                f"session ({exc}); retry once it finishes"
+            ) from exc
+
+    def _stored_seq(self, binary_id: str) -> int | None:
+        """``seq`` of the record on disk, whatever its schema. None if absent.
+
+        Read raw rather than through :meth:`read`, which refuses records it
+        can't interpret -- the sequence check must still see those.
+        """
+        path = self._coverage_path(binary_id)
+        try:
+            with open(path, encoding="utf-8") as handle:
+                data = json.load(handle)
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError):
+            return 0
+        seq = data.get("seq") if isinstance(data, dict) else None
+        return seq if isinstance(seq, int) and not isinstance(seq, bool) else 0
 
     def binary_id_for_path(self, binary_path: str) -> str:
         return self.cache._get_binary_hash(binary_path)
@@ -575,17 +685,34 @@ class CoverageStore:
         return data
 
     def write(self, data: dict) -> bool:
-        """Atomically persist a coverage record.
+        """Atomically persist a coverage record and bump its ``seq``.
 
         Whole-file replace via ``os.replace`` so a reader never observes a
-        half-written ledger. There is no lock: two MCP clients marking the same
-        binary concurrently race read-modify-write in the classic way (later
-        write wins). That matches the surrounding cache's contract and vr-lab's
-        one-session-per-campaign rule; a lock is the fix if that ever changes.
+        half-written ledger, under the binary's lock so two writers serialize.
+        ``data["seq"]`` must be the ``seq`` the caller read (0 or absent for a
+        record that predates it); if the record on disk has moved on since,
+        the write is refused with :class:`CoverageError` rather than silently
+        discarding the other writer's changes. On success ``data["seq"]`` is
+        the new value.
         """
         binary_id = data.get("binary_id")
         if not binary_id:
             raise CoverageError("cannot write a coverage record without binary_id")
+        with self.locked(binary_id):
+            on_disk = self._stored_seq(binary_id)
+            base = data.get("seq") or 0
+            if on_disk is not None and base != on_disk:
+                raise CoverageError(
+                    f"stale coverage write for {binary_id[:12]}: record was read at "
+                    f"seq {base} but is now at seq {on_disk}; re-read and retry"
+                )
+            data["seq"] = (on_disk or 0) + 1
+            if not self._write_file(binary_id, data):
+                data["seq"] = base
+                return False
+            return True
+
+    def _write_file(self, binary_id: str, data: dict) -> bool:
         target = self._coverage_path(binary_id)
         try:
             handle = tempfile.NamedTemporaryFile(
@@ -725,6 +852,11 @@ class CoverageStore:
                 f"from this denominator; total under-counts the binary."
             )
 
+        with self.locked(binary_id):
+            return self._index_locked(binary_id, binary_path, context, records, description, dropped)
+
+    def _index_locked(self, binary_id, binary_path, context, records, description, dropped):
+        functions = context.get("functions") or []
         previous = self.read(binary_id) or {}
         prior_functions = previous.get("functions") or {}
         for addr, record in records.items():
@@ -785,6 +917,9 @@ class CoverageStore:
             "source_index_count": source_index_count,
             "dropped_address_count": dropped,
             "functions": records,
+            # A rebuild replaces the record wholesale, including one read()
+            # refused, so it builds on whatever seq is on disk.
+            "seq": self._stored_seq(binary_id) or 0,
         }
         self.write(data)
         return data
@@ -818,6 +953,7 @@ class CoverageStore:
             self.cache_dir / f"{binary_id}.json"
         ).exists()
 
+    @_under_binary_lock
     def ensure_indexed(
         self,
         binary_id: str,
@@ -966,8 +1102,31 @@ class CoverageStore:
                 breakdown[str(kind)] = breakdown.get(str(kind), 0) + 1
         return breakdown
 
+    @staticmethod
+    def origin_breakdown(record: dict) -> dict[str, dict[str, int]]:
+        """``{origin: {"in_scope": n, "remaining": n}}`` over in-scope functions.
+
+        Makes the reachability gap visible. ``export`` and ``ioctl_dispatch``
+        functions are reached by direct calls from an evidenced entry point;
+        ``indirect_root`` and ``cycle_root`` ones are in scope only because the
+        walk promoted them, typically as callback or function-pointer targets.
+        They are counted in the denominator either way -- this shows how much
+        of it the call graph could not explain.
+        """
+        breakdown = {origin: {"in_scope": 0, "remaining": 0} for origin in REACH_ORIGINS}
+        for entry in (record.get("functions") or {}).values():
+            if not entry.get("in_scope"):
+                continue
+            origin = entry.get("reach_origin") or "unknown"
+            row = breakdown.setdefault(str(origin), {"in_scope": 0, "remaining": 0})
+            row["in_scope"] += 1
+            if not entry.get("reviewed"):
+                row["remaining"] += 1
+        return breakdown
+
     # marking
 
+    @_under_binary_lock
     def reset_marks(self, binary_id: str) -> int:
         """Clear every review mark, keeping the index and the scope.
 
@@ -994,6 +1153,7 @@ class CoverageStore:
             self.write(record)
         return cleared
 
+    @_under_binary_lock
     def drop(self, binary_id: str) -> bool:
         """Delete the coverage record entirely.
 
@@ -1012,6 +1172,7 @@ class CoverageStore:
             logger.error("Could not drop coverage side-car %s: %s", path, exc)
             return False
 
+    @_under_binary_lock
     def mark_reviewed(
         self,
         binary_id: str,
@@ -1059,6 +1220,7 @@ class CoverageStore:
 
         return {"marked": marked, "already": already, "unknown": unknown}
 
+    @_under_binary_lock
     def mark_examined(
         self,
         binary_id: str,
@@ -1124,6 +1286,7 @@ class CoverageStore:
 
         return {"marked": marked, "already": already, "unknown": unknown}
 
+    @_under_binary_lock
     def reset_examinations(self, binary_id: str) -> int:
         """Clear every examination, keeping the review marks and the scope.
 

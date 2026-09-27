@@ -17,6 +17,7 @@ import tempfile
 from pathlib import Path
 
 from src.engines.static.ghidra.coverage_store import auto_mark, has_reviewable_body
+from src.utils.decompiler_caveats import render_c_block
 
 logger = logging.getLogger(__name__)
 
@@ -670,7 +671,7 @@ def register_function_hash_tools(app, session_manager, cache, runner):
                     if signature:
                         output.append(f"Signature: {signature}")
                     output.append("")
-                    output.append(pseudocode)
+                    output.extend(render_c_block(pseudocode, fence=False))
                     succeeded += 1
                     # Printed either way -- a banner-comment-only body is still
                     # worth showing -- but only actual code advances the

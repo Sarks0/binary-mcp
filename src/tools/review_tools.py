@@ -14,6 +14,7 @@ import re
 from pathlib import Path
 
 from src.engines.static.ghidra.coverage_store import auto_mark, has_reviewable_body
+from src.utils.decompiler_caveats import render_c_block
 from src.utils.pseudocode_rules import (
     SINK_HINTS,
     PseudocodeRules,
@@ -881,9 +882,7 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
             lines.append("")
             lines.append("## Pseudocode")
             if pseudo:
-                lines.append("```c")
-                lines.append(pseudo)
-                lines.append("```")
+                lines.extend(render_c_block(pseudo))
             else:
                 lines.append(
                     "(no pseudocode -- function was likely analyzed with "

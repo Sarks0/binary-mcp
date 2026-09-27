@@ -57,6 +57,7 @@ from src.utils.compatibility import (
     CompatibilityLevel,
 )
 from src.utils.config import get_config_int
+from src.utils.decompiler_caveats import render_c_block
 from src.utils.patterns import APIPatterns, CryptoPatterns
 from src.utils.security import (
     FileSizeError,
@@ -2750,7 +2751,10 @@ def decompile_function(
 
     Returns:
         Decompiled C pseudocode, or a ``job_id`` when a targeted decompile was
-        needed and did not finish inside the inline deadline.
+        needed and did not finish inside the inline deadline. Known decompiler
+        artifacts (``unaff_*`` returns, ``extraout_*`` values, truncated
+        variadic calls, CFG/GS helpers, Ghidra warnings) are marked inline with
+        ``/* [caveat] ... */`` and listed under the code.
     """
     try:
         # Peek at the existing cache first. If it was produced shallow/structural,
@@ -2855,9 +2859,7 @@ def decompile_function(
         result = f"**Decompiled: {function_name}**\n\n"
         result += f"Address: `{function.get('address')}`\n"
         result += f"Signature: `{function.get('signature')}`\n\n"
-        result += "```c\n"
-        result += pseudocode
-        result += "\n```\n"
+        result += "\n".join(render_c_block(pseudocode)) + "\n"
 
         return result
 
@@ -3071,9 +3073,7 @@ def decompile_functions(
                     shown.append(fn.get("address"))
                 lines.append(f"### {name} @ `{fn.get('address')}`")
                 lines.append(f"Signature: `{fn.get('signature')}`")
-                lines.append("```c")
-                lines.append(body)
-                lines.append("```")
+                lines.extend(render_c_block(body))
                 lines.append("")
             if withheld:
                 lines.append(

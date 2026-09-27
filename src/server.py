@@ -73,6 +73,7 @@ from src.utils.security import (
     sanitize_output_path,
     validate_numeric_range,
 )
+from src.utils.table_refs import find_table_base_refs
 
 # Allowed output directory for decrypted/decoded files
 CRYPTO_OUTPUT_DIR = Path.home() / ".binary_mcp_output" / "crypto"
@@ -2347,6 +2348,34 @@ def get_strings(
         return f"Error: {e}"
 
 
+def _function_containing(functions: list[dict], va: int) -> dict | None:
+    """The cached function whose body holds ``va``, or None.
+
+    Basic blocks when the cache has them (bodies can be non-contiguous),
+    otherwise ``[address, address + size)``.
+    """
+    fallback = None
+    for fn in functions:
+        blocks = fn.get("basic_blocks") or []
+        for block in blocks:
+            try:
+                start = int(str(block.get("start")), 16)
+                end = int(str(block.get("end")), 16)
+            except (TypeError, ValueError):
+                continue
+            if start <= va <= end:
+                return fn
+        if blocks or fallback is not None:
+            continue
+        try:
+            start = int(str(fn.get("address")), 16)
+        except (TypeError, ValueError):
+            continue
+        if start <= va < start + int(fn.get("size") or 0):
+            fallback = fn
+    return fallback
+
+
 def _normalize_xref_addr(raw: str | None) -> str:
     """Normalize an address for xref comparison: lowercase, no 0x, no leading zeros."""
     if not raw:
@@ -2449,6 +2478,7 @@ def get_xrefs(
     function_name: str | None = None,
     direction: str = "to",
     limit: int = 200,
+    table_window: int = 0x800,
 ) -> str:
     """
     Get cross-references for a function or arbitrary address.
@@ -2460,6 +2490,13 @@ def get_xrefs(
       * String xrefs (existing per-string ``xrefs`` list).
       * Pseudocode-mention scan as a last resort, surfacing any function
         whose decompiled body references the target address literal.
+      * Table-base references, for a non-function address with
+        ``direction="to"``: code that references an address at or up to
+        ``table_window`` bytes below the target. A dispatch-table slot is
+        indexed at runtime (``lea rcx,[table]; call [rcx+rdx*8]``), so only
+        the table's base is referenced statically -- this is how callers of
+        a slot are found. Read straight from the file, confirmed by
+        disassembly (x86 / x64 PE).
 
     Args:
         binary_path: Path to analyzed binary
@@ -2468,6 +2505,8 @@ def get_xrefs(
             function's entry point
         direction: "to" (references inbound) or "from" (outbound)
         limit: Max xref rows to list (default 200)
+        table_window: How far below a data address to look for a table base
+            (bytes, default 0x800 = 256 pointer slots). 0 disables the scan.
 
     Returns:
         Structured listing grouped by xref source, or a clear "no xrefs"
@@ -2615,12 +2654,31 @@ def get_xrefs(
                         "type": "PSEUDOCODE_MENTION",
                     })
 
+        # table-base references (direction=to, data addresses only)
+        table_hits: list[dict] = []
+        if direction == "to" and target_fn is None and table_window > 0:
+            try:
+                target_int = int(target_norm, 16)
+            except ValueError:
+                target_int = None
+            if target_int is not None:
+                for hit in find_table_base_refs(
+                    binary_path, target_int, window=min(int(table_window), 0x10000)
+                ):
+                    owner = _function_containing(functions, hit["insn_address"])
+                    table_hits.append({
+                        **hit,
+                        "from_name": owner.get("name") if owner else None,
+                        "from_func": owner.get("address") if owner else None,
+                    })
+
         total = (
             len(function_xrefs)
             + len(string_xrefs)
             + len(pseudocode_xrefs)
             + len(indirect_xrefs)
             + len(vtable_hits)
+            + len(table_hits)
         )
         if total == 0:
             target_label = (
@@ -2692,6 +2750,30 @@ def get_xrefs(
                     break
                 lines.append(
                     f"- {x['from_name']} @ {x['from']}  [{x['type']}]"
+                )
+                shown += 1
+            lines.append("")
+
+        if table_hits and shown < limit:
+            lines.append(
+                f"### Table-base references ({len(table_hits)}) -- the target "
+                f"is a slot in a table these instructions reference"
+            )
+            for x in table_hits:
+                if shown >= limit:
+                    break
+                owner = (
+                    f"{x['from_name']} @ {x['from_func']}" if x.get("from_name")
+                    else "(no containing function in the cache)"
+                )
+                ptr = x.get("pointer_size") or 8
+                slot = (
+                    f", slot {x['offset'] // ptr} of {ptr}-byte entries"
+                    if x["offset"] % ptr == 0 else ""
+                )
+                lines.append(
+                    f"- 0x{x['insn_address']:x} `{x['instruction']}` in {owner}: "
+                    f"base 0x{x['base']:x}, target at +0x{x['offset']:x}{slot}"
                 )
                 shown += 1
             lines.append("")

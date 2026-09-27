@@ -363,16 +363,17 @@ jobs:
         sha256sum -c SHA256SUMS
         cat SHA256SUMS
 
-    # These notes used to be a static heredoc: every release shipped the same
-    # body, so nothing told a reader what changed between two versions. It also
-    # rotted -- it still advertised "15+ analysis tools" long after the count
-    # moved -- and, worst of all, v1.1.0 removed 159 tool names and the notes
-    # said nothing at all about it. A user upgrading found out when their calls
-    # started failing.
+    # These notes used to be a static heredoc: every release shipped an
+    # identical body, so nothing told a reader what changed between two
+    # versions. It rotted, too -- still advertising "15+ analysis tools" long
+    # after the count moved to 147 -- and worst of all v1.1.0 removed 159 tool
+    # names while the notes said nothing at all about it.
     #
-    # What stays hardcoded is only what is TRUE OF EVERY RELEASE: how to verify
-    # the assets and how to install them. Anything version-specific is derived
-    # from the commits, so it cannot drift from what actually shipped.
+    # The rule now: anything VERSION-SPECIFIC is derived, and the only prose
+    # kept is what is true of every release -- what the assets are, how to
+    # verify them, how to install. The old "Features" blurb is gone rather
+    # than corrected: it duplicated the README, which is where it can be
+    # maintained in one place instead of two.
     - name: Create Release Notes
       env:
         VERSION: ${{ steps.version.outputs.version }}
@@ -382,8 +383,8 @@ jobs:
         # The previous release to describe changes against. Two rules:
         #
         # Same kind: a FULL release spans from the last full release, not from
-        # its own release candidate, or the notes would cover only the
-        # rc-to-final delta and omit everything the rc itself introduced.
+        # its own release candidate, or the range would omit everything the rc
+        # introduced.
         #
         # Strictly below: walk down from this tag's own position in version
         # order rather than taking "the highest tag that is not this one" --
@@ -393,7 +394,7 @@ jobs:
         # versionsort.suffix=- makes git order a hyphen-suffixed tag BELOW the
         # release it precedes (1.2.0-rc1 < 1.2.0), which is semver's rule and
         # the opposite of git's default -- by default the longer string sorts
-        # higher, so an rc would be treated as newer than its own final.
+        # higher, so an rc would count as newer than its own final.
         PREV=$(git -c versionsort.suffix=- tag --list --sort=-v:refname | awk \
           -v cur="${VERSION}" -v full_only="${FULL_ONLY}" '
             seen && (full_only == 0 || $0 !~ /-/) { print; exit }
@@ -401,36 +402,46 @@ jobs:
           ')
         echo "Previous tag: ${PREV:-<none>}"
 
-        # Commit subjects and bodies in range, for the breaking-change scan.
-        if [[ -n "${PREV}" ]]; then
-          RANGE="${PREV}..HEAD"
-        else
-          RANGE="HEAD"
-        fi
+        if [[ -n "${PREV}" ]]; then RANGE="${PREV}..HEAD"; else RANGE="HEAD"; fi
 
-        # A breaking change is the one thing a reader MUST not miss, and it is
-        # exactly what an auto-generated commit list buries: the squash commit
-        # that deleted 159 tool names has a title about consolidation, and the
-        # word BREAKING appears only in its body.
+        # A breaking change is the one thing a reader must not miss, and it is
+        # exactly what a generated commit list buries: the squash commit that
+        # deleted 159 tool names has a title about consolidation, and the word
+        # BREAKING appears only in its body.
         #
         # Read as a conventional-commits footer: a line BEGINNING with
-        # "BREAKING CHANGE:" or "BREAKING:", continuing over wrapped lines
-        # until a blank line, so a footer that runs to three lines is not
-        # clipped to its first. Anchored at the line start deliberately -- the
-        # token mid-sentence in running prose is a description of a break, not
-        # a declaration of one, and matching it would pull out fragments.
+        # "BREAKING CHANGE:" or "BREAKING:", continuing over wrapped lines so a
+        # footer running to three lines is not clipped to its first. It ends at
+        # a blank line, the end of the commit, OR the next trailer -- git
+        # trailers are conventionally written with no blank line between them,
+        # so without that last rule a following Co-Authored-By or Signed-off-by
+        # is swallowed into the middle of the bullet.
+        #
+        # Anchored at the line start deliberately: the token mid-sentence in
+        # running prose describes a break rather than declaring one, and
+        # matching it there yields clipped fragments.
         git log "${RANGE}" --format='%B%n~~COMMIT~~' \
           | awk '
-              /^~~COMMIT~~$/ { if (buf != "") { print buf; buf = "" } ; next }
-              /^[[:space:]]*$/ { if (buf != "") { print buf; buf = "" } ; next }
+              function flush() { if (buf != "") { print buf; buf = "" } }
+              /^~~COMMIT~~$/           { flush(); next }
+              /^[[:space:]]*$/         { flush(); next }
               {
-                line = $0
-                if (buf != "") { sub(/^[[:space:]]+/, "", line); buf = buf " " line; next }
-                if (match(line, /^BREAKING( CHANGE)?:[[:space:]]*/)) {
-                  buf = "- " substr(line, RSTART + RLENGTH)
+                # Tested first, and separately from the trailer pattern below:
+                # "BREAKING CHANGE:" has a SPACE, so it does not match the
+                # single-token trailer shape and would otherwise be dropped on
+                # the floor -- while the spaceless "BREAKING:" was matched.
+                if (match($0, /^BREAKING( CHANGE)?:[[:space:]]*/)) {
+                  flush()
+                  buf = "- " substr($0, RSTART + RLENGTH)
+                  next
                 }
+                # Some other trailer (Co-Authored-By:, Signed-off-by:, Refs:)
+                # -- ends any footer in progress, and is not itself one.
+                if ($0 ~ /^[A-Za-z][A-Za-z0-9-]*:/) { flush(); next }
+                # Otherwise a wrapped continuation of the footer in progress.
+                if (buf != "") { line = $0; sub(/^[[:space:]]+/, "", line); buf = buf " " line }
               }
-              END { if (buf != "") print buf }
+              END { flush() }
             ' \
           | sed -E 's/[[:space:]]+$//' \
           | sort -u > breaking.txt || true
@@ -447,11 +458,29 @@ jobs:
           } >> release_notes.md
         fi
 
+        # Version-derived so the names always match the assets actually
+        # attached; the old text named a zip by hand.
+        {
+          echo "## What is in this release"
+          echo
+          echo "| Asset | What it is |"
+          echo "| --- | --- |"
+          echo "| \`binary-mcp-${VERSION}.zip\` | MCP server source, plus the plugin binaries under \`obsidian-plugins/\` |"
+          echo "| \`obsidian.dp64\` | Obsidian plugin for the 64-bit debugger (\`x64dbg/x64/plugins/\`) |"
+          echo "| \`obsidian.dp32\` | Obsidian plugin for the 32-bit debugger (\`x64dbg/x32/plugins/\`) |"
+          echo "| \`obsidian_server.exe\` | HTTP server the plugin spawns; goes in the SAME directory as the plugin |"
+          echo "| \`SHA256SUMS\` | SHA-256 of every asset above |"
+          echo
+          echo "The plugin binaries report version \`${VERSION#v}\` over \`/api/status\`, so"
+          echo "you can confirm which build a debugger has actually loaded."
+          echo
+        } >> release_notes.md
+
         cat >> release_notes.md << 'NOTES_EOF'
         ## Verifying this release
 
-        `SHA256SUMS` lists the SHA-256 of every asset below. Download it
-        alongside the assets and check them before running anything:
+        Download `SHA256SUMS` alongside the assets and check them before
+        running anything:
 
         ```bash
         sha256sum -c SHA256SUMS
@@ -462,19 +491,19 @@ jobs:
         ```
 
         `install.ps1` verifies `obsidian.dp64`, `obsidian.dp32` and
-        `obsidian_server.exe` against this manifest automatically, and refuses to
-        install a plugin the manifest does not cover.
+        `obsidian_server.exe` against this manifest automatically, and refuses
+        to install a plugin the manifest does not cover.
 
         ## Installing
 
-        **Option 1: Clone the repository (recommended)**
+        **Clone the repository (recommended)**
         ```bash
         git clone https://github.com/Sarks0/binary-mcp.git
         cd binary-mcp
         python3 install.py          # Windows: .\install.ps1  (as Administrator)
         ```
 
-        **Option 2: Download the installer, read it, then run it**
+        **Or download the installer, read it, then run it**
         ```bash
         curl -fsSLO https://raw.githubusercontent.com/Sarks0/binary-mcp/main/install.py
         sha256sum install.py && less install.py
@@ -483,38 +512,25 @@ jobs:
 
         These installers are deliberately not offered as a
         `download | interpreter` one-liner: that form executes whatever the
-        network returned with no copy on disk to inspect, and on Windows it runs
-        elevated. See `INSTALL.md` -> Supply-Chain Integrity.
+        network returned with no copy on disk to inspect, and on Windows it
+        runs elevated. See `INSTALL.md` -> Supply-Chain Integrity.
 
-        **Option 3: Manual installation**
+        **Or install by hand** -- extract the zip (verify it first), then follow
+        `INSTALL.md`, and `obsidian-plugins/README.md` for the x64dbg plugins.
+
         NOTES_EOF
 
+        # Read out of pyproject rather than restated, so the floor in the notes
+        # cannot drift from the one the package actually enforces. Everything
+        # else a reader needs is in INSTALL.md, which is maintained; repeating
+        # it here is what produced the stale list this replaced.
+        PY_REQ=$(sed -n 's/^requires-python[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' pyproject.toml | head -n1)
         {
-          echo "1. Download and extract \`binary-mcp-${VERSION}.zip\` (verify it against \`SHA256SUMS\` first)"
-          echo "2. Follow the instructions in \`INSTALL.md\`"
-          echo "3. For the Obsidian x64dbg plugins, see \`obsidian-plugins/README.md\`"
-          echo
-          echo "The x64dbg plugin binaries in this release report version"
-          echo "\`${VERSION#v}\` over \`/api/status\`, so you can confirm which build"
-          echo "a debugger has actually loaded."
-          echo
           echo "## Requirements"
           echo
-          echo "- Python 3.12+"
-          echo "- Java 21+ (for Ghidra)"
-          echo "- Ghidra (auto-detected, or set GHIDRA_HOME)"
-          echo "- x64dbg (optional, for dynamic analysis on Windows)"
-          echo
-          echo "## Documentation"
-          echo
-          echo "- [Installation guide](https://github.com/Sarks0/binary-mcp/blob/main/INSTALL.md)"
-          echo "- [README](https://github.com/Sarks0/binary-mcp/blob/main/README.md)"
+          echo "Python ${PY_REQ:-3.12+}, plus Java and Ghidra for static analysis and"
+          echo "x64dbg for dynamic analysis. Full list and setup: [INSTALL.md](https://github.com/Sarks0/binary-mcp/blob/main/INSTALL.md)."
         } >> release_notes.md
-
-        if [[ -n "${PREV}" ]]; then
-          echo >> release_notes.md
-          echo "**Full diff**: https://github.com/Sarks0/binary-mcp/compare/${PREV}...${VERSION}" >> release_notes.md
-        fi
 
         echo "--- release_notes.md ---"
         cat release_notes.md

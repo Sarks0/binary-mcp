@@ -131,8 +131,8 @@ def test_tags_reach_tools_list(roster):
     tags = asyncio.run(listed())
     assert "category:uncategorized" not in set().union(*tags.values())
     assert {"category:decompile", "code-output"} <= tags["decompile_functions"]
-    assert {"category:debugger"} <= tags["x64dbg_run"]
-    assert {"category:debugger", "code-output"} <= tags["x64dbg_disassemble"]
+    assert {"category:debugger"} <= tags["x64dbg_execution"]
+    assert {"category:debugger", "code-output"} <= tags["x64dbg_disasm"]
 
 
 def test_tools_the_guard_missed_are_code_gated():

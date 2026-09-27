@@ -26,6 +26,8 @@ import logging
 import struct
 from pathlib import Path
 
+from src.utils.formatters import wrap_untrusted
+
 logger = logging.getLogger(__name__)
 
 # Recognised section names where vtables / fnptr tables typically live.
@@ -313,25 +315,41 @@ def _format_vtables(binary_name: str, vtables: list[dict]) -> str:
     total_targets = sum(vt.get("slot_count", 0) for vt in vtables)
     lines.append(f"Tables: {len(vtables)} ({total_targets} pointers total)")
     lines.append("")
+
+    # Audit F-7: the per-table listing is sample-authored on two axes -- the
+    # PE section name comes straight out of the section header (an 8-byte
+    # field the sample chooses, decoded with errors="replace") and every slot
+    # target name is the symbol/PDB/export name recovered from the binary.
+    # The scan counts and the tags this module assigns (DRIVER_DISPATCH_TABLE
+    # and friends) are our own conclusions and stay outside the fence, so the
+    # reader can see which half of the report the server is vouching for.
+    body: list[str] = []
     for vt in vtables:
         tags = vt.get("tags") or []
         tag_text = f" [{', '.join(tags)}]" if tags else ""
-        lines.append(
+        body.append(
             f"### `{vt.get('address')}` -- {vt.get('section')}, "
             f"{vt.get('slot_count')} slots, stride {vt.get('stride')} "
             f"bytes{tag_text}"
         )
         for tgt in vt.get("targets") or []:
             name = tgt.get("name") or "?"
-            lines.append(
+            body.append(
                 f"- slot {tgt.get('slot')}: {name} @ {tgt.get('address')}"
             )
-        lines.append("")
+        body.append("")
+    lines.append(
+        wrap_untrusted(
+            "\n".join(body).rstrip("\n"),
+            kind="section and function names recovered from the sample",
+        )
+    )
     return "\n".join(lines)
 
 
 def register_indirect_call_tools(app, cache, runner=None):
     """Register Wave 2 indirect-call enumeration tools."""
+    from src.tools.error_hygiene import safe_path_error
     from src.utils.security import (
         FileSizeError,
         PathTraversalError,
@@ -377,7 +395,13 @@ def register_indirect_call_tools(app, cache, runner=None):
             try:
                 validated = sanitize_binary_path(binary_path)
             except (PathTraversalError, FileSizeError, FileNotFoundError, ValueError) as e:
-                return f"Invalid binary path: {e}"
+                # Audit F-10: this branch used to forward the exception text
+                # verbatim. For a PathTraversalError raised under the default
+                # policy that text is _default_confinement_denied(), which
+                # enumerates the resolved quarantine directories AND appends a
+                # hint containing Path.home()/quarantine -- the operator's
+                # username, handed to the model on any out-of-bounds path.
+                return safe_path_error("find_vtables", e, "binary path")
             binary_path = str(validated)
 
             try:

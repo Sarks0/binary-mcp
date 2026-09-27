@@ -36,8 +36,7 @@
       "load_session_section",
       "scan_pseudocode",
       "windbg_disassemble",
-      "x64dbg_disassemble",
-      "x64dbg_get_instruction"
+      "x64dbg_disasm"
     ],
     "pseudocode-derived": [
       "detect_dynamic_api_resolution",
@@ -747,643 +746,69 @@
       "category": "debugger",
       "facets": []
     },
-    "x64dbg_add_function": {
+    "x64dbg_analyze": {
       "category": "debugger",
       "facets": []
     },
-    "x64dbg_add_member": {
+    "x64dbg_annotate": {
       "category": "debugger",
       "facets": []
     },
-    "x64dbg_add_struct": {
+    "x64dbg_breakpoint": {
       "category": "debugger",
       "facets": []
     },
-    "x64dbg_add_union": {
+    "x64dbg_context": {
       "category": "debugger",
       "facets": []
     },
-    "x64dbg_add_watch": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_alloc_memory": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_analyze_control_flow": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_analyze_recursive": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_analyze_xrefs": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_apply_antidebug_bypass": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_attach": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_bulk_resolve_functions": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_check_conditional_breakpoint": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_check_function_hook": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_check_memory": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_clear_breakpoint_logs": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_clear_events": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_clear_trace": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_clear_types": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_connect": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_create_minidump": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_delete_bookmark": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_delete_breakpoint": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_delete_breakpoints": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_delete_debug_state": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_delete_dll_breakpoint": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_delete_exception_breakpoint": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_delete_function": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_delete_hardware_bp": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_delete_memory_bp": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_delete_memory_watch": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_delete_variable": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_delete_watch": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_detach": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_detect_hooks": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_disable_dll_breakpoint": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_disable_privilege": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_disassemble": {
+    "x64dbg_disasm": {
       "category": "debugger",
       "facets": [
         "code-output"
       ]
     },
-    "x64dbg_dump_memory": {
+    "x64dbg_execution": {
       "category": "debugger",
       "facets": []
     },
-    "x64dbg_dump_module": {
+    "x64dbg_hooks": {
       "category": "debugger",
       "facets": []
     },
-    "x64dbg_enable_dll_breakpoint": {
+    "x64dbg_memory": {
       "category": "debugger",
       "facets": []
     },
-    "x64dbg_enable_privilege": {
+    "x64dbg_module": {
       "category": "debugger",
       "facets": []
     },
-    "x64dbg_evaluate_expression": {
+    "x64dbg_search": {
       "category": "debugger",
       "facets": []
     },
-    "x64dbg_event_status": {
+    "x64dbg_session": {
       "category": "debugger",
       "facets": []
     },
-    "x64dbg_execute_command": {
+    "x64dbg_state": {
       "category": "debugger",
       "facets": []
     },
-    "x64dbg_find_assembly": {
+    "x64dbg_symbols": {
       "category": "debugger",
       "facets": []
     },
-    "x64dbg_find_guid": {
+    "x64dbg_thread": {
       "category": "debugger",
       "facets": []
     },
-    "x64dbg_find_module_calls": {
+    "x64dbg_trace": {
       "category": "debugger",
       "facets": []
     },
-    "x64dbg_find_references_range": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_find_string_references": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_free_memory": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_get_antidebug_status": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_get_api_params": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_get_bp_logs": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_get_breakpoint_logs": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_get_comment": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_get_events": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_get_exception_handlers": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_get_exception_info": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_get_instruction": {
-      "category": "debugger",
-      "facets": [
-        "code-output"
-      ]
-    },
-    "x64dbg_get_memory_info": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_get_memory_map": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_get_module_exports": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_get_module_imports": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_get_modules": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_get_registers": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_get_runtime_function_address": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_get_stack": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_get_threads": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_get_trace": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_goto_address": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_goto_function": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_hide_debugger": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_list_all_breakpoints": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_list_bookmarks": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_list_breakpoints": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_list_debug_states": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_list_exception_breakpoints": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_list_function_mappings": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_list_functions": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_list_memory_watches": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_list_types": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_list_variables": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_load_types": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_log_api_params": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_memory_diff": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_memset": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_navigate_disasm": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_navigate_dump": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_parse_types": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_pause": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_protect_memory": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_read_memory": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_refresh_function_cache": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_remove_type": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_resolve_function": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_resolve_static_address": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_restore_debug_state": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_resume_all_threads": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_resume_thread": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_run": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_run_and_wait": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_run_to_address": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_run_to_user_code": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_run_until_event": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_run_until_memory_changed": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_run_until_return": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_save_debug_state": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_search_function": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_search_memory": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_set_bookmark": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_set_breakpoint": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_set_breakpoint_by_function": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_set_breakpoint_by_name": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_set_breakpoints": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_set_breakpoints_by_functions": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_set_comment": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_set_conditional_bp": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_set_conditional_breakpoint": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_set_dll_breakpoint": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_set_exception_breakpoint": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_set_hardware_bp": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_set_memory_bp": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_set_register": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_set_trace_command": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_set_trace_log": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_set_trace_log_file": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_set_variable": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_set_watchdog": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_show_graph": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_sizeof_type": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_skip": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_skip_exception": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_start_trace": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_status": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_step_into": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_step_out": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_step_over": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_stop_trace": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_suspend_all_threads": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_suspend_thread": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_switch_thread": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_toggle_breakpoint": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_toggle_hardware_bp": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_toggle_memory_bp": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_trace_api_calls": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_trace_execution": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_trace_into_conditional": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_trace_over_conditional": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_trace_to_oep": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_undo_instruction": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_unhook_function": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_update_memory_snapshot": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_view_type": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_wait_debugging": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_wait_paused": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_wait_running": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_watch_memory": {
-      "category": "debugger",
-      "facets": []
-    },
-    "x64dbg_write_memory": {
+    "x64dbg_types": {
       "category": "debugger",
       "facets": []
     }

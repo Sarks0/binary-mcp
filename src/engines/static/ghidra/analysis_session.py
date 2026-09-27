@@ -11,7 +11,7 @@ import uuid
 from pathlib import Path
 
 from src.utils.config import get_cache_dir
-from src.utils.security import safe_regex_compile
+from src.utils.security import safe_regex_compile, validate_session_id
 
 logger = logging.getLogger(__name__)
 
@@ -41,11 +41,40 @@ class AnalysisSession:
         self.active_session_data: dict | None = None
 
     def _get_session_path(self, session_id: str) -> Path:
-        """Get compressed session data file path."""
+        """
+        Get compressed session data file path.
+
+        Audit F-5 (MEDIUM), second occurrence: the first remediation pass fixed
+        this exact ``store_dir / f"{session_id}.session.json.gz"`` construction
+        in ``src/engines/session/unified_session.py`` and left this identical
+        copy unvalidated, so a ``session_id`` of ``'../../../../tmp/pwned'``
+        would still escape the store directory and give read/write/unlink on
+        any path ending in ``.session.json.gz``.
+
+        Validation happens HERE, at the chokepoint, rather than in each public
+        method: every read, write and unlink of session data funnels through
+        this method or :meth:`_get_metadata_path`, so a future caller cannot
+        forget it. This class is not currently reachable from any MCP tool --
+        nothing instantiates ``AnalysisSession`` today -- but the next caller
+        that wires it up would inherit the traversal, and an unreachable hole
+        is still a hole.
+
+        Raises:
+            ValueError: If session_id is not a canonical UUIDv4
+        """
+        session_id = validate_session_id(session_id)
         return self.store_dir / f"{session_id}.session.json.gz"
 
     def _get_metadata_path(self, session_id: str) -> Path:
-        """Get session metadata file path."""
+        """
+        Get session metadata file path.
+
+        Same chokepoint validation as :meth:`_get_session_path` (F-5).
+
+        Raises:
+            ValueError: If session_id is not a canonical UUIDv4
+        """
+        session_id = validate_session_id(session_id)
         return self.store_dir / f"{session_id}.meta.json"
 
     def start_session(
@@ -149,7 +178,20 @@ class AnalysisSession:
 
         Returns:
             True if saved successfully
+
+        Raises:
+            ValueError: If session_id is not a canonical UUIDv4
         """
+        # Validate OUTSIDE the try. F-5 UX: the broad "except Exception ->
+        # return False" below turns every failure into the same "Failed to save
+        # session" message, so a caller who mistyped an ID was told the save
+        # failed rather than that the ID was malformed -- and an attacker
+        # probing with traversal payloads got the identical answer as a genuine
+        # I/O error. A validation error is the caller's fault and must be
+        # distinguishable, so it propagates.
+        if session_id is not None:
+            session_id = validate_session_id(session_id)
+
         try:
             # Determine which session to save
             if session_id is None:
@@ -234,7 +276,15 @@ class AnalysisSession:
 
         Returns:
             Full session data dict, or None if not found
+
+        Raises:
+            ValueError: If session_id is not a canonical UUIDv4
         """
+        # Same F-5 UX split as save/delete: "not found" (None) is reserved for
+        # a well-formed ID with no session behind it. A malformed ID is a
+        # different answer and says so.
+        session_id = validate_session_id(session_id)
+
         try:
             # Check if it's the active session
             if session_id == self.active_session_id and self.active_session_data:
@@ -256,7 +306,12 @@ class AnalysisSession:
 
         Returns:
             Metadata dict, or None if not found
+
+        Raises:
+            ValueError: If session_id is not a canonical UUIDv4
         """
+        session_id = validate_session_id(session_id)
+
         try:
             metadata_path = self._get_metadata_path(session_id)
             if not metadata_path.exists():
@@ -280,7 +335,12 @@ class AnalysisSession:
 
         Returns:
             Section data dict
+
+        Raises:
+            ValueError: If session_id is not a canonical UUIDv4
         """
+        session_id = validate_session_id(session_id)
+
         try:
             if section_type == "metadata":
                 return self.get_metadata(session_id)
@@ -384,7 +444,15 @@ class AnalysisSession:
 
         Returns:
             True if deleted successfully
+
+        Raises:
+            ValueError: If session_id is not a canonical UUIDv4
         """
+        # Validated outside the try for the same reason as save_session (F-5
+        # UX): "Failed to delete session" must not be the answer to "that is
+        # not a session ID".
+        session_id = validate_session_id(session_id)
+
         try:
             session_path = self._get_session_path(session_id)
             metadata_path = self._get_metadata_path(session_id)

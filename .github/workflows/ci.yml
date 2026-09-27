@@ -48,6 +48,128 @@ jobs:
         name: codecov-umbrella
         fail_ci_if_error: false
 
+  # Compile-check the x64dbg plugin and its HTTP server on every PR.
+  #
+  # Until this job existed, NO pull-request check built any of the C++. The only
+  # workflow that compiled it was release.yml, which triggers solely on a
+  # 'v*.*.*' tag -- so a compile error could not surface until someone cut a
+  # release, after merge. create-release depends on build-plugin, so such an
+  # error blocked the release rather than shipping a broken plugin, but it
+  # surfaced at the worst possible moment and after the offending change had
+  # already landed on main.
+  #
+  # This job deliberately BUILDS ONLY. Packaging, SHA256SUMS and artifact upload
+  # stay in release.yml; duplicating them here would mean two places to keep
+  # correct. Both architectures are built because the 32-bit target has caught
+  # size-assumption bugs that x64 alone does not -- its first run flagged 21
+  # C4477 format defects that were invisible on x64.
+  #
+  # WARNINGS ARE ERRORS here, via CMAKE_COMPILE_WARNING_AS_ERROR (CMake 3.24+,
+  # which maps to /WX for MSVC). Not -DCMAKE_CXX_FLAGS="/WX": that REPLACES the
+  # cache default rather than appending, dropping /EHsc among others, and
+  # plugin.cpp uses try/catch.
+  #
+  # This is the ONE deliberate difference from release.yml's otherwise identical
+  # build steps, so do not "fix" the divergence. The asymmetry is the point:
+  # a new warning (from an MSVC upgrade, say) should fail a PR, where someone
+  # can look at it, and NOT block cutting a release when you need to ship. If a
+  # toolchain bump ever reddens this job on an unrelated PR, that is this flag
+  # working as intended -- fix the warning, do not delete the gate.
+  build-plugin:
+    name: Build x64dbg Plugin (compile check)
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Setup MSBuild
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Setup CMake
+      uses: jwlawson/actions-setup-cmake@v2
+      with:
+        cmake-version: 'latest'
+
+    - name: Download x64dbg Plugin SDK
+      shell: pwsh
+      env:
+        # Authenticate the release lookup. Unauthenticated api.github.com calls
+        # are rate-limited per IP, and shared CI egress hits that limit -- which
+        # would show up as a red build job on an unrelated PR.
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $headers = @{
+          'Accept'        = 'application/vnd.github+json'
+          'Authorization' = "Bearer $env:GH_TOKEN"
+          'User-Agent'    = 'binary-mcp-ci'
+        }
+
+        Write-Host "Fetching latest x64dbg release info..."
+        $release = Invoke-RestMethod -Uri "https://api.github.com/repos/x64dbg/x64dbg/releases/latest" -Headers $headers
+
+        Write-Host "Latest release: $($release.tag_name)"
+        $sdkAsset = $release.assets | Where-Object { $_.name -eq "x64dbg-pluginsdk.zip" }
+
+        if (-not $sdkAsset) {
+            Write-Error "x64dbg-pluginsdk.zip not found in latest release"
+            exit 1
+        }
+
+        Write-Host "Downloading official x64dbg plugin SDK..."
+        Invoke-WebRequest -Uri $sdkAsset.browser_download_url -OutFile sdk.zip
+
+        New-Item -ItemType Directory -Force -Path extern/x64dbg_sdk/pluginsdk
+        Expand-Archive -Path sdk.zip -DestinationPath extern/x64dbg_sdk/pluginsdk -Force
+        Write-Host "SDK ready at: extern/x64dbg_sdk/pluginsdk"
+
+    - name: Build x64 Plugin
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        Write-Host "Building 64-bit plugin..."
+        $sdkPath = "$env:GITHUB_WORKSPACE/extern/x64dbg_sdk"
+        cd src/engines/dynamic/x64dbg/plugin
+
+        New-Item -ItemType Directory -Force -Path build-x64
+        cd build-x64
+
+        cmake .. -A x64 `
+          -DX64DBG_SDK_PATH="$sdkPath" `
+          -DCMAKE_BUILD_TYPE=Release `
+          -DCMAKE_COMPILE_WARNING_AS_ERROR=ON
+        if ($LASTEXITCODE -ne 0) { throw "CMake configure failed for x64" }
+
+        cmake --build . --config Release
+        if ($LASTEXITCODE -ne 0) { throw "CMake build failed for x64" }
+
+        Write-Host "x64 plugin built successfully"
+
+    - name: Build x32 Plugin
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        Write-Host "Building 32-bit plugin..."
+        $sdkPath = "$env:GITHUB_WORKSPACE/extern/x64dbg_sdk"
+        cd src/engines/dynamic/x64dbg/plugin
+
+        New-Item -ItemType Directory -Force -Path build-x32
+        cd build-x32
+
+        cmake .. -A Win32 `
+          -DX64DBG_SDK_PATH="$sdkPath" `
+          -DCMAKE_BUILD_TYPE=Release `
+          -DCMAKE_COMPILE_WARNING_AS_ERROR=ON
+        if ($LASTEXITCODE -ne 0) { throw "CMake configure failed for x32" }
+
+        cmake --build . --config Release
+        if ($LASTEXITCODE -ne 0) { throw "CMake build failed for x32" }
+
+        Write-Host "x32 plugin built successfully"
+
   security:
     runs-on: ubuntu-latest
     steps:

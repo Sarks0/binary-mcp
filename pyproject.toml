@@ -18,9 +18,15 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-yara = [
-    "yara-python>=4.5.0",
-]
+# There is deliberately no `yara` extra. Audit finding F-11: this file declared
+# `yara = ["yara-python>=4.5.0"]` and the README advertised "rule scanning",
+# but `import yara` appears nowhere in src/. src/tools/yara_tools.py only
+# GENERATES rule text -- it never compiles or runs a rule -- so the extra
+# installed a native-code dependency that nothing could ever import, and the
+# README promised a scanning feature that did not exist. Removed rather than
+# kept for forward-compat: if scanning is ever added, the extra comes back in
+# the same commit as the `import yara` that needs it, which keeps the declared
+# dependency surface equal to the real one.
 windbg = [
     "pybag>=2.2.16; sys_platform == 'win32'",
 ]

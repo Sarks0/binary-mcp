@@ -34,6 +34,329 @@ logger = logging.getLogger(__name__)
 MAX_DUMP_SIZE = 100 * 1024 * 1024
 
 
+# ---------------------------------------------------------------------------
+# x64dbg command-string structure (audit findings F-9 / F-16)
+# ---------------------------------------------------------------------------
+#
+# WHY THIS EXISTS: every gate this project had between a caller and x64dbg's
+# DbgCmdExec decided on the FIRST TOKEN of the WHOLE string. x64dbg does not
+# dispatch the whole string. ``cmdsplit`` (x64dbg src/dbg/command.cpp:207-253)
+# chops the string on ';' first, and ``cmddirectexec`` then trims and dispatches
+# EACH resulting segment independently. So "log x" passed every allowlist while
+# "log x;init C:/evil.exe" passed them too -- and x64dbg then ran the ``init``,
+# which STARTS the sample. That is a static-analysis server executing malware:
+# the cardinal-rule violation, and the reason every layer below now validates
+# every segment rather than the first word of the blob.
+#
+# The functions below mirror cmdsplit's state machine EXACTLY, because a
+# splitter that disagrees with x64dbg's is itself a bypass: any segment we fail
+# to see is a segment we fail to validate. Verified against the upstream source
+# (x64dbg/x64dbg, src/dbg/command.cpp):
+#
+#   * '"' toggles quote state unless the previous character escaped it;
+#     '\\' toggles an escape flag; anything else clears it.
+#   * ';' inside quotes is literal -- x64dbg is genuinely quote-aware, so
+#     'log "a;b"' really is ONE command and rejecting it would be a false
+#     positive (see _has_unbalanced_quotes for the one case we still refuse).
+#   * empty segments are dropped, surviving segments are Trim()'d.
+#
+# A leading '$' is refused outright rather than parsed: cmdsplit runs
+# ``stringformatinline`` over a '$'-prefixed command BEFORE splitting
+# (command.cpp:211-218), so the expansion result -- which we cannot evaluate
+# here, it depends on live debuggee state -- is what gets split on ';'. A
+# format expression that expands to a ';' would smuggle in a command no gate
+# ever saw.
+
+
+def _has_unbalanced_quotes(command: str) -> bool:
+    """
+    Report whether ``command`` ends inside a quote (or a dangling escape).
+
+    F-16: x64dbg's own splitter would treat the trailing remainder as quoted
+    and therefore as a single command, which is the same conclusion our mirror
+    reaches -- so this is not itself a bypass. It is refused anyway because an
+    unterminated quote is the one input where our mirror and x64dbg's parser
+    are most likely to drift apart across versions, and drift here is measured
+    in "the sample got launched". Malformed input is not worth that risk.
+    """
+    inquote = False
+    inescape = False
+    for ch in command:
+        if ch == '"':
+            if not inescape:
+                inquote = not inquote
+            inescape = False
+        elif ch == "\\":
+            inescape = not inescape
+        else:
+            inescape = False
+    return inquote or inescape
+
+
+def split_x64dbg_command(command: str) -> list[str]:
+    """
+    Split a command string the way x64dbg's ``cmdsplit`` does.
+
+    F-9/F-16: this is the function that makes per-segment validation possible.
+    See the module comment above for the upstream reference and for why the
+    state machine is copied character for character instead of approximated
+    with ``str.split(";")``.
+
+    Args:
+        command: Raw command string as it would be handed to DbgCmdExec.
+
+    Returns:
+        The trimmed, non-empty segments x64dbg would dispatch, in order.
+    """
+    segments: list[str] = []
+    current: list[str] = []
+    inquote = False
+    inescape = False
+
+    for ch in command:
+        if ch == '"':
+            if not inescape:
+                inquote = not inquote
+            inescape = False
+        elif ch == "\\":
+            inescape = not inescape
+        else:
+            inescape = False
+
+        if ch == ";" and not inquote:
+            # x64dbg drops empty segments here (`if(!split.empty())`).
+            if current:
+                segments.append("".join(current))
+                current = []
+        else:
+            current.append(ch)
+
+    if current:
+        segments.append("".join(current))
+
+    # cmddirectexec/cmdloop trim each segment and skip the ones that are empty
+    # afterwards, so a ";  ;" run yields no extra dispatch.
+    return [segment.strip() for segment in segments if segment.strip()]
+
+
+def x64dbg_command_segments(command: str | None) -> list[str]:
+    """
+    Structurally validate a command string and return its dispatchable segments.
+
+    This performs the checks that are about the SHAPE of the string, before any
+    allowlist sees it (F-9/F-16). Every caller that is about to hand a string to
+    x64dbg must route it through here and then validate each returned segment,
+    because each segment is an independent command as far as x64dbg is
+    concerned.
+
+    Args:
+        command: Raw command string (``None`` is treated as empty).
+
+    Returns:
+        List of trimmed, non-empty segments to validate individually.
+
+    Raises:
+        ValueError: If the string is empty or structurally unsafe. ValueError
+            specifically -- callers treat it as "rejected input", while an
+            IndexError/AttributeError escapes as an opaque internal error
+            (finding F-12).
+    """
+    text = command or ""
+    if not isinstance(text, str):
+        raise ValueError("Command must be a string")
+
+    if not text.strip():
+        raise ValueError("Command cannot be empty")
+
+    # A NUL truncates the string at the C boundary: everything the Python gate
+    # inspected past the NUL is invisible to x64dbg, and everything x64dbg runs
+    # past it would be invisible to us. Refuse rather than reason about it.
+    if "\x00" in text:
+        raise ValueError(
+            "Command contains a NUL byte and is blocked by security policy."
+        )
+
+    # x64dbg's script engine and log-redirection commands are line-oriented, so
+    # an embedded CR/LF is a second command by another name. The C++ plugin
+    # rejects these too; doing it here as well means the string never leaves
+    # this process.
+    if "\n" in text or "\r" in text:
+        raise ValueError(
+            "Command contains an embedded line break and is blocked by "
+            "security policy."
+        )
+
+    # See the module comment: '$' makes cmdsplit run stringformatinline BEFORE
+    # splitting, so the text that actually gets split is not the text we
+    # validated. Refuse the prefix instead of trying to predict the expansion.
+    if text.lstrip().startswith("$"):
+        raise ValueError(
+            "Command starts with '$' (inline string formatting) and is blocked "
+            "by security policy: x64dbg expands it before splitting on ';', so "
+            "the commands that would actually run cannot be validated here."
+        )
+
+    if _has_unbalanced_quotes(text):
+        raise ValueError(
+            "Command has an unterminated quote or a dangling escape and is "
+            "blocked by security policy: its ';' separators cannot be located "
+            "unambiguously."
+        )
+
+    segments = split_x64dbg_command(text)
+    if not segments:
+        raise ValueError("Command cannot be empty")
+
+    for segment in segments:
+        # cmdsplit only strips '$' from the head of the WHOLE string, but a
+        # per-segment '$' is refused as well: it costs nothing, and it keeps
+        # this rule from depending on where in the string the caller put it.
+        if segment.startswith("$"):
+            raise ValueError(
+                "Command segment starts with '$' (inline string formatting) "
+                "and is blocked by security policy."
+            )
+
+    return segments
+
+
+def x64dbg_command_name(segment: str) -> str:
+    """
+    Extract the command name from one already-split, already-trimmed segment.
+
+    Splitting on space, '(' and ',' is deliberately STRICTER than x64dbg's
+    ``cmdget``, which truncates at the first space only. A name containing '('
+    or ',' can never match a registered command (x64dbg comma-splits the
+    registration string), so anything this shortens is something x64dbg would
+    hand to its expression parser rather than to a command handler -- shrinking
+    the token can only make the allowlist harder to satisfy, never easier.
+
+    Args:
+        segment: A single command segment.
+
+    Returns:
+        The lowercased command name, or "" if the segment has no name-like head.
+    """
+    head = segment.strip().split(" ")[0].split("\t")[0]
+    return head.split("(")[0].split(",")[0].lower()
+
+
+def _coerce_int(value: Any, default: int = 0) -> int:
+    """
+    Parse a numeric field from the plugin.
+
+    The plugin streams addresses as *bare hex strings* (``std::hex`` with no
+    "0x") and counts as JSON numbers. So a string is always hex -- reading
+    "140000000" as decimal yields 140000000 instead of 0x140000000, an address
+    off by a factor of 38 that still looks like a plausible base.
+    """
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return default
+        try:
+            return int(text, 16)
+        except ValueError:
+            return default
+    return default
+
+
+# x64dbg's THREADWAITREASON enum, for turning wait_reason into something a
+# reader can act on.
+_WAIT_REASONS = {
+    0: "Executive", 1: "FreePage", 2: "PageIn", 3: "PoolAllocation",
+    4: "DelayExecution", 5: "Suspended", 6: "UserRequest", 7: "WrExecutive",
+    8: "WrFreePage", 9: "WrPageIn", 10: "WrPoolAllocation",
+    11: "WrDelayExecution", 12: "WrSuspended", 13: "WrUserRequest",
+    14: "WrEventPair", 15: "WrQueue", 16: "WrLpcReceive", 17: "WrLpcReply",
+    18: "WrVirtualMemory", 19: "WrPageOut", 20: "WrRendezvous", 21: "Spare2",
+    22: "Spare3", 23: "Spare4", 24: "Spare5", 25: "WrCalloutStack",
+    26: "WrKernel", 27: "WrResource", 28: "WrPushLock", 29: "WrMutex",
+    30: "WrQuantumEnd", 31: "WrDispatchInt", 32: "WrPreempted",
+    33: "WrYieldExecution", 34: "WrFastMutex", 35: "WrGuardedMutex",
+    36: "WrRundown",
+}
+
+
+def normalize_thread(raw: dict[str, Any]) -> dict[str, Any]:
+    """
+    Give a thread dict from the plugin a stable shape.
+
+    Plugin builds before thread enumeration sent only ``id`` and ``is_current``
+    for the single current thread, so every other field has to be optional --
+    ``None`` where the build cannot report it, so callers can say "not
+    reported" rather than printing a fabricated 0.
+    """
+    def opt_int(key: str) -> int | None:
+        """Addresses arrive as bare hex strings; absent means absent."""
+        value = raw.get(key)
+        return None if value is None else _coerce_int(value)
+
+    # The thread id is a JSON number, not one of the hex-string address
+    # fields, so it must not go through the hex-first coercion.
+    raw_id = raw.get("id", 0)
+    try:
+        thread_id = int(raw_id)
+    except (TypeError, ValueError):
+        thread_id = 0
+
+    wait_reason = raw.get("wait_reason")
+    return {
+        **raw,
+        "id": thread_id,
+        "number": raw.get("number"),
+        "name": str(raw.get("name") or ""),
+        "entry": opt_int("entry"),
+        "teb": opt_int("teb"),
+        "cip": opt_int("cip"),
+        "suspend_count": raw.get("suspend_count"),
+        "priority": raw.get("priority"),
+        "wait_reason": wait_reason,
+        "wait_reason_name": (
+            _WAIT_REASONS.get(wait_reason) if isinstance(wait_reason, int) else None
+        ),
+        "last_error": raw.get("last_error"),
+        "is_current": bool(raw.get("is_current", False)),
+    }
+
+
+def normalize_module(raw: dict[str, Any]) -> dict[str, Any]:
+    """
+    Give a module dict from the plugin a stable shape.
+
+    Older plugin builds emit only ``base``/``size``/``entry``/``path``, where
+    ``path`` is really the module *name* that ``DbgGetModuleAt`` filled in --
+    there is no ``name`` key at all. Callers that read ``name`` therefore got
+    ``""``, which made every substring comparison against it succeed and turned
+    "find the module I asked for" into "take whatever came first". Deriving the
+    name here means one place understands the wire format, and both old and new
+    plugin builds present the same keys to the rest of the codebase.
+
+    Returns a dict with ``name`` (lowercased basename), ``display_name``,
+    ``path``, and integer ``base``/``size``/``entry``.
+    """
+    path = str(raw.get("path") or "")
+    display_name = str(raw.get("name") or "").strip()
+    if not display_name and path:
+        # path may be a full path or a bare module name; both end in the name.
+        display_name = path.replace("\\", "/").rsplit("/", 1)[-1]
+
+    return {
+        **raw,
+        "name": display_name.lower(),
+        "display_name": display_name or "unknown",
+        "path": path,
+        "base": _coerce_int(raw.get("base")),
+        "size": _coerce_int(raw.get("size")),
+        "entry": _coerce_int(raw.get("entry")),
+        "is_main": bool(raw.get("is_main", False)),
+    }
+
+
 class AddressValidationError(StructuredBaseError):
     """
     Raised when an address parameter is invalid or missing.
@@ -102,6 +425,28 @@ class X64DbgAPIError(StructuredBaseError):
         self.operation = operation
         self.api_message = api_message
         self.context = context or {}
+
+
+class FeatureUnavailableError(Exception):
+    """
+    Raised when the plugin build has no handler for an endpoint (HTTP 404).
+
+    This used to surface as ConnectionError("Failed to connect to x64dbg: 404
+    Client Error"), which reads as a dead debugger rather than a missing
+    feature -- so callers retried, reconnected, and re-attached against an
+    endpoint that was never going to exist. Keeping it distinct also stops
+    _request_with_retry from burning its reconnect budget on it.
+    """
+
+    def __init__(self, endpoint: str, operation: str = ""):
+        self.endpoint = endpoint
+        self.operation = operation or endpoint.rsplit("/", 1)[-1]
+        super().__init__(
+            f"The x64dbg plugin has no handler for {endpoint}.\n"
+            f"This is a plugin capability gap, not a connection problem -- the "
+            f"debugger is reachable. Update the Obsidian plugin and server to a "
+            f"build that implements it, or use a different tool."
+        )
 
 
 class X64DbgBridge(Debugger):
@@ -277,6 +622,9 @@ class X64DbgBridge(Debugger):
             except X64DbgAPIError:
                 # API errors are deterministic -- never retry
                 raise
+            except FeatureUnavailableError:
+                # A missing handler will still be missing on the next attempt.
+                raise
             except (ConnectionError, RuntimeError) as e:
                 last_error = e
                 error_msg = str(e)
@@ -391,6 +739,25 @@ class X64DbgBridge(Debugger):
             ConnectionError: If request fails
             RuntimeError: If API returns error or authentication fails
         """
+        # Validate command strings at the CHOKEPOINT, not per call site.
+        #
+        # F-9/F-16 follow-up: execute_command() validated its argument, but 38
+        # other bridge methods build a command string and POST it to
+        # /api/command directly, never touching that gate -- add_watch,
+        # set_watch_expression, set_watch_name, the type-system family
+        # (add_struct/add_type/parse_types/load_types/...), set_dll_breakpoint,
+        # set_variable, navigate_*, show_graph and the privilege toggles all
+        # interpolate caller-controlled text. 'AddWatch x;init C:/evil.exe'
+        # therefore left the bridge verbatim, and the plugin only inspects the
+        # first token, so DbgCmdExec split it and started the sample -- the same
+        # bug F-16 fixed for one method, still open for the rest.
+        #
+        # Validating here means a new bridge method cannot reintroduce it by
+        # forgetting to call _validate_command, which is exactly how these 38
+        # came to exist.
+        if endpoint == "/api/command" and data and "command" in data:
+            self._validate_command(str(data["command"]))
+
         url = f"{self.base_url}{endpoint}"
         start_time = time.time()
         operation = endpoint.split("/")[-1]  # Extract operation name from endpoint
@@ -526,6 +893,12 @@ class X64DbgBridge(Debugger):
 
             logger.error(f"HTTP request failed: {e}")
 
+            # A 404 means this plugin build has no handler for the endpoint.
+            # Reporting that as a connection failure sent callers into reconnect
+            # loops against an endpoint that does not exist.
+            if http_status == 404:
+                raise FeatureUnavailableError(endpoint, operation)
+
             # Check if it's an authentication error
             if http_status == 401:
                 raise ConnectionError(
@@ -548,15 +921,23 @@ class X64DbgBridge(Debugger):
         Raises:
             ConnectionError: If connection fails
         """
+        previous_timeout = self.timeout
         try:
             self._arch = None  # Reset cached architecture on new connection
+            # The handshake gets its own (usually shorter) timeout so a dead
+            # plugin fails fast instead of hanging for the request timeout.
+            self.timeout = timeout
             result = self._request("/api/status")
             self.connected = True
             logger.info(f"Connected to x64dbg - state: {result.get('state')}")
             return True
         except Exception as e:
             logger.error(f"Failed to connect: {e}")
-            raise ConnectionError(f"Cannot connect to x64dbg plugin at {self.base_url}")
+            raise ConnectionError(
+                f"Cannot connect to x64dbg plugin at {self.base_url}: {e}"
+            )
+        finally:
+            self.timeout = previous_timeout
 
     def disconnect(self) -> None:
         """Disconnect from x64dbg plugin."""
@@ -721,7 +1102,7 @@ class X64DbgBridge(Debugger):
         Returns:
             List of breakpoint dictionaries
         """
-        result = self._request("/api/breakpoint/list")
+        result = self._request_with_retry("/api/breakpoint/list")
         return result.get("breakpoints", [])
 
     # Exception handling control
@@ -794,7 +1175,7 @@ class X64DbgBridge(Debugger):
         Returns:
             List of exception breakpoint dictionaries
         """
-        result = self._request("/api/exception/list")
+        result = self._request_with_retry("/api/exception/list")
         return result.get("exceptions", [])
 
     def skip_exception(self, exception_code: str) -> bool:
@@ -903,7 +1284,7 @@ class X64DbgBridge(Debugger):
         Returns:
             Dictionary mapping register names to hex values
         """
-        result = self._request("/api/registers")
+        result = self._request_with_retry("/api/registers")
 
         # Extract register values (remove 'success' key)
         registers = {k: v for k, v in result.items() if k != "success"}
@@ -927,7 +1308,7 @@ class X64DbgBridge(Debugger):
             call frames)
         """
         data = {"depth": depth}
-        result = self._request("/api/stack", data)
+        result = self._request_with_retry("/api/stack", data)
         frames = result.get("frames", [])
 
         if frames:
@@ -968,20 +1349,95 @@ class X64DbgBridge(Debugger):
         Get loaded modules.
 
         Returns:
-            List of module dictionaries
+            List of module dictionaries, each with ``name`` (lowercased),
+            ``display_name``, ``path``, and integer ``base``/``size``/``entry``.
+            The first entry is the main module when the plugin reports one.
         """
-        result = self._request("/api/modules")
-        return result.get("modules", [])
+        result = self._request_with_retry("/api/modules")
+        modules = [normalize_module(m) for m in result.get("modules", [])]
+
+        # Older plugin builds only ever return the main module and never set
+        # is_main; the first entry is it. Newer builds flag it explicitly.
+        if modules and not any(m["is_main"] for m in modules):
+            modules[0]["is_main"] = True
+
+        return modules
+
+    def find_module(self, name_or_path: str) -> dict[str, Any] | None:
+        """
+        Find a loaded module by name or path.
+
+        Matching is deliberately strict -- exact name, then name with the
+        extension dropped. A loose substring match here silently resolves
+        addresses against the wrong module, which is worse than not finding it.
+
+        Args:
+            name_or_path: Module name or a path whose basename names the module
+
+        Returns:
+            The normalized module dict, or None if no module matches.
+        """
+        wanted = os.path.basename(str(name_or_path or "").replace("\\", "/")).lower()
+        if not wanted:
+            return None
+
+        modules = self.get_modules()
+
+        for mod in modules:
+            if mod["name"] == wanted:
+                return mod
+
+        # "sample" should still find "sample.exe", and vice versa.
+        wanted_stem = wanted.rsplit(".", 1)[0]
+        for mod in modules:
+            if mod["name"].rsplit(".", 1)[0] == wanted_stem:
+                return mod
+
+        return None
+
+    def get_main_module(self) -> dict[str, Any] | None:
+        """Return the main (debuggee) module, or None if nothing is loaded."""
+        modules = self.get_modules()
+        for mod in modules:
+            if mod["is_main"]:
+                return mod
+        return modules[0] if modules else None
 
     def get_threads(self) -> list[dict[str, Any]]:
         """
         Get thread list.
 
         Returns:
-            List of thread dictionaries
+            List of thread dicts with ``id``, ``is_current``, and -- where the
+            plugin build reports them -- ``number``, ``name``, ``entry``,
+            ``teb``, ``cip``, ``suspend_count``, ``priority``, ``wait_reason``
+            and ``last_error``. Fields the build cannot report are None.
         """
-        result = self._request("/api/threads")
-        return result.get("threads", [])
+        result = self._request_with_retry("/api/threads")
+        return [normalize_thread(t) for t in result.get("threads", [])]
+
+    def find_thread(self, thread_id: str | int) -> dict[str, Any] | None:
+        """
+        Find a thread by id.
+
+        Accepts a decimal or 0x-prefixed id, since callers copy ids out of
+        both this tool's output and x64dbg's own (hex) thread view.
+
+        Returns:
+            The normalized thread dict, or None if no thread has that id.
+        """
+        text = str(thread_id).strip()
+        if not text:
+            return None
+        try:
+            wanted = int(text, 16) if text.lower().startswith("0x") else int(text)
+        except ValueError:
+            return None
+
+        for thread in self.get_threads():
+            if thread["id"] == wanted:
+                return thread
+        return None
 
     def switch_thread(self, thread_id: str) -> dict[str, Any]:
         """
@@ -1096,7 +1552,7 @@ class X64DbgBridge(Debugger):
             "size": size
         }
 
-        result = self._request("/api/memory/read", data)
+        result = self._request_with_retry("/api/memory/read", data)
         hex_data = result.get("data", "")
 
         # Convert hex string to bytes
@@ -1239,7 +1695,7 @@ class X64DbgBridge(Debugger):
         Returns:
             Current state
         """
-        result = self._request("/api/status")
+        result = self._request_with_retry("/api/status")
         state_str = result.get("state", "not_loaded")
         return self._parse_state(state_str)
 
@@ -1250,13 +1706,26 @@ class X64DbgBridge(Debugger):
         Returns:
             Dictionary with address, instruction, module, etc.
         """
-        result = self._request("/api/status")
+        result = self._request_with_retry("/api/status")
 
         return {
             "address": result.get("current_address", "unknown"),
             "binary_path": result.get("binary_path", ""),
-            "state": result.get("state", "unknown")
+            "state": result.get("state", "unknown"),
+            # Absent on plugin builds from before the version was reported.
+            # None means "this build cannot say", which is itself the answer to
+            # "am I running the rebuilt plugin?" -- do not fill it with a guess.
+            "plugin_version": result.get("plugin_version") or None,
         }
+
+    def get_plugin_version(self) -> str | None:
+        """
+        Version string of the loaded x64dbg plugin.
+
+        Returns:
+            The version, or None if the plugin build does not report one.
+        """
+        return self.get_current_location().get("plugin_version")
 
     def _parse_state(self, state_str: str) -> DebuggerState:
         """Convert string state to DebuggerState enum."""
@@ -1368,7 +1837,7 @@ class X64DbgBridge(Debugger):
         Note:
             Requires C++ plugin implementation of /api/memory/map
         """
-        result = self._request("/api/memory/map")
+        result = self._request_with_retry("/api/memory/map")
         regions = result.get("regions", [])
 
         logger.debug(f"Got {len(regions)} memory regions")
@@ -1390,7 +1859,7 @@ class X64DbgBridge(Debugger):
         address = self._normalize_address(address)
 
         data = {"address": address}
-        result = self._request("/api/memory/info", data)
+        result = self._request_with_retry("/api/memory/info", data)
 
         return {
             "base": result.get("base", "unknown"),
@@ -1418,7 +1887,7 @@ class X64DbgBridge(Debugger):
             data["address"] = address
 
         try:
-            result = self._request("/api/instruction", data)
+            result = self._request_with_retry("/api/instruction", data)
             api_result = {
                 "address": result.get("address", "unknown"),
                 "bytes": result.get("bytes", ""),
@@ -1514,7 +1983,7 @@ class X64DbgBridge(Debugger):
         # Try plugin first
         try:
             data = {"expression": expression}
-            result = self._request("/api/evaluate", data)
+            result = self._request_with_retry("/api/evaluate", data)
             if result.get("valid", False):
                 return {
                     "value": result.get("value", "unknown"),
@@ -1636,7 +2105,7 @@ class X64DbgBridge(Debugger):
             - Module containing symbol is loaded
         """
         data = {"expression": expression}
-        result = self._request("/api/resolve", data)
+        result = self._request_with_retry("/api/resolve", data)
         return result
 
     def set_comment(self, address: str, comment: str) -> bool:
@@ -1792,7 +2261,7 @@ class X64DbgBridge(Debugger):
         Note:
             Requires C++ plugin implementation of /api/function/list
         """
-        result = self._request("/api/function/list")
+        result = self._request_with_retry("/api/function/list")
 
         functions = result.get("functions", [])
         logger.debug(f"Got {len(functions)} functions")
@@ -1812,7 +2281,7 @@ class X64DbgBridge(Debugger):
             Requires C++ plugin implementation of /api/module/imports
         """
         data = {"module": module_name}
-        result = self._request("/api/module/imports", data)
+        result = self._request_with_retry("/api/module/imports", data)
 
         imports = result.get("imports", [])
         logger.debug(f"Got {len(imports)} imports for {module_name}")
@@ -1832,7 +2301,7 @@ class X64DbgBridge(Debugger):
             Requires C++ plugin implementation of /api/module/exports
         """
         data = {"module": module_name}
-        result = self._request("/api/module/exports", data)
+        result = self._request_with_retry("/api/module/exports", data)
 
         exports = result.get("exports", [])
         logger.debug(f"Got {len(exports)} exports for {module_name}")
@@ -1898,6 +2367,26 @@ class X64DbgBridge(Debugger):
         """
         if value.startswith("0x"):
             value = value[2:]
+
+        # F-9 class, plugin side: HandleSetRegister whitelists the register NAME
+        # but then snprintf's the VALUE into a "mov <reg>, <value>" string and
+        # hands it to DbgCmdExec, which splits on ';'. Stripping a leading "0x"
+        # was the only processing this value got, so
+        # set_register("rax", "0;init C:/evil.exe") reached the dispatcher and
+        # started the sample -- the same class as F-16, reachable through a
+        # dedicated tool rather than the raw command endpoint.
+        #
+        # A register value is a hex literal. Anything else is rejected outright
+        # rather than escaped, because there is no legitimate value containing a
+        # separator and a strict pattern cannot be got subtly wrong.
+        value = value.strip()
+        if not re.fullmatch(r"[0-9a-fA-F]{1,16}", value):
+            raise ValueError(
+                f"Invalid register value {value!r}: expected 1-16 hexadecimal "
+                "digits (an optional '0x' prefix is accepted). Values are "
+                "interpolated into a debugger command, so anything else is "
+                "refused."
+            )
 
         data = {
             "register": register.lower(),
@@ -1992,43 +2481,195 @@ class X64DbgBridge(Debugger):
             "message": result.get("message", "Instruction undone"),
         }
 
-    # Commands that must never reach DbgCmdExec -- they load external code,
-    # write arbitrary files, or compromise the debugging session.
-    # Trace configuration commands are also blocked here because their
-    # arguments (arbitrary commands, file paths) bypass validation -- use
+    # Fast-fail denylist -- NOT the authoritative command gate.
+    #
+    # Audit finding F-4: this list used to be byte-identical to the C++
+    # BLOCKED_COMMAND_PREFIXES table in plugin.cpp, and both used the same
+    # exact-first-token match. Two copies of one list is one control described
+    # as two: any command missing here was missing there as well, so the
+    # "defense-in-depth" claim was false. The plugin gate has since been
+    # INVERTED to an allowlist (see ALLOWED_COMMANDS in plugin.cpp) and is now
+    # the authoritative decision point -- it fails CLOSED on any command it
+    # does not recognise, which is the only structure robust to x64dbg's
+    # alias-rich command language (finding F-9: x64dbg registers several
+    # spellings per handler, e.g. init/initdbg/InitDebug all start a process).
+    #
+    # This list survives only as a cheap early reject: it turns the obvious
+    # dangerous cases into a clear local ValueError with an actionable message
+    # instead of paying a round trip to the plugin for a generic refusal. It is
+    # deliberately a DIFFERENT control from the plugin's: different direction
+    # (deny vs allow), different contents (it names alias spellings the plugin
+    # does not need to enumerate, because the plugin rejects unknown tokens by
+    # default). Do not treat an omission here as permission.
+    #
+    # WHY THE ALLOWLIST IS AUTHORITATIVE AND THIS LIST NEVER CAN BE (F-9):
+    # x64dbg registers commands with dbgcmdnew("InitDebug,init,initdbg", ...)
+    # -- COMMA-SEPARATED aliases, matched with _stricmp. One handler answers to
+    # several names, new aliases arrive with new releases, and a denylist has to
+    # name every spelling of every dangerous handler to be worth anything, while
+    # an allowlist has to name only the handful of commands we actually want.
+    # A missing entry here is a missed block; a missing entry on the allowlist
+    # is only a missing feature. That asymmetry is the whole argument, and it is
+    # why _ALLOWED_COMMANDS below -- not this set -- is the gate.
+    #
+    # Finding F-16 audit note: five former entries ("savefile", "quit", "exit",
+    # "exec", "execute") matched NO command registered by x64dbg's
+    # registercommands() and were removed. They blocked nothing while making the
+    # list look more comprehensive than it was, which is exactly the illusion
+    # that let alias-reachable commands through. They stay rejected -- by
+    # _ALLOWED_COMMANDS, which refuses everything it does not recognise.
+    #
+    # Trace configuration commands are denied here because their arguments are
+    # themselves commands and file paths, which would bypass validation -- use
     # the dedicated set_trace_command / set_trace_log_file methods instead.
     _BLOCKED_COMMANDS = frozenset({
         "scriptdll", "scriptload", "scriptrun",
         "loadlib", "freelib",
-        "savedata", "savefile",
-        "quit", "stop", "exit",
+        "savedata",
+        "stop",
         "detach", "attach", "init",
-        "exec", "execute",
         "createthread",
         "tracesetcommand", "tracesetlog", "tracesetlogfile",
+        # Known alias spellings of the above handlers. x64dbg registers
+        # multiple names per command callback, so blocking one spelling blocks
+        # nothing (F-9). These are the process-control and code-loading aliases
+        # worth naming explicitly at this layer; the allowlist is what actually
+        # catches the ones nobody thought of.
+        "initdbg", "initdebug", "startdebug",
+        "attachdebugger", "detachdebugger",
+        "stopdebug", "dbgstop",
+        "plugload", "pluginload", "loadplugin", "plugunload", "pluginunload",
+        "threadcreate", "newthread", "threadnew", "killthread", "threadkill",
+        "setjit", "restartadmin", "runas", "adminrestart",
+        "scylla", "startscylla", "imprec",
+        "chd",
+        # F-16: commands the first remediation pass never named, each of which
+        # reaches something a static-analysis server must never reach.
+        # "scriptcmd"/"scriptexec" are the worst of them -- scriptcmd routes
+        # through ScriptCmdExecAwait -> cmddirectexec, i.e. the FULL dispatcher,
+        # so allowing it once would re-open every hole at once.
+        "scriptcmd", "scriptexec", "dllscript",
+        # Arbitrary code staging inside the debuggee: alloc defaults to
+        # PAGE_EXECUTE_READWRITE, and memcpy/fill/copystr/asm write to it.
+        "alloc", "free", "memcpy", "fill", "memset", "copystr", "strcpy",
+        "asm", "setpagerights",
+        # Arbitrary file writes / log redirection on the ANALYST's host.
+        "minidump", "savelog", "logsave", "redirectlog", "logredirect",
+        # Stores a command string that x64dbg later runs via cmddirectexec.
+        "setbreakpointcommand", "bpcommand",
+        "settracelog", "settracecommand", "settracelogfile",
+        # Persist a command into the x64dbg UI for later one-click execution.
+        "addfavouritetool", "addfavouritecommand",
+    })
+
+    # Bridge-layer command allowlist -- the authoritative Python-side gate.
+    #
+    # F-16: the C++ plugin's ALLOWED_COMMANDS is documented as the authoritative
+    # decision point, but it too matches only the first word of the string it is
+    # handed, so it accepts "log x;init C:/evil.exe" and passes the whole thing
+    # to DbgCmdExec, which splits and runs the init. Until the plugin validates
+    # per segment, the last gate that actually bounds what x64dbg executes is
+    # this one, in Python. It therefore has to be an allowlist and it has to be
+    # applied to EVERY segment.
+    #
+    # Contents: exactly the plugin's ALLOWED_COMMANDS set. That is deliberate --
+    # the bridge must not send anything the plugin will refuse, so the sets are
+    # kept identical on purpose and a test asserts it. It is a superset of the
+    # tool-layer allowlist in dynamic_tools.py (which is what bounds
+    # x64dbg_execute_command) because the bridge also issues commands on its own
+    # behalf for the dedicated tools: findasm, findguid, reffindrange, ticnd,
+    # tocnd, tibt, tobt and friends are here for that reason, not because
+    # callers may ask for them.
+    #
+    # Anything not named here is refused. Adding an entry means "x64dbg may run
+    # this against a live sample" -- weigh it accordingly, and update
+    # ALLOWED_COMMANDS in plugin.cpp at the same time.
+    _ALLOWED_COMMANDS = frozenset({
+        # Disassembly and navigation
+        "dis", "dis.prev", "dis.next", "dis.iscall", "dis.isbranch",
+        "disasm", "graph", "graphit",
+        # Search
+        "find", "findall", "findmem", "findallmem", "findasm", "findguid",
+        "modcallfind", "reffindrange",
+        "ref", "refstr", "refsearch", "refinfo",
+        # Analysis
+        "cfanalyze", "analxrefs", "analrecur", "analadv", "analyse",
+        "exhandlers", "exinfo",
+        # Execution control the dedicated tools rely on
+        "rtu", "instrundo",
+        "ticnd", "tocnd", "tibt", "tobt", "tracesetcondition",
+        # Breakpoint listing / DLL breakpoints
+        "bplist", "bphitcount", "bpdll", "bcdll", "bpedll", "bpddll",
+        # Output and evaluation
+        "log", "msg", "eval",
+        "dump", "sdump",
+        # Annotations
+        "lbl", "lblset", "lbldel", "lbllist",
+        "cmt", "cmtset", "cmtdel", "cmtlist",
+        "bm", "bmset", "bmdel", "bmlist",
+        # Variables and watches
+        "var", "vardel", "varlist",
+        "addwatch", "delwatch", "setwatchdog",
+        "setwatchexpression", "setwatchname",
+        # Type system
+        "addstruct", "addunion", "addmember", "addtype",
+        "visittype", "sizeoftype", "removetype",
+        "enumtypes", "cleartypes", "loadtypes", "parsetypes",
+        # Privilege toggles used by the dedicated privilege tools
+        "enableprivilege", "disableprivilege",
     })
 
     def _validate_command(self, command: str) -> None:
         """
-        Validate a command against the blocked commands list.
+        Validate every command x64dbg would dispatch from this string.
+
+        F-9/F-16: this used to inspect the first token of the whole string.
+        x64dbg splits on ';' and dispatches each segment separately, so
+        ``log x;init C:/evil.exe`` sailed through on the strength of the ``log``
+        and then STARTED THE SAMPLE. Each segment is now validated in its own
+        right, against a deny-then-allow pair, and the string is rejected if any
+        one of them fails.
 
         Raises:
-            ValueError: If the command is blocked for security reasons
+            ValueError: If the command is empty, structurally unsafe, or any of
+                its segments is not permitted.
         """
-        first_token = command.strip().split()[0].split("(")[0].lower()
-        if first_token in self._BLOCKED_COMMANDS:
-            raise ValueError(
-                f"Command '{first_token}' is blocked by security policy. "
-                f"This command could load external code or compromise the session."
-            )
+        # Structural checks first (empty / NUL / CR-LF / '$' / unbalanced
+        # quotes) -- see x64dbg_command_segments. Finding F-12: this must raise
+        # ValueError, never IndexError, because callers of execute_command()
+        # treat ValueError as "rejected input".
+        segments = x64dbg_command_segments(command)
+
+        for segment in segments:
+            name = x64dbg_command_name(segment)
+
+            # Fast-fail denylist: a specific, actionable message for the cases
+            # people actually try. Not the gate -- the allowlist below is.
+            if name in self._BLOCKED_COMMANDS:
+                raise ValueError(
+                    f"Command '{name}' is blocked by security policy. "
+                    f"This command could load external code or compromise the session."
+                )
+
+            # The gate. Fails closed on anything unrecognised, which is the only
+            # structure that survives x64dbg's alias-rich command language.
+            if name not in self._ALLOWED_COMMANDS:
+                raise ValueError(
+                    f"Command '{name}' is blocked by security policy: it is not "
+                    f"on the x64dbg bridge allowlist. Use a dedicated tool for "
+                    f"operations this list does not cover."
+                )
 
     def execute_command(self, command: str) -> dict[str, Any]:
         """
         Execute an x64dbg command via the command API.
 
-        Commands are validated against a blocklist of dangerous operations
-        (ScriptDll, loadlib, savedata, etc.) before being sent. The plugin
-        also enforces its own server-side blocklist as defense-in-depth.
+        Every ';'-separated segment of the string is validated independently
+        (F-9/F-16) against a fast-fail denylist and then against
+        ``_ALLOWED_COMMANDS``; the whole string is refused if any segment fails.
+        The plugin enforces its own allowlist as well, but only on the first
+        token of the string it receives, so this is the layer that bounds what
+        DbgCmdExec ends up dispatching.
 
         Args:
             command: The x64dbg command string to execute
@@ -4044,35 +4685,29 @@ class X64DbgBridge(Debugger):
             result["warnings"].append(f"Invalid output path: {e}")
             return result
 
-        # Find the module
-        modules = self.get_modules()
+        # Find the module, by base address first and then by name.
+        #
+        # normalize_module() coerces "base" and "size" to int, so the string
+        # handling this used to do (.startswith("0x") on the base) raised
+        # AttributeError on every call -- and at the address branch it escaped
+        # the surrounding "except ValueError" rather than falling through to
+        # the name lookup. Both paths now go through the same normalised
+        # accessors that the rest of the bridge uses.
         target_module = None
 
-        # Check if module_name is an address
         try:
-            if module_name.lower().startswith("0x"):
-                base_addr = int(module_name, 16)
-            else:
-                base_addr = int(module_name, 16)
+            base_addr = int(module_name, 16)
+        except (TypeError, ValueError):
+            base_addr = None
 
-            # Search by base address
-            for mod in modules:
-                mod_base_str = mod.get("base", "0")
-                if mod_base_str.startswith("0x"):
-                    mod_base = int(mod_base_str, 16)
-                else:
-                    mod_base = int(mod_base_str, 16)
-
-                if mod_base == base_addr:
+        if base_addr is not None:
+            for mod in self.get_modules():
+                if _coerce_int(mod.get("base")) == base_addr:
                     target_module = mod
                     break
-        except ValueError:
-            # It's a module name, not an address
-            module_name_lower = module_name.lower()
-            for mod in modules:
-                if mod.get("name", "").lower() == module_name_lower:
-                    target_module = mod
-                    break
+
+        if target_module is None:
+            target_module = self.find_module(module_name)
 
         if not target_module:
             raise RuntimeError(
@@ -4080,19 +4715,8 @@ class X64DbgBridge(Debugger):
                 f"Use get_modules() to list available modules."
             )
 
-        # Get module details
-        base_str = target_module.get("base", "0")
-        if base_str.startswith("0x"):
-            base_addr = int(base_str, 16)
-        else:
-            base_addr = int(base_str, 16)
-
-        size = target_module.get("size", 0)
-        if isinstance(size, str):
-            if size.startswith("0x"):
-                size = int(size, 16)
-            else:
-                size = int(size, 16)
+        base_addr = _coerce_int(target_module.get("base"))
+        size = _coerce_int(target_module.get("size"))
 
         result["original_base"] = f"0x{base_addr:X}"
         result["size"] = size
@@ -5445,6 +6069,24 @@ class X64DbgBridge(Debugger):
         """
         if not definition or not definition.strip():
             raise ValueError("Type definition text cannot be empty")
+        # PRE-EXISTING limitation, surfaced rather than introduced by the
+        # per-segment validation below. ParseTypes is delivered over the
+        # command channel, and x64dbg's cmdsplit() splits every command string
+        # on ';' before the handler ever runs -- so C source, which is full of
+        # semicolons, was already being torn into fragments by the debugger
+        # itself ("ParseTypes struct A{int x" + "};"). It has never worked for
+        # anything but a single semicolon-free declaration.
+        #
+        # Fail with an accurate message instead of letting the generic
+        # allowlist rejection blame a stray '}' for it.
+        if ";" in definition:
+            raise ValueError(
+                "Type definitions containing ';' cannot be sent through the "
+                "x64dbg command channel: x64dbg splits every command on ';' "
+                "before the ParseTypes handler runs, so the definition would "
+                "arrive truncated. Write the types to a file and use "
+                "load_types() instead."
+            )
         return self._request_with_retry(
             "/api/command", {"command": f"ParseTypes {definition.strip()}"}
         )

@@ -236,7 +236,7 @@ PREFIX_RULES: dict[str, ToolEntry] = {
     "windbg_": _e("debugger"),
 }
 
-DEBUGGER_CODE_OUTPUT = ("x64dbg_disassemble", "x64dbg_get_instruction", "windbg_disassemble")
+DEBUGGER_CODE_OUTPUT = ("x64dbg_disasm", "windbg_disassemble")
 for _name in DEBUGGER_CODE_OUTPUT:
     TOOL_CATALOG[_name] = _e("debugger", CODE)
 

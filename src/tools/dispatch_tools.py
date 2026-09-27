@@ -16,6 +16,7 @@ import re
 from pathlib import Path
 
 from src.engines.dynamic.windbg.kernel_types import IOCTLCode
+from src.utils.formatters import wrap_untrusted
 
 logger = logging.getLogger(__name__)
 
@@ -416,9 +417,23 @@ def register_dispatch_tools(app, session_manager, cache, runner):
                 )
                 return "\n".join(output)
 
+            # Audit F-7: the per-dispatcher blocks name functions and their
+            # handler targets, and both are symbol strings recovered from the
+            # driver under analysis -- a hostile driver picks its own export
+            # and PDB names. The decoded CTL_CODE fields and the risk rating
+            # beside them are this module's own arithmetic, but they are
+            # interleaved with the names line by line, so the whole listing is
+            # fenced as one block and the counts above it stay outside.
+            body: list[str] = []
             for record in records:
-                output.extend(_format_record(record))
-                output.append("")
+                body.extend(_format_record(record))
+                body.append("")
+            output.append(
+                wrap_untrusted(
+                    "\n".join(body).rstrip("\n"),
+                    kind="dispatcher and handler names recovered from the sample",
+                )
+            )
 
             return "\n".join(output)
 

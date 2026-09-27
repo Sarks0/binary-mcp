@@ -11,6 +11,7 @@ Provides 255 tools for static and dynamic binary analysis:
 - Review coverage (per-binary denominator, scope, unreviewed worklist)
 """
 
+import asyncio
 import contextlib
 import functools
 import json
@@ -32,6 +33,7 @@ from src.engines.static.ghidra.coverage_store import CoverageStore, has_reviewab
 from src.engines.static.ghidra.coverage_store import auto_mark as auto_mark_reviewed
 from src.engines.static.ghidra.project_cache import ProjectCache
 from src.engines.static.ghidra.runner import GhidraAnalysisError, GhidraRunner
+from src.tool_catalog import apply_catalog as apply_tool_catalog
 from src.tools.control_flow_tools import register_control_flow_tools
 from src.tools.coverage_tools import register_coverage_tools
 from src.tools.diff_tools import register_diff_tools
@@ -5749,11 +5751,18 @@ def list_python_archive_contents(binary_path: str) -> str:
         return f"Error listing archive contents: {e}"
 
 
-def main():
-    """Run the MCP server."""
-    logger.info("Starting Binary MCP Server...")
-    logger.info(f"Ghidra Path: {runner.ghidra_path}")
-    logger.info(f"Cache Directory: {cache.cache_dir}")
+_tools_registered = False
+
+
+def register_all_tools() -> None:
+    """Register every tool module on ``app`` and tag the roster from the catalog.
+
+    Idempotent: ``main()`` and ``python -m src.tool_catalog`` both call it.
+    """
+    global _tools_registered
+    if _tools_registered:
+        return
+    _tools_registered = True
 
     # Register .NET analysis tools
     register_dotnet_tools(app)
@@ -5808,6 +5817,24 @@ def main():
 
     # Register job-control tools (the poll side of the async transport)
     register_job_tools(app, jobs)
+
+    # Category/facet tags so integrators can select tools by what they do
+    # (see src/tool_catalog.py). An unclassified tool is a catalog bug.
+    uncategorized = apply_tool_catalog(asyncio.run(app.get_tools()))
+    if uncategorized:
+        logger.error(
+            "Tools missing from src/tool_catalog.py (tagged uncategorized): %s",
+            ", ".join(uncategorized),
+        )
+
+
+def main():
+    """Run the MCP server."""
+    logger.info("Starting Binary MCP Server...")
+    logger.info(f"Ghidra Path: {runner.ghidra_path}")
+    logger.info(f"Cache Directory: {cache.cache_dir}")
+
+    register_all_tools()
 
     # Reap anything a previously-abandoned client left running before we
     # add load of our own.

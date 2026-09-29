@@ -605,17 +605,22 @@ class TestVirusTotalEnvelope:
         monkeypatch.setattr(
             vt,
             "search_files",
-            lambda q, limit: [
-                {
-                    "attributes": {
-                        "last_analysis_stats": {"malicious": 12, "undetected": 50},
-                        "sha256": "d" * 64,
-                        "type_description": "Win32 EXE",
-                        "names": [INJECTION],
-                        "tags": ["ransomware"],
+            # search_files now returns (results, next_cursor) so vt_search can
+            # page through an Intelligence result set.
+            lambda q, limit, cursor="": (
+                [
+                    {
+                        "attributes": {
+                            "last_analysis_stats": {"malicious": 12, "undetected": 50},
+                            "sha256": "d" * 64,
+                            "type_description": "Win32 EXE",
+                            "names": [INJECTION],
+                            "tags": ["ransomware"],
+                        }
                     }
-                }
-            ],
+                ],
+                "",
+            ),
         )
 
         out = self._register_vt()["vt_search"]("tag:ransomware")

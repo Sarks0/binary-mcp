@@ -395,11 +395,29 @@ _TOOLS_DIR = Path(__file__).resolve().parent.parent / "src" / "tools"
 # including one this branch itself added that returned the Path.home()-derived
 # extraction root. Scanning it here is what stops that recurring.
 _SERVER_PY = Path(__file__).resolve().parent.parent / "src" / "server.py"
+_INTEGRATIONS_DIR = Path(__file__).resolve().parent.parent / "src" / "integrations"
 
 
 def _guarded_sources() -> list[Path]:
-    """Every file the F-10 guards must inspect: src/tools/*.py plus server.py."""
-    return sorted(_TOOLS_DIR.glob("*.py")) + [_SERVER_PY]
+    """
+    Every file the F-10 guards must inspect.
+
+    src/tools/*.py plus server.py, plus src/integrations/*.py.
+
+    The integrations package was added when the per-provider HTTP plumbing was
+    factored out of vt_tools and mb_tools. Both of those are inside the guard;
+    the shared layer they moved INTO was not, so the refactor would have
+    silently carried error-message construction out of scope -- and the
+    transport is precisely where a raw urllib exception, with whatever host
+    detail it carries, is most likely to get interpolated into a message. A
+    guard that a refactor can walk out of is the hole this file already warns
+    about elsewhere.
+    """
+    return (
+        sorted(_TOOLS_DIR.glob("*.py"))
+        + sorted(_INTEGRATIONS_DIR.glob("*.py"))
+        + [_SERVER_PY]
+    )
 
 # Exception types whose messages are raised by this project's own validators.
 # Those are deliberately echoed verbatim (see the F-10 comments in the tool
@@ -501,6 +519,30 @@ _AST_ALLOWED_HANDLERS = {
     # with one. Widening this set requires the same audit.
     "CfgBuildError",
     "VirusTotalError",
+    #   * MalwareBazaarError (src/tools/mb_tools.py) -- the same construction
+    #     as VirusTotalError, audited the same way. Its raise sites are: the
+    #     curated Auth-Key / rate-limit / response-cap / "not JSON" / "not a
+    #     zip archive" sentences written in that module; the HTTP status line
+    #     (``{e.code} {e.reason}``) and the URLError reason, neither of which
+    #     can carry a filesystem path for an https:// request; and
+    #     ``_status_message()``, whose only variable part is a ``query_status``
+    #     token already constrained to ``[a-z0-9_]{1,64}`` before it is echoed.
+    "MalwareBazaarError",
+    #   * AbuseChError (src/tools/abusech_tools.py) -- ThreatFox, URLhaus and
+    #     YARAify, audited together because they share one transport and one
+    #     failure vocabulary. Raise sites: the curated sentences in that
+    #     module, the shared client's status-line and network messages, and
+    #     `_status_message()`, whose only variable part is a `query_status`
+    #     token already constrained to `[a-z0-9_]{1,64}` before it is echoed.
+    "AbuseChError",
+    #   * AttackDataError (src/tools/attack_tools.py) -- MITRE ATT&CK. Raise
+    #     sites: the curated sentences in that module (no bundle for <matrix>,
+    #     index pointed somewhere unexpected, bundle contained no objects, the
+    #     offline-without-cache message) plus the shared client's status-line
+    #     and network messages. The one path that could quote a filesystem path
+    #     -- a failed cache write -- is an OSError routed through
+    #     safe_path_error in the handler, not through this type.
+    "AttackDataError",
     #   * CoverageError (src/engines/static/ghidra/coverage_store.py) -- every
     #     raise site was audited when it was added here: "invariant violated:
     #     remaining != total - reviewed", "unknown examination kind 'x';

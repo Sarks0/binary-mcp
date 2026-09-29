@@ -99,7 +99,7 @@ Analyze the crash dump at C:\Windows\MEMORY.DMP
 Decompile the type MyNamespace.MyClass to C#
 ```
 
-## Capabilities (147 tools)
+## Capabilities (166 tools)
 
 Counts below are derived from the tools actually registered by `src/server.py`, and `tests/test_docs_accuracy.py` fails if this file and the code disagree.
 
@@ -146,7 +146,7 @@ Type listing, C# decompilation, IL disassembly, type search, full assembly decom
 
 Comprehensive PE header, section, import, export, resource, debug, TLS, and Rich header analysis in a single call, at three detail levels (basic/standard/full) with decoded characteristic flags, compiler attribution, and malware indicators. Plus Authenticode signature inspection, embedded-binary carving, and similarity hashing.
 
-### Other - 45 tools
+### Other - 64 tools
 
 - **Triage (3)** - Quick file type detection, packer identification, entropy analysis
 - **Malware Analysis (6)** - Behavior detection, API call chains, dynamic API resolution, anti-analysis detection, stack-string recovery, IOC extraction with context
@@ -156,6 +156,9 @@ Comprehensive PE header, section, import, export, resource, debug, TLS, and Rich
 - **Review Coverage (6)** - Per-binary review denominator, reachability scope, a deterministic unreviewed worklist, and a separate machine-examination axis so a diff run is recorded without being counted as a review. See [docs/coverage.md](docs/coverage.md)
 - **Background Jobs (4)** - Poll long-running analysis that outlives the MCP client timeout, with one Ghidra run per binary shared across server processes and orphan reaping. See [docs/jobs.md](docs/jobs.md)
 - **VirusTotal (4)** - Hash lookups, sandbox behavior reports, Intelligence search, API-key check. Read-only: see "Operational safety" below
+- **MalwareBazaar (5)** - Sample lookup by hash, corpus pivots (tag, family signature, file type, ClamAV signature, imphash, TLSH, telfhash, gimphash, icon dhash, YARA rule), recent uploads, Auth-Key check, and an opt-in sample download. Downloading is off unless `MB_ALLOW_DOWNLOAD=1`: see "Operational safety" below
+- **abuse.ch: ThreatFox, URLhaus, YARAify (9)** - IOC-to-malware-family identification, malware distribution history for a URL/host/payload (including the payload hashes served from a host), and public YARA rule matching by hash or by rule name, imphash, TLSH, telfhash, gimphash, icon dhash or ClamAV signature. Shares one Auth-Key with MalwareBazaar
+- **MITRE ATT&CK (5)** - Technique, threat-actor group and malware/tool lookups with alias resolution, plus keyword search across the matrix. No API key and no rate limit: the STIX bundle is fetched once from MITRE's public repository, distilled to a compact index, and served from disk thereafter - so these work offline
 - **Reporting (2)** - Generate structured analysis reports, export IOCs
 - **YARA (2)** - Rule *generation* from session data or extracted strings. This server emits rule text; it does not compile or run rules, so no YARA library is required or installed
 - **IOCTL Dispatch (1)** - Recover driver IOCTL handlers
@@ -203,6 +206,22 @@ worth being precise about which parts:
   host through it, deliberately or by accident. Sending a hash still tells
   VirusTotal you have the sample; sending the file would tell everyone with VT
   Intelligence access.
+
+  The MalwareBazaar integration is the same property with a different
+  mechanism, and the difference is worth stating plainly: abuse.ch's API is
+  POST-only, so unlike the VirusTotal tools these calls do have a request
+  body. What goes in it is a hash, a tag, a family name or a rule name -
+  never file content. `mb_lookup(file_path=...)` hashes the file locally and
+  sends the digest alone. There is no `add_file` call here, and
+  `tests/test_mb_tools.py` pins that the request body is assembled only from
+  scalar form fields, so sample bytes have no path to the wire.
+- **Downloading a sample is off by default.** `mb_download` is the one tool in
+  this server that writes malware to disk. It refuses unless the operator sets
+  `MB_ALLOW_DOWNLOAD=1`; it writes only inside `~/.binary_mcp_output/malwarebazaar/`;
+  and it stores abuse.ch's **encrypted** zip without ever extracting it, so
+  nothing this server does leaves a runnable copy on the host. The archive
+  password is the abuse.ch convention, `infected`. Extract it in your analysis
+  VM, not on the machine running this server.
 - **File access is confined by default.** Binary paths go through
   `sanitize_binary_path` (`src/utils/security.py`), which checks a symlink's
   target for containment before following it, and answers "denied" identically
@@ -252,6 +271,18 @@ worth being precise about which parts:
 | `WINDBG_MODE` | Operating mode: `kernel`, `user`, `dump` | `kernel` |
 | `BINARY_CACHE_DIR` | Cache root for Ghidra projects and carved output | `~/ghidra_mcp_cache` |
 | `VT_API_KEY` | VirusTotal API key (lookups only) | Unset - VT tools report how to configure it |
+| `VT_API_TIMEOUT` | Socket timeout for VirusTotal calls (seconds, clamped 5-300) | 30 |
+| `ABUSECH_API_KEY` | abuse.ch Auth-Key. One key covers MalwareBazaar, ThreatFox, URLhaus and YARAify; mandatory for all of them since 30 June 2025. Free from https://auth.abuse.ch/ | Unset - the tools report how to configure it |
+| `MB_API_KEY` | Accepted as an alias for `ABUSECH_API_KEY`, which shipped later. `ABUSECH_API_KEY` wins if both are set | Unset |
+| `MB_API_TIMEOUT` | Socket timeout for MalwareBazaar calls (seconds, clamped 5-300) | 30 |
+| `ABUSECH_API_TIMEOUT` | Socket timeout for ThreatFox/URLhaus/YARAify calls (seconds, clamped 5-300) | 30 |
+| `ATTACK_DOMAIN` | ATT&CK matrix: `enterprise-attack`, `mobile-attack` or `ics-attack` | `enterprise-attack` |
+| `ATTACK_DATA_DIR` | Where the distilled ATT&CK index is cached | `$BINARY_CACHE_DIR/attack` |
+| `ATTACK_OFFLINE` | Refuse to download ATT&CK data; serve only what is already cached | Unset (off) |
+| `ATTACK_MAX_BUNDLE_MB` | Ceiling on the downloaded STIX bundle, in MB (clamped 8-1024). Enterprise is ~51MB today | 128 |
+| `ATTACK_TIMEOUT` | Socket timeout for the ATT&CK download (seconds, clamped 5-600) | 120 |
+| `MB_ALLOW_DOWNLOAD` | Enable `mb_download`, the only tool that writes a sample to disk. Archives are saved encrypted under `~/.binary_mcp_output/malwarebazaar/` and never extracted | Unset (off) |
+| `MB_MAX_DOWNLOAD_MB` | Ceiling on a downloaded archive, in MB (clamped 1-2048) | 128 |
 | `BINARY_MCP_ALLOWED_DIRS` | Directories analysis is confined to, separated by `:` (POSIX) or `;` (Windows) | Unset - falls back to the quarantine directories described under "Operational safety" |
 | `BINARY_MCP_REQUIRE_CONFINEMENT` | Fail closed: refuse to open any binary unless `BINARY_MCP_ALLOWED_DIRS` is set explicitly | Unset (off) |
 | `BINARY_MCP_ALLOW_ANY_PATH` | Opt out of path confinement entirely. Not recommended - every file this process can read becomes reachable through the server. Logs a warning once per process, and is ignored when `BINARY_MCP_REQUIRE_CONFINEMENT` is set | Unset (off) |

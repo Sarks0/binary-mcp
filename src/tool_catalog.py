@@ -66,7 +66,19 @@ CATEGORIES: dict[str, str] = {
     "reporting": "Reports, IOC exports and YARA rule generation.",
     "jobs": "Background job control for long-running analysis calls.",
     "admin": "Setup diagnostics and cache maintenance.",
-    "threat-intel": "External reputation / sandbox lookups (VirusTotal).",
+    "threat-intel": (
+        "External reputation, sandbox and corpus lookups that SEND a "
+        "sample-derived value -- a hash, an extracted IOC, a rule name -- to "
+        "a third party (VirusTotal, MalwareBazaar, ThreatFox, URLhaus, "
+        "YARAify). Gate on this when the sample itself is sensitive: the "
+        "lookup tells that service you hold it."
+    ),
+    "reference": (
+        "Read-only reference data about techniques, actors and malware "
+        "families (MITRE ATT&CK). Distinct from threat-intel because nothing "
+        "derived from the sample leaves the host: the dataset is fetched once "
+        "and then queried locally."
+    ),
     "debugger": "Live debugging via x64dbg or WinDbg against a running target or dump.",
 }
 
@@ -87,8 +99,13 @@ FACETS: dict[str, str] = {
         "also fetch its PDB from the symbol server (BINARY_MCP_AUTO_PDB)."
     ),
     "network": (
-        "Always contacts an external service (VirusTotal, a symbol server). "
-        "runs-engine tools can too, on a first import, per BINARY_MCP_AUTO_PDB."
+        "Contacts an external service. For threat-intel tools that is every "
+        "call, and it carries a sample-derived value. For the ATT&CK tools it "
+        "is only a cache miss or an explicit refresh, and it carries nothing "
+        "about the sample -- they are still tagged, because a guard gating "
+        "egress should fail closed on 'may' rather than on 'always'. "
+        "runs-engine tools can also reach a symbol server on a first import, "
+        "per BINARY_MCP_AUTO_PDB."
     ),
 }
 
@@ -221,11 +238,37 @@ TOOL_CATALOG: dict[str, ToolEntry] = {
     "diagnose_setup": _e("admin"),
     "diagnose_dotnet_setup": _e("admin"),
     "clean_cache": _e("admin"),
-    # threat-intel
+    # threat-intel -- VirusTotal
     "vt_lookup": _e("threat-intel", NET),
     "vt_search": _e("threat-intel", NET),
     "vt_behavior": _e("threat-intel", NET),
     "vt_check_api": _e("threat-intel", NET),
+    # threat-intel -- MalwareBazaar (abuse.ch). mb_download additionally writes
+    # an encrypted sample archive under ~/.binary_mcp_output/, and is refused
+    # unless MB_ALLOW_DOWNLOAD is set; it is the only tool here that puts a
+    # sample on disk.
+    "mb_check_api": _e("threat-intel", NET),
+    "mb_lookup": _e("threat-intel", NET),
+    "mb_search": _e("threat-intel", NET),
+    "mb_recent": _e("threat-intel", NET),
+    "mb_download": _e("threat-intel", NET),
+    # threat-intel -- ThreatFox, URLhaus, YARAify (abuse.ch)
+    "abusech_check_api": _e("threat-intel", NET),
+    "threatfox_lookup_ioc": _e("threat-intel", NET),
+    "threatfox_lookup_hash": _e("threat-intel", NET),
+    "threatfox_by_malware": _e("threat-intel", NET),
+    "urlhaus_lookup_url": _e("threat-intel", NET),
+    "urlhaus_lookup_host": _e("threat-intel", NET),
+    "urlhaus_lookup_payload": _e("threat-intel", NET),
+    "yaraify_lookup_hash": _e("threat-intel", NET),
+    "yaraify_search": _e("threat-intel", NET),
+    # reference -- MITRE ATT&CK. Served from a local cache after one fetch, so
+    # NET here means "may", not "does": see the facet description.
+    "attack_status": _e("reference", NET),
+    "attack_lookup_technique": _e("reference", NET),
+    "attack_lookup_group": _e("reference", NET),
+    "attack_lookup_software": _e("reference", NET),
+    "attack_search": _e("reference", NET),
 }
 
 # The ~190 debugger tools share one shape; listing each by hand would add

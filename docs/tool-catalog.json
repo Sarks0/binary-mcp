@@ -13,14 +13,15 @@
     "reporting": "Reports, IOC exports and YARA rule generation.",
     "jobs": "Background job control for long-running analysis calls.",
     "admin": "Setup diagnostics and cache maintenance.",
-    "threat-intel": "External reputation / sandbox lookups (VirusTotal).",
+    "threat-intel": "External reputation, sandbox and corpus lookups that SEND a sample-derived value -- a hash, an extracted IOC, a rule name -- to a third party (VirusTotal, MalwareBazaar, ThreatFox, URLhaus, YARAify). Gate on this when the sample itself is sensitive: the lookup tells that service you hold it.",
+    "reference": "Read-only reference data about techniques, actors and malware families (MITRE ATT&CK). Distinct from threat-intel because nothing derived from the sample leaves the host: the dataset is fetched once and then queried locally.",
     "debugger": "Live debugging via x64dbg or WinDbg against a running target or dump."
   },
   "facets": {
     "code-output": "The response can contain decompiled code, pseudocode excerpts, C# source or IL/disassembly listings -- including replays of earlier tool output. Gate on this to keep code out of the model's context.",
     "pseudocode-derived": "Results are computed from Ghidra's decompiler output, so they inherit its artifacts (unaff_* values, collapsed variadic args) and are empty on a structural-only cache.",
     "runs-engine": "May launch Ghidra headless or ILSpy -- by design, or on a cache miss. Can take minutes on a large binary. A first import of a PE may also fetch its PDB from the symbol server (BINARY_MCP_AUTO_PDB).",
-    "network": "Always contacts an external service (VirusTotal, a symbol server). runs-engine tools can too, on a first import, per BINARY_MCP_AUTO_PDB."
+    "network": "Contacts an external service. For threat-intel tools that is every call, and it carries a sample-derived value. For the ATT&CK tools it is only a cache miss or an explicit refresh, and it carries nothing about the sample -- they are still tagged, because a guard gating egress should fail closed on 'may' rather than on 'always'. runs-engine tools can also reach a symbol server on a first import, per BINARY_MCP_AUTO_PDB."
   },
   "by_facet": {
     "code-output": [
@@ -94,14 +95,39 @@
       "search_dotnet_types"
     ],
     "network": [
+      "abusech_check_api",
+      "attack_lookup_group",
+      "attack_lookup_software",
+      "attack_lookup_technique",
+      "attack_search",
+      "attack_status",
       "load_pdb",
+      "mb_check_api",
+      "mb_download",
+      "mb_lookup",
+      "mb_recent",
+      "mb_search",
+      "threatfox_by_malware",
+      "threatfox_lookup_hash",
+      "threatfox_lookup_ioc",
+      "urlhaus_lookup_host",
+      "urlhaus_lookup_payload",
+      "urlhaus_lookup_url",
       "vt_behavior",
       "vt_check_api",
       "vt_lookup",
-      "vt_search"
+      "vt_search",
+      "yaraify_lookup_hash",
+      "yaraify_search"
     ]
   },
   "tools": {
+    "abusech_check_api": {
+      "category": "threat-intel",
+      "facets": [
+        "network"
+      ]
+    },
     "add_note": {
       "category": "annotation",
       "facets": [
@@ -143,6 +169,36 @@
     "analyze_xor_encryption": {
       "category": "triage",
       "facets": []
+    },
+    "attack_lookup_group": {
+      "category": "reference",
+      "facets": [
+        "network"
+      ]
+    },
+    "attack_lookup_software": {
+      "category": "reference",
+      "facets": [
+        "network"
+      ]
+    },
+    "attack_lookup_technique": {
+      "category": "reference",
+      "facets": [
+        "network"
+      ]
+    },
+    "attack_search": {
+      "category": "reference",
+      "facets": [
+        "network"
+      ]
+    },
+    "attack_status": {
+      "category": "reference",
+      "facets": [
+        "network"
+      ]
     },
     "batch_decompile": {
       "category": "decompile",
@@ -548,6 +604,36 @@
       "category": "coverage",
       "facets": []
     },
+    "mb_check_api": {
+      "category": "threat-intel",
+      "facets": [
+        "network"
+      ]
+    },
+    "mb_download": {
+      "category": "threat-intel",
+      "facets": [
+        "network"
+      ]
+    },
+    "mb_lookup": {
+      "category": "threat-intel",
+      "facets": [
+        "network"
+      ]
+    },
+    "mb_recent": {
+      "category": "threat-intel",
+      "facets": [
+        "network"
+      ]
+    },
+    "mb_search": {
+      "category": "threat-intel",
+      "facets": [
+        "network"
+      ]
+    },
     "quick_scan": {
       "category": "triage",
       "facets": []
@@ -587,6 +673,42 @@
     "start_analysis_session": {
       "category": "session",
       "facets": []
+    },
+    "threatfox_by_malware": {
+      "category": "threat-intel",
+      "facets": [
+        "network"
+      ]
+    },
+    "threatfox_lookup_hash": {
+      "category": "threat-intel",
+      "facets": [
+        "network"
+      ]
+    },
+    "threatfox_lookup_ioc": {
+      "category": "threat-intel",
+      "facets": [
+        "network"
+      ]
+    },
+    "urlhaus_lookup_host": {
+      "category": "threat-intel",
+      "facets": [
+        "network"
+      ]
+    },
+    "urlhaus_lookup_payload": {
+      "category": "threat-intel",
+      "facets": [
+        "network"
+      ]
+    },
+    "urlhaus_lookup_url": {
+      "category": "threat-intel",
+      "facets": [
+        "network"
+      ]
     },
     "vt_behavior": {
       "category": "threat-intel",
@@ -811,6 +933,18 @@
     "x64dbg_types": {
       "category": "debugger",
       "facets": []
+    },
+    "yaraify_lookup_hash": {
+      "category": "threat-intel",
+      "facets": [
+        "network"
+      ]
+    },
+    "yaraify_search": {
+      "category": "threat-intel",
+      "facets": [
+        "network"
+      ]
     }
   }
 }

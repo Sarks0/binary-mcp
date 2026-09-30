@@ -42,6 +42,14 @@ MAX_PDB_DOWNLOAD_BYTES = 256 * 1024 * 1024
 ALLOW_PRIVATE_SERVERS_ENV = "BINARY_MCP_ALLOW_PRIVATE_SYMBOL_SERVERS"
 
 
+class SymbolsOfflineError(RuntimeError):
+    """``BINARY_MCP_SYMBOL_OFFLINE=1`` and the PDB was not already cached.
+
+    Distinct from every other failure: nothing was sent to any server, and
+    the absence says nothing about whether the PDB exists upstream.
+    """
+
+
 class PdbNotPublishedError(RuntimeError):
     """Every symbol server answered 404: the PDB is genuinely not published.
 
@@ -195,6 +203,17 @@ DEFAULT_SYMBOL_SERVER = os.environ.get(
     "BINARY_MCP_SYMBOL_SERVER",
     "https://msdl.microsoft.com/download/symbols",
 )
+
+# Air-gap switch. Documented in config.py and honoured by the WinDbg
+# sympath builder; fetch_pdb has to honour it too, because the automatic
+# fetch on first import now reaches the network without an operator asking.
+SYMBOL_OFFLINE_ENV = "BINARY_MCP_SYMBOL_OFFLINE"
+
+
+def symbols_offline() -> bool:
+    """True when the operator has asked for cache-only symbol resolution."""
+    return os.environ.get(SYMBOL_OFFLINE_ENV) == "1"
+
 
 MAX_CODEVIEW_BYTES = 64 * 1024
 _PDB_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+\.pdb$", re.IGNORECASE)
@@ -500,6 +519,8 @@ def fetch_pdb(
     Raises:
         ValueError: if the binary has no usable CodeView record OR the cache
             path would escape ``cache_dir``.
+        SymbolsOfflineError: if ``BINARY_MCP_SYMBOL_OFFLINE=1`` and the PDB
+            is not already in the local cache. Nothing was sent anywhere.
         PdbNotPublishedError: if every configured server answered 404.
         RuntimeError: if every configured server fails for any other reason
             (network, empty body, size cap) or the cache dir is not writable.
@@ -544,6 +565,20 @@ def fetch_pdb(
     if cache_path.exists() and cache_path.stat().st_size > 0:
         logger.info(f"PDB cache hit: {cache_path}")
         return cache_path
+
+    # Cache-only mode: the hit above is all an air-gapped session gets. Check
+    # here rather than earlier so a pre-populated cache still resolves.
+    if symbols_offline():
+        # Deliberately no cache path in the message: it is echoed verbatim by
+        # load_pdb and stored in the analysis note, and a resolved
+        # ~/.cache/... path is host detail (audit F-10). The env var names
+        # where to look.
+        raise SymbolsOfflineError(
+            f"{SYMBOL_OFFLINE_ENV}=1 and {cv['pdb_filename']} is not in the "
+            f"local symbol cache; no symbol server was contacted. "
+            f"Pre-populate the cache (BINARY_MCP_SYMBOL_CACHE) or unset "
+            f"{SYMBOL_OFFLINE_ENV}."
+        )
 
     _ensure_writable(cache_path.parent)
 
@@ -726,6 +761,29 @@ MICROSOFT_ONLY_SYMBOL_HOSTS = frozenset({
 })
 
 
+# CompanyName comes out of the sample's own version resource. Server-authored
+# text that quotes it has to bound it and strip the envelope spellings, or the
+# sample chooses what the model reads around it.
+MAX_COMPANY_CHARS = 120
+
+
+def safe_company(company: str | None) -> str:
+    """A bounded, delimiter-neutralised rendering of a sample's CompanyName.
+
+    For embedding in server-authored prose (log lines, cache notes). A block
+    a reader will treat as sample data belongs in ``wrap_untrusted`` instead.
+    """
+    if not company:
+        return "None"
+    from src.utils.formatters import neutralise_untrusted_delimiters
+
+    text = neutralise_untrusted_delimiters(str(company))
+    text = text.replace("\r", " ").replace("\n", " ")
+    if len(text) > MAX_COMPANY_CHARS:
+        text = text[:MAX_COMPANY_CHARS] + "..."
+    return repr(text)
+
+
 def symbol_servers_are_microsoft_only(symbol_path: str | None = None) -> bool:
     """True if every configured symbol server is a Microsoft-only public one.
 
@@ -781,18 +839,21 @@ def symbol_server_prognosis(
             ),
         }
 
+    # ``reason`` is server-authored and carries NO text read out of the
+    # sample: ``company`` comes from the PE's own version resource, so a
+    # caller that renders it has to fence it (wrap_untrusted) first.
     if is_microsoft:
-        reason = f"version info names Microsoft (CompanyName={company!r})"
+        reason = "the binary's version info names Microsoft"
     elif not ms_only:
         reason = (
-            f"CompanyName={company!r} is not Microsoft, but the configured "
-            f"symbol path points somewhere other than the Microsoft public "
-            f"server, which may hold third-party symbols"
+            "the version info does not name Microsoft, but the configured "
+            "symbol path points somewhere other than the Microsoft public "
+            "server, which may hold third-party symbols"
         )
     elif company:
         reason = (
-            f"CompanyName={company!r} -- a third-party binary, and the "
-            f"Microsoft public symbol server only serves Microsoft's own PDBs"
+            "the version info names a third-party vendor, and the Microsoft "
+            "public symbol server only serves Microsoft's own PDBs"
         )
     else:
         reason = (
@@ -846,28 +907,32 @@ def auto_fetch_pdb(
 
     if policy == "microsoft":
         prognosis = symbol_server_prognosis(binary_path)
-        if not prognosis["is_microsoft"]:
-            company = prognosis["company"]
-            hint = (
-                "the Microsoft public symbol server only serves Microsoft's "
-                "own PDBs, so there is nothing there to fetch -- do NOT retry "
-                "with load_pdb unless you have the vendor's PDB on disk "
-                "(pdb_path=...) or a symbol server that carries it "
-                "(symbol_path=...)"
-                if prognosis["microsoft_only_servers"]
-                else "call load_pdb to try the configured symbol server"
-            )
+        # `likely`, not `is_microsoft`: a third-party binary is only hopeless
+        # when every configured server is a Microsoft-only public one. An
+        # operator who pointed us at a vendor server or a corporate symstore
+        # gets the fetch -- load_pdb's gate makes the same call.
+        if not prognosis["likely"]:
             return None, {
                 **note,
                 "status": "skipped",
                 "detail": (
-                    f"not a Microsoft binary (CompanyName={company!r}); {hint}. "
-                    f"Set {AUTO_PDB_ENV}=always to attempt a fetch anyway"
+                    f"not a Microsoft binary "
+                    f"(CompanyName={safe_company(prognosis['company'])}); the "
+                    f"Microsoft public symbol server only serves Microsoft's "
+                    f"own PDBs, so there is nothing there to fetch -- do NOT "
+                    f"retry with load_pdb unless you have the vendor's PDB on "
+                    f"disk (pdb_path=...) or a symbol server that carries it "
+                    f"(symbol_path=...). Set {AUTO_PDB_ENV}=always to attempt "
+                    f"a fetch anyway"
                 ),
             }
 
     try:
         path = fetch_pdb(binary_path, timeout=timeout)
+    except SymbolsOfflineError as e:
+        # Not a failure: the operator asked for cache-only resolution and the
+        # cache did not have it. Nothing was sent anywhere.
+        return None, {**note, "status": "skipped", "detail": str(e)}
     except PdbNotPublishedError as e:
         return None, {**note, "status": "not_published", "detail": str(e)}
     except (RuntimeError, ValueError, OSError) as e:

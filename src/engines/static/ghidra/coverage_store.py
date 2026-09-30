@@ -953,7 +953,17 @@ class CoverageStore:
             self.cache_dir / f"{binary_id}.json"
         ).exists()
 
-    @_under_binary_lock
+    # Deliberately NOT @_under_binary_lock. This method decides whether to
+    # index and then delegates; the read-modify-write it can reach
+    # (index -> _index_locked -> write) takes the lock itself, around the
+    # merge and the write only. Holding it out here instead nullified that:
+    # index() computes compute_scope and _load_context -- a multi-hundred-MB
+    # gunzip plus a whole-call-graph BFS -- OUTSIDE the lock on purpose, and
+    # the decorator put them back inside it. A status poll on a 47K-function
+    # binary then held the lock for minutes while a concurrent
+    # decompile_function's auto_mark timed out after COVERAGE_LOCK_WAIT_SECONDS
+    # and silently dropped the mark, which is the exact loss the lock exists
+    # to prevent.
     def ensure_indexed(
         self,
         binary_id: str,

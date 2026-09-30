@@ -969,19 +969,26 @@ def get_analysis_context(
         # name everything. Try the symbol server before settling for FUN_*
         # placeholders. Not on a shallow import (-noanalysis never runs the
         # PDB analyzer) and not on a delta run, which would have to re-import.
-        if pdb_path:
-            pdb_note = {"source": "explicit", "status": "applied", "pdb_path": str(pdb_path)}
-        elif (
-            not reuse_project
-            and resume_from_cache is None
-            and not target_addresses
-            and analysis_depth != "shallow"
-        ):
+        def _import_can_take_a_pdb() -> bool:
+            return (
+                resume_from_cache is None
+                and not target_addresses
+                and analysis_depth != "shallow"
+            )
+
+        def _fetch_pdb_for_import():
+            """(path, note) from the symbol server for an import about to run."""
             if job_context is not None:
                 job_context.set_progress("fetching PDB from the symbol server")
-            pdb_path, pdb_note = auto_fetch_pdb(binary_path)
-            if pdb_note is not None:
-                logger.info("Auto PDB for %s: %s", binary_path, pdb_note.get("status"))
+            path, note = auto_fetch_pdb(binary_path)
+            if note is not None:
+                logger.info("Auto PDB for %s: %s", binary_path, note.get("status"))
+            return path, note
+
+        if pdb_path:
+            pdb_note = {"source": "explicit", "status": "applied", "pdb_path": str(pdb_path)}
+        elif not reuse_project and _import_can_take_a_pdb():
+            pdb_path, pdb_note = _fetch_pdb_for_import()
     except BaseException:
         # Release the lock AND drop a manifest this block may already have
         # written -- the `finally` further down that normally cleans it up is
@@ -1070,6 +1077,10 @@ def get_analysis_context(
             cache.clear_project_state(project_name)
             reuse_project = False
             project_state = None
+            # This is a genuine fresh import now, so it is the one chance to
+            # apply a PDB -- the reuse path deliberately skipped the fetch.
+            if pdb_path is None and _import_can_take_a_pdb():
+                pdb_path, pdb_note = _fetch_pdb_for_import()
             result = _run(False)
 
         # Save Ghidra output to debug file for inspection
@@ -1223,6 +1234,20 @@ def get_analysis_context(
         elif (existing_cache_data or {}).get("metadata", {}).get("pdb"):
             # A delta run touched no symbols; keep what the import recorded.
             meta.setdefault("pdb", existing_cache_data["metadata"]["pdb"])
+        elif reuse_project and (project_state or {}).get("pdb_applied"):
+            # A reuse run re-opened a program that already has PDB symbols,
+            # but this run made no note of its own and -- outside a delta run
+            # -- never pre-loaded a cache to carry one over. Without this the
+            # summary silently drops its Symbols line and the analyst reads
+            # symbolic names with no idea where they came from.
+            meta["pdb"] = {
+                "source": "project",
+                "status": "reused",
+                "detail": (
+                    "the Ghidra project was re-opened rather than re-imported; "
+                    "the PDB applied at import is still in effect"
+                ),
+            }
 
         # Record what the project now holds so the next run can skip the
         # import. Only an import run may write this: it is the statement
@@ -1908,6 +1933,11 @@ def _pdb_summary_line(note: dict | None) -> str | None:
             f"no PDB applied -- the symbol server fetch FAILED ({rest or first}). "
             f"That is not evidence the PDB is unpublished; retry with load_pdb."
         )
+    if status == "reused":
+        return (
+            "PDB symbols from the earlier import are still applied (the Ghidra "
+            "project was re-opened, not re-imported)."
+        )
     if status == "no_codeview":
         return "no PDB applied -- the binary carries no CodeView record to look one up by."
     if status == "skipped":
@@ -2013,13 +2043,25 @@ Use other tools like get_functions, get_imports, decompile_function to explore t
 
 
 def _non_microsoft_pdb_refusal(binary_path: str, prognosis: dict) -> str:
-    """Explain why an auto-fetch was not attempted, and what to do instead."""
+    """Explain why an auto-fetch was not attempted, and what to do instead.
+
+    ``prognosis['reason']`` is server-authored, but the CompanyName behind it
+    is read out of the sample's version resource, so it goes out fenced --
+    the rest of this message is guidance the model should act on.
+    """
     name = Path(binary_path).name
+    company = prognosis.get("company")
+    vendor_block = (
+        wrap_untrusted(str(company), "PE version info (CompanyName)") + "\n\n"
+        if company
+        else ""
+    )
     return (
         f"**No PDB fetch attempted for {name}**\n"
         f"\n"
         f"Reason: {prognosis['reason']}.\n"
         f"\n"
+        f"{vendor_block}"
         f"Nothing was sent to the symbol server and the analysis cache is "
         f"untouched. Going ahead would have cost a 404, a disclosure of this "
         f"binary's PDB name and GUID to Microsoft, and a full Ghidra "
@@ -2128,7 +2170,11 @@ def load_pdb(
 
         pdb_was_fetched = False
         if pdb_path in (None, "", "auto"):
-            from src.utils.pdb_fetcher import fetch_pdb, symbol_server_prognosis
+            from src.utils.pdb_fetcher import (
+                SymbolsOfflineError,
+                fetch_pdb,
+                symbol_server_prognosis,
+            )
 
             # Vendor gate. Runs BEFORE the network call and before the cache
             # is invalidated, so refusing costs nothing: the Microsoft public
@@ -2144,6 +2190,10 @@ def load_pdb(
                 fetched = fetch_pdb(binary_path, symbol_path=symbol_path)
             except ValueError as e:
                 return f"Cannot auto-fetch PDB: {e}"
+            except SymbolsOfflineError as e:
+                # Operator policy, not a failure -- say so plainly rather than
+                # handing back an opaque error reference.
+                return f"No PDB fetch attempted: {e}"
             except RuntimeError as e:
                 return safe_tool_error("load_pdb", e)
             pdb_path = str(fetched)

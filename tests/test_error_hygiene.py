@@ -535,6 +535,16 @@ _AST_ALLOWED_HANDLERS = {
     #     path. Surfacing it verbatim is the point: it is what stops a caller
     #     retrying and reconnecting against an endpoint that does not exist.
     "FeatureUnavailableError",
+    #   * SymbolsOfflineError (src/utils/pdb_fetcher.py) -- one raise site,
+    #     one message: "BINARY_MCP_SYMBOL_OFFLINE=1 and <name>.pdb is not in
+    #     the local symbol cache; no symbol server was contacted...". The only
+    #     interpolated values are the env var name (a literal here) and the
+    #     PDB basename, which _sanitize_pdb_name has already constrained to
+    #     [A-Za-z0-9._-]+\.pdb with no separators. The resolved cache path was
+    #     deliberately left out of the message for this rule. Surfacing it
+    #     verbatim is the point: an opaque reference ID would read as a
+    #     failure, when it is the operator's own air-gap policy.
+    "SymbolsOfflineError",
 }
 
 

@@ -524,7 +524,12 @@ class TestLoadPdbAllowlist:
         # cache so the test can't pollute real ~/.binary_mcp_cache.
         _wire_real_cache(server_module, monkeypatch, tmp_path / "cache")
 
-        result = server_module.load_pdb(str(binary), pdb_path="auto")
+        # allow_non_microsoft: this fixture binary carries no version
+        # resource, so the vendor gate would otherwise refuse the auto-fetch
+        # before it reached the allowlist logic under test.
+        result = server_module.load_pdb(
+            str(binary), pdb_path="auto", allow_non_microsoft=True
+        )
 
         # The fetched PDB was used despite living outside the allowlist.
         assert seen["pdb_path"] == str(fetched_pdb), seen

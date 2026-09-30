@@ -1700,9 +1700,12 @@ def analyze_binary(
             Ghidra's PdbUniversalAnalyzer can apply symbolic function names.
             When omitted, a first (non-shallow) import of a PE tries the
             symbol server first, per ``BINARY_MCP_AUTO_PDB`` (default: only
-            binaries whose version info names Microsoft). The summary's
-            **Symbols** line says what happened; "fetch FAILED" is not the
-            same as "not published".
+            binaries whose version info names Microsoft -- the public server
+            holds no PDBs for third-party code, so for those the summary
+            reports the fetch as skipped and ``load_pdb`` will refuse it too
+            unless you supply a ``pdb_path`` or vendor ``symbol_path``). The
+            summary's **Symbols** line says what happened; "fetch FAILED" is
+            not the same as "not published".
         enable_fid: Run Ghidra's Function ID library fingerprinting; matches
             are stored per-function in ``fid_match``. Query via ``fid_match``
             tool after analysis.
@@ -2009,6 +2012,34 @@ Use other tools like get_functions, get_imports, decompile_function to explore t
     return summary
 
 
+def _non_microsoft_pdb_refusal(binary_path: str, prognosis: dict) -> str:
+    """Explain why an auto-fetch was not attempted, and what to do instead."""
+    name = Path(binary_path).name
+    return (
+        f"**No PDB fetch attempted for {name}**\n"
+        f"\n"
+        f"Reason: {prognosis['reason']}.\n"
+        f"\n"
+        f"Nothing was sent to the symbol server and the analysis cache is "
+        f"untouched. Going ahead would have cost a 404, a disclosure of this "
+        f"binary's PDB name and GUID to Microsoft, and a full Ghidra "
+        f"re-analysis for no new symbols.\n"
+        f"\n"
+        f"Do one of these instead:\n"
+        f"- Have the vendor's PDB on disk? "
+        f"`load_pdb(binary_path=..., pdb_path=\"/path/to/{Path(name).stem}.pdb\")`\n"
+        f"- Vendor runs its own symbol server? "
+        f"`load_pdb(binary_path=..., "
+        f"symbol_path=\"srv*<cache-dir>*https://symbols.vendor.example\")`\n"
+        f"- Otherwise work without symbols: "
+        f"`analyze_binary(binary_path=..., analysis_depth=\"structural\", "
+        f"skip_decompile=True)` and reason from FUN_* names, strings, and "
+        f"imports.\n"
+        f"- Certain the Microsoft server has it anyway (e.g. a rebranded "
+        f"Microsoft component)? `load_pdb(..., allow_non_microsoft=True)`."
+    )
+
+
 @app.tool()
 @log_to_session
 def load_pdb(
@@ -2017,6 +2048,7 @@ def load_pdb(
     symbol_path: str | None = None,
     skip_decompile: bool = True,
     analysis_depth: str = "structural",
+    allow_non_microsoft: bool = False,
 ) -> str:
     """
     Apply a Windows PDB to an analyzed binary.
@@ -2029,6 +2061,21 @@ def load_pdb(
     CodeView (RSDS) debug record and downloads the matching PDB from the
     Microsoft public symbol server, caching it under
     ``~/.binary_mcp_cache/symbols/``.
+
+    That auto-fetch only works for Microsoft's own binaries. The public
+    symbol server (msdl.microsoft.com) carries Microsoft PDBs and nothing
+    else, so a third-party target -- steam.exe, a game, a vendor driver,
+    a malware sample -- has no PDB there to fetch, and asking costs a 404,
+    a disclosure of the PDB name and GUID to Microsoft, and a discarded
+    cache plus a full Ghidra re-analysis for zero new names. This tool
+    therefore refuses the auto-fetch up front when the binary's version
+    info does not name Microsoft and every configured symbol server is
+    the Microsoft public one; the refusal is free (no network, no cache
+    invalidation) and names the alternatives. For a third-party binary,
+    supply the vendor's ``pdb_path``, point ``symbol_path`` at a server
+    that carries it, or skip symbols and run a structural pass
+    (``analyze_binary(analysis_depth="structural")``) -- FUN_* names are
+    all there is to work with.
 
     On big binaries (e.g. mpengine.dll, 47K functions) this runs in
     structural mode by default -- auto-analyse + apply PDB symbols, but
@@ -2056,6 +2103,13 @@ def load_pdb(
         analysis_depth: "structural" (default) applies PDB symbols + xrefs
                   + memory map without decompile. "full" decompiles every
                   function (slow). "shallow" skips most analysis.
+        allow_non_microsoft: Attempt the auto-fetch even when the target is
+                  not a Microsoft binary and the only configured server is
+                  the Microsoft public one. Default False, which returns
+                  the up-front refusal described above. Set True only when
+                  you have a specific reason to believe the server has this
+                  PDB (e.g. a rebranded Microsoft component) -- it does not
+                  make a third-party PDB appear.
 
     Returns:
         Summary comparing pre/post symbolic-function counts.
@@ -2074,7 +2128,18 @@ def load_pdb(
 
         pdb_was_fetched = False
         if pdb_path in (None, "", "auto"):
-            from src.utils.pdb_fetcher import fetch_pdb
+            from src.utils.pdb_fetcher import fetch_pdb, symbol_server_prognosis
+
+            # Vendor gate. Runs BEFORE the network call and before the cache
+            # is invalidated, so refusing costs nothing: the Microsoft public
+            # symbol server has no PDB for a third-party binary, and the
+            # model should be told that instead of spending a 404 plus a full
+            # re-analysis to discover it.
+            if not allow_non_microsoft:
+                prognosis = symbol_server_prognosis(binary_path, symbol_path)
+                if not prognosis["likely"]:
+                    return _non_microsoft_pdb_refusal(binary_path, prognosis)
+
             try:
                 fetched = fetch_pdb(binary_path, symbol_path=symbol_path)
             except ValueError as e:

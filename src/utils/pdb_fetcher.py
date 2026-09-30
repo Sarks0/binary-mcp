@@ -42,6 +42,15 @@ MAX_PDB_DOWNLOAD_BYTES = 256 * 1024 * 1024
 ALLOW_PRIVATE_SERVERS_ENV = "BINARY_MCP_ALLOW_PRIVATE_SYMBOL_SERVERS"
 
 
+class SymbolServerConfigError(RuntimeError):
+    """Every configured symbol server was rejected, so there is none to try.
+
+    Distinct from "none configured": silently substituting the Microsoft
+    public server for an operator's internal symstore would send the
+    binary's PDB name and GUID somewhere they did not choose.
+    """
+
+
 class SymbolsOfflineError(RuntimeError):
     """``BINARY_MCP_SYMBOL_OFFLINE=1`` and the PDB was not already cached.
 
@@ -279,6 +288,11 @@ def parse_symbol_path(
 
     Unrecognised entries are logged and skipped (instead of being silently
     dropped) so misconfiguration is easier to debug.
+
+    Returns an EMPTY server list when every configured server was rejected.
+    The built-in default is substituted only when nothing was configured at
+    all -- an operator whose internal symstore we dropped must not have their
+    binary's PDB name and GUID sent to Microsoft instead.
     """
     if symbol_path is None:
         symbol_path = (
@@ -291,6 +305,9 @@ def parse_symbol_path(
     cache_dir: Path = DEFAULT_SYMBOL_CACHE
     servers: list[str] = []
     cache_set = False
+    # Did the configuration name a server that we then refused? That is not
+    # the same as naming none, and the two must not resolve the same way.
+    rejected: list[str] = []
 
     def _maybe_add_server(url: str) -> None:
         if not url:
@@ -302,13 +319,16 @@ def parse_symbol_path(
                 "BINARY_MCP_ALLOW_HTTP_SYMBOLS=1 to permit: %s",
                 url,
             )
+            rejected.append(url)
             return
         if not (lower.startswith("http://") or lower.startswith("https://")):
             logger.warning("Ignoring non-http symbol-server entry: %r", url)
+            rejected.append(url)
             return
         host = _host_from_url(url)
         if host is None:
             logger.warning("Ignoring symbol-server entry with unparseable host: %r", url)
+            rejected.append(url)
             return
         if not _is_safe_symbol_server_host(host):
             logger.warning(
@@ -318,6 +338,7 @@ def parse_symbol_path(
                 url,
                 ALLOW_PRIVATE_SERVERS_ENV,
             )
+            rejected.append(url)
             return
         servers.append(url)
 
@@ -352,35 +373,72 @@ def parse_symbol_path(
                     "Ignoring unrecognized _NT_SYMBOL_PATH entry: %r", entry
                 )
 
-    if not servers:
+    if not servers and not rejected:
+        # Nothing was configured, so the built-in default applies. When
+        # something WAS configured and we refused all of it, the list stays
+        # empty: fetch_pdb turns that into a clear configuration error
+        # rather than quietly asking Microsoft about the operator's binary.
         servers = [DEFAULT_SYMBOL_SERVER]
     return cache_dir, servers
 
 
-def extract_codeview_record(binary_path: str | Path) -> dict | None:
+# Distinguishes "no handle was passed" (open one) from "the caller's shared
+# open already failed" (there is nothing to read, and retrying it here is how
+# a single read of a 400 MB binary became three).
+_NO_PE = object()
+
+
+def open_pe_for_symbols(binary_path: str | Path):
+    """A ``pefile.PE`` with the debug AND resource directories parsed, or None.
+
+    One open, one whole-file read, for a caller that needs both the CodeView
+    record and the version resource. ``auto_fetch_pdb`` needs both and then
+    hands the record to ``fetch_pdb``: done separately that is three full
+    reads of the binary on the first-import path -- ~1.2 GB of I/O on a
+    400 MB target, for data already in hand. The caller closes it.
+    """
+    try:
+        import pefile
+    except ImportError:
+        logger.debug("pefile unavailable - cannot read PE symbol metadata")
+        return None
+    try:
+        pe = pefile.PE(str(binary_path), fast_load=True)
+    except Exception as e:
+        logger.debug(f"PE parse failed for {binary_path}: {e}")
+        return None
+    try:
+        pe.parse_data_directories(directories=[
+            pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_DEBUG"],
+            pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_RESOURCE"],
+        ])
+    except Exception as e:
+        # A binary with no debug or no resource directory is ordinary; the
+        # readers below simply find nothing.
+        logger.debug(f"Could not parse data directories for {binary_path}: {e}")
+    return pe
+
+
+def extract_codeview_record(binary_path: str | Path, pe=_NO_PE) -> dict | None:
     """
     Extract the CodeView (RSDS) debug record from a PE file.
 
     Returns a dict with ``guid`` (uppercase hex string, no dashes), ``age``
     (int), and ``pdb_filename`` (basename only). Returns None if the binary
     isn't PE, has no CodeView record, or the record fails sanity checks.
+
+    ``pe`` is an already-open :func:`open_pe_for_symbols` handle to read from
+    instead of opening the file again; the caller keeps ownership of it, and
+    passing an explicit ``None`` (its open failed) returns None without
+    re-opening.
     """
-    try:
-        import pefile
-    except ImportError:
-        logger.debug("pefile unavailable - cannot extract CodeView record")
+    owned = pe is _NO_PE
+    if owned:
+        pe = open_pe_for_symbols(binary_path)
+    if pe is None:
         return None
 
     try:
-        pe = pefile.PE(str(binary_path), fast_load=True)
-        try:
-            pe.parse_data_directories(
-                directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_DEBUG"]]
-            )
-        except Exception as e:
-            logger.debug(f"Could not parse debug directory: {e}")
-            return None
-
         debug = getattr(pe, "DIRECTORY_ENTRY_DEBUG", None) or []
         for entry in debug:
             data = getattr(entry, "entry", None)
@@ -391,13 +449,14 @@ def extract_codeview_record(binary_path: str | Path) -> dict | None:
                 return cv
         return None
     except Exception as e:
-        logger.debug(f"PE parse failed for {binary_path}: {e}")
+        logger.debug(f"CodeView read failed for {binary_path}: {e}")
         return None
     finally:
-        try:
-            pe.close()
-        except Exception:
-            pass
+        if owned:
+            try:
+                pe.close()
+            except Exception:
+                pass
 
 
 def _decode_codeview(entry, pe) -> dict | None:
@@ -505,12 +564,13 @@ def fetch_pdb(
     server: str | None = None,
     symbol_path: str | None = None,
     timeout: int = 300,
+    codeview: dict | None = None,
 ) -> Path:
     """
     Locate or download the PDB matching a binary.
 
     Order of operations:
-      1. Read CodeView record from the PE.
+      1. Read the CodeView record from the PE (or take ``codeview``).
       2. Resolve cache_dir + server list.
       3. Compute canonical cache path; assert it stays inside cache_dir.
       4. If already cached, return it.
@@ -519,13 +579,17 @@ def fetch_pdb(
     Raises:
         ValueError: if the binary has no usable CodeView record OR the cache
             path would escape ``cache_dir``.
+        SymbolServerConfigError: if every configured symbol server was
+            rejected. Nothing was sent anywhere, and no default was assumed.
         SymbolsOfflineError: if ``BINARY_MCP_SYMBOL_OFFLINE=1`` and the PDB
             is not already in the local cache. Nothing was sent anywhere.
         PdbNotPublishedError: if every configured server answered 404.
         RuntimeError: if every configured server fails for any other reason
             (network, empty body, size cap) or the cache dir is not writable.
     """
-    cv = extract_codeview_record(binary_path)
+    # `codeview`: a record the caller already read, so a first import does
+    # not re-read the whole binary to recover what it just had.
+    cv = codeview or extract_codeview_record(binary_path)
     if cv is None:
         raise ValueError(
             f"No CodeView (RSDS) debug record found in {binary_path}. "
@@ -538,6 +602,14 @@ def fetch_pdb(
         cache_dir = parsed_cache
     if server is not None:
         servers = [server]
+    if not servers:
+        raise SymbolServerConfigError(
+            "every configured symbol server was rejected (see the warnings "
+            "logged by parse_symbol_path -- http:// needs "
+            "BINARY_MCP_ALLOW_HTTP_SYMBOLS=1, a private or loopback host "
+            f"needs {ALLOW_PRIVATE_SERVERS_ENV}=1). No request was made, and "
+            "the Microsoft public server was NOT substituted."
+        )
 
     cache_dir = Path(cache_dir)
     cache_path = (
@@ -723,18 +795,21 @@ def _pefile_available() -> bool:
     return True
 
 
-def version_info_company(binary_path: str | Path) -> str | None:
-    """``CompanyName`` from the PE's version resource, or None."""
-    try:
-        import pefile
-    except ImportError:
+def version_info_company(binary_path: str | Path, pe=_NO_PE) -> str | None:
+    """``CompanyName`` from the PE's version resource, or None.
+
+    ``pe`` is an already-open :func:`open_pe_for_symbols` handle to read from
+    instead of opening the file again; the caller keeps ownership of it, and
+    passing an explicit ``None`` (its open failed) returns None without
+    re-opening.
+    """
+    owned = pe is _NO_PE
+    if owned:
+        pe = open_pe_for_symbols(binary_path)
+    if pe is None:
         return None
     try:
-        pe = pefile.PE(str(binary_path), fast_load=True)
         try:
-            pe.parse_data_directories(
-                directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_RESOURCE"]]
-            )
             for file_info_list in getattr(pe, "FileInfo", None) or []:
                 for entry in file_info_list:
                     for table in getattr(entry, "StringTable", None) or []:
@@ -744,7 +819,8 @@ def version_info_company(binary_path: str | Path) -> str | None:
                                 v = value.decode("utf-8", "ignore") if isinstance(value, bytes) else str(value)
                                 return v.strip() or None
         finally:
-            pe.close()
+            if owned:
+                pe.close()
     except Exception as e:
         logger.debug(f"Could not read version info from {binary_path}: {e}")
     return None
@@ -793,6 +869,8 @@ def symbol_servers_are_microsoft_only(symbol_path: str | None = None) -> bool:
     """
     _, servers = parse_symbol_path(symbol_path)
     if not servers:
+        # Every configured server was rejected. Not "Microsoft-only": there
+        # is no server at all, and fetch_pdb will say so.
         return False
     for srv in servers:
         host = _host_from_url(srv)
@@ -802,7 +880,7 @@ def symbol_servers_are_microsoft_only(symbol_path: str | None = None) -> bool:
 
 
 def symbol_server_prognosis(
-    binary_path: str | Path, symbol_path: str | None = None
+    binary_path: str | Path, symbol_path: str | None = None, pe=_NO_PE
 ) -> dict:
     """Judge, before any network call, whether a fetch can plausibly succeed.
 
@@ -821,7 +899,7 @@ def symbol_server_prognosis(
       ``reason``         -- one line explaining the verdict, for the caller
                             to put in front of the model
     """
-    company = version_info_company(binary_path)
+    company = version_info_company(binary_path, pe=pe)
     is_microsoft = bool(company) and "microsoft" in company.lower()
     ms_only = symbol_servers_are_microsoft_only(symbol_path)
 
@@ -898,15 +976,30 @@ def auto_fetch_pdb(
     if policy == "never":
         return None, {**note, "status": "skipped", "detail": f"{AUTO_PDB_ENV}=never"}
 
-    if extract_codeview_record(binary_path) is None:
+    # One open for both reads below, and the record travels on to fetch_pdb.
+    pe = open_pe_for_symbols(binary_path)
+    try:
+        codeview = extract_codeview_record(binary_path, pe=pe)
+        prognosis = (
+            symbol_server_prognosis(binary_path, pe=pe)
+            if policy == "microsoft"
+            else None
+        )
+    finally:
+        if pe is not None:
+            try:
+                pe.close()
+            except Exception:
+                pass
+
+    if codeview is None:
         return None, {
             **note,
             "status": "no_codeview",
             "detail": "binary has no CodeView (RSDS) record, so there is no PDB to look up",
         }
 
-    if policy == "microsoft":
-        prognosis = symbol_server_prognosis(binary_path)
+    if prognosis is not None:
         # `likely`, not `is_microsoft`: a third-party binary is only hopeless
         # when every configured server is a Microsoft-only public one. An
         # operator who pointed us at a vendor server or a corporate symstore
@@ -928,7 +1021,11 @@ def auto_fetch_pdb(
             }
 
     try:
-        path = fetch_pdb(binary_path, timeout=timeout)
+        path = fetch_pdb(binary_path, timeout=timeout, codeview=codeview)
+    except SymbolServerConfigError as e:
+        # A misconfiguration, not a transient failure: retrying changes
+        # nothing until the operator fixes the symbol path.
+        return None, {**note, "status": "skipped", "detail": str(e)}
     except SymbolsOfflineError as e:
         # Not a failure: the operator asked for cache-only resolution and the
         # cache did not have it. Nothing was sent anywhere.

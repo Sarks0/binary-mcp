@@ -545,6 +545,13 @@ _AST_ALLOWED_HANDLERS = {
     #     verbatim is the point: an opaque reference ID would read as a
     #     failure, when it is the operator's own air-gap policy.
     "SymbolsOfflineError",
+    #   * SymbolServerConfigError (src/utils/pdb_fetcher.py) -- one raise
+    #     site, one message: "every configured symbol server was rejected
+    #     (see the warnings logged by parse_symbol_path ...)". Only env var
+    #     names, all literals in this repo; the rejected URLs stay in the
+    #     log. Surfacing it verbatim is the point: it names the two settings
+    #     that un-reject the operator's own symbol path.
+    "SymbolServerConfigError",
 }
 
 

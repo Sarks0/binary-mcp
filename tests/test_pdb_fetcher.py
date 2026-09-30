@@ -488,14 +488,15 @@ def test_decode_codeview_rejects_traversal_pdb_name():
 
 class TestParseSymbolPathHttpHardening:
     def test_http_dropped_without_optin(self, monkeypatch):
-        from src.utils.pdb_fetcher import (
-            DEFAULT_SYMBOL_SERVER,
-            parse_symbol_path,
-        )
+        from src.utils.pdb_fetcher import parse_symbol_path
 
         monkeypatch.delenv("BINARY_MCP_ALLOW_HTTP_SYMBOLS", raising=False)
         _, servers = parse_symbol_path("srv*/tmp/c*http://untrusted.example/p")
-        assert servers == [DEFAULT_SYMBOL_SERVER]  # http dropped, default added
+        # Dropped, and NOT replaced by the Microsoft public server: the
+        # operator configured one server, and substituting a different one
+        # would send this binary's PDB name and GUID somewhere they did not
+        # choose. fetch_pdb turns the empty list into a config error.
+        assert servers == []
 
     def test_http_kept_with_optin(self, monkeypatch):
         from src.utils.pdb_fetcher import parse_symbol_path
@@ -673,13 +674,13 @@ class TestParseSymbolPathSsrf:
     def test_private_server_dropped(self, monkeypatch, caplog):
         import logging
 
-        from src.utils.pdb_fetcher import DEFAULT_SYMBOL_SERVER, parse_symbol_path
+        from src.utils.pdb_fetcher import parse_symbol_path
 
         monkeypatch.delenv("BINARY_MCP_ALLOW_PRIVATE_SYMBOL_SERVERS", raising=False)
         caplog.set_level(logging.WARNING, logger="src.utils.pdb_fetcher")
         _, servers = parse_symbol_path("srv*https://127.0.0.1/sym")
-        # Falls back to the default since the configured server was dropped.
-        assert servers == [DEFAULT_SYMBOL_SERVER]
+        # Dropped, and no public server substituted for the internal one.
+        assert servers == []
         joined = " ".join(r.message for r in caplog.records)
         assert "BINARY_MCP_ALLOW_PRIVATE_SYMBOL_SERVERS" in joined
 
@@ -691,7 +692,7 @@ class TestParseSymbolPathSsrf:
         assert servers == ["https://10.0.0.1/sym"]
 
     def test_cloud_metadata_dropped(self, monkeypatch):
-        from src.utils.pdb_fetcher import DEFAULT_SYMBOL_SERVER, parse_symbol_path
+        from src.utils.pdb_fetcher import parse_symbol_path
 
         monkeypatch.delenv("BINARY_MCP_ALLOW_PRIVATE_SYMBOL_SERVERS", raising=False)
         _, servers = parse_symbol_path(
@@ -700,7 +701,7 @@ class TestParseSymbolPathSsrf:
         # Both the http-without-optin and the SSRF gate would reject this,
         # but the result must not contain the metadata URL.
         assert "169.254.169.254" not in " ".join(servers)
-        assert servers == [DEFAULT_SYMBOL_SERVER]
+        assert servers == []
 
 
 class TestSafeRedirectHandler:

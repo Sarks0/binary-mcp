@@ -2171,6 +2171,7 @@ def load_pdb(
         pdb_was_fetched = False
         if pdb_path in (None, "", "auto"):
             from src.utils.pdb_fetcher import (
+                SymbolServerConfigError,
                 SymbolsOfflineError,
                 fetch_pdb,
                 symbol_server_prognosis,
@@ -2190,9 +2191,10 @@ def load_pdb(
                 fetched = fetch_pdb(binary_path, symbol_path=symbol_path)
             except ValueError as e:
                 return f"Cannot auto-fetch PDB: {e}"
-            except SymbolsOfflineError as e:
-                # Operator policy, not a failure -- say so plainly rather than
-                # handing back an opaque error reference.
+            except (SymbolsOfflineError, SymbolServerConfigError) as e:
+                # Operator policy or operator configuration, not a failure --
+                # say so plainly rather than handing back an opaque error
+                # reference the operator cannot act on.
                 return f"No PDB fetch attempted: {e}"
             except RuntimeError as e:
                 return safe_tool_error("load_pdb", e)
@@ -2918,7 +2920,19 @@ def get_xrefs(
                 target_int = int(target_norm, 16)
             except ValueError:
                 target_int = None
+            # An address inside a known function body is code, not a table
+            # slot; `target_fn` only matches entry points, so without this
+            # the full-binary scan runs for a mid-function address and
+            # anything it finds cannot mean what the heading says.
+            if target_int is not None and _function_containing(
+                functions, target_int
+            ) is not None:
+                target_int = None
             if target_int is not None:
+                # Cached inside find_table_base_refs, keyed on the file's
+                # (path, mtime, size): walking a table asks about
+                # neighbouring slots, and each call used to re-read the
+                # whole binary and re-scan every executable section.
                 for hit in find_table_base_refs(
                     binary_path, target_int, window=min(int(table_window), 0x10000)
                 ):
@@ -6298,7 +6312,6 @@ def register_all_tools() -> None:
     global _tools_registered
     if _tools_registered:
         return
-    _tools_registered = True
 
     # Register .NET analysis tools
     register_dotnet_tools(app)
@@ -6362,6 +6375,12 @@ def register_all_tools() -> None:
             "Tools missing from src/tool_catalog.py (tagged uncategorized): %s",
             ", ".join(uncategorized),
         )
+
+    # Last, not first. Set before the work, a raising register_*_tools (a bad
+    # import in a tool module, a duplicate tool name) left the flag standing:
+    # every later call returned immediately and reported success with a
+    # partial roster, and the catalog tagging above never ran.
+    _tools_registered = True
 
 
 def main():

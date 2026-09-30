@@ -677,7 +677,14 @@ class ProjectCache:
         # `diff_binaries` call persists. It is derived output like everything
         # else here, so a full wipe must take it -- otherwise it is the one
         # thing `clear_all` leaves behind, and it is the largest.
-        for pattern in ("*.json.gz", "*.json", "*.diff.txt"):
+        # `.<sha>.coverage.lock` is the per-binary coverage lock. Its holder
+        # never unlinks it (that would race the next acquirer onto a new
+        # inode), so nothing else ever removes one and every binary ever
+        # indexed left one behind -- unmatched by the globs above, which
+        # cannot see a name ending in .lock. A full wipe is the one place it
+        # is safe to take: it already deletes the records those locks
+        # protect, so a concurrent writer has lost its data either way.
+        for pattern in ("*.json.gz", "*.json", "*.diff.txt", "*.coverage.lock"):
             for cache_file in self.cache_dir.glob(pattern):
                 try:
                     cache_file.unlink()
@@ -844,7 +851,7 @@ class ProjectCache:
         """Get total size of cache in bytes (all cache + sidecar files)."""
         total_size = 0
 
-        for pattern in ("*.json.gz", "*.json", "*.diff.txt"):
+        for pattern in ("*.json.gz", "*.json", "*.diff.txt", "*.coverage.lock"):
             for cache_file in self.cache_dir.glob(pattern):
                 try:
                     total_size += cache_file.stat().st_size

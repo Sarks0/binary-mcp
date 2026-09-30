@@ -29,6 +29,10 @@ from dataclasses import dataclass
 
 # Inline markers are C comments so the body still reads as code.
 MARKER_PREFIX = "/* [caveat] "
+# A marker this module appended: at end of line, and closed. Sample text can
+# contain the prefix, but not in this position -- and re-annotating replaces
+# it rather than trusting it.
+_EXISTING_MARKER_RE = re.compile(r"\s*" + re.escape(MARKER_PREFIX) + r".*\*/\s*$")
 
 _UNAFF_RE = re.compile(r"\bunaff_\w+")
 _EXTRAOUT_RE = re.compile(r"\bextraout_\w+")
@@ -125,12 +129,30 @@ def find_caveats(pseudocode: str) -> list[Caveat]:
     The first occurrence's line is kept; later repeats of the same name add
     nothing a reader needs.
     """
+    return _scan(pseudocode)[0]
+
+
+def _scan(
+    pseudocode: str,
+) -> tuple[list[Caveat], dict[int, dict[tuple[str, str], Caveat]]]:
+    """One pass, two views: the deduped list and the per-line grouping.
+
+    ``annotate`` needs both. Deriving the second by re-running the whole
+    regex battery per line -- which is what it used to do -- costs a second
+    ~7 scans of every line of a body that can run to 10K lines, on the
+    decompile path, for information this pass already has in hand.
+    """
     if not pseudocode:
-        return []
+        return [], {}
     found: dict[tuple[str, str], Caveat] = {}
+    per_line: dict[int, dict[tuple[str, str], Caveat]] = {}
 
     def add(kind: str, detail: str, line: int, meaning: str) -> None:
-        found.setdefault((kind, detail), Caveat(kind, detail, line, meaning))
+        caveat = Caveat(kind, detail, line, meaning)
+        found.setdefault((kind, detail), caveat)
+        # Keyed per line, so a repeat on a later line still marks that line
+        # even though the deduped list keeps only the first occurrence.
+        per_line.setdefault(line, {}).setdefault((kind, detail), caveat)
 
     for lineno, line in enumerate(pseudocode.splitlines(), 1):
         for m in _WARNING_RE.finditer(line):
@@ -158,7 +180,7 @@ def find_caveats(pseudocode: str) -> list[Caveat]:
                 "variadic callee; Ghidra often truncates the argument list to the fixed parameters, so don't draw argument-count conclusions without the disassembly")
         for m in _HELPER_RE.finditer(code):
             add("compiler-helper", m.group(1), lineno, COMPILER_HELPERS[m.group(1)])
-    return list(found.values())
+    return list(found.values()), per_line
 
 
 def _inline_note(kinds_on_line: dict[str, Caveat]) -> str | None:
@@ -186,7 +208,7 @@ def annotate(pseudocode: str, max_summary: int = 12) -> tuple[str, list[str]]:
     trailing ``/* [caveat] ... */`` comment. ``summary_lines`` is a short
     markdown block for under the code, empty when there is nothing to say.
     """
-    caveats = find_caveats(pseudocode)
+    caveats, per_line = _scan(pseudocode)
     if not caveats:
         return pseudocode, []
 
@@ -194,12 +216,16 @@ def annotate(pseudocode: str, max_summary: int = 12) -> tuple[str, list[str]]:
     # the reader meets each line in place.
     lines = pseudocode.splitlines()
     for idx, line in enumerate(lines):
-        if MARKER_PREFIX in line:
-            continue
-        on_line = {(c.kind, c.detail): c for c in find_caveats(line)}
-        note = _inline_note(on_line)
-        if note:
-            lines[idx] = f"{line}  {MARKER_PREFIX}{note} */"
+        # Strip a marker this function appended on an earlier pass rather
+        # than skipping the line. Skipping on `MARKER_PREFIX in line` let the
+        # SAMPLE suppress its own warning: Ghidra reproduces the binary's
+        # string constants and symbol names, so a sample carrying the literal
+        # "/* [caveat] " anywhere on a line silenced the inline note for it
+        # while the summary below still counted it -- the two disagreed and
+        # the reader had no way to tell which was right.
+        base = _EXISTING_MARKER_RE.sub("", line)
+        note = _inline_note(per_line.get(idx + 1, {}))
+        lines[idx] = f"{base}  {MARKER_PREFIX}{note} */" if note else base
     annotated = "\n".join(lines)
     if pseudocode.endswith("\n"):
         annotated += "\n"

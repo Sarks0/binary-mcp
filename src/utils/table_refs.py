@@ -41,10 +41,34 @@ _MAX_LEAD = 6
 _MAX_INSN = 15
 
 
-def capstone_rip() -> int:
-    from capstone import x86_const
+# Resolved on first use and cached: capstone is an optional dependency, so
+# this cannot be a plain module constant, and _confirm's inner loop is no
+# place for an import statement.
+_X86_CONSTS: dict[str, int] | None = None
 
-    return x86_const.X86_REG_RIP
+
+def _x86_consts() -> dict[str, int]:
+    global _X86_CONSTS
+    if _X86_CONSTS is None:
+        import capstone
+        from capstone import x86_const
+
+        _X86_CONSTS = {
+            "rip": x86_const.X86_REG_RIP,
+            # Control-flow groups. A `call rel32` / `jmp rel32` carries its
+            # ABSOLUTE destination in an IMM operand (capstone resolves the
+            # displacement for us), so without this an ordinary direct branch
+            # into the window is reported as a table-base reference.
+            "jump": capstone.CS_GRP_JUMP,
+            "call": capstone.CS_GRP_CALL,
+            "ret": capstone.CS_GRP_RET,
+            "iret": capstone.CS_GRP_IRET,
+        }
+    return _X86_CONSTS
+
+
+def capstone_rip() -> int:
+    return _x86_consts()["rip"]
 
 
 def _executable_sections(pe):
@@ -89,6 +113,9 @@ def _confirm(md, data, start, section_va, image_base, lo, hi, is_64):
     instruction with its prefixes (REX, operand size) shaved off -- a
     ``lea rcx`` read one byte late is a ``lea ecx``.
     """
+    consts = _x86_consts()
+    rip = consts["rip"]
+    control_flow = (consts["jump"], consts["call"], consts["ret"], consts["iret"])
     for lead in range(_MAX_LEAD, 0, -1):
         begin = start - lead
         if begin < 0:
@@ -99,20 +126,82 @@ def _confirm(md, data, start, section_va, image_base, lo, hi, is_64):
         insn = next(md.disasm(chunk, image_base + section_va + begin, count=1), None)
         if insn is None or insn.address + insn.size <= image_base + section_va + start:
             continue
+        # A direct branch's IMM operand is its destination, not a data
+        # reference, and reporting one under "the target is a slot in a table
+        # these instructions reference" turns a control-flow edge into a
+        # dispatch-table claim. Its MEM operands are still real references
+        # (`call [rip + IatSlot]`), so only the IMM branch is suppressed.
+        is_branch = any(g in control_flow for g in getattr(insn, "groups", ()))
         for op in getattr(insn, "operands", ()):
             target = None
             if op.type == 3:  # X86_OP_MEM
-                if is_64 and op.mem.base == capstone_rip():
+                if is_64 and op.mem.base == rip:
                     target = insn.address + insn.size + op.mem.disp
                 elif not is_64 and op.mem.disp:
                     # [disp32] or [reg*scale + table] -- the classic 32-bit
                     # table index carries the table's absolute address.
                     target = op.mem.disp & 0xFFFFFFFF
-            elif op.type == 2 and not is_64:  # X86_OP_IMM
+            elif op.type == 2 and not is_64 and not is_branch:  # X86_OP_IMM
                 target = op.imm & 0xFFFFFFFF
             if target is not None and lo <= target <= hi:
                 return insn.address, target, f"{insn.mnemonic} {insn.op_str}".strip()
     return None
+
+
+# One entry is every executable section of one binary held in memory, so the
+# cache is deliberately tiny: a session works on one binary at a time, and a
+# second slot covers a diff. Keyed on identity AND (mtime, size) so a rebuilt
+# binary is never served from a stale parse.
+_LAYOUT_CACHE_SIZE = 2
+_layout_cache: dict[tuple, tuple | None] = {}
+
+
+def _binary_key(binary_path: str | Path) -> tuple | None:
+    try:
+        st = Path(binary_path).stat()
+    except OSError:
+        return None
+    return (str(binary_path), st.st_mtime_ns, st.st_size)
+
+
+def _pe_layout(binary_path: str | Path, key: tuple):
+    """``(is_64, image_base, ((section_va, data), ...))`` or None.
+
+    Cached: this reads the whole file through pefile, and get_xrefs used to
+    pay that on every call with a data address.
+    """
+    if key in _layout_cache:
+        return _layout_cache[key]
+    try:
+        import pefile
+    except ImportError:
+        return None
+    layout = None
+    try:
+        pe = pefile.PE(str(binary_path), fast_load=True)
+    except Exception as e:
+        logger.debug(f"table-base scan: not a PE ({e})")
+    else:
+        try:
+            machine = pe.FILE_HEADER.Machine
+            if machine in (_MACHINE_AMD64, _MACHINE_I386):
+                layout = (
+                    machine == _MACHINE_AMD64,
+                    pe.OPTIONAL_HEADER.ImageBase,
+                    tuple(_executable_sections(pe)),
+                )
+        except Exception as e:
+            logger.debug(f"table-base scan: unusable headers ({e})")
+        finally:
+            pe.close()
+    while len(_layout_cache) >= _LAYOUT_CACHE_SIZE:
+        _layout_cache.pop(next(iter(_layout_cache)))
+    _layout_cache[key] = layout
+    return layout
+
+
+_RESULT_CACHE_SIZE = 64
+_result_cache: dict[tuple, list[dict]] = {}
 
 
 def find_table_base_refs(
@@ -127,34 +216,40 @@ def find_table_base_refs(
     base), ``instruction`` and ``pointer_size``, nearest base first. Empty on a non-PE, a
     non-x86 machine, or any parse failure -- this is a best-effort hint,
     never a reason to fail the xref lookup.
+
+    The PE read and the per-query result are both cached, keyed on the file's
+    (path, mtime, size): a caller walking a table asks about neighbouring
+    slots, and each miss used to re-read the binary and re-walk every
+    executable section.
     """
     try:
         import capstone
-        import pefile
     except ImportError:
         return []
-    try:
-        pe = pefile.PE(str(binary_path), fast_load=True)
-    except Exception as e:
-        logger.debug(f"table-base scan: not a PE ({e})")
+
+    key = _binary_key(binary_path)
+    if key is None:
         return []
+    result_key = (key, target_va, window, max_hits)
+    cached = _result_cache.get(result_key)
+    if cached is not None:
+        return list(cached)
+
+    layout = _pe_layout(binary_path, key)
+    if layout is None:
+        return []
+    is_64, image_base, sections = layout
 
     try:
-        machine = pe.FILE_HEADER.Machine
-        if machine == _MACHINE_AMD64:
-            is_64 = True
-            md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
-        elif machine == _MACHINE_I386:
-            is_64 = False
-            md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
-        else:
-            return []
+        md = capstone.Cs(
+            capstone.CS_ARCH_X86,
+            capstone.CS_MODE_64 if is_64 else capstone.CS_MODE_32,
+        )
         md.detail = True
-        image_base = pe.OPTIONAL_HEADER.ImageBase
         lo, hi = max(0, target_va - window), target_va
 
         hits: dict[int, dict] = {}
-        for section_va, data in _executable_sections(pe):
+        for section_va, data in sections:
             if is_64:
                 candidates = _rip_candidates(data, section_va, image_base, lo, hi)
             else:
@@ -175,12 +270,16 @@ def find_table_base_refs(
                     break
             if len(hits) >= max_hits:
                 break
-        return sorted(hits.values(), key=lambda h: (h["offset"], h["insn_address"]))
+        found = sorted(
+            hits.values(), key=lambda h: (h["offset"], h["insn_address"])
+        )
+        while len(_result_cache) >= _RESULT_CACHE_SIZE:
+            _result_cache.pop(next(iter(_result_cache)))
+        _result_cache[result_key] = found
+        return list(found)
     except Exception as e:
         logger.debug(f"table-base scan failed for {binary_path}: {e}")
         return []
-    finally:
-        pe.close()
 
 
 def _rip_candidates(data, section_va, image_base, lo, hi):

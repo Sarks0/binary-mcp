@@ -677,6 +677,17 @@ def auto_pdb_policy() -> str:
     return value
 
 
+def _pefile_available() -> bool:
+    """True if ``pefile`` can be imported. Kept separate so the vendor gate
+    can tell "this is not a Microsoft binary" apart from "we could not read
+    the version resource at all"."""
+    try:
+        import pefile  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
 def version_info_company(binary_path: str | Path) -> str | None:
     """``CompanyName`` from the PE's version resource, or None."""
     try:
@@ -702,6 +713,101 @@ def version_info_company(binary_path: str | Path) -> str | None:
     except Exception as e:
         logger.debug(f"Could not read version info from {binary_path}: {e}")
     return None
+
+
+# Hosts that only ever serve Microsoft's own PDBs. The vendor gate below
+# applies only when EVERY configured server is one of these: a corporate
+# symstore, or a vendor's own server (Chromium, Mozilla, Unity all run one),
+# may legitimately hold symbols for non-Microsoft code and must not be
+# second-guessed.
+MICROSOFT_ONLY_SYMBOL_HOSTS = frozenset({
+    "msdl.microsoft.com",
+    "symweb.azurefd.net",
+})
+
+
+def symbol_servers_are_microsoft_only(symbol_path: str | None = None) -> bool:
+    """True if every configured symbol server is a Microsoft-only public one.
+
+    Resolves the same server list ``fetch_pdb`` would use, so the answer
+    reflects ``symbol_path`` / ``BINARY_MCP_SYMBOL_PATH`` / ``_NT_SYMBOL_PATH``
+    / ``BINARY_MCP_SYMBOL_SERVER``, not an assumption about the default.
+    """
+    _, servers = parse_symbol_path(symbol_path)
+    if not servers:
+        return False
+    for srv in servers:
+        host = _host_from_url(srv)
+        if host is None or host not in MICROSOFT_ONLY_SYMBOL_HOSTS:
+            return False
+    return True
+
+
+def symbol_server_prognosis(
+    binary_path: str | Path, symbol_path: str | None = None
+) -> dict:
+    """Judge, before any network call, whether a fetch can plausibly succeed.
+
+    The public Microsoft symbol server holds PDBs for Microsoft's own builds
+    and nothing else, so asking it about a third-party binary (steam.exe,
+    a game, a vendor driver) buys a guaranteed 404 -- plus a disclosure of
+    the PDB name and GUID to Microsoft, and, via ``load_pdb``, a discarded
+    cache and a full Ghidra re-analysis for no symbols at all.
+
+    Returns a dict with:
+      ``is_microsoft``   -- version info names Microsoft
+      ``company``        -- the ``CompanyName`` string, or None if absent
+      ``microsoft_only_servers`` -- every configured server is MS-public-only
+      ``likely``         -- worth attempting: a Microsoft binary, or a server
+                            set that might serve third-party symbols
+      ``reason``         -- one line explaining the verdict, for the caller
+                            to put in front of the model
+    """
+    company = version_info_company(binary_path)
+    is_microsoft = bool(company) and "microsoft" in company.lower()
+    ms_only = symbol_servers_are_microsoft_only(symbol_path)
+
+    if company is None and not _pefile_available():
+        # No verdict is possible -- don't turn a missing dependency into a
+        # refusal to fetch symbols for a genuine Microsoft binary.
+        return {
+            "is_microsoft": False,
+            "company": None,
+            "microsoft_only_servers": ms_only,
+            "likely": True,
+            "reason": (
+                "the vendor could not be determined (pefile is not "
+                "installed), so the fetch is attempted rather than refused"
+            ),
+        }
+
+    if is_microsoft:
+        reason = f"version info names Microsoft (CompanyName={company!r})"
+    elif not ms_only:
+        reason = (
+            f"CompanyName={company!r} is not Microsoft, but the configured "
+            f"symbol path points somewhere other than the Microsoft public "
+            f"server, which may hold third-party symbols"
+        )
+    elif company:
+        reason = (
+            f"CompanyName={company!r} -- a third-party binary, and the "
+            f"Microsoft public symbol server only serves Microsoft's own PDBs"
+        )
+    else:
+        reason = (
+            "the binary carries no CompanyName in its version resource, so "
+            "there is nothing to suggest the Microsoft public symbol server "
+            "has its PDB"
+        )
+
+    return {
+        "is_microsoft": is_microsoft,
+        "company": company,
+        "microsoft_only_servers": ms_only,
+        "likely": is_microsoft or not ms_only,
+        "reason": reason,
+    }
 
 
 def auto_fetch_pdb(
@@ -739,14 +845,24 @@ def auto_fetch_pdb(
         }
 
     if policy == "microsoft":
-        company = version_info_company(binary_path)
-        if not company or "microsoft" not in company.lower():
+        prognosis = symbol_server_prognosis(binary_path)
+        if not prognosis["is_microsoft"]:
+            company = prognosis["company"]
+            hint = (
+                "the Microsoft public symbol server only serves Microsoft's "
+                "own PDBs, so there is nothing there to fetch -- do NOT retry "
+                "with load_pdb unless you have the vendor's PDB on disk "
+                "(pdb_path=...) or a symbol server that carries it "
+                "(symbol_path=...)"
+                if prognosis["microsoft_only_servers"]
+                else "call load_pdb to try the configured symbol server"
+            )
             return None, {
                 **note,
                 "status": "skipped",
                 "detail": (
-                    f"not a Microsoft binary (CompanyName={company!r}); set "
-                    f"{AUTO_PDB_ENV}=always to fetch anyway, or call load_pdb"
+                    f"not a Microsoft binary (CompanyName={company!r}); {hint}. "
+                    f"Set {AUTO_PDB_ENV}=always to attempt a fetch anyway"
                 ),
             }
 

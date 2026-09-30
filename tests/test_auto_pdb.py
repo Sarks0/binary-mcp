@@ -233,3 +233,184 @@ class TestAnalysisWiring:
         context = server_mod.get_analysis_context(str(binary), incremental=True)
         auto.assert_not_called()
         assert context["metadata"]["pdb"]["status"] == "fetched"
+
+
+# Vendor gate: the public Microsoft symbol server only has Microsoft's PDBs
+
+
+@pytest.fixture
+def clean_symbol_env(monkeypatch):
+    """No inherited symbol-path config, so the default server list applies."""
+    for var in ("BINARY_MCP_SYMBOL_PATH", "_NT_SYMBOL_PATH"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(
+        mod, "DEFAULT_SYMBOL_SERVER", "https://msdl.microsoft.com/download/symbols"
+    )
+
+
+class TestSymbolServerScope:
+    def test_the_default_server_is_microsoft_only(self, clean_symbol_env):
+        assert mod.symbol_servers_are_microsoft_only() is True
+
+    def test_a_third_party_server_is_not(self, clean_symbol_env):
+        assert mod.symbol_servers_are_microsoft_only(
+            "srv*C:\\sym*https://symbols.mozilla.org/"
+        ) is False
+
+    def test_one_non_microsoft_server_in_the_chain_is_enough(self, clean_symbol_env):
+        assert mod.symbol_servers_are_microsoft_only(
+            "srv*C:\\sym*https://msdl.microsoft.com/download/symbols;"
+            "srv*C:\\sym*https://symbols.vendor.example/"
+        ) is False
+
+
+class TestPrognosis:
+    def test_a_microsoft_binary_is_worth_fetching(self, tmp_path, clean_symbol_env):
+        with patch.object(mod, "version_info_company", return_value="Microsoft Corporation"):
+            p = mod.symbol_server_prognosis(_pe(tmp_path))
+        assert p["is_microsoft"] and p["likely"]
+
+    def test_a_third_party_binary_on_the_microsoft_server_is_not(self, tmp_path, clean_symbol_env):
+        with patch.object(mod, "version_info_company", return_value="Valve Corporation"):
+            p = mod.symbol_server_prognosis(_pe(tmp_path, "steam.exe"))
+        assert not p["is_microsoft"] and not p["likely"]
+        assert p["microsoft_only_servers"] is True
+        assert "Valve" in p["reason"]
+
+    def test_a_third_party_binary_is_worth_trying_on_a_third_party_server(
+        self, tmp_path, clean_symbol_env
+    ):
+        with patch.object(mod, "version_info_company", return_value="Valve Corporation"):
+            p = mod.symbol_server_prognosis(
+                _pe(tmp_path, "steam.exe"),
+                symbol_path="srv*C:\\sym*https://symbols.vendor.example/",
+            )
+        assert p["likely"] and p["microsoft_only_servers"] is False
+
+    def test_no_version_resource_reads_as_not_worth_fetching(self, tmp_path, clean_symbol_env):
+        with patch.object(mod, "version_info_company", return_value=None):
+            p = mod.symbol_server_prognosis(_pe(tmp_path))
+        assert not p["likely"] and "no CompanyName" in p["reason"]
+
+    def test_a_missing_pefile_does_not_become_a_refusal(self, tmp_path, clean_symbol_env):
+        with patch.object(mod, "version_info_company", return_value=None), \
+                patch.object(mod, "_pefile_available", return_value=False):
+            p = mod.symbol_server_prognosis(_pe(tmp_path))
+        assert p["likely"] and "pefile" in p["reason"]
+
+
+class TestAutoNoteWording:
+    def test_the_skip_note_does_not_send_the_model_to_load_pdb(self, tmp_path, clean_symbol_env):
+        with patch.object(mod, "extract_codeview_record", return_value=CV), \
+                patch.object(mod, "version_info_company", return_value="Valve Corporation"), \
+                patch.object(mod, "fetch_pdb") as fetch:
+            _, note = mod.auto_fetch_pdb(_pe(tmp_path, "steam.exe"), policy="microsoft")
+        fetch.assert_not_called()
+        assert note["status"] == "skipped"
+        assert "do NOT retry with load_pdb" in note["detail"]
+        assert "Valve Corporation" in note["detail"]
+
+
+def _tool_fn(tool):
+    """The underlying function of a registered tool.
+
+    Some test modules stub out fastmcp, so ``@app.tool()`` sometimes leaves a
+    FunctionTool behind and sometimes the plain function.
+    """
+    return getattr(tool, "fn", tool)
+
+
+class TestLoadPdbGate:
+    def _prognosis(self, monkeypatch, likely, reason="CompanyName='Valve Corporation'"):
+        monkeypatch.setattr(
+            mod,
+            "symbol_server_prognosis",
+            MagicMock(return_value={
+                "is_microsoft": likely,
+                "company": "Valve Corporation",
+                "microsoft_only_servers": True,
+                "likely": likely,
+                "reason": reason,
+            }),
+        )
+
+    def test_a_third_party_binary_is_refused_before_any_network_call(
+        self, server, tmp_path, monkeypatch, clean_symbol_env
+    ):
+        server_mod, cache_obj, _ = server
+        binary = _pe(tmp_path, "steam.exe")
+        self._prognosis(monkeypatch, likely=False)
+        fetch = MagicMock()
+        monkeypatch.setattr(mod, "fetch_pdb", fetch)
+        invalidate = MagicMock()
+        monkeypatch.setattr(cache_obj, "invalidate", invalidate)
+
+        out = _tool_fn(server_mod.load_pdb)(str(binary))
+
+        fetch.assert_not_called()
+        invalidate.assert_not_called()
+        assert "No PDB fetch attempted for steam.exe" in out
+        assert "Valve Corporation" in out
+        assert "allow_non_microsoft=True" in out
+        assert "analysis_depth=" in out
+
+    def test_the_override_lets_the_fetch_through(
+        self, server, tmp_path, monkeypatch, clean_symbol_env
+    ):
+        server_mod, _, captured = server
+        binary = _pe(tmp_path, "steam.exe")
+        prognosis = MagicMock()
+        monkeypatch.setattr(mod, "symbol_server_prognosis", prognosis)
+        monkeypatch.setattr(mod, "fetch_pdb", MagicMock(return_value=tmp_path / "steam.pdb"))
+
+        out = _tool_fn(server_mod.load_pdb)(str(binary), allow_non_microsoft=True)
+
+        prognosis.assert_not_called()
+        assert captured["pdb_path"] == str(tmp_path / "steam.pdb")
+        assert "PDB applied" in out
+
+    def test_a_microsoft_binary_still_fetches(
+        self, server, tmp_path, monkeypatch, clean_symbol_env
+    ):
+        server_mod, _, captured = server
+        binary = _pe(tmp_path)
+        self._prognosis(monkeypatch, likely=True)
+        monkeypatch.setattr(mod, "fetch_pdb", MagicMock(return_value=tmp_path / "t.pdb"))
+
+        out = _tool_fn(server_mod.load_pdb)(str(binary))
+
+        assert captured["pdb_path"] == str(tmp_path / "t.pdb")
+        assert "PDB applied" in out
+
+    def test_a_vendor_symbol_path_reopens_the_door(
+        self, server, tmp_path, monkeypatch, clean_symbol_env
+    ):
+        """Real prognosis, not a stub: pointing at a non-Microsoft server is
+        the caller saying the PDB might be there, and the gate steps aside."""
+        server_mod, _, captured = server
+        binary = _pe(tmp_path, "steam.exe")
+        monkeypatch.setattr(mod, "version_info_company", lambda _p: "Valve Corporation")
+        monkeypatch.setattr(mod, "fetch_pdb", MagicMock(return_value=tmp_path / "steam.pdb"))
+
+        out = _tool_fn(server_mod.load_pdb)(
+            str(binary), symbol_path="srv*C:\\sym*https://symbols.vendor.example/"
+        )
+
+        assert captured["pdb_path"] == str(tmp_path / "steam.pdb")
+        assert "PDB applied" in out
+
+    def test_an_explicit_pdb_path_is_never_gated(
+        self, server, tmp_path, monkeypatch, clean_symbol_env
+    ):
+        server_mod, _, captured = server
+        binary = _pe(tmp_path, "steam.exe")
+        pdb = tmp_path / "steam.pdb"
+        pdb.write_bytes(b"pdb")
+        prognosis = MagicMock()
+        monkeypatch.setattr(mod, "symbol_server_prognosis", prognosis)
+
+        out = _tool_fn(server_mod.load_pdb)(str(binary), pdb_path=str(pdb))
+
+        prognosis.assert_not_called()
+        assert captured["pdb_path"] == str(pdb)
+        assert "PDB applied" in out

@@ -257,11 +257,20 @@ Edit `src/utils/patterns.py`:
 
 ## Documentation
 
-### README Updates
+### Documentation Updates
 
-- Keep usage examples up-to-date
-- Add new tools to the tool reference
-- Update configuration examples if needed
+The README is an overview and links out; the detail lives in `docs/`.
+
+- New tool: add it to `docs/tools.md` and bump that group's count and the
+  `## Capabilities (N tools)` heading. `tests/test_docs_accuracy.py` fails if
+  either disagrees with the code.
+- New environment variable: add it to `CONFIG_KEYS` in `src/utils/config.py`
+  and to `docs/configuration.md`. Do not document a key nothing reads.
+- New security-relevant behaviour: `docs/security.md`, which is pinned against
+  the source by the same test module.
+- New doc file: list it in `docs/README.md`.
+- Keep the README's usage examples current, but resist growing the README
+  itself; if a section needs more than a few lines, it belongs in `docs/`.
 
 ### Code Documentation
 

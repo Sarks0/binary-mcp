@@ -14,6 +14,7 @@ import json
 import re
 import sys
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -211,3 +212,26 @@ def test_manifest_by_facet_is_consistent(roster):
     for facet, names in manifest["by_facet"].items():
         for name in names:
             assert facet in manifest["tools"][name]["facets"]
+
+
+# Regression from the branch code review
+
+
+def test_a_failed_registration_does_not_latch_the_idempotence_flag(monkeypatch):
+    """The flag used to be set BEFORE the work. A register_*_tools that
+    raised (a bad import in a tool module, a duplicate tool name) then left
+    it standing: every later call returned immediately and reported success
+    with a partial roster, and apply_tool_catalog never ran."""
+    import src.server as server_module
+
+    monkeypatch.setattr(server_module, "_tools_registered", False)
+    monkeypatch.setattr(
+        server_module,
+        "register_job_tools",
+        MagicMock(side_effect=RuntimeError("duplicate tool name")),
+    )
+
+    with pytest.raises(RuntimeError):
+        server_module.register_all_tools()
+
+    assert server_module._tools_registered is False

@@ -1214,6 +1214,76 @@ def _mark_worker(cache_dir, binary_id, addresses):
         store.mark_reviewed(binary_id, [addr], tool="worker")
 
 
+class TestIndexingDoesNotBlockMarking:
+    """index() computes the expensive parts (cache decompression, scope BFS)
+    outside the lock on purpose. ensure_indexed used to re-acquire the lock
+    around the whole thing, so a status poll on a big binary starved every
+    concurrent mark until it timed out and was silently dropped."""
+
+    def _lock_held(self):
+        from src.engines.static.ghidra import coverage_store as mod
+
+        return bool(getattr(mod._held_locks, "paths", None))
+
+    def test_the_scope_walk_runs_without_the_lock(self, lab, monkeypatch):
+        from src.engines.static.ghidra import coverage_store as mod
+
+        lab.analyze(_context([_func("entry", "140001000")]))
+        seen = {}
+        real = mod.compute_scope
+        monkeypatch.setattr(
+            mod,
+            "compute_scope",
+            lambda ctx: (seen.setdefault("locked", self._lock_held()), real(ctx))[1],
+        )
+
+        record, status = lab.store.ensure_indexed(lab.binary_id, lab.path)
+
+        assert status == "ready" and record is not None
+        assert seen["locked"] is False
+
+    def test_a_mark_from_another_session_lands_mid_index(self, lab, monkeypatch):
+        """The real shape of the bug: another thread marking while this one
+        indexes. Same-thread re-entry would not have caught it -- locked() is
+        re-entrant per thread, so only a second thread contends."""
+        import threading
+
+        from src.engines.static.ghidra import coverage_store as mod
+
+        # A failure must not cost the full 30s production wait.
+        monkeypatch.setattr(mod, "COVERAGE_LOCK_WAIT_SECONDS", 1.0)
+
+        lab.analyze(_context([_func("entry", "140001000"), _func("b", "140002000")]))
+        lab.store.index(lab.binary_id, lab.path)
+        record = lab.store.read(lab.binary_id)
+        record["scope_version"] = -1  # force the re-index path
+        lab.store.write(record)
+
+        outcome = {}
+        real = mod.compute_scope
+
+        def mark_from_another_thread():
+            try:
+                lab.store.mark_reviewed(lab.binary_id, ["0x140001000"], tool="other")
+                outcome["ok"] = True
+            except CoverageError as exc:  # lock held across the walk: mark lost
+                outcome["ok"] = False
+                outcome["why"] = str(exc)
+
+        def contended_scope(ctx):
+            worker = threading.Thread(target=mark_from_another_thread)
+            worker.start()
+            worker.join(timeout=10)
+            return real(ctx)
+
+        monkeypatch.setattr(mod, "compute_scope", contended_scope)
+        rebuilt, _ = lab.store.ensure_indexed(lab.binary_id, lab.path)
+
+        assert outcome.get("ok") is True, outcome.get("why")
+        # And the rebuild preserved it rather than overwriting the marker.
+        assert rebuilt["functions"]["0x140001000"]["reviewed"] is True
+
+
 class TestConcurrentWrites:
     def _index_many(self, lab, n):
         funcs = [_func(f"f{i}", f"{0x140001000 + i * 0x100:x}") for i in range(n)]

@@ -340,3 +340,35 @@ class TestTempOutputPath:
         server_module.cache.clear_all()
 
         assert not leaked.exists()
+
+
+# Regressions from the branch code review
+
+
+def test_clear_all_takes_the_coverage_lock_files(tmp_path):
+    """`.<sha>.coverage.lock` is never unlinked by its holder (that would
+    race the next acquirer onto a new inode), so nothing else removed one
+    either: the globs could not match a name ending in .lock, and every
+    binary ever indexed left one behind a full wipe."""
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    binary = _binary(tmp_path)
+    cache = _cache(cache_dir)
+    cache.save_cached(str(binary), {"functions": [], "metadata": {}})
+    lock = cache_dir / ".deadbeef.coverage.lock"
+    lock.write_bytes(b"")
+
+    cache.clear_all()
+
+    assert not lock.exists()
+    assert not list(cache_dir.glob("*.coverage.lock"))
+
+
+def test_cache_size_counts_the_coverage_lock_files(tmp_path):
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    cache = _cache(cache_dir)
+    before = cache.get_cache_size()
+    (cache_dir / ".deadbeef.coverage.lock").write_bytes(b"x" * 16)
+
+    assert cache.get_cache_size() == before + 16

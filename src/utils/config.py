@@ -199,7 +199,7 @@ CONFIG_KEYS = {
     "BINARY_MCP_SYMBOL_SERVER": "Override upstream symbol server (default https://msdl.microsoft.com/download/symbols).",
     "BINARY_MCP_SYMBOL_OFFLINE": "Set to 1 to skip the upstream symbol server and serve only from the local cache (air-gapped sessions).",
     "BINARY_MCP_ALLOW_HTTP_SYMBOLS": "Set to 1 to permit http:// symbol servers (off by default; PDBs are MITM-sensitive).",
-    "BINARY_MCP_AUTO_PDB": "Fetch a PDB from the symbol server on a binary's first import: 'microsoft' (default; only binaries whose version info names Microsoft), 'always', or 'never'. Fetching sends the PDB name and GUID to the server, so keep 'microsoft' or 'never' for samples you don't want disclosed.",
+    "BINARY_MCP_AUTO_PDB": "Fetch a PDB from the symbol server on a binary's first import: 'microsoft' (default; only binaries whose version info names Microsoft), 'always', or 'never'. Fetching sends the PDB name and GUID to the server, so keep 'microsoft' or 'never' for samples you don't want disclosed. load_pdb's own auto-fetch applies the same vendor check and refuses up front (no network, no re-analysis) when a third-party binary is pointed at the Microsoft-only public server; override per call with allow_non_microsoft=True.",
 
     # Analysis
     "BINARY_MCP_CACHE_DIR": "Directory for caching analysis results",

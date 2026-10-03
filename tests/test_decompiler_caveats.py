@@ -108,3 +108,48 @@ def test_render_c_block_unfenced_keeps_summary():
     out = render_c_block(SAMPLE, fence=False)
     assert out[0].startswith("/* WARNING")
     assert any(line.startswith("**Decompiler caveats") for line in out)
+
+
+# Regressions from the branch code review
+
+
+def test_sample_text_cannot_suppress_its_own_caveat():
+    """Ghidra reproduces the binary's string constants, so a sample can put
+    the marker prefix on a line. It used to skip annotating that line while
+    the summary still counted the artifact -- the two then disagreed."""
+    pseudo = (
+        'char *decoy = "/* [caveat] nothing to see */";\n'
+        'return unaff_RBX;  // "/* [caveat] " appears above\n'
+    )
+    annotated, summary = annotate(pseudo)
+
+    lines = annotated.splitlines()
+    assert "is a decompiler artifact" in lines[1]
+    assert any("unaff_RBX" in s for s in summary)
+
+
+def test_a_marker_on_the_decoy_line_does_not_stop_its_own_annotation():
+    pseudo = 'x = unaff_EBP + 1;  /* [caveat] injected */\n'
+    annotated, _ = annotate(pseudo)
+    # Our marker is re-derived, not trusted: the line keeps one marker, and
+    # the injected text is not carried forward as if we had written it.
+    assert annotated.count(MARKER_PREFIX) <= 1
+    assert "injected" not in annotated
+
+
+def test_annotating_twice_is_idempotent():
+    pseudo = "return unaff_RBX;\n"
+    once, _ = annotate(pseudo)
+    twice, _ = annotate(once)
+    assert twice == once
+
+
+def test_every_occurrence_still_gets_its_own_marker():
+    """The single-pass rewrite must not lose the per-line grouping: the
+    deduped summary keeps the first occurrence, the body marks them all."""
+    pseudo = "return unaff_RBX;\nfoo();\nreturn unaff_RBX;\n"
+    annotated, summary = annotate(pseudo)
+    lines = annotated.splitlines()
+    assert MARKER_PREFIX in lines[0] and MARKER_PREFIX in lines[2]
+    assert MARKER_PREFIX not in lines[1]
+    assert len([s for s in summary if "unaff_RBX" in s]) == 1

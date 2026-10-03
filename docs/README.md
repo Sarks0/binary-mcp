@@ -26,6 +26,7 @@
 | Document | What it covers |
 |----------|----------------|
 | [`tool-catalog.json`](tool-catalog.json) | Machine-readable tool roster, categories and facets |
+| [x64dbg plugin build](../src/engines/dynamic/x64dbg/plugin/README.md) | Building the C++ plugin for x64 and x32 |
 
 Regenerate the catalog with `python -m src.tool_catalog`.
 

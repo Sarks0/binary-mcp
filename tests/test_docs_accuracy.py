@@ -426,6 +426,34 @@ def test_documented_confinement_defaults_match_security_module():
     )
 
 
+def test_documented_auto_pdb_default_matches_code():
+    """
+    The symbol-fetch default decides whether sample metadata leaves the host.
+
+    docs/security.md and docs/configuration.md both state the default policy is
+    `microsoft` -- fetch a PDB only for binaries whose version info names
+    Microsoft. If that default ever became `always`, both docs would be telling
+    an analyst their samples stay private while every first import announced one
+    to the symbol server. test_auto_pdb.py asserts auto_pdb_policy() ==
+    AUTO_PDB_DEFAULT, which holds whatever that constant is, so the literal is
+    what gets pinned here, together with the docs that quote it.
+    """
+    from src.utils.pdb_fetcher import AUTO_PDB_DEFAULT, AUTO_PDB_POLICIES
+
+    assert AUTO_PDB_DEFAULT == "microsoft", (
+        "the BINARY_MCP_AUTO_PDB default changed; docs/security.md and "
+        "docs/configuration.md both state `microsoft`"
+    )
+    assert set(AUTO_PDB_POLICIES) == {"microsoft", "always", "never"}
+
+    for path in (SECURITY_DOC, CONFIG_DOC):
+        text = path.read_text(encoding="utf-8")
+        assert "BINARY_MCP_AUTO_PDB" in text, f"{path.name} no longer names the key"
+        assert "`microsoft`" in text, (
+            f"{path.name} no longer states the default symbol-fetch policy"
+        )
+
+
 # F-6: x64dbg_execute_command docstring
 
 

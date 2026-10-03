@@ -4,9 +4,14 @@ This is a malware-analysis tool. Analyze samples in an isolated VM, on a host
 you can revert.
 
 Some of that advice is enforced by the code, and it is worth being precise
-about which parts. Each claim below is pinned by a test in
-`tests/test_docs_accuracy.py` that asserts it against the source, so it cannot
-quietly stop being true.
+about which parts.
+
+Most of the claims below are pinned against the source by a test, so they
+cannot quietly stop being true: the no-execution, never-uploaded,
+confinement-default and symbol-policy claims by `tests/test_docs_accuracy.py`,
+the command gates by `tests/test_windbg_gate_allowlist.py` and
+`tests/test_x64dbg_command_gate.py`, and the installer claims by
+`tests/test_installer_integrity.py`.
 
 ## No tool can execute a sample
 

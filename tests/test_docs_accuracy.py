@@ -33,6 +33,16 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SRC = REPO_ROOT / "src"
 README = REPO_ROOT / "README.md"
+# The capability tables, the security model and the configuration reference
+# moved out of README.md into docs/ when the README was cut down to an
+# overview. They are the same claims about the same code, so the assertions
+# follow them to their new files rather than being dropped, and
+# test_readme_links_to_the_claim_docs keeps each one reachable from the front
+# page. A claim nobody can find is only marginally better than a false one.
+TOOLS_DOC = REPO_ROOT / "docs" / "tools.md"
+SECURITY_DOC = REPO_ROOT / "docs" / "security.md"
+CONFIG_DOC = REPO_ROOT / "docs" / "configuration.md"
+CLAIM_DOCS = (README, TOOLS_DOC, SECURITY_DOC, CONFIG_DOC)
 PYPROJECT = REPO_ROOT / "pyproject.toml"
 SERVER_PY = SRC / "server.py"
 DYNAMIC_TOOLS = SRC / "tools" / "dynamic_tools.py"
@@ -123,12 +133,29 @@ def _plugin_allowlist() -> set[str]:
 # F-11: tool counts
 
 
-def test_readme_headline_tool_count_matches_code():
-    """README '## Capabilities (N tools)' must equal the real tool count."""
-    text = README.read_text(encoding="utf-8")
+def test_tool_reference_headline_count_matches_code():
+    """docs/tools.md '## Capabilities (N tools)' must equal the real tool count."""
+    text = TOOLS_DOC.read_text(encoding="utf-8")
     match = re.search(r"^## Capabilities \((\d+) tools\)", text, re.M)
-    assert match, "README is missing the '## Capabilities (N tools)' heading"
+    assert match, "docs/tools.md is missing the '## Capabilities (N tools)' heading"
     assert int(match.group(1)) == count_registered_tools()
+
+
+def test_readme_tool_count_matches_code():
+    """
+    The README's pitch names a tool count too, and it drifts like any other.
+
+    It used to carry the whole capability table, so the heading assertion above
+    covered it. Now it just says "N tools" in prose and links to docs/tools.md;
+    every such number in the file must still be the real one, or the front page
+    advertises a roster the server does not have.
+    """
+    counts = {int(n) for n in re.findall(r"(\d+) tools", README.read_text(encoding="utf-8"))}
+    assert counts, "README no longer states a tool count at all"
+    assert counts == {count_registered_tools()}, (
+        f"README advertises {sorted(counts)} tools; the code registers "
+        f"{count_registered_tools()}"
+    )
 
 
 def test_server_module_docstring_tool_count_matches_code():
@@ -141,7 +168,7 @@ def test_server_module_docstring_tool_count_matches_code():
     assert int(match.group(1)) == count_registered_tools()
 
 
-def test_readme_category_counts_sum_to_total():
+def test_tool_reference_category_counts_sum_to_total():
     """
     The per-category '### Name - N tools' counts must add up to the headline.
 
@@ -149,9 +176,9 @@ def test_readme_category_counts_sum_to_total():
     279; a table that sums to the wrong number is the shape the bug took, so
     the sum is what gets asserted.
     """
-    text = README.read_text(encoding="utf-8")
+    text = TOOLS_DOC.read_text(encoding="utf-8")
     section_counts = [int(n) for n in re.findall(r"^### .+ - (\d+) tools?$", text, re.M)]
-    assert section_counts, "README no longer lists per-category tool counts"
+    assert section_counts, "docs/tools.md no longer lists per-category tool counts"
     assert sum(section_counts) == count_registered_tools()
 
 
@@ -216,23 +243,34 @@ def test_every_tool_module_is_registered_from_main():
 # F-11: VirusTotal is lookup-only, samples are never uploaded
 
 
-def test_readme_does_not_advertise_virustotal_submission():
+def test_no_doc_advertises_virustotal_submission():
     """
     The README promised VT 'file submission'. No such tool exists.
 
     This is good security -- no sample exfiltration path can fire, even by
     accident -- but the promise had to go, and it must not come back without
-    the code to match it.
+    the code to match it. Swept across every claim-bearing doc, not just the
+    README: the promise would be equally false in docs/tools.md.
     """
-    text = README.read_text(encoding="utf-8").lower()
-    for claim in ("file submission", "submit file", "upload sample", "sample upload"):
-        assert claim not in text, f"README re-advertises VirusTotal {claim!r}"
+    for path in CLAIM_DOCS:
+        text = path.read_text(encoding="utf-8").lower()
+        for claim in ("file submission", "submit file", "upload sample", "sample upload"):
+            assert claim not in text, f"{path.name} re-advertises VirusTotal {claim!r}"
 
 
-def test_readme_states_samples_are_never_uploaded():
-    """The never-uploads property is a genuine selling point; keep it stated."""
-    text = README.read_text(encoding="utf-8").lower()
-    assert "never uploaded" in text or "never upload" in text
+def test_docs_state_samples_are_never_uploaded():
+    """
+    The never-uploads property is a genuine selling point; keep it stated.
+
+    Required in BOTH places on purpose: docs/security.md is where the claim is
+    argued from the code, and the README is where someone deciding whether to
+    point this at a sample will actually read it.
+    """
+    for path in (README, SECURITY_DOC):
+        text = path.read_text(encoding="utf-8").lower()
+        assert "never uploaded" in text or "never upload" in text, (
+            f"{path.name} no longer states that samples are never uploaded"
+        )
 
 
 def test_no_vt_caller_uses_post():
@@ -289,22 +327,26 @@ def test_pyproject_has_no_yara_extra_while_yara_is_unimported():
         )
 
 
-def test_readme_describes_yara_as_generation_not_scanning():
-    text = README.read_text(encoding="utf-8")
+def test_tool_reference_describes_yara_as_generation_not_scanning():
+    text = TOOLS_DOC.read_text(encoding="utf-8")
     yara_lines = [ln for ln in text.splitlines() if "YARA" in ln or "yara" in ln]
-    assert yara_lines, "README no longer mentions YARA at all"
+    assert yara_lines, "docs/tools.md no longer mentions YARA at all"
     joined = " ".join(yara_lines).lower()
     assert "generation" in joined or "generate" in joined
     assert "rule scanning" not in joined
-    assert "yara-python" not in joined, "README still points at the removed extra"
+    assert "yara-python" not in joined, "the docs still point at the removed extra"
 
 
 # F-11: 'analyze in a VM' guidance, and the code that backs it
 
 
-def test_readme_carries_isolated_vm_guidance():
-    text = README.read_text(encoding="utf-8").lower()
-    assert "isolated vm" in text or "isolated virtual machine" in text
+def test_docs_carry_isolated_vm_guidance():
+    """Also required in both places, and for the same reason as never-uploaded."""
+    for path in (README, SECURITY_DOC):
+        text = path.read_text(encoding="utf-8").lower()
+        assert "isolated vm" in text or "isolated virtual machine" in text, (
+            f"{path.name} no longer tells the reader to work in an isolated VM"
+        )
 
 
 def test_no_tool_can_launch_a_sample():
@@ -325,24 +367,51 @@ def test_no_tool_can_launch_a_sample():
                 )
 
 
-def test_readme_documents_confinement_controls():
-    text = README.read_text(encoding="utf-8")
+def test_docs_document_confinement_controls():
+    """
+    Every confinement knob has to be documented somewhere a reader can find.
+
+    docs/configuration.md is the reference and must name all three;
+    docs/security.md must at least name the allow-list, since that is where the
+    default posture is explained and an operator who reads only that page still
+    needs to know the variable exists.
+    """
+    config_text = CONFIG_DOC.read_text(encoding="utf-8")
     for var in (
         "BINARY_MCP_ALLOWED_DIRS",
         "BINARY_MCP_REQUIRE_CONFINEMENT",
         "BINARY_MCP_ALLOW_ANY_PATH",
     ):
-        assert var in text, f"README no longer documents {var}"
+        assert var in config_text, f"docs/configuration.md no longer documents {var}"
+
+    assert "BINARY_MCP_ALLOWED_DIRS" in SECURITY_DOC.read_text(encoding="utf-8"), (
+        "docs/security.md explains the default confinement posture but no longer "
+        "names the variable that changes it"
+    )
+
+
+def test_readme_links_to_the_claim_docs():
+    """
+    The README is an overview now, so its job is to route to the detail.
+
+    Without this, the tests above could all pass against docs that nothing
+    links to: the tool roster, the security model and the config reference
+    would be correct and unreachable. Every path asserted here is a file the
+    other tests in this module pin.
+    """
+    text = README.read_text(encoding="utf-8")
+    for target in ("docs/tools.md", "docs/security.md", "docs/configuration.md", "INSTALL.md"):
+        assert target in text, f"README no longer links to {target}"
 
 
 def test_documented_confinement_defaults_match_security_module():
     """
-    The README describes the CURRENT default posture; verify it against code.
+    docs/security.md describes the CURRENT default posture; verify it in code.
 
     Defaults moved during this audit (F-8: unset used to mean "any path").
-    A README that describes the old posture is worse than one that says
-    nothing, because an operator would skip configuring an allow-list they
-    actually still need.
+    A doc that describes the old posture is worse than one that says nothing,
+    because an operator would skip configuring an allow-list they actually
+    still need.
     """
     from src.utils import security
 
@@ -355,6 +424,34 @@ def test_documented_confinement_defaults_match_security_module():
         "default_quarantine_dirs() is empty, so an unconfigured install would "
         "again be unrestricted and the README's default-confinement claim false"
     )
+
+
+def test_documented_auto_pdb_default_matches_code():
+    """
+    The symbol-fetch default decides whether sample metadata leaves the host.
+
+    docs/security.md and docs/configuration.md both state the default policy is
+    `microsoft` -- fetch a PDB only for binaries whose version info names
+    Microsoft. If that default ever became `always`, both docs would be telling
+    an analyst their samples stay private while every first import announced one
+    to the symbol server. test_auto_pdb.py asserts auto_pdb_policy() ==
+    AUTO_PDB_DEFAULT, which holds whatever that constant is, so the literal is
+    what gets pinned here, together with the docs that quote it.
+    """
+    from src.utils.pdb_fetcher import AUTO_PDB_DEFAULT, AUTO_PDB_POLICIES
+
+    assert AUTO_PDB_DEFAULT == "microsoft", (
+        "the BINARY_MCP_AUTO_PDB default changed; docs/security.md and "
+        "docs/configuration.md both state `microsoft`"
+    )
+    assert set(AUTO_PDB_POLICIES) == {"microsoft", "always", "never"}
+
+    for path in (SECURITY_DOC, CONFIG_DOC):
+        text = path.read_text(encoding="utf-8")
+        assert "BINARY_MCP_AUTO_PDB" in text, f"{path.name} no longer names the key"
+        assert "`microsoft`" in text, (
+            f"{path.name} no longer states the default symbol-fetch policy"
+        )
 
 
 # F-6: x64dbg_execute_command docstring

@@ -461,7 +461,7 @@ def register_yara_tools(app, session_manager):
         Args:
             binary_path: Path to binary file. Subject to the same path
                 confinement as every other analysis tool (BINARY_MCP_ALLOWED_DIRS,
-                defaulting to the quarantine directories -- see README).
+                defaulting to the quarantine directories -- see docs/security.md).
             rule_name: Name for the rule (auto-generated if empty)
             strictness: Rule strictness - "low", "medium", "high"
             output_path: Optional path to save rule. Confined to

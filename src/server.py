@@ -17,7 +17,7 @@ finding F-11: this said "245" while 279 were registered, and a documented
 capability count that overstates reality is a claim a caller may act on).
 
 Samples are never executed by this server and never uploaded anywhere: no
-tool can launch a binary (see README, "Operational safety"), and the
+tool can launch a binary (see docs/security.md), and the
 VirusTotal integration is lookup-only.
 """
 

@@ -742,7 +742,15 @@ def test_no_doc_pipes_a_project_installer_into_an_interpreter():
     `curl ... | python3 -` after the first pass, and release.yml's release notes
     said the same thing - so every release told users to do the exact thing the
     installers were hardened against."""
-    for path in (README_PATH, INSTALL_MD_PATH, RELEASE_WORKFLOW_PATH):
+    docs_dir = REPO_ROOT / "docs"
+    for path in (
+        README_PATH,
+        INSTALL_MD_PATH,
+        RELEASE_WORKFLOW_PATH,
+        docs_dir / "README.md",
+        docs_dir / "security.md",
+        docs_dir / "configuration.md",
+    ):
         text = path.read_text(encoding="utf-8")
         offenders = [
             line.strip()
@@ -754,20 +762,52 @@ def test_no_doc_pipes_a_project_installer_into_an_interpreter():
         )
 
 
-def test_readme_leads_with_download_inspect_run():
+def test_install_doc_leads_with_download_inspect_run():
     """Not enough to delete the one-liner: the replacement has to actually show
-    the inspect step, or users will reinvent the one-liner."""
-    text = README_PATH.read_text(encoding="utf-8")
+    the inspect step, or users will reinvent the one-liner.
+
+    This asserted against README.md's Quick Start, which was the only install
+    instruction the project had. The README is an overview now and carries the
+    clone form plus a link, so the download-to-disk flow is asserted where it
+    actually lives. test_readme_routes_to_the_inspect_flow below keeps the
+    README from reintroducing an unverified download of its own.
+    """
+    text = INSTALL_MD_PATH.read_text(encoding="utf-8")
     quick_start = text[text.index("## Quick Start"):]
 
     assert "git clone" in quick_start
     assert "-OutFile" in quick_start, "no download-to-disk form for Windows"
     assert "sha256sum install.py" in quick_start or "Get-FileHash" in quick_start, (
-        "README shows no way to record what was downloaded"
+        "INSTALL.md shows no way to record what was downloaded"
     )
     # The risk is stated where the reader is, not only behind a link.
     assert re.search(r"elevated|Administrator", quick_start)
-    assert "INSTALL.md" in quick_start
+    assert "Supply-Chain Integrity" in quick_start, (
+        "the inspect step no longer points at what the installers actually verify"
+    )
+
+
+def test_readme_routes_to_the_inspect_flow():
+    """
+    The README may only show the clone form, and must hand off for the rest.
+
+    The failure this guards against is a future README that grows its own
+    `curl ... > install.py && python3 install.py` shortcut: no digest, no read
+    step, and no link to the page explaining why that matters. Either the
+    README shows the full inspect flow itself, or it links to INSTALL.md.
+    """
+    text = README_PATH.read_text(encoding="utf-8")
+    quick_start = text[text.index("## Quick Start"):]
+
+    assert "INSTALL.md" in quick_start, (
+        "README's install section neither shows the inspect flow nor links to it"
+    )
+    if "curl" in quick_start or "Invoke-WebRequest" in quick_start:
+        assert "sha256sum install.py" in quick_start or "Get-FileHash" in quick_start, (
+            "README downloads an installer without showing how to check it; "
+            "either add the digest and read steps or leave the download to "
+            "INSTALL.md"
+        )
 
 
 def test_ps1_does_not_clear_mark_of_the_web_before_verification():

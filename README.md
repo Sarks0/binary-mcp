@@ -1,5 +1,9 @@
 # Binary MCP Server
 
+[![CI](https://github.com/sarks0/binary-mcp/workflows/CI/badge.svg)](https://github.com/sarks0/binary-mcp/actions)
+[![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+
 An MCP server for reverse engineering. It hands an AI assistant 147 tools for
 static analysis, live debugging, kernel debugging and .NET decompilation, so
 the whole workflow happens in one place instead of across four GUIs.

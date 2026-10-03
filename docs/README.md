@@ -38,3 +38,4 @@ Regenerate the catalog with `python -m src.tool_catalog`.
 | [opencode issues](opencode-issues.md) | Two upstream opencode bugs and their workarounds |
 | [Vulnerability-research workflow](vr-workflow-enhancements.md) | Planned improvements for triaging large binaries |
 | [Activity log and tracing](activity-log-plan.md) | Proposed, not implemented |
+| [Remote access plan](remote-access-plan.md) | Proposed, not implemented: running the MCP server and x64dbg on separate hosts |

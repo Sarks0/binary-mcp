@@ -65,6 +65,18 @@ These are the controls described in the [security model](security.md#file-access
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `VT_API_KEY` | VirusTotal API key, lookups only | Unset, VT tools report how to configure it |
+| `VT_API_TIMEOUT` | Socket timeout for VirusTotal calls, in seconds (clamped 5-300) | 30 |
+| `ABUSECH_API_KEY` | abuse.ch Auth-Key. One key covers MalwareBazaar, ThreatFox, URLhaus and YARAify, and is mandatory for all of them since 30 June 2025. Free from <https://auth.abuse.ch/> | Unset, the tools report how to configure it |
+| `MB_API_KEY` | Alias for `ABUSECH_API_KEY`, kept because it shipped first. `ABUSECH_API_KEY` wins if both are set | Unset |
+| `MB_API_TIMEOUT` | Socket timeout for MalwareBazaar calls, in seconds (clamped 5-300) | 30 |
+| `ABUSECH_API_TIMEOUT` | Socket timeout for ThreatFox/URLhaus/YARAify calls, in seconds (clamped 5-300) | 30 |
+| `MB_ALLOW_DOWNLOAD` | Enable `mb_download`, the only tool that writes a sample to disk. Archives are saved encrypted under `~/.binary_mcp_output/malwarebazaar/` and never extracted | Unset (off) |
+| `MB_MAX_DOWNLOAD_MB` | Ceiling on a downloaded archive, in MB (clamped 1-2048) | 128 |
+| `ATTACK_DOMAIN` | ATT&CK matrix: `enterprise-attack`, `mobile-attack` or `ics-attack` | `enterprise-attack` |
+| `ATTACK_DATA_DIR` | Where the distilled ATT&CK index is cached | `$BINARY_CACHE_DIR/attack` |
+| `ATTACK_OFFLINE` | Refuse to download ATT&CK data, serve only what is already cached | Unset (off) |
+| `ATTACK_MAX_BUNDLE_MB` | Ceiling on the downloaded STIX bundle, in MB (clamped 8-1024). Enterprise is ~51MB today | 128 |
+| `ATTACK_TIMEOUT` | Socket timeout for the ATT&CK download, in seconds (clamped 5-600) | 120 |
 
 ## Optional dependencies
 

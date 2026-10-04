@@ -1,6 +1,9 @@
 # Remote access plan: MCP server and Obsidian plugin across hosts
 
-**Status:** Proposed, not implemented.
+**Status:** Phase 0 and Phase 2 are implemented, along with the Phase 1
+groundwork they needed (`src/utils/remote.py` and the security-model section).
+See [Remote access](remote-access.md) for the resulting setup. The bridge half
+of Phase 1 and Phases 3, 4 and 5 are still proposed.
 
 ## The target topology
 
@@ -147,7 +150,7 @@ Host A (copied once, same bytes → same hash → the cache lines up fine), or t
 whole static side is unavailable. This needs to be stated explicitly rather
 than discovered.
 
-### 1.9 The MCP server itself is stdio-only
+### 1.9 The MCP server itself is stdio-only — FIXED
 
 `src/server.py:6386-6407` ends in a bare `app.run()`, which is FastMCP's stdio
 transport. The client must therefore spawn the server as a subprocess on its
@@ -166,7 +169,7 @@ a local-kernel read-only mode (`connect_kernel_local`, `:1122+`). What it does
 *not* have is user-mode dbgeng remoting (`-premote tcp:...`). So for WinDbg,
 "remote" means either topology B below, or a separate dbgeng-remoting project.
 
-### 1.11 Configuration keys are documented wrong
+### 1.11 Configuration keys are documented wrong — FIXED
 
 `src/utils/config.py:193` declares:
 
@@ -293,7 +296,7 @@ Phase 4 below. Both share Phase 1.
 
 ## Part 4 — Phased implementation
 
-### Phase 0 — Fix the configuration surface (prerequisite, ~small)
+### Phase 0 — Fix the configuration surface (prerequisite, ~small) — DONE
 
 | Change | Files |
 |---|---|
@@ -303,25 +306,27 @@ Phase 4 below. Both share Phase 1.
 Doing this first means the remote keys added later land in a surface that is
 actually true. The new test is the thing that stops key #11 recurring.
 
-### Phase 1 — Shared remote groundwork
+### Phase 1 — Shared remote groundwork — PARTLY DONE
 
-- New `src/utils/remote.py`: parse and validate a remote endpoint
-  (host, port, scheme, TLS material, token source) from one documented set of
-  variables. One parser, used by both topologies, so the two never drift.
-- New env keys, all **off by default**:
-  `BINARY_MCP_REMOTE_ALLOW` (master switch — nothing below has any effect
-  without it), `BINARY_MCP_REMOTE_TLS_CA`, `BINARY_MCP_REMOTE_TLS_CERT`,
-  `BINARY_MCP_REMOTE_TLS_KEY`, `BINARY_MCP_REMOTE_CLIENT_ALLOWLIST`.
-- A `## Remote access` section in `docs/security.md` stating the new threat
-  model in the same plain terms as the rest of that file: what a stolen token
-  grants, that loopback-only is still the default, and that remote mode is an
-  operator decision not a convenience default.
-- Decide and document the posture: **fail closed**. A non-loopback host without
-  `BINARY_MCP_REMOTE_ALLOW` keeps raising the current `ValueError`; a
-  non-loopback host *with* it but without TLS material refuses too, with a
-  message naming the variable to set.
+- **Done.** `src/utils/remote.py` parses and validates a remote endpoint
+  (host, port, TLS material, token, Host allow-set, client allowlist) from one
+  documented set of variables, and carries the ASGI gate that enforces them.
+  Phase 3 reuses the same parser for the bridge so the two cannot drift.
+- **Done.** New env keys, all off by default: `BINARY_MCP_REMOTE_ALLOW`
+  (master switch), `BINARY_MCP_REMOTE_TLS_CERT`, `_KEY`, `_CA` and
+  `BINARY_MCP_REMOTE_CLIENT_ALLOWLIST`, plus the transport's own
+  `BINARY_MCP_TRANSPORT`, `_HTTP_HOST`, `_HTTP_PORT`, `_HTTP_PATH`,
+  `_HTTP_TOKEN` and `_HTTP_ALLOWED_HOSTS`.
+- **Done.** `docs/security.md` has a `## The HTTP transport` section stating
+  the new threat model in the same plain terms as the rest of that file, and
+  `docs/remote-access.md` is the operator guide.
+- **Still to do (the bridge half):** apply the same policy to
+  `X64DbgBridge`, replacing the hard loopback check at `bridge.py:466-471`.
+  The posture is already decided and implemented for the transport — fail
+  closed, with a message naming the variable to set — so the bridge adopts it
+  rather than inventing one.
 
-### Phase 2 — Topology B: remote MCP transport
+### Phase 2 — Topology B: remote MCP transport — DONE
 
 | Change | Files |
 |---|---|

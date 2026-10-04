@@ -14,6 +14,7 @@
 | Document | What it covers |
 |----------|----------------|
 | [Claude Code integration](claude-code-setup.md) | Wiring the server into Claude Code |
+| [Remote access](remote-access.md) | Running the client and the debugger on different hosts |
 | [Large binaries](large-binary-decompile.md) | Project reuse and targeted decompiles for multi-MB binaries |
 | [Background jobs](jobs.md) | Polling analysis that outlives the client timeout |
 | [Review coverage](coverage.md) | The review denominator, worklist and examination axis |

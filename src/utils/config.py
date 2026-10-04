@@ -177,6 +177,7 @@ CONFIG_KEYS = {
 
     # Ghidra
     "GHIDRA_HOME": "Path to Ghidra installation directory",
+    "GHIDRA_INSTALL_DIR": "Alias for GHIDRA_HOME, which is the name Ghidra's own tooling uses. Checked after GHIDRA_HOME.",
     "GHIDRA_TIMEOUT": "Default wall-clock timeout for Ghidra analysis (seconds, 30-3600, default 1800)",
     "GHIDRA_FUNCTION_TIMEOUT": "Per-function decompilation timeout (seconds, default 30)",
     "GHIDRA_MAX_FUNCTIONS": "Cap on functions processed per Ghidra run (0 = unlimited)",
@@ -189,24 +190,57 @@ CONFIG_KEYS = {
     "GHIDRA_MAX_HEAP_MB": "JVM max heap for Ghidra subprocess in MB (default 4096). Bump to 6144-8192 for very large binaries.",
     "BINARY_MCP_INLINE_DEADLINE": "Seconds a Ghidra-invoking tool may block before returning a job handle instead (default 25, max 900). Raise it if your MCP client is patient -- under Claude Code, where long calls move to a background task after 2 min, 90-120 returns more answers inline.",
 
-    # x64dbg
-    "X64DBG_BRIDGE_URL": "URL for x64dbg HTTP bridge (default: http://localhost:27042)",
-    "X64DBG_TIMEOUT": "Default timeout for x64dbg commands (seconds)",
+    # x64dbg (the Obsidian plugin's HTTP listener)
+    "X64DBG_HOST": "Host the Obsidian plugin's HTTP listener is reachable on (default 127.0.0.1). Only loopback is accepted -- the bridge refuses anything else, so a remote debugger host goes through a tunnel whose local end is 127.0.0.1.",
+    "X64DBG_PORT": "Port for that listener (default 8765, which is the port obsidian_server.exe binds).",
+    "X64DBG_TIMEOUT": "Default timeout for x64dbg commands (seconds, default 30)",
+
+    # WinDbg / kernel debugging
+    "WINDBG_PATH": "Path to the Windows debuggers installation (auto-detected when unset).",
+    "WINDBG_TIMEOUT": "Timeout for a single WinDbg command (seconds, default 30)",
+    "WINDBG_DEBUG": "Set to any non-empty value for verbose dbgeng diagnostics.",
+    "KDNET_TIMEOUT": "Timeout for establishing a KDNET kernel connection (seconds, default 60)",
+    "BINARY_MCP_ENABLE_RAW_WINDBG": "Set to 1 to enable windbg_execute_command behind its fail-closed allowlist. Off by default.",
 
     # Symbol server (PDB fetch + WinDbg sympath - shared by static analysis and live debugging)
     "BINARY_MCP_SYMBOL_PATH": "Windows-style _NT_SYMBOL_PATH for PDB fetch (overrides _NT_SYMBOL_PATH).",
     "BINARY_MCP_SYMBOL_CACHE": "Override the on-disk symbol cache directory (defaults to ~/.cache/binary_mcp/symbols on POSIX, ~/.binary_mcp_cache/symbols on Windows). Shared by analyze_binary and live WinDbg sessions.",
     "BINARY_MCP_SYMBOL_SERVER": "Override upstream symbol server (default https://msdl.microsoft.com/download/symbols).",
     "BINARY_MCP_SYMBOL_OFFLINE": "Set to 1 to skip the upstream symbol server and serve only from the local cache (air-gapped sessions).",
+    "BINARY_MCP_ALLOW_PRIVATE_SYMBOL_SERVERS": "Set to 1 to permit a symbol server on a private or loopback address, for an internal symbol store. Off by default: a public name resolving into your network is an SSRF, not a symbol server.",
     "BINARY_MCP_ALLOW_HTTP_SYMBOLS": "Set to 1 to permit http:// symbol servers (off by default; PDBs are MITM-sensitive).",
     "BINARY_MCP_AUTO_PDB": "Fetch a PDB from the symbol server on a binary's first import: 'microsoft' (default; only binaries whose version info names Microsoft), 'always', or 'never'. Fetching sends the PDB name and GUID to the server, so keep 'microsoft' or 'never' for samples you don't want disclosed. load_pdb's own auto-fetch applies the same vendor check and refuses up front (no network, no re-analysis) when a third-party binary is pointed at the Microsoft-only public server; override per call with allow_non_microsoft=True.",
 
-    # Analysis
-    "BINARY_MCP_CACHE_DIR": "Directory for caching analysis results",
-    "BINARY_MCP_SESSION_DIR": "Directory for storing session data",
+    # Storage
+    #
+    # BINARY_CACHE_DIR is the real name of what this dict used to advertise as
+    # BINARY_MCP_CACHE_DIR -- a key nothing read. get_cache_dir() below is the
+    # only resolver, and it reads BINARY_CACHE_DIR.
+    "BINARY_CACHE_DIR": "Base directory for all on-disk state: the analysis cache, Ghidra projects, saved sessions, job records and per-engine error logs (default ~/ghidra_mcp_cache).",
+    "BINARY_MCP_CARVE_DIR": "Destination for carved embedded binaries (default ~/.cache/binary_mcp/carved on POSIX, ~/.binary_mcp_cache/carved on Windows).",
+    "BINARY_MCP_SESSION_DIR": "Directory for saved analysis sessions (default ~/.binary_mcp_sessions).",
+
+    # Path confinement -- see docs/security.md
+    "BINARY_MCP_ALLOWED_DIRS": "Directories analysis is confined to, separated by ':' (POSIX) or ';' (Windows). Unset falls back to the quarantine directories.",
+    "BINARY_MCP_REQUIRE_CONFINEMENT": "Fail closed: refuse any binary unless BINARY_MCP_ALLOWED_DIRS is set explicitly.",
+    "BINARY_MCP_ALLOW_ANY_PATH": "Opt out of path confinement entirely. Not recommended; ignored when BINARY_MCP_REQUIRE_CONFINEMENT is set.",
+    "BINARY_MCP_ALLOW_HARDLINKS": "Re-permit multiply linked regular files. Narrower than BINARY_MCP_ALLOW_ANY_PATH: directory confinement stays in force.",
+
+    # Transport -- see docs/remote-access.md
+    "BINARY_MCP_TRANSPORT": "MCP transport: 'stdio' (default) or 'http'. 'http' lets a client on another host connect instead of spawning the server itself.",
+    "BINARY_MCP_HTTP_HOST": "Address the HTTP transport binds (default 127.0.0.1). A non-loopback address additionally requires BINARY_MCP_REMOTE_ALLOW, TLS and an explicit token.",
+    "BINARY_MCP_HTTP_PORT": "Port the HTTP transport binds (default 8770).",
+    "BINARY_MCP_HTTP_PATH": "URL path the MCP endpoint is served at (default /mcp).",
+    "BINARY_MCP_HTTP_TOKEN": "Bearer token the HTTP transport requires. Generated and logged once per start when unset on loopback; REQUIRED for a non-loopback bind, so restarts do not invalidate the client's config.",
+    "BINARY_MCP_HTTP_ALLOWED_HOSTS": "Extra Host/Origin header values the HTTP transport accepts, comma-separated. The bind address is always accepted; add the DNS name clients dial so a name-based request is not refused as rebinding.",
+    "BINARY_MCP_REMOTE_ALLOW": "Master switch for binding the HTTP transport off loopback. Without it a non-loopback bind is refused.",
+    "BINARY_MCP_REMOTE_TLS_CERT": "PEM certificate chain for the HTTP transport. Required for a non-loopback bind.",
+    "BINARY_MCP_REMOTE_TLS_KEY": "PEM private key matching BINARY_MCP_REMOTE_TLS_CERT.",
+    "BINARY_MCP_REMOTE_TLS_CA": "PEM CA bundle used to verify client certificates. Setting it turns on mutual TLS: a client without a certificate this CA signed is refused at the TLS layer.",
+    "BINARY_MCP_REMOTE_CLIENT_ALLOWLIST": "Comma-separated client addresses or CIDRs allowed to reach the HTTP transport. Checked before authentication; unset means any address that gets past TLS may present a token.",
 
     # Logging
-    "BINARY_MCP_LOG_LEVEL": "Logging level (DEBUG, INFO, WARNING, ERROR)",
+    "BINARY_MCP_LOG_LEVEL": "Logging level (DEBUG, INFO, WARNING, ERROR; default INFO).",
 }
 
 

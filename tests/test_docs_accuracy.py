@@ -635,3 +635,273 @@ def test_windbg_docstring_does_not_claim_read_only():
     for command in ("lm", "k", "r", "dt nt!_EPROCESS", "!analyze -v", "u 401000"):
         ok, _ = validate_command(command)
         assert ok, f"{command!r} should still be permitted; the gate is a denylist"
+
+
+# ---------------------------------------------------------------------------
+# The configuration surface
+# ---------------------------------------------------------------------------
+#
+# CONFIG_KEYS in src/utils/config.py is the project's own description of the
+# knobs it honours, and `diagnose_setup` reports against it -- so a key listed
+# there that nothing reads is not a cosmetic docs bug. It is an operator
+# setting a variable, seeing it acknowledged, and getting no change in
+# behaviour. Four keys were in exactly that state:
+#
+#   X64DBG_BRIDGE_URL     advertised "http://localhost:27042"; the bridge reads
+#                         X64DBG_HOST/X64DBG_PORT and binds 8765
+#   BINARY_MCP_CACHE_DIR  the real name is BINARY_CACHE_DIR
+#   BINARY_MCP_SESSION_DIR  nothing read it; UnifiedSessionManager now does
+#   BINARY_MCP_LOG_LEVEL    nothing read it; basicConfig now does
+#
+# The two tests below close that loop from both sides, which is the only way a
+# surface like this stays true: one refuses a key nothing reads, the other
+# refuses an operator-facing variable nothing documents.
+
+# Prefixes that mark an environment variable as this project's own.
+PROJECT_ENV_PREFIXES = (
+    "BINARY_MCP_",
+    "BINARY_CACHE_DIR",
+    "GHIDRA_",
+    "X64DBG_",
+    "WINDBG_",
+    "KDNET_",
+    "VT_",
+    "OBSIDIAN_",
+)
+
+# Variables that are real, read by src/, and deliberately absent from
+# CONFIG_KEYS because they are not operator-facing. Each one is an internal
+# channel between two parts of this project, so documenting it as a setting
+# would invite someone to set it.
+INTERNAL_ENV_VARS = {
+    # Server -> Ghidra Jython subprocess. Set by the runner on every launch;
+    # a value the operator supplied would be overwritten.
+    "GHIDRA_CONTEXT_JSON",
+    "GHIDRA_TARGET_ADDRESSES",
+    "GHIDRA_ANALYSIS_BUDGET",
+    "GHIDRA_ANALYSIS_DEPTH",
+    # x64dbg plugin -> its own HTTP server process, and the escape hatch the
+    # bridge uses when the token file is on another host. Documented in
+    # docs/remote-access.md as part of a procedure, not as a server setting.
+    "OBSIDIAN_AUTH_TOKEN",
+}
+
+
+# Functions whose first positional string argument names an environment
+# variable. get_config* live in src/utils/config.py; the os.* forms are used
+# directly where config.py is not imported.
+_ENV_READ_FUNCS = frozenset({"getenv", "get_config", "get_config_bool", "get_config_int"})
+
+
+def _subscript_base_name(node: ast.AST) -> str:
+    """Name of the thing being subscripted, for ``os.environ[...]`` / ``env[...]``."""
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    if isinstance(node, ast.Name):
+        return node.id
+    return ""
+
+
+def _project_env_literals() -> dict[str, list[Path]]:
+    """Map every project environment variable named in src/ to the files naming it.
+
+    Three shapes are collected, because the codebase uses all three and a
+    collector that missed one would report a real variable as undocumented (or
+    a documented key as dead):
+
+      1. the first string argument of an env-reading call --
+         ``os.environ.get("X")``, ``os.getenv("X")``, ``get_config("X")``;
+      2. a subscript of an environment mapping -- ``os.environ["X"]``, and
+         ``env["X"] = ...`` where a subprocess environment is being built;
+      3. a module constant whose name contains ENV --
+         ``ENV_ALLOW_ANY_PATH = "BINARY_MCP_ALLOW_ANY_PATH"``. security.py,
+         windbg_tools.py, pdb_fetcher.py and remote.py all bind their variable
+         names this way and then pass the constant, so the literal never
+         appears at the call site;
+      4. the elements of a literal sequence a ``for`` loop iterates --
+         ``for var in ("GHIDRA_HOME", "GHIDRA_INSTALL_DIR")``, which is how
+         GhidraRunner checks an alias chain.
+
+    A bare uppercase string is deliberately NOT enough. ``ErrorCode`` members
+    in src/utils/structured_errors.py are spelled exactly like environment
+    variables (``WINDBG_NOT_FOUND = "WINDBG_NOT_FOUND"``), and treating those
+    as settings would fill this test with findings that are not variables at
+    all.
+    """
+    found: dict[str, list[Path]] = {}
+
+    def record(name: object, path: Path) -> None:
+        if isinstance(name, str) and name.isupper() and name.startswith(PROJECT_ENV_PREFIXES):
+            found.setdefault(name, []).append(path)
+
+    for path in _iter_python_sources():
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except SyntaxError:
+            continue  # Jython 2.7 analysis scripts are not Python 3
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Subscript):
+                base = _subscript_base_name(node.value)
+                if base in ("environ", "env") and isinstance(node.slice, ast.Constant):
+                    record(node.slice.value, path)
+            elif isinstance(node, ast.Call):
+                func = node.func
+                name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+                is_env_read = name in _ENV_READ_FUNCS or (
+                    name == "get"
+                    and isinstance(func, ast.Attribute)
+                    and _subscript_base_name(func.value) == "environ"
+                )
+                if is_env_read and node.args and isinstance(node.args[0], ast.Constant):
+                    record(node.args[0].value, path)
+            elif isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and "ENV" in target.id.upper():
+                        record(node.value.value, path)
+            elif isinstance(node, ast.For) and isinstance(node.iter, (ast.Tuple, ast.List)):
+                for element in node.iter.elts:
+                    if isinstance(element, ast.Constant):
+                        record(element.value, path)
+
+    return found
+
+
+def test_no_config_key_is_dead():
+    """Every key in CONFIG_KEYS is read by something outside config.py.
+
+    This is the test X64DBG_BRIDGE_URL would have failed for its whole life.
+    """
+    from src.utils.config import CONFIG_KEYS
+
+    config_py = SRC / "utils" / "config.py"
+    readers = {
+        name: [p for p in paths if p != config_py]
+        for name, paths in _project_env_literals().items()
+    }
+    dead = sorted(key for key in CONFIG_KEYS if not readers.get(key))
+    assert not dead, (
+        f"CONFIG_KEYS advertises {dead}, but no module outside config.py "
+        f"mentions them. Either wire the key up or remove it -- a key the "
+        f"server acknowledges and ignores is worse than one it never offered."
+    )
+
+
+def test_no_operator_facing_env_var_is_undocumented():
+    """Every project env var read by src/ is in CONFIG_KEYS or named internal.
+
+    The counterpart to the test above. Without it, a new setting (the transport
+    and remote keys are the current example) can be read by the code and
+    documented nowhere, which is how CONFIG_KEYS fell behind in the first
+    place.
+    """
+    from src.utils.config import CONFIG_KEYS
+
+    undocumented = sorted(
+        name
+        for name in _project_env_literals()
+        if name not in CONFIG_KEYS and name not in INTERNAL_ENV_VARS
+    )
+    assert not undocumented, (
+        f"src/ reads {undocumented}, which appear in neither CONFIG_KEYS nor "
+        f"INTERNAL_ENV_VARS. Add operator-facing keys to CONFIG_KEYS (and to "
+        f"docs/configuration.md), or list them as internal here with a reason."
+    )
+
+
+def test_configuration_doc_documents_the_transport_keys():
+    """The HTTP transport's controls are reachable from the configuration reference.
+
+    Pinned separately from the generic check above because these are the keys
+    that decide whether this server is reachable from the network. An operator
+    who cannot find them cannot turn them on correctly -- and the fail-closed
+    policy means they will be refused rather than silently exposed, which only
+    helps if the refusal points somewhere.
+    """
+    config_text = CONFIG_DOC.read_text(encoding="utf-8")
+    for var in (
+        "BINARY_MCP_TRANSPORT",
+        "BINARY_MCP_HTTP_HOST",
+        "BINARY_MCP_HTTP_TOKEN",
+        "BINARY_MCP_REMOTE_ALLOW",
+        "BINARY_MCP_REMOTE_TLS_CERT",
+        "BINARY_MCP_REMOTE_TLS_CA",
+        "BINARY_MCP_REMOTE_CLIENT_ALLOWLIST",
+    ):
+        assert var in config_text, f"docs/configuration.md no longer documents {var}"
+
+
+def test_security_doc_covers_the_http_transport():
+    """docs/security.md must state what the HTTP transport exposes.
+
+    The rest of that file was written for a server reachable only as a
+    subprocess of its own client. A transport that accepts network connections
+    changes the threat model, so the page has to say so.
+    """
+    security_text = SECURITY_DOC.read_text(encoding="utf-8")
+    assert "BINARY_MCP_TRANSPORT" in security_text, (
+        "docs/security.md does not mention the HTTP transport, which is the one "
+        "setting that makes this server reachable from another host"
+    )
+    assert "BINARY_MCP_REMOTE_ALLOW" in security_text, (
+        "docs/security.md does not name the opt-in required for a non-loopback bind"
+    )
+
+
+def test_stdio_is_still_the_default_transport():
+    """The default must stay stdio: no listener unless asked for.
+
+    Pinned against the code, not the docs, because this is the claim the
+    security model rests on.
+    """
+    import src.utils.remote as remote
+
+    assert remote.resolve_transport_config.__module__ == "src.utils.remote"
+    # Resolved with the transport variable absent from the environment.
+    import os
+
+    saved = os.environ.pop(remote.ENV_TRANSPORT, None)
+    try:
+        import src.utils.config as config_module
+
+        saved_cache, saved_loaded = config_module._config_cache, config_module._env_loaded
+        config_module._config_cache, config_module._env_loaded = {}, True
+        try:
+            assert remote.resolve_transport_config().transport == "stdio"
+        finally:
+            config_module._config_cache = saved_cache
+            config_module._env_loaded = saved_loaded
+    finally:
+        if saved is not None:
+            os.environ[remote.ENV_TRANSPORT] = saved
+
+
+def test_http_transport_is_gated_in_the_server_entry_point():
+    """src/server.py must route the http transport through RemoteAccessGate.
+
+    AST-based because importing src.server needs a Ghidra installation. The
+    failure this guards against is a plain ``app.run(transport="http", ...)``
+    added later: it would serve the full tool roster to anyone who can reach
+    the port, with no token, Host check or client allowlist.
+    """
+    tree = ast.parse(SERVER_PY.read_text(encoding="utf-8"))
+    http_runs = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and any(
+            kw.arg == "transport"
+            and isinstance(kw.value, ast.Constant)
+            and kw.value.value in ("http", "streamable-http", "sse")
+            for kw in node.keywords
+        )
+    ]
+    assert http_runs, "src/server.py no longer starts an HTTP transport at all"
+    for call in http_runs:
+        middleware = [kw for kw in call.keywords if kw.arg == "middleware"]
+        assert middleware, (
+            "an HTTP transport is started in src/server.py without a middleware "
+            "argument, so RemoteAccessGate is not in front of it"
+        )
+        assert "RemoteAccessGate" in ast.dump(middleware[0].value), (
+            "the HTTP transport's middleware does not include RemoteAccessGate"
+        )

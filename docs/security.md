@@ -76,6 +76,60 @@ defaults to `microsoft` (only binaries whose version info names Microsoft). Set
 it to `never` for samples you do not want disclosed, or set
 `BINARY_MCP_SYMBOL_OFFLINE=1` to serve only from the local cache.
 
+## The HTTP transport
+
+By default this server speaks `stdio`: the MCP client spawns it as a
+subprocess and the transport is a pair of pipes. Nothing listens, so nothing on
+the network can reach it, and the rest of this page was written for that shape.
+
+`BINARY_MCP_TRANSPORT=http` changes that shape. The server becomes a listener,
+and a client that reaches it can drive every tool in the roster — including
+debuggee memory writes, register writes and breakpoints. Treat the bearer token
+as equivalent to a debugger session on that host.
+
+What the code enforces, pinned by `tests/test_remote_policy.py`:
+
+- **Loopback by default.** `BINARY_MCP_HTTP_HOST` defaults to `127.0.0.1`.
+- **A wildcard bind is always refused.** `0.0.0.0`, `::` and `*` are rejected
+  outright, with or without the opt-in. "Reachable from every interface" must
+  not be something you can arrive at by typo; name the interface instead.
+- **A non-loopback bind needs three things, all of them.** The opt-in
+  `BINARY_MCP_REMOTE_ALLOW`, a TLS certificate and key
+  (`BINARY_MCP_REMOTE_TLS_CERT` / `_KEY`), and an explicitly set
+  `BINARY_MCP_HTTP_TOKEN`. Missing any one is a refusal to start, naming the
+  variable. The token is required rather than generated because a generated
+  token changes on restart and would silently break the client on the other
+  host.
+- **A token is always required, loopback included**, because any local process
+  can reach a loopback listener. On loopback it is generated and logged once
+  per start if you do not set one.
+- **`Host` and `Origin` are validated** against the bind address plus anything
+  in `BINARY_MCP_HTTP_ALLOWED_HOSTS`. This is the DNS-rebinding control: a
+  browser on any host that can resolve a name to this address would otherwise
+  be able to drive the server through a page you never visited. There is
+  deliberately no CORS support — an `Access-Control-Allow-Origin` header here
+  would undo the check.
+- **Optional client-address allowlist.** `BINARY_MCP_REMOTE_CLIENT_ALLOWLIST`
+  takes addresses and CIDRs, checked before authentication, so a client outside
+  it never gets to present a credential.
+- **Optional mutual TLS.** Setting `BINARY_MCP_REMOTE_TLS_CA` requires a client
+  certificate that CA signed, enforced at the TLS layer. This is the control
+  worth having on a LAN listener: a stolen token alone is then not enough.
+
+What it does *not* do: there is no rate limiting, no audit log of refused
+requests beyond the server log, and no revocation short of restarting with a
+new token. The transport also trusts the peer address the socket reports, so
+it must not be placed behind a reverse proxy without re-thinking the
+allowlist — `X-Forwarded-For` is not consulted.
+
+Path confinement matters *more* in this mode, not less: the server now shares a
+filesystem with the sample it is analysing. See
+[file access](#file-access-is-confined-by-default) and set
+`BINARY_MCP_ALLOWED_DIRS` deliberately.
+
+See [Remote access](remote-access.md) for the setup, and
+[Configuration](configuration.md#transport) for every key.
+
 ## Tightening the defaults
 
 The keys below are documented in full in [Configuration](configuration.md).
@@ -88,6 +142,8 @@ The keys below are documented in full in [Configuration](configuration.md).
 | `BINARY_MCP_ENABLE_RAW_WINDBG` | Enable `windbg_execute_command` behind its allowlist |
 | `BINARY_MCP_SYMBOL_OFFLINE` | Never contact the upstream symbol server |
 | `BINARY_MCP_AUTO_PDB` | Whether a first import fetches a PDB at all |
+| `BINARY_MCP_TRANSPORT` | `stdio` (default, no listener) or `http` |
+| `BINARY_MCP_REMOTE_ALLOW` | Required before the HTTP transport may bind off loopback |
 
 ## Installer integrity
 

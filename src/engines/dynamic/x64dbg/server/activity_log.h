@@ -231,7 +231,13 @@ inline unsigned long long NowMs() {
 }
 
 // Open a new per-run log beside the executable. exeDir must end in a slash.
-inline bool Init(const std::string& exeDir, const char* version, int port) {
+//
+// ``listener`` is the resolved bind address and TLS mode, so a log can be tied
+// to the listener that produced it. Without it a log from a LAN-exposed,
+// mutual-TLS run reads identically to one from the loopback default -- which is
+// the single most important thing to know when reading one after the fact.
+inline bool Init(const std::string& exeDir, const char* version, int port,
+                 const char* listener) {
     std::string logDir = exeDir + "logs\\";
     if (!CreateDirectoryA(logDir.c_str(), nullptr)) {
         if (GetLastError() != ERROR_ALREADY_EXISTS) {
@@ -263,6 +269,7 @@ inline bool Init(const std::string& exeDir, const char* version, int port) {
         .Str("version", version)
         .Num("pid", static_cast<long long>(pid))
         .Num("port", port)
+        .Str("listener", listener ? listener : "")
         .Bool("bodies_logged", BodiesEnabled());
     return true;
 }

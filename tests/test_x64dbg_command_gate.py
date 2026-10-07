@@ -554,23 +554,51 @@ def test_oversized_or_slow_requests_are_rejected_before_the_handler():
     assert '408, "Request Timeout"' in source
     assert '431, "Request Header Fields Too Large"' in source
 
-    # The reject path must not fall through into HandleHTTPRequest.
+    # The reject path must not fall through into HandleHTTPRequest. The send
+    # now goes through Connection, which routes to SendAll for a plaintext
+    # connection and to the TLS channel otherwise -- see test_response_send_is_looped
+    # for the loop guarantee on both.
     assert re.search(
-        r"if\s*\(!earlyReject\.empty\(\)\)\s*\{[^}]*SendAll\(", source, re.S
+        r"if\s*\(!earlyReject\.empty\(\)\)\s*\{[^}]*conn\.Send\(", source, re.S
     )
 
 
 def test_response_send_is_looped():
-    """A short send() used to truncate large responses and hang the client."""
+    """A short send() used to truncate large responses and hang the client.
+
+    Responses now leave through Connection::Send, which has two
+    implementations, so the loop has to hold in both: SendAll for a plaintext
+    connection and Tls::Channel::SendRaw for a TLS one. A looping plaintext
+    path and a single-shot TLS path would reintroduce the exact truncation this
+    test was written for, only on the transport nobody tests by hand.
+    """
     code = _strip_comments(_main_source())
     assert "static bool SendAll(SOCKET sock, const char* data, size_t length)" in code
-    assert "SendAll(clientSocket, response.c_str(), response.size())" in code
+    assert "conn.Send(response.c_str(), response.size())" in code
     # The unlooped call is gone.
     assert "send(clientSocket, response.c_str()" not in code
+
     # SendAll must actually loop rather than wrap a single send().
     body = _function_body(code, "static bool SendAll(", until="\n}\n")
     assert re.search(r"while\s*\(\s*sent\s*<\s*length\s*\)", body)
     assert "sent += (size_t)written;" in body
+
+    # Connection::Send must route to it, not call send() itself.
+    connection = _function_body(code, "    bool Send(const char* data, size_t length)",
+                                until="\n    }\n")
+    assert "SendAll(m_socket, data, length)" in connection
+    assert "m_tls->Write(data, length)" in connection
+
+    # And the TLS side loops too.
+    tls = _strip_comments(
+        (
+            REPO_ROOT / "src" / "engines" / "dynamic" / "x64dbg" / "server"
+            / "schannel_tls.h"
+        ).read_text(encoding="utf-8")
+    )
+    tls_body = _function_body(tls, "    bool SendRaw(const char* data, size_t length)",
+                              until="\n    }\n")
+    assert re.search(r"while\s*\(\s*sent\s*<\s*length\s*\)", tls_body)
 
 
 # - F-20: abortable waits and a safe unload

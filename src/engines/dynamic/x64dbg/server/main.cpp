@@ -12,6 +12,8 @@
 #include <cstring>  // for strrchr
 #include "../pipe_protocol.h"
 #include "activity_log.h"
+#include "listener_policy.h"
+#include "schannel_tls.h"
 
 // Reported in the activity log's server.start event so a log can be tied to
 // the build that produced it.
@@ -24,6 +26,12 @@ static std::string g_authToken;
 // events with it. Safe as a plain global: the server handles one connection at
 // a time in its accept loop. Zero means "no request in flight".
 static unsigned long long g_currentRequestId = 0;
+
+// The validated listener configuration, resolved once in main() before
+// anything binds. A plain global for the same reason g_currentRequestId is one:
+// the server handles a single connection at a time in its accept loop, so there
+// is no concurrent reader to synchronise with. Read-only after start-up.
+static Listener::Options g_listener;
 
 // Log file handle for diagnostics (server runs without console window)
 static FILE* g_logFile = nullptr;
@@ -537,7 +545,11 @@ std::string BuildHTTPResponse(int statusCode, const std::string& statusText,
     std::string response = "HTTP/1.1 " + std::to_string(statusCode) + " " + statusText + "\r\n";
     response += "Content-Type: " + contentType + "\r\n";
     response += "Content-Length: " + std::to_string(body.size()) + "\r\n";
-    response += "Access-Control-Allow-Origin: *\r\n";
+    // No Access-Control-Allow-Origin. There is no browser client for this API,
+    // so the wildcard that used to be here granted nothing legitimate -- while
+    // inviting exactly the cross-origin access HostAllowed now refuses. It was
+    // on every response including the 401, and would have become reachable the
+    // moment someone added Access-Control-Allow-Headers to the preflight.
     response += "Connection: close\r\n";
     response += "\r\n";
     response += body;
@@ -574,8 +586,57 @@ static std::string HandleHTTPRequestInner(const std::string& request) {
 
     Log("HTTP %s %s", method.c_str(), path.c_str());
 
-    // Validate authentication (except for OPTIONS preflight)
-    if (method != "OPTIONS" && !ValidateAuthHeader(request)) {
+    // Host and Origin BEFORE the token, cheapest and least secret-dependent
+    // first -- the same order the Python gate uses. This is the DNS-rebinding
+    // control: a browser on any host that can resolve a name to this address
+    // would otherwise be able to drive the debugger through a page the operator
+    // never visited. A missing Host is allowed through to the token check
+    // (HTTP/2 clients send :authority instead); a present one must match.
+    // A duplicate Host is refused rather than resolved. See
+    // Listener::CountHeaderOccurrences for why: in the supported deployment
+    // where a TLS terminator fronts a loopback listener, a gate that decides on
+    // the first value while the proxy decided on the last is a gate that can be
+    // walked past.
+    if (Listener::CountHeaderOccurrences(request, "Host") > 1 ||
+        Listener::CountHeaderOccurrences(request, "Origin") > 1) {
+        Log("Rejecting request with a duplicated Host or Origin header");
+        ActivityLog::Event("header.duplicated")
+            .Num("id", static_cast<long long>(reqId));
+        return BuildHTTPResponse(400, "Bad Request", "application/json",
+                                 "{\"error\":\"Duplicate Host or Origin header\"}");
+    }
+
+    std::string hostHeader;
+    if (FindHeaderValue(request, "Host", hostHeader) &&
+        !Listener::HostAllowed(g_listener, hostHeader)) {
+        Log("Rejecting request for Host '%s': not an address this listener "
+            "answers for (add it with --allow-host)", hostHeader.c_str());
+        ActivityLog::Event("host.rejected")
+            .Num("id", static_cast<long long>(reqId))
+            .Str("host", hostHeader);
+        // The body says only what was refused: echoing the Host back would turn
+        // a denial into an oracle.
+        return BuildHTTPResponse(400, "Bad Request", "application/json",
+                                 "{\"error\":\"Host not allowed\"}");
+    }
+
+    std::string originHeader;
+    if (FindHeaderValue(request, "Origin", originHeader)) {
+        const std::string origin = Listener::StripOrigin(originHeader);
+        if (!Listener::HostAllowed(g_listener, origin)) {
+            Log("Rejecting cross-origin request (Origin '%s')", originHeader.c_str());
+            ActivityLog::Event("origin.rejected")
+                .Num("id", static_cast<long long>(reqId))
+                .Str("origin", originHeader);
+            return BuildHTTPResponse(400, "Bad Request", "application/json",
+                                     "{\"error\":\"Origin not allowed\"}");
+        }
+    }
+
+    // Validate authentication. OPTIONS used to be exempt, to serve a CORS
+    // preflight; with CORS gone there is no preflight to serve and no reason
+    // for an unauthenticated method.
+    if (!ValidateAuthHeader(request)) {
         Log("Authentication failed for %s %s", method.c_str(), path.c_str());
         ActivityLog::Event("auth.failed")
             .Num("id", static_cast<long long>(reqId))
@@ -589,17 +650,6 @@ static std::string HandleHTTPRequestInner(const std::string& request) {
         // auth problem needs.
         return BuildHTTPResponse(401, "Unauthorized", "application/json",
                                 "{\"error\":\"Invalid or missing authentication token\"}");
-    }
-
-    // Handle OPTIONS (CORS preflight)
-    if (method == "OPTIONS") {
-        std::string response = "HTTP/1.1 200 OK\r\n";
-        response += "Access-Control-Allow-Origin: *\r\n";
-        response += "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n";
-        response += "Access-Control-Allow-Headers: Content-Type\r\n";
-        response += "Connection: close\r\n";
-        response += "\r\n";
-        return response;
     }
 
     // Handle GET /health
@@ -877,8 +927,65 @@ std::string HandleHTTPRequest(const std::string& request) {
     return response;
 }
 
-bool StartHTTPServer(int port) {
-    Log("Starting HTTP server on port %d...", port);
+// Format a host-order IPv4 address for a log line.
+//
+// Not inet_ntoa: that is deprecated and trips C4996, which ci.yml promotes to
+// an error. Not InetNtopA either -- it would pull in another header for four
+// integers and a format string.
+static std::string FormatIPv4(uint32_t hostOrder) {
+    char text[16];
+    snprintf(text, sizeof(text), "%u.%u.%u.%u",
+             (hostOrder >> 24) & 0xFFu, (hostOrder >> 16) & 0xFFu,
+             (hostOrder >> 8) & 0xFFu, hostOrder & 0xFFu);
+    return std::string(text);
+}
+
+// One accepted connection, plaintext or TLS.
+//
+// Recv and Send keep recv()/send() semantics exactly -- a positive byte count,
+// 0 for an orderly close, SOCKET_ERROR for a failure -- so the request-reading
+// loop below did not have to change when TLS was added. That loop is the
+// audited one (the F-19 header, body and deadline bounds), and rewriting it to
+// suit a new transport is how those bounds would have been lost.
+class Connection {
+public:
+    Connection(SOCKET socket, Tls::Channel* tls) : m_socket(socket), m_tls(tls) {}
+
+    int Recv(char* buffer, int length) {
+        if (m_tls != nullptr) {
+            return m_tls->Read(buffer, length);
+        }
+        return recv(m_socket, buffer, length, 0);
+    }
+
+    bool Send(const char* data, size_t length) {
+        if (m_tls != nullptr) {
+            return m_tls->Write(data, length);
+        }
+        return SendAll(m_socket, data, length);
+    }
+
+private:
+    SOCKET m_socket;
+    Tls::Channel* m_tls;
+};
+
+bool StartHTTPServer(const Listener::Options& options) {
+    Log("Starting HTTP server: %s", Listener::Describe(options).c_str());
+
+    // TLS credentials BEFORE the socket. A certificate that cannot be used is a
+    // start-up refusal; acquiring it after bind would leave a listening socket
+    // behind on the way out, and on a non-loopback bind would briefly listen
+    // without the TLS that made the bind permissible in the first place.
+    Tls::ServerCredentials credentials;
+    if (options.TlsEnabled()) {
+        if (!credentials.Acquire(options.tlsCertThumbprint, options.machineStore,
+                                 options.MutualTls())) {
+            Log("Refusing to start: TLS was requested but the certificate named by "
+                "--tls-cert-thumbprint could not be used");
+            return false;
+        }
+    }
 
     // Create listening socket
     SOCKET listenSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -895,14 +1002,31 @@ bool StartHTTPServer(int port) {
     u_long mode = 1;
     ioctlsocket(listenSocket, FIONBIO, &mode);
 
-    // Bind to localhost only for security (prevents network exposure)
+    // Bind the address the policy resolved. Loopback unless --bind said
+    // otherwise, and ParseOptions has already refused a wildcard, a
+    // non-loopback bind without TLS, and anything it could not classify.
+    //
+    // The address is built from Listener::ParseIPv4 rather than inet_addr on
+    // purpose: inet_addr accepts forms the policy does not ("0" is 0.0.0.0,
+    // "127.1" is loopback, "0177.0.0.1" is octal), so letting it parse the
+    // string here would mean the thing that classifies the bind and the thing
+    // that performs it could disagree. They now read the same parser.
+    uint32_t bindAddr = 0;
+    if (!Listener::ParseIPv4(options.bind, bindAddr)) {
+        Log("Refusing to bind: '%s' is not a dotted-quad IPv4 address",
+            options.bind.c_str());
+        closesocket(listenSocket);
+        return false;
+    }
+
     sockaddr_in serverAddr = {};
     serverAddr.sin_family = AF_INET;
-    serverAddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);  // 127.0.0.1 only
-    serverAddr.sin_port = htons(port);
+    serverAddr.sin_addr.s_addr = htonl(bindAddr);
+    serverAddr.sin_port = htons(static_cast<unsigned short>(options.port));
 
     if (bind(listenSocket, (sockaddr*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR) {
-        Log("Failed to bind to port %d: %d", port, WSAGetLastError());
+        Log("Failed to bind to %s:%d: %d", options.bind.c_str(), options.port,
+            WSAGetLastError());
         closesocket(listenSocket);
         return false;
     }
@@ -914,7 +1038,7 @@ bool StartHTTPServer(int port) {
         return false;
     }
 
-    Log("HTTP server listening on http://127.0.0.1:%d", port);
+    Log("HTTP server listening on %s", Listener::Describe(options).c_str());
     Log("Press Ctrl+C to stop server");
 
     // Accept and handle connections
@@ -955,6 +1079,19 @@ bool StartHTTPServer(int port) {
             continue;
         }
 
+        // The client allowlist is checked HERE: before the TLS handshake, before
+        // a single byte of HTTP is parsed, and before the token is compared. A
+        // peer outside it costs one accept and one close, and never reaches any
+        // of this server's parsing surface.
+        const uint32_t peerAddr = ntohl(clientAddr.sin_addr.s_addr);
+        if (!Listener::ClientAllowed(options, peerAddr)) {
+            const std::string peer = FormatIPv4(peerAddr);
+            Log("Refusing connection from %s: not in --allow-client", peer.c_str());
+            ActivityLog::Event("client.rejected").Str("peer", peer);
+            closesocket(clientSocket);
+            continue;
+        }
+
         // Set client socket to blocking mode
         mode = 0;
         ioctlsocket(clientSocket, FIONBIO, &mode);
@@ -966,6 +1103,24 @@ bool StartHTTPServer(int port) {
         // Set send timeout (5 seconds)
         int sendTimeout = 5000;
         setsockopt(clientSocket, SOL_SOCKET, SO_SNDTIMEO, (const char*)&sendTimeout, sizeof(sendTimeout));
+
+        // TLS, when configured, before any HTTP exists. The channel is declared
+        // unconditionally and costs nothing unused -- it reserves its buffers in
+        // Handshake, not in its constructor -- which keeps it alive for exactly
+        // the scope the connection is handled in.
+        Tls::Channel tlsChannel(clientSocket);
+        Tls::Channel* tls = nullptr;
+        if (options.TlsEnabled()) {
+            if (!tlsChannel.Handshake(credentials, options.MutualTls(),
+                                      options.tlsClientCaThumbprint)) {
+                ActivityLog::Event("tls.handshake_failed")
+                    .Str("peer", FormatIPv4(peerAddr));
+                closesocket(clientSocket);
+                continue;
+            }
+            tls = &tlsChannel;
+        }
+        Connection conn(clientSocket, tls);
 
         // Read HTTP request - loop until we have the full body.
         // See the F-19 block above for what each bound here is defending.
@@ -996,7 +1151,7 @@ bool StartHTTPServer(int port) {
                     break;
                 }
 
-                int bytesRead = recv(clientSocket, buffer, sizeof(buffer), 0);
+                int bytesRead = conn.Recv(buffer, sizeof(buffer));
                 if (bytesRead == 0) {
                     break;  // peer closed; request stays incomplete and is dropped
                 }
@@ -1037,7 +1192,7 @@ bool StartHTTPServer(int port) {
 
                         size_t remaining = contentLength - (request.size() - bodyStart);
                         int want = (remaining < sizeof(buffer)) ? (int)remaining : (int)sizeof(buffer);
-                        int bytesRead = recv(clientSocket, buffer, want, 0);
+                        int bytesRead = conn.Recv(buffer, want);
                         if (bytesRead == 0) {
                             break;  // peer closed mid-body
                         }
@@ -1054,13 +1209,18 @@ bool StartHTTPServer(int port) {
         if (!earlyReject.empty()) {
             // Rejected before authentication and before any parsing of the
             // request. Answer, then close -- never fall through to the handler.
-            SendAll(clientSocket, earlyReject.c_str(), earlyReject.size());
+            conn.Send(earlyReject.c_str(), earlyReject.size());
         } else if (!request.empty()) {
             // Handle request and send response
             std::string response = HandleHTTPRequest(request);
-            SendAll(clientSocket, response.c_str(), response.size());
+            conn.Send(response.c_str(), response.size());
         }
 
+        if (tls != nullptr) {
+            // close_notify, so the peer sees a clean shutdown rather than a
+            // truncation it is right to treat as an attack.
+            tlsChannel.Shutdown();
+        }
         closesocket(clientSocket);
     }
 
@@ -1072,17 +1232,32 @@ int main(int argc, char* argv[]) {
     // Initialize file-based logging (persists even if console is unavailable)
     InitLogging();
 
-    // Parse command line arguments
-    int port = 8765;  // Default port
-    if (argc > 1) {
-        port = atoi(argv[1]);
+    // The listener policy decides everything about where this binds, and it
+    // decides it BEFORE the activity log is opened, Winsock starts or the pipe
+    // is dialled. A refused configuration must cost nothing and leave nothing
+    // behind: there is no point creating a log directory on the way out.
+    //
+    // Exit code 2, not 1: the plugin distinguishes "the server could not be
+    // configured" (a flag it passed is wrong, and retrying will not help) from
+    // "the server ran and stopped" (exit 1), which it already reports as a pipe
+    // or port problem.
+    std::string optionError;
+    if (!Listener::ParseOptions(argc, argv, g_listener, optionError)) {
+        Log("Refusing to start: %s", optionError.c_str());
+        Log("%s", Listener::UsageText());
+        if (g_logFile) fclose(g_logFile);
+        return 2;
     }
 
     // Opened before anything that can fail, so a start-up failure is itself
-    // recorded rather than leaving an empty folder.
-    ActivityLog::Init(g_exeDir, OBSIDIAN_SERVER_VERSION, port);
+    // recorded rather than leaving an empty folder. The listener description
+    // goes into server.start so a log can be tied to the configuration that
+    // produced it -- a LAN-exposed run must not read like the loopback default.
+    const std::string listenerDescription = Listener::Describe(g_listener);
+    ActivityLog::Init(g_exeDir, OBSIDIAN_SERVER_VERSION, g_listener.port,
+                      listenerDescription.c_str());
 
-    Log("Obsidian HTTP Server starting...");
+    Log("Obsidian HTTP Server starting: %s", listenerDescription.c_str());
 
     // Initialize Winsock
     WSADATA wsaData;
@@ -1114,11 +1289,11 @@ int main(int argc, char* argv[]) {
     }
 
     // Start HTTP server
-    Log("Starting HTTP server on port %d...", port);
-    bool success = StartHTTPServer(port);
+    bool success = StartHTTPServer(g_listener);
 
     if (!success) {
-        Log("HTTP server failed to start - check if port %d is already in use", port);
+        Log("HTTP server failed to start - check whether %s:%d is already in use",
+            g_listener.bind.c_str(), g_listener.port);
     }
 
     // Cleanup

@@ -5287,11 +5287,132 @@ static bool SpawnHTTPServer() {
         return false;
     }
 
-    LogInfo("Spawning Obsidian server: %s", serverPath);
+    // Listener configuration comes from obsidian.ini beside the plugin.
+    //
+    // An ini read with GetPrivateProfileString rather than x64dbg's
+    // BridgeSettingGet: it is plain Win32 with no SDK surface to track, the
+    // operator can edit it without x64dbg's settings dialog, and install.ps1
+    // can write it during a -RemoteListener setup. It sits next to the server
+    // executable and its log, which is where someone looking for it will look.
+    //
+    // Absent or empty, every value defaults to what this plugin has always
+    // spawned: loopback, port 8765, no TLS. The server's own policy
+    // (server/listener_policy.h) is what refuses an unsafe combination; this
+    // only forwards.
+    char iniPath[MAX_PATH];
+    snprintf(iniPath, sizeof(iniPath), "%sobsidian.ini", pluginPath);
 
-    // Build command line (lpCommandLine must be writable per MSDN)
-    char cmdLine[MAX_PATH + 2];
-    snprintf(cmdLine, sizeof(cmdLine), "\"%s\"", serverPath);
+    std::string arguments;
+    bool iniRejected = false;
+
+    // Each ini value is passed on a command line, so it is restricted to the
+    // characters its flag can legitimately contain. The server validates
+    // thumbprints and addresses properly, but it validates them AFTER the
+    // command line has been split -- a value carrying a quote or a space could
+    // smuggle a second flag past the one being set. Refusing the whole ini is
+    // the right answer: a listener configured differently from how it was
+    // written is worse than one that does not start.
+    const auto readSetting = [&](const char* key, std::string& out) -> bool {
+        char buffer[512] = {};
+        const DWORD length = GetPrivateProfileStringA("listener", key, "", buffer,
+                                                      sizeof(buffer), iniPath);
+        out.assign(buffer, length);
+
+        // Trim before the character check, not after. GetPrivateProfileString
+        // is not consistent about trailing whitespace across Windows versions,
+        // and a value that came back as "192.168.1.50 " would otherwise fail
+        // the space check below -- refusing the whole ini over a trailing blank
+        // the operator cannot see.
+        size_t begin = 0;
+        size_t end = out.size();
+        while (begin < end && (out[begin] == ' ' || out[begin] == '\t')) begin++;
+        while (end > begin && (out[end - 1] == ' ' || out[end - 1] == '\t' ||
+                               out[end - 1] == '\r' || out[end - 1] == '\n')) end--;
+        out = out.substr(begin, end - begin);
+
+        for (size_t i = 0; i < out.size(); i++) {
+            const char c = out[i];
+            const bool safe = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                              (c >= '0' && c <= '9') || c == '.' || c == '-' ||
+                              c == '_' || c == '/' || c == ':';
+            if (!safe) {
+                LogError("obsidian.ini: [listener] %s contains an unexpected "
+                         "character; refusing the whole file", key);
+                iniRejected = true;
+                out.clear();
+                return false;
+            }
+        }
+        return !out.empty();
+    };
+
+    std::string bindAddress;
+    std::string port;
+    std::string certThumbprint;
+    std::string clientCaThumbprint;
+    std::string allowClients;
+    std::string allowHosts;
+
+    const bool haveBind = readSetting("bind", bindAddress);
+    const bool havePort = readSetting("port", port);
+    const bool haveCert = readSetting("tls_cert_thumbprint", certThumbprint);
+    const bool haveClientCa = readSetting("tls_client_ca_thumbprint", clientCaThumbprint);
+    const bool haveClients = readSetting("allow_clients", allowClients);
+    const bool haveHosts = readSetting("allow_hosts", allowHosts);
+    const bool machineStore =
+        GetPrivateProfileIntA("listener", "machine_store", 0, iniPath) != 0;
+
+    if (iniRejected) {
+        LogError("Not spawning the server: obsidian.ini is malformed. Fix or "
+                 "delete %s; deleting it restores the loopback default.", iniPath);
+        return false;
+    }
+
+    if (haveBind) arguments += " --bind " + bindAddress;
+    if (havePort) arguments += " --port " + port;
+    if (haveCert) arguments += " --tls-cert-thumbprint " + certThumbprint;
+    if (haveClientCa) arguments += " --tls-client-ca-thumbprint " + clientCaThumbprint;
+    if (machineStore) arguments += " --machine-store";
+
+    // Comma-separated in the ini, one flag each on the command line.
+    const auto appendList = [&](const std::string& list, const char* flag) {
+        size_t start = 0;
+        while (start <= list.size()) {
+            const size_t comma = list.find(',', start);
+            const size_t end = (comma == std::string::npos) ? list.size() : comma;
+            const std::string item = list.substr(start, end - start);
+            if (!item.empty()) {
+                arguments += std::string(" ") + flag + " " + item;
+            }
+            if (comma == std::string::npos) break;
+            start = comma + 1;
+        }
+    };
+    if (haveClients) appendList(allowClients, "--allow-client");
+    if (haveHosts) appendList(allowHosts, "--allow-host");
+
+    LogInfo("Spawning Obsidian server: %s", serverPath);
+    // The effective listener, in the x64dbg log, at startup. Whether this
+    // instance is reachable from the network is the one thing an analyst should
+    // be able to see at a glance rather than infer from an ini.
+    if (arguments.empty()) {
+        LogInfo("Listener: 127.0.0.1:8765, no TLS (default; no obsidian.ini settings)");
+    } else {
+        LogInfo("Listener options from obsidian.ini:%s", arguments.c_str());
+        if (haveBind && bindAddress != "127.0.0.1") {
+            LogInfo("NOTE: this listener is configured for %s -- it may be "
+                    "reachable from the network.", bindAddress.c_str());
+        }
+    }
+
+    // Build command line (lpCommandLine must be writable per MSDN).
+    // A std::vector, not a fixed char[MAX_PATH + 2]: the path plus two
+    // thumbprints and an allowlist is comfortably past MAX_PATH, and snprintf
+    // would have silently truncated the flags -- producing a listener
+    // configured differently from how it was asked to be.
+    const std::string commandLine = "\"" + std::string(serverPath) + "\"" + arguments;
+    std::vector<char> cmdLine(commandLine.begin(), commandLine.end());
+    cmdLine.push_back('\0');
 
     // Spawn process
     STARTUPINFOA si = {};
@@ -5300,7 +5421,7 @@ static bool SpawnHTTPServer() {
 
     if (!CreateProcessA(
         nullptr,       // lpApplicationName: NULL so lpCommandLine is used
-        cmdLine,       // Command line (writable buffer, quoted for spaces)
+        cmdLine.data(),  // Command line (writable buffer, quoted for spaces)
         nullptr,       // Process attributes
         nullptr,       // Thread attributes
         FALSE,         // Inherit handles
@@ -5347,7 +5468,14 @@ static bool SpawnHTTPServer() {
         } else if (exitCode == 0xC0000142) {
             LogError("Exit code 0xC0000142: DLL initialization failed");
         } else if (exitCode == 1) {
-            LogError("Server returned error 1 - check: pipe connection, auth token file, or port 8765 in use");
+            LogError("Server returned error 1 - check: pipe connection, auth token file, or the port already in use");
+        } else if (exitCode == 2) {
+            // The server refused its own configuration. Distinguished from
+            // exit 1 because retrying will not help and the pipe is not the
+            // problem: the flags built from obsidian.ini are.
+            LogError("Server refused its listener configuration (exit 2). The "
+                     "reason is in obsidian_server.log; fix [listener] in "
+                     "obsidian.ini, or delete the file for the loopback default.");
         }
         // F-17: the handle that pinned this PID is about to be closed, so the
         // PID may be recycled. Clear it, or the pipe would authorise whatever

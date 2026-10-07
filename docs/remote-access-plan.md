@@ -1,10 +1,9 @@
 # Remote access plan: MCP server and Obsidian plugin across hosts
 
-**Status:** Phases 0, 1 and 2 are implemented. See
-[Remote access](remote-access.md) for the resulting setup. Phases 3, 4 and 5
-are still proposed — notably, the plugin does not serve TLS itself, so the
-direct (untunnelled) x64dbg path needs a TLS terminator on the debugger host
-until Phase 3 lands.
+**Status:** Phases 0 to 3 are implemented. See
+[Remote access](remote-access.md) for the resulting setup. Phase 4 (artifact
+transfer) and Phase 5 (WinDbg user-mode remoting) are still proposed, and two
+items inside Phase 3 were deliberately not done — see the notes under it.
 
 ## The target topology
 
@@ -24,7 +23,7 @@ the work to remove it.
 
 ## Part 1 — Where the same-host assumption lives
 
-### 1.1 The C++ HTTP server binds loopback, unconditionally
+### 1.1 The C++ HTTP server binds loopback, unconditionally — FIXED
 
 `src/engines/dynamic/x64dbg/server/main.cpp:901`
 
@@ -36,7 +35,7 @@ There is no bind-address argument, no environment variable, and no setting
 file. `main()` (`main.cpp:1071-1076`) takes a port from `argv[1]` and defaults
 to 8765 — but the plugin never passes one.
 
-### 1.2 The plugin spawns the server with no arguments
+### 1.2 The plugin spawns the server with no arguments — FIXED
 
 `src/engines/dynamic/x64dbg/plugin/plugin.cpp:5263-5345` (`SpawnHTTPServer`)
 builds the command line as a bare quoted path:
@@ -85,7 +84,7 @@ with a current-user-only DACL (`plugin.cpp:5661-5685`,
 precedence, so a token copied from Host B out-of-band is already accepted on
 Host A with no code change. See Part 2.
 
-### 1.5 No transport security at all
+### 1.5 No transport security at all — FIXED
 
 The wire format is plain HTTP/1.1 with `Authorization: Bearer <64 hex chars>`.
 The token is compared in constant time (`main.cpp:242-281`, `SecureCompare`),
@@ -102,7 +101,7 @@ writes, breakpoints, thread suspend/resume, and the allowlisted command gate.
 `docs/security.md` is careful to say no tool can start a sample — that holds,
 but it was written for a listener only the local user could reach.
 
-### 1.6 The accept loop serves one connection at a time
+### 1.6 The accept loop serves one connection at a time — STILL TRUE, BY DECISION
 
 `main.cpp:920-947`: a single-threaded `select()` loop with a 1-second accept
 timeout, 5-second `SO_RCVTIMEO`/`SO_SNDTIMEO`, a 15-second request deadline
@@ -114,6 +113,27 @@ connection is closed after one request — no keep-alive.
 Over loopback that is fine. Over a LAN it means one round trip per TCP
 handshake for each of the dozens of calls a single tool makes, and one slow
 client blocks every other. The 1 MiB body cap also caps a single memory write.
+
+**Left as it is, deliberately.** Phase 3 said "keep-alive, or a small thread
+pool ... measure before choosing", and measuring needs a Windows host with a
+live plugin, which this work did not have. Choosing anyway would have been a
+guess, and the two candidates do not deserve equal weight:
+
+* A thread pool buys nothing. Every request serialises on the single named pipe
+  to the plugin, and the plugin executes x64dbg API calls on one thread, so
+  concurrency at the HTTP layer only moves the queue.
+* Keep-alive would help, but less than it first appears: Schannel's session
+  cache makes a resumed handshake one round trip with no asymmetric operation,
+  which is most of what a per-request handshake costs. Against that, adding
+  persistent connections to a hand-rolled HTTP parser adds request-smuggling
+  surface — this parser ignores `Transfer-Encoding` entirely, which is harmless
+  when every connection closes after one request and is a framing
+  vulnerability when it does not.
+
+So the trade is a modest latency win for a class of bug this codebase has
+already paid for once (the F-9/F-16 command-splitting work). If a LAN session
+turns out to be visibly slow, the fix is keep-alive *plus* explicit rejection of
+`Transfer-Encoding` and duplicate `Content-Length`, in one change.
 
 ### 1.7 Artifacts: which side of the network a file lands on
 
@@ -351,49 +371,96 @@ Tests: refuses non-loopback bind without the switch; refuses without TLS;
 rejects a missing/wrong token; rejects a mismatched `Host` header; stdio
 remains the default when nothing is set.
 
-### Phase 3 — Topology A: remote Obsidian listener
+### Phase 3 — Topology A: remote Obsidian listener — DONE
 
-**C++ server** (`src/engines/dynamic/x64dbg/server/main.cpp`)
+**Policy** — new, and the reason the rest of this could be verified at all.
+`src/engines/dynamic/x64dbg/server/listener_policy.h` holds every decision as a
+string or integer decision, with no Windows headers, so
+`tests/test_cpp_listener_policy.py` compiles the shipped header with g++ and
+*runs* it. It refuses a wildcard bind with or without TLS, refuses a
+non-loopback bind with no certificate, refuses an address it cannot parse as a
+dotted quad (rather than handing it to `inet_addr`, which accepts `0`, `127.1`
+and `0177.0.0.1` — a classifier that disagrees with the thing performing the
+bind is one that can be walked past), validates thumbprints and ports, and
+parses the client allowlist.
 
-- Accept `--bind <addr>` and `--port <n>`; keep `INADDR_LOOPBACK` as the
-  default when `--bind` is absent. Refuse `0.0.0.0` outright — require a
-  specific interface address, so "expose to the LAN" is never a typo.
-- TLS via **Schannel** (ships with Windows; no new third-party dependency in a
-  binary that gets shipped into analysts' plugin directories). Require a
-  server certificate when bound off-loopback, and support requiring a client
-  certificate (mTLS) — which is the control that actually makes a LAN listener
-  defensible, token or not.
-- A client-address allowlist checked at `accept()` before any parsing.
-- Keep-alive, or a small thread pool, so a LAN round trip per call does not
-  dominate (1.6). Measure before choosing: the per-call cost today is one TCP
-  handshake, and over a LAN that may already be acceptable.
-- Log the bind address and TLS mode into the activity log's `server.start`
-  event (`src/engines/dynamic/x64dbg/server/activity_log.h`).
+**C++ server** (`server/main.cpp`)
 
-**Plugin** (`src/engines/dynamic/x64dbg/plugin/plugin.cpp:5263-5345`)
+- `--bind`, `--port`, `--tls-cert-thumbprint`, `--tls-client-ca-thumbprint`,
+  `--machine-store`, `--allow-client`, `--allow-host`. The legacy positional
+  port still works, because deployed plugins may still pass it.
+- TLS via Schannel (`server/schannel_tls.h`): TLS 1.2 with
+  `SCH_USE_STRONG_CRYPTO`, certificate named by SHA-1 thumbprint from a
+  Windows store, so there is no PEM parser in the process and no new runtime
+  dependency on a binary that gets copied into an analyst's plugins directory.
+  Mutual TLS pins the client chain to one CA thumbprint rather than accepting
+  anything the machine's trust stores would.
+- The client allowlist is checked at `accept()`, before the handshake, before
+  any HTTP is parsed, and before the token is compared.
+- `Host` and `Origin` are validated before the token, and the
+  `Access-Control-Allow-Origin: *` that used to be on every response —
+  including the 401 — is gone. `OPTIONS` is no longer exempt from
+  authentication, there being no preflight left to serve. **This was not in the
+  original plan**; §1.5 named the missing Host check as a finding and it would
+  have been a live rebinding hole the moment the listener left loopback.
+- `server.start` in the activity log carries the resolved listener, so a log
+  from a LAN-exposed mutual-TLS run does not read like one from the loopback
+  default.
+- TLS is introduced behind a `Connection` abstraction whose `Recv`/`Send` keep
+  `recv`/`send` semantics exactly, so the audited request-reading loop (the
+  F-19 header, body and deadline bounds) did not change. Rewriting that loop to
+  suit a new transport is how those bounds would have been lost.
 
-- Read bind address, port and TLS paths from x64dbg's own settings
-  (`BridgeSettingGet`) or an ini beside the plugin, and pass them on the
-  spawned command line. Default unchanged: loopback, 8765, no TLS.
-- Surface the effective listener in the x64dbg log at startup, so an analyst
-  can see at a glance whether this instance is reachable from the network.
+**Plugin** (`plugin/plugin.cpp`)
 
-**Python bridge** — done in Phase 1; nothing left here. The bridge already
-dials an `https` endpoint and verifies it against `X64DBG_TLS_CA`, so when the
-C++ server grows its own listener the Python side needs no change: an operator
-drops the TLS terminator and points `X64DBG_HOST` at the plugin directly.
+- Reads `obsidian.ini` beside the plugin with `GetPrivateProfileString` and
+  forwards the values as flags. An ini rather than `BridgeSettingGet`: plain
+  Win32 with no SDK surface to track, editable without x64dbg's settings
+  dialog, and next to the server executable and its log where someone looking
+  for it will look. Default unchanged — no ini means loopback, 8765, no TLS.
+- Values are restricted to the characters their flag can hold, and a violation
+  refuses the **whole file**. The server validates thumbprints and addresses,
+  but only after the command line has been split; a value carrying a space or a
+  quote could otherwise smuggle a second flag past the one being set.
+- The effective listener goes in the x64dbg log at startup, with an explicit
+  note when the bind is not loopback.
+- Exit code 2 from the server (configuration refused) is reported distinctly
+  from exit 1 (ran and stopped): retrying will not help and the pipe is not the
+  problem.
 
-**Installer / release**
+**Python bridge** — done in Phase 1; nothing left. It already dialled an
+`https` endpoint and verified it against `X64DBG_TLS_CA`, so this phase needed
+no Python change at all: an operator drops the TLS terminator and points
+`X64DBG_HOST` at the plugin.
 
-- `install.ps1`: a `-RemoteListener` mode that configures the plugin's bind
-  settings, generates or installs certificates, and adds the Windows Firewall
-  rule — scoped to the configured client address, not `Any`.
-- `install.py`: a split-host mode that writes a client config for Host A with
-  the `X64DBG_*` remote keys set.
-- `.github/workflows/release.yml:86-211`: the plugin build already produces
-  `obsidian.dp64`/`.dp32`/`obsidian_server.exe`; confirm Schannel adds no new
-  link-time dependency that breaks the digest-verification path in
-  `install.ps1:1288-1366`.
+**Installer / release** — two deviations, both deliberate:
+
+- The planned `install.ps1 -RemoteListener` mode became a documented command
+  sequence in [Remote access](remote-access.md) instead. There is no PowerShell
+  on any runner this work could reach, so the script could not have been
+  syntax-checked, let alone run — and an unverifiable installer that creates
+  certificates and firewall rules is a worse outcome than commands an operator
+  pastes one at a time and sees the result of. The two properties that make the
+  sequence safe rather than merely convenient (`-RemoteAddress` on the firewall
+  rule, never a wildcard bind in an example) are pinned by
+  `tests/test_cpp_listener_policy.py`, as is the correspondence between the
+  documented `[listener]` keys and the ones the plugin actually reads.
+- The planned `install.py` split-host mode is **not done**. It would write a
+  bearer token into a `.env` on the analyst's behalf; the six documented
+  environment variables are clearer, and where a debugger token lands should be
+  a deliberate act. Say so rather than leave it looking forgotten.
+- `release.yml` needs no change: `secur32` and `crypt32` ship with Windows, so
+  the server gains no new link-time artifact and the static-runtime property
+  ("no VC++ Redist required") still holds. The `build-plugin` job in `ci.yml`
+  compiles both architectures with warnings-as-errors on every pull request,
+  which is what will first exercise this C++ for real.
+
+**What is verified, and what is not.** The policy header is compiled and run on
+Linux (~90 decisions). `schannel_tls.h` and the changed `main.cpp` were
+type-checked against stub Windows headers, which catches typos, wrong member
+names and sign defects but cannot catch a misremembered Win32 signature.
+Neither has been executed. The first real test is the CI compile job, which
+runs on a pull request to `main` or `develop` — not on a branch push.
 
 ### Phase 4 — Artifact transfer and path-origin semantics
 

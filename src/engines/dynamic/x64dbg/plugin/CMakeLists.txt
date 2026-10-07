@@ -104,6 +104,8 @@ set(SERVER_SOURCES
 set(SERVER_HEADERS
     ../pipe_protocol.h
     ../server/activity_log.h
+    ../server/listener_policy.h
+    ../server/schannel_tls.h
 )
 
 # Create the server executable
@@ -115,8 +117,25 @@ target_include_directories(obsidian_server PRIVATE
 )
 
 # Link libraries for server
+#
+# secur32 and crypt32 arrive with TLS (../server/schannel_tls.h): secur32 for
+# SSPI (AcquireCredentialsHandle, AcceptSecurityContext, EncryptMessage) and
+# crypt32 for the certificate store and chain checks (CertOpenStore,
+# CertFindCertificateInStore, CertGetCertificateChain). Both ship with Windows,
+# which is the reason Schannel was chosen over a vendored TLS library: the
+# server binary gains no new runtime dependency, so install.ps1's digest
+# verification and the "no VC++ Redist required" static-runtime property below
+# both still hold.
+#
+# Listed explicitly rather than relying on MSVC's default library set, for the
+# same reason advapi32 is listed on the plugin target: a symbol we now call
+# directly should not resolve by accident. The ci.yml build-plugin job compiles
+# both architectures on every pull request, so an unresolved external here
+# fails a PR.
 target_link_libraries(obsidian_server PRIVATE
-    ws2_32  # Windows sockets
+    ws2_32    # Windows sockets
+    secur32   # SSPI / Schannel
+    crypt32   # certificate store and chain validation
 )
 
 # Output name: obsidian_server.exe

@@ -164,10 +164,55 @@ server's listener accepts; the second is the CA that signs the debugger host's
 certificate. Sharing one would make a CA trusted to issue client credentials
 also trusted to impersonate the debugger.
 
-What this does **not** do is give the plugin TLS. `obsidian_server.exe` binds
-`127.0.0.1` and speaks plaintext HTTP, so a non-loopback endpoint only exists
-if something on the debugger host terminates TLS and forwards to that loopback
-port. See [Remote access](remote-access.md#option-2-direct-with-a-tls-terminator).
+### The plugin's own listener
+
+`obsidian_server.exe` enforces the mirror of that policy on its own side,
+configured by an `obsidian.ini` beside the plugin. With no ini it binds
+`127.0.0.1:8765` in plaintext, exactly as it always has.
+
+- **A wildcard bind is refused outright** — `0.0.0.0`, `::`, `*` — with or
+  without TLS.
+- **A non-loopback bind requires a server certificate**
+  (`tls_cert_thumbprint`), named by SHA-1 thumbprint from a Windows
+  certificate store. TLS 1.2 with `SCH_USE_STRONG_CRYPTO`, via Schannel, so the
+  binary gains no new runtime dependency.
+- **An address the policy cannot classify is refused** rather than passed to
+  the OS. `inet_addr` accepts forms the policy does not (`0` is `0.0.0.0`,
+  `127.1` is loopback, `0177.0.0.1` is octal), and a classifier that disagrees
+  with the thing that performs the bind is one that can be walked past. Both
+  now read the same parser.
+- **`Host` and `Origin` are validated** against the bind address plus
+  `allow_hosts`, before the token is compared. The
+  `Access-Control-Allow-Origin: *` header that used to be on every response —
+  including the 401 — is gone; there is no browser client, so it granted
+  nothing legitimate. `OPTIONS` is no longer exempt from authentication,
+  because there is no preflight left to serve.
+- **An optional client allowlist** (`allow_clients`, addresses or CIDRs) is
+  checked at `accept()`: before the TLS handshake, before any HTTP is parsed,
+  and before the token is compared.
+- **Optional mutual TLS** (`tls_client_ca_thumbprint`). Schannel fails the
+  handshake for a client with no certificate, and the server additionally
+  checks the chain against *that* CA rather than against anything in the
+  machine's trust stores.
+- **A malformed `obsidian.ini` is refused whole.** Any value containing a
+  character its flag cannot legitimately hold fails the file, rather than one
+  setting being quietly dropped — a listener configured differently from how it
+  was written is worse than one that does not start.
+
+The decisions above live in `src/engines/dynamic/x64dbg/server/listener_policy.h`,
+which is deliberately free of Windows headers so that
+`tests/test_cpp_listener_policy.py` can compile and run them. The TLS plumbing
+around them (`schannel_tls.h`) can only be compiled, which the `build-plugin`
+job in `.github/workflows/ci.yml` does for both architectures with
+warnings-as-errors on every pull request.
+
+Two things it does not do: there is no keep-alive (every request is one
+connection), and TLS 1.3 is not negotiated — that needs an SSPI credential
+structure this code does not use. A TLS terminator in front of a loopback
+listener remains supported and is the way to get either.
+
+See [Remote access](remote-access.md#option-2-direct-with-the-plugins-own-tls-listener)
+for the setup.
 
 ## Tightening the defaults
 

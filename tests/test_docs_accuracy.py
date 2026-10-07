@@ -680,10 +680,11 @@ INTERNAL_ENV_VARS = {
     "GHIDRA_TARGET_ADDRESSES",
     "GHIDRA_ANALYSIS_BUDGET",
     "GHIDRA_ANALYSIS_DEPTH",
-    # x64dbg plugin -> its own HTTP server process, and the escape hatch the
-    # bridge uses when the token file is on another host. Documented in
-    # docs/remote-access.md as part of a procedure, not as a server setting.
-    "OBSIDIAN_AUTH_TOKEN",
+    # OBSIDIAN_AUTH_TOKEN used to be listed here, as "an escape hatch
+    # documented in a procedure rather than a server setting". It stopped being
+    # that when the endpoint policy made it REQUIRED for a non-loopback
+    # debugger host, so it moved to CONFIG_KEYS. Nothing internal is left in
+    # this direction.
 }
 
 

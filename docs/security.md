@@ -130,6 +130,45 @@ filesystem with the sample it is analysing. See
 See [Remote access](remote-access.md) for the setup, and
 [Configuration](configuration.md#transport) for every key.
 
+## Reaching x64dbg on another host
+
+The section above is about who may drive this server. This one is about what
+this server may drive.
+
+The bridge dials the Obsidian plugin's HTTP API, which grants the same powers
+from the other end: memory read and write, registers, breakpoints, threads. The
+policy mirrors the listener's, and is enforced in the same module:
+
+- **Loopback by default**, and a loopback endpoint needs no opt-in. This is
+  what a tunnel looks like from here, which is why the recommended remote setup
+  requires no configuration beyond a token.
+- **A non-loopback host needs three things, all of them.**
+  `BINARY_MCP_REMOTE_ALLOW`, a CA in `X64DBG_TLS_CA`, and an explicit
+  `OBSIDIAN_AUTH_TOKEN`. Missing any one is a refusal to connect, naming the
+  variable.
+- **There is no plaintext remote path.** The CA is what selects `https`, so a
+  non-loopback endpoint is always TLS. `verify` is set to that CA rather than
+  `True`: the plugin's certificate is one an analyst issued for a lab host, so
+  checking it against the system trust store would be checking the wrong thing.
+- **`0.0.0.0` and `::` are refused** as a destination. They mean "every
+  interface" to a listener and nothing at all to a client.
+- **Optional mutual TLS** via `X64DBG_TLS_CLIENT_CERT` / `_KEY`.
+- **The plugin's token file is only read for a loopback endpoint.** It lives in
+  `%TEMP%` on the host x64dbg runs on, so for a remote endpoint this machine's
+  copy is a different file — reading it would authenticate with the wrong
+  token.
+
+Note that `BINARY_MCP_REMOTE_TLS_CA` and `X64DBG_TLS_CA` are deliberately
+different variables. The first is the CA whose client certificates this
+server's listener accepts; the second is the CA that signs the debugger host's
+certificate. Sharing one would make a CA trusted to issue client credentials
+also trusted to impersonate the debugger.
+
+What this does **not** do is give the plugin TLS. `obsidian_server.exe` binds
+`127.0.0.1` and speaks plaintext HTTP, so a non-loopback endpoint only exists
+if something on the debugger host terminates TLS and forwards to that loopback
+port. See [Remote access](remote-access.md#option-2-direct-with-a-tls-terminator).
+
 ## Tightening the defaults
 
 The keys below are documented in full in [Configuration](configuration.md).
@@ -144,6 +183,7 @@ The keys below are documented in full in [Configuration](configuration.md).
 | `BINARY_MCP_AUTO_PDB` | Whether a first import fetches a PDB at all |
 | `BINARY_MCP_TRANSPORT` | `stdio` (default, no listener) or `http` |
 | `BINARY_MCP_REMOTE_ALLOW` | Required before the HTTP transport may bind off loopback |
+| `X64DBG_TLS_CA` | CA verifying the debugger host's certificate. Required for a non-loopback x64dbg endpoint |
 
 ## Installer integrity
 

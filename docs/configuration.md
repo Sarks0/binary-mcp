@@ -20,9 +20,13 @@ below.
 | `GHIDRA_MAX_FUNCTIONS` | Cap on functions processed per run (0 = unlimited) | 0 |
 | `GHIDRA_SKIP_DECOMPILE` | Structural pass only, no decompilation | Off |
 | `GHIDRA_ENABLE_FID` | Enable Function ID library matching during analysis | Off |
-| `X64DBG_HOST` | Host the Obsidian plugin's HTTP listener is on. Loopback only — the bridge refuses anything else | `127.0.0.1` |
+| `X64DBG_HOST` | Host the Obsidian plugin's HTTP listener is on. A non-loopback host additionally requires `BINARY_MCP_REMOTE_ALLOW`, `X64DBG_TLS_CA` and `OBSIDIAN_AUTH_TOKEN` | `127.0.0.1` |
 | `X64DBG_PORT` | Port that listener is on, matching what `obsidian_server.exe` binds | 8765 |
 | `X64DBG_TIMEOUT` | Timeout for a single x64dbg command, in seconds | 30 |
+| `X64DBG_TLS_CA` | PEM CA bundle that signs the debugger host's certificate. Setting it selects `https`. Required off loopback | Unset |
+| `X64DBG_TLS_CLIENT_CERT` | PEM client certificate to present to the debugger host, for mutual TLS. Requires `X64DBG_TLS_CA` | Unset |
+| `X64DBG_TLS_CLIENT_KEY` | PEM private key for that certificate | Unset |
+| `OBSIDIAN_AUTH_TOKEN` | Bearer token for the plugin's API. Optional on loopback (the bridge reads the plugin's `%TEMP%` token file); **required** off loopback | Unset |
 | `WINDBG_PATH` | WinDbg/CDB installation path | Auto-detected |
 | `WINDBG_TIMEOUT` | Timeout for a single WinDbg command, in seconds | 30 |
 | `WINDBG_DEBUG` | Verbose dbgeng diagnostics | Off |

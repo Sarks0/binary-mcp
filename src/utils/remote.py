@@ -62,12 +62,24 @@ ENV_TLS_KEY = "BINARY_MCP_REMOTE_TLS_KEY"
 ENV_TLS_CA = "BINARY_MCP_REMOTE_TLS_CA"
 ENV_CLIENT_ALLOWLIST = "BINARY_MCP_REMOTE_CLIENT_ALLOWLIST"
 
+# The other direction: the x64dbg Obsidian plugin this server dials.
+ENV_X64DBG_HOST = "X64DBG_HOST"
+ENV_X64DBG_PORT = "X64DBG_PORT"
+ENV_X64DBG_TLS_CA = "X64DBG_TLS_CA"
+ENV_X64DBG_CLIENT_CERT = "X64DBG_TLS_CLIENT_CERT"
+ENV_X64DBG_CLIENT_KEY = "X64DBG_TLS_CLIENT_KEY"
+ENV_OBSIDIAN_TOKEN = "OBSIDIAN_AUTH_TOKEN"
+
 STDIO = "stdio"
 HTTP = "http"
 
 DEFAULT_HTTP_HOST = "127.0.0.1"
 DEFAULT_HTTP_PORT = 8770
 DEFAULT_HTTP_PATH = "/mcp"
+
+# What obsidian_server.exe binds, and the only address it binds today.
+DEFAULT_X64DBG_HOST = "127.0.0.1"
+DEFAULT_X64DBG_PORT = 8765
 
 # Token length in bytes before hex encoding. 32 bytes -> 64 hex characters,
 # matching the token the x64dbg plugin generates, so the two look alike in logs.
@@ -82,8 +94,16 @@ _LOOPBACK_NAMES = frozenset({"localhost", "ip6-localhost", "ip6-loopback"})
 _LOOPBACK_HOST_HEADERS = frozenset({"localhost", "127.0.0.1", "::1"})
 
 
-class TransportConfigError(Exception):
-    """The transport configuration is unsafe or unusable; do not start."""
+class RemoteConfigError(Exception):
+    """A remote endpoint or listener is configured unsafely. Fail closed."""
+
+
+class TransportConfigError(RemoteConfigError):
+    """This server's own listener is misconfigured; do not start."""
+
+
+class DebuggerEndpointError(RemoteConfigError):
+    """The x64dbg endpoint this server would dial is misconfigured; do not dial it."""
 
 
 def _normalize_host(value: str) -> str:
@@ -176,22 +196,38 @@ def _parse_networks(raw: str) -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Net
     return tuple(networks)
 
 
-def _require_readable(path_value: str, env_name: str) -> Path:
+def _require_readable(
+    path_value: str,
+    env_name: str,
+    error: type[RemoteConfigError] = TransportConfigError,
+) -> Path:
     """Resolve a configured file and refuse now if it cannot be read.
 
-    Checked at startup rather than at the first TLS handshake: uvicorn's
-    failure for a missing key is a traceback out of the event loop, long after
-    the log has claimed the server started.
+    Checked at configuration time rather than at the first TLS handshake:
+    uvicorn's failure for a missing key is a traceback out of the event loop,
+    long after the log has claimed the server started, and requests' failure
+    for a missing CA bundle surfaces as an opaque SSLError on whatever tool
+    call happened to be first.
     """
     path = Path(path_value).expanduser()
     if not path.is_file():
-        raise TransportConfigError(f"{env_name} does not point at a file: {path}")
+        raise error(f"{env_name} does not point at a file: {path}")
     try:
         with open(path, "rb"):
             pass
     except OSError as exc:
-        raise TransportConfigError(f"{env_name} is not readable ({path}): {exc}") from exc
+        raise error(f"{env_name} is not readable ({path}): {exc}") from exc
     return path.resolve()
+
+
+def _bracket(host: str) -> str:
+    """Wrap a bare IPv6 literal in brackets so it can go in a URL authority.
+
+    ``f"http://{host}:{port}"`` with host ``::1`` produces ``http://::1:8765``,
+    which is not a URL. The bridge built its base URL that way and accepted
+    ``::1`` as a loopback spelling, so that combination has never worked.
+    """
+    return f"[{host}]" if ":" in host and not host.startswith("[") else host
 
 
 @dataclass(frozen=True)
@@ -245,8 +281,7 @@ class TransportConfig:
     @property
     def url(self) -> str:
         scheme = "https" if self.tls_enabled else "http"
-        host = f"[{self.host}]" if ":" in self.host else self.host
-        return f"{scheme}://{host}:{self.port}{self.path}"
+        return f"{scheme}://{_bracket(self.host)}:{self.port}{self.path}"
 
     def uvicorn_config(self) -> dict[str, Any]:
         """Return the uvicorn keyword arguments that carry the TLS settings.
@@ -402,6 +437,225 @@ def resolve_transport_config() -> TransportConfig:
         tls_ca=tls_ca,
         allowed_hosts=frozenset(allowed_hosts),
         client_allowlist=client_allowlist,
+    )
+
+
+# ---------------------------------------------------------------------------
+# The other direction: the x64dbg endpoint this server dials
+# ---------------------------------------------------------------------------
+#
+# Same posture, mirrored. The listener above decides who may drive this server;
+# this decides what this server may drive. The asymmetry worth naming is which
+# certificate matters: the listener holds a server certificate and optionally
+# verifies a CLIENT one; the bridge verifies the plugin's SERVER certificate
+# against a CA and optionally presents a client one. They are different roles
+# with different files, so ``BINARY_MCP_REMOTE_TLS_CA`` (client certs this
+# server accepts) and ``X64DBG_TLS_CA`` (the CA that signs the plugin's
+# certificate) are deliberately NOT the same variable. Reusing one would mean
+# a CA trusted to issue client credentials silently became a CA trusted to
+# impersonate the debugger.
+#
+# One thing this does not do is make the plugin reachable. obsidian_server.exe
+# binds 127.0.0.1 and speaks plaintext HTTP (server/main.cpp -- INADDR_LOOPBACK,
+# no TLS), so a non-loopback endpoint only exists if something on the debugger
+# host terminates TLS and forwards to that loopback port. Phase 3 of
+# docs/remote-access-plan.md replaces that with a native listener. Until then
+# the supported paths are a tunnel (loopback, no opt-in needed) or a TLS
+# terminator, and both land here.
+
+
+@dataclass(frozen=True)
+class DebuggerEndpoint:
+    """A validated x64dbg endpoint. Only produced by :func:`resolve_debugger_endpoint`."""
+
+    host: str = DEFAULT_X64DBG_HOST
+    port: int = DEFAULT_X64DBG_PORT
+    tls_ca: Path | None = None
+    client_cert: Path | None = None
+    client_key: Path | None = None
+
+    def __post_init__(self) -> None:
+        if (self.client_cert is None) != (self.client_key is None):
+            raise DebuggerEndpointError(
+                "DebuggerEndpoint needs both client_cert and client_key, or neither"
+            )
+        if self.client_cert is not None and self.tls_ca is None:
+            raise DebuggerEndpointError(
+                "DebuggerEndpoint has a client certificate but no tls_ca, so there "
+                "is no TLS to present it over"
+            )
+
+    @property
+    def is_loopback(self) -> bool:
+        return is_loopback_host(self.host)
+
+    @property
+    def tls_enabled(self) -> bool:
+        """True when a CA is configured, which is also what selects https.
+
+        The CA doubles as the "TLS is on" switch rather than having a separate
+        scheme variable, because https without a CA to verify against is the
+        one combination there is never a reason to want: it would encrypt the
+        token against a passive listener and hand it to any active one.
+        """
+        return self.tls_ca is not None
+
+    @property
+    def mutual_tls(self) -> bool:
+        return self.client_cert is not None
+
+    @property
+    def scheme(self) -> str:
+        return "https" if self.tls_enabled else "http"
+
+    @property
+    def base_url(self) -> str:
+        return f"{self.scheme}://{_bracket(self.host)}:{self.port}"
+
+    @property
+    def token_must_come_from_env(self) -> bool:
+        """True when the plugin's token file is on a machine this one cannot read.
+
+        The plugin writes its token to ``%TEMP%\\x64dbg_mcp_token.txt`` on the
+        host x64dbg runs on. For a remote endpoint that is not this host, so
+        looking there produces "token file not found" for what is really "you
+        did not provision a token" -- a message that sends the operator to
+        check whether the plugin is loaded instead of to the one thing they
+        have to do.
+        """
+        return not self.is_loopback
+
+    def requests_kwargs(self) -> dict[str, Any]:
+        """Return the ``requests`` keyword arguments carrying the TLS settings.
+
+        Empty for a plaintext loopback endpoint, so the common case is byte for
+        byte the call it was before. ``verify`` is a CA path rather than True:
+        the plugin's certificate is one an analyst issued for a lab host, so the
+        system trust store is the wrong thing to check it against.
+        """
+        kwargs: dict[str, Any] = {}
+        if self.tls_ca is not None:
+            kwargs["verify"] = str(self.tls_ca)
+        if self.client_cert is not None and self.client_key is not None:
+            kwargs["cert"] = (str(self.client_cert), str(self.client_key))
+        return kwargs
+
+    def describe(self) -> str:
+        """One line for the log, naming what is NOT on rather than what is."""
+        parts = [self.base_url]
+        parts.append("tls=mutual" if self.mutual_tls else ("tls=server" if self.tls_enabled else "tls=OFF"))
+        parts.append("loopback" if self.is_loopback else "REMOTE")
+        return " ".join(parts)
+
+
+def resolve_debugger_endpoint(
+    host: str | None = None, port: int | None = None
+) -> DebuggerEndpoint:
+    """Resolve and validate the x64dbg endpoint.
+
+    Args:
+        host: Explicit host, overriding ``$X64DBG_HOST``. ``None`` resolves
+            from the environment, then the loopback default.
+        port: Explicit port, overriding ``$X64DBG_PORT``.
+
+    Returns:
+        A validated :class:`DebuggerEndpoint`.
+
+    Raises:
+        DebuggerEndpointError: If the endpoint is unparseable, or is a
+            non-loopback host without the opt-in, a CA and a token.
+    """
+    # A blank host is treated as unset, same as None: "" is not a host, and a
+    # caller that passes one should still get the configured endpoint rather
+    # than silently bypassing it. The port cannot do the same, because 0 is
+    # falsy AND an invalid port -- it has to reach the range check below.
+    if not (host or "").strip():
+        host = get_config(ENV_X64DBG_HOST) or ""
+    resolved_host = _normalize_host(str(host)) or DEFAULT_X64DBG_HOST
+
+    if is_wildcard_host(resolved_host):
+        raise DebuggerEndpointError(
+            f"{ENV_X64DBG_HOST}={resolved_host!r} is not a destination. "
+            f"0.0.0.0 and :: mean 'every interface' to a listener and nothing at "
+            f"all to a client -- name the debugger host's address, or leave it "
+            f"unset for {DEFAULT_X64DBG_HOST}."
+        )
+
+    if port is None:
+        port_raw = (get_config(ENV_X64DBG_PORT) or str(DEFAULT_X64DBG_PORT)).strip()
+    else:
+        port_raw = str(port)
+    try:
+        resolved_port = int(port_raw)
+    except ValueError as exc:
+        raise DebuggerEndpointError(
+            f"{ENV_X64DBG_PORT}={port_raw!r} is not an integer"
+        ) from exc
+    if not 1 <= resolved_port <= 65535:
+        raise DebuggerEndpointError(f"{ENV_X64DBG_PORT}={resolved_port} is outside 1-65535")
+
+    ca_raw = (get_config(ENV_X64DBG_TLS_CA) or "").strip()
+    cert_raw = (get_config(ENV_X64DBG_CLIENT_CERT) or "").strip()
+    key_raw = (get_config(ENV_X64DBG_CLIENT_KEY) or "").strip()
+    if cert_raw and not key_raw:
+        raise DebuggerEndpointError(
+            f"{ENV_X64DBG_CLIENT_CERT} is set but {ENV_X64DBG_CLIENT_KEY} is not"
+        )
+    if key_raw and not cert_raw:
+        raise DebuggerEndpointError(
+            f"{ENV_X64DBG_CLIENT_KEY} is set but {ENV_X64DBG_CLIENT_CERT} is not"
+        )
+    if cert_raw and not ca_raw:
+        raise DebuggerEndpointError(
+            f"{ENV_X64DBG_CLIENT_CERT} asks to present a client certificate, but "
+            f"{ENV_X64DBG_TLS_CA} is unset so the connection would be plaintext "
+            f"HTTP with nothing to present it over"
+        )
+
+    tls_ca = _require_readable(ca_raw, ENV_X64DBG_TLS_CA, DebuggerEndpointError) if ca_raw else None
+    client_cert = (
+        _require_readable(cert_raw, ENV_X64DBG_CLIENT_CERT, DebuggerEndpointError)
+        if cert_raw else None
+    )
+    client_key = (
+        _require_readable(key_raw, ENV_X64DBG_CLIENT_KEY, DebuggerEndpointError)
+        if key_raw else None
+    )
+
+    if not is_loopback_host(resolved_host):
+        # The three remote requirements, refused one at a time so the message
+        # names the single thing still missing. Same shape as the listener's.
+        if not get_config_bool(ENV_REMOTE_ALLOW):
+            raise DebuggerEndpointError(
+                f"{ENV_X64DBG_HOST}={resolved_host!r} is not a loopback address. "
+                f"Driving a debugger across the network means this server's "
+                f"bearer token, and every memory write it authorises, crosses it "
+                f"too. Set {ENV_REMOTE_ALLOW}=1 to say you intend that, and see "
+                f"docs/remote-access.md -- a tunnel to 127.0.0.1 needs no opt-in "
+                f"and is the simpler answer."
+            )
+        if tls_ca is None:
+            raise DebuggerEndpointError(
+                f"{ENV_X64DBG_HOST}={resolved_host!r} is not loopback, so TLS is "
+                f"required: set {ENV_X64DBG_TLS_CA} to the CA that signs the "
+                f"debugger host's certificate. Without it the token crosses the "
+                f"network in cleartext and anyone who captures it owns the "
+                f"debugger. Note that obsidian_server.exe does not serve TLS "
+                f"itself yet -- something on that host has to terminate it."
+            )
+        if not (get_config(ENV_OBSIDIAN_TOKEN) or "").strip():
+            raise DebuggerEndpointError(
+                f"{ENV_OBSIDIAN_TOKEN} must be set for a non-loopback endpoint. "
+                f"The plugin writes its token to %TEMP% on the debugger host, "
+                f"which is not this machine -- read it there and set it here."
+            )
+
+    return DebuggerEndpoint(
+        host=resolved_host,
+        port=resolved_port,
+        tls_ca=tls_ca,
+        client_cert=client_cert,
+        client_key=client_key,
     )
 
 

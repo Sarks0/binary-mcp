@@ -1,9 +1,10 @@
 # Remote access plan: MCP server and Obsidian plugin across hosts
 
-**Status:** Phase 0 and Phase 2 are implemented, along with the Phase 1
-groundwork they needed (`src/utils/remote.py` and the security-model section).
-See [Remote access](remote-access.md) for the resulting setup. The bridge half
-of Phase 1 and Phases 3, 4 and 5 are still proposed.
+**Status:** Phases 0, 1 and 2 are implemented. See
+[Remote access](remote-access.md) for the resulting setup. Phases 3, 4 and 5
+are still proposed — notably, the plugin does not serve TLS itself, so the
+direct (untunnelled) x64dbg path needs a TLS terminator on the debugger host
+until Phase 3 lands.
 
 ## The target topology
 
@@ -50,7 +51,7 @@ setting `OBSIDIAN_AUTH_TOKEN` in the environment before `CreateProcessA` and
 clearing it immediately after (`plugin.cpp:5336`) — a good pattern that already
 works for a remote client, see 1.4.
 
-### 1.3 The Python bridge refuses any non-loopback host
+### 1.3 The Python bridge refuses any non-loopback host — FIXED
 
 `src/engines/dynamic/x64dbg/bridge.py:466-471`
 
@@ -64,6 +65,13 @@ if host not in allowed_hosts:
 `get_x64dbg_bridge()` (`dynamic_tools.py:393-405`, reading `X64DBG_HOST` /
 `X64DBG_PORT`) both plumb a host through to this constructor, which then
 rejects anything but loopback. The parameter exists; the gate makes it inert.
+
+Replaced by `resolve_debugger_endpoint` in `src/utils/remote.py`, the same
+module the listener's policy lives in. `get_x64dbg_bridge()` no longer reads
+`X64DBG_HOST`/`X64DBG_PORT` itself — two readers of one setting is how a
+default drifts. A side effect worth noting: the old check accepted `::1` as a
+loopback spelling and then built `http://::1:8765`, which is not a URL, so that
+spelling had never worked. The endpoint brackets IPv6 literals.
 
 ### 1.4 Token provisioning is same-machine by default — but not exclusively
 
@@ -306,7 +314,7 @@ Phase 4 below. Both share Phase 1.
 Doing this first means the remote keys added later land in a surface that is
 actually true. The new test is the thing that stops key #11 recurring.
 
-### Phase 1 — Shared remote groundwork — PARTLY DONE
+### Phase 1 — Shared remote groundwork — DONE
 
 - **Done.** `src/utils/remote.py` parses and validates a remote endpoint
   (host, port, TLS material, token, Host allow-set, client allowlist) from one
@@ -320,11 +328,13 @@ actually true. The new test is the thing that stops key #11 recurring.
 - **Done.** `docs/security.md` has a `## The HTTP transport` section stating
   the new threat model in the same plain terms as the rest of that file, and
   `docs/remote-access.md` is the operator guide.
-- **Still to do (the bridge half):** apply the same policy to
-  `X64DbgBridge`, replacing the hard loopback check at `bridge.py:466-471`.
-  The posture is already decided and implemented for the transport — fail
-  closed, with a message naming the variable to set — so the bridge adopts it
-  rather than inventing one.
+- **Done (the bridge half).** `resolve_debugger_endpoint` replaces the hard
+  loopback check at `bridge.py:466-471`, with the same fail-closed posture and
+  the same opt-in variable: a non-loopback host needs `BINARY_MCP_REMOTE_ALLOW`,
+  `X64DBG_TLS_CA` and `OBSIDIAN_AUTH_TOKEN`. `verify=` and `cert=` reach the
+  `requests` calls, and the plugin's `%TEMP%` token file is consulted only for
+  a loopback endpoint. One shared exception base, `RemoteConfigError`, with
+  `TransportConfigError` and `DebuggerEndpointError` under it.
 
 ### Phase 2 — Topology B: remote MCP transport — DONE
 
@@ -368,16 +378,10 @@ remains the default when nothing is set.
 - Surface the effective listener in the x64dbg log at startup, so an analyst
   can see at a glance whether this instance is reachable from the network.
 
-**Python bridge** (`src/engines/dynamic/x64dbg/bridge.py:466-471`)
-
-- Replace the hard loopback check with the Phase 1 policy: loopback always
-  allowed; anything else requires `BINARY_MCP_REMOTE_ALLOW` **and** `https`
-  **and** a CA to verify against, with `verify=` wired into the `requests`
-  calls at `bridge.py:798-800`.
-- Token from `OBSIDIAN_AUTH_TOKEN` only when the host is remote — never try to
-  read Host B's token file off Host A's `%TEMP%`
-  (`bridge.py:690-700`), which today produces a confusing
-  "token file not found" for what is really "you did not provision a token".
+**Python bridge** — done in Phase 1; nothing left here. The bridge already
+dials an `https` endpoint and verifies it against `X64DBG_TLS_CA`, so when the
+C++ server grows its own listener the Python side needs no change: an operator
+drops the TLS terminator and points `X64DBG_HOST` at the plugin directly.
 
 **Installer / release**
 

@@ -191,9 +191,13 @@ CONFIG_KEYS = {
     "BINARY_MCP_INLINE_DEADLINE": "Seconds a Ghidra-invoking tool may block before returning a job handle instead (default 25, max 900). Raise it if your MCP client is patient -- under Claude Code, where long calls move to a background task after 2 min, 90-120 returns more answers inline.",
 
     # x64dbg (the Obsidian plugin's HTTP listener)
-    "X64DBG_HOST": "Host the Obsidian plugin's HTTP listener is reachable on (default 127.0.0.1). Only loopback is accepted -- the bridge refuses anything else, so a remote debugger host goes through a tunnel whose local end is 127.0.0.1.",
+    "X64DBG_HOST": "Host the Obsidian plugin's HTTP listener is reachable on (default 127.0.0.1). A non-loopback host additionally requires BINARY_MCP_REMOTE_ALLOW, X64DBG_TLS_CA and OBSIDIAN_AUTH_TOKEN; a tunnel whose local end is 127.0.0.1 needs none of them.",
     "X64DBG_PORT": "Port for that listener (default 8765, which is the port obsidian_server.exe binds).",
     "X64DBG_TIMEOUT": "Default timeout for x64dbg commands (seconds, default 30)",
+    "X64DBG_TLS_CA": "PEM CA bundle that signs the debugger host's server certificate. Setting it selects https and verifies against this CA instead of the system trust store. Required for a non-loopback host. Note obsidian_server.exe does not serve TLS itself yet -- something on that host must terminate it.",
+    "X64DBG_TLS_CLIENT_CERT": "PEM client certificate this server presents to the debugger host, for mutual TLS. Requires X64DBG_TLS_CA.",
+    "X64DBG_TLS_CLIENT_KEY": "PEM private key matching X64DBG_TLS_CLIENT_CERT.",
+    "OBSIDIAN_AUTH_TOKEN": "Bearer token for the Obsidian plugin's HTTP API. For a loopback host it is optional: the bridge falls back to the token file the plugin writes in %TEMP%. For a non-loopback host it is REQUIRED, because that file is on the debugger host and not on this machine.",
 
     # WinDbg / kernel debugging
     "WINDBG_PATH": "Path to the Windows debuggers installation (auto-detected when unset).",

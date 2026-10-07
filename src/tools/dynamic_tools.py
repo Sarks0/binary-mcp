@@ -30,6 +30,7 @@ from src.tools.error_hygiene import (
     safe_tool_error,
 )
 from src.utils.formatters import neutralise_untrusted_delimiters, wrap_untrusted
+from src.utils.remote import resolve_debugger_endpoint
 from src.utils.security import (
     PathTraversalError,
     safe_error_message,
@@ -393,16 +394,19 @@ def log_dynamic_tool(func):
 
 
 def get_x64dbg_bridge() -> X64DbgBridge:
-    """Get or create x64dbg bridge instance."""
+    """Get or create x64dbg bridge instance.
+
+    X64DBG_HOST/X64DBG_PORT are read by the bridge's own endpoint policy rather
+    than here. They used to be read in both places, which is how a second
+    reader ends up disagreeing with the first about the default -- and the
+    endpoint needs the rest of the configuration (the opt-in, the CA, the
+    token) in one place anyway.
+    """
     global _x64dbg_bridge
     if _x64dbg_bridge is None:
-        # Support custom connection via environment variables (useful for testing)
-        host = os.getenv("X64DBG_HOST", "127.0.0.1")
-        port = int(os.getenv("X64DBG_PORT", "8765"))
         timeout = int(os.getenv("X64DBG_TIMEOUT", "30"))
-
-        _x64dbg_bridge = X64DbgBridge(host=host, port=port, timeout=timeout)
-        logger.info(f"Initialized x64dbg bridge: {host}:{port} (timeout: {timeout}s)")
+        _x64dbg_bridge = X64DbgBridge(timeout=timeout)
+        logger.info(f"Initialized x64dbg bridge (timeout: {timeout}s)")
     return _x64dbg_bridge
 
 
@@ -995,13 +999,15 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             )
 
     @log_dynamic_tool
-    def x64dbg_connect(host: str = "127.0.0.1", port: int = 8765) -> str:
+    def x64dbg_connect(host: str | None = None, port: int | None = None) -> str:
         """
         Connect to x64dbg debugger.
 
         Args:
-            host: x64dbg plugin host (default: localhost)
-            port: x64dbg plugin port (default: 8765)
+            host: x64dbg plugin host. Omit to use the configured endpoint
+                (X64DBG_HOST, or 127.0.0.1). A non-loopback host is refused
+                unless the operator has enabled and configured remote access.
+            port: x64dbg plugin port. Omit for X64DBG_PORT, or 8765.
 
         Returns:
             Connection status message
@@ -1023,7 +1029,11 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
             location = bridge.get_current_location()
             lines = [
-                f"Connected to x64dbg at {host}:{port}",
+                # bridge.base_url, not the arguments: those are None whenever
+                # the caller took the configured endpoint, and reporting
+                # "None:None" for a working connection is the same class of bug
+                # as reporting a path the server did not write to.
+                f"Connected to x64dbg at {bridge.base_url}",
                 f"State: {location['state']}",
             ]
             try:
@@ -1054,9 +1064,19 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             logger.error(f"x64dbg_connect failed: {e}")
             # Audit F-10: connection failures surface urllib/socket exceptions
             # whose text can include local paths and proxy configuration.
+            # Name the endpoint, because "check the port" is the actionable
+            # half of this message and the arguments no longer carry it: both
+            # are None whenever the caller took the configured endpoint.
+            # Resolved through the policy rather than read off the bridge --
+            # the bridge may not exist, since a refused endpoint fails in the
+            # constructor. A second refusal here just means we cannot name it.
+            try:
+                target = resolve_debugger_endpoint(host=host, port=port).base_url
+            except Exception:
+                target = "the configured x64dbg endpoint"
             return safe_error_message(
                 f"x64dbg_connect failed. Ensure x64dbg is running with the MCP "
-                f"plugin loaded and port {port} reachable.",
+                f"plugin loaded and {target} reachable.",
                 e,
             )
 

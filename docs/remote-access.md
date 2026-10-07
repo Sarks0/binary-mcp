@@ -4,14 +4,14 @@ Running the MCP client on one host and the analysis tooling on another. The
 usual reason: the debugger and the sample belong in a disposable VM, and the
 client does not.
 
-Two arrangements are possible. Only the first is implemented today; the design
-and the remaining work for the second are in
-[the remote access plan](remote-access-plan.md).
+Two arrangements are possible, and both work. What is still outstanding for
+the second — a native TLS listener in the plugin, and fetching plugin-written
+artifacts back — is in [the remote access plan](remote-access-plan.md).
 
 | | What crosses the network | Status |
 |---|---|---|
 | **Remote MCP server** | The MCP protocol itself. The whole server, Ghidra and x64dbg all live on the debugger host | Implemented |
-| **Remote x64dbg bridge** | Only the x64dbg HTTP hop. The server and Ghidra stay with the client | Works through a tunnel; see [below](#remote-x64dbg-through-a-tunnel) |
+| **Remote x64dbg bridge** | Only the x64dbg HTTP hop. The server and Ghidra stay with the client | Implemented; the plugin still needs a TLS terminator for the direct path — see [below](#remote-x64dbg) |
 
 Throughout: **Host A** is where the MCP client runs, **Host B** is where
 x64dbg, the sample and (for the first arrangement) this server run.
@@ -137,13 +137,20 @@ client address and the reason.
 
 ---
 
-## Remote x64dbg through a tunnel
+## Remote x64dbg
 
 The other arrangement — this server and Ghidra on Host A, only the x64dbg hop
-crossing the network — works today through an SSH port-forward, with no code
-changes. The Obsidian plugin's HTTP server binds Host B's loopback, a forward
-terminates on loopback at both ends, and the bridge accepts a token from the
-environment instead of its local token file.
+crossing the network. Use it when the analysis brain should stay outside the
+malware VM, or when Ghidra wants a bigger machine than the VM.
+
+The endpoint policy mirrors the listener's: loopback needs no opt-in, and a
+non-loopback host needs `BINARY_MCP_REMOTE_ALLOW`, a CA and an explicit token,
+all three. See [Security model](security.md#reaching-x64dbg-on-another-host).
+
+### Option 1: over an SSH tunnel (recommended)
+
+The plugin keeps its loopback bind and SSH carries the traffic. Nothing new
+listens on the LAN, and no certificates are involved.
 
 **On Host B**, with x64dbg running and the plugin loaded, read the token:
 
@@ -161,19 +168,68 @@ export X64DBG_HOST=127.0.0.1
 export X64DBG_PORT=8765
 ```
 
-Every x64dbg tool then works: memory read and write, breakpoints, stepping,
-events, coverage, and `x64dbg_dump_module` (which streams bytes over the API
-and writes the file on Host A, where the static tools can reach it).
+The bridge sees a loopback endpoint, so the policy asks for nothing else. The
+token has to be set explicitly because the plugin's `%TEMP%` token file is on
+Host B; the bridge reads that file only for a loopback endpoint, and here the
+loopback end is a tunnel, not the plugin.
 
-Two limitations, both from the same cause — some artifacts are written by the
-plugin, on Host B:
+### Option 2: direct, with a TLS terminator
+
+Use this when a tunnel is impractical. One thing to know first: **the plugin
+does not serve TLS**. `obsidian_server.exe` binds `127.0.0.1` and speaks
+plaintext HTTP, so this path needs something on Host B listening on the LAN
+with TLS and forwarding to `127.0.0.1:8765` — stunnel, nginx, Caddy. Phase 3 of
+[the plan](remote-access-plan.md) replaces that with a native listener.
+
+On Host B, point your terminator at `127.0.0.1:8765` and give it a certificate
+for the host's name or address. Then on Host A:
+
+```bash
+export BINARY_MCP_REMOTE_ALLOW=1
+export X64DBG_HOST=192.168.1.50
+export X64DBG_PORT=8765
+export X64DBG_TLS_CA=/etc/binary-mcp/debugger-ca.pem
+export OBSIDIAN_AUTH_TOKEN=<the token from Host B>
+```
+
+`X64DBG_TLS_CA` is what selects `https`; there is no separate scheme variable,
+and no combination that yields plaintext to a non-loopback host. The CA is used
+*instead of* the system trust store, which is the right check for a certificate
+an analyst issued for a lab host.
+
+**Add mutual TLS** if the terminator asks for a client certificate:
+
+```bash
+export X64DBG_TLS_CLIENT_CERT=/etc/binary-mcp/client.crt
+export X64DBG_TLS_CLIENT_KEY=/etc/binary-mcp/client.key
+```
+
+### What works, and what does not
+
+Either option gives you every x64dbg tool: memory read and write, breakpoints,
+stepping, events, coverage, and `x64dbg_dump_module` — which streams bytes over
+the API and writes the file on Host A, where the static tools can reach it.
+
+Two limitations remain, both from the same cause: some artifacts are written by
+the plugin, on Host B.
 
 - `x64dbg_create_minidump`, `x64dbg_dump_memory` and the coverage export land
-  in `%TEMP%\obsidian_x64dbg\output\` on Host B. There is no tool to fetch them
-  back yet.
+  in `%TEMP%\obsidian_x64dbg\output\` on Host B. There is no tool to fetch
+  them back yet.
 - The static side needs the sample on Host A. The Ghidra cache is keyed on the
   SHA-256 of the file's contents, so a copy of the same bytes lines up with
   analysis done on either host.
 
 Phases 3 and 4 of [the plan](remote-access-plan.md) cover the native listener
-and artifact transfer that remove both.
+and the artifact transfer that remove both.
+
+### Troubleshooting
+
+| Symptom | Cause |
+|---|---|
+| `X64DBG_HOST=... is not a loopback address` | The endpoint needs `BINARY_MCP_REMOTE_ALLOW`. A tunnel needs no opt-in and is simpler |
+| `... so TLS is required: set X64DBG_TLS_CA` | No CA configured for a remote host. Remember the plugin itself serves plaintext — something on Host B must terminate TLS |
+| `OBSIDIAN_AUTH_TOKEN must be set for a non-loopback endpoint` | The plugin's token file is on Host B. Read it there |
+| `OBSIDIAN_AUTH_TOKEN is not set, and this bridge points at ...` | Same cause, hit at request time rather than construction |
+| `SSLError` / certificate verify failed | The certificate the terminator serves is not signed by `X64DBG_TLS_CA`, or its name does not match `X64DBG_HOST` |
+| Connection reset, or a timeout, reaching a host that is clearly up | `HTTPS_PROXY` is set in the server's environment and `requests` is routing the debugger connection through it. Add the debugger host to `no_proxy` |

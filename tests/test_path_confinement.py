@@ -49,7 +49,7 @@ from src.utils.security import (
 
 posix_only = pytest.mark.skipif(
     os.name == "nt",
-    reason="st_nlink is not a reliable hard-link signal on Windows",
+    reason="the hard-link check is not enabled on Windows (see _reject_hardlinked_file)",
 )
 
 

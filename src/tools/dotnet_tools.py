@@ -76,11 +76,14 @@ After installation, restart your MCP client.
                 validated = sanitize_binary_path(assembly_path)
                 assembly_path = str(validated)
             except (PathTraversalError, FileSizeError) as e:
-                return safe_path_error("analyze_dotnet", e, "binary path")
-            except FileNotFoundError:
-                return f"Error: Assembly not found: {assembly_path}"
-            except ValueError as e:
-                return safe_error_message("Invalid assembly path", e)
+                return safe_path_error("analyze_dotnet", e, "assembly path")
+            except (FileNotFoundError, ValueError) as e:
+                # Was `f"Error: Assembly not found: {assembly_path}"`, which
+                # echoed the caller's path -- the thing error_hygiene exists to
+                # stop. safe_path_error says "no file exists at the path
+                # supplied" for the missing case and falls back to a reference
+                # ID for the rest, without naming the path.
+                return safe_path_error("analyze_dotnet", e, "assembly path")
 
             # Get assembly info
             assembly_info = ilspy.list_types(assembly_path, force_refresh)
@@ -198,11 +201,14 @@ After installation, restart your MCP client.
                 validated = sanitize_binary_path(assembly_path)
                 assembly_path = str(validated)
             except (PathTraversalError, FileSizeError) as e:
-                return safe_path_error("get_dotnet_types", e, "binary path")
-            except FileNotFoundError:
-                return f"Error: Assembly not found: {assembly_path}"
-            except ValueError as e:
-                return safe_error_message("Invalid assembly path", e)
+                return safe_path_error("get_dotnet_types", e, "assembly path")
+            except (FileNotFoundError, ValueError) as e:
+                # Was `f"Error: Assembly not found: {assembly_path}"`, which
+                # echoed the caller's path -- the thing error_hygiene exists to
+                # stop. safe_path_error says "no file exists at the path
+                # supplied" for the missing case and falls back to a reference
+                # ID for the rest, without naming the path.
+                return safe_path_error("get_dotnet_types", e, "assembly path")
 
             assembly_info = ilspy.list_types(assembly_path)
 
@@ -270,11 +276,14 @@ After installation, restart your MCP client.
                 validated = sanitize_binary_path(assembly_path)
                 assembly_path = str(validated)
             except (PathTraversalError, FileSizeError) as e:
-                return safe_path_error("decompile_dotnet_type", e, "binary path")
-            except FileNotFoundError:
-                return f"Error: Assembly not found: {assembly_path}"
-            except ValueError as e:
-                return safe_error_message("Invalid assembly path", e)
+                return safe_path_error("decompile_dotnet_type", e, "assembly path")
+            except (FileNotFoundError, ValueError) as e:
+                # Was `f"Error: Assembly not found: {assembly_path}"`, which
+                # echoed the caller's path -- the thing error_hygiene exists to
+                # stop. safe_path_error says "no file exists at the path
+                # supplied" for the missing case and falls back to a reference
+                # ID for the rest, without naming the path.
+                return safe_path_error("decompile_dotnet_type", e, "assembly path")
 
             source_code = ilspy.decompile_type(assembly_path, type_name)
 
@@ -344,11 +353,14 @@ After installation, restart your MCP client.
                 validated = sanitize_binary_path(assembly_path)
                 assembly_path = str(validated)
             except (PathTraversalError, FileSizeError) as e:
-                return safe_path_error("search_dotnet_types", e, "binary path")
-            except FileNotFoundError:
-                return f"Error: Assembly not found: {assembly_path}"
-            except ValueError as e:
-                return safe_error_message("Invalid assembly path", e)
+                return safe_path_error("search_dotnet_types", e, "assembly path")
+            except (FileNotFoundError, ValueError) as e:
+                # Was `f"Error: Assembly not found: {assembly_path}"`, which
+                # echoed the caller's path -- the thing error_hygiene exists to
+                # stop. safe_path_error says "no file exists at the path
+                # supplied" for the missing case and falls back to a reference
+                # ID for the rest, without naming the path.
+                return safe_path_error("search_dotnet_types", e, "assembly path")
 
             matches = ilspy.search_types(assembly_path, pattern)
 
@@ -413,11 +425,14 @@ After installation, restart your MCP client.
                 validated = sanitize_binary_path(assembly_path)
                 assembly_path = str(validated)
             except (PathTraversalError, FileSizeError) as e:
-                return safe_path_error("decompile_dotnet_assembly", e, "binary path")
-            except FileNotFoundError:
-                return f"Error: Assembly not found: {assembly_path}"
-            except ValueError as e:
-                return safe_error_message("Invalid assembly path", e)
+                return safe_path_error("decompile_dotnet_assembly", e, "assembly path")
+            except (FileNotFoundError, ValueError) as e:
+                # Was `f"Error: Assembly not found: {assembly_path}"`, which
+                # echoed the caller's path -- the thing error_hygiene exists to
+                # stop. safe_path_error says "no file exists at the path
+                # supplied" for the missing case and falls back to a reference
+                # ID for the rest, without naming the path.
+                return safe_path_error("decompile_dotnet_assembly", e, "assembly path")
 
             output_dir = ilspy.decompile_assembly(assembly_path, force_refresh=force_refresh)
 
@@ -486,11 +501,14 @@ After installation, restart your MCP client.
                 validated = sanitize_binary_path(assembly_path)
                 assembly_path = str(validated)
             except (PathTraversalError, FileSizeError) as e:
-                return safe_path_error("get_dotnet_il", e, "binary path")
-            except FileNotFoundError:
-                return f"Error: Assembly not found: {assembly_path}"
-            except ValueError as e:
-                return safe_error_message("Invalid assembly path", e)
+                return safe_path_error("get_dotnet_il", e, "assembly path")
+            except (FileNotFoundError, ValueError) as e:
+                # Was `f"Error: Assembly not found: {assembly_path}"`, which
+                # echoed the caller's path -- the thing error_hygiene exists to
+                # stop. safe_path_error says "no file exists at the path
+                # supplied" for the missing case and falls back to a reference
+                # ID for the rest, without naming the path.
+                return safe_path_error("get_dotnet_il", e, "assembly path")
 
             il_code = ilspy.get_il_code(assembly_path, type_name)
 

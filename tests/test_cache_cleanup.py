@@ -285,6 +285,11 @@ def test_clean_cache_missing_binary_returns_friendly_error(
     # And no longer hands back host layout to get there.
     assert str(cache_dir) not in result
     assert str(missing) not in result
+    # The reference ID terminates the reply. Asserted because getting the
+    # advice back in cost two attempts: concatenating it onto safe_path_error's
+    # output left the ID mid-reply, and moving it into the operation argument
+    # dropped it from the reply entirely (operation only reaches the log).
+    assert result.strip().splitlines()[-1].startswith("Reference ID:"), result
 
 
 def test_clean_cache_preserves_notes_sidecar(server_with_temp_cache, tmp_path):

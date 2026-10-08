@@ -603,6 +603,30 @@ def test_hardlink_and_confinement_guidance_do_not_read_alike(
     assert "hard link" not in oob_text
 
 
+@posix_only
+def test_hardlink_check_exempts_non_regular_files_on_its_own(quarantine):
+    """
+    The regular-file exemption belongs to the function, not to its caller.
+
+    ``test_directories_are_not_hardlink_checked`` covers the exemption as
+    reached through ``sanitize_binary_path``, which runs ``is_file()`` first --
+    so it would pass even if the check itself refused anything with
+    st_nlink > 1. This calls the helper directly: a directory with two
+    subdirectories has st_nlink == 4, and must still be waved through, so that
+    a second caller or a reordering of the existence checks cannot turn every
+    normal directory into a confinement refusal.
+    """
+    from src.utils.security import _reject_hardlinked_file
+
+    d = quarantine / "corpus"
+    (d / "sub1").mkdir(parents=True)
+    (d / "sub2").mkdir(parents=True)
+    assert d.stat().st_nlink > 1
+
+    # No exception: the helper itself declines to judge a non-regular file.
+    _reject_hardlinked_file(d, str(d))
+
+
 def test_guidance_lookup_does_not_depend_on_mapping_order(monkeypatch):
     """
     Resolution is by MRO, not by scanning the mapping in insertion order.

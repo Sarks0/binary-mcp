@@ -1895,12 +1895,27 @@ Format: {compat_info.format.value}
     except UserFacingError as e:
         # Return safe error with reference ID
         return str(e)
-    except (PathTraversalError, FileSizeError) as e:
+    except (PathTraversalError, FileSizeError, FileNotFoundError) as e:
         # Security errors. Routed through safe_path_error, not the generic
         # envelope: "Invalid binary file or path" plus a reference ID named
         # neither which of the two it was nor what to do, so a hard-link
-        # refusal and an out-of-bounds path were the same four words. Every
-        # other path-validating tool in this module already does this.
+        # refusal and an out-of-bounds path were the same four words.
+        #
+        # FileNotFoundError belongs in this arm and not in the catch-all:
+        # confine_binary_path raises it for a missing in-bounds file, and
+        # PATH_ERROR_GUIDANCE has text for it ("no file exists at the path
+        # supplied"), so leaving it to fall through reported a typo'd path as
+        # "Analysis failed unexpectedly" while check_binary, two thousand
+        # lines down, answered the same input usefully.
+        #
+        # NOTE this is not yet the whole module: load_pdb, decompile_function,
+        # get_notes and find_related_sessions still answer a refused path with
+        # the collapsed envelope, and the tools that validate only via
+        # get_analysis_context cannot reach an arm like this at all -- it
+        # converts every path error to RuntimeError(f"...{e}") at the top of
+        # that function, which both erases the type and forwards the resolved
+        # allow-list. Fixing those is a change to get_analysis_context, not to
+        # this handler.
         return safe_path_error("analyze_binary", e, "binary path")
     except GhidraAnalysisError as e:
         # Ghidra itself failed (subprocess error or timeout). The diagnostic

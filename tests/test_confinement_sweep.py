@@ -31,6 +31,7 @@ regression shows up as "the cache was asked about /outside/secret.bin" rather
 than as a vague assertion failure.
 """
 
+import os
 import sys
 import tempfile
 import zipfile
@@ -532,24 +533,36 @@ def test_find_related_sessions_confines_before_hashing(
     assert find.calls == []
 
 
-def test_hardlinked_sample_is_refused_by_the_tool_layer(
-    server, quarantine, tmp_path, monkeypatch
-):
+@pytest.fixture
+def hardlinked_sample(quarantine, tmp_path):
     """
-    End to end: the hard-link bypass is refused where a caller would hit it,
-    not just in the validator's unit tests.
-    """
-    import os
+    An in-bounds hard link to an out-of-bounds inode, plus that inode.
 
+    Shared because three tests needed the same six lines and the same skip
+    reason; the previous copies drifted only in variable names. Returns
+    ``(link, target)`` so a test can exercise the hard-link refusal and the
+    plain out-of-bounds refusal against the same fixture.
+    """
     if os.name == "nt":
         pytest.skip("st_nlink is not a reliable hard-link signal on Windows")
 
     outside = tmp_path / "outside"
     outside.mkdir(exist_ok=True)
-    secret = outside / "secret"
-    secret.write_bytes(b"MZ\x90\x00" + b"\x00" * 64)
+    target = outside / "secret"
+    target.write_bytes(b"MZ\x90\x00" + b"\x00" * 64)
     link = quarantine / "sample.bin"
-    os.link(secret, link)
+    os.link(target, link)
+    return link, target
+
+
+def test_hardlinked_sample_is_refused_by_the_tool_layer(
+    server, hardlinked_sample, monkeypatch
+):
+    """
+    End to end: the hard-link bypass is refused where a caller would hit it,
+    not just in the validator's unit tests.
+    """
+    link, _ = hardlinked_sample
 
     check_compat = Recorder()
     monkeypatch.setattr(
@@ -564,7 +577,7 @@ def test_hardlinked_sample_is_refused_by_the_tool_layer(
 
 @pytest.mark.parametrize("tool_name", ["check_binary", "analyze_binary"])
 def test_hardlink_refusal_is_not_reported_as_a_bad_path(
-    server, quarantine, tmp_path, monkeypatch, tool_name
+    server, hardlinked_sample, tmp_path, monkeypatch, tool_name
 ):
     """
     The refusal must say what was wrong WHERE a caller reads it.
@@ -579,19 +592,8 @@ def test_hardlink_refusal_is_not_reported_as_a_bad_path(
     Both tools now route through ``safe_path_error``, which reconstructs the
     category from the exception type -- and the type is now distinct.
     """
-    import os
-
-    if os.name == "nt":
-        pytest.skip("st_nlink is not a reliable hard-link signal on Windows")
-
     _disable_auto_session(server, monkeypatch)
-
-    outside = tmp_path / "outside"
-    outside.mkdir(exist_ok=True)
-    secret = outside / "secret"
-    secret.write_bytes(b"MZ\x90\x00" + b"\x00" * 64)
-    link = quarantine / "sample.bin"
-    os.link(secret, link)
+    link, secret = hardlinked_sample
 
     tool = getattr(server, tool_name)
     hardlink_result = tool(binary_path=str(link))
@@ -600,6 +602,20 @@ def test_hardlink_refusal_is_not_reported_as_a_bad_path(
 
     assert "Error" in hardlink_result
     assert "Error" in oob_result
+
+    # Distinguishable is only half of it: the refusal must still withhold host
+    # layout. Without this pair, the test is satisfied by ANY two different
+    # strings -- including the leaky "Access denied: ... is outside the default
+    # quarantine directories (<every resolved dir>)" that tools validating via
+    # get_analysis_context still return today, which interpolates the
+    # Path.home()-derived allow-list and so the operator's username. Asserting
+    # only "the texts differ" is what let that survive a review.
+    for label, text in (("hard link", hardlink_result), ("out of bounds", oob_result)):
+        assert str(tmp_path) not in text, (
+            f"{tool_name} echoed host layout in its {label} refusal; the "
+            f"resolved directory list belongs in the log, against the "
+            f"reference ID, not in the caller's transcript"
+        )
 
     # Reference IDs are per-call, so compare the text without them.
     def _without_reference_id(text):

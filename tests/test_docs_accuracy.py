@@ -382,15 +382,10 @@ def test_docs_document_confinement_controls():
     src/utils/security.py, which is exactly what a field report said it took.
     A knob an error message names must be findable in the docs.
     """
-    config_text = CONFIG_DOC.read_text(encoding="utf-8")
-    for var in (
-        "BINARY_MCP_ALLOWED_DIRS",
-        "BINARY_MCP_REQUIRE_CONFINEMENT",
-        "BINARY_MCP_ALLOW_ANY_PATH",
-        "BINARY_MCP_ALLOW_HARDLINKS",
-    ):
-        assert var in config_text, f"docs/configuration.md no longer documents {var}"
-
+    # The config-reference half is covered by (and derived in)
+    # test_every_env_var_named_in_a_refusal_message_is_documented below; what
+    # is only asserted here is the SECURITY doc, which names a deliberate
+    # subset rather than every knob.
     security_text = SECURITY_DOC.read_text(encoding="utf-8")
     for var in ("BINARY_MCP_ALLOWED_DIRS", "BINARY_MCP_ALLOW_HARDLINKS"):
         assert var in security_text, (
@@ -410,19 +405,28 @@ def test_every_env_var_named_in_a_refusal_message_is_documented():
     """
     from src.utils import security
 
-    config_text = CONFIG_DOC.read_text(encoding="utf-8")
-    named_in_messages = (
-        security.ENV_ALLOWED_DIRS,
-        security.ENV_REQUIRE_CONFINEMENT,
-        security.ENV_ALLOW_ANY_PATH,
-        security.ENV_ALLOW_HARDLINKS,
+    # DERIVED, not listed. A hardcoded tuple could not keep the promise in the
+    # docstring above: the fifth knob would simply be absent from it and the
+    # test would keep passing while the gap reopened. Reading the ENV_*
+    # constants off the module means adding one is enough to be covered.
+    discovered = sorted(
+        value
+        for name, value in vars(security).items()
+        if name.startswith("ENV_") and isinstance(value, str)
     )
-    for var in named_in_messages:
-        assert var in config_text, (
-            f"{var} is named in a confinement refusal but is not documented in "
-            f"docs/configuration.md, so an operator who hits the refusal cannot "
-            f"look it up"
-        )
+    assert discovered, (
+        "no ENV_* constants found on src.utils.security -- the naming "
+        "convention this test derives from has changed, and the test is now "
+        "asserting nothing"
+    )
+
+    config_text = CONFIG_DOC.read_text(encoding="utf-8")
+    undocumented = [var for var in discovered if var not in config_text]
+    assert not undocumented, (
+        f"{', '.join(undocumented)} named in a confinement refusal but absent "
+        f"from docs/configuration.md, so an operator who hits the refusal "
+        f"cannot look it up"
+    )
 
 
 def test_readme_links_to_the_claim_docs():

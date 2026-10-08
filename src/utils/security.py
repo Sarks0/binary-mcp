@@ -6,6 +6,7 @@ import re
 import tempfile
 import uuid
 from pathlib import Path
+from stat import S_ISREG
 
 logger = logging.getLogger(__name__)
 
@@ -333,11 +334,16 @@ def _reject_hardlinked_file(path: Path, binary_path: str) -> None:
         entries, so any non-empty directory has nlink > 1. Only regular files
         are checked. Symlinks never reach here as themselves (the caller has
         already resolved them, and out-of-bounds targets were rejected above).
-      * POSIX ONLY. On Windows ``os.stat`` fills ``st_nlink`` from a different
-        API path and reports 0 or 1 for files that do have multiple NTFS hard
-        links, so the check would be simultaneously unreliable and unable to
-        catch the equivalent attack. Rather than pretend, it is skipped there
-        and the limitation is stated here.
+      * POSIX ONLY, and this is a GAP rather than a non-issue. ``mklink /H``
+        is the Windows equivalent of the construction above and nothing here
+        refuses it, so the allow-list is advisory on Windows. The skip is a
+        choice not to depend on ``st_nlink`` on a platform where this project
+        has never measured what CPython reports for a file with several NTFS
+        links -- the honest statement is "unverified", not "reports 0 or 1",
+        which earlier revisions of this comment asserted without a test to
+        back it. Measuring it on Windows would let the check be enabled there;
+        until someone does, docs/security.md tells operators to confine at the
+        filesystem instead.
 
     Args:
         path: Resolved, in-bounds path that is known to exist and be a file.
@@ -356,6 +362,17 @@ def _reject_hardlinked_file(path: Path, binary_path: str) -> None:
     except OSError:
         # Let the caller's own stat() below produce the error; a failure here
         # must not turn into a confusing security denial.
+        return
+
+    # "Only regular files are checked" is asserted by this function's own
+    # docstring, by HardLinkError's, and by docs/security.md -- but until this
+    # guard it was true only because sanitize_binary_path happens to run
+    # `if not path.is_file()` a few lines earlier. Any second caller, or a
+    # reordering of those two checks, would have made every non-empty
+    # directory raise a confinement refusal: st_nlink counts the '..' entry of
+    # each subdirectory, so a directory with two subdirectories reports three
+    # names. The invariant now holds wherever this is called from.
+    if not S_ISREG(st.st_mode):
         return
 
     if st.st_nlink > 1:

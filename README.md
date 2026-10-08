@@ -25,16 +25,16 @@ everything else runs anywhere.
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/images/architecture-dark.png">
     <img src="docs/images/architecture.png"
-         alt="binary-mcp architecture: an AI assistant talks MCP over stdio to the binary-mcp server, which exposes 147 tools behind path and command guardrails, session, job and cache layers, and drives five engines -- Ghidra, ILSpyCmd, pefile built-ins, x64dbg and WinDbg -- while keeping state in a shared on-disk cache.">
+         alt="binary-mcp architecture. An AI assistant talks MCP over stdio to the binary-mcp server, which exposes 147 tools in 14 categories behind path and debugger-command guardrails, plus session, job and cache layers. It drives five engines: Ghidra headless, ILSpyCmd, in-process pefile built-ins, x64dbg and WinDbg. State is kept in three on-disk roots, and the only network calls are VirusTotal hash lookups and symbol-server PDB fetches.">
   </picture>
 </p>
 
-The client speaks MCP over stdio, so each one gets its own server process. That
-is why sessions, jobs and the Ghidra project cache are file-backed in a shared
-directory rather than held in memory: two agents analyzing the same binary
-attach to one analysis instead of starting two. Every engine runs as a
-subprocess the server supervises, and the sample reaches them as bytes only --
-nothing in the diagram executes it.
+A client speaks MCP over stdio, so each one gets its own server process. That
+is why the analysis cache, the job registry and the coverage ledger are
+file-backed rather than held in memory: two agents working on the same binary
+attach to one Ghidra run instead of starting two. Ghidra and ILSpyCmd run as
+supervised subprocesses, the PE and ELF parsers run in-process, and the two
+debuggers drive a live target on Windows. No tool executes the sample.
 
 The drawing is editable: open
 [`docs/images/architecture.excalidraw`](docs/images/architecture.excalidraw) at

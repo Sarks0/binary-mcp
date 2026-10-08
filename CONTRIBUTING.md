@@ -109,9 +109,15 @@ Reviewing one:
   and the plugin compile check installs no Python dependencies -- a green tick
   from those three says nothing about a dependency.
 - Action bumps arrive as majors, one per pull request. The `uses:` refs are
-  major-only tags (`@v4`), and Dependabot matches the precision of the ref it
-  finds, so `@v5` is the only update it can propose. Read the action's release
-  notes: a renamed input is exactly the kind of break no check on the PR sees.
+  floating major tags (`@v4`), and Dependabot matches the precision of the ref
+  it finds, so `@v5` is normally the only update it can propose. Read the
+  action's release notes: a renamed input is exactly the kind of break no check
+  on the PR sees.
+- One exception, worth recognising rather than rejecting: where an action has
+  stopped publishing floating major tags, Dependabot rewrites the ref to an
+  exact version instead, and the jump can cross several majors. `setup-uv` is
+  that case -- it publishes only immutable exact tags since v8.0.0 -- so its
+  bump will change the shape of the pin, not just its number.
 - Release-only actions are exercised by no pull-request check at all.
   `upload-artifact`, `download-artifact` and `action-gh-release` run only in
   `release.yml`, which triggers on a `v*.*.*` tag. Validate a bump to those with

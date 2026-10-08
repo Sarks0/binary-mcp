@@ -90,14 +90,27 @@ updates:
         patterns:
           - "actions/upload-artifact"
           - "actions/download-artifact"
-    # Every other action gets its own PR -- which is also all Dependabot can
-    # offer here. All nine refs are major-only tags (@v2, @v4, @v5) and
-    # Dependabot matches the precision of the ref it finds, so the only update
-    # it can propose for '@v4' is '@v5': a major. There is deliberately NO
-    # minor/patch group, because with these pins it could never match anything.
+    # Every other action gets its own PR -- which is also close to all
+    # Dependabot can offer here. All nine refs are FLOATING major tags (@v2,
+    # @v4, @v5), and Dependabot matches the precision of the ref it finds, so
+    # the only candidate for '@v4' is '@v5': a major. Hence deliberately NO
+    # minor/patch group -- as the refs stand it could not match anything.
     #
-    # One PR each suits them anyway: codecov-action v4 -> v5 renamed its `file:`
-    # input, and a setup-msbuild or actions-setup-cmake major can move the MSVC
+    # "As the refs stand" is load-bearing, because that rule has an exception:
+    # where upstream has STOPPED publishing a floating major, Dependabot bumps
+    # the floating ref to an exact tag instead. astral-sh/setup-uv is that case
+    # -- v8.0.0 was its first immutable release and no floating '@v8' or later
+    # major tag is published, by design, to blunt the tj-actions class of attack
+    # -- so the PR that arrives for '@v5' will not read 'v5 -> v6'. It will
+    # rewrite the ref to a pinned exact version, and may cross several majors at
+    # once. Expect the ref SHAPE to change on that one, review it as the pin
+    # change it is, and note that once an action is pinned exactly, patch/minor
+    # updates for it become real -- at which point a minor/patch group is worth
+    # adding, and the paragraph above stops being true.
+    #
+    # One PR each suits them anyway: codecov-action's v5 renamed its `file:`
+    # input (the ref here is behind enough that a bump may cross more than one
+    # major), and a setup-msbuild or actions-setup-cmake major can move the MSVC
     # toolchain, which with CMAKE_COMPILE_WARNING_AS_ERROR in ci.yml shows up as
     # new warnings failing the compile check. That gate working is the point.
     #

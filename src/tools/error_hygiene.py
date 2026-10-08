@@ -38,7 +38,7 @@ from src.utils.security import (
     PATH_ERROR_GUIDANCE,
     FileSizeError,
     PathTraversalError,
-    path_error_guidance,
+    path_refusal_message,
     safe_error_message,
 )
 from src.utils.structured_errors import StructuredBaseError
@@ -123,6 +123,8 @@ def safe_tool_error(operation: str, error: Exception) -> str:
     # extension" would trade one vague error for a confidently wrong one. A
     # tool that wants the missing-file category names FileNotFoundError in its
     # own arm, where the provenance is known.
+    # safe_error_message routes these at the base too, so this branch is here
+    # only to supply the operation name -- which it has and the base does not.
     if isinstance(error, (PathTraversalError, FileSizeError)):
         return safe_path_error(operation, error, "path")
 
@@ -168,7 +170,9 @@ def safe_tool_error(operation: str, error: Exception) -> str:
 _PATH_ERROR_GUIDANCE = PATH_ERROR_GUIDANCE
 
 
-def safe_path_error(operation: str, error: Exception, subject: str = "path") -> str:
+def safe_path_error(
+    operation: str, error: Exception, subject: str = "path", extra: str = None
+) -> str:
     """
     Format a path-validation failure without disclosing host layout (F-10).
 
@@ -182,34 +186,12 @@ def safe_path_error(operation: str, error: Exception, subject: str = "path") -> 
     Returns:
         Safe, still-actionable error string carrying a reference ID.
     """
-    guidance = path_error_guidance(error)
+    routed = path_refusal_message(operation, error, subject, extra)
+    if routed is not None:
+        return routed
 
-    if guidance is None:
-        # A ValueError from sanitize_binary_path ("Path is not a file: ...")
-        # or the wrapped OSError from sanitize_output_path ("Invalid path:
-        # ...") -- both interpolate a resolved absolute path, so neither text
-        # can be forwarded. Fall back to the generic safe envelope.
-        return safe_error_message(f"Invalid {subject} for {operation}", error)
-
-    error_id = str(uuid.uuid4())[:8]
-    # ERROR with a traceback, not WARNING without one. The reference ID handed
-    # to the caller is only worth anything if the operator can find the line it
-    # names, and a stdio MCP server is commonly run at level=ERROR -- at which
-    # a WARNING disappears, leaving the caller holding an ID that resolves to
-    # nothing. These are also the events most worth keeping: every confinement
-    # denial and every refused hard link comes through here. safe_error_message,
-    # which this function replaced at ~50 call sites, logged at ERROR with
-    # exc_info; matching it keeps that conversion from costing visibility.
-    logger.error(
-        "Error %s: %s rejected %s: %s: %s",
-        error_id,
-        operation or "tool call",
-        subject,
-        type(error).__name__,
-        error,
-        exc_info=error,
-    )
-    return (
-        f"Error: Invalid {subject} -- {guidance}\n"
-        f"Reference ID: {error_id}"
-    )
+    # None means the category cannot be described without echoing the text: a
+    # ValueError from sanitize_binary_path ("Path is not a file: ...") or the
+    # wrapped OSError from sanitize_output_path ("Invalid path: ..."), both of
+    # which interpolate a resolved absolute path. Generic envelope instead.
+    return safe_error_message(f"Invalid {subject} for {operation}", error)

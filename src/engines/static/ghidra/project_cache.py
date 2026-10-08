@@ -25,15 +25,6 @@ from pathlib import Path
 
 from src.utils.config import get_cache_dir
 
-# Module scope is safe for these: src/utils/security.py imports nothing from
-# this package (only stdlib), so there is no cycle. The LOCAL import inside
-# _get_binary_hash stays local for the reason given there; what is needed here
-# is only the exception classes, at class-definition time for _REFUSALS.
-from src.utils.security import (
-    FileSizeError,
-    PathTraversalError,
-)
-
 logger = logging.getLogger(__name__)
 
 # Longest project name we will hand Ghidra. GhidraRunner.analyze clamps to the
@@ -279,22 +270,51 @@ class ProjectCache:
     # swallow-and-miss behaviour: re-analysing is the right answer to a bad
     # cache entry, and is not the right answer to a denied path.
     #
-    # has_cached deliberately does NOT propagate. It is a boolean predicate
-    # whose callers turn a False into "analyze the binary first" -- a static
-    # sentence that neither leaks nor acts on the refused path -- so the
-    # fail-closed answer its own audit chose stays correct there.
-    _REFUSALS = (
-        PathTraversalError, FileSizeError, FileNotFoundError, IsADirectoryError,
-    )
+    # The split is by SCOPE, not by exception type, and the first attempt at
+    # this got that wrong in both directions. It matched a type tuple over a
+    # try block covering validation AND the cache read, which
+    #
+    #   * MISSED the directory case. sanitize_binary_path refuses a non-file
+    #     with ValueError, which was not in the tuple, so a directory was
+    #     still laundered into a cache miss -- submitting a Ghidra job for a
+    #     directory and handing the caller the refusal's raw text through the
+    #     job record. The leak this class was fixed for, still live.
+    #   * Listed IsADirectoryError, which nothing in this project raises, so
+    #     that entry was dead.
+    #   * And would have MISREPORTED a real cache fault: FileNotFoundError
+    #     from a cache file unlinked between _resolve_cache_path's exists()
+    #     check and the open (a concurrent clean_cache, invalidate, or
+    #     external GC) is indistinguishable by type from a missing binary, so
+    #     the caller was told "no file exists at the path supplied" about a
+    #     binary sitting on disk, and the analysis was abandoned instead of
+    #     re-run.
+    #
+    # Adding ValueError to a type tuple would not have helped either: a
+    # corrupt cache file raises json.JSONDecodeError, which IS a ValueError,
+    # so the tuple would have turned the commonest genuine cache fault into a
+    # hard refusal. Validation and I/O are now in separate try blocks, which
+    # is what the distinction actually is -- everything the validator raises
+    # propagates, everything the read raises degrades to a miss.
+    #
+    # has_cached deliberately does NOT propagate; see its own docstring.
 
     def has_cached(self, binary_path: str) -> bool:
         """Check if analysis results are cached for a binary.
 
         Unlike :meth:`get_cached` this still answers False for a refused path
-        rather than raising -- see the note above ``_REFUSALS`` for why the two
-        differ. It is a predicate, read as ``if not cache.has_cached(...)`` at
-        nine call sites that answer "analyze the binary first", which is a
-        fine thing to tell someone about a path they may not read.
+        rather than raising. It is a boolean predicate: its nine callers turn
+        a False into a fixed sentence and stop, so nothing leaks and no work is
+        scheduled on the refused path, which is the property that mattered.
+
+        It is NOT a good answer, though, and the limitation is worth stating
+        rather than dressing up. Six of those callers (``src/tools/
+        dynamic_tools.py``) say "No Ghidra analysis cache found for 'x'" --
+        a false statement about a binary that was refused for its link count
+        or its directory, and one that sends the caller off to analyse
+        something that will be refused again. Making this propagate means
+        giving nine x64dbg/malware handlers a path arm they do not have; that
+        is a change to those tools, not to this method, and it is not in the
+        change that wrote this docstring.
         """
         try:
             binary_hash = self._get_binary_hash(binary_path)
@@ -307,11 +327,16 @@ class ProjectCache:
         """Retrieve cached analysis results (gz or legacy).
 
         Raises:
-            PathTraversalError, FileSizeError, FileNotFoundError: If the path
-                is refused. See the note above ``_REFUSALS``.
+            Whatever :func:`sanitize_binary_path` raises for a refused path --
+            PathTraversalError (including HardLinkError), FileSizeError,
+            FileNotFoundError or ValueError. See the note above.
         """
+        # Validation: everything propagates. Deliberately OUTSIDE the try
+        # below, so the split is by scope rather than by exception type.
+        binary_hash = self._get_binary_hash(binary_path)
+
+        # Cache I/O: everything degrades to a miss.
         try:
-            binary_hash = self._get_binary_hash(binary_path)
             cache_path = self._resolve_cache_path(binary_hash)
 
             if cache_path is None:
@@ -331,8 +356,6 @@ class ProjectCache:
             )
             return data
 
-        except self._REFUSALS:
-            raise
         except Exception as e:
             logger.error(f"Error reading cache: {e}")
             return None
@@ -344,11 +367,10 @@ class ProjectCache:
         Callers (e.g. resumable analysis) need the path to hand to Ghidra
         without paying the cost of loading the JSON.
         """
+        # Same split as get_cached: validation propagates, resolution degrades.
+        binary_hash = self._get_binary_hash(binary_path)
         try:
-            binary_hash = self._get_binary_hash(binary_path)
             return self._resolve_cache_path(binary_hash)
-        except self._REFUSALS:
-            raise
         except Exception as e:
             logger.error(f"Error resolving cache path: {e}")
             return None

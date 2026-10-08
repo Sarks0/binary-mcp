@@ -1112,6 +1112,63 @@ def path_error_guidance(error: Exception) -> "str | None":
     return None
 
 
+def path_refusal_message(
+    operation: str, error: Exception, subject: str = "path", extra: str = None
+) -> str:
+    """
+    The one renderer for a path refusal: category to the caller, detail to the log.
+
+    Lives HERE, beside :data:`PATH_ERROR_GUIDANCE`, because three layers need
+    it and ``src/utils/`` cannot import from ``src/tools/``:
+    :func:`safe_error_message` below (the base every catch-all in the project
+    reaches), ``tools.error_hygiene.safe_path_error`` (the explicit per-tool
+    arms), and through that, ``safe_tool_error``. The note on
+    PATH_ERROR_GUIDANCE records what a second copy cost last time; this is the
+    same rule applied to the renderer rather than just the text.
+
+    Args:
+        operation: Short description of what failed, normally the tool name.
+        error: The caught path-validation exception.
+        subject: What was being validated, e.g. ``"binary path"``. Named in the
+            first line so the caller can tell which argument to fix, so it
+            should match the parameter the tool actually takes.
+        extra: Tool-specific remediation to add BEFORE the reference ID, for
+            the cases where the tool knows something the guidance cannot --
+            ``clean_cache`` can still wipe the cache of a binary that is no
+            longer on disk, for instance. It belongs here rather than
+            concatenated onto this function's return value, which is how the
+            reference ID ended up in the middle of a reply that every other
+            refusal in the project terminates with.
+
+    Returns:
+        Safe, still-actionable error text, or ``None`` if the exception's
+        category cannot be described without echoing its text.
+    """
+    guidance = path_error_guidance(error)
+    if guidance is None:
+        return None
+
+    error_id = str(uuid.uuid4())[:8]
+    # ERROR with a traceback, not WARNING without one: a stdio MCP server is
+    # commonly run at level=ERROR, where a WARNING disappears and leaves the
+    # caller holding a reference ID that resolves to nothing. These are also
+    # the events most worth keeping -- every confinement denial comes through
+    # here.
+    logger.error(
+        "Error %s: %s rejected %s: %s: %s",
+        error_id,
+        operation or "tool call",
+        subject,
+        type(error).__name__,
+        error,
+        exc_info=error,
+    )
+    body = f"Error: Invalid {subject} -- {guidance}"
+    if extra:
+        body = f"{body}\n{extra}"
+    return f"{body}\nReference ID: {error_id}"
+
+
 def safe_path_reason(error: Exception) -> str:
     """
     Non-disclosing ``StructuredError.reason`` text for a path failure.
@@ -1192,6 +1249,28 @@ def safe_error_message(
     """
     if error_id is None:
         error_id = str(uuid.uuid4())[:8]
+
+    # A confinement refusal keeps its category, wherever it surfaces.
+    #
+    # This is the structural half of the fix. The per-tool arms and
+    # safe_tool_error cover src/server.py, coverage_tools and dynamic_tools --
+    # but every catch-all in the other eleven tool modules lands HERE instead
+    # (15 in dotnet_tools alone, 0 safe_tool_error calls between them), so
+    # routing only there left "a tool cannot reintroduce the gap by forgetting
+    # an arm" true of one file and false of eleven. Routing at the base makes
+    # it true everywhere, including for tools added later.
+    #
+    # Only these two types. Both are raised exclusively by this project's own
+    # path validators, so the category is unambiguous. FileNotFoundError is
+    # NOT included even though PATH_ERROR_GUIDANCE has text for it: the Ghidra
+    # detector raises it for a missing INSTALLATION, and answering that with
+    # "check the name and extension" would trade a vague error for a
+    # confidently wrong one. A tool wanting that category names
+    # FileNotFoundError in its own arm, where the provenance is known.
+    if isinstance(internal_details, (PathTraversalError, FileSizeError)):
+        routed = path_refusal_message(user_message, internal_details)
+        if routed is not None:
+            return routed
 
     # Log internal details
     if internal_details:

@@ -545,7 +545,7 @@ def hardlinked_sample(quarantine, tmp_path):
     plain out-of-bounds refusal against the same fixture.
     """
     if os.name == "nt":
-        pytest.skip("st_nlink is not a reliable hard-link signal on Windows")
+        pytest.skip("the hard-link check is not enabled on Windows (see _reject_hardlinked_file)")
 
     outside = tmp_path / "outside"
     outside.mkdir(exist_ok=True)
@@ -656,6 +656,35 @@ _SWEEP_ARGS = {
     "rule_name": "r",
     "tag": "t",
     "session_id": "00000000-0000-4000-8000-000000000000",
+    # Added after the sweep was found to be silently dropping these: the
+    # for/else below `break`s out for any tool whose other required argument
+    # has no placeholder, so decrypt_xor, expand_callgraph and
+    # extract_python_packed -- all three of which had their path arms rewritten
+    # in the change that added this sweep -- were covered by nothing at all.
+    "key": "41",
+    "root": "main",
+    "output_dir": "out",
+    "note": "n",
+    "new_name": "renamed",
+}
+
+# Extra OPTIONAL arguments a few tools need before they will look at the path
+# at all. rename_function returns "Must provide either 'address' or 'old_name'"
+# from its own argument check, which runs first, so without this the sweep
+# drove it to an argument error and learned nothing about its path handling.
+# Kept explicit and per-tool rather than passing every optional argument the
+# sweep happens to have a value for, which would change what is under test.
+_SWEEP_EXTRA_ARGS = {
+    "rename_function": {"old_name": "main"},
+}
+
+# Module-level callables that take a binary_path but are not MCP tools, so the
+# sweep's "every tool returns a refusal string" contract does not apply: the
+# validators raise by design, and these helpers are called with a cache or a
+# resolved address by their real callers.
+_SWEEP_NON_TOOL_HELPERS = {
+    "auto_mark_reviewed",
+    "find_table_base_refs",
 }
 
 # Module-level helpers that happen to take a binary_path but are not MCP tools.
@@ -671,8 +700,18 @@ _SWEEP_NOT_TOOLS = {
 
 
 def _binary_path_tools(server):
-    """Every callable in src.server taking ``binary_path`` we can drive."""
+    """
+    Every callable in src.server taking ``binary_path`` we can drive.
+
+    Returns ``(found, skipped)``. The skipped list is the point: this used to
+    `break` out of the argument loop and move on, so a tool whose other
+    required argument had no placeholder simply vanished from the sweep. Seven
+    did, three of them modified by the change that added the sweep, and
+    nothing failed -- the guard test only checked a floor count and four
+    hardcoded names. Handing the list back lets the guard assert it.
+    """
     found = []
+    skipped = []
     for name in sorted(dir(server._module)):
         if name.startswith("_") or name in _SWEEP_NOT_TOOLS:
             continue
@@ -686,15 +725,23 @@ def _binary_path_tools(server):
         if "binary_path" not in signature.parameters:
             continue
         kwargs = {}
+        unsupplied = [
+            pname
+            for pname, param in signature.parameters.items()
+            if pname != "binary_path"
+            and param.default is inspect.Parameter.empty
+            and pname not in _SWEEP_ARGS
+        ]
+        if unsupplied:
+            skipped.append((name, unsupplied))
+            continue
         for pname, param in signature.parameters.items():
             if pname == "binary_path" or param.default is not inspect.Parameter.empty:
                 continue
-            if pname not in _SWEEP_ARGS:
-                break
             kwargs[pname] = _SWEEP_ARGS[pname]
-        else:
-            found.append((name, fn, kwargs))
-    return found
+        kwargs.update(_SWEEP_EXTRA_ARGS.get(name, {}))
+        found.append((name, fn, kwargs))
+    return found, skipped
 
 
 def test_the_sweep_finds_the_tools_it_claims_to(server):
@@ -705,11 +752,27 @@ def test_the_sweep_finds_the_tools_it_claims_to(server):
     nothing -- an earlier version of this sweep enumerated the proxy instead
     of the module and cheerfully reported that zero tools took a binary_path.
     """
-    tools = _binary_path_tools(server)
+    tools, skipped = _binary_path_tools(server)
     names = {name for name, _, _ in tools}
     assert len(tools) >= 20, f"sweep found only {len(tools)} tools: {sorted(names)}"
     for expected in ("analyze_binary", "check_binary", "get_functions", "get_xrefs"):
         assert expected in names, f"sweep no longer reaches {expected}"
+
+    # Nothing may drop out silently. A floor count and four names could not
+    # see it when seven tools vanished for want of an argument placeholder --
+    # add a required argument to any swept tool and it leaves the sweep
+    # without failing anything. Anything genuinely not a tool is named in
+    # _SWEEP_NON_TOOL_HELPERS, so the remainder has to be empty.
+    unexplained = [
+        (name, args) for name, args in skipped
+        if name not in _SWEEP_NON_TOOL_HELPERS
+    ]
+    assert not unexplained, (
+        "these binary_path tools are silently outside the sweep; add a "
+        "placeholder to _SWEEP_ARGS for each argument listed, or name the "
+        "callable in _SWEEP_NON_TOOL_HELPERS if it is not a tool:\n  "
+        + "\n  ".join(f"{n}: needs {a}" for n, a in unexplained)
+    )
 
 
 @pytest.fixture
@@ -729,9 +792,19 @@ def refused_paths(quarantine, tmp_path):
     target = outside / "secret"
     target.write_bytes(b"MZ\x90\x00" + b"\x00" * 64)
 
+    adir = quarantine / "a-directory"
+    adir.mkdir(exist_ok=True)
+
     cases = [
         ("out of bounds", target),
         ("missing", quarantine / "nope.bin"),
+        # The directory case is the reason this list exists as a fixture. Its
+        # absence is how a live leak survived this very sweep: a directory is
+        # refused by sanitize_binary_path with ValueError, which was not in
+        # ProjectCache._REFUSALS, so the refusal was laundered into a cache
+        # miss, a Ghidra job was submitted for a directory, and the job
+        # record's raw error text came back to the caller.
+        ("directory", adir),
     ]
     if os.name != "nt":
         link = quarantine / "sample.bin"
@@ -759,7 +832,7 @@ def test_no_tool_leaks_host_layout_when_it_refuses_a_path(
     _disable_auto_session(server, monkeypatch)
 
     offenders = []
-    for name, fn, kwargs in _binary_path_tools(server):
+    for name, fn, kwargs in _binary_path_tools(server)[0]:
         for label, path in refused_paths:
             try:
                 result = str(fn(binary_path=str(path), **kwargs))
@@ -776,7 +849,7 @@ def test_no_tool_leaks_host_layout_when_it_refuses_a_path(
 
 
 def test_every_tool_names_the_category_of_a_confinement_refusal(
-    server, hardlinked_sample, monkeypatch
+    server, refused_paths, monkeypatch
 ):
     """
     A refusal has to say WHICH refusal it was, not just that one happened.
@@ -794,16 +867,25 @@ def test_every_tool_names_the_category_of_a_confinement_refusal(
     forgetting an arm.
     """
     _disable_auto_session(server, monkeypatch)
-    link, secret = hardlinked_sample
+    cases = dict(refused_paths)
 
     vague = []
-    for name, fn, kwargs in _binary_path_tools(server):
-        hardlink_result = str(fn(binary_path=str(link), **kwargs))
-        oob_result = str(fn(binary_path=str(secret), **kwargs))
-        if "hard link" not in hardlink_result:
-            vague.append(f"{name}: hard-link refusal does not mention the link")
+    for name, fn, kwargs in _binary_path_tools(server)[0]:
+        oob_result = str(fn(binary_path=str(cases["out of bounds"]), **kwargs))
         if "outside the directories" not in oob_result:
             vague.append(f"{name}: out-of-bounds refusal does not say so")
+
+        # Only on POSIX: the hard-link check is not enabled on Windows, so
+        # there is no hard-link refusal to name there. The out-of-bounds half
+        # above does not depend on it and now runs everywhere -- taking the
+        # hard-link fixture directly made this whole test skip on Windows,
+        # which is the mistake refused_paths was introduced to fix and which
+        # was fixed in only one of the two sweeps the first time.
+        if "hard link" not in cases:
+            continue
+        hardlink_result = str(fn(binary_path=str(cases["hard link"]), **kwargs))
+        if "hard link" not in hardlink_result:
+            vague.append(f"{name}: hard-link refusal does not mention the link")
         if hardlink_result == oob_result:
             vague.append(f"{name}: the two refusals are identical")
 

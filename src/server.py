@@ -1938,14 +1938,12 @@ Format: {compat_info.format.value}
         # "Analysis failed unexpectedly" while check_binary, two thousand
         # lines down, answered the same input usefully.
         #
-        # NOTE this is not yet the whole module: load_pdb, decompile_function,
-        # get_notes and find_related_sessions still answer a refused path with
-        # the collapsed envelope, and the tools that validate only via
-        # get_analysis_context cannot reach an arm like this at all -- it
-        # converts every path error to RuntimeError(f"...{e}") at the top of
-        # that function, which both erases the type and forwards the resolved
-        # allow-list. Fixing those is a change to get_analysis_context, not to
-        # this handler.
+        # An explicit arm is no longer what makes this work, and that is the
+        # point: security.safe_error_message routes PathTraversalError and
+        # FileSizeError through the same renderer, so every catch-all in the
+        # project keeps the category whether or not its tool remembered an arm
+        # like this one. The arm is kept because it names the subject
+        # ("binary path") and the operation, which the base cannot.
         return safe_path_error("analyze_binary", e, "binary path")
     except GhidraAnalysisError as e:
         # Ghidra itself failed (subprocess error or timeout). The diagnostic
@@ -2265,15 +2263,19 @@ def load_pdb(
                         allowed_dirs=get_allowed_dirs(),
                     )
                 )
-            except FileNotFoundError:
-                return f"PDB not found at {pdb_path}"
-            except PathTraversalError:
-                return (
-                    "PDB path is outside the allowed directories "
-                    "(BINARY_MCP_ALLOWED_DIRS)."
-                )
-            except (FileSizeError, ValueError) as e:
-                return safe_error_message("Invalid PDB path", e)
+            except (
+                PathTraversalError, FileSizeError, FileNotFoundError, ValueError
+            ) as e:
+                # One arm, and routed. The three it replaces each got this
+                # wrong in a different way: the PathTraversalError arm returned
+                # a hardcoded "outside the allowed directories", which is the
+                # exact false diagnosis this change exists to remove -- a
+                # hard-linked PDB is a HardLinkError, caught here, and the
+                # directory was accepted; the FileNotFoundError arm echoed the
+                # caller's path; and the last collapsed the category. The
+                # binary-path arm a few lines up was converted and this one
+                # was missed.
+                return safe_path_error("load_pdb", e, "PDB path")
 
         # Capture pre-state for before/after comparison
         pre_cached = cache.get_cached(binary_path)
@@ -2417,11 +2419,19 @@ def clean_cache(
                 # transcript -- and this arm fires on the most ordinary
                 # mistake there is, a typo. The remaining advice is the part
                 # that was actually useful.
-                return (
-                    f"{safe_path_error('clean_cache', e, 'binary path')}\n"
-                    f"To wipe a stale cache for a binary that is no longer "
-                    f"on disk, call clean_cache() with no arguments for a "
-                    f"full wipe."
+                # The advice goes in the MESSAGE, not after the envelope.
+                # Concatenating it onto safe_path_error's output put the
+                # Reference ID line in the middle of the reply, where every
+                # other refusal in the project ends with it -- and where
+                # test_confinement_sweep's own _without_reference_id helper
+                # assumes it is the last line.
+                return safe_path_error(
+                    "clean_cache", e, "binary path",
+                    extra=(
+                        "To wipe a stale cache for a binary that is no longer "
+                        "on disk, call clean_cache() with no arguments for a "
+                        "full wipe."
+                    ),
                 )
 
             ok = cache.invalidate(
@@ -6279,7 +6289,7 @@ def analyze_pyc_file(pyc_path: str) -> str:
         return wrap_untrusted('\n'.join(output), "pyc analysis")
 
     except (PathTraversalError, FileSizeError) as e:
-        return safe_path_error("analyze_pyc_file", e, "binary path")
+        return safe_path_error("analyze_pyc_file", e, "pyc path")
     except FileNotFoundError as e:
         return safe_path_error("analyze_pyc_file", e, "path")
     except Exception as e:

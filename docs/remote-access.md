@@ -22,16 +22,29 @@ x64dbg, the sample and (for the first arrangement) this server run.
 ## Remote MCP server
 
 ```
-Host A                        Host B
-┌──────────────────┐         ┌───────────────────────────────────┐
-│ MCP client ──────┼──MCP───▶│ binary-mcp (http transport)       │
-└──────────────────┘         │   └─ Ghidra                       │
-                             │   └─ x64dbg + obsidian.dp64       │
-                             └───────────────────────────────────┘
+  HOST A  analyst workstation          HOST B  debugger VM
+  ┌─────────────────────────┐          ┌──────────────────────────────┐
+  │  MCP client             │          │  binary-mcp  (Python)        │
+  │  Claude Code / Desktop  │          │  FastMCP  transport=http     │
+  │                         │          │  ┌────────────────────────┐  │
+  │                         │ MCP/TLS  │  │ RemoteAccessGate (ASGI)│  │
+  │              ───────────┼─────────▶│  └───────────┬────────────┘  │
+  │                         │  :8770   │              ▼               │
+  │                         │  /mcp    │        tool dispatch         │
+  └─────────────────────────┘          │         │           │        │
+                                       │         ▼           ▼        │
+                                       │      Ghidra    X64DbgBridge  │
+                                       │      + cache        │        │
+                                       │                     ▼ 8765   │
+                                       │  x64dbg + obsidian.dp64      │
+                                       │  + the sample + all dumps    │
+                                       └──────────────────────────────┘
 ```
 
 Everything the server touches — the sample, the Ghidra cache, memory dumps,
 trace logs — is on one filesystem, so no artifact ends up on the wrong host.
+The bridge hop inside Host B stays on loopback, so none of the x64dbg-side
+remote configuration applies. Cost: Ghidra runs inside the malware VM.
 
 ### Option 1: over an SSH tunnel (recommended)
 
@@ -143,6 +156,22 @@ client address and the reason.
 The other arrangement — this server and Ghidra on Host A, only the x64dbg hop
 crossing the network. Use it when the analysis brain should stay outside the
 malware VM, or when Ghidra wants a bigger machine than the VM.
+
+```
+  HOST A  analyst workstation          HOST B  debugger VM
+  ┌─────────────────────────┐          ┌──────────────────────────────┐
+  │  MCP client             │          │  obsidian_server.exe         │
+  │       │ stdio           │          │   listener_policy.h          │
+  │       ▼                 │          │   + Schannel TLS 1.2         │
+  │  binary-mcp (Python)    │  HTTPS   │        ▲                     │
+  │   ├─ Ghidra + cache     │ ────────▶│        │ named pipe          │
+  │   └─ X64DbgBridge ──────┼─ :8765   │        ▼ \\.\pipe\x64dbg_mcp │
+  │        verify= $X64DBG_ │          │  x64dbg.exe                  │
+  │                 TLS_CA  │          │   └─ obsidian.dp64           │
+  │                         │          │       spawns the server,     │
+  │  sample copy, dumps     │          │       reads obsidian.ini     │
+  └─────────────────────────┘          └──────────────────────────────┘
+```
 
 The endpoint policy mirrors the listener's: loopback needs no opt-in, and a
 non-loopback host needs `BINARY_MCP_REMOTE_ALLOW`, a CA and an explicit token,
@@ -354,5 +383,76 @@ removes the first.
 | `SSLError` / certificate verify failed | The certificate Host B serves is not the one in `X64DBG_TLS_CA`, or its subject alternative name does not cover `X64DBG_HOST` (the `TextExtension` line) |
 | Plugin log says `Server refused its listener configuration (exit 2)` | The flags built from `obsidian.ini` were rejected. The reason is in `obsidian_server.log`; deleting the ini restores the loopback default |
 | Plugin log says `obsidian.ini is malformed` | A value contains a character a flag cannot hold — usually a stray space or quote. The whole file is refused rather than one setting dropped |
-| Nothing listens, and the server log says `no certificate with that thumbprint` | The thumbprint is from a different store. `--machine-store` / `machine_store=1` selects `LocalMachine\\My`; the default is `CurrentUser\\My`, which is what x64dbg's own user can read |
+| Nothing listens, and the server log says `no certificate with that thumbprint` | The thumbprint is from a different store. `--machine-store` / `machine_store=1` selects `LocalMachine\My`; the default is `CurrentUser\My`, which is what x64dbg's own user can read |
 | Connection reset, or a timeout, reaching a host that is clearly up | `HTTPS_PROXY` is set in the server's environment and `requests` is routing the debugger connection through it. Add the debugger host to `no_proxy` |
+
+---
+
+## What the gates check
+
+Both listeners apply the same checks in the same order: cheapest and least
+secret-dependent first, so a denial never depends on comparing a token the
+caller was never going to get right.
+
+The chain below is `obsidian_server.exe`. The Python gate
+(`RemoteAccessGate` in `src/utils/remote.py`) runs steps 1 and 4–7; steps 2
+and 3 are uvicorn's.
+
+```
+  connection ──▶ ┌────────────────────────────────────────────┐
+                 │  accept()                                  │
+                 ├────────────────────────────────────────────┤
+                 │ 1  client address   allow_clients     403  │ ◀─ before TLS,
+                 ├────────────────────────────────────────────┤    before any
+                 │ 2  TLS handshake    + mTLS chain pin       │    parsing
+                 ├────────────────────────────────────────────┤
+                 │ 3  read request     16 KiB headers         │
+                 │                     1 MiB body             │
+                 │                     15 s deadline          │
+                 ├────────────────────────────────────────────┤
+                 │ 4  duplicate Host or Origin?          400  │
+                 ├────────────────────────────────────────────┤
+                 │ 5  Host    == bind / allow_hosts      400  │ ◀─ DNS
+                 ├────────────────────────────────────────────┤    rebinding
+                 │ 6  Origin  == bind / allow_hosts      400  │
+                 ├────────────────────────────────────────────┤
+                 │ 7  Bearer token     constant-time     401  │
+                 ├────────────────────────────────────────────┤
+                 │ 8  dispatch ──▶ pipe ──▶ plugin ──▶ x64dbg │
+                 └────────────────────────────────────────────┘
+```
+
+A duplicate `Host` is refused rather than resolved (step 4) because a gate
+deciding on the first value while a proxy in front decided on the last is a
+gate that can be walked past — and a TLS terminator in front of a loopback
+listener is a supported deployment.
+
+## What the policy demands
+
+One rule, enforced identically by `resolve_debugger_endpoint` and
+`resolve_transport_config` on the Python side and `ParseOptions` on the C++
+side:
+
+```
+                 is it loopback?
+                        │
+            ┌───────────┴────────────┐
+           yes                       no
+            │                         │
+   no opt-in needed          ┌────────┴───────────────────────┐
+   TLS optional              │  REMOTE_ALLOW=1                │  all three,
+   token still required      │  + a certificate / CA          │  or refuse
+   (%TEMP% file fallback)    │  + an explicit token           │  to start
+                             └────────────────────────────────┘
+
+   0.0.0.0   ::   *   ──▶  refused always, opt-in or not
+   an address the parser cannot classify  ──▶  refused, never given to the OS
+```
+
+That last line is the one worth remembering. Each of these is a form
+`inet_addr` accepts and this parser refuses: `0` as the wildcard `0.0.0.0`,
+`127.1` as loopback, `0177.0.0.1` as octal. A classifier that disagrees with
+the thing performing the bind is one that can be walked past, so both read the
+same strict dotted-quad parser. The decisions in that diagram are compiled and
+executed by `tests/test_cpp_listener_policy.py` and
+`tests/test_remote_policy.py`.

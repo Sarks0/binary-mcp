@@ -17,6 +17,7 @@ that needed the real app could not run in CI.
 from __future__ import annotations
 
 import ipaddress
+import socket
 import ssl
 
 import pytest
@@ -934,39 +935,89 @@ class TestCipherSuites:
         assert "ssl_ca_certs" not in config
 
 
-class TestAddressClassificationMatchesTheBinder:
-    """Every spelling the socket layer accepts must be classified, not just the
-    strict dotted quad.
+def _what_the_os_binds(host: str) -> str | None:
+    """The address this platform's socket layer actually binds for ``host``.
 
-    ``ipaddress.ip_address`` implements the strict form; ``inet_aton``, which
-    is what ``bind()`` goes through, also accepts ``0``, ``00``, ``0x0`` and
-    ``0.0`` (all 0.0.0.0) and ``127.1`` and ``0177.0.0.1`` (both 127.0.0.1).
-    Classifying with the strict parser while binding with the lax one is how
-    ``BINARY_MCP_HTTP_HOST=0`` came to be accepted as an ordinary remote bind
-    and then listened on every interface -- the one thing the policy says is
-    refused with or without the opt-in.
+    None means it refuses the spelling. Probed rather than assumed because the
+    accepted set is platform-specific: glibc's resolver takes ``0177.0.0.1`` as
+    octal for 127.0.0.1, macOS's does not, and a test that hardcodes either
+    answer is testing the platform rather than the policy.
+    """
+    probe = socket.socket()
+    try:
+        probe.bind((host, 0))
+        return str(probe.getsockname()[0])
+    except OSError:
+        return None
+    finally:
+        probe.close()
+
+
+# Spellings of an address that are not the strict dotted quad. ``inet_aton``,
+# which is what bind() ends up going through, reads the first four as 0.0.0.0
+# and the next two as 127.0.0.1 -- on the platforms that accept them at all.
+_SHORTHAND_SPELLINGS = [
+    "0", "00", "0x0", "0.0", "0.0.0.0", "127.1", "0177.0.0.1",
+    "127.0.0.1", "127.0.0.2",
+]
+
+
+class TestAddressClassificationMatchesTheBinder:
+    """The classifier must never describe an address more narrowly than the
+    socket layer will bind it.
+
+    ``ipaddress.ip_address`` implements the strict dotted quad; the resolver
+    behind ``bind()`` is laxer. Classifying with the strict parser while
+    binding with the lax one is how ``BINARY_MCP_HTTP_HOST=0`` came to be
+    accepted as an ordinary remote bind and then listened on every interface --
+    the one thing the policy says is refused with or without the opt-in.
+
+    Which exotic spellings a platform accepts is its own business, so these
+    assert the two invariants that hold everywhere rather than a fixed table.
+    An earlier version asserted the table and failed on macOS, whose resolver
+    takes ``127.1`` but not ``0177.0.0.1``.
     """
 
     @pytest.mark.parametrize("host", ["0", "00", "0x0", "0.0", "0.0.0.0", "::"])
-    def test_every_wildcard_spelling_is_caught(self, host):
-        assert is_wildcard_host(host), f"{host!r} binds 0.0.0.0 but reads as specific"
-
-    @pytest.mark.parametrize("host", ["127.1", "0177.0.0.1", "127.0.0.1", "127.0.0.2"])
-    def test_every_loopback_spelling_is_caught(self, host):
-        assert is_loopback_host(host), f"{host!r} binds loopback but reads as remote"
-
-    @pytest.mark.parametrize("host", ["0", "00", "0x0", "0.0"])
-    def test_wildcard_shorthand_is_refused_even_fully_configured(
+    def test_a_wildcard_spelling_is_never_a_usable_bind(
         self, monkeypatch, tls_pair, host
     ):
-        """The bypass, as a test: opt-in plus TLS plus a token must not help."""
+        """The security invariant: refused, whatever the reason.
+
+        Either the classifier recognises the wildcard, or it cannot classify
+        the string at all and the bind is refused as not-an-address-literal.
+        Both are refusals; what must never happen is the string being taken for
+        a specific interface and then binding every one of them.
+        """
         _remote(monkeypatch, tls_pair, **{ENV_HTTP_HOST: host})
-        with pytest.raises(TransportConfigError, match="binds every interface"):
+        with pytest.raises(TransportConfigError):
             resolve_transport_config()
 
-    @pytest.mark.parametrize("host", ["127.1", "0177.0.0.1"])
-    def test_loopback_shorthand_needs_no_opt_in(self, monkeypatch, host):
-        """The converse: a real loopback bind must not demand the remote three."""
+    @pytest.mark.parametrize("host", _SHORTHAND_SPELLINGS)
+    def test_the_classifier_never_overstates_a_spelling(self, host):
+        """Never read an address as narrower than what gets bound.
+
+        The opposite direction -- the OS binds loopback while the classifier
+        says remote -- is deliberately not asserted. It is fail-closed (the
+        operator is asked for an opt-in they do not strictly need) and it is
+        exactly where platforms differ.
+        """
+        bound = _what_the_os_binds(host)
+        if bound is None:
+            return  # this platform refuses the spelling, and so does the policy
+        address = ipaddress.ip_address(bound)
+        if address.is_unspecified:
+            assert is_wildcard_host(host), (
+                f"{host!r} binds {bound} but the classifier reads it as specific"
+            )
+        if not address.is_loopback:
+            assert not is_loopback_host(host), (
+                f"{host!r} binds {bound} but the classifier reads it as loopback"
+            )
+
+    @pytest.mark.parametrize("host", ["127.0.0.1", "127.0.0.2", "127.255.255.254"])
+    def test_canonical_loopback_needs_no_opt_in(self, monkeypatch, host):
+        """The whole 127.0.0.0/8 range, in the spelling every platform accepts."""
         monkeypatch.setenv(ENV_TRANSPORT, "http")
         monkeypatch.setenv(ENV_HTTP_HOST, host)
         assert resolve_transport_config().is_loopback

@@ -272,6 +272,28 @@ class PathTraversalError(SecurityError):
     pass
 
 
+class HardLinkError(PathTraversalError):
+    """
+    Raised when a multiply-linked regular file is refused (see
+    :func:`_reject_hardlinked_file`).
+
+    A SUBCLASS of :class:`PathTraversalError` on purpose. Roughly thirty tool
+    handlers catch ``PathTraversalError`` to mean "this path was refused", and
+    the refusal genuinely is a confinement refusal -- just not a *directory*
+    one. Subclassing keeps every one of those handlers working unchanged while
+    letting the ones that explain the failure tell the two cases apart.
+
+    That distinction is the whole reason the type exists. Both refusals used to
+    arrive as a bare ``PathTraversalError``, and
+    :data:`PATH_ERROR_GUIDANCE` keys on the exception TYPE, so a hard-linked
+    staging copy was described to the caller as "the path is outside the
+    directories this server is allowed to read" -- which is false, and sends
+    whoever reads it to re-check ``BINARY_MCP_ALLOWED_DIRS`` instead of the
+    link count. The only way to tell them apart was to read this file.
+    """
+    pass
+
+
 class FileSizeError(SecurityError):
     """Raised when file size exceeds limits."""
     pass
@@ -322,7 +344,9 @@ def _reject_hardlinked_file(path: Path, binary_path: str) -> None:
         binary_path: The caller's original argument, for the error message.
 
     Raises:
-        PathTraversalError: If ``path`` is a regular file with several links.
+        HardLinkError: If ``path`` is a regular file with several links. A
+            ``PathTraversalError`` subclass, so existing handlers still catch
+            it; see that class for why it is not the base type.
     """
     if os.name == "nt" or _hardlinks_allowed():
         return
@@ -335,7 +359,7 @@ def _reject_hardlinked_file(path: Path, binary_path: str) -> None:
         return
 
     if st.st_nlink > 1:
-        raise PathTraversalError(
+        raise HardLinkError(
             f"Access denied: {binary_path} is a hard link (it has "
             f"{st.st_nlink} names). Directory confinement resolves symlinks "
             f"but cannot see through a hard link, so a multiply-linked file "
@@ -371,6 +395,9 @@ def sanitize_binary_path(
     Raises:
         PathTraversalError: If path is invalid, outside allowed directories,
             or confinement is required but unconfigured
+        HardLinkError: If the file has more than one name while confinement is
+            active. A ``PathTraversalError`` subclass, listed separately
+            because it is a different refusal with a different remedy
         FileSizeError: If file exceeds size limit
         FileNotFoundError: If file does not exist
         ValueError: If path validation fails
@@ -994,6 +1021,24 @@ def get_allowed_dirs() -> list[Path] | None:
 # the same text through StructuredError.reason, which curated_structured_text
 # deliberately preserves. A second copy is how that happened.
 PATH_ERROR_GUIDANCE: "dict[type, str]" = {
+    # Must stay distinct from the PathTraversalError text below. A hard-linked
+    # sample is refused for a reason that has nothing to do with WHERE it sits,
+    # and describing it as an out-of-bounds path sent at least one operator
+    # re-checking their allow-list for a refusal the allow-list did not cause.
+    # The link count is the operator's own staging choice, not host layout, so
+    # it is safe to name here -- what is still withheld is the directory list.
+    HardLinkError: (
+        "the file has more than one name (it is a hard link), and this server "
+        "refuses multiply-linked files while path confinement is active: "
+        "containment resolves symlinks but cannot see through a hard link, so "
+        "a link inside an allowed directory may be the same inode as a file "
+        "outside it. NOTE this is not an out-of-bounds path -- the directory "
+        "was accepted, the link count was not, so widening "
+        f"{ENV_ALLOWED_DIRS} will not help. Stage the sample with a copy "
+        f"rather than a link, or ask the operator to set "
+        f"{ENV_ALLOW_HARDLINKS}=1 if this corpus is deliberately "
+        "de-duplicated with links."
+    ),
     PathTraversalError: (
         "the path is outside the directories this server is allowed to read. "
         f"Analyse files from a directory the operator exposed via "
@@ -1025,9 +1070,17 @@ def path_error_guidance(error: Exception) -> "str | None":
     Return non-disclosing guidance for a path-validation error, or None.
 
     None means the exception type is not one whose category can be described
-    without echoing its text -- callers decide their own fallback. Iteration
-    order is irrelevant: the mapped types are siblings, never subclasses of one
-    another.
+    without echoing its text -- callers decide their own fallback.
+
+    Resolution is MOST SPECIFIC FIRST, by walking the exception's own MRO
+    rather than scanning the mapping with ``isinstance``. The mapped types used
+    to be siblings, so a scan in dict order was fine; :class:`HardLinkError`
+    broke that by subclassing :class:`PathTraversalError`, and a scan would
+    hand it whichever of the two happened to be inserted first -- i.e. the
+    correctness of the message would rest on the order of a dict literal. The
+    MRO walk makes it rest on the class hierarchy instead, so any future
+    subclass gets its own text, or inherits its parent's, without anyone having
+    to remember to keep this mapping sorted.
 
     Args:
         error: The caught path-validation exception.
@@ -1035,8 +1088,9 @@ def path_error_guidance(error: Exception) -> "str | None":
     Returns:
         Guidance text safe to show the model, or None if unmapped.
     """
-    for exc_type, text in PATH_ERROR_GUIDANCE.items():
-        if isinstance(error, exc_type):
+    for exc_type in type(error).__mro__:
+        text = PATH_ERROR_GUIDANCE.get(exc_type)
+        if text is not None:
             return text
     return None
 

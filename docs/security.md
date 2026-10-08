@@ -68,6 +68,33 @@ allow-list:
 So `~/.ssh/id_rsa` and `/etc/shadow` are out of reach without you saying so.
 Report and rule output is separately confined to `~/.binary_mcp_output/`.
 
+### Hard links are refused, and that is a different refusal
+
+Containment is a prefix test on the resolved path, and `resolve()` follows
+symlinks only. A hard link has no target to follow -- it *is* the inode, under
+a second name -- so `os.link("/etc/hostname", "/tmp/sample.bin")` would pass
+every check above and hand back the contents of `/etc/hostname`. There is no
+way to ask the kernel which other names an inode has, so while confinement is
+active a regular file with `st_nlink > 1` is refused.
+
+That costs some false positives: a corpus de-duplicated with links (`cp -l`,
+`rsync --link-dest`, a content-addressed sample store) is refused even though
+it is legitimate. `BINARY_MCP_ALLOW_HARDLINKS=1` re-permits multiply-linked
+files and leaves directory confinement untouched -- deliberately a far smaller
+hammer than `BINARY_MCP_ALLOW_ANY_PATH`. Nothing this server writes trips the
+check; caches, carved output and dumps are all created with one link.
+Directories are exempt (`st_nlink` counts `..` entries, so any directory with a
+subdirectory has more than one). The check is POSIX-only: on Windows
+`os.stat` reports 0 or 1 for files that do have multiple NTFS links, so it
+would be both unreliable and unable to catch the equivalent attack.
+
+The two refusals report separately. A hard-link refusal raises `HardLinkError`
+-- a `PathTraversalError` subclass, so existing handlers still catch it -- and
+says the link count was the problem and that widening
+`BINARY_MCP_ALLOWED_DIRS` will not help. An out-of-bounds path says the path is
+outside the allow-list. They used to be the same sentence, which sent operators
+to re-check an allow-list that had already accepted the directory.
+
 ## Symbol fetches leave the host
 
 A first import of a PE may fetch its PDB from a symbol server, which discloses
@@ -84,6 +111,7 @@ The keys below are documented in full in [Configuration](configuration.md).
 |----------|--------|
 | `BINARY_MCP_ALLOWED_DIRS` | Confine analysis to an explicit directory list |
 | `BINARY_MCP_REQUIRE_CONFINEMENT` | Fail closed: refuse any binary unless `BINARY_MCP_ALLOWED_DIRS` is set |
+| `BINARY_MCP_ALLOW_HARDLINKS` | Permit multiply-linked files. Keeps directory confinement in force |
 | `BINARY_MCP_ALLOW_ANY_PATH` | Opt out of confinement entirely. Not recommended |
 | `BINARY_MCP_ENABLE_RAW_WINDBG` | Enable `windbg_execute_command` behind its allowlist |
 | `BINARY_MCP_SYMBOL_OFFLINE` | Never contact the upstream symbol server |

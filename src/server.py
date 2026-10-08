@@ -1896,8 +1896,12 @@ Format: {compat_info.format.value}
         # Return safe error with reference ID
         return str(e)
     except (PathTraversalError, FileSizeError) as e:
-        # Security errors - return safe message
-        return safe_error_message("Invalid binary file or path", e)
+        # Security errors. Routed through safe_path_error, not the generic
+        # envelope: "Invalid binary file or path" plus a reference ID named
+        # neither which of the two it was nor what to do, so a hard-link
+        # refusal and an out-of-bounds path were the same four words. Every
+        # other path-validating tool in this module already does this.
+        return safe_path_error("analyze_binary", e, "binary path")
     except GhidraAnalysisError as e:
         # Ghidra itself failed (subprocess error or timeout). The diagnostic
         # is curated from Ghidra's own stdout/stderr -- surface it so users
@@ -4443,10 +4447,12 @@ def check_binary(binary_path: str) -> str:
 
         return wrap_untrusted(report + guidance, "triage report")
 
-    except (PathTraversalError, FileSizeError) as e:
-        return safe_error_message("Invalid binary file or path", e)
-    except FileNotFoundError as e:
-        return safe_path_error("check_binary", e, "path")
+    except (PathTraversalError, FileSizeError, FileNotFoundError) as e:
+        # One arm for all three: safe_path_error reconstructs the category
+        # from the exception type, so the missing-file case that was already
+        # routed here needs no separate handler, and the other two stop
+        # collapsing to a bare reference ID.
+        return safe_path_error("check_binary", e, "binary path")
     except Exception as e:
         logger.error(f"check_binary failed: {e}")
         return safe_tool_error("check_binary", e)

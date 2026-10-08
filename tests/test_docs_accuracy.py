@@ -371,23 +371,58 @@ def test_docs_document_confinement_controls():
     """
     Every confinement knob has to be documented somewhere a reader can find.
 
-    docs/configuration.md is the reference and must name all three;
-    docs/security.md must at least name the allow-list, since that is where the
-    default posture is explained and an operator who reads only that page still
-    needs to know the variable exists.
+    docs/configuration.md is the reference and must name all four;
+    docs/security.md must at least name the allow-list and the hard-link
+    opt-out, since that is where the default posture is explained and an
+    operator who reads only that page still needs to know they exist.
+
+    BINARY_MCP_ALLOW_HARDLINKS earns its place here the hard way. The refusal
+    message tells the operator to set it, and for a while the variable appeared
+    in no document at all -- the only way to find it was to read
+    src/utils/security.py, which is exactly what a field report said it took.
+    A knob an error message names must be findable in the docs.
     """
     config_text = CONFIG_DOC.read_text(encoding="utf-8")
     for var in (
         "BINARY_MCP_ALLOWED_DIRS",
         "BINARY_MCP_REQUIRE_CONFINEMENT",
         "BINARY_MCP_ALLOW_ANY_PATH",
+        "BINARY_MCP_ALLOW_HARDLINKS",
     ):
         assert var in config_text, f"docs/configuration.md no longer documents {var}"
 
-    assert "BINARY_MCP_ALLOWED_DIRS" in SECURITY_DOC.read_text(encoding="utf-8"), (
-        "docs/security.md explains the default confinement posture but no longer "
-        "names the variable that changes it"
+    security_text = SECURITY_DOC.read_text(encoding="utf-8")
+    for var in ("BINARY_MCP_ALLOWED_DIRS", "BINARY_MCP_ALLOW_HARDLINKS"):
+        assert var in security_text, (
+            f"docs/security.md explains the default confinement posture but no "
+            f"longer names {var}"
+        )
+
+
+def test_every_env_var_named_in_a_refusal_message_is_documented():
+    """
+    No refusal may name a variable the docs do not.
+
+    The generalisation of the BINARY_MCP_ALLOW_HARDLINKS gap: a denial that
+    says "set X" is only actionable if X can be looked up. Any future
+    confinement knob that reaches an error message is caught here rather than
+    after someone has read the source to find it.
+    """
+    from src.utils import security
+
+    config_text = CONFIG_DOC.read_text(encoding="utf-8")
+    named_in_messages = (
+        security.ENV_ALLOWED_DIRS,
+        security.ENV_REQUIRE_CONFINEMENT,
+        security.ENV_ALLOW_ANY_PATH,
+        security.ENV_ALLOW_HARDLINKS,
     )
+    for var in named_in_messages:
+        assert var in config_text, (
+            f"{var} is named in a confinement refusal but is not documented in "
+            f"docs/configuration.md, so an operator who hits the refusal cannot "
+            f"look it up"
+        )
 
 
 def test_readme_links_to_the_claim_docs():

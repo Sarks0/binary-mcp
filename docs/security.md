@@ -72,10 +72,19 @@ Report and rule output is separately confined to `~/.binary_mcp_output/`.
 
 Containment is a prefix test on the resolved path, and `resolve()` follows
 symlinks only. A hard link has no target to follow -- it *is* the inode, under
-a second name -- so `os.link("/etc/hostname", "/tmp/sample.bin")` would pass
-every check above and hand back the contents of `/etc/hostname`. There is no
-way to ask the kernel which other names an inode has, so while confinement is
-active a regular file with `st_nlink > 1` is refused.
+a second name -- so a link created inside an allowed directory, pointing at an
+inode outside it, passes every check above and reads back the outside file.
+There is no way to ask the kernel which other names an inode has, so while
+confinement is active a regular file with `st_nlink > 1` is refused.
+
+Two things bound the attack, and are worth knowing before you judge how much
+the refusal is buying. Hard links cannot cross filesystems, so the target must
+live on the same filesystem as the allowed directory -- an `os.link` from
+`/etc` into a tmpfs `/tmp` fails with `EXDEV`. And Linux sets
+`fs.protected_hardlinks=1` by default, which stops an unprivileged user
+linking to a file they neither own nor can write. What remains is a real
+bypass with a narrower reach than "any file on the host": a same-filesystem
+file the caller owns or can write, republished under an in-bounds name.
 
 That costs some false positives: a corpus de-duplicated with links (`cp -l`,
 `rsync --link-dest`, a content-addressed sample store) is refused even though
@@ -84,9 +93,16 @@ files and leaves directory confinement untouched -- deliberately a far smaller
 hammer than `BINARY_MCP_ALLOW_ANY_PATH`. Nothing this server writes trips the
 check; caches, carved output and dumps are all created with one link.
 Directories are exempt (`st_nlink` counts `..` entries, so any directory with a
-subdirectory has more than one). The check is POSIX-only: on Windows
-`os.stat` reports 0 or 1 for files that do have multiple NTFS links, so it
-would be both unreliable and unable to catch the equivalent attack.
+subdirectory has more than one).
+
+**The check does not run on Windows at all**, and the allow-list should be
+treated as advisory there: `mklink /H` is the equivalent of the construction
+above, and nothing refuses it. The skip is a deliberate choice not to rely on
+`st_nlink` on a platform where this project has not measured what CPython
+reports for a file with multiple NTFS links -- but an unmeasured platform
+difference is a reason to state the gap, not a reason to call the gap safe. If
+you run this server on Windows and the allow-list is load-bearing for you,
+confine it at the filesystem instead.
 
 The two refusals report separately. A hard-link refusal raises `HardLinkError`
 -- a `PathTraversalError` subclass, so existing handlers still catch it -- and

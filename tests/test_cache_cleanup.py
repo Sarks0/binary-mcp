@@ -260,14 +260,31 @@ def test_clean_cache_include_ghidra_projects_drops_dir(server_with_temp_cache, t
     assert not (project_dir / f"{binary.stem}.rep").exists()
 
 
-def test_clean_cache_missing_binary_returns_friendly_error(server_with_temp_cache, tmp_path):
-    server_module, _ = server_with_temp_cache
+def test_clean_cache_missing_binary_returns_friendly_error(
+    server_with_temp_cache, tmp_path
+):
+    """
+    Friendly AND non-disclosing.
+
+    Asserted on behaviour rather than the old literal "Binary not found":
+    that message interpolated both the caller's path and ``cache_dir``, which
+    is resolved from ``Path.home()`` or ``$BINARY_CACHE_DIR`` -- so the most
+    ordinary mistake available, a typo, printed the operator's username. The
+    reply now comes from safe_path_error, which names the category, and keeps
+    the full-wipe advice that was the useful half.
+    """
+    server_module, cache_dir = server_with_temp_cache
     missing = tmp_path / "does-not-exist.dll"
 
     result = server_module.clean_cache(binary_path=str(missing))
 
-    assert "Binary not found" in result
+    # Still says what went wrong, in the words the guidance mapping uses.
+    assert "no file exists at the path supplied" in result
+    # Still says what to do instead.
     assert "clean_cache() with no arguments" in result
+    # And no longer hands back host layout to get there.
+    assert str(cache_dir) not in result
+    assert str(missing) not in result
 
 
 def test_clean_cache_preserves_notes_sidecar(server_with_temp_cache, tmp_path):

@@ -436,7 +436,7 @@ def register_indirect_call_tools(app, cache, runner=None):
 
             return _format_vtables(Path(binary_path).name, vtables)
         except (PathTraversalError, FileSizeError) as e:
-            return safe_error_message("find_vtables", e)
+            return safe_path_error("find_vtables", e, "binary path")
         except Exception as e:
             logger.exception("find_vtables failed")
             return safe_error_message("Failed to scan for vtables", e)

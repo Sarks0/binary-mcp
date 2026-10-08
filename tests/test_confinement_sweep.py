@@ -31,6 +31,7 @@ regression shows up as "the cache was asked about /outside/secret.bin" rather
 than as a vague assertion failure.
 """
 
+import inspect
 import os
 import sys
 import tempfile
@@ -634,6 +635,157 @@ def test_hardlink_refusal_is_not_reported_as_a_bad_path(
         f"caller to find it in the source"
     )
     assert "hard link" not in oob_result
+
+
+# Whole-surface sweep: every tool that takes a binary_path
+
+
+# Placeholders for the OTHER required arguments of each tool, so the sweep can
+# call it at all. Values are deliberately boring -- the point is to reach the
+# path check, which happens before any of these matter.
+_SWEEP_ARGS = {
+    "function_name": "main",
+    "function_names": ["main"],
+    "function": "main",
+    "name": "sweep",
+    "address": "0x1000",
+    "type_name": "T",
+    "pattern": "90",
+    "query": "x",
+    "output_path": "out.txt",
+    "rule_name": "r",
+    "tag": "t",
+    "session_id": "00000000-0000-4000-8000-000000000000",
+}
+
+# Module-level helpers that happen to take a binary_path but are not MCP tools.
+# They are the validators themselves (and pdb_fetcher.auto_fetch_pdb, a helper
+# imported into the server namespace), so they RAISE rather than return a
+# refusal string -- which is the contract the tools below are built on.
+_SWEEP_NOT_TOOLS = {
+    "sanitize_binary_path",
+    "confine_binary_path",
+    "get_analysis_context",
+    "auto_fetch_pdb",
+}
+
+
+def _binary_path_tools(server):
+    """Every callable in src.server taking ``binary_path`` we can drive."""
+    found = []
+    for name in sorted(dir(server._module)):
+        if name.startswith("_") or name in _SWEEP_NOT_TOOLS:
+            continue
+        fn = getattr(server, name)
+        if not callable(fn) or inspect.isclass(fn):
+            continue
+        try:
+            signature = inspect.signature(fn)
+        except (TypeError, ValueError):
+            continue
+        if "binary_path" not in signature.parameters:
+            continue
+        kwargs = {}
+        for pname, param in signature.parameters.items():
+            if pname == "binary_path" or param.default is not inspect.Parameter.empty:
+                continue
+            if pname not in _SWEEP_ARGS:
+                break
+            kwargs[pname] = _SWEEP_ARGS[pname]
+        else:
+            found.append((name, fn, kwargs))
+    return found
+
+
+def test_the_sweep_finds_the_tools_it_claims_to(server):
+    """
+    Guard the sweep itself: silent discovery failure would assert nothing.
+
+    The ``server`` fixture is a _ToolProxy, and ``dir()`` on the proxy returns
+    nothing -- an earlier version of this sweep enumerated the proxy instead
+    of the module and cheerfully reported that zero tools took a binary_path.
+    """
+    tools = _binary_path_tools(server)
+    names = {name for name, _, _ in tools}
+    assert len(tools) >= 20, f"sweep found only {len(tools)} tools: {sorted(names)}"
+    for expected in ("analyze_binary", "check_binary", "get_functions", "get_xrefs"):
+        assert expected in names, f"sweep no longer reaches {expected}"
+
+
+def test_no_tool_leaks_host_layout_when_it_refuses_a_path(
+    server, hardlinked_sample, quarantine, tmp_path, monkeypatch
+):
+    """
+    No tool may echo the resolved allow-list, whatever refuses the path.
+
+    This is the structural form of the F-10 guarantee, and it exists because
+    the per-handler form was not enough. ``decompile_functions`` leaked the
+    whole quarantine list -- ``Path.home()``-derived, so the operator's
+    username -- through a chain no single handler owned: ``get_cached``
+    swallowed the refusal into a cache miss, the tool read that as "analyse
+    it", a job was submitted, ``get_analysis_context`` raised inside the job
+    work function, the job record stored the refusal's text, and
+    ``_run_or_degrade`` returned it as ``f"Error: {reason}"``. Every link was
+    locally defensible. Asserting on the whole surface is what catches that.
+    """
+    _disable_auto_session(server, monkeypatch)
+    link, secret = hardlinked_sample
+    missing = quarantine / "nope.bin"
+
+    offenders = []
+    for name, fn, kwargs in _binary_path_tools(server):
+        for label, path in (
+            ("hard link", link), ("out of bounds", secret), ("missing", missing)
+        ):
+            try:
+                result = str(fn(binary_path=str(path), **kwargs))
+            except Exception as exc:  # noqa: BLE001 - reported, not swallowed
+                offenders.append(f"{name} [{label}] raised {type(exc).__name__}")
+                continue
+            if str(tmp_path) in result:
+                offenders.append(f"{name} [{label}] echoed host layout")
+
+    assert not offenders, (
+        "tools disclosed host layout, or raised instead of returning a "
+        "refusal:\n  " + "\n  ".join(offenders)
+    )
+
+
+def test_every_tool_names_the_category_of_a_confinement_refusal(
+    server, hardlinked_sample, monkeypatch
+):
+    """
+    A refusal has to say WHICH refusal it was, not just that one happened.
+
+    The B3 field report: a hard-linked staging copy and an out-of-bounds path
+    came back as the same four words plus a reference ID, so the failure read
+    as "wrong path" when the path had been accepted and only the link count
+    refused. Fixing the two handlers named in that report left ~25 tools still
+    collapsing, which is why this asserts over the surface instead.
+
+    Tools reach this guarantee two ways and the test does not care which: an
+    explicit ``except (PathTraversalError, FileSizeError)`` arm calling
+    safe_path_error, or the catch-all, since safe_tool_error routes those two
+    types through safe_path_error precisely so a tool cannot regress by
+    forgetting an arm.
+    """
+    _disable_auto_session(server, monkeypatch)
+    link, secret = hardlinked_sample
+
+    vague = []
+    for name, fn, kwargs in _binary_path_tools(server):
+        hardlink_result = str(fn(binary_path=str(link), **kwargs))
+        oob_result = str(fn(binary_path=str(secret), **kwargs))
+        if "hard link" not in hardlink_result:
+            vague.append(f"{name}: hard-link refusal does not mention the link")
+        if "outside the directories" not in oob_result:
+            vague.append(f"{name}: out-of-bounds refusal does not say so")
+        if hardlink_result == oob_result:
+            vague.append(f"{name}: the two refusals are identical")
+
+    assert not vague, (
+        "refusals that do not name their own category:\n  " + "\n  ".join(vague)
+    )
 
 
 # F-5: the second, unswept session store

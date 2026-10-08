@@ -11,6 +11,7 @@ from pathlib import Path
 from fastmcp import FastMCP
 
 from src.engines.static.dotnet.ilspy_runner import get_ilspy_runner
+from src.tools.error_hygiene import safe_path_error
 from src.utils.formatters import wrap_untrusted
 from src.utils.security import (
     FileSizeError,
@@ -75,7 +76,7 @@ After installation, restart your MCP client.
                 validated = sanitize_binary_path(assembly_path)
                 assembly_path = str(validated)
             except (PathTraversalError, FileSizeError) as e:
-                return safe_error_message("Invalid assembly path", e)
+                return safe_path_error("analyze_dotnet", e, "binary path")
             except FileNotFoundError:
                 return f"Error: Assembly not found: {assembly_path}"
             except ValueError as e:
@@ -197,7 +198,7 @@ After installation, restart your MCP client.
                 validated = sanitize_binary_path(assembly_path)
                 assembly_path = str(validated)
             except (PathTraversalError, FileSizeError) as e:
-                return safe_error_message("Invalid assembly path", e)
+                return safe_path_error("get_dotnet_types", e, "binary path")
             except FileNotFoundError:
                 return f"Error: Assembly not found: {assembly_path}"
             except ValueError as e:
@@ -269,7 +270,7 @@ After installation, restart your MCP client.
                 validated = sanitize_binary_path(assembly_path)
                 assembly_path = str(validated)
             except (PathTraversalError, FileSizeError) as e:
-                return safe_error_message("Invalid assembly path", e)
+                return safe_path_error("decompile_dotnet_type", e, "binary path")
             except FileNotFoundError:
                 return f"Error: Assembly not found: {assembly_path}"
             except ValueError as e:
@@ -343,7 +344,7 @@ After installation, restart your MCP client.
                 validated = sanitize_binary_path(assembly_path)
                 assembly_path = str(validated)
             except (PathTraversalError, FileSizeError) as e:
-                return safe_error_message("Invalid assembly path", e)
+                return safe_path_error("search_dotnet_types", e, "binary path")
             except FileNotFoundError:
                 return f"Error: Assembly not found: {assembly_path}"
             except ValueError as e:
@@ -412,7 +413,7 @@ After installation, restart your MCP client.
                 validated = sanitize_binary_path(assembly_path)
                 assembly_path = str(validated)
             except (PathTraversalError, FileSizeError) as e:
-                return safe_error_message("Invalid assembly path", e)
+                return safe_path_error("decompile_dotnet_assembly", e, "binary path")
             except FileNotFoundError:
                 return f"Error: Assembly not found: {assembly_path}"
             except ValueError as e:
@@ -485,7 +486,7 @@ After installation, restart your MCP client.
                 validated = sanitize_binary_path(assembly_path)
                 assembly_path = str(validated)
             except (PathTraversalError, FileSizeError) as e:
-                return safe_error_message("Invalid assembly path", e)
+                return safe_path_error("get_dotnet_il", e, "binary path")
             except FileNotFoundError:
                 return f"Error: Assembly not found: {assembly_path}"
             except ValueError as e:

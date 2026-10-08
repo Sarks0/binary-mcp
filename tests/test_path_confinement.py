@@ -881,10 +881,29 @@ class TestGhidraCacheConfinement:
     def test_public_readers_do_not_open_an_out_of_bounds_path(
         self, tmp_path, monkeypatch
     ):
-        """has_cached/get_cached swallow the refusal into 'not cached'.
+        """
+        Neither reader opens the file; they report the refusal differently.
 
-        That is fail-closed and matches their existing broad handlers -- what
-        matters is that the file is never opened.
+        This test used to assert that both swallowed the refusal into "not
+        cached", on the grounds that what mattered was never opening the file.
+        The first half of that is still the point and is still asserted. The
+        second half turned out to have a cost the reasoning did not anticipate:
+        a None from ``get_cached`` is what a caller reads as "nothing cached,
+        go and analyse it", so ``decompile_functions`` took a refused path,
+        got a cache miss, submitted an analysis JOB, and then returned the
+        job record's error -- which interpolates the resolved allow-list -- to
+        the caller. Fail-closed on the read, wide open on the reporting.
+
+        So the two now differ deliberately:
+
+          * ``get_cached`` (and ``get_cache_path``) RAISE, because their None
+            means "proceed", and a refused path must not be proceeded with.
+          * ``has_cached`` still answers False, because its callers turn that
+            into "analyze the binary first" -- a static sentence that neither
+            leaks nor acts.
+
+        Propagating is strictly stronger on the original property: the file is
+        not opened either way.
         """
         from src.engines.static.ghidra.project_cache import ProjectCache
 
@@ -897,8 +916,14 @@ class TestGhidraCacheConfinement:
         outside.write_bytes(b"MZ")
 
         cache = ProjectCache()
+        # Predicate: fail-closed, no exception.
         assert cache.has_cached(str(outside)) is False
-        assert cache.get_cached(str(outside)) is None
+        # Lookups: the refusal reaches the caller instead of being read as a
+        # licence to start work on the path.
+        with pytest.raises(PathTraversalError):
+            cache.get_cached(str(outside))
+        with pytest.raises(PathTraversalError):
+            cache.get_cache_path(str(outside))
 
     def test_hash_is_the_only_place_the_cache_opens_a_binary(self):
         """Guard the chokepoint property the fix depends on.

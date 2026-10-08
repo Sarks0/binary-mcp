@@ -55,6 +55,19 @@ namespace Tls {
 // the context after the handshake; this is only the initial buffer reservation.
 static const size_t INITIAL_IO_BUFFER = 32 * 1024;
 
+// Wall-clock budget for completing a handshake, mirroring main.cpp's
+// REQUEST_DEADLINE_MS for the request that follows it.
+//
+// Both exist because Read() and Handshake() loop recv() internally, which the
+// request reader in main.cpp cannot see. That reader checks its deadline only
+// BETWEEN conn.Recv() calls; on the plaintext path recv returns as soon as any
+// byte arrives, so the check fires. On the TLS path DecryptAvailable re-reads
+// on a partial record and Read re-reads while no plaintext has emerged, so a
+// peer sending one byte every four seconds -- under the 5 s SO_RCVTIMEO --
+// never returned control to it. The server handles one connection at a time,
+// so that was a single unauthenticated peer denying the whole bridge.
+static const unsigned long long HANDSHAKE_DEADLINE_MS = 15000;
+
 // Convert 40 hex characters into the 20 raw bytes CERT_FIND_HASH wants.
 inline bool ThumbprintToBytes(const std::string& hex, BYTE* out20) {
     if (hex.size() != 40) {
@@ -306,11 +319,21 @@ public:
         }
     }
 
+    // The instant after which no further recv may be attempted. main.cpp sets
+    // this to the request deadline before reading, so the bound covers the
+    // whole request and not just one recv.
+    void SetDeadline(unsigned long long tickCount) { m_deadline = tickCount; }
+
     // Run the handshake to completion. Returns false on any failure, having
     // logged why; the caller closes the socket.
     bool Handshake(ServerCredentials& credentials, bool requireClientCert,
                    const std::string& clientCaThumbprint) {
         m_incoming.reserve(INITIAL_IO_BUFFER);
+        // The handshake happens before any HTTP exists, so main.cpp has not set
+        // a deadline yet. Without one here, a peer could drip bytes at a
+        // completed TCP connection forever and never reach the request reader.
+        m_deadline = GetTickCount64() + HANDSHAKE_DEADLINE_MS;
+        m_credentials = credentials.Handle();
 
         DWORD contextRequirements = ASC_REQ_SEQUENCE_DETECT | ASC_REQ_REPLAY_DETECT |
                                     ASC_REQ_CONFIDENTIALITY | ASC_REQ_EXTENDED_ERROR |
@@ -320,14 +343,22 @@ public:
         }
 
         bool first = true;
+        // Nothing is buffered yet, so the first pass must read. Thereafter this
+        // is set only when Schannel says it needs more: the previous form
+        // (`m_incoming.empty() || !first`) was unconditionally true after the
+        // first iteration, so a tail deliberately carried over as
+        // SECBUFFER_EXTRA could never be used without first blocking on
+        // another recv -- a client pipelining two flights in one write stalled
+        // for the full SO_RCVTIMEO and was then abandoned, with the bytes
+        // needed to finish already in hand.
+        bool needMoreData = true;
         for (;;) {
-            // Schannel needs at least one byte of client hello before the
-            // first AcceptSecurityContext call.
-            if (m_incoming.empty() || !first) {
+            if (needMoreData) {
                 if (!FillIncoming()) {
                     Log("TLS: peer closed or failed during handshake");
                     return false;
                 }
+                needMoreData = false;
             }
 
             SecBuffer inBuffers[2];
@@ -375,6 +406,7 @@ public:
 
             if (status == SEC_E_INCOMPLETE_MESSAGE) {
                 // Need more bytes; keep what we have and read again.
+                needMoreData = true;
                 continue;
             }
 
@@ -403,6 +435,8 @@ public:
                 break;
             }
             if (status == SEC_I_CONTINUE_NEEDED) {
+                // Read again only if the carried tail is empty.
+                needMoreData = m_incoming.empty();
                 continue;
             }
 
@@ -545,10 +579,22 @@ public:
         outDescriptor.cBuffers = 1;
         outDescriptor.pBuffers = &outBuffer;
 
+        // The credentials handle, not nullptr. With nullptr this returns
+        // SEC_E_INVALID_HANDLE, outBuffer stays empty and no close_notify is
+        // ever produced -- so every TLS connection was torn down by a bare
+        // closesocket, which is exactly the truncation this function exists to
+        // avoid. Handshake records the handle for this reason.
         DWORD attributes = 0;
-        AcceptSecurityContext(nullptr, &m_context, nullptr,
-                              ASC_REQ_ALLOCATE_MEMORY | ASC_REQ_STREAM, 0, nullptr,
-                              &outDescriptor, &attributes, nullptr);
+        const SECURITY_STATUS status = AcceptSecurityContext(
+            m_credentials, &m_context, nullptr,
+            ASC_REQ_ALLOCATE_MEMORY | ASC_REQ_STREAM, 0, nullptr, &outDescriptor,
+            &attributes, nullptr);
+        if (status != SEC_E_OK && status != SEC_I_CONTINUE_NEEDED) {
+            // Best effort: a failed shutdown token is not worth failing the
+            // response that has already been sent.
+            Log("TLS: shutdown token not produced (0x%08lx)",
+                static_cast<unsigned long>(status));
+        }
 
         if (outBuffer.pvBuffer != nullptr && outBuffer.cbBuffer > 0) {
             SendRaw(static_cast<const char*>(outBuffer.pvBuffer), outBuffer.cbBuffer);
@@ -575,9 +621,15 @@ private:
         return accepted;
     }
 
-    // Append more ciphertext. False means the peer closed or the socket failed;
-    // m_readFailed distinguishes the two.
+    // Append more ciphertext. False means the peer closed, the socket failed,
+    // or the deadline expired; m_readFailed distinguishes a close from the
+    // other two.
     bool FillIncoming() {
+        if (m_deadline != 0 && GetTickCount64() >= m_deadline) {
+            Log("TLS: deadline expired while reading; closing");
+            m_readFailed = true;
+            return false;
+        }
         char buffer[8192];
         const int read = recv(m_socket, buffer, sizeof(buffer), 0);
         if (read == 0) {
@@ -694,6 +746,12 @@ private:
 
     SOCKET m_socket;
     CtxtHandle m_context;
+    // Borrowed from the process-wide ServerCredentials, which outlives every
+    // channel: Shutdown needs it and the handshake is where it is available.
+    CredHandle* m_credentials = nullptr;
+    // 0 means no deadline. Set by Handshake, then reset by main.cpp to the
+    // request deadline.
+    unsigned long long m_deadline = 0;
     std::vector<char> m_incoming;   // ciphertext not yet decrypted
     std::vector<char> m_plaintext;  // decrypted bytes not yet read
     unsigned long m_headerSize = 0;

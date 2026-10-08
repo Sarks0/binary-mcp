@@ -932,3 +932,116 @@ class TestCipherSuites:
         ).uvicorn_config()
         assert "ssl_cert_reqs" not in config
         assert "ssl_ca_certs" not in config
+
+
+class TestAddressClassificationMatchesTheBinder:
+    """Every spelling the socket layer accepts must be classified, not just the
+    strict dotted quad.
+
+    ``ipaddress.ip_address`` implements the strict form; ``inet_aton``, which
+    is what ``bind()`` goes through, also accepts ``0``, ``00``, ``0x0`` and
+    ``0.0`` (all 0.0.0.0) and ``127.1`` and ``0177.0.0.1`` (both 127.0.0.1).
+    Classifying with the strict parser while binding with the lax one is how
+    ``BINARY_MCP_HTTP_HOST=0`` came to be accepted as an ordinary remote bind
+    and then listened on every interface -- the one thing the policy says is
+    refused with or without the opt-in.
+    """
+
+    @pytest.mark.parametrize("host", ["0", "00", "0x0", "0.0", "0.0.0.0", "::"])
+    def test_every_wildcard_spelling_is_caught(self, host):
+        assert is_wildcard_host(host), f"{host!r} binds 0.0.0.0 but reads as specific"
+
+    @pytest.mark.parametrize("host", ["127.1", "0177.0.0.1", "127.0.0.1", "127.0.0.2"])
+    def test_every_loopback_spelling_is_caught(self, host):
+        assert is_loopback_host(host), f"{host!r} binds loopback but reads as remote"
+
+    @pytest.mark.parametrize("host", ["0", "00", "0x0", "0.0"])
+    def test_wildcard_shorthand_is_refused_even_fully_configured(
+        self, monkeypatch, tls_pair, host
+    ):
+        """The bypass, as a test: opt-in plus TLS plus a token must not help."""
+        _remote(monkeypatch, tls_pair, **{ENV_HTTP_HOST: host})
+        with pytest.raises(TransportConfigError, match="binds every interface"):
+            resolve_transport_config()
+
+    @pytest.mark.parametrize("host", ["127.1", "0177.0.0.1"])
+    def test_loopback_shorthand_needs_no_opt_in(self, monkeypatch, host):
+        """The converse: a real loopback bind must not demand the remote three."""
+        monkeypatch.setenv(ENV_TRANSPORT, "http")
+        monkeypatch.setenv(ENV_HTTP_HOST, host)
+        assert resolve_transport_config().is_loopback
+
+    def test_a_dns_name_is_refused_as_a_bind(self, monkeypatch, tls_pair):
+        """Classification must not rest on a DNS answer that can change."""
+        _remote(monkeypatch, tls_pair, **{ENV_HTTP_HOST: "analysis.lan"})
+        with pytest.raises(TransportConfigError, match="not an address literal"):
+            resolve_transport_config()
+
+    def test_a_loopback_name_is_still_accepted(self, monkeypatch):
+        monkeypatch.setenv(ENV_TRANSPORT, "http")
+        monkeypatch.setenv(ENV_HTTP_HOST, "localhost")
+        assert resolve_transport_config().is_loopback
+
+
+class TestGateSurvivesHostileHeaders:
+    """No request may make the gate raise instead of answering.
+
+    A non-ASCII bearer token used to reach ``hmac.compare_digest`` as a str and
+    raise TypeError out of the gate: a 500 and a logged traceback per request,
+    from any unauthenticated client, where the contract is 401.
+    """
+
+    async def test_non_ascii_token_is_401_not_500(self):
+        recorder = await _call(
+            _config(),
+            _scope([(b"host", b"127.0.0.1"),
+                    (b"authorization", "Bearer éx".encode("latin-1"))]),
+        )
+        assert not recorder.inner_called
+        assert recorder.status == 401
+
+    @pytest.mark.parametrize(
+        "value",
+        [b"Bearer \xff\xfe", b"Bearer \xc3\xa9", b"\xff" * 8,
+         b"Bearer " + bytes(range(1, 32))],
+    )
+    async def test_arbitrary_bytes_never_raise(self, value):
+        recorder = await _call(
+            _config(), _scope([(b"host", b"127.0.0.1"), (b"authorization", value)])
+        )
+        assert recorder.status == 401
+
+    async def test_non_ascii_host_is_400_not_500(self):
+        recorder = await _call(
+            _config(), _scope([(b"host", "evilé.test".encode("latin-1"))])
+        )
+        assert recorder.status == 400
+
+
+class TestOriginParsing:
+    """An Origin's path must not be read as its authority."""
+
+    def test_path_cannot_impersonate_the_host(self):
+        assert strip_origin("https://evil.test/a//127.0.0.1") == "evil.test"
+
+    @pytest.mark.parametrize(
+        ("origin", "expected"),
+        [
+            ("https://127.0.0.1:8770", "127.0.0.1"),
+            ("http://analysis.lan", "analysis.lan"),
+            ("https://[::1]:8770", "::1"),
+            ("https://evil.test/127.0.0.1", "evil.test"),
+            ("https://evil.test?x=//127.0.0.1", "evil.test"),
+            ("https://evil.test#//127.0.0.1", "evil.test"),
+            ("null", "null"),
+        ],
+    )
+    def test_authority_only(self, origin, expected):
+        assert strip_origin(origin) == expected
+
+    async def test_a_path_bearing_origin_is_refused_by_the_gate(self):
+        recorder = await _call(
+            _config(), _scope(_authed([(b"origin", b"https://evil.test/a//127.0.0.1")]))
+        )
+        assert not recorder.inner_called
+        assert recorder.status == 400

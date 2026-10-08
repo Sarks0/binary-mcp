@@ -5332,9 +5332,18 @@ static bool SpawnHTTPServer() {
 
         for (size_t i = 0; i < out.size(); i++) {
             const char c = out[i];
+            // The comma is in this set because allow_clients and allow_hosts
+            // are documented as comma-separated and appendList below exists to
+            // split them. Without it, the format docs/remote-access.md tells
+            // operators to write made iniRejected true, SpawnHTTPServer
+            // returned false, and NO listener started at all -- not even the
+            // loopback default -- with the only clue being a malformed-file
+            // message for a file written exactly as documented. It is safe to
+            // allow: Windows splits a command line on whitespace and quotes,
+            // so a comma inside a value cannot become a separate argument.
             const bool safe = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
                               (c >= '0' && c <= '9') || c == '.' || c == '-' ||
-                              c == '_' || c == '/' || c == ':';
+                              c == '_' || c == '/' || c == ':' || c == ',';
             if (!safe) {
                 LogError("obsidian.ini: [listener] %s contains an unexpected "
                          "character; refusing the whole file", key);

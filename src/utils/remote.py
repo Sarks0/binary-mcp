@@ -36,7 +36,9 @@ from __future__ import annotations
 import hmac
 import ipaddress
 import logging
+import re
 import secrets
+import socket
 import ssl
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
@@ -106,6 +108,29 @@ TOKEN_BYTES = 32
 # AEAD with forward secrecy.
 HTTP_CIPHERS = "ECDHE+AESGCM:ECDHE+CHACHA20:!aNULL:!eNULL:!MD5:!DSS"
 
+# Characters a bearer token may contain: RFC 6750's token68 set.
+#
+# Validated at configuration time for two reasons. A token with a non-ASCII
+# character used to brick the listener -- hmm.compare_digest refuses non-ASCII
+# str, so every request raised, including the correct one. And a token
+# containing CR, LF or a space is a header-injection primitive on the client
+# side, where the bridge builds "Bearer " + token into an outbound header.
+# Refusing the shape up front costs nothing: every token this project
+# generates is hex.
+_TOKEN_CHARS = re.compile(r"^[A-Za-z0-9._~+/=-]+$")
+
+
+def _validate_token(token: str, env_name: str,
+                    error: type[RemoteConfigError]) -> None:
+    """Refuse a token that cannot be compared or safely put in a header."""
+    if not _TOKEN_CHARS.match(token):
+        raise error(
+            f"{env_name} contains a character a bearer token may not hold. "
+            f"Allowed: letters, digits and - . _ ~ + / = (RFC 6750 token68). "
+            f"A space or newline would break the header it is placed in, and a "
+            f"non-ASCII character cannot be compared in constant time."
+        )
+
 # Host names that mean "this machine" but are not IP literals, so
 # ipaddress.ip_address cannot classify them.
 _LOOPBACK_NAMES = frozenset({"localhost", "ip6-localhost", "ip6-loopback"})
@@ -135,19 +160,52 @@ def _normalize_host(value: str) -> str:
     return host
 
 
+def numeric_addresses(value: str) -> tuple[str, ...] | None:
+    """Addresses the OS will bind for ``value``, or None if it is not a literal.
+
+    Resolved through ``getaddrinfo`` with ``AI_NUMERICHOST`` -- no DNS -- rather
+    than through ``ipaddress.ip_address``, because those two disagree and the
+    one that matters is the one the socket layer uses.
+    ``ipaddress.ip_address`` implements the strict dotted quad; ``inet_aton``,
+    which is what ``bind()`` ends up going through, also accepts ``0``, ``00``,
+    ``0x0`` and ``0.0`` (all of them 0.0.0.0) and ``127.1`` and ``0177.0.0.1``
+    (both 127.0.0.1).
+
+    That gap was a real hole: ``BINARY_MCP_HTTP_HOST=0`` was classified as
+    neither wildcard nor loopback, so with the opt-in, a certificate and a
+    token it was accepted as an ordinary remote bind -- and then listened on
+    every interface, which the policy says is refused with or without the
+    opt-in. Classifying through the resolver closes it by construction: there
+    is no spelling the classifier can read differently from the binder.
+    """
+    host = _normalize_host(value)
+    if not host:
+        return None
+    try:
+        infos = socket.getaddrinfo(
+            host, None, type=socket.SOCK_STREAM, flags=socket.AI_NUMERICHOST
+        )
+    except (socket.gaierror, UnicodeError):
+        return None
+    return tuple(sorted({str(info[4][0]) for info in infos}))
+
+
 def is_loopback_host(value: str) -> bool:
     """Report whether ``value`` names only this machine.
 
-    Both spellings matter: ``localhost`` is not parseable as an address, and
-    ``127.0.0.2`` is loopback without being ``127.0.0.1`` -- so the whole
-    127.0.0.0/8 range and ``::1`` go through ``ip_address.is_loopback`` rather
-    than an equality check against a hardcoded trio.
+    ``127.0.0.2`` is loopback without being ``127.0.0.1``, so the whole
+    127.0.0.0/8 range goes through ``is_loopback`` rather than an equality
+    check against a hardcoded trio -- and a name that resolves to several
+    addresses is loopback only if *every* one of them is, since one LAN
+    address among them means it does not name only this machine.
     """
-    host = _normalize_host(value)
-    if host in _LOOPBACK_NAMES:
+    if _normalize_host(value) in _LOOPBACK_NAMES:
         return True
+    addresses = numeric_addresses(value)
+    if not addresses:
+        return False
     try:
-        return ipaddress.ip_address(host).is_loopback
+        return all(ipaddress.ip_address(a).is_loopback for a in addresses)
     except ValueError:
         return False
 
@@ -155,17 +213,21 @@ def is_loopback_host(value: str) -> bool:
 def is_wildcard_host(value: str) -> bool:
     """Report whether ``value`` asks to bind every interface.
 
-    ``0.0.0.0``, ``::``, ``*`` and the empty string all mean "everywhere" to
-    one layer or another, and all of them are refused -- see the module
-    docstring for why this is not negotiable with an opt-in.
+    ``0.0.0.0``, ``::``, ``*``, the empty string and every shorthand that
+    resolves to an unspecified address mean "everywhere" to one layer or
+    another, and all of them are refused -- see the module docstring for why
+    this is not negotiable with an opt-in.
     """
     host = _normalize_host(value)
     if host in ("", "*"):
         return True
-    try:
-        return ipaddress.ip_address(host).is_unspecified
-    except ValueError:
-        return False
+    for address in numeric_addresses(value) or ():
+        try:
+            if ipaddress.ip_address(address).is_unspecified:
+                return True
+        except ValueError:
+            continue
+    return False
 
 
 def strip_host_port(value: str) -> str:
@@ -188,12 +250,25 @@ def strip_host_port(value: str) -> str:
 
 
 def strip_origin(value: str) -> str:
-    """Return the host of an ``Origin`` value (``https://host:port``)."""
+    """Return the host of an ``Origin`` value (``https://host:port``).
+
+    Split on the FIRST ``://`` and stop at the first delimiter that ends an
+    authority. ``rpartition("//")`` read ``https://evil.test/a//127.0.0.1`` as
+    host ``127.0.0.1``, which a loopback listener answers for -- so the parser
+    accepted an origin the check is meant to reject. A conforming browser never
+    puts a path in ``Origin``, so this was not reachable from the attacker the
+    check is written for; it is fixed because a gate that parses its input
+    differently from what it guards is the defect, independent of who can
+    currently reach it.
+    """
     origin = value.strip().lower()
     if origin == "null":
         return "null"
-    _, _, remainder = origin.rpartition("//")
-    return strip_host_port(remainder or origin)
+    _, separator, remainder = origin.partition("://")
+    authority = remainder if separator else origin
+    # Anything from the first '/', '?' or '#' on is not part of the authority.
+    authority = re.split(r"[/?#]", authority, maxsplit=1)[0]
+    return strip_host_port(authority)
 
 
 def _parse_networks(raw: str) -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
@@ -374,6 +449,19 @@ def resolve_transport_config() -> TransportConfig:
             f"or leave it unset for {DEFAULT_HTTP_HOST}."
         )
 
+    # A bind must be an address literal or a loopback name. A DNS name is
+    # refused: the classification above would then depend on a DNS answer that
+    # can change between this check and the bind, and a name with several A
+    # records does not pick out the interface the policy just reasoned about.
+    # Clients that dial a name are served by BINARY_MCP_HTTP_ALLOWED_HOSTS,
+    # which is where a name belongs.
+    if numeric_addresses(host) is None and not is_loopback_host(host):
+        raise TransportConfigError(
+            f"{ENV_HTTP_HOST}={host!r} is not an address literal. Give the "
+            f"interface's address rather than a name; if clients dial a DNS "
+            f"name, add that name to {ENV_HTTP_ALLOWED_HOSTS} instead."
+        )
+
     port_raw = (get_config(ENV_HTTP_PORT) or str(DEFAULT_HTTP_PORT)).strip()
     try:
         port = int(port_raw)
@@ -441,6 +529,9 @@ def resolve_transport_config() -> TransportConfig:
         token = secrets.token_hex(TOKEN_BYTES)
         token_was_generated = True
 
+    if not token_was_generated:
+        _validate_token(token, ENV_HTTP_TOKEN, TransportConfigError)
+
     allowed_hosts = {_normalize_host(host)}
     if loopback:
         allowed_hosts |= _LOOPBACK_HOST_HEADERS
@@ -479,13 +570,12 @@ def resolve_transport_config() -> TransportConfig:
 # a CA trusted to issue client credentials silently became a CA trusted to
 # impersonate the debugger.
 #
-# One thing this does not do is make the plugin reachable. obsidian_server.exe
-# binds 127.0.0.1 and speaks plaintext HTTP (server/main.cpp -- INADDR_LOOPBACK,
-# no TLS), so a non-loopback endpoint only exists if something on the debugger
-# host terminates TLS and forwards to that loopback port. Phase 3 of
-# docs/remote-access-plan.md replaces that with a native listener. Until then
-# the supported paths are a tunnel (loopback, no opt-in needed) or a TLS
-# terminator, and both land here.
+# The listener on the other end is configured separately, by an obsidian.ini
+# beside the plugin, and enforces the mirror of this policy -- see
+# server/listener_policy.h. It defaults to 127.0.0.1 in plaintext and serves
+# TLS when given a certificate thumbprint. A TLS terminator in front of a
+# loopback listener works identically from here, since either way this side
+# verifies whatever certificate the thing it dials presents.
 
 
 @dataclass(frozen=True)
@@ -664,15 +754,18 @@ def resolve_debugger_endpoint(
                 f"required: set {ENV_X64DBG_TLS_CA} to the CA that signs the "
                 f"debugger host's certificate. Without it the token crosses the "
                 f"network in cleartext and anyone who captures it owns the "
-                f"debugger. Note that obsidian_server.exe does not serve TLS "
-                f"itself yet -- something on that host has to terminate it."
+                f"debugger. obsidian_server.exe serves TLS itself -- set "
+                f"tls_cert_thumbprint in its obsidian.ini -- or put a TLS "
+                f"terminator in front of it; see docs/remote-access.md."
             )
-        if not (get_config(ENV_OBSIDIAN_TOKEN) or "").strip():
+        endpoint_token = (get_config(ENV_OBSIDIAN_TOKEN) or "").strip()
+        if not endpoint_token:
             raise DebuggerEndpointError(
                 f"{ENV_OBSIDIAN_TOKEN} must be set for a non-loopback endpoint. "
                 f"The plugin writes its token to %TEMP% on the debugger host, "
                 f"which is not this machine -- read it there and set it here."
             )
+        _validate_token(endpoint_token, ENV_OBSIDIAN_TOKEN, DebuggerEndpointError)
 
     return DebuggerEndpoint(
         host=resolved_host,
@@ -844,7 +937,17 @@ class RemoteAccessGate:
             logger.warning("Refused request from %s: Authorization is not 'Bearer <token>'", peer)
             return (401, "Authentication required", ((b"www-authenticate", b"Bearer"),))
 
-        if not hmac.compare_digest(presented.strip(), config.token):
+        # Compared as BYTES, not as str. hmac.compare_digest refuses a str
+        # containing non-ASCII ("comparing strings with non-ASCII characters is
+        # not supported"), and _header decodes with latin-1, so
+        # `Authorization: Bearer \xc3\xa9x` from any unauthenticated client
+        # raised TypeError out of the gate -- a 500 and a logged traceback per
+        # request where the contract is 401. latin-1 round-trips the wire bytes
+        # exactly, so for an ASCII token (the only shape resolve_transport_config
+        # now accepts) this compares precisely what arrived against what was
+        # configured.
+        presented_bytes = presented.strip().encode("latin-1", "replace")
+        if not hmac.compare_digest(presented_bytes, config.token.encode("utf-8")):
             logger.warning("Refused request from %s: token mismatch", peer)
             return (401, "Authentication required", ((b"www-authenticate", b"Bearer"),))
 

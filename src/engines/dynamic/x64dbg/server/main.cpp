@@ -1128,6 +1128,13 @@ bool StartHTTPServer(const Listener::Options& options) {
         std::string earlyReject;  // non-empty => respond with this and close
         {
             const unsigned long long deadline = GetTickCount64() + REQUEST_DEADLINE_MS;
+            // The TLS channel loops recv() internally, so the deadline checks
+            // in this block cannot see a peer that drips bytes inside one
+            // conn.Recv(). Hand the channel the same instant so the bound
+            // holds on both transports.
+            if (tls != nullptr) {
+                tls->SetDeadline(deadline);
+            }
             char buffer[8192];
 
             // Phase 1: read until the header terminator, bounded by

@@ -202,11 +202,21 @@ class TestNonLoopbackRequiresAllThree:
         with pytest.raises(DebuggerEndpointError, match=ENV_X64DBG_TLS_CA):
             resolve_debugger_endpoint()
 
-    def test_the_ca_refusal_says_the_plugin_has_no_tls_yet(self, monkeypatch, ca_file):
-        """Otherwise an operator sets the CA and waits for a handshake that never comes."""
+    def test_the_ca_refusal_says_where_the_far_end_gets_tls(self, monkeypatch, ca_file):
+        """The message has to name the other half of the setup.
+
+        It used to say obsidian_server.exe could not serve TLS and something
+        else had to terminate it. The same branch gave the listener Schannel,
+        so that sent operators off to install stunnel for no reason.
+        """
         _remote(monkeypatch, ca_file, **{ENV_X64DBG_TLS_CA: None})
-        with pytest.raises(DebuggerEndpointError, match="does not serve TLS"):
+        with pytest.raises(DebuggerEndpointError) as exc:
             resolve_debugger_endpoint()
+        message = str(exc.value)
+        assert "tls_cert_thumbprint" in message, (
+            "the refusal does not say how to give the far end a certificate"
+        )
+        assert "does not serve TLS" not in message
 
     def test_refused_without_a_token(self, monkeypatch, ca_file):
         _remote(monkeypatch, ca_file, **{ENV_OBSIDIAN_TOKEN: None})
@@ -480,3 +490,29 @@ class TestBlankAndZeroArguments:
     def test_explicit_port_beats_the_environment(self, monkeypatch):
         monkeypatch.setenv(ENV_X64DBG_PORT, "9001")
         assert resolve_debugger_endpoint(port=8765).port == 8765
+
+
+class TestTokenShapeIsValidated:
+    """A token that cannot be compared, or safely placed in a header, is refused.
+
+    Checked at configuration time rather than per request: a non-ASCII token
+    made `hmac.compare_digest` raise on *every* request including the correct
+    one, and a token containing CR or LF is a header-injection primitive where
+    the bridge builds "Bearer " + token into an outbound header.
+    """
+
+    @pytest.mark.parametrize(
+        "token",
+        # No NUL case: an environment variable cannot hold one, so os.environ
+        # refuses it before this policy is reached.
+        ["tok en", "tok\nen", "tok\ren", "tok\ten", "tøken", "tok;en", "tok\"en"],
+    )
+    def test_refused(self, monkeypatch, ca_file, token):
+        _remote(monkeypatch, ca_file, **{ENV_OBSIDIAN_TOKEN: token})
+        with pytest.raises(DebuggerEndpointError, match="bearer token may not hold"):
+            resolve_debugger_endpoint()
+
+    @pytest.mark.parametrize("token", ["b" * 64, "a-b_c.d~e+f/g=", "A1"])
+    def test_accepted(self, monkeypatch, ca_file, token):
+        _remote(monkeypatch, ca_file, **{ENV_OBSIDIAN_TOKEN: token})
+        assert resolve_debugger_endpoint().token_must_come_from_env is True

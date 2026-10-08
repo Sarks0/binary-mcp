@@ -146,8 +146,11 @@ Two things worth knowing before you expose it:
 | `400 {"error":"Origin not allowed"}` | A cross-origin request, usually a browser. Not served by design |
 | `403 {"error":"Client address not permitted"}` | The peer is outside `BINARY_MCP_REMOTE_CLIENT_ALLOWLIST` |
 
-Raise `BINARY_MCP_LOG_LEVEL=DEBUG` on Host B to see each refusal with the
-client address and the reason.
+Every refusal above is logged at WARNING with the client address and the
+reason, so it is already visible at the default log level — there is no need to
+raise `BINARY_MCP_LOG_LEVEL` to see why a request was turned away. Raise it to
+`DEBUG` only for the successful path (which endpoint was resolved, where the
+token came from).
 
 ---
 

@@ -269,11 +269,21 @@ inline std::string StripOrigin(const std::string& value) {
     if (origin == "null") {
         return origin;
     }
-    const size_t sep = origin.rfind("//");
-    if (sep == std::string::npos) {
-        return StripHostPort(origin);
+    // Split on the FIRST "://" and stop at the first delimiter that ends an
+    // authority. rfind("//") read "https://evil.test/a//127.0.0.1" as host
+    // "127.0.0.1", which a loopback listener answers for -- the parser
+    // accepted an origin the check exists to reject. No conforming browser
+    // puts a path in Origin, so this was not reachable from the attacker the
+    // check is written for; it is fixed because a gate that parses its input
+    // differently from what it guards is the defect either way.
+    const size_t scheme = origin.find("://");
+    std::string authority =
+        (scheme == std::string::npos) ? origin : origin.substr(scheme + 3);
+    const size_t end = authority.find_first_of("/?#");
+    if (end != std::string::npos) {
+        authority.erase(end);
     }
-    return StripHostPort(origin.substr(sep + 2));
+    return StripHostPort(authority);
 }
 
 // How many times does this header name appear in the request's header section?
@@ -339,7 +349,9 @@ inline bool HostAllowed(const Options& options, const std::string& hostValue) {
     if (host.empty()) {
         return false;
     }
-    if (host == AsciiLower(Unbracket(options.bind))) {
+    // options.bind is already lowercased and unbracketed by ParseOptions, and
+    // Describe/ParseIPv4/main.cpp all read that same value.
+    if (host == options.bind) {
         return true;
     }
     // A loopback listener answers for every spelling of itself: a client may
@@ -450,7 +462,13 @@ inline bool ParseOptions(int argc, const char* const* argv, Options& outOptions,
         }
 
         if (arg == "--bind") {
-            options.bind = Trim(value);
+            // Normalised HERE, not at each use. ParseOptions classified
+            // "[127.0.0.1]" by unbracketing it and then stored the raw value,
+            // so main.cpp's ParseIPv4 on the raw string failed at bind time --
+            // exit 1 ("port already in use") instead of the clean exit-2
+            // refusal, and the plugin's exit-2 branch never fired. The whole
+            // point of one shared parser is that every reader agrees.
+            options.bind = AsciiLower(Unbracket(Trim(value)));
         } else if (arg == "--port") {
             if (!ParsePort(Trim(value), options.port, outError)) return false;
             portSeen = true;

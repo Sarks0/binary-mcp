@@ -22,6 +22,7 @@ import ssl
 import pytest
 
 import src.utils.config as config_module
+import src.utils.remote as remote_module
 from src.utils.remote import (
     DEFAULT_HTTP_PATH,
     DEFAULT_HTTP_PORT,
@@ -820,3 +821,114 @@ class TestWhitespaceHostFallsBackToTheDefault:
         config = resolve_transport_config()
         assert config.host == "127.0.0.1"
         assert config.is_loopback
+
+
+class TestCipherSuites:
+    """The HTTP transport must not offer a suite without server authentication.
+
+    uvicorn's default is ``ssl_ciphers="TLSv1"``, which expands to 39 suites
+    including three with ``Au=None``: AECDH-AES256-SHA, AECDH-AES128-SHA and
+    AECDH-NULL-SHA. Anonymous key exchange means the server sends no
+    certificate, so there is nothing for a client to verify and an active
+    attacker can interpose with no certificate of their own; the third also has
+    ``Enc=None``, i.e. no confidentiality.
+
+    Reaching them needs a client that offers them, which neither requests nor
+    Node does -- so this was never exploitable against the shipped clients.
+
+    These assert the PROPERTIES of the expanded list rather than the cipher
+    string itself, because the properties are what matter and the string is
+    only one way to get them. The expansion is done by OpenSSL on a bare
+    context: no certificate is involved, so no fixture key material is needed
+    and the test says nothing about uvicorn beyond that it passes the string
+    through (verified separately, by hand, against a live listener).
+    """
+
+    def _suites(self, cipher_string=None):
+        import ssl as ssl_module
+
+        if cipher_string is None:
+            cipher_string = remote_module.HTTP_CIPHERS
+        context = ssl_module.SSLContext(ssl_module.PROTOCOL_TLS_SERVER)
+        context.set_ciphers(cipher_string)
+        return context.get_ciphers()
+
+    def test_ciphers_are_set_explicitly(self, tls_pair):
+        """Inheriting uvicorn's default is the bug; passing nothing is the bug."""
+        cert, key = tls_pair
+        config = TransportConfig(
+            transport="http", host="192.168.1.50", token="t" * 64,
+            tls_cert=cert, tls_key=key,
+        ).uvicorn_config()
+        assert config.get("ssl_ciphers") == remote_module.HTTP_CIPHERS, (
+            "uvicorn_config does not set ssl_ciphers, so uvicorn's default "
+            "'TLSv1' list applies and anonymous suites are offered"
+        )
+
+    def test_the_default_we_are_avoiding_really_is_unsafe(self):
+        """Guard the premise: if uvicorn's default stops being dangerous, say so.
+
+        Without this, the tests below could pass against a list that happens to
+        be fine for an unrelated reason, and nobody would know the override had
+        stopped earning its keep.
+        """
+        anonymous = [c["name"] for c in self._suites("TLSv1")
+                     if c["auth"] == "auth-null"]
+        assert anonymous, (
+            "uvicorn's default cipher list no longer contains anonymous "
+            "suites; re-evaluate whether HTTP_CIPHERS is still needed"
+        )
+
+    def test_no_anonymous_suites(self):
+        anonymous = [c["name"] for c in self._suites() if c["auth"] == "auth-null"]
+        assert not anonymous, f"suites with no server authentication: {anonymous}"
+
+    def test_no_null_encryption(self):
+        nulls = [c["name"] for c in self._suites() if "NULL" in c["name"].upper()]
+        assert not nulls, f"suites with no confidentiality: {nulls}"
+
+    def test_forward_secrecy_only(self):
+        """A static-RSA suite means one stolen key decrypts every past session."""
+        static = [c["name"] for c in self._suites()
+                  if c["kea"] not in ("kx-ecdhe", "kx-any")]
+        assert not static, f"suites without forward secrecy: {static}"
+
+    def test_tls_12_floor_without_a_version_knob(self):
+        """TLS 1.0/1.1 define no AEAD suites, so the cipher list is the floor.
+
+        uvicorn exposes no minimum_version setting, so this is how the floor
+        gets enforced rather than left to whatever the host's OpenSSL defaults
+        to.
+        """
+        protocols = {c["protocol"] for c in self._suites()}
+        assert protocols <= {"TLSv1.2", "TLSv1.3"}, f"pre-1.2 suites: {protocols}"
+
+    def test_aead_only(self):
+        cbc = [c["name"] for c in self._suites()
+               if "CBC" in c["name"].upper() or c["name"].endswith("-SHA")]
+        assert not cbc, f"CBC/SHA1 suites offered: {cbc}"
+
+    def test_both_rsa_and_ecdsa_server_keys_work(self):
+        """Narrowing the list must not lock out a certificate type."""
+        auths = {c["auth"] for c in self._suites()}
+        assert "auth-rsa" in auths and "auth-ecdsa" in auths, auths
+
+    def test_a_ca_turns_on_client_verification(self, tls_pair):
+        import ssl as ssl_module
+
+        cert, key = tls_pair
+        config = TransportConfig(
+            transport="http", host="192.168.1.50", token="t" * 64,
+            tls_cert=cert, tls_key=key, tls_ca=cert,
+        ).uvicorn_config()
+        assert config["ssl_cert_reqs"] == ssl_module.CERT_REQUIRED
+        assert config["ssl_ca_certs"] == str(cert)
+
+    def test_without_a_ca_no_client_cert_is_demanded(self, tls_pair):
+        cert, key = tls_pair
+        config = TransportConfig(
+            transport="http", host="192.168.1.50", token="t" * 64,
+            tls_cert=cert, tls_key=key,
+        ).uvicorn_config()
+        assert "ssl_cert_reqs" not in config
+        assert "ssl_ca_certs" not in config

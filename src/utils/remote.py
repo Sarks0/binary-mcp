@@ -85,6 +85,27 @@ DEFAULT_X64DBG_PORT = 8765
 # matching the token the x64dbg plugin generates, so the two look alike in logs.
 TOKEN_BYTES = 32
 
+# OpenSSL cipher list for the HTTP transport. Forward secrecy and AEAD only.
+#
+# This is set explicitly because uvicorn's default is ssl_ciphers="TLSv1",
+# which expands to 39 suites including three with Au=None -- AECDH-AES256-SHA,
+# AECDH-AES128-SHA and AECDH-NULL-SHA. "Au=None" is anonymous key exchange: the
+# server sends no certificate, so there is nothing for the client to verify and
+# an active attacker can interpose with no certificate of their own. The last
+# of the three also has Enc=None, i.e. no confidentiality either.
+#
+# Reaching them needs a client that offers them, which neither requests nor
+# Node does, so this was not exploitable against the shipped clients. It is
+# still the wrong thing for a listener whose entire purpose is authenticated
+# remote control of a debugger, and the cost of excluding them is one string.
+#
+# Restricting to ECDHE+AEAD also pins the protocol floor at TLS 1.2 without a
+# version knob: TLS 1.0 and 1.1 define no AEAD suites, so there is nothing for
+# them to negotiate. TLS 1.3's suites are chosen by set_ciphersuites rather
+# than set_ciphers and are unaffected by this list -- all of them are already
+# AEAD with forward secrecy.
+HTTP_CIPHERS = "ECDHE+AESGCM:ECDHE+CHACHA20:!aNULL:!eNULL:!MD5:!DSS"
+
 # Host names that mean "this machine" but are not IP literals, so
 # ipaddress.ip_address cannot classify them.
 _LOOPBACK_NAMES = frozenset({"localhost", "ip6-localhost", "ip6-loopback"})
@@ -296,6 +317,9 @@ class TransportConfig:
         if self.tls_cert is not None:
             config["ssl_certfile"] = str(self.tls_cert)
             config["ssl_keyfile"] = str(self.tls_key)
+            # Never inherit uvicorn's default cipher list -- see HTTP_CIPHERS
+            # for the anonymous suites it would otherwise enable.
+            config["ssl_ciphers"] = HTTP_CIPHERS
             if self.tls_ca is not None:
                 config["ssl_ca_certs"] = str(self.tls_ca)
                 config["ssl_cert_reqs"] = ssl.CERT_REQUIRED

@@ -325,6 +325,22 @@ Export-PfxCertificate -Cert $client -FilePath "$HOME\analyst.pfx" `
   -Password (Read-Host -AsSecureString "PFX password")
 ```
 
+**Import the CA into a trust store.** This step is easy to miss and nothing
+works without it: the server validates the client's chain in full before
+applying the thumbprint pin, so a CA that sits only in `My` produces
+`CERT_TRUST_IS_UNTRUSTED_ROOT` and every client is refused.
+
+```powershell
+$store = Get-Item Cert:\CurrentUser\Root
+$store.Open('ReadWrite'); $store.Add($ca); $store.Close()
+```
+
+`CurrentUser\Root`, not `LocalMachine\Root`: that scopes the trust to the one
+account x64dbg runs as, on a VM you revert. It is still real trust — that CA
+can now vouch for any host to that account — which is the cost of pinning on
+top of chain validation rather than instead of it. If that trade is wrong for
+your setup, use the SSH tunnel instead and skip certificates entirely.
+
 Add the CA thumbprint to the ini:
 
 ```ini
@@ -332,8 +348,10 @@ tls_client_ca_thumbprint=0011223344556677889900AABBCCDDEEFF001122
 ```
 
 Schannel then fails the handshake for a client without a certificate, and the
-server additionally checks that the certificate chains to *that* CA rather than
-to anything in the machine's trust stores — the pinning is the point.
+server additionally checks two things the chain alone does not: that the
+certificate is valid **for client authentication** (a server certificate from
+the same CA is refused), and that the pinned CA appears in its chain — so a
+different CA in the same trust store cannot vouch for a client here.
 
 On Host A, split the PFX into a PEM certificate and key (`openssl pkcs12
 -in analyst.pfx -clcerts -nokeys -out analyst.crt` and `openssl pkcs12 -in
@@ -383,6 +401,8 @@ removes the first.
 | `SSLError` / certificate verify failed | The certificate Host B serves is not the one in `X64DBG_TLS_CA`, or its subject alternative name does not cover `X64DBG_HOST` (the `TextExtension` line) |
 | Plugin log says `Server refused its listener configuration (exit 2)` | The flags built from `obsidian.ini` were rejected. The reason is in `obsidian_server.log`; deleting the ini restores the loopback default |
 | Plugin log says `obsidian.ini is malformed` | A value contains a character a flag cannot hold — usually a stray space or quote. The whole file is refused rather than one setting dropped |
+| Server log says `client certificate chain is not trusted (status 0x00000020)` | `CERT_TRUST_IS_UNTRUSTED_ROOT`: the client CA is not in a trust store the server can read. Import it into `Cert:\CurrentUser\Root` |
+| Server log says `was not issued under the CA named by --tls-client-ca-thumbprint` | The certificate is trusted but came from a different CA than the pinned one |
 | Nothing listens, and the server log says `no certificate with that thumbprint` | The thumbprint is from a different store. `--machine-store` / `machine_store=1` selects `LocalMachine\My`; the default is `CurrentUser\My`, which is what x64dbg's own user can read |
 | Connection reset, or a timeout, reaching a host that is clearly up | `HTTPS_PROXY` is set in the server's environment and `requests` is routing the debugger connection through it. Add the debugger host to `no_proxy` |
 

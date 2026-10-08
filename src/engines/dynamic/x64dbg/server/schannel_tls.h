@@ -199,8 +199,28 @@ inline bool ClientCertificateChainsTo(PCCERT_CONTEXT clientCert,
         return false;
     }
 
+    // Require the certificate to be valid FOR CLIENT AUTHENTICATION, not
+    // merely valid.
+    //
+    // With RequestedUsage left zeroed, CertGetCertificateChain checks the
+    // chain but not what the certificate is for -- so a SERVER certificate
+    // issued by the pinned CA would authenticate as a client. That matters
+    // whenever the pin is anything broader than a CA made solely for this
+    // purpose: against an enterprise CA, every server certificate it ever
+    // issued becomes a valid client credential here.
+    //
+    // OpenSSL enforces this on the Python listener already (a serverAuth-only
+    // certificate from the configured CA is rejected there), so without this
+    // the two halves of the same policy disagreed about the same certificate.
+    // A usage mismatch surfaces as CERT_TRUST_IS_NOT_VALID_FOR_USAGE, which
+    // the dwErrorStatus check below already treats as fatal.
+    LPSTR clientAuthOid[] = {const_cast<LPSTR>(szOID_PKIX_KP_CLIENT_AUTH)};
+
     CERT_CHAIN_PARA chainParameters = {};
     chainParameters.cbSize = sizeof(chainParameters);
+    chainParameters.RequestedUsage.dwType = USAGE_MATCH_TYPE_AND;
+    chainParameters.RequestedUsage.Usage.cUsageIdentifier = 1;
+    chainParameters.RequestedUsage.Usage.rgpszUsageIdentifier = clientAuthOid;
 
     PCCERT_CHAIN_CONTEXT chain = nullptr;
     if (!CertGetCertificateChain(nullptr, clientCert, nullptr, nullptr,
@@ -212,9 +232,22 @@ inline bool ClientCertificateChainsTo(PCCERT_CONTEXT clientCert,
 
     bool accepted = false;
     do {
+        // Nothing is tolerated here, including CERT_TRUST_IS_UNTRUSTED_ROOT.
+        // That means the pinned CA must also be installed in a trust store the
+        // server process can read -- the thumbprint pin is an ADDITIONAL
+        // restriction on top of chain validity, not a replacement for it.
+        //
+        // Deliberate: tolerating an untrusted root so the pin could stand
+        // alone would need the CA certificate supplied to chain building via
+        // hAdditionalStore, and getting that wrong fails open. Requiring the
+        // operator to put the CA in CurrentUser\Root fails closed, and scopes
+        // that trust to the one account on the debugger VM rather than the
+        // machine. docs/remote-access.md spells out the step and its cost.
         const DWORD errorStatus = chain->TrustStatus.dwErrorStatus;
         if (errorStatus != CERT_TRUST_NO_ERROR) {
-            Log("TLS: client certificate chain is not trusted (status 0x%08lx)",
+            Log("TLS: client certificate chain is not trusted (status 0x%08lx). "
+                "CERT_TRUST_IS_UNTRUSTED_ROOT (0x20) means the CA is not in a "
+                "trust store this process can read.",
                 static_cast<unsigned long>(errorStatus));
             break;
         }

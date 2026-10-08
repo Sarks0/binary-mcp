@@ -19,6 +19,27 @@ the whole workflow happens in one place instead of across four GUIs.
 Requires Python 3.12+ and Java 21+ for Ghidra. Both debuggers are Windows only;
 everything else runs anywhere.
 
+## Architecture
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/architecture-dark.png">
+    <img src="docs/images/architecture.png"
+         alt="binary-mcp architecture: an AI assistant talks MCP over stdio to the binary-mcp server, which exposes 147 tools behind path and command guardrails, session, job and cache layers, and drives five engines -- Ghidra, ILSpyCmd, pefile built-ins, x64dbg and WinDbg -- while keeping state in a shared on-disk cache.">
+  </picture>
+</p>
+
+The client speaks MCP over stdio, so each one gets its own server process. That
+is why sessions, jobs and the Ghidra project cache are file-backed in a shared
+directory rather than held in memory: two agents analyzing the same binary
+attach to one analysis instead of starting two. Every engine runs as a
+subprocess the server supervises, and the sample reaches them as bytes only --
+nothing in the diagram executes it.
+
+The drawing is editable: open
+[`docs/images/architecture.excalidraw`](docs/images/architecture.excalidraw) at
+[excalidraw.com](https://excalidraw.com) and re-export the two PNGs.
+
 ## Quick Start
 
 ```bash

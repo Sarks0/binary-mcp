@@ -12,6 +12,7 @@
 
 # JSON files
 *.json text eol=lf
+*.excalidraw text eol=lf
 
 # TOML files
 *.toml text eol=lf

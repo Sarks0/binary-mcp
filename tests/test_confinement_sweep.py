@@ -562,6 +562,64 @@ def test_hardlinked_sample_is_refused_by_the_tool_layer(
     assert check_compat.calls == []
 
 
+@pytest.mark.parametrize("tool_name", ["check_binary", "analyze_binary"])
+def test_hardlink_refusal_is_not_reported_as_a_bad_path(
+    server, quarantine, tmp_path, monkeypatch, tool_name
+):
+    """
+    The refusal must say what was wrong WHERE a caller reads it.
+
+    The test above asserts only ``"Error" in result``, which is how this
+    shipped: ``analyze_binary`` and ``check_binary`` were the two handlers
+    still answering a refused path with ``safe_error_message("Invalid binary
+    file or path", e)``, i.e. four words and a reference ID. A hard-linked
+    staging copy and a genuine confinement violation were byte-identical, so
+    the link count could only be found by reading src/utils/security.py.
+
+    Both tools now route through ``safe_path_error``, which reconstructs the
+    category from the exception type -- and the type is now distinct.
+    """
+    import os
+
+    if os.name == "nt":
+        pytest.skip("st_nlink is not a reliable hard-link signal on Windows")
+
+    _disable_auto_session(server, monkeypatch)
+
+    outside = tmp_path / "outside"
+    outside.mkdir(exist_ok=True)
+    secret = outside / "secret"
+    secret.write_bytes(b"MZ\x90\x00" + b"\x00" * 64)
+    link = quarantine / "sample.bin"
+    os.link(secret, link)
+
+    tool = getattr(server, tool_name)
+    hardlink_result = tool(binary_path=str(link))
+    # Same tool, same posture, a genuinely out-of-bounds path.
+    oob_result = tool(binary_path=str(secret))
+
+    assert "Error" in hardlink_result
+    assert "Error" in oob_result
+
+    # Reference IDs are per-call, so compare the text without them.
+    def _without_reference_id(text):
+        return "\n".join(
+            line for line in text.splitlines() if not line.startswith("Reference ID:")
+        )
+
+    assert _without_reference_id(hardlink_result) != _without_reference_id(oob_result), (
+        f"{tool_name} reports a hard-link refusal and an out-of-bounds path "
+        f"with the same text, so the failure reads as 'wrong path' when the "
+        f"path was accepted and the link count was not"
+    )
+    assert "hard link" in hardlink_result
+    assert ENV_ALLOW_HARDLINKS in hardlink_result, (
+        f"{tool_name} refuses the link without naming the opt-out, leaving the "
+        f"caller to find it in the source"
+    )
+    assert "hard link" not in oob_result
+
+
 # F-5: the second, unswept session store
 
 

@@ -36,8 +36,11 @@ from src.utils.security import (
     ENV_ALLOW_HARDLINKS,
     ENV_ALLOWED_DIRS,
     ENV_REQUIRE_CONFINEMENT,
+    PATH_ERROR_GUIDANCE,
+    HardLinkError,
     PathTraversalError,
     default_quarantine_dirs,
+    path_error_guidance,
     reset_confinement_warning,
     sanitize_binary_path,
     sanitize_output_dir,
@@ -524,6 +527,120 @@ def test_hardlink_check_is_skipped_when_confinement_is_disabled(
 
     monkeypatch.setenv(ENV_ALLOW_ANY_PATH, "1")
     assert sanitize_binary_path(str(link)) == link.resolve()
+
+
+# The two refusals must not read alike. A hard-linked staging copy and a
+# genuinely out-of-bounds path were both a bare PathTraversalError whose
+# model-facing text was reconstructed from the exception TYPE, so the link-count
+# refusal was described as "the path is outside the directories this server is
+# allowed to read" -- false, and it sends the reader to re-check an allow-list
+# that had already accepted the directory.
+
+
+@posix_only
+def test_hardlink_refusal_has_its_own_exception_type(tmp_path, quarantine):
+    """
+    HardLinkError, but still a PathTraversalError.
+
+    The subclass relationship is load-bearing: ~30 tool handlers catch
+    PathTraversalError to mean "path refused", and this refusal must keep
+    arriving there. Narrowing the raise to a non-PathTraversalError type would
+    turn every one of those into an unhandled exception.
+    """
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    secret = outside_dir / "secret"
+    secret.write_bytes(b"MZ\x00\x00")
+    link = quarantine / "sample.bin"
+    os.link(secret, link)
+
+    with pytest.raises(HardLinkError):
+        sanitize_binary_path(str(link))
+    # The same raise, caught as the base type every handler actually names.
+    with pytest.raises(PathTraversalError):
+        sanitize_binary_path(str(link))
+
+
+@posix_only
+def test_hardlink_and_confinement_guidance_do_not_read_alike(
+    tmp_path, quarantine
+):
+    """
+    The B3 regression: the two refusals must be told apart from the text alone.
+
+    Asserted on the guidance text rather than on the raw exception string,
+    because the guidance is what reaches the caller -- the raw text is logged
+    against a reference ID and never shown.
+    """
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    secret = outside_dir / "secret"
+    secret.write_bytes(b"MZ\x00\x00")
+    link = quarantine / "sample.bin"
+    os.link(secret, link)
+
+    with pytest.raises(PathTraversalError) as hard:
+        sanitize_binary_path(str(link))
+    with pytest.raises(PathTraversalError) as oob:
+        sanitize_binary_path(str(secret))
+
+    hard_text = path_error_guidance(hard.value)
+    oob_text = path_error_guidance(oob.value)
+
+    assert hard_text != oob_text, (
+        "a hard-link refusal and an out-of-bounds path produce identical "
+        "guidance, so the caller cannot tell which of the two it hit"
+    )
+    # The hard-link text must name the cause and the remedy...
+    assert "hard link" in hard_text
+    assert ENV_ALLOW_HARDLINKS in hard_text
+    # ...and must not mis-describe the refusal as a directory problem, which is
+    # the specific wrong turn this test exists to prevent.
+    assert "outside the directories" not in hard_text
+    # The out-of-bounds text keeps its own diagnosis and does not acquire the
+    # hard-link one.
+    assert "outside the directories" in oob_text
+    assert "hard link" not in oob_text
+
+
+def test_guidance_lookup_does_not_depend_on_mapping_order(monkeypatch):
+    """
+    Resolution is by MRO, not by scanning the mapping in insertion order.
+
+    PATH_ERROR_GUIDANCE used to hold only sibling types, so an isinstance scan
+    in dict order was safe. HardLinkError subclasses PathTraversalError, and a
+    scan would return whichever of the two was inserted first -- making the
+    correctness of the message depend on the order of a dict literal. Reversing
+    the mapping must change nothing.
+    """
+    assert path_error_guidance(HardLinkError("x")) == PATH_ERROR_GUIDANCE[HardLinkError]
+
+    monkeypatch.setattr(
+        "src.utils.security.PATH_ERROR_GUIDANCE",
+        dict(reversed(list(PATH_ERROR_GUIDANCE.items()))),
+    )
+    assert path_error_guidance(HardLinkError("x")) == PATH_ERROR_GUIDANCE[HardLinkError]
+    assert (
+        path_error_guidance(PathTraversalError("x"))
+        == PATH_ERROR_GUIDANCE[PathTraversalError]
+    )
+
+
+def test_unmapped_path_traversal_subclass_inherits_the_base_guidance():
+    """
+    A future subclass with no entry of its own must not fall through to None.
+
+    The MRO walk is what preserves the old isinstance behaviour here: without
+    it, an unmapped subclass would return None and callers would drop to the
+    generic reference-ID envelope.
+    """
+
+    class FutureRefusalError(PathTraversalError):
+        pass
+
+    assert path_error_guidance(FutureRefusalError("x")) == PATH_ERROR_GUIDANCE[
+        PathTraversalError
+    ]
 
 
 @posix_only

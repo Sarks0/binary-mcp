@@ -95,22 +95,32 @@ make test-cov
 ### Dependency Updates
 
 Dependencies are bumped by Dependabot, configured in `.github/dependabot.yml`.
-It watches the two version surfaces that live in tracked files -- `uv.lock` for
-Python and the action pins in `.github/workflows/` -- and opens grouped pull
-requests weekly.
+It covers the dependencies `pyproject.toml` declares (resolved into `uv.lock`)
+and the actions referenced by `.github/workflows/`, and opens pull requests
+weekly. The comments in that file say what it does not cover, and why -- the
+x64dbg plugin SDK, cmake and `uvx bandit` are all resolved at run time, and
+Ghidra/Java/x64dbg/WinDbg are user installs.
 
 Reviewing one:
 
-- Patch/minor and dev-tooling groups are gated by the PR's own CI run. Green
-  across the three OSes, plus the x64dbg plugin compile check, is normally the
-  whole review.
-- Major bumps arrive one per pull request, because each is a real decision. Read
-  the upstream changelog for the runtime parsers (`capstone`, `pefile`,
-  `pyelftools`): they parse attacker-controlled input, and the test suite works
-  from a small sample set that will not catch a behaviour change on its own.
-- Dependabot cannot bump what no tracked file pins. The x64dbg plugin SDK, cmake,
-  and Ghidra/Java/x64dbg/WinDbg are all resolved outside the repository; the
-  comments in `.github/dependabot.yml` list what that leaves uncovered.
+- Two checks actually gate a Python bump: `uv run ruff check src/ tests/` and
+  `uv run pytest`. The bandit job carries `continue-on-error: true` and the
+  Codecov upload `fail_ci_if_error: false`, so neither can fail a pull request,
+  and the plugin compile check installs no Python dependencies -- a green tick
+  from those three says nothing about a dependency.
+- Action bumps arrive as majors, one per pull request. The `uses:` refs are
+  major-only tags (`@v4`), and Dependabot matches the precision of the ref it
+  finds, so `@v5` is the only update it can propose. Read the action's release
+  notes: a renamed input is exactly the kind of break no check on the PR sees.
+- Release-only actions are exercised by no pull-request check at all.
+  `upload-artifact`, `download-artifact` and `action-gh-release` run only in
+  `release.yml`, which triggers on a `v*.*.*` tag. Validate a bump to those with
+  a prerelease tag (any tag carrying a hyphen, e.g. `v0.2.1-rc1`) before a full
+  release depends on them.
+- Runtime majors are each a real decision. Read the upstream changelog for the
+  parsers (`capstone`, `pefile`, `pyelftools`): they read attacker-controlled
+  input, and the test suite works from a small sample set that will not catch a
+  behaviour change on its own.
 
 To bump something by hand instead:
 
@@ -335,6 +345,7 @@ Follow conventional commits:
 - `refactor`: Code restructuring
 - `test`: Adding tests
 - `chore`: Maintenance
+- `ci`: CI, release workflows and dependency configuration
 
 **Example:**
 

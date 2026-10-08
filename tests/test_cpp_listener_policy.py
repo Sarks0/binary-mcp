@@ -19,6 +19,7 @@ plaintext to a LAN address, would pass a happy-path test just as well.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -401,7 +402,14 @@ def policy_binary(tmp_path_factory):
     workdir = tmp_path_factory.mktemp("listener_policy")
     source = workdir / "harness.cpp"
     source.write_text(_HARNESS, encoding="utf-8")
-    binary = workdir / "harness"
+    # Named with the platform's executable suffix. A Windows compiler emits
+    # harness.exe, so an extensionless path is not the file that appears --
+    # which made the is_file() assertion below fail on windows-latest while
+    # test_policy_decisions right next to it PASSED, because CreateProcess
+    # appends .exe to an extensionless path and ran the binary anyway. Naming
+    # it keeps the path asserted on and the path executed identical instead of
+    # resting on that fallback.
+    binary = workdir / ("harness.exe" if os.name == "nt" else "harness")
     compile_result = subprocess.run(
         [
             _COMPILER,

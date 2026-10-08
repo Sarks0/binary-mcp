@@ -1,0 +1,201 @@
+# Dependabot configuration.
+#
+# Two dependency surfaces in this repository carry a version in a tracked file,
+# and this file covers both: the Python dependencies pyproject.toml declares
+# (resolved into uv.lock) and the GitHub Actions referenced by
+# .github/workflows/.
+#
+# SCOPE, precisely. Version updates cover the 13 dependencies pyproject.toml
+# DECLARES: 7 runtime, `pybag` in the `windbg` extra, 4 under `dev`, and
+# `hatchling` as the build backend. uv.lock holds 93 packages; the other 80 are
+# transitive, and Dependabot's default `allow` does not raise version PRs for
+# them -- they move when a direct dependency's resolution drags them along, or
+# when a security alert fires, since security updates do reach transitive
+# dependencies. `allow: [{dependency-type: "all"}]` would watch all 93; not
+# enabled, because 80 extra PR streams behind a 7-dependency project is noise.
+#
+# What is deliberately NOT covered, so this file is not mistaken for watching
+# more than it does:
+#
+#   * The x64dbg plugin SDK. ci.yml and release.yml both resolve it at build
+#     time from x64dbg's 'releases/latest' API, so it is always current and
+#     there is no manifest to bump. The flip side is that an upstream SDK change
+#     can redden a build with no commit of ours involved -- a property of
+#     fetching 'latest', not something this file can fix.
+#   * cmake. jwlawson/actions-setup-cmake is pinned here, but it runs with
+#     `cmake-version: 'latest'`, so the toolchain version is resolved per run.
+#   * bandit. ci.yml's security job runs `uvx bandit`, which resolves the newest
+#     release from PyPI at run time: not in pyproject.toml, not in uv.lock, so
+#     nothing pins it, and a bandit release can change that job's behaviour with
+#     no commit here. Declaring it in the `dev` extra and calling `uv run bandit`
+#     would bring it under the uv entry below -- that is a CI change rather than
+#     a Dependabot one, so it is not made here.
+#   * Ghidra, Java, x64dbg, WinDbg. Users install these themselves (INSTALL.md);
+#     no tracked file declares a version.
+#   * ssdeep, python-tlsh, yara-python. Intentionally not dependencies at all --
+#     see the comments in pyproject.toml for why. A Dependabot entry cannot
+#     resurrect a dependency the project does not have.
+#
+# Labels are left to the default. Dependabot creates and applies `dependencies`
+# itself, and adds a per-ecosystem label (`python`, `github_actions`) because
+# more than one ecosystem is configured here. A custom label must already exist
+# in the repository before it can be requested, so naming one that has not been
+# created buys nothing.
+#
+# Reference: https://docs.github.com/en/code-security/reference/supply-chain-security/dependabot-options-reference
+
+version: 2
+
+updates:
+  # ---------------------------------------------------------------------------
+  # GitHub Actions used by ci.yml and release.yml
+  # ---------------------------------------------------------------------------
+  #
+  # This is the higher-value half of the file. release.yml publishes the plugin
+  # binaries and the SHA256SUMS manifest the installers verify against, so every
+  # action in that job runs with `contents: write` over a release artifact. An
+  # abandoned or compromised action there matters more than a stale library.
+  - package-ecosystem: "github-actions"
+    # "/" means .github/workflows/ -- not a literal directory named "/".
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    # Above the default of 5. There are nine action refs, each update arrives as
+    # its own PR (see below), and codecov-action and setup-uv are already behind,
+    # so 5 would defer the rest until something merges.
+    open-pull-requests-limit: 10
+    # Conventional commits, per CONTRIBUTING.md. Yields
+    # "ci(deps): bump actions/checkout from 4 to 5".
+    commit-message:
+      prefix: "ci"
+      include: "scope"
+    cooldown:
+      # Hold a new release for a week before opening a PR for it, which buys
+      # time on one that gets yanked or hotfixed. Read the note at the end of
+      # this entry for what cooldown does NOT protect against.
+      default-days: 7
+    groups:
+      # upload-artifact and download-artifact MUST move together: release.yml
+      # hands an artifact from one to the other, and v4 cannot read what v5
+      # wrote. Grouping keeps that pair atomic. Ungrouped they would be two
+      # independently mergeable PRs, and nothing on either PR would catch the
+      # mismatch, because release.yml runs ONLY on a 'v*.*.*' tag -- the break
+      # would surface at the next release, after both had merged. No
+      # update-types filter here on purpose: the pair stays together at every
+      # level.
+      actions-artifact-pair:
+        patterns:
+          - "actions/upload-artifact"
+          - "actions/download-artifact"
+    # Every other action gets its own PR -- which is also close to all
+    # Dependabot can offer here. All nine refs are FLOATING major tags (@v2,
+    # @v4, @v5), and Dependabot matches the precision of the ref it finds, so
+    # the only candidate for '@v4' is '@v5': a major. Hence deliberately NO
+    # minor/patch group -- as the refs stand it could not match anything.
+    #
+    # "As the refs stand" is load-bearing, because that rule has an exception:
+    # where upstream has STOPPED publishing a floating major, Dependabot bumps
+    # the floating ref to an exact tag instead. astral-sh/setup-uv is that case
+    # -- v8.0.0 was its first immutable release and no floating '@v8' or later
+    # major tag is published, by design, to blunt the tj-actions class of attack
+    # -- so the PR that arrives for '@v5' will not read 'v5 -> v6'. It will
+    # rewrite the ref to a pinned exact version, and may cross several majors at
+    # once. Expect the ref SHAPE to change on that one, review it as the pin
+    # change it is, and note that once an action is pinned exactly, patch/minor
+    # updates for it become real -- at which point a minor/patch group is worth
+    # adding, and the paragraph above stops being true.
+    #
+    # One PR each suits them anyway: codecov-action's v5 renamed its `file:`
+    # input (the ref here is behind enough that a bump may cross more than one
+    # major), and a setup-msbuild or actions-setup-cmake major can move the MSVC
+    # toolchain, which with CMAKE_COMPILE_WARNING_AS_ERROR in ci.yml shows up as
+    # new warnings failing the compile check. That gate working is the point.
+    #
+    # ON COOLDOWN, AND WHAT PINS WOULD ADD: cooldown delays a new version PR. It
+    # is not protection against a MOVED tag -- '@v4' is re-resolved on every
+    # workflow run, so if upstream force-moves v4, this repo picks it up at once
+    # and no Dependabot PR is anywhere in the path. Pinning each `uses:` to a
+    # 40-character commit SHA (`actions/checkout@<sha>  # v4.2.2`) is what closes
+    # that hole, and Dependabot maintains SHA pins; it would also make
+    # patch/minor updates real here, and so make a grouped minor/patch PR worth
+    # having. That is a change to the two workflows, not to this file.
+
+  # ---------------------------------------------------------------------------
+  # Python dependencies (uv)
+  # ---------------------------------------------------------------------------
+  #
+  # "uv" -- not "pip". The ecosystem is chosen by the lockfile format, and this
+  # project locks with uv (uv.lock is committed and `uv sync` is what both CI
+  # and the Makefile run). A "pip" entry would read pyproject.toml while
+  # ignoring uv.lock, leaving the lockfile CI installs from untouched.
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+    cooldown:
+      default-days: 7
+    # Set explicitly, because the default is not what this project wants. The
+    # default `auto` picks `increase` for an application and `widen` for a
+    # library, judged from the package's own metadata -- and `widen` REWRITES
+    # the constraint in pyproject.toml, relaxing an upper bound to admit the new
+    # version. pyproject here pins by floor (`>=`) except for one deliberate
+    # cap, so widening is the one behaviour that could undo a decision this repo
+    # made on purpose.
+    #
+    # `increase-if-necessary` leaves a constraint alone whenever it already
+    # admits the new version, which covers every floor-only pin: the PR then
+    # touches uv.lock and nothing else. (`lockfile-only` is the stricter
+    # alternative -- it skips any update needing a manifest edit -- but support
+    # for it on the uv ecosystem is reported as patchy, and a strategy that
+    # silently produces no PRs is worse than one that produces reviewable ones.)
+    versioning-strategy: "increase-if-necessary"
+    ignore:
+      # The one constraint `increase-if-necessary` WOULD rewrite: fastmcp is
+      # capped `fastmcp>=2.13,<3` in pyproject.toml, 3.x does not satisfy that,
+      # so the strategy above would bump the cap rather than leave it. The cap
+      # exists to force a deliberate migration, so the major is ignored outright
+      # and lifting it stays a human edit. Patch and minor fastmcp updates are
+      # unaffected, as are security updates within 2.x.
+      - dependency-name: "fastmcp"
+        update-types: ["version-update:semver-major"]
+    groups:
+      # Dev tooling, every update type. Gated by the PR's own CI: a ruff major
+      # that introduces new lint rules fails `uv run ruff check src/ tests/` in
+      # the same run, which is the whole signal needed to decide.
+      #
+      # Patterns rather than `dependency-type: "development"` so the membership
+      # is exact and visible. The cost is that this list MIRRORS the `dev` extra
+      # in pyproject.toml by hand: a dev tool added there that is neither
+      # pytest* nor ruff falls into the runtime group below until it is added
+      # here as well. (`coverage` is intentionally absent -- it reaches uv.lock
+      # only as a transitive dependency of pytest-cov, which the default `allow`
+      # raises no PRs for, so a `coverage*` pattern would match nothing.)
+      python-dev-tooling:
+        patterns:
+          - "pytest*"
+          - "ruff"
+      # Everything else, patch and minor only. Groups are matched in file order
+      # and a dependency joins the first group it matches, so dev tooling is
+      # already claimed above and cannot land here.
+      python-runtime-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
+    # Runtime majors are ungrouped on purpose -- one PR each. capstone and
+    # pefile parse attacker-controlled binaries and pyproject pins them by floor
+    # only, so a major there is a parser swap under the analysis engines.
+    # Ungrouped too, and easy to forget: `pybag` (the `windbg` extra) and
+    # `hatchling` (the build backend), both declared in pyproject.toml and so
+    # both watched. One naming trap: the MCP SDK is declared `mcp[cli]>=1.6.0`,
+    # and Dependabot carries the extras in the name, so an `ignore` or
+    # `patterns` entry written as plain `mcp` would match nothing.

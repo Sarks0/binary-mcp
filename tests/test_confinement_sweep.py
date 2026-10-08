@@ -712,8 +712,36 @@ def test_the_sweep_finds_the_tools_it_claims_to(server):
         assert expected in names, f"sweep no longer reaches {expected}"
 
 
+@pytest.fixture
+def refused_paths(quarantine, tmp_path):
+    """
+    Every shape of refusal a tool can be handed, as ``(label, path)``.
+
+    The hard-link case is appended only on POSIX, so the sweeps that use this
+    still run on Windows for the other two. An earlier version took the
+    hard-link fixture directly, which made the whole sweep skip on Windows --
+    throwing away out-of-bounds and missing-file leak coverage on the one
+    platform where the hard-link check is deliberately absent, and so the one
+    platform where the remaining refusals carry more of the weight.
+    """
+    outside = tmp_path / "outside"
+    outside.mkdir(exist_ok=True)
+    target = outside / "secret"
+    target.write_bytes(b"MZ\x90\x00" + b"\x00" * 64)
+
+    cases = [
+        ("out of bounds", target),
+        ("missing", quarantine / "nope.bin"),
+    ]
+    if os.name != "nt":
+        link = quarantine / "sample.bin"
+        os.link(target, link)
+        cases.append(("hard link", link))
+    return cases
+
+
 def test_no_tool_leaks_host_layout_when_it_refuses_a_path(
-    server, hardlinked_sample, quarantine, tmp_path, monkeypatch
+    server, refused_paths, tmp_path, monkeypatch
 ):
     """
     No tool may echo the resolved allow-list, whatever refuses the path.
@@ -729,14 +757,10 @@ def test_no_tool_leaks_host_layout_when_it_refuses_a_path(
     locally defensible. Asserting on the whole surface is what catches that.
     """
     _disable_auto_session(server, monkeypatch)
-    link, secret = hardlinked_sample
-    missing = quarantine / "nope.bin"
 
     offenders = []
     for name, fn, kwargs in _binary_path_tools(server):
-        for label, path in (
-            ("hard link", link), ("out of bounds", secret), ("missing", missing)
-        ):
+        for label, path in refused_paths:
             try:
                 result = str(fn(binary_path=str(path), **kwargs))
             except Exception as exc:  # noqa: BLE001 - reported, not swallowed

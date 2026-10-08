@@ -92,6 +92,33 @@ make test
 make test-cov
 ```
 
+### Dependency Updates
+
+Dependencies are bumped by Dependabot, configured in `.github/dependabot.yml`.
+It watches the two version surfaces that live in tracked files -- `uv.lock` for
+Python and the action pins in `.github/workflows/` -- and opens grouped pull
+requests weekly.
+
+Reviewing one:
+
+- Patch/minor and dev-tooling groups are gated by the PR's own CI run. Green
+  across the three OSes, plus the x64dbg plugin compile check, is normally the
+  whole review.
+- Major bumps arrive one per pull request, because each is a real decision. Read
+  the upstream changelog for the runtime parsers (`capstone`, `pefile`,
+  `pyelftools`): they parse attacker-controlled input, and the test suite works
+  from a small sample set that will not catch a behaviour change on its own.
+- Dependabot cannot bump what no tracked file pins. The x64dbg plugin SDK, cmake,
+  and Ghidra/Java/x64dbg/WinDbg are all resolved outside the repository; the
+  comments in `.github/dependabot.yml` list what that leaves uncovered.
+
+To bump something by hand instead:
+
+```bash
+uv lock --upgrade-package <name>   # or `uv lock --upgrade` for everything
+make test
+```
+
 ## Code Style
 
 ### Python Style

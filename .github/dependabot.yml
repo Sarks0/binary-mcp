@@ -1,0 +1,122 @@
+# Dependabot configuration.
+#
+# This file covers the two dependency surfaces this repository actually pins in
+# git: the Python lockfile (uv.lock, resolved from pyproject.toml) and the
+# GitHub Actions referenced by .github/workflows/. Those are the only places a
+# version number lives in a tracked file, so they are the only places a bot can
+# bump one.
+#
+# What is deliberately NOT covered, so nobody assumes this file is watching it:
+#
+#   * The x64dbg plugin SDK. ci.yml and release.yml both resolve it at build
+#     time from x64dbg's 'releases/latest' API, so it is always current and
+#     there is no manifest to bump. The flip side is that an upstream SDK change
+#     can redden a build with no commit of ours involved -- that is a property
+#     of fetching 'latest', not something this file can fix.
+#   * cmake. jwlawson/actions-setup-cmake is pinned here, but it is configured
+#     with `cmake-version: 'latest'`, so the compiler toolchain version is
+#     resolved per run, not per commit.
+#   * Ghidra, Java, x64dbg, WinDbg. Users install these themselves (INSTALL.md);
+#     no tracked file declares a version.
+#   * ssdeep, python-tlsh, yara-python. Intentionally not declared as
+#     dependencies at all -- see the comments in pyproject.toml for why. A
+#     Dependabot entry cannot resurrect a dependency the project does not have.
+#
+# Labels are intentionally left to the default. Dependabot creates and applies
+# `dependencies` itself, and adds a per-ecosystem label (`python`,
+# `github_actions`) because more than one ecosystem is configured here. Custom
+# labels must already exist in the repository before they can be requested, so
+# naming one that has not been created yet buys nothing.
+#
+# Reference: https://docs.github.com/en/code-security/reference/supply-chain-security/dependabot-options-reference
+
+version: 2
+
+updates:
+  # ---------------------------------------------------------------------------
+  # GitHub Actions used by ci.yml and release.yml
+  # ---------------------------------------------------------------------------
+  #
+  # This is the higher-value half of the file. release.yml publishes the plugin
+  # binaries and the SHA256SUMS manifest the installers verify against, so every
+  # action in that job runs with `contents: write` on a release artifact. An
+  # abandoned or compromised action there matters more than a stale library in
+  # the lockfile, and the pins are major-only tags (@v4, @v5) which silently
+  # track moving refs -- a bump is the only thing that moves them across majors.
+  - package-ecosystem: "github-actions"
+    # "/" means .github/workflows/ -- not a literal directory named "/".
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 5
+    # Conventional commits, per CONTRIBUTING.md. Yields
+    # "ci(deps): bump actions/checkout from 4 to 5".
+    commit-message:
+      prefix: "ci"
+      include: "scope"
+    cooldown:
+      # Do not open a PR for a release younger than a week. Actions are
+      # resolved at run time from a tag the publisher can move, so a yanked or
+      # hotfixed release is worth waiting out. Security updates ignore cooldown.
+      default-days: 7
+    groups:
+      # Patch and minor action bumps are routine and land together, so that one
+      # green CI run covers them all instead of five near-identical PRs.
+      actions-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
+    # Major action bumps are deliberately left ungrouped: each gets its own PR
+    # because each is a real review. codecov-action v4 -> v5 changed its inputs
+    # (`file:` became `files:`), and a build-plugin action bumping major can
+    # change the MSVC toolchain -- which, with CMAKE_COMPILE_WARNING_AS_ERROR
+    # set in ci.yml, surfaces as new warnings failing the compile check. That
+    # gate working is the point; see the comment on that job.
+
+  # ---------------------------------------------------------------------------
+  # Python dependencies (uv)
+  # ---------------------------------------------------------------------------
+  #
+  # "uv" -- not "pip". The ecosystem is chosen by the lockfile format, and this
+  # project locks with uv (uv.lock is committed and `uv sync` is what both CI
+  # and the Makefile run). A "pip" entry here would read pyproject.toml while
+  # ignoring uv.lock, leaving the lockfile CI installs from untouched.
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+    cooldown:
+      default-days: 7
+    groups:
+      # Dev tooling, any update type including major. These are gated by CI on
+      # the PR itself: a ruff major that introduces new lint rules fails
+      # `ruff check src/ tests/` in the same run, which is the whole signal
+      # needed to decide. One PR for the lot.
+      python-dev-tooling:
+        patterns:
+          - "pytest*"
+          - "ruff"
+          - "coverage*"
+      # Everything else, patch and minor only. Groups are matched in file order
+      # and a dependency joins the first group it matches, so dev tooling is
+      # already claimed above and cannot land here.
+      python-runtime-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
+    # Runtime majors (mcp, fastmcp, pefile, pyelftools, requests, capstone,
+    # asn1crypto) are ungrouped on purpose -- one PR each. capstone and pefile
+    # parse attacker-controlled binaries and pyproject pins them by floor only,
+    # so a major there is a parser swap under the analysis engines. fastmcp is
+    # capped at <3 in pyproject.toml; that cap, not this file, is what holds
+    # back a v3 bump, and lifting it is a migration to review on its own.

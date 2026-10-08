@@ -36,6 +36,8 @@ import uuid
 
 from src.utils.security import (
     PATH_ERROR_GUIDANCE,
+    FileSizeError,
+    PathTraversalError,
     path_error_guidance,
     safe_error_message,
 )
@@ -100,6 +102,29 @@ def safe_tool_error(operation: str, error: Exception) -> str:
             f"Error {error_id}: {operation or 'tool call'} failed: {error.to_json()}"
         )
         return f"{curated_structured_text(error)}\nReference ID: {error_id}"
+
+    # A confinement refusal that reaches a CATCH-ALL still gets its category.
+    #
+    # Thirteen read-only tools (get_functions, get_strings, get_xrefs,
+    # extract_metadata, ...) validate only through get_analysis_context and
+    # have no path arm of their own, so a refused path arrived here and came
+    # back as "<tool> failed" plus a reference ID -- no leak, but the caller
+    # could not tell a denied directory from a hard link from a broken Ghidra
+    # install. Routing these two types through safe_path_error fixes all of
+    # them at once, and means a tool added later cannot reintroduce the gap by
+    # forgetting an arm.
+    #
+    # Deliberately ONLY these two. Both are raised exclusively by this
+    # project's own path validators, so the category is unambiguous.
+    # FileNotFoundError is NOT included even though PATH_ERROR_GUIDANCE has
+    # text for it: the Ghidra detector raises it for a missing INSTALLATION
+    # ("Ghidra installation not found. Please set GHIDRA_HOME"), and answering
+    # that with "no file exists at the path supplied -- check the name and
+    # extension" would trade one vague error for a confidently wrong one. A
+    # tool that wants the missing-file category names FileNotFoundError in its
+    # own arm, where the provenance is known.
+    if isinstance(error, (PathTraversalError, FileSizeError)):
+        return safe_path_error(operation, error, "path")
 
     return safe_error_message(
         f"{operation} failed" if operation else "Tool call failed", error
@@ -167,13 +192,22 @@ def safe_path_error(operation: str, error: Exception, subject: str = "path") -> 
         return safe_error_message(f"Invalid {subject} for {operation}", error)
 
     error_id = str(uuid.uuid4())[:8]
-    logger.warning(
+    # ERROR with a traceback, not WARNING without one. The reference ID handed
+    # to the caller is only worth anything if the operator can find the line it
+    # names, and a stdio MCP server is commonly run at level=ERROR -- at which
+    # a WARNING disappears, leaving the caller holding an ID that resolves to
+    # nothing. These are also the events most worth keeping: every confinement
+    # denial and every refused hard link comes through here. safe_error_message,
+    # which this function replaced at ~50 call sites, logged at ERROR with
+    # exc_info; matching it keeps that conversion from costing visibility.
+    logger.error(
         "Error %s: %s rejected %s: %s: %s",
         error_id,
         operation or "tool call",
         subject,
         type(error).__name__,
         error,
+        exc_info=error,
     )
     return (
         f"Error: Invalid {subject} -- {guidance}\n"

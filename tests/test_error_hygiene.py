@@ -71,6 +71,70 @@ class TestSafeToolError:
         assert_no_host_leak(out)
         assert_has_reference_id(out)
 
+    def test_confinement_refusal_reaching_a_catch_all_keeps_its_category(self):
+        """
+        Thirteen read-only tools have no path arm; the catch-all must cover them.
+
+        get_functions, get_strings, get_xrefs, extract_metadata and friends
+        validate only through get_analysis_context and end at
+        ``except Exception -> safe_tool_error``. Before this routing a refused
+        path came back as "<tool> failed" plus a reference ID, so a caller
+        could not tell a denied directory from a hard link from a broken
+        Ghidra install. Routing these two types here covers every such tool at
+        once, and means a tool added later cannot reintroduce the gap by
+        forgetting an arm.
+        """
+        from src.utils.security import (
+            FileSizeError,
+            HardLinkError,
+            PathTraversalError,
+        )
+
+        hardlink = safe_tool_error(
+            "get_functions", HardLinkError(f"{LEAK_MARKER} is a hard link (2 names)")
+        )
+        assert_no_host_leak(hardlink)
+        assert "hard link" in hardlink
+
+        confinement = safe_tool_error(
+            "get_functions", PathTraversalError(f"outside: {LEAK_MARKER}")
+        )
+        assert_no_host_leak(confinement)
+        assert "outside the directories" in confinement
+
+        # The two stay distinguishable through the catch-all, which is the
+        # whole point -- this is the B3 guarantee for tools with no path arm.
+        assert hardlink.splitlines()[0] != confinement.splitlines()[0]
+
+        oversize = safe_tool_error("get_functions", FileSizeError(LEAK_MARKER))
+        assert_no_host_leak(oversize)
+        assert "size limit" in oversize
+
+    def test_file_not_found_is_deliberately_not_routed_as_a_path_error(self):
+        """
+        FileNotFoundError is excluded from that routing, on purpose.
+
+        PATH_ERROR_GUIDANCE has text for it -- "no file exists at the path
+        supplied. Check the name and extension" -- but the Ghidra detector
+        raises FileNotFoundError for a missing INSTALLATION
+        (engines/static/ghidra/runner.py), and so do plenty of unrelated
+        reads. Answering "check the name and extension of your binary" to
+        "Ghidra installation not found" would trade a vague error for a
+        confidently wrong one. A tool that wants the missing-file category
+        names FileNotFoundError in its own arm, where provenance is known --
+        analyze_binary and check_binary both do.
+        """
+        out = safe_tool_error(
+            "analyze_binary",
+            FileNotFoundError(
+                "Ghidra installation not found. Please set GHIDRA_HOME "
+                f"environment variable. Searched {LEAK_MARKER}"
+            ),
+        )
+        assert_no_host_leak(out)
+        assert_has_reference_id(out)
+        assert "check the name and extension" not in out.lower()
+
     def test_ghidra_diagnostic_passthrough_is_preserved(self):
         """
         security.safe_error_message deliberately surfaces a curated
@@ -508,6 +572,18 @@ _AST_ALLOWED_HANDLERS = {
     #     non-negative int". Counts, kind names and the caller's own arguments;
     #     no raise site interpolates a path or any other host state.
     "CoverageError",
+    # urllib's two network error types, reviewed for the vt_tools raise sites
+    # the ast.Raise arm of this guard surfaced. Both interpolate ATTRIBUTES,
+    # never str(e): ``HTTPError.code`` is an int status and
+    # ``HTTPError.reason``/``URLError.reason`` is a status phrase or a socket
+    # error ("Not Found", "Name or service not known"). That is network state,
+    # not the host filesystem state F-10 is about, and it is the only thing
+    # that tells a user whether VirusTotal returned 404, 429 or refused the
+    # key -- collapsing it to a reference ID would make the VT tools
+    # materially harder to drive. Narrow handlers, not a blanket
+    # ``except Exception``, which is what keeps the audit bounded.
+    "HTTPError",
+    "URLError",
     # Third-party, reviewed: pefile raises PEFormatError with a fixed set of
     # structural descriptions ("DOS Header magic not found.", "Invalid NT
     # Headers signature.") and never interpolates the file path -- pefile is
@@ -631,7 +707,22 @@ def _walk_pruning_safe_helpers(node: ast.AST):
 
 def _exception_echoing_returns(path: Path) -> list[tuple[int, str, str]]:
     """
-    Find ``return f"...{e}..."`` statements governed by ``except ... as e``.
+    Find statements that echo a caught exception, governed by ``except ... as e``.
+
+    Covers ``return f"...{e}..."`` AND ``raise Foo(f"...{e}...")``. The guard
+    used to walk only ``ast.Return``, and that hole shipped a live leak: in
+    ``get_analysis_context`` a confinement refusal -- whose text interpolates
+    the resolved allow-list, and so ``Path.home()`` and the operator's
+    username -- was re-raised as
+
+        raise RuntimeError(f"Invalid binary path: {e}")
+
+    which is not a return, so this guard scored the file clean. The message
+    then became the job record's ``error`` and ``_run_or_degrade`` handed it
+    straight back to the caller. A ``raise`` is no safer than a ``return``
+    here: whether the string reaches the caller depends on what catches it,
+    and the whole point of the F-10 layer is not to have to reason about that
+    per call site.
 
     Returns ``(line_number, clause_text, source_text)`` for each offender,
     skipping handlers whose caught types are all on the allow-list.
@@ -652,9 +743,18 @@ def _exception_echoing_returns(path: Path) -> list[tuple[int, str, str]]:
         # exception if it names it, and the inner handler is visited on its
         # own turn for its own binding.
         for node in ast.walk(handler):
-            if not isinstance(node, ast.Return) or node.value is None:
+            # A bare `raise` (node.exc is None) re-raises the original object
+            # and composes no new string, so it cannot leak and is the fix this
+            # guard wants, not a finding.
+            if isinstance(node, ast.Return):
+                payload = node.value
+            elif isinstance(node, ast.Raise):
+                payload = node.exc
+            else:
                 continue
-            if handler.name in _interpolated_names(node.value):
+            if payload is None:
+                continue
+            if handler.name in _interpolated_names(payload):
                 offenders.append(
                     (node.lineno, ", ".join(clauses), ast.unparse(node)[:120])
                 )
@@ -683,6 +783,79 @@ def test_no_returned_fstring_interpolates_a_caught_exception():
         "returned f-string interpolates a caught exception (audit F-10):\n  "
         + "\n  ".join(offenders)
     )
+
+
+@pytest.mark.parametrize(
+    "label,body",
+    [
+        (
+            "the real get_analysis_context leak",
+            'def f():\n'
+            '    try:\n'
+            '        pass\n'
+            '    except (PathTraversalError, FileSizeError) as e:\n'
+            '        raise RuntimeError(f"Invalid binary path: {e}")\n',
+        ),
+        (
+            "raise from a catch-all",
+            'def f():\n'
+            '    try:\n'
+            '        pass\n'
+            '    except Exception as e:\n'
+            '        raise RuntimeError(f"Failed to analyze binary: {e}")\n',
+        ),
+        (
+            "raise with the exception as a bare arg",
+            'def f():\n'
+            '    try:\n'
+            '        pass\n'
+            '    except Exception as e:\n'
+            '        raise RuntimeError("boom: " + str(e))\n',
+        ),
+    ],
+)
+def test_ast_guard_catches_the_raise_spelling(label, body, tmp_path):
+    """
+    Meta-test: the ``raise`` arm must stay in the guard.
+
+    The guard walked only ``ast.Return`` for its first two passes, and that is
+    exactly how the get_analysis_context leak shipped -- a confinement
+    refusal, whose text carries the resolved allow-list and the operator's
+    username, re-raised through an f-string. Without this test a refactor
+    could narrow the walk back to returns and nothing would notice, because
+    the production tree would be clean either way.
+    """
+    path = tmp_path / "probe.py"
+    path.write_text(body, encoding="utf-8")
+    assert _exception_echoing_returns(path), (
+        f"guard no longer catches {label}; the raise spelling is how the "
+        f"F-10 leak in get_analysis_context reached production"
+    )
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # The sanctioned fix: re-raise the original object, compose nothing.
+        'def f():\n'
+        '    try:\n'
+        '        pass\n'
+        '    except (PathTraversalError, FileSizeError):\n'
+        '        raise\n',
+        # Chaining keeps the cause for the traceback without echoing its text.
+        'def f():\n'
+        '    try:\n'
+        '        pass\n'
+        '    except Exception as e:\n'
+        '        raise RuntimeError("Failed to analyze binary") from e\n',
+    ],
+)
+def test_ast_guard_allows_the_sanctioned_raise_forms(body, tmp_path):
+    """A bare re-raise and a ``from e`` chain compose no string, so neither
+    is a finding -- flagging them would push authors back toward f-strings."""
+    path = tmp_path / "probe.py"
+    path.write_text(body, encoding="utf-8")
+    assert not _exception_echoing_returns(path)
 
 
 def test_ast_guard_actually_catches_the_spellings_the_line_guard_missed():

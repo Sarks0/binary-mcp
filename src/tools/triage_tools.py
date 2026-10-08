@@ -502,6 +502,7 @@ def register_triage_tools(app, session_manager=None):
         app: FastMCP application instance
         session_manager: Optional session manager for logging
     """
+    from src.tools.error_hygiene import safe_path_error
     from src.utils.security import (
         FileSizeError,
         PathTraversalError,
@@ -696,7 +697,7 @@ def register_triage_tools(app, session_manager=None):
             return "\n".join(output)
 
         except (PathTraversalError, FileSizeError) as e:
-            return safe_error_message("quick_scan", e)
+            return safe_path_error("quick_scan", e, "binary path")
         except Exception as e:
             logger.error(f"quick_scan failed: {e}")
             return safe_error_message("Failed to scan file", e)
@@ -753,7 +754,7 @@ def register_triage_tools(app, session_manager=None):
             return "\n".join(output)
 
         except (PathTraversalError, FileSizeError) as e:
-            return safe_error_message("detect_packers", e)
+            return safe_path_error("detect_packers", e, "binary path")
         except Exception as e:
             logger.error(f"detect_packers failed: {e}")
             return safe_error_message("Failed to detect packers", e)
@@ -857,7 +858,7 @@ def register_triage_tools(app, session_manager=None):
             return "\n".join(output)
 
         except (PathTraversalError, FileSizeError) as e:
-            return safe_error_message("extract_iocs", e)
+            return safe_path_error("extract_iocs", e, "binary path")
         except Exception as e:
             logger.error(f"extract_iocs failed: {e}")
             return safe_error_message("Failed to extract IOCs", e)

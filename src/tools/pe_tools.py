@@ -545,6 +545,7 @@ def _detect_overlay(pe, file_path: Path, include_hex: bool = False) -> list[str]
 
 def register_pe_tools(app, session_manager=None):
     """Register PE structure analysis tools with the MCP app."""
+    from src.tools.error_hygiene import safe_path_error
     from src.utils.security import (
         FileSizeError,
         PathTraversalError,
@@ -791,7 +792,7 @@ def register_pe_tools(app, session_manager=None):
                 pe.close()
 
         except (PathTraversalError, FileSizeError) as e:
-            return safe_error_message("get_pe_info", e)
+            return safe_path_error("get_pe_info", e, "binary path")
         except Exception as e:
             logger.error(f"get_pe_info failed: {e}")
             return safe_error_message("Failed to analyze PE file", e)
@@ -843,7 +844,7 @@ def register_pe_tools(app, session_manager=None):
             logger.error("pe_tools structured error (detail withheld from model): %s", e.structured_error)
             return curated_structured_text(e)
         except (PathTraversalError, FileSizeError) as e:
-            return safe_error_message("inspect_authenticode", e)
+            return safe_path_error("inspect_authenticode", e, "binary path")
         except Exception as e:
             logger.error(f"inspect_authenticode failed: {e}")
             return safe_error_message("Failed to inspect Authenticode signature", e)
@@ -914,7 +915,7 @@ def register_pe_tools(app, session_manager=None):
             logger.error("pe_tools structured error (detail withheld from model): %s", e.structured_error)
             return curated_structured_text(e)
         except (PathTraversalError, FileSizeError) as e:
-            return safe_error_message("extract_embedded_binaries", e)
+            return safe_path_error("extract_embedded_binaries", e, "binary path")
         except Exception as e:
             logger.error(f"extract_embedded_binaries failed: {e}")
             return safe_error_message("Failed to extract embedded binaries", e)
@@ -969,7 +970,7 @@ def register_pe_tools(app, session_manager=None):
             logger.error("pe_tools structured error (detail withheld from model): %s", e.structured_error)
             return curated_structured_text(e)
         except (PathTraversalError, FileSizeError) as e:
-            return safe_error_message("compute_similarity_hashes", e)
+            return safe_path_error("compute_similarity_hashes", e, "binary path")
         except Exception as e:
             logger.error(f"compute_similarity_hashes failed: {e}")
             return safe_error_message("Failed to compute similarity hashes", e)

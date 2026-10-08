@@ -891,6 +891,7 @@ def register_diff_tools(app, session_manager, cache, runner):
         runner: GhidraRunner (kept for parity; this tool is strictly
             cache-only and never invokes it).
     """
+    from src.tools.error_hygiene import safe_path_error
     from src.utils.security import (
         FileSizeError,
         PathTraversalError,
@@ -1114,7 +1115,7 @@ def register_diff_tools(app, session_manager, cache, runner):
             return _render(bounded=True, full_path=full_path)
 
         except (PathTraversalError, FileSizeError) as e:
-            return safe_error_message("diff_binaries", e)
+            return safe_path_error("diff_binaries", e, "binary path")
         except Exception as e:
             logger.exception("diff_binaries failed")
             return safe_error_message("Failed to diff binaries", e)

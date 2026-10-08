@@ -803,23 +803,46 @@ def get_analysis_context(
 
     Raises:
         RuntimeError: If analysis fails
-        PathTraversalError: If path is outside allowed directories
-        FileSizeError: If file exceeds size limits
+        PathTraversalError: If the path is outside the allow-list (or, as
+            :class:`HardLinkError`, if it has more than one name)
+        FileSizeError: If the file exceeds the analysis size limit
+        FileNotFoundError: If no file exists at the path
+        ValueError: If the path names something that is not a file
+
+    The last four propagate UNCHANGED from :func:`sanitize_binary_path`. They
+    used to be caught here and re-raised as
+    ``RuntimeError(f"Invalid binary path: {e}")``, which was wrong twice over:
+
+      * The text of a confinement denial is itself host state --
+        ``_default_confinement_denied`` interpolates the resolved allow-list,
+        which is derived from ``Path.home()`` and so carries the operator's
+        username. Stringifying it into a new exception put it on a path that
+        ends in the caller's transcript (validation happens inside the job work
+        function, so the message became the job record's ``error``, which
+        ``_run_or_degrade`` returns as ``f"Error: {reason}"``). That is the
+        F-10 leak this module's whole safe_*_error layer exists to prevent,
+        reintroduced by a single f-string.
+      * Flattening four types into one erased the distinction every caller's
+        ``except (PathTraversalError, FileSizeError)`` arm was written to make.
+        Those arms could never fire, so ~20 tools answered a refused path from
+        their generic ``except Exception`` -- and the HardLinkError type added
+        to tell a hard link apart from an out-of-bounds path was unreachable
+        from all of them.
+
+    Re-raising costs callers nothing: an arm that named these types now works
+    as written, and a caller with no such arm still catches them under
+    ``except Exception`` exactly as it caught the RuntimeError.
     """
-    # Validate and sanitize binary path (SECURITY FIX)
-    # TODO: Configure allowed_dirs from a config file
-    # For now, allow any directory but still validate the path exists and is a file
-    try:
-        validated_path = sanitize_binary_path(
-            binary_path,
-            allowed_dirs=get_allowed_dirs(),
-            max_size_bytes=500 * 1024 * 1024  # 500MB max
-        )
-        # Use string representation for consistency with rest of codebase
-        binary_path = str(validated_path)
-    except (PathTraversalError, FileSizeError, FileNotFoundError, ValueError) as e:
-        logger.error(f"Path validation failed: {e}")
-        raise RuntimeError(f"Invalid binary path: {e}")
+    # Confinement. Not "allow any directory" -- an unset BINARY_MCP_ALLOWED_DIRS
+    # falls back to default_quarantine_dirs() (audit F-8), and the refusals
+    # below are raised, not swallowed.
+    validated_path = sanitize_binary_path(
+        binary_path,
+        allowed_dirs=get_allowed_dirs(),
+        max_size_bytes=500 * 1024 * 1024  # 500MB max
+    )
+    # Use string representation for consistency with rest of codebase
+    binary_path = str(validated_path)
 
     # A targeted run is an extension of an existing cache by definition -- it
     # merges bodies back into it -- so it always takes the incremental path.
@@ -1303,8 +1326,15 @@ def get_analysis_context(
         # reference-ID response. See docs/ghidra-mcp-defender-issues.md (Issue 2).
         raise
     except Exception as e:
-        logger.error(f"Analysis failed: {e}")
-        raise RuntimeError(f"Failed to analyze binary: {e}")
+        logger.error(f"Analysis failed: {e}", exc_info=True)
+        # Chained, not interpolated. The bare `raise` above is what preserves
+        # GhidraAnalysisError's curated diagnostic (see the comment there and
+        # docs/ghidra-mcp-defender-issues.md Issue 2); THIS arm is the
+        # catch-all for the unexpected, where `e` is an arbitrary exception
+        # that may carry an absolute path or subprocess output. `from e` keeps
+        # the cause for the traceback just logged, without putting its text in
+        # a message that travels to the caller.
+        raise RuntimeError("Failed to analyze binary") from e
     finally:
         # The temp output is run-scoped now, so a failure that leaves one
         # behind leaks a fresh multi-megabyte file rather than overwriting a
@@ -2182,10 +2212,12 @@ def load_pdb(
         # below, all before any confinement check. Validate first.
         try:
             binary_path = confine_binary_path(binary_path)
-        except FileNotFoundError:
-            return f"Binary not found: {binary_path}"
-        except PathTraversalError as e:
-            return safe_error_message("Invalid binary path", e)
+        except (FileNotFoundError, PathTraversalError) as e:
+            # One arm: safe_path_error already distinguishes "no file exists
+            # at the path supplied" from a confinement refusal, so the
+            # hand-rolled missing-file branch bought nothing except an echo of
+            # the caller's path.
+            return safe_path_error("load_pdb", e, "binary path")
 
         pdb_was_fetched = False
         if pdb_path in (None, "", "auto"):
@@ -2321,7 +2353,7 @@ def load_pdb(
     except FileNotFoundError as e:
         return safe_path_error("load_pdb", e, "path")
     except (PathTraversalError, FileSizeError) as e:
-        return safe_error_message("Invalid binary or PDB path", e)
+        return safe_path_error("load_pdb", e, "binary or PDB path")
     except Exception as e:
         logger.exception(f"load_pdb failed: {e}")
         return safe_error_message("Failed to apply PDB", e)
@@ -2378,13 +2410,18 @@ def clean_cache(
                     binary_path,
                     allowed_dirs=get_allowed_dirs(),
                 )
-            except FileNotFoundError:
+            except FileNotFoundError as e:
+                # Neither the caller's path nor cache_dir goes in the reply.
+                # cache_dir is resolved from Path.home() or $BINARY_CACHE_DIR,
+                # so printing it put the operator's username in the
+                # transcript -- and this arm fires on the most ordinary
+                # mistake there is, a typo. The remaining advice is the part
+                # that was actually useful.
                 return (
-                    f"Binary not found: {binary_path}\n"
-                    f"To wipe a stale cache for a missing binary, call "
-                    f"clean_cache() with no arguments (full wipe), or "
-                    f"delete the relevant <hash>.* files manually from "
-                    f"{cache_dir}."
+                    f"{safe_path_error('clean_cache', e, 'binary path')}\n"
+                    f"To wipe a stale cache for a binary that is no longer "
+                    f"on disk, call clean_cache() with no arguments for a "
+                    f"full wipe."
                 )
 
             ok = cache.invalidate(
@@ -2420,7 +2457,7 @@ def clean_cache(
         )
 
     except (PathTraversalError, FileSizeError) as e:
-        return safe_error_message("Invalid binary path", e)
+        return safe_path_error("clean_cache", e, "binary path")
     except Exception as e:
         logger.exception(f"clean_cache failed: {e}")
         return safe_error_message("Cache cleanup failed", e)
@@ -3280,7 +3317,7 @@ def decompile_function(
         return wrap_untrusted(result, "decompiled pseudocode")
 
     except (PathTraversalError, FileSizeError) as e:
-        return safe_error_message("Invalid binary path", e)
+        return safe_path_error("decompile_function", e, "binary path")
     except Exception as e:
         logger.error(f"decompile_function failed: {e}")
         return safe_tool_error("decompile_function", e)
@@ -3534,7 +3571,7 @@ def decompile_functions(
         return "\n".join(lines)
 
     except (PathTraversalError, FileSizeError) as e:
-        return safe_error_message("Invalid binary path", e)
+        return safe_path_error("decompile_functions", e, "binary path")
     except UserFacingError as e:
         # Returned, not re-raised: these carry the remediation text (ELF loader
         # hints, Ghidra diagnostics) and re-raising turns them into a
@@ -3796,7 +3833,7 @@ def expand_callgraph(
         )
 
     except (PathTraversalError, FileSizeError) as e:
-        return safe_error_message("Invalid binary path", e)
+        return safe_path_error("expand_callgraph", e, "binary path")
     except (UserFacingError, GhidraAnalysisError):
         raise
     except Exception as e:
@@ -4227,7 +4264,7 @@ def search_bytes(
     except FileNotFoundError as e:
         return safe_path_error("search_bytes", e, "path")
     except (PathTraversalError, FileSizeError) as e:
-        return safe_error_message("search_bytes", e)
+        return safe_path_error("search_bytes", e, "binary path")
     except Exception as e:
         logger.error(f"search_bytes failed: {e}")
         return safe_tool_error("search_bytes", e)
@@ -4862,7 +4899,7 @@ def get_notes(
         lines.append(f"_Total: {total}_")
         return wrap_untrusted('\n'.join(lines), "annotations and function names")
     except (PathTraversalError, FileSizeError) as e:
-        return safe_error_message("Invalid binary path", e)
+        return safe_path_error("get_notes", e, "binary path")
     except Exception as e:
         logger.error(f"get_notes failed: {e}")
         return safe_tool_error("get_notes", e)
@@ -5031,7 +5068,7 @@ def start_analysis_session(
         return result
 
     except (PathTraversalError, FileSizeError) as e:
-        return safe_error_message("Invalid binary path", e)
+        return safe_path_error("start_analysis_session", e, "binary path")
     except Exception as e:
         logger.error(f"start_analysis_session failed: {e}")
         return safe_tool_error("start_analysis_session", e)
@@ -5564,7 +5601,7 @@ def find_related_sessions(binary_path: str, limit: int = 10) -> str:
         return result
 
     except (PathTraversalError, FileSizeError) as e:
-        return safe_error_message("Invalid binary path", e)
+        return safe_path_error("find_related_sessions", e, "binary path")
     except Exception as e:
         logger.error(f"find_related_sessions failed: {e}")
         return safe_tool_error("find_related_sessions", e)
@@ -5723,7 +5760,7 @@ def detect_crypto_patterns(binary_path: str) -> str:
         return wrap_untrusted('\n'.join(output), "crypto pattern report")
 
     except (PathTraversalError, FileSizeError) as e:
-        return safe_error_message("detect_crypto_patterns", e)
+        return safe_path_error("detect_crypto_patterns", e, "binary path")
     except Exception as e:
         logger.error(f"detect_crypto_patterns failed: {e}")
         return safe_tool_error("detect_crypto_patterns", e)
@@ -5803,7 +5840,7 @@ def analyze_xor_encryption(
         return wrap_untrusted('\n'.join(output), "XOR analysis")
 
     except (PathTraversalError, FileSizeError) as e:
-        return safe_error_message("analyze_xor_encryption", e)
+        return safe_path_error("analyze_xor_encryption", e, "binary path")
     except Exception as e:
         logger.error(f"analyze_xor_encryption failed: {e}")
         return safe_tool_error("analyze_xor_encryption", e)
@@ -5895,7 +5932,7 @@ def decrypt_xor(
         return wrap_untrusted('\n'.join(output), "decrypted sample bytes")
 
     except (PathTraversalError, FileSizeError) as e:
-        return safe_error_message("decrypt_xor", e)
+        return safe_path_error("decrypt_xor", e, "binary path")
     except Exception as e:
         logger.error(f"decrypt_xor failed: {e}")
         return safe_tool_error("decrypt_xor", e)
@@ -5996,7 +6033,7 @@ def decode_base64_file(
         return wrap_untrusted('\n'.join(output), "decoded sample bytes")
 
     except (PathTraversalError, FileSizeError) as e:
-        return safe_error_message("decode_base64_file", e)
+        return safe_path_error("decode_base64_file", e, "binary path")
     except Exception as e:
         logger.error(f"decode_base64_file failed: {e}")
         return safe_tool_error("decode_base64_file", e)
@@ -6068,7 +6105,7 @@ def detect_python_packer(binary_path: str) -> str:
         return wrap_untrusted('\n'.join(output), "packer detection")
 
     except (PathTraversalError, FileSizeError) as e:
-        return safe_error_message("detect_python_packer", e)
+        return safe_path_error("detect_python_packer", e, "binary path")
     except FileNotFoundError as e:
         return safe_path_error("detect_python_packer", e, "path")
     except Exception as e:
@@ -6180,7 +6217,7 @@ def extract_python_packed(
         return wrap_untrusted('\n'.join(output), "extracted archive members")
 
     except (PathTraversalError, FileSizeError) as e:
-        return safe_error_message("extract_python_packed", e)
+        return safe_path_error("extract_python_packed", e, "binary path")
     except FileNotFoundError as e:
         return safe_path_error("extract_python_packed", e, "path")
     except Exception as e:
@@ -6242,7 +6279,7 @@ def analyze_pyc_file(pyc_path: str) -> str:
         return wrap_untrusted('\n'.join(output), "pyc analysis")
 
     except (PathTraversalError, FileSizeError) as e:
-        return safe_error_message("analyze_pyc_file", e)
+        return safe_path_error("analyze_pyc_file", e, "binary path")
     except FileNotFoundError as e:
         return safe_path_error("analyze_pyc_file", e, "path")
     except Exception as e:
@@ -6314,7 +6351,7 @@ def list_python_archive_contents(binary_path: str) -> str:
         return wrap_untrusted('\n'.join(output), "archive member names")
 
     except (PathTraversalError, FileSizeError) as e:
-        return safe_error_message("list_python_archive_contents", e)
+        return safe_path_error("list_python_archive_contents", e, "binary path")
     except FileNotFoundError as e:
         return safe_path_error("list_python_archive_contents", e, "path")
     except Exception as e:

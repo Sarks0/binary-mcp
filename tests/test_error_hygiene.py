@@ -71,6 +71,58 @@ class TestSafeToolError:
         assert_no_host_leak(out)
         assert_has_reference_id(out)
 
+    def test_base_routing_covers_every_catch_all_in_the_project(self):
+        """
+        security.safe_error_message is where the routing has to live.
+
+        This is the single highest-blast-radius line in the change: 203
+        call sites across 18 files reach safe_error_message, and every
+        catch-all in the eleven tool modules that have no safe_tool_error call
+        lands there. It was the only part of the change with no direct test --
+        the sweep enumerates src/server.py, whose tools have explicit arms and
+        so never reach the base at all, which is exactly how it stayed
+        uncovered.
+
+        Asserts the three categories it must route and the one it must not.
+        """
+        from src.utils.security import (
+            FileSizeError,
+            HardLinkError,
+            PathTraversalError,
+            safe_error_message,
+        )
+
+        hardlink = safe_error_message("Failed to do the thing", HardLinkError(LEAK_MARKER))
+        assert_no_host_leak(hardlink)
+        assert "hard link" in hardlink
+        assert "outside the directories" not in hardlink
+
+        confinement = safe_error_message(
+            "Failed to do the thing", PathTraversalError(LEAK_MARKER)
+        )
+        assert_no_host_leak(confinement)
+        assert "outside the directories" in confinement
+        assert "hard link" not in confinement
+
+        oversize = safe_error_message("Failed to do the thing", FileSizeError(LEAK_MARKER))
+        assert_no_host_leak(oversize)
+        assert "size limit" in oversize
+
+        # The three stay distinguishable through the base, which is the B3
+        # guarantee for a tool with no path arm in a module with no
+        # safe_tool_error call -- i.e. for most of src/tools/.
+        firsts = {
+            text.splitlines()[0] for text in (hardlink, confinement, oversize)
+        }
+        assert len(firsts) == 3, firsts
+
+        # And an unrelated exception must NOT be dressed up as a path problem:
+        # the generic envelope still carries the caller's own user_message.
+        unrelated = safe_error_message("Failed to do the thing", OSError(LEAK_MARKER))
+        assert_no_host_leak(unrelated)
+        assert "Failed to do the thing" in unrelated
+        assert "Invalid path" not in unrelated
+
     def test_confinement_refusal_reaching_a_catch_all_keeps_its_category(self):
         """
         Thirteen read-only tools have no path arm; the catch-all must cover them.

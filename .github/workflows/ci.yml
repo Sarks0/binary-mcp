@@ -185,6 +185,14 @@ jobs:
     # shipped one is testing something else.
     - name: Stage plugin artifacts
       shell: pwsh
+      env:
+        # On a pull_request event github.sha is the MERGE commit GitHub
+        # synthesises (head merged into base), which exists in no branch -- the
+        # first run of this job named its artifact after one, so the name
+        # pointed at a commit nobody could check out. head.sha is the commit
+        # that was actually pushed; it is empty on a push event, where
+        # github.sha is already right.
+        OBSIDIAN_BUILD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
       run: |
         $ErrorActionPreference = 'Stop'
         $plugin = "src/engines/dynamic/x64dbg/plugin"
@@ -217,7 +225,7 @@ jobs:
         $note = @(
           'This is a CI build of Sarks0/binary-mcp, not a release.'
           ''
-          "  commit: ${env:GITHUB_SHA}"
+          "  commit: ${env:OBSIDIAN_BUILD_SHA}"
           "  run:    ${env:GITHUB_SERVER_URL}/${env:GITHUB_REPOSITORY}/actions/runs/${env:GITHUB_RUN_ID}"
           ''
           'It is here so an unmerged branch can be tested without publishing a'
@@ -253,7 +261,10 @@ jobs:
     - name: Upload plugin artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: obsidian-plugins-${{ github.sha }}
+        # Same reasoning as OBSIDIAN_BUILD_SHA above: name the download after
+        # the commit it was built from, not after a merge commit that exists
+        # only inside this run.
+        name: obsidian-plugins-${{ github.event.pull_request.head.sha || github.sha }}
         path: artifact/*
         # A build that produced nothing is a failure, not an empty download.
         if-no-files-found: error

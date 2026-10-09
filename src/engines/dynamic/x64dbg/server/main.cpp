@@ -17,7 +17,7 @@
 
 // Reported in the activity log's server.start event so a log can be tied to
 // the build that produced it.
-#define OBSIDIAN_SERVER_VERSION "1.1.0"
+#define OBSIDIAN_SERVER_VERSION "1.2.0-rc1"
 
 // Global authentication token
 static std::string g_authToken;

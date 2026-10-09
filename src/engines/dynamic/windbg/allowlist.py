@@ -80,9 +80,7 @@ _MAX_VALIDATION_DEPTH = 8
 _MAX_COMMAND_LEN = 4096
 _MAX_SUBCOMMANDS = 16
 
-# ---------------------------------------------------------------------------
 # The allowlist
-# ---------------------------------------------------------------------------
 #
 # Matched case-insensitively against the first whitespace-delimited token of
 # each subcommand, sigils included ("shell" is harmless, ".shell" is not).
@@ -325,7 +323,6 @@ _DENY_ARGFORM: tuple[tuple[re.Pattern[str], str], ...] = (
     ),
 )
 
-# ---------------------------------------------------------------------------
 # NOTE on rules deliberately NOT present any more
 #
 # "s -[bdwq]" was refused as a "search-and-write variant". There is no such
@@ -340,7 +337,6 @@ _DENY_ARGFORM: tuple[tuple[re.Pattern[str], str], ...] = (
 # ".writevirtmem" is likewise gone from every list and comment here: it is not
 # a command in current WinDbg. Reasoning about it made the old module docstring
 # describe a control over something that does not exist.
-# ---------------------------------------------------------------------------
 
 
 def parse_compound(command: str) -> list[str]:

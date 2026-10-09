@@ -31,11 +31,6 @@ read.
   <img alt="binary-mcp architecture: an AI assistant talks MCP over stdio to the binary-mcp server, whose tool layer sits behind guardrails, sessions, jobs and a shared cache, and which drives Ghidra, ILSpyCmd and pefile for static analysis on any OS and x64dbg and WinDbg for live debugging on Windows." src="docs/images/architecture-dark.png">
 </picture>
 
-The source is [`docs/architecture.excalidraw`](docs/architecture.excalidraw),
-editable at [excalidraw.com](https://excalidraw.com). Edit that and re-export
-both themes rather than touching the PNGs, so the diagram and its source do not
-drift apart.
-
 ## Quick Start
 
 ```bash

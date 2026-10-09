@@ -30,7 +30,11 @@ from src.tools.error_hygiene import (
     safe_tool_error,
 )
 from src.utils.formatters import neutralise_untrusted_delimiters, wrap_untrusted
-from src.utils.remote import resolve_debugger_endpoint
+from src.utils.remote import (
+    EndpointOverrideError,
+    refuse_caller_endpoint_override,
+    resolve_debugger_endpoint,
+)
 from src.utils.security import (
     PathTraversalError,
     safe_error_message,
@@ -1005,14 +1009,23 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         Args:
             host: x64dbg plugin host. Omit to use the configured endpoint
-                (X64DBG_HOST, or 127.0.0.1). A non-loopback host is refused
-                unless the operator has enabled and configured remote access.
-            port: x64dbg plugin port. Omit for X64DBG_PORT, or 8765.
+                (X64DBG_HOST, or 127.0.0.1). Naming a host other than the
+                configured one is refused -- see
+                refuse_caller_endpoint_override.
+            port: x64dbg plugin port. Omit for X64DBG_PORT, or 8765. Naming a
+                different port is refused, for the same reason.
 
         Returns:
             Connection status message
         """
         try:
+            # The endpoint is the operator's to choose. These arguments may
+            # restate it but not replace it: unchecked, they were a port probe
+            # off loopback and a way to post the plugin's bearer token to any
+            # local listener on it. The policy and the reasoning live in
+            # src/utils/remote.py.
+            refuse_caller_endpoint_override(host, port)
+
             # Honour X64DBG_TIMEOUT here too; rebuilding the bridge with the
             # constructor default silently dropped a configured timeout.
             timeout = int(os.getenv("X64DBG_TIMEOUT", "30"))
@@ -1059,6 +1072,20 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
                     "binary in x64dbg before setting breakpoints."
                 )
             return "\n".join(lines)
+
+        except EndpointOverrideError as e:
+            # Echoed verbatim, and only this leaf type. A caller naming the
+            # wrong endpoint is not a connectivity failure, and the generic
+            # note below ("ensure x64dbg is running with the plugin loaded")
+            # would send them to check a debugger that may be running
+            # perfectly well; the message names the variable to change
+            # instead. Safe to pass through because EndpointOverrideError has
+            # exactly two raise sites and neither can carry host state -- see
+            # its docstring, and the audit entry in tests/test_error_hygiene.py.
+            # Its PARENT is not safe this way: _require_readable puts an
+            # absolute path in a DebuggerEndpointError.
+            logger.error(f"x64dbg_connect refused: {e}")
+            return f"x64dbg_connect refused: {e}"
 
         except Exception as e:
             logger.error(f"x64dbg_connect failed: {e}")

@@ -164,10 +164,17 @@ public:
         // offer them.
         credentials.dwFlags = SCH_USE_STRONG_CRYPTO;
         if (requireClientCert) {
-            // Ask for the client's certificate during the handshake AND fail
-            // the handshake when it is absent. Without SCH_CRED_NO_SYSTEM_MAPPER
-            // Schannel would also try to map it to a Windows account, which is
-            // not what is wanted: the chain check below is the authority.
+            // Ask for the client's certificate during the handshake. Note
+            // what this does NOT do: with ASC_REQ_MUTUAL_AUTH set, Schannel
+            // sends a CertificateRequest but still COMPLETES the handshake
+            // when the client answers with an empty certificate list. Both
+            // presence and issuer are enforced after the handshake, by
+            // VerifyClientCertificate -- so neither half of it is redundant.
+            //
+            // SCH_CRED_NO_SYSTEM_MAPPER stops Schannel additionally trying to
+            // map the certificate to a Windows account, which is not wanted:
+            // the CA thumbprint is the authority, not the machine's idea of
+            // who the holder is.
             credentials.dwFlags |= SCH_CRED_NO_SYSTEM_MAPPER;
         }
 
@@ -389,7 +396,6 @@ public:
                 credentials.Handle(), first ? nullptr : &m_context, &inDescriptor,
                 contextRequirements, 0, &m_context, &outDescriptor, &contextAttributes,
                 nullptr);
-            first = false;
 
             // Anything Schannel produced must go out even on failure: the
             // alert tells the client why, instead of leaving it to time out.
@@ -406,9 +412,23 @@ public:
 
             if (status == SEC_E_INCOMPLETE_MESSAGE) {
                 // Need more bytes; keep what we have and read again.
+                //
+                // `first` stays true here, which is the whole reason this
+                // check sits ahead of clearing it. Schannel does not create
+                // the context on this status -- phNewContext is left alone --
+                // so m_context is still the SecInvalidateHandle'd value from
+                // the constructor. Passing it back as phContext on the retry
+                // is answered with SEC_E_INVALID_HANDLE, and the handshake
+                // fails for the one reason that is not the peer's fault: a
+                // ClientHello that arrived in more than one segment, which a
+                // small MSS or a large extension set makes ordinary.
                 needMoreData = true;
                 continue;
             }
+
+            // The context exists from this status onward, so every later
+            // flight must pass it rather than asking for a new one.
+            first = false;
 
             // Bytes beyond this handshake message belong to the next one, or
             // are already application data. Dropping them is a silent protocol

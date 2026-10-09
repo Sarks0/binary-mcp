@@ -152,6 +152,26 @@ class DebuggerEndpointError(RemoteConfigError):
     """The x64dbg endpoint this server would dial is misconfigured; do not dial it."""
 
 
+class EndpointOverrideError(DebuggerEndpointError):
+    """A caller named an endpoint other than the configured one.
+
+    A type of its own, rather than a plain DebuggerEndpointError, so that
+    ``x64dbg_connect`` can return this message verbatim while still routing
+    every other endpoint failure through ``safe_error_message``. The audit
+    that makes the passthrough safe is: this is raised from exactly one
+    function, :func:`refuse_caller_endpoint_override`, in exactly two places,
+    and the only values either interpolates are the caller's own argument and
+    the configured host/port -- which the success path already prints as
+    ``bridge.base_url``.
+
+    That bound matters because its parent cannot offer one. ``_require_readable``
+    raises DebuggerEndpointError with an expanded absolute path in the text
+    (``X64DBG_TLS_CA does not point at a file: /home/.../ca.pem``), which is
+    the audit-F-10 disclosure exactly. So the family is not safe to echo and
+    this leaf is; keep new raise sites out of it, or re-run the audit.
+    """
+
+
 def _normalize_host(value: str) -> str:
     """Lowercase a host and strip IPv6 brackets, leaving the bare name or IP."""
     host = value.strip().lower()
@@ -199,8 +219,44 @@ def is_loopback_host(value: str) -> bool:
     addresses is loopback only if *every* one of them is, since one LAN
     address among them means it does not name only this machine.
     """
-    if _normalize_host(value) in _LOOPBACK_NAMES:
-        return True
+    host = _normalize_host(value)
+    if not host:
+        return False
+    if host in _LOOPBACK_NAMES:
+        # Resolved, not assumed. These names mean loopback on every sane
+        # machine, but the classifier's whole contract is that it reads the
+        # same address the binder will bind -- and the binder resolves the
+        # name at bind time. A host whose /etc/hosts or search domain maps
+        # "localhost" to a routable address would otherwise be classified
+        # loopback: no opt-in, no TLS required, and a listener serving the
+        # full tool roster in plaintext on a LAN interface.
+        #
+        # AI_NUMERICHOST is deliberately absent here: that flag is what makes
+        # numeric_addresses refuse names, which is right for a literal and
+        # wrong for this branch.
+        try:
+            infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+        except (socket.gaierror, UnicodeError):
+            # Unresolvable: keep the spelling's answer. "ip6-localhost" and
+            # "ip6-loopback" are in Debian's /etc/hosts and absent from
+            # plenty of other machines, so refusing on a failed lookup would
+            # reclassify them as remote and answer a name that cannot be
+            # bound at all with "set BINARY_MCP_REMOTE_ALLOW" -- a refusal
+            # pointing at the wrong problem.
+            #
+            # Safe, because the hole this branch closes needs the classifier
+            # and the binder to DISAGREE. If the name does not resolve for us
+            # it does not resolve for uvicorn either, so there is no routable
+            # address to be bound behind a loopback classification; the bind
+            # fails with the accurate DNS error instead.
+            return True
+        resolved = {str(info[4][0]) for info in infos}
+        if not resolved:
+            return True
+        try:
+            return all(ipaddress.ip_address(a).is_loopback for a in resolved)
+        except ValueError:
+            return False
     addresses = numeric_addresses(value)
     if not addresses:
         return False
@@ -284,7 +340,13 @@ def _parse_networks(raw: str) -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Net
         if not item:
             continue
         try:
-            networks.append(ipaddress.ip_network(item, strict=False))
+            # strict=True: "10.0.0.5/24" is refused rather than quietly read as
+            # 10.0.0.0/24. Someone writing a host address with a prefix means
+            # that host, and silently widening an allowlist by 254 addresses is
+            # the wrong way to resolve the ambiguity. A bare address still
+            # works -- ip_network gives it a /32 -- so the single-host case
+            # this list mostly holds needs nothing special.
+            networks.append(ipaddress.ip_network(item, strict=True))
         except ValueError as exc:
             raise TransportConfigError(
                 f"{ENV_CLIENT_ALLOWLIST} entry {item!r} is not an address or CIDR: {exc}"
@@ -341,6 +403,14 @@ class TransportConfig:
     tls_ca: Path | None = None
     allowed_hosts: frozenset[str] = field(default_factory=frozenset)
     client_allowlist: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] = ()
+    # Resolved once, at construction, rather than recomputed per read. Both
+    # classes expose is_loopback and fan several other members out to it, and
+    # is_loopback_host goes through getaddrinfo -- so the old property turned
+    # every read, including the one on the bridge's per-request token path,
+    # into a resolver call for an answer the resolver already knew. None means
+    # "work it out from host", which keeps a directly-constructed instance
+    # (the tests build plenty) behaving as before.
+    loopback: bool | None = None
 
     def __post_init__(self) -> None:
         """Keep the TLS fields consistent regardless of how this was built.
@@ -372,6 +442,8 @@ class TransportConfig:
 
     @property
     def is_loopback(self) -> bool:
+        if self.loopback is not None:
+            return self.loopback
         return is_loopback_host(self.host)
 
     @property
@@ -440,7 +512,14 @@ def resolve_transport_config() -> TransportConfig:
             f"{ENV_TRANSPORT}={raw!r} is not a transport. Use 'stdio' (default) or 'http'."
         )
 
-    host = (get_config(ENV_HTTP_HOST) or "").strip() or DEFAULT_HTTP_HOST
+    # Normalised once, here, so every later reader -- the wildcard and
+    # loopback classifiers, the Host allowlist, and uvicorn's bind -- sees the
+    # same string. Classifying one spelling and binding another is how
+    # "[::1]" used to pass the policy (every classifier unbrackets internally)
+    # and then die in getaddrinfo, which refuses a bracketed literal. The C++
+    # half normalises --bind at parse time for this reason; this is the same
+    # fix on this side.
+    host = _normalize_host(get_config(ENV_HTTP_HOST) or "") or DEFAULT_HTTP_HOST
     if is_wildcard_host(host):
         raise TransportConfigError(
             f"{ENV_HTTP_HOST}={host!r} binds every interface, which is refused "
@@ -532,11 +611,15 @@ def resolve_transport_config() -> TransportConfig:
     if not token_was_generated:
         _validate_token(token, ENV_HTTP_TOKEN, TransportConfigError)
 
+    # Entries are port-stripped because the gate port-strips every incoming
+    # Host before comparing. Without this, "analysis.lan:8770" -- the obvious
+    # thing to paste from the URL clients dial -- sat in the set matching
+    # nothing, and the 400 told the operator to add a name they had added.
     allowed_hosts = {_normalize_host(host)}
     if loopback:
         allowed_hosts |= _LOOPBACK_HOST_HEADERS
     for extra in (get_config(ENV_HTTP_ALLOWED_HOSTS) or "").split(","):
-        name = _normalize_host(extra)
+        name = strip_host_port(extra)
         if name:
             allowed_hosts.add(name)
 
@@ -552,6 +635,7 @@ def resolve_transport_config() -> TransportConfig:
         tls_ca=tls_ca,
         allowed_hosts=frozenset(allowed_hosts),
         client_allowlist=client_allowlist,
+        loopback=loopback,
     )
 
 
@@ -585,6 +669,14 @@ class DebuggerEndpoint:
     tls_ca: Path | None = None
     client_cert: Path | None = None
     client_key: Path | None = None
+    # Resolved once, at construction, rather than recomputed per read. Both
+    # classes expose is_loopback and fan several other members out to it, and
+    # is_loopback_host goes through getaddrinfo -- so the old property turned
+    # every read, including the one on the bridge's per-request token path,
+    # into a resolver call for an answer the resolver already knew. None means
+    # "work it out from host", which keeps a directly-constructed instance
+    # (the tests build plenty) behaving as before.
+    loopback: bool | None = None
 
     def __post_init__(self) -> None:
         if (self.client_cert is None) != (self.client_key is None):
@@ -599,6 +691,8 @@ class DebuggerEndpoint:
 
     @property
     def is_loopback(self) -> bool:
+        if self.loopback is not None:
+            return self.loopback
         return is_loopback_host(self.host)
 
     @property
@@ -658,6 +752,86 @@ class DebuggerEndpoint:
         parts.append("tls=mutual" if self.mutual_tls else ("tls=server" if self.tls_enabled else "tls=OFF"))
         parts.append("loopback" if self.is_loopback else "REMOTE")
         return " ".join(parts)
+
+
+def configured_debugger_endpoint() -> tuple[str, int]:
+    """The host and port the OPERATOR configured, ignoring any caller input.
+
+    Separate from :func:`resolve_debugger_endpoint` because the two answer
+    different questions. That resolver answers "what endpoint should this
+    bridge use", and a caller may legitimately name one. This answers "what
+    endpoint did the person running the server choose", which is the only
+    thing a tool argument may be checked against.
+    """
+    host = _normalize_host(get_config(ENV_X64DBG_HOST) or "") or DEFAULT_X64DBG_HOST
+    port_raw = (get_config(ENV_X64DBG_PORT) or str(DEFAULT_X64DBG_PORT)).strip()
+    try:
+        port = int(port_raw)
+    except ValueError as exc:
+        raise DebuggerEndpointError(
+            f"{ENV_X64DBG_PORT}={port_raw!r} is not an integer"
+        ) from exc
+    return host, port
+
+
+def refuse_caller_endpoint_override(host: str | None, port: int | None) -> None:
+    """Refuse a caller-named endpoint that is not the configured one.
+
+    WHY THIS EXISTS: ``x64dbg_connect`` takes host and port from whoever is
+    driving the MCP server, and this project's threat model does not treat
+    that caller as trusted -- the same reasoning that put a fence around
+    sample-derived strings and an allowlist in front of ``DbgCmdExec``. A
+    prompt-injected caller naming its own destination gets two things it
+    should not have:
+
+      * off loopback, a TCP connect and TLS handshake to any address reachable
+        from this server's network position -- a port probe behind whatever
+        boundary the server sits inside. The CA pin stops the token being
+        disclosed to a host without a certificate from that CA, but nothing
+        stopped the connection, because the policy only ever distinguished
+        loopback from non-loopback and never "the endpoint the operator chose"
+        from "an endpoint the caller named".
+      * on loopback, the bridge reads the plugin's %TEMP% token and sends it
+        as a bearer header. ``x64dbg_connect(port=8080)`` therefore handed the
+        credential that drives the debugger to whatever was listening on 8080,
+        and any local service that logs request headers kept a copy.
+
+    The rule is that the caller may re-state the configured endpoint but may
+    not replace it. That leaves ``x64dbg_connect()`` and a redundant
+    ``x64dbg_connect(host="127.0.0.1")`` working, and makes switching debugger
+    hosts what it already was in the documentation: an operator changing
+    ``X64DBG_HOST``, not a tool argument.
+
+    This is deliberately not inside :func:`resolve_debugger_endpoint`. That
+    function is also the ordinary constructor path for
+    :class:`~src.engines.dynamic.x64dbg.bridge.X64DbgBridge`, which internal
+    code and tests build directly; the trust boundary is the tool argument, so
+    the check belongs on the tool and the policy for it belongs here, beside
+    everything else a reviewer would want to read in one place.
+
+    Raises:
+        EndpointOverrideError: If ``host`` or ``port`` names anything other
+            than the configured endpoint.
+    """
+    configured_host, configured_port = configured_debugger_endpoint()
+
+    named_host = _normalize_host(host or "")
+    if named_host and named_host != configured_host:
+        raise EndpointOverrideError(
+            f"host={host!r} is not the configured debugger endpoint "
+            f"({configured_host}). The endpoint is the operator's choice, not "
+            f"a per-call argument: set {ENV_X64DBG_HOST} to point this server "
+            f"at a different debugger, then reconnect. See "
+            f"docs/remote-access.md."
+        )
+
+    if port is not None and port != configured_port:
+        raise EndpointOverrideError(
+            f"port={port!r} is not the configured debugger port "
+            f"({configured_port}). Set {ENV_X64DBG_PORT} if the plugin listens "
+            f"elsewhere -- a bearer token that drives the debugger should not "
+            f"be sent to a port chosen per call."
+        )
 
 
 def resolve_debugger_endpoint(
@@ -734,7 +908,19 @@ def resolve_debugger_endpoint(
         if key_raw else None
     )
 
-    if not is_loopback_host(resolved_host):
+    # Validated regardless of where the endpoint points, because what makes a
+    # bad token dangerous is unrelated to distance: the bridge builds
+    # "Bearer " + token into an outbound header either way, so a CR or LF in
+    # it is a header-injection primitive against a loopback plugin exactly as
+    # much as against a remote one. This used to run only on the remote
+    # branch, so the identical value was a startup refusal for one endpoint
+    # and a per-request InvalidHeader from requests for the other.
+    configured_token = (get_config(ENV_OBSIDIAN_TOKEN) or "").strip()
+    if configured_token:
+        _validate_token(configured_token, ENV_OBSIDIAN_TOKEN, DebuggerEndpointError)
+
+    endpoint_is_loopback = is_loopback_host(resolved_host)
+    if not endpoint_is_loopback:
         # The three remote requirements, refused one at a time so the message
         # names the single thing still missing. Same shape as the listener's.
         if not get_config_bool(ENV_REMOTE_ALLOW):
@@ -756,14 +942,12 @@ def resolve_debugger_endpoint(
                 f"tls_cert_thumbprint in its obsidian.ini -- or put a TLS "
                 f"terminator in front of it; see docs/remote-access.md."
             )
-        endpoint_token = (get_config(ENV_OBSIDIAN_TOKEN) or "").strip()
-        if not endpoint_token:
+        if not configured_token:
             raise DebuggerEndpointError(
                 f"{ENV_OBSIDIAN_TOKEN} must be set for a non-loopback endpoint. "
                 f"The plugin writes its token to %TEMP% on the debugger host, "
                 f"which is not this machine -- read it there and set it here."
             )
-        _validate_token(endpoint_token, ENV_OBSIDIAN_TOKEN, DebuggerEndpointError)
 
     return DebuggerEndpoint(
         host=resolved_host,
@@ -771,6 +955,7 @@ def resolve_debugger_endpoint(
         tls_ca=tls_ca,
         client_cert=client_cert,
         client_key=client_key,
+        loopback=endpoint_is_loopback,
     )
 
 
@@ -845,8 +1030,22 @@ class RemoteAccessGate:
             return
 
         if scope_type != "http":
-            # An unknown scope type is not something to guess at.
-            return
+            # Neither allow nor deny is available for a protocol this gate
+            # does not model: passing it through would skip every check below,
+            # and an HTTP refusal would be the wrong bytes on a channel that
+            # is not HTTP. Returning silently was worse than both -- the
+            # server was left holding a request it would never answer, so the
+            # peer hung until a timeout somewhere fired.
+            #
+            # So: fail loudly. The ASGI server logs this and drops the
+            # connection, which is a refusal with a reason attached, and the
+            # reason names the gate rather than looking like a dead socket.
+            # No server in practice sends a fourth scope type; if one starts,
+            # this is the line that should be read and updated.
+            raise RuntimeError(
+                f"RemoteAccessGate cannot police ASGI scope type {scope_type!r}; "
+                f"refusing it rather than passing it through unchecked"
+            )
 
         denial = self._check(scope)
         if denial is not None:
@@ -856,7 +1055,7 @@ class RemoteAccessGate:
 
         await self._app(scope, receive, send)
 
-    # -- checks ------------------------------------------------------------
+    # Checks.
 
     def _client_address(self, scope: dict[str, Any]) -> str | None:
         client = scope.get("client")
@@ -951,7 +1150,7 @@ class RemoteAccessGate:
 
         return None
 
-    # -- response ----------------------------------------------------------
+    # Response.
 
     async def _deny(
         self,

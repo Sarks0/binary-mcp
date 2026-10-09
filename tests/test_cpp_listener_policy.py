@@ -20,6 +20,7 @@ plaintext to a LAN address, would pass a happy-path test just as well.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -284,6 +285,30 @@ static void test_client_allowed() {
     const Listener::Options exact = with_allowlist({"10.0.0.7/32"});
     expect_client("slash-32-in", exact, "10.0.0.7", true);
     expect_client("slash-32-out", exact, "10.0.0.6", false);
+
+    // Host bits below the prefix are a typo, not a wider range. Masking
+    // "10.0.0.5/24" down to 10.0.0.0/24 admits 254 addresses nobody asked
+    // for; the single-host case needs no prefix, so nothing legitimate is
+    // rejected by refusing it.
+    {
+        Listener::Cidr range;
+        std::string error;
+        if (Listener::ParseCidr("10.0.0.5/24", range, error)) {
+            fail("cidr-host-bits", "10.0.0.5/24 was accepted and masked");
+        }
+        if (!Listener::ParseCidr("10.0.0.0/24", range, error)) {
+            fail("cidr-network-form", "10.0.0.0/24 should still parse: " + error);
+        }
+        if (!Listener::ParseCidr("10.0.0.5", range, error)) {
+            fail("cidr-bare-host", "a bare address should still parse: " + error);
+        }
+        if (!Listener::ParseCidr("10.0.0.5/32", range, error)) {
+            fail("cidr-slash-32", "/32 has no host bits to set: " + error);
+        }
+        if (!Listener::ParseCidr("0.0.0.0/0", range, error)) {
+            fail("cidr-slash-zero", "/0 masks everything: " + error);
+        }
+    }
 }
 
 // Host / Origin
@@ -294,6 +319,24 @@ static void expect_host(const std::string& label, const Listener::Options& optio
         fail(label, std::string("Host '") + value + "' wanted " +
                         (want ? "allow" : "deny"));
     }
+}
+
+static void test_allow_host_entry_with_a_port() {
+    // HostAllowed strips the port from every incoming Host, so an entry that
+    // keeps its own can never match. "analysis.lan:8765" is what an operator
+    // copies out of the URL their client dials, and it used to be a dead
+    // entry whose refusal named a host they had already allowed.
+    const char* argv[] = {"obsidian_server", "--allow-host", "analysis.lan:8765"};
+    Listener::Options options;
+    std::string error;
+    if (!Listener::ParseOptions(3, argv, options, error)) {
+        fail("allow-host-port", "refused: " + error);
+        return;
+    }
+    expect_host("allow-host-port-bare", options, "analysis.lan", true);
+    expect_host("allow-host-port-dialled", options, "analysis.lan:8765", true);
+    expect_host("allow-host-port-other", options, "analysis.lan:9999", true);
+    expect_host("allow-host-port-wrong-name", options, "elsewhere.lan", false);
 }
 
 static void test_host_allowed() {
@@ -386,6 +429,7 @@ int main() {
     test_parse_options();
     test_parse_ipv4();
     test_client_allowed();
+    test_allow_host_entry_with_a_port();
     test_host_allowed();
     test_strip();
     printf("failures=%d\n", failures);
@@ -564,9 +608,13 @@ def test_documented_setup_never_binds_a_wildcard():
     operator to try a thing that cannot work -- or, worse, read as advice.
     """
     doc = _REMOTE_ACCESS_DOC.read_text(encoding="utf-8")
+    # Matched as a whole address, not as a substring: "10.0.0.0/24" ends in the
+    # characters "0.0.0.0" without being a wildcard, and a bare `in` check
+    # failed this test on a legitimate CIDR example.
+    wildcard = re.compile(r"(?<![\d.])0\.0\.0\.0(?![\d])")
     for line in doc.splitlines():
         stripped = line.strip()
-        if "0.0.0.0" not in stripped:
+        if not wildcard.search(stripped):
             continue
         # Allowed only where it is named as refused, or as a CIDR prefix.
         narrative = any(
@@ -610,3 +658,63 @@ def test_documented_ini_keys_match_the_plugin():
             f"docs/remote-access.md documents [listener] {key}, but plugin.cpp "
             f"does not read it"
         )
+
+
+_SCHANNEL_H = _SERVER_DIR / "schannel_tls.h"
+
+
+def test_handshake_keeps_asking_for_a_new_context_until_schannel_makes_one():
+    """`first` must survive SEC_E_INCOMPLETE_MESSAGE.
+
+    AcceptSecurityContext does not populate phNewContext on that status, so
+    m_context is still the SecInvalidateHandle'd value from the constructor.
+    Clearing `first` before the check meant the retry passed that handle back
+    as phContext and got SEC_E_INVALID_HANDLE -- a failed handshake for the
+    one cause that is not the peer's fault: a ClientHello split across TCP
+    segments, which a small MSS or a large extension set makes ordinary.
+
+    Pinned by source order because this cannot be executed here: TLS is the
+    only transport the listener is allowed to serve off loopback, so a
+    regression takes remote access with it. The order is the whole fix -- the
+    assignment must come after the early-continue, not before it.
+    """
+    source = _SCHANNEL_H.read_text(encoding="utf-8")
+
+    assignment = source.find("\n            first = false;")
+    incomplete = source.find("if (status == SEC_E_INCOMPLETE_MESSAGE) {")
+    assert assignment != -1, "schannel_tls.h no longer clears `first` at all"
+    assert incomplete != -1, "the SEC_E_INCOMPLETE_MESSAGE branch is gone"
+    assert incomplete < assignment, (
+        "`first = false` runs before the SEC_E_INCOMPLETE_MESSAGE check again, "
+        "so a retry after a partial ClientHello passes an uncreated context"
+    )
+
+    # One assignment only: a second one anywhere in the loop could reintroduce
+    # the same ordering by a different route.
+    assert source.count("first = false;") == 1, (
+        "more than one `first = false;` in the handshake -- the ordering "
+        "guarantee above only covers the first"
+    )
+
+
+def test_mutual_tls_still_checks_the_certificate_was_presented():
+    """ASC_REQ_MUTUAL_AUTH asks; it does not enforce.
+
+    Schannel completes the handshake when the client answers the
+    CertificateRequest with an empty list, so presence is enforced only by
+    VerifyClientCertificate's QueryContextAttributes call. A maintainer
+    trimming that as redundant to the chain check would silently accept
+    certificate-less clients on a mutual-TLS listener, which is why the
+    comment beside the flag now says so and this pins the check itself.
+    """
+    source = _SCHANNEL_H.read_text(encoding="utf-8")
+    assert "SECPKG_ATTR_REMOTE_CERT_CONTEXT" in source, (
+        "nothing queries the client certificate, so mutual TLS no longer "
+        "requires one to be presented"
+    )
+    assert "presented no" in source, (
+        "the no-certificate refusal in VerifyClientCertificate is gone"
+    )
+    assert "ClientCertificateChainsTo" in source, (
+        "the CA thumbprint pin is gone, so any certificate would be accepted"
+    )

@@ -190,10 +190,13 @@ configured by an `obsidian.ini` beside the plugin. With no ini it binds
 - **An optional client allowlist** (`allow_clients`, addresses or CIDRs) is
   checked at `accept()`: before the TLS handshake, before any HTTP is parsed,
   and before the token is compared.
-- **Optional mutual TLS** (`tls_client_ca_thumbprint`). Schannel fails the
-  handshake for a client with no certificate, and the server additionally
-  checks the chain against *that* CA rather than against anything in the
-  machine's trust stores.
+- **Optional mutual TLS** (`tls_client_ca_thumbprint`). Both halves of this
+  are enforced after the handshake, not by it: with `ASC_REQ_MUTUAL_AUTH` set,
+  Schannel asks for a certificate but still completes the handshake when the
+  client answers with an empty list. The server then requires that a
+  certificate was presented *and* that its chain reaches *that* CA — the
+  thumbprint pinned in `obsidian.ini`, not anything in the machine's trust
+  stores.
 - **A malformed `obsidian.ini` is refused whole.** Any value containing a
   character its flag cannot legitimately hold fails the file, rather than one
   setting being quietly dropped — a listener configured differently from how it

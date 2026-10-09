@@ -90,7 +90,7 @@ See [Remote access](remote-access.md) for the full setup and
 | `BINARY_MCP_REMOTE_TLS_CERT` | PEM certificate chain. Required off loopback | Unset |
 | `BINARY_MCP_REMOTE_TLS_KEY` | PEM private key for that certificate | Unset |
 | `BINARY_MCP_REMOTE_TLS_CA` | PEM CA bundle for verifying client certificates. Setting it turns on mutual TLS | Unset |
-| `BINARY_MCP_REMOTE_CLIENT_ALLOWLIST` | Client addresses or CIDRs allowed to connect, comma-separated. Checked before authentication | Unset, any address may present a token |
+| `BINARY_MCP_REMOTE_CLIENT_ALLOWLIST` | Client addresses or CIDRs allowed to connect, comma-separated. Checked before authentication. A CIDR must be its network address — `10.0.0.5/24` is refused, not widened to `10.0.0.0/24` | Unset, any address may present a token |
 
 ## External services
 

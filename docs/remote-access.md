@@ -274,6 +274,16 @@ when clients dial a DNS name. Any value containing a character a flag cannot
 legitimately hold causes the whole file to be refused, rather than one setting
 being quietly dropped.
 
+A CIDR must be written as its network address: `10.0.0.0/24`, not
+`10.0.0.5/24`. The second is refused rather than read as the first, because
+someone writing a host address with a prefix means that host, and silently
+admitting 254 more would be the wrong way to resolve the ambiguity — write
+`10.0.0.5` on its own for a single client. The same rule applies to
+`BINARY_MCP_REMOTE_CLIENT_ALLOWLIST` on the Python listener. An entry in
+`allow_hosts` may carry a port or not (`analysis.lan` and
+`analysis.lan:8765` behave identically); the port is stripped before
+comparing, as it is on every incoming `Host`.
+
 **4. Add a firewall rule, scoped to the client** — not to `Any`. This is the
 one step that needs an elevated prompt:
 
@@ -408,6 +418,9 @@ removes the first.
 | Server log says `was not issued under the CA named by --tls-client-ca-thumbprint` | The certificate is trusted but came from a different CA than the pinned one |
 | Nothing listens, and the server log says `no certificate with that thumbprint` | The thumbprint is from a different store. `--machine-store` / `machine_store=1` selects `LocalMachine\My`; the default is `CurrentUser\My`, which is what x64dbg's own user can read |
 | Connection reset, or a timeout, reaching a host that is clearly up | `HTTPS_PROXY` is set in the server's environment and `requests` is routing the debugger connection through it. Add the debugger host to `no_proxy` |
+| A client denied by `allow_clients` sees a connection reset, not a 403 | Expected. The check runs before the TLS handshake, so there is no channel to answer on; `obsidian_server.log` records the peer address |
+| `entry '10.0.0.5/24' is not an address or CIDR: ... has host bits set` | Write the network address (`10.0.0.0/24`) or drop the prefix for one host (`10.0.0.5`) |
+| `host=... is not the configured debugger endpoint` | `x64dbg_connect` may restate the configured endpoint but not replace it. Set `X64DBG_HOST` / `X64DBG_PORT` and reconnect |
 
 ---
 
@@ -421,11 +434,19 @@ The chain below is `obsidian_server.exe`. The Python gate
 (`RemoteAccessGate` in `src/utils/remote.py`) runs steps 1 and 4–7; steps 2
 and 3 are uvicorn's.
 
+Step 1 is the one asymmetry between the two. `obsidian_server.exe` closes the
+socket and sends nothing — the check runs before the TLS handshake, so there
+is no channel to send a status over — so a client denied by `allow_clients`
+sees a connection reset, not a 403. The Python gate, which sits behind a
+handshake that has already completed, does answer 403. If an `allow_clients`
+entry is wrong, expect the port to look firewalled; `obsidian_server.log`
+records the refusal with the peer address.
+
 ```
   connection ──▶ ┌────────────────────────────────────────────┐
                  │  accept()                                  │
                  ├────────────────────────────────────────────┤
-                 │ 1  client address   allow_clients     403  │ ◀─ before TLS,
+                 │ 1  client address   allow_clients   close  │ ◀─ before TLS,
                  ├────────────────────────────────────────────┤    before any
                  │ 2  TLS handshake    + mTLS chain pin       │    parsing
                  ├────────────────────────────────────────────┤

@@ -262,6 +262,37 @@ class TestLoopbackHttp:
         assert "analyst.lan" in allowed
         assert "box.local" in allowed
 
+    def test_allowed_host_written_with_a_port_still_matches(self, monkeypatch):
+        """An entry pasted from the dialled URL must not be a dead entry.
+
+        The gate strips the port from every incoming Host before comparing, so
+        an entry that keeps its port can never match anything -- and the 400
+        told the operator to allow a name they had already allowed.
+        """
+        monkeypatch.setenv(ENV_TRANSPORT, "http")
+        monkeypatch.setenv(ENV_HTTP_ALLOWED_HOSTS, "analysis.lan:8770")
+        allowed = resolve_transport_config().allowed_hosts
+        assert "analysis.lan" in allowed
+        assert remote_module.strip_host_port("analysis.lan:8770") in allowed
+
+    @pytest.mark.parametrize("spelling", ["[::1]", " [::1] "])
+    def test_bracketed_ipv6_bind_is_stored_as_the_os_will_read_it(
+        self, monkeypatch, spelling
+    ):
+        """What the policy classified and what uvicorn binds must be one string.
+
+        Every classifier unbrackets internally, so "[::1]" passed as loopback
+        and was then stored bracketed -- and getaddrinfo refuses a bracketed
+        literal, so the server died at bind time with a DNS-shaped error.
+        """
+        monkeypatch.setenv(ENV_TRANSPORT, "http")
+        monkeypatch.setenv(ENV_HTTP_HOST, spelling)
+        config = resolve_transport_config()
+        assert config.host == "::1"
+        assert config.is_loopback
+        # The stored host is the one handed to uvicorn, so it must resolve.
+        socket.getaddrinfo(config.host, config.port, type=socket.SOCK_STREAM)
+
 
 class TestPortAndPath:
     @pytest.mark.parametrize("value", ["not-a-port", "80.5", ""])
@@ -437,6 +468,25 @@ class TestClientAllowlistParsing:
         with pytest.raises(TransportConfigError, match="not an address or CIDR"):
             resolve_transport_config()
 
+    def test_host_bits_set_is_refused_not_widened(self, monkeypatch):
+        """"10.0.0.5/24" means one host to whoever typed it.
+
+        strict=False read it as 10.0.0.0/24 -- 254 extra addresses admitted,
+        with a startup line reporting only "client-allowlist=1 entry(s)".
+        """
+        monkeypatch.setenv(ENV_TRANSPORT, "http")
+        monkeypatch.setenv(ENV_CLIENT_ALLOWLIST, "10.0.0.5/24")
+        with pytest.raises(TransportConfigError, match="not an address or CIDR"):
+            resolve_transport_config()
+
+    def test_network_address_with_a_prefix_still_works(self, monkeypatch):
+        """The refusal above must not cost the legitimate CIDR spelling."""
+        monkeypatch.setenv(ENV_TRANSPORT, "http")
+        monkeypatch.setenv(ENV_CLIENT_ALLOWLIST, "10.0.0.0/24, 192.168.1.5")
+        networks = resolve_transport_config().client_allowlist
+        assert ipaddress.ip_address("10.0.0.77") in networks[0]
+        assert ipaddress.ip_address("192.168.1.5") in networks[1]
+
 
 class TestDescribe:
     def test_names_tls_off(self, monkeypatch):
@@ -550,8 +600,19 @@ class TestGateScopeTypes:
         assert not recorder.inner_called
         assert recorder.messages == [{"type": "websocket.close", "code": 1008}]
 
-    async def test_unknown_scope_is_dropped(self):
-        recorder = await _call(_config(), {"type": "something-else"})
+    async def test_unknown_scope_is_refused_loudly(self):
+        """A scope the gate cannot police must not reach the app, or hang.
+
+        Returning silently -- what this used to assert -- was the one outcome
+        that is neither allow nor deny: nothing was sent, so the ASGI server
+        held a request it would never answer and the peer waited for a
+        timeout. Raising reaches the server's error handling, which drops the
+        connection with a reason naming the gate.
+        """
+        recorder = _Recorder()
+        gate = RemoteAccessGate(recorder.app, config=_config())
+        with pytest.raises(RuntimeError, match="cannot police ASGI scope type"):
+            await gate({"type": "something-else"}, recorder.receive, recorder.send)
         assert not recorder.inner_called
         assert recorder.messages == []
 

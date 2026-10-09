@@ -34,8 +34,12 @@ from src.utils.remote import (
     ENV_X64DBG_TLS_CA,
     DebuggerEndpoint,
     DebuggerEndpointError,
+    EndpointOverrideError,
     RemoteConfigError,
     TransportConfigError,
+    configured_debugger_endpoint,
+    is_loopback_host,
+    refuse_caller_endpoint_override,
     resolve_debugger_endpoint,
 )
 
@@ -510,3 +514,206 @@ class TestTokenShapeIsValidated:
     def test_accepted(self, monkeypatch, ca_file, token):
         _remote(monkeypatch, ca_file, **{ENV_OBSIDIAN_TOKEN: token})
         assert resolve_debugger_endpoint().token_must_come_from_env is True
+
+
+class TestTokenValidationIsNotDistanceDependent:
+    """A bad token is a bad token at any distance.
+
+    The bridge builds "Bearer " + token into an outbound header for a loopback
+    endpoint exactly as it does for a remote one, so a CR or LF in it is the
+    same header-injection primitive either way. The check used to run only on
+    the remote branch, which made the identical value a clean startup refusal
+    for one endpoint and a per-request requests.InvalidHeader for the other.
+    """
+
+    BAD = "abc\r\nX-Evil: 1"
+
+    def test_loopback_endpoint_refuses_a_crlf_token(self, monkeypatch):
+        monkeypatch.setenv(ENV_OBSIDIAN_TOKEN, self.BAD)
+        with pytest.raises(DebuggerEndpointError, match="may not hold"):
+            resolve_debugger_endpoint()
+
+    def test_remote_endpoint_refuses_the_same_token(self, monkeypatch, tmp_path):
+        ca = tmp_path / "ca.pem"
+        ca.write_text("-----BEGIN CERTIFICATE-----\n")
+        monkeypatch.setenv(ENV_X64DBG_HOST, "10.0.0.5")
+        monkeypatch.setenv(ENV_REMOTE_ALLOW, "1")
+        monkeypatch.setenv(ENV_X64DBG_TLS_CA, str(ca))
+        monkeypatch.setenv(ENV_OBSIDIAN_TOKEN, self.BAD)
+        with pytest.raises(DebuggerEndpointError, match="may not hold"):
+            resolve_debugger_endpoint()
+
+    def test_a_good_token_is_still_accepted_on_loopback(self, monkeypatch):
+        monkeypatch.setenv(ENV_OBSIDIAN_TOKEN, "a" * 32)
+        assert resolve_debugger_endpoint().is_loopback
+
+    def test_the_bridge_never_builds_an_unvalidated_header(self, monkeypatch):
+        """The refusal has to land before a bridge exists to use the token."""
+        monkeypatch.setenv(ENV_OBSIDIAN_TOKEN, self.BAD)
+        with pytest.raises(DebuggerEndpointError):
+            X64DbgBridge()
+
+
+class TestLoopbackNamesAreResolved:
+    """The classifier must read the address the binder will bind.
+
+    numeric_addresses exists so that no spelling can be classified one way and
+    bound another; a name short-circuit that returned True without resolving
+    put "localhost" outside that guarantee.
+    """
+
+    def test_localhost_is_loopback_on_a_normal_host(self):
+        assert is_loopback_host("localhost")
+
+    def test_a_loopback_name_mapping_to_a_routable_address_is_not_loopback(
+        self, monkeypatch
+    ):
+        """The whole point: classified from resolution, not from spelling.
+
+        A host whose /etc/hosts or search domain maps "localhost" somewhere
+        routable would otherwise get no opt-in, no TLS requirement, and a
+        listener serving every tool in plaintext on a LAN interface.
+        """
+        import socket as socket_module
+
+        def fake_getaddrinfo(host, *args, **kwargs):
+            if host == "localhost":
+                return [(2, 1, 6, "", ("192.168.1.50", 0))]
+            raise socket_module.gaierror("no")
+
+        monkeypatch.setattr(
+            "src.utils.remote.socket.getaddrinfo", fake_getaddrinfo
+        )
+        assert not is_loopback_host("localhost")
+
+    @pytest.mark.parametrize("name", ["localhost", "ip6-localhost", "ip6-loopback"])
+    def test_an_unresolvable_loopback_name_keeps_the_spelling_answer(
+        self, monkeypatch, name
+    ):
+        """Resolution failure must not reclassify a loopback name as remote.
+
+        ip6-localhost and ip6-loopback are in Debian's /etc/hosts and missing
+        from plenty of other machines -- including the Linux runner this suite
+        runs on. Refusing on a failed lookup would answer a name that cannot
+        be bound at all with "set BINARY_MCP_REMOTE_ALLOW", which points at
+        the wrong problem. It is safe because the hole the resolution closes
+        needs the classifier and the binder to disagree, and a name neither
+        can resolve gives them nothing to disagree about.
+        """
+        import socket as socket_module
+
+        def fake_getaddrinfo(*args, **kwargs):
+            raise socket_module.gaierror("no such host")
+
+        monkeypatch.setattr(
+            "src.utils.remote.socket.getaddrinfo", fake_getaddrinfo
+        )
+        assert is_loopback_host(name)
+
+    @pytest.mark.parametrize("name", ["localhost", "ip6-localhost", "ip6-loopback"])
+    def test_every_loopback_name_is_loopback_on_this_machine(self, name):
+        """Whether or not the local resolver knows the IPv6 spellings."""
+        assert is_loopback_host(name)
+
+    def test_a_name_resolving_to_both_is_not_loopback(self, monkeypatch):
+        """One LAN address among them means it does not name only this machine."""
+
+        def fake_getaddrinfo(host, *args, **kwargs):
+            return [(2, 1, 6, "", ("127.0.0.1", 0)), (2, 1, 6, "", ("10.0.0.5", 0))]
+
+        monkeypatch.setattr(
+            "src.utils.remote.socket.getaddrinfo", fake_getaddrinfo
+        )
+        assert not is_loopback_host("localhost")
+
+
+class TestCallerCannotReplaceTheConfiguredEndpoint:
+    """x64dbg_connect's arguments may restate the endpoint, not replace it.
+
+    Unchecked they were two primitives: off loopback, a TCP connect and TLS
+    handshake to any address reachable from this server; on loopback, the
+    plugin's bearer token posted to whatever was listening on a
+    caller-chosen port.
+    """
+
+    def test_default_configuration_is_the_loopback_endpoint(self):
+        assert configured_debugger_endpoint() == ("127.0.0.1", DEFAULT_X64DBG_PORT)
+
+    def test_omitting_both_is_always_allowed(self):
+        refuse_caller_endpoint_override(None, None)
+
+    def test_restating_the_configured_endpoint_is_allowed(self, monkeypatch):
+        monkeypatch.setenv(ENV_X64DBG_HOST, "10.0.0.5")
+        monkeypatch.setenv(ENV_X64DBG_PORT, "9000")
+        refuse_caller_endpoint_override("10.0.0.5", 9000)
+
+    @pytest.mark.parametrize("spelling", ["10.0.0.5", "[10.0.0.5]", " 10.0.0.5 "])
+    def test_restating_it_differently_spelled_is_allowed(self, monkeypatch, spelling):
+        monkeypatch.setenv(ENV_X64DBG_HOST, "10.0.0.5")
+        refuse_caller_endpoint_override(spelling, None)
+
+    def test_another_host_is_refused(self, monkeypatch):
+        monkeypatch.setenv(ENV_X64DBG_HOST, "10.0.0.5")
+        monkeypatch.setenv(ENV_REMOTE_ALLOW, "1")
+        with pytest.raises(EndpointOverrideError, match="not the configured debugger endpoint"):
+            refuse_caller_endpoint_override("10.0.0.9", None)
+
+    def test_another_port_on_loopback_is_refused(self):
+        """The plugin token must not be postable to an arbitrary local service."""
+        with pytest.raises(EndpointOverrideError, match="not the configured debugger port"):
+            refuse_caller_endpoint_override(None, 8080)
+
+    def test_the_refusal_names_the_variable_to_change(self, monkeypatch):
+        monkeypatch.setenv(ENV_X64DBG_HOST, "10.0.0.5")
+        with pytest.raises(EndpointOverrideError) as excinfo:
+            refuse_caller_endpoint_override("10.0.0.9", None)
+        assert ENV_X64DBG_HOST in str(excinfo.value)
+
+
+
+class TestConnectRefusalReachesTheCaller:
+    """A policy refusal must not be reported as a dead debugger.
+
+    The generic handler says "ensure x64dbg is running with the MCP plugin
+    loaded", which for a configuration refusal sends the caller to check a
+    debugger that may be running perfectly well. The policy messages are
+    written to be the answer -- they name the variable to change -- and they
+    disclose nothing the success path does not already print.
+    """
+
+    @staticmethod
+    def _x64dbg_connect():
+        """The real registered implementation, via the op registry.
+
+        Reached the way tests/test_x64dbg_tool_groups.py reaches it: the 159
+        operations are registered as 16 grouped dispatchers, so the function
+        under test is in _OP_REGISTRY rather than being a module attribute.
+        """
+        from fastmcp import FastMCP
+
+        from src.tools import dynamic_tools
+
+        dynamic_tools.register_dynamic_tools(FastMCP("test"))
+        for group in dynamic_tools._OP_REGISTRY.values():
+            for name, func in group.items():
+                if func.__name__ == "x64dbg_connect":
+                    return func
+        raise AssertionError("x64dbg_connect is no longer a registered operation")
+
+    def _connect(self, **kwargs):
+        return self._x64dbg_connect()(**kwargs)
+
+    def test_a_different_port_is_reported_as_a_refusal(self):
+        result = self._connect(port=8080)
+        assert "refused" in result.lower()
+        assert ENV_X64DBG_PORT in result
+
+    def test_a_different_host_names_the_variable_to_change(self, monkeypatch):
+        monkeypatch.setenv(ENV_X64DBG_HOST, "10.0.0.5")
+        result = self._connect(host="10.0.0.9")
+        assert "refused" in result.lower()
+        assert ENV_X64DBG_HOST in result
+
+    def test_a_refusal_does_not_blame_the_debugger(self):
+        result = self._connect(port=8080)
+        assert "Ensure x64dbg is running" not in result

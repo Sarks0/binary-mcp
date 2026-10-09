@@ -6402,13 +6402,24 @@ def _run_http(transport_config) -> None:
     from src.utils.remote import RemoteAccessGate
 
     if transport_config.token_was_generated:
-        # The operator cannot configure a client against a token they cannot
-        # see, and this is the only place it is ever shown. WARNING, not INFO,
-        # because the default log level must not hide it.
-        logger.warning(
-            "Generated a bearer token for this start: %s\n"
-            "Set BINARY_MCP_HTTP_TOKEN to keep it stable across restarts.",
-            transport_config.token,
+        # Written straight to stderr, NOT through logging, because this is the
+        # only place a generated token is ever shown and the log level is now
+        # operator-configurable. BINARY_MCP_LOG_LEVEL=ERROR is documented and
+        # supported, and it silenced the logger.warning this replaces -- which
+        # left a listener demanding a credential that existed nowhere: not in
+        # the log, not in describe() (it says only "generated-this-start"), and
+        # not on disk. Every request 401s and the only cure is a restart with
+        # BINARY_MCP_HTTP_TOKEN set.
+        #
+        # stderr and not stdout because stdio transport speaks the protocol on
+        # stdout; stderr is the channel that is a channel in both modes.
+        print(
+            f"binary-mcp: generated a bearer token for this start: "
+            f"{transport_config.token}\n"
+            f"binary-mcp: set BINARY_MCP_HTTP_TOKEN to keep it stable across "
+            f"restarts.",
+            file=sys.stderr,
+            flush=True,
         )
 
     app.run(

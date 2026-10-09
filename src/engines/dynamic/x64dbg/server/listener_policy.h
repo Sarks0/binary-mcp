@@ -212,6 +212,20 @@ inline bool ParseCidr(const std::string& text, Cidr& outCidr, std::string& outEr
     // Shifting by 32 is undefined behaviour, so /0 is spelled out.
     const uint32_t mask =
         (prefix == 0) ? 0u : (0xFFFFFFFFu << (32 - prefix));
+
+    // Host bits outside the mask are refused rather than masked away.
+    // "--allow-client 10.0.0.5/24" means one analyst's box to whoever typed
+    // it; reading it as 10.0.0.0/24 admits 254 more addresses and reports
+    // nothing. The single-host case needs no prefix at all, so there is no
+    // legitimate spelling this rejects.
+    if ((addr & ~mask) != 0u) {
+        outError = "'" + entry + "' sets bits below the /" +
+                   std::to_string(prefix) +
+                   " prefix; write the network address, or drop the prefix for "
+                   "a single host";
+        return false;
+    }
+
     outCidr.network = addr & mask;
     outCidr.mask = mask;
     return true;
@@ -430,7 +444,6 @@ inline bool ParsePort(const std::string& text, int& outPort, std::string& outErr
 inline bool ParseOptions(int argc, const char* const* argv, Options& outOptions,
                          std::string& outError) {
     Options options;
-    bool portSeen = false;
 
     for (int i = 1; i < argc; i++) {
         const std::string arg = argv[i] ? argv[i] : "";
@@ -438,7 +451,6 @@ inline bool ParseOptions(int argc, const char* const* argv, Options& outOptions,
         // Legacy positional port.
         if (i == 1 && !arg.empty() && arg[0] != '-') {
             if (!ParsePort(arg, options.port, outError)) return false;
-            portSeen = true;
             continue;
         }
 
@@ -465,7 +477,6 @@ inline bool ParseOptions(int argc, const char* const* argv, Options& outOptions,
             options.bind = AsciiLower(Unbracket(Trim(value)));
         } else if (arg == "--port") {
             if (!ParsePort(Trim(value), options.port, outError)) return false;
-            portSeen = true;
         } else if (arg == "--tls-cert-thumbprint") {
             options.tlsCertThumbprint = NormalizeThumbprint(Trim(value));
             if (!IsThumbprint(options.tlsCertThumbprint)) {
@@ -493,7 +504,13 @@ inline bool ParseOptions(int argc, const char* const* argv, Options& outOptions,
             }
             options.clientAllowlist.push_back(range);
         } else if (arg == "--allow-host") {
-            const std::string host = AsciiLower(Unbracket(Trim(value)));
+            // StripHostPort as well as the usual normalisation, because
+            // HostAllowed strips the port from every incoming Host before
+            // comparing. An entry written as "analysis.lan:8765" -- the
+            // obvious thing to copy from the URL a client dials -- would
+            // otherwise sit in the list matching nothing, and the refusal
+            // would name a host the operator had already allowed.
+            const std::string host = StripHostPort(AsciiLower(Unbracket(Trim(value))));
             if (host.empty()) {
                 outError = "--allow-host needs a non-empty value";
                 return false;
@@ -505,9 +522,8 @@ inline bool ParseOptions(int argc, const char* const* argv, Options& outOptions,
         }
     }
 
-    (void)portSeen;  // accepted either way; kept for readability of the branches
-
-    // Policy checks.
+    // Policy checks. The legacy positional port and --port are accepted
+    // either way, so nothing below distinguishes them.
 
     if (IsWildcardBind(options.bind)) {
         outError =
@@ -520,15 +536,21 @@ inline bool ParseOptions(int argc, const char* const* argv, Options& outOptions,
 
     const bool loopback = IsLoopbackBind(options.bind);
 
-    uint32_t bindAddr = 0;
-    if (!loopback && !ParseIPv4(options.bind, bindAddr)) {
+    // Both checks below are predicates, not conversions: main.cpp parses the
+    // address again at bind time, so the value is not wanted here. And
+    // options.bind is already AsciiLower(Unbracket(Trim(...))) from the
+    // --bind branch above -- re-normalising it here would reintroduce exactly
+    // the per-use normalisation that caused the classifier and the binder to
+    // read different strings.
+    uint32_t ignored = 0;
+    if (!loopback && !ParseIPv4(options.bind, ignored)) {
         outError = "--bind " + options.bind +
                    " is not a dotted-quad IPv4 address. This listener binds "
                    "AF_INET numerically and does not resolve names; give the "
                    "interface's address.";
         return false;
     }
-    if (loopback && !ParseIPv4(AsciiLower(Unbracket(Trim(options.bind))), bindAddr)) {
+    if (loopback && !ParseIPv4(options.bind, ignored)) {
         // "::1" classifies as loopback but cannot be bound by an AF_INET
         // socket. Refusing here beats failing in bind() with WSAEFAULT.
         outError = "--bind " + options.bind +

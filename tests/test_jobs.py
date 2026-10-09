@@ -63,6 +63,27 @@ def no_killing(monkeypatch):
     return killed
 
 
+def _record(registry, job_id):
+    """The job record, or an empty dict while it is not yet readable.
+
+    ``JobRegistry.read`` returns None in two transient cases: before the
+    first write of a freshly submitted job lands, and when a reader catches a
+    partial write (the json.loads raises and read() answers None). Every
+    product call site guards for it; a poll predicate has to as well, because
+    "not readable yet" is the state it is waiting out, not an error.
+
+    This existed as a latent flake until a Windows runner hit it: the first
+    poll after submit() got None and the predicate raised AttributeError
+    instead of returning False and trying again, which failed the whole run.
+
+    Deliberately NOT used by the assertions that follow a _wait_for. By then
+    the record has been read successfully and found in the expected state, so
+    a None from the next read is a genuine regression and should fail loudly
+    rather than be smoothed into {}.
+    """
+    return registry.read(job_id) or {}
+
+
 def _wait_for(predicate, timeout=5.0):
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -78,7 +99,7 @@ class TestBasicLifecycle:
         assert submitted["attached"] is False
 
         assert _wait_for(
-            lambda: registry.read(submitted["job_id"])["state"] == STATE_SUCCEEDED
+            lambda: _record(registry, submitted["job_id"]).get("state") == STATE_SUCCEEDED
         )
         assert registry.read(submitted["job_id"])["result"] == {"n": 42}
 
@@ -88,7 +109,7 @@ class TestBasicLifecycle:
 
         submitted = registry.submit(kind="test", key="k1", fn=_boom)
         assert _wait_for(
-            lambda: registry.read(submitted["job_id"])["state"] == STATE_FAILED
+            lambda: _record(registry, submitted["job_id"]).get("state") == STATE_FAILED
         )
         assert "ghidra fell over" in registry.read(submitted["job_id"])["error"]
 
@@ -102,7 +123,7 @@ class TestBasicLifecycle:
 
         submitted = registry.submit(kind="test", key="k1", fn=_slow)
         assert _wait_for(
-            lambda: registry.read(submitted["job_id"])["progress"] == "halfway"
+            lambda: _record(registry, submitted["job_id"]).get("progress") == "halfway"
         )
         release.set()
 
@@ -128,7 +149,7 @@ class TestClaimExclusivity:
         assert second["job_id"] == first["job_id"]
 
         release.set()
-        assert _wait_for(lambda: registry.read(first["job_id"])["state"] == STATE_SUCCEEDED)
+        assert _wait_for(lambda: _record(registry, first["job_id"]).get("state") == STATE_SUCCEEDED)
         assert started == [1], "the work must have run exactly once"
 
     def test_different_keys_run_independently(self, registry):
@@ -136,11 +157,11 @@ class TestClaimExclusivity:
         b = registry.submit(kind="analyze", key="b", fn=lambda ctx: {"which": "b"})
         assert a["job_id"] != b["job_id"]
         assert b["attached"] is False
-        assert _wait_for(lambda: registry.read(b["job_id"])["state"] == STATE_SUCCEEDED)
+        assert _wait_for(lambda: _record(registry, b["job_id"]).get("state") == STATE_SUCCEEDED)
 
     def test_claim_is_released_when_the_job_finishes(self, registry):
         first = registry.submit(kind="analyze", key="same", fn=lambda ctx: {})
-        assert _wait_for(lambda: registry.read(first["job_id"])["state"] == STATE_SUCCEEDED)
+        assert _wait_for(lambda: _record(registry, first["job_id"]).get("state") == STATE_SUCCEEDED)
 
         second = registry.submit(kind="analyze", key="same", fn=lambda ctx: {})
         assert second["attached"] is False, "a finished job must not block the next one"
@@ -207,7 +228,7 @@ class TestDeadOwners:
 
         assert taken["attached"] is False, "a dead owner must not hold the claim"
         assert taken["job_id"] != "deadbeef0000dead"
-        assert _wait_for(lambda: registry.read(taken["job_id"])["state"] == STATE_SUCCEEDED)
+        assert _wait_for(lambda: _record(registry, taken["job_id"]).get("state") == STATE_SUCCEEDED)
         assert registry.read("deadbeef0000dead")["state"] == STATE_ORPHANED
 
     def test_sweep_leaves_our_own_running_jobs_alone(self, registry):
@@ -276,7 +297,7 @@ class TestCancellation:
 
         submitted = registry.submit(kind="test", key="k", fn=_work)
         assert _wait_for(
-            lambda: (registry.read(submitted["job_id"]).get("child_pids") or []) == [5150]
+            lambda: (_record(registry, submitted["job_id"]).get("child_pids") or []) == [5150]
         )
 
         result = registry.cancel(submitted["job_id"])
@@ -289,7 +310,7 @@ class TestCancellation:
     def test_cancelling_a_finished_job_is_not_an_error(self, registry):
         submitted = registry.submit(kind="test", key="k", fn=lambda ctx: {})
         assert _wait_for(
-            lambda: registry.read(submitted["job_id"])["state"] == STATE_SUCCEEDED
+            lambda: _record(registry, submitted["job_id"]).get("state") == STATE_SUCCEEDED
         )
         result = registry.cancel(submitted["job_id"])
         assert result["cancelled"] is False
@@ -317,14 +338,14 @@ class TestCancellation:
         submitted = registry.submit(kind="test", key="k", fn=_work)
         job_id = submitted["job_id"]
         assert _wait_for(
-            lambda: (registry.read(job_id).get("child_pids") or []) == [6060]
+            lambda: (_record(registry, job_id).get("child_pids") or []) == [6060]
         )
 
         # The kill loop is where the window lives: let the worker finish inside it.
         def _slow_kill(pid):
             release.set()
             assert _wait_for(
-                lambda: registry.read(job_id)["state"] == STATE_SUCCEEDED
+                lambda: _record(registry, job_id).get("state") == STATE_SUCCEEDED
             )
             return True
 
@@ -343,7 +364,7 @@ class TestCancellation:
         """Same rule for the reaper: the owner looked dead, not was dead."""
         submitted = registry.submit(kind="test", key="k", fn=lambda ctx: {"ok": 1})
         job_id = submitted["job_id"]
-        assert _wait_for(lambda: registry.read(job_id)["state"] == STATE_SUCCEEDED)
+        assert _wait_for(lambda: _record(registry, job_id).get("state") == STATE_SUCCEEDED)
 
         registry._orphan(registry.read(job_id))
 
@@ -365,7 +386,7 @@ class TestShutdown:
 
         submitted = registry.submit(kind="analyze", key="k", fn=_work)
         assert _wait_for(
-            lambda: (registry.read(submitted["job_id"]).get("child_pids") or []) == [7777]
+            lambda: (_record(registry, submitted["job_id"]).get("child_pids") or []) == [7777]
         )
 
         registry.shutdown()
@@ -402,7 +423,7 @@ class TestRecordHandling:
     def test_purge_drops_old_terminal_records_only(self, registry):
         submitted = registry.submit(kind="test", key="a", fn=lambda ctx: {})
         assert _wait_for(
-            lambda: registry.read(submitted["job_id"])["state"] == STATE_SUCCEEDED
+            lambda: _record(registry, submitted["job_id"]).get("state") == STATE_SUCCEEDED
         )
         assert registry.purge(older_than_seconds=86400) == 0
         assert registry.purge(older_than_seconds=0) == 1
@@ -558,7 +579,7 @@ class TestClaimHandover:
 
     def test_a_finished_job_frees_the_key_for_the_next_one(self, registry):
         first = registry.submit(kind="analyze", key="k", fn=lambda ctx: {})
-        assert _wait_for(lambda: registry.read(first["job_id"])["state"] == STATE_SUCCEEDED)
+        assert _wait_for(lambda: _record(registry, first["job_id"]).get("state") == STATE_SUCCEEDED)
         # The claim is released *after* the terminal state is written -- which
         # is the right order, since freeing the key first would let a second
         # process start a duplicate run while this one is still writing its
@@ -691,7 +712,7 @@ class TestUnreadableClaim:
         assert "error" not in submitted
         assert submitted["attached"] is False
         assert _wait_for(
-            lambda: registry.read(submitted["job_id"])["state"] == STATE_SUCCEEDED
+            lambda: _record(registry, submitted["job_id"]).get("state") == STATE_SUCCEEDED
         )
 
 
@@ -714,7 +735,7 @@ class TestRecordWriteContention:
         with patch.object(jobs_mod.os, "replace", flaky_replace):
             submitted = registry.submit(kind="test", key="k", fn=lambda ctx: {"n": 1})
             assert _wait_for(
-                lambda: registry.read(submitted["job_id"])["state"] == STATE_SUCCEEDED
+                lambda: _record(registry, submitted["job_id"]).get("state") == STATE_SUCCEEDED
             ), "the retried write must still commit the terminal state"
         assert len(calls) > 1, "the first refusal should have been retried"
 

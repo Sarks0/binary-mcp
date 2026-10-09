@@ -699,6 +699,204 @@ _SWEEP_NOT_TOOLS = {
 }
 
 
+# Tools registered by register_all_tools(), which main() calls and imports do
+# not -- so on import only src/server.py's own @app.tool() functions exist, and
+# the ~105 tools in src/tools/* are invisible to any test that just imports the
+# module. That is why the first version of this sweep, which enumerated module
+# attributes, reported "whole surface" while covering a third of it. Calling
+# the registrar is what makes the claim checkable.
+
+
+class _RecordedTool:
+    """
+    Minimal stand-in for a FastMCP tool object.
+
+    ``apply_tool_catalog`` (src/tool_catalog.py:267) reads and rewrites
+    ``tool.tags``, so a bare function is not enough.
+    """
+
+    def __init__(self, fn):
+        self.fn = fn
+        self.name = getattr(fn, "__name__", repr(fn))
+        self.tags = set()
+
+
+class _ToolRecorder:
+    """
+    A stand-in for the FastMCP app that just records what gets registered.
+
+    Deliberately NOT ``app.get_tools()``. Other test modules stub the whole
+    ``fastmcp`` module in ``sys.modules`` before importing the server, and that
+    stub is global and leaks between files -- so in a full-suite run ``app`` is
+    a MagicMock whose ``get_tools()`` looks awaitable and blows up, while in a
+    single-file run it is the real thing. The sweep passed alone and failed in
+    the suite for exactly that reason. Recording the registration ourselves
+    depends on nothing but the decorator protocol.
+    """
+
+    def __init__(self):
+        self.tools = {}
+
+    def tool(self, *args, **kwargs):
+        # Supports both @app.tool() and @app.tool
+        if args and callable(args[0]) and not kwargs:
+            self.tools[args[0].__name__] = _RecordedTool(args[0])
+            return args[0]
+
+        def register(fn):
+            name = getattr(fn, "__name__", repr(fn))
+            self.tools[name] = _RecordedTool(fn)
+            return fn
+
+        return register
+
+    async def get_tools(self):
+        # register_all_tools() ends with
+        # `apply_tool_catalog(asyncio.run(app.get_tools()))`, so this has to be
+        # a real coroutine returning something dict-shaped.
+        return dict(self.tools)
+
+    def __getattr__(self, name):
+        # Any other app API a registrar happens to touch is a no-op here.
+        def permissive(*args, **kwargs):
+            return None
+
+        return permissive
+
+
+def _registered_path_tools(server):
+    """
+    Every REGISTERED tool with a path-shaped argument, from a real registration.
+
+    ``register_all_tools()`` is called only by ``main()``, so on import the
+    ~105 tools in ``src/tools/*`` do not exist -- which is why the earlier
+    module-attribute sweep covered a third of the surface while calling itself
+    whole-surface. This runs the registrar against a recorder to get the real
+    set.
+
+    Discovery is on ``*path*`` rather than ``binary_path`` specifically: the
+    module-attribute version missed analyze_pyc_file (``pyc_path``), the six
+    dotnet tools (``assembly_path``), vt_lookup (``file_path``) and
+    diff_binaries (``old_path``/``new_path``) purely because of the parameter
+    name, and those are where the surviving refusal defects were.
+
+    Returns ``(found, skipped)``; each found entry is
+    ``(name, fn, kwargs, path_param)``.
+    """
+    module = server._module
+    recorder = _ToolRecorder()
+    real_app = module.app
+    try:
+        module.app = recorder
+        module.register_all_tools()
+    finally:
+        module.app = real_app
+
+    found, skipped = [], []
+    for name, tool in sorted(recorder.tools.items()):
+        fn = getattr(tool, "fn", tool)
+        if not callable(fn):
+            continue
+        try:
+            signature = inspect.signature(fn)
+        except (TypeError, ValueError):
+            continue
+        path_params = [p for p in signature.parameters if "path" in p]
+        if not path_params:
+            continue
+        target = path_params[0]
+
+        kwargs = {}
+        unsupplied = [
+            pname
+            for pname, param in signature.parameters.items()
+            if pname != target
+            and param.default is inspect.Parameter.empty
+            and pname not in _SWEEP_ARGS
+        ]
+        if unsupplied:
+            skipped.append((name, unsupplied))
+            continue
+        for pname, param in signature.parameters.items():
+            if pname == target or param.default is not inspect.Parameter.empty:
+                continue
+            kwargs[pname] = _SWEEP_ARGS[pname]
+        kwargs.update(_SWEEP_EXTRA_ARGS.get(name, {}))
+        found.append((name, fn, kwargs, target))
+
+    # Union with src/server.py's own tools. Those are registered by the
+    # @app.tool() decorators at IMPORT time, against the real app, so
+    # register_all_tools() never sees them and the recorder cannot either --
+    # it captures only the src/tools/* registrars. Taking the recorder alone
+    # covered 37 of ~69 and would have called that the whole surface, which is
+    # the same mistake one layer along.
+    seen = {name for name, _, _, _ in found}
+    module_tools, module_skipped = _binary_path_tools(server)
+    for name, fn, kwargs in module_tools:
+        if name not in seen:
+            found.append((name, fn, kwargs, "binary_path"))
+    skipped.extend(
+        (name, args) for name, args in module_skipped if name not in seen
+    )
+    return found, skipped
+
+
+def test_the_registry_sweep_reaches_the_tool_modules(server):
+    """
+    The registry sweep must see far more than the module-attribute one.
+
+    Without this, a regression that stopped register_all_tools() running would
+    silently shrink the sweep back to src/server.py's own tools and every
+    assertion below would still pass.
+    """
+    found, _ = _registered_path_tools(server)
+    names = {n for n, _, _, _ in found}
+    assert len(found) >= 60, f"registry sweep found only {len(found)}"
+    for expected in (
+        # from the src/tools/* registrars...
+        "quick_scan", "get_pe_info", "analyze_dotnet", "vt_lookup",
+        # ...and from src/server.py's own import-time registrations.
+        "analyze_binary", "check_binary", "get_functions",
+    ):
+        assert expected in names, f"registry sweep does not reach {expected}"
+
+
+def test_no_registered_tool_leaks_host_layout_on_a_refused_path(
+    server, refused_paths, tmp_path, monkeypatch
+):
+    """
+    The real whole-surface guarantee, over the registry rather than one module.
+
+    The module-attribute sweep covered 32 tools and called itself
+    whole-surface. This covers every registered tool with a path argument, and
+    the difference is not cosmetic: the five refusal defects that survived
+    three reviews of this branch were all in tools the old sweep could not
+    reach -- vt_lookup and four coverage tools echoing a resolved path, and
+    coverage_index raising out of the tool entirely.
+    """
+    _disable_auto_session(server, monkeypatch)
+    found, _ = _registered_path_tools(server)
+
+    offenders = []
+    for name, fn, kwargs, target in found:
+        for label, path in refused_paths:
+            try:
+                result = str(fn(**{target: str(path)}, **kwargs))
+            except Exception as exc:  # noqa: BLE001 - reported, not swallowed
+                offenders.append(
+                    f"{name}[{label}] raised {type(exc).__name__} instead of "
+                    f"returning a refusal"
+                )
+                continue
+            if str(tmp_path) in result:
+                offenders.append(f"{name}[{label}] echoed host layout")
+
+    assert not offenders, (
+        "registered tools disclosed host layout, or raised instead of "
+        "returning a refusal:\n  " + "\n  ".join(offenders)
+    )
+
+
 def _binary_path_tools(server):
     """
     Every callable in src.server taking ``binary_path`` we can drive.

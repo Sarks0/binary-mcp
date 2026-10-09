@@ -94,7 +94,7 @@ jobs:
         submodules: recursive
 
     - name: Setup MSBuild
-      uses: microsoft/setup-msbuild@v2
+      uses: microsoft/setup-msbuild@v3
 
     - name: Setup CMake
       uses: jwlawson/actions-setup-cmake@v2

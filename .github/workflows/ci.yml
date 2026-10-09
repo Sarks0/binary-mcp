@@ -170,6 +170,98 @@ jobs:
 
         Write-Host "x32 plugin built successfully"
 
+    # Why this job uploads at all, when the comment above says it builds only:
+    # the plugin half of a change cannot be tested without these three files,
+    # and the only other way to get them was a tag -- which publishes a
+    # release. Testing an unmerged branch should not need one. An artifact is
+    # scoped to this run, expires, and is downloadable only by people who can
+    # already see the repository, so install.ps1 and releases/latest are
+    # untouched.
+    #
+    # Packaging and SHA256SUMS still live in release.yml and are NOT duplicated
+    # here. This stages the same three files in the same layout so that
+    # "unzip, copy three files into x64dbg/plugins" is the identical procedure
+    # either way -- a test build that has to be assembled differently from the
+    # shipped one is testing something else.
+    - name: Stage plugin artifacts
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $plugin = "src/engines/dynamic/x64dbg/plugin"
+        New-Item -ItemType Directory -Force -Path artifact/obsidian-plugins | Out-Null
+
+        # obsidian_server.exe comes from the x64 build, matching release.yml:
+        # it is a standalone process that talks to the plugin over a named
+        # pipe, so one build serves a 32- and a 64-bit debugger alike.
+        $files = @{
+          "$plugin/build-x64/Release/obsidian.dp64"        = "obsidian.dp64"
+          "$plugin/build-x32/Release/obsidian.dp32"        = "obsidian.dp32"
+          "$plugin/build-x64/Release/obsidian_server.exe"  = "obsidian_server.exe"
+        }
+        foreach ($src in $files.Keys) {
+          # Checked rather than assumed. A rename in CMakeLists would otherwise
+          # produce an artifact missing a file, and the first anyone would know
+          # is a plugin that loads and never answers.
+          if (-not (Test-Path -LiteralPath $src)) {
+            throw "Expected build output not found: $src"
+          }
+          Copy-Item -LiteralPath $src -Destination "artifact/obsidian-plugins/$($files[$src])"
+        }
+
+        # What this is, next to the files, because an artifact outlives the
+        # run page that explains it.
+        #
+        # An array of lines rather than a here-string. A here-string needs its
+        # body and its terminator at column zero, and a line at column zero
+        # ends the YAML block scalar that this whole step lives inside.
+        $note = @(
+          'This is a CI build of Sarks0/binary-mcp, not a release.'
+          ''
+          "  commit: ${env:GITHUB_SHA}"
+          "  run:    ${env:GITHUB_SERVER_URL}/${env:GITHUB_REPOSITORY}/actions/runs/${env:GITHUB_RUN_ID}"
+          ''
+          'It is here so an unmerged branch can be tested without publishing a'
+          'release. install.ps1 does not serve these files -- it fetches the latest'
+          'non-prerelease from the releases page, which nothing you do with this'
+          'artifact changes.'
+          ''
+          'INSTALL'
+          ''
+          'Copy all three files into the plugins directory of the x64dbg you want'
+          'to test: x64dbg/x64/plugins for a 64-bit debugger, x64dbg/x32/plugins'
+          'for a 32-bit one.'
+          ''
+          'Prefer a second, portable x64dbg copy over the one install.ps1 set up.'
+          'The plugin finds obsidian_server.exe, obsidian.ini and its log beside'
+          'its own DLL, so a separate copy is fully isolated and leaves your'
+          'working install on the released binaries.'
+          ''
+          'LISTENER'
+          ''
+          'Configuration is an optional obsidian.ini beside these files. With no'
+          'ini the server binds 127.0.0.1:8765 in plaintext, exactly as it always'
+          'has. See docs/remote-access.md for the remote setup and its certificate'
+          'steps.'
+          ''
+          'These binaries are unsigned and built from an arbitrary commit. Treat'
+          'them as test material, not as something to leave installed.'
+        )
+        Set-Content -Path artifact/obsidian-plugins/BUILD-INFO.txt -Value $note -Encoding ascii
+
+        Get-ChildItem artifact/obsidian-plugins
+
+    - name: Upload plugin artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: obsidian-plugins-${{ github.sha }}
+        path: artifact/*
+        # A build that produced nothing is a failure, not an empty download.
+        if-no-files-found: error
+        # Short on purpose. These exist to be fetched during a round of
+        # testing, not to become a parallel distribution channel that outlives
+        # the branch.
+        retention-days: 14
+
   security:
     runs-on: ubuntu-latest
     steps:

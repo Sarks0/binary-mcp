@@ -420,8 +420,17 @@ public:
                 // the constructor. Passing it back as phContext on the retry
                 // is answered with SEC_E_INVALID_HANDLE, and the handshake
                 // fails for the one reason that is not the peer's fault: a
-                // ClientHello that arrived in more than one segment, which a
-                // small MSS or a large extension set makes ordinary.
+                // ClientHello that arrived in more than one segment.
+                //
+                // That is the ordinary case, not an edge case. A current
+                // OpenSSL offers a post-quantum key share by default and its
+                // ClientHello runs past 1600 bytes, so it does not fit one
+                // segment on a 1500-byte path. Confirmed in the field: a
+                // capture of the first cross-host handshake showed curl
+                // sending 1240 then 435 bytes before the server answered,
+                // and the handshake completed. Without this ordering it
+                // would have failed on the second AcceptSecurityContext,
+                // for every modern client, on the first connection.
                 needMoreData = true;
                 continue;
             }

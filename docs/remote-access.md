@@ -254,7 +254,27 @@ $pem = "-----BEGIN CERTIFICATE-----`n" +
 Set-Content -Path "$HOME\obsidian-debugger.pem" -Value $pem -Encoding ascii
 ```
 
-Copy that file to Host A. It contains no private key.
+`Set-Content` prints nothing on success, so "it did nothing" and "it worked"
+look identical. Check it:
+
+```powershell
+Get-Content "$HOME\obsidian-debugger.pem"
+```
+
+`$cert` only exists in the session that ran step 1. In a new window, fetch the
+certificate by thumbprint first and the export above works unchanged:
+
+```powershell
+$cert = Get-Item "Cert:\CurrentUser\My\<THUMBPRINT>"
+```
+
+Copy that file to Host A. It contains no private key. Worth confirming the SAN
+survived before going further, because a missing one fails much later and the
+error does not name it:
+
+```bash
+openssl x509 -in obsidian-debugger.pem -noout -subject -ext subjectAltName
+```
 
 **3. Write `obsidian.ini`** next to `obsidian.dp64` and
 `obsidian_server.exe` — ASCII, no BOM, and no spaces around `=`:
@@ -285,7 +305,16 @@ admitting 254 more would be the wrong way to resolve the ambiguity — write
 comparing, as it is on every incoming `Host`.
 
 **4. Add a firewall rule, scoped to the client** — not to `Any`. This is the
-one step that needs an elevated prompt:
+one step that needs an elevated prompt.
+
+Needed even on a network that is already open to this traffic: Windows
+Defender Firewall is per-host and independent of any VLAN or switch policy, it
+blocks unsolicited inbound by default on every profile, and
+`obsidian_server.exe` is spawned without a window so it never gets the
+first-run allow prompt a GUI application would. `Get-NetFirewallProfile |
+Select-Object Name, Enabled` says whether it is on. The symptom when it blocks
+is a timeout, which is also the symptom of a wrong `allow_clients` — so rule
+this out first:
 
 ```powershell
 New-NetFirewallRule -DisplayName "Obsidian x64dbg bridge" `
@@ -307,13 +336,36 @@ says so; the reason is in `obsidian_server.log` beside the executable.
 
 #### On Host A
 
-```bash
-export BINARY_MCP_REMOTE_ALLOW=1
-export X64DBG_HOST=192.168.1.50
-export X64DBG_PORT=8765
-export X64DBG_TLS_CA=/path/to/obsidian-debugger.pem
-export OBSIDIAN_AUTH_TOKEN=<the token from Host B>
+Put these in a `.env` beside the server rather than exporting them. The server
+searches upwards for one, so a file in the repository root is found without
+any shell involvement — and a shell that loses its exports (a new terminal, a
+restarted service) is otherwise indistinguishable from a broken endpoint:
+`$X64DBG_TLS_CA` unset makes curl report `the file '' provided to --cacert
+does not exist`, and an unset token gets you a 401.
+
+```ini
+BINARY_MCP_REMOTE_ALLOW=1
+X64DBG_HOST=192.168.1.50
+X64DBG_PORT=8765
+X64DBG_TLS_CA=/path/to/obsidian-debugger.pem
+OBSIDIAN_AUTH_TOKEN=<the token from Host B>
 ```
+
+`chmod 600` it: that last line drives a debugger. Note that `os.environ` wins
+over `.env`, so a stale value still exported in the shell you launch from
+silently overrides the file.
+
+Shell exports of the same five names work too, and are what `curl` needs since
+it does not read `.env`:
+
+```bash
+set -a; . ./.env; set +a
+```
+
+**The token changes every time x64dbg restarts.** The plugin generates one on
+load and deletes the file on unload, so every restart of the debugger means
+re-reading `%TEMP%\x64dbg_mcp_token.txt` and updating that line. This is the
+single most common reason a working setup starts answering 401.
 
 #### Adding mutual TLS
 
@@ -409,6 +461,8 @@ removes the first.
 |---|---|
 | `X64DBG_HOST=... is not a loopback address` | The endpoint needs `BINARY_MCP_REMOTE_ALLOW`. A tunnel needs no opt-in and is simpler |
 | `... so TLS is required: set X64DBG_TLS_CA` | No CA configured for a remote host. Point it at the certificate exported from Host B |
+| Server log says `Invalid token (wrong length)` | The presented token is not 64 characters — a truncated paste, or a `\r` picked up from the Windows file. `printf '%s' "$OBSIDIAN_AUTH_TOKEN" \| wc -c` should print 64 |
+| Server log says `Invalid token (mismatch)` | 64 characters but the wrong value, which means the token rotated: x64dbg has been restarted since you read it |
 | `OBSIDIAN_AUTH_TOKEN must be set for a non-loopback endpoint` | The plugin's token file is on Host B. Read it there |
 | `OBSIDIAN_AUTH_TOKEN is not set, and this bridge points at ...` | Same cause, hit at request time rather than construction |
 | `SSLError` / certificate verify failed | The certificate Host B serves is not the one in `X64DBG_TLS_CA`, or its subject alternative name does not cover `X64DBG_HOST` (the `TextExtension` line) |

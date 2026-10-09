@@ -897,6 +897,57 @@ def test_no_registered_tool_leaks_host_layout_on_a_refused_path(
     )
 
 
+def test_windbg_open_dump_validates_before_entering_dump_mode(
+    server, refused_paths, tmp_path, monkeypatch
+):
+    """
+    A Windows-only tool, pinned from every platform.
+
+    windbg_open_dump handed dump_path straight to the bridge, whose open_dump
+    sets the mode and returns True without reading the file. So a missing path
+    or a directory came back as "Opened crash dump" with the session in
+    dump-analysis mode against nothing, and the success line echoed the
+    caller's path. The registry sweep caught it on the Windows runner only --
+    on POSIX the tool returns its platform message and never reaches any of
+    this.
+
+    Forcing the platform check and a succeeding bridge reproduces the real
+    Windows path from any host, so the fix cannot regress on the one platform
+    CI would otherwise be the only place to notice.
+    """
+    _disable_auto_session(server, monkeypatch)
+    import src.tools.windbg_tools as windbg_tools
+
+    monkeypatch.setattr(windbg_tools, "_is_windows", lambda: True)
+    opened = []
+
+    class _Bridge:
+        def open_dump(self, path):
+            opened.append(path)
+            return True
+
+    monkeypatch.setattr(windbg_tools, "get_windbg_bridge", lambda: _Bridge())
+
+    found, _ = _registered_path_tools(server)
+    open_dump = next(fn for name, fn, _, _ in found if name == "windbg_open_dump")
+
+    cases = dict(refused_paths)
+    for label in ("missing", "directory"):
+        result = open_dump(dump_path=str(cases[label]))
+        assert "Invalid dump path" in result, (label, result)
+        assert "Opened crash dump" not in result, (
+            f"{label} reported success without a readable dump"
+        )
+        assert str(tmp_path) not in result, f"{label} echoed host layout"
+    assert not opened, "the bridge was handed a path that is not a readable file"
+
+    # A real file still opens, and the reply names it without the path.
+    result = open_dump(dump_path=str(cases["out of bounds"]))
+    assert "Opened crash dump" in result
+    assert str(tmp_path) not in result, "success line echoed the caller's path"
+    assert len(opened) == 1
+
+
 def _binary_path_tools(server):
     """
     Every callable in src.server taking ``binary_path`` we can drive.

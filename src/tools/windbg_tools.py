@@ -19,6 +19,7 @@ from src.engines.dynamic.windbg.commands import WinDbgCommands
 from src.engines.session import AnalysisType, UnifiedSessionManager
 from src.tools.error_hygiene import safe_tool_error
 from src.utils.formatters import wrap_untrusted
+from src.utils.security import path_refusal_message
 from src.utils.structured_errors import StructuredBaseError
 
 logger = logging.getLogger(__name__)
@@ -400,9 +401,35 @@ def register_windbg_tools(
         try:
             from pathlib import Path
 
+            # Validated before the bridge sees it. This tool used to hand
+            # dump_path straight to open_dump, which sets the mode and returns
+            # True without touching the file -- so a path that did not exist,
+            # or named a directory, was reported back as "Opened crash dump"
+            # and the session entered dump-analysis mode against nothing. The
+            # confinement sweep found it on Windows, where it is reachable.
+            #
+            # Existence and file-ness only: NOT the allow-list. A crash dump
+            # legitimately lives outside any quarantine directory --
+            # C:\Windows\MEMORY.DMP is the README's own worked example -- so
+            # confining this path is an operator policy decision, not a bug
+            # fix, and is deliberately not made here.
+            candidate = Path(dump_path)
+            if candidate.is_dir():
+                return path_refusal_message(
+                    "windbg_open_dump", IsADirectoryError(dump_path), "dump path"
+                )
+            if not candidate.is_file():
+                return path_refusal_message(
+                    "windbg_open_dump", FileNotFoundError(dump_path), "dump path"
+                )
+
             bridge = get_windbg_bridge()
-            bridge.open_dump(Path(dump_path))
-            return f"Opened crash dump: {dump_path}\nMode: dump_analysis"
+            bridge.open_dump(candidate)
+            # Basename, not the path. The caller supplied the path, so echoing
+            # it back confirms nothing it does not already know, and a
+            # resolved path in model-facing text is what the F-10 layer exists
+            # to keep out of transcripts and the reports built from them.
+            return f"Opened crash dump: {candidate.name}\nMode: dump_analysis"
         except (WinDbgBridgeError, StructuredBaseError) as e:
             return safe_tool_error("windbg_open_dump", e)
 

@@ -59,9 +59,7 @@ def _sentinels(text: str) -> tuple[int, int]:
     return text.count(UNTRUSTED_OPEN_SENTINEL), text.count(UNTRUSTED_CLOSE_SENTINEL)
 
 
-# ---------------------------------------------------------------------------
 # Wire contracts: the three services disagree, on purpose
-# ---------------------------------------------------------------------------
 
 
 def test_threatfox_posts_json_to_its_fixed_endpoint(monkeypatch):
@@ -201,9 +199,7 @@ def test_no_request_body_carries_anything_but_scalars():
         assert not keywords & {"data", "body"}, ast.unparse(call)
 
 
-# ---------------------------------------------------------------------------
 # The shared Auth-Key
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -264,9 +260,7 @@ def test_rejected_auth_key_is_reported_as_such(monkeypatch):
         )
 
 
-# ---------------------------------------------------------------------------
 # query_status handling
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -307,9 +301,7 @@ def test_a_non_json_reply_is_an_error(monkeypatch):
         abusech_tools.query(abusech_tools.urlhaus_client, "host/", form={"host": "x"})
 
 
-# ---------------------------------------------------------------------------
 # F-7 fencing: these rows ARE attacker infrastructure
-# ---------------------------------------------------------------------------
 
 
 def test_threatfox_fences_the_ioc_and_community_labels(monkeypatch):
@@ -484,3 +476,96 @@ def test_oversize_reply_is_refused(monkeypatch):
     )
     with pytest.raises(AbuseChError, match="response cap"):
         abusech_tools.query(abusech_tools.threatfox_client, json_body={"query": "x"})
+
+
+def test_the_host_is_fenced_with_the_url_that_contains_it(monkeypatch):
+    """
+    `host` is the attacker-registered domain -- the same string the fenced URL
+    carries. Printing it outside the envelope also skipped delimiter
+    neutralisation on it.
+    """
+    _capture(monkeypatch, abusech_tools.urlhaus_client, {
+        "query_status": "ok",
+        "id": "12345",
+        "url_status": "online",
+        "host": f"evil.test{INJECTION}",
+        "url": "http://evil.test/a.exe",
+        "payloads": [],
+    })
+
+    out = _register(monkeypatch)["urlhaus_lookup_url"]("http://evil.test/a.exe")
+
+    assert _sentinels(out) == (2, 2)
+    assert out.index("Host:") > out.index(UNTRUSTED_OPEN_SENTINEL)
+    assert out.index("Status: online") < out.index(UNTRUSTED_OPEN_SENTINEL)
+
+
+def test_a_served_filename_is_tied_to_its_payload_number(monkeypatch):
+    """
+    Hashes printed outside the fence and filenames inside it were paired by
+    position only, so one payload without a filename shifted every later name
+    onto the wrong hash. The number states the correspondence.
+    """
+    _capture(monkeypatch, abusech_tools.urlhaus_client, {
+        "query_status": "ok",
+        "url": "http://evil.test/a.exe",
+        "payloads": [
+            {"response_sha256": "a" * 64},                      # no filename
+            {"response_sha256": "b" * 64, "filename": "second.exe"},
+        ],
+    })
+
+    out = _register(monkeypatch)["urlhaus_lookup_url"]("http://evil.test/a.exe")
+
+    assert " 1.\n" in out and " 2.\n" in out
+    assert "Payload 2 served filename: second.exe" in out
+    assert "Payload 1 served filename" not in out
+
+
+def test_the_family_signature_is_fenced_like_malwarebazaars(monkeypatch):
+    """`signature` is a community-assigned label; mb_tools already fences it."""
+    _capture(monkeypatch, abusech_tools.urlhaus_client, {
+        "query_status": "ok",
+        "sha256_hash": "f" * 64,
+        "file_size": 2048,
+        "signature": f"AgentTesla{INJECTION}",
+        "urls": [],
+    })
+
+    out = _register(monkeypatch)["urlhaus_lookup_payload"]("f" * 64)
+
+    assert _sentinels(out) == (2, 2)
+    begin = out.index(UNTRUSTED_OPEN_SENTINEL)
+    assert out.index("SHA256: " + "f" * 64) < begin, "the hash pivot should stay usable"
+    assert out.index("Signature:") > begin
+
+
+@pytest.mark.parametrize("shape", ["top-level", "nested-in-tasks"])
+def test_yara_matches_are_found_in_either_response_shape(monkeypatch, shape):
+    """
+    YARAify's `lookup_hash` shape could not be verified against the live API.
+    Reading only one placement would report "no rules matched" for a file that
+    matched several -- a silent wrong answer. Accept both.
+    """
+    match = {"rule_name": "MALWARE_Win_Neshta", "description": "detects Neshta"}
+    entry = {"sha256_hash": "e" * 64, "file_size": 1024}
+    if shape == "top-level":
+        entry["static_results"] = [match]
+    else:
+        entry["tasks"] = [{"static_results": [match]}]
+
+    _capture(monkeypatch, abusech_tools.yaraify_client,
+             {"query_status": "ok", "data": [entry]})
+
+    out = _register(monkeypatch)["yaraify_lookup_hash"]("e" * 64)
+
+    assert "YARA rules matched (1):" in out
+    assert "MALWARE_Win_Neshta" in out
+    assert "No public YARA rules matched" not in out
+
+
+def test_no_matches_still_says_so(monkeypatch):
+    _capture(monkeypatch, abusech_tools.yaraify_client,
+             {"query_status": "ok", "data": [{"sha256_hash": "e" * 64}]})
+    out = _register(monkeypatch)["yaraify_lookup_hash"]("e" * 64)
+    assert "No public YARA rules matched this sample." in out

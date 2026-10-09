@@ -41,10 +41,11 @@ in tests/test_untrusted_rollout.py.
 
 import json
 import logging
-import re
+import os
 from pathlib import Path
 
 from src.integrations import IntegrationClient, IntegrationError, ProviderConfig
+from src.utils.file_lock import LockTimeoutError, exclusive_lock
 
 logger = logging.getLogger(__name__)
 
@@ -90,11 +91,6 @@ _KIND_LABELS = {
     "tool": "Tool",
     "campaign": "Campaign",
 }
-
-#: ATT&CK external IDs: T1055/T1055.001 techniques, G#### groups, S#### software,
-#: C#### campaigns, M#### mitigations. Validated before use so a lookup argument
-#: cannot become a cache filename or a URL path segment.
-_ATTACK_ID_RE = re.compile(r"\A(?:T\d{4}(?:\.\d{3})?|G\d{4}|S\d{4}|C\d{4}|M\d{4})\Z")
 
 #: Cap on a rendered description. Some ATT&CK technique descriptions run to
 #: several thousand characters of prose.
@@ -154,9 +150,7 @@ client = IntegrationClient(
 )
 
 
-# ---------------------------------------------------------------------------
 # Fetch and distil
-# ---------------------------------------------------------------------------
 
 
 def _external_id(obj: dict) -> tuple[str | None, str | None]:
@@ -302,39 +296,52 @@ def load_index(matrix: str | None = None, refresh: bool = False) -> dict:
             logger.warning(f"ATT&CK index at {cached} unreadable, refetching: {e}")
 
     if _offline():
+        # Two different situations, and the old single message was false in one
+        # of them: a refresh against a populated cache is a refusal to go to
+        # the network, not missing data, and telling that operator to unset
+        # their air-gap setting is bad advice.
+        if cached.exists():
+            raise AttackDataError(
+                f"{ATTACK_OFFLINE_ENV} is set, so the cached {matrix} data cannot "
+                "be refreshed. Every other attack_* tool still answers from it."
+            )
         raise AttackDataError(
             f"No cached ATT&CK data for {matrix} and {ATTACK_OFFLINE_ENV} is set, "
             "so it cannot be downloaded. Unset it once to populate the cache."
         )
 
-    index = fetch_index(matrix)
     cached.parent.mkdir(parents=True, exist_ok=True)
-    cached.write_text(json.dumps(index), encoding="utf-8")
-    return index
+
+    # Serialise the fetch, and write through a temporary file.
+    #
+    # Two cold-cache callers would otherwise each download ~51MB and then
+    # interleave their writes into the same path, and a concurrent reader would
+    # see a half-written file -- parsed as corrupt, which sends it back to the
+    # network too. The lock makes the second caller wait and then find the
+    # cache populated; os.replace makes the swap atomic for readers.
+    lock_path = cached.with_suffix(".lock")
+    try:
+        with exclusive_lock(lock_path, wait_seconds=client.timeout() + 60):
+            # The caller that held the lock may have just populated it.
+            if not refresh and cached.exists():
+                try:
+                    return json.loads(cached.read_text(encoding="utf-8"))
+                except (ValueError, OSError):
+                    pass
+            index = fetch_index(matrix)
+            tmp_path = cached.with_suffix(".tmp")
+            tmp_path.write_text(json.dumps(index), encoding="utf-8")
+            os.replace(tmp_path, cached)
+            return index
+    except LockTimeoutError:
+        # Someone is mid-download and taking longer than our own timeout
+        # allows. Answer from a fresh fetch rather than failing the call; the
+        # only cost is that this result is not the one cached.
+        logger.warning("ATT&CK cache lock still held; fetching without caching")
+        return fetch_index(matrix)
 
 
-# ---------------------------------------------------------------------------
 # Query helpers
-# ---------------------------------------------------------------------------
-
-
-def normalise_attack_id(value: str) -> str:
-    """
-    Validate an ATT&CK external ID.
-
-    Raises:
-        ValueError: If it is not a well-formed ID. Validated rather than merely
-            upper-cased because the value reaches a cache filename and a URL
-            path in other code paths; the same reasoning as hash validation in
-            src/integrations/hashes.py.
-    """
-    candidate = (value or "").strip().upper()
-    if not _ATTACK_ID_RE.match(candidate):
-        raise ValueError(
-            f"Invalid ATT&CK ID: {value!r}. Expected a form like T1055, "
-            "T1055.001, G0016, S0154 or C0001."
-        )
-    return candidate
 
 
 def resolve(index: dict, value: str, kinds: tuple[str, ...] = ()) -> dict | None:

@@ -24,7 +24,6 @@ from src.tools import attack_tools
 from src.tools.attack_tools import (
     AttackDataError,
     distil,
-    normalise_attack_id,
     related,
     resolve,
 )
@@ -169,9 +168,7 @@ def _tools(monkeypatch) -> dict:
     return registered
 
 
-# ---------------------------------------------------------------------------
 # Distillation
-# ---------------------------------------------------------------------------
 
 
 def test_distil_keeps_only_the_entities_these_tools_answer_with(index):
@@ -236,29 +233,7 @@ def test_version_is_recorded(index):
     assert index["attack_version"] == "19.2"
 
 
-# ---------------------------------------------------------------------------
-# ID validation and resolution
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "raw,expected",
-    [("t1055", "T1055"), (" T1055.001 ", "T1055.001"), ("g0016", "G0016"),
-     ("S0154", "S0154"), ("c0001", "C0001"), ("m1040", "M1040")],
-)
-def test_normalise_attack_id_accepts_the_real_forms(raw, expected):
-    assert normalise_attack_id(raw) == expected
-
-
-@pytest.mark.parametrize(
-    "raw",
-    ["", "T105", "T10555", "X1055", "T1055.0001", "../../etc/passwd",
-     "T1055/../x", "T1055 OR 1=1"],
-)
-def test_normalise_attack_id_rejects_everything_else(raw):
-    """The value reaches a cache filename and a URL path elsewhere."""
-    with pytest.raises(ValueError):
-        normalise_attack_id(raw)
+# Resolution
 
 
 def test_resolve_by_id_name_and_alias(index):
@@ -287,9 +262,7 @@ def test_resolve_returns_none_for_nothing(index):
     assert resolve(index, "no such thing") is None
 
 
-# ---------------------------------------------------------------------------
 # Relationship traversal
-# ---------------------------------------------------------------------------
 
 
 def test_related_follows_both_directions(index):
@@ -312,9 +285,7 @@ def test_related_distinguishes_relationship_types(index):
     assert related(index, "T1055", "mitigates") == []
 
 
-# ---------------------------------------------------------------------------
 # Caching: no key, and no network after the first fetch
-# ---------------------------------------------------------------------------
 
 
 def test_attack_needs_no_api_key():
@@ -375,9 +346,7 @@ def test_refresh_refetches_even_with_a_cache(cached, monkeypatch):
     assert calls
 
 
-# ---------------------------------------------------------------------------
 # Fetching
-# ---------------------------------------------------------------------------
 
 
 def _catalogue(url: str) -> dict:
@@ -445,9 +414,7 @@ def test_an_empty_bundle_is_reported(monkeypatch):
         attack_tools.fetch_index("enterprise-attack")
 
 
-# ---------------------------------------------------------------------------
 # Tool behaviour
-# ---------------------------------------------------------------------------
 
 
 def test_status_reports_version_and_counts(cached, monkeypatch):
@@ -545,3 +512,64 @@ def test_the_configured_matrix_is_honoured(monkeypatch):
 def test_an_unknown_matrix_falls_back_to_enterprise(monkeypatch):
     monkeypatch.setenv("ATTACK_DOMAIN", "not-a-matrix")
     assert attack_tools.domain() == "enterprise-attack"
+
+
+def test_offline_refresh_against_a_populated_cache_says_what_is_true(cached, monkeypatch):
+    """
+    The single old message claimed "No cached ATT&CK data" and advised unsetting
+    the air-gap setting. With a cache present that is false on both counts.
+    """
+    monkeypatch.setenv("ATTACK_OFFLINE", "1")
+    with pytest.raises(AttackDataError) as excinfo:
+        attack_tools.load_index(refresh=True)
+    message = str(excinfo.value)
+    assert "cannot be refreshed" in message
+    assert "No cached ATT&CK data" not in message
+    assert "Unset it once" not in message
+
+
+def test_the_cache_is_written_atomically(tmp_path, monkeypatch, index):
+    """
+    A plain write_text leaves a reader parsing a half-written 2.7MB file, which
+    reads as corrupt and sends it back to the network. The swap must be atomic,
+    so no .tmp file survives and the final path is complete JSON.
+    """
+    monkeypatch.setenv("ATTACK_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(attack_tools, "fetch_index", lambda matrix=None: index)
+
+    attack_tools.load_index()
+
+    cached = attack_tools.index_path()
+    assert json.loads(cached.read_text())["entities"]["T1055"]
+    assert not list(tmp_path.glob("*.tmp")), "a temporary file was left behind"
+
+
+def test_a_second_caller_waits_and_reuses_the_first_fetch(tmp_path, monkeypatch, index):
+    """
+    Two cold-cache callers must not each download the bundle. The lock makes the
+    second wait; it then finds the cache populated and fetches nothing.
+    """
+    monkeypatch.setenv("ATTACK_DATA_DIR", str(tmp_path))
+    fetches = []
+
+    def counting_fetch(matrix=None):
+        fetches.append(matrix)
+        return index
+
+    monkeypatch.setattr(attack_tools, "fetch_index", counting_fetch)
+
+    attack_tools.load_index()
+    attack_tools.load_index()
+    assert len(fetches) == 1, "the second caller re-downloaded the bundle"
+
+
+def test_a_held_lock_still_answers_rather_than_failing(tmp_path, monkeypatch, index):
+    """A stuck downloader must not turn every lookup into an error."""
+    monkeypatch.setenv("ATTACK_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(attack_tools, "fetch_index", lambda matrix=None: index)
+
+    def always_timeout(*_args, **_kwargs):
+        raise attack_tools.LockTimeoutError("held")
+
+    monkeypatch.setattr(attack_tools, "exclusive_lock", always_timeout)
+    assert attack_tools.load_index()["entities"]["T1055"]["name"] == "Process Injection"

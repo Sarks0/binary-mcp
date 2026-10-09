@@ -35,7 +35,6 @@ import logging
 import uuid
 
 from src.utils.security import (
-    PATH_ERROR_GUIDANCE,
     FileSizeError,
     PathTraversalError,
     path_refusal_message,
@@ -125,7 +124,7 @@ def safe_tool_error(operation: str, error: Exception) -> str:
     # own arm, where the provenance is known.
     # safe_error_message routes these at the base too, so this branch is here
     # only to supply the operation name -- which it has and the base does not.
-    if isinstance(error, (PathTraversalError, FileSizeError)):
+    if isinstance(error, (PathTraversalError, FileSizeError, IsADirectoryError)):
         return safe_path_error(operation, error, "path")
 
     return safe_error_message(
@@ -162,10 +161,9 @@ def safe_tool_error(operation: str, error: Exception) -> str:
 # and when it is not (a path taken from a session record or a cached context)
 # echoing it is another way host layout re-enters the transcript.
 
-# The mapping itself lives in src/utils/security.py so the src/utils/ producers
-# that raise StructuredBaseError from a path failure share exactly this text --
-# see the note there for why a second copy is what let the leak reopen.
-_PATH_ERROR_GUIDANCE = PATH_ERROR_GUIDANCE
+# The mapping and its renderer both live in src/utils/security.py; nothing in
+# this module holds a copy of either. See the note there for why a second copy
+# is what let the leak reopen last time.
 
 
 def safe_path_error(

@@ -330,9 +330,12 @@ def _reject_hardlinked_file(path: Path, binary_path: str) -> None:
         a much smaller hammer than ``BINARY_MCP_ALLOW_ANY_PATH``.
       * NOTHING THIS SERVER WRITES trips it: cache entries, carved output,
         dumps and extracted files are all created fresh with one link.
-      * Directories are exempt: ``st_nlink`` counts subdirectory ``..``
-        entries, so any non-empty directory has nlink > 1. Only regular files
-        are checked. Symlinks never reach here as themselves (the caller has
+      * Directories are exempt, and the guard for that is load-bearing:
+        EVERY directory has ``st_nlink >= 2`` (its own entry plus ``.``), not
+        merely non-empty ones as earlier revisions of this comment claimed --
+        a freshly created empty directory reports 2. Without the S_ISREG
+        check below, every directory reaching here would be refused. Only
+        regular files are checked. Symlinks never reach here as themselves (the caller has
         already resolved them, and out-of-bounds targets were rejected above).
       * POSIX ONLY, and this is a GAP rather than a non-issue. ``mklink /H``
         is the Windows equivalent of the construction above and nothing here
@@ -417,7 +420,9 @@ def sanitize_binary_path(
             because it is a different refusal with a different remedy
         FileSizeError: If file exceeds size limit
         FileNotFoundError: If file does not exist
-        ValueError: If path validation fails
+        IsADirectoryError: If the path names a directory
+        ValueError: If the path is neither a regular file nor a directory
+            (a FIFO, socket or device node), or validation otherwise fails
     """
     # Resolve the confinement policy centrally so every caller is confined
     # uniformly. Historically most call sites passed no allowed_dirs and thus
@@ -553,9 +558,28 @@ def sanitize_binary_path(
     if not path.exists():
         raise FileNotFoundError(f"File does not exist: {binary_path}")
 
-    # Must be a file, not directory
+    # Must be a file. A DIRECTORY gets IsADirectoryError, not ValueError.
+    #
+    # The bare ValueError this replaces was the root cause of four separate
+    # workarounds. PATH_ERROR_GUIDANCE has had an IsADirectoryError entry
+    # ("the path names a directory, not a file") the whole time, unreachable
+    # because nothing raised the type. Meanwhile ValueError could not be
+    # routed anywhere near the path layer, because json.JSONDecodeError IS a
+    # ValueError -- so a directory ended up with no reportable category at
+    # all, project_cache needed its lookups split by scope to avoid catching
+    # decode errors, several handlers bolted ValueError onto their
+    # FileNotFoundError arms, and the arms that echoed `{e}` for a ValueError
+    # leaked the resolved path.
+    #
+    # IsADirectoryError is an OSError subclass, so it is cleanly separable
+    # from a decode error and routes like every other refusal. Anything else
+    # that is not a regular file (a FIFO, socket or device node inside an
+    # allowed directory) keeps ValueError, because "is a directory" would be
+    # a lie about it.
+    if path.is_dir():
+        raise IsADirectoryError(f"Path is a directory, not a file: {binary_path}")
     if not path.is_file():
-        raise ValueError(f"Path is not a file: {binary_path}")
+        raise ValueError(f"Path is not a regular file: {binary_path}")
 
     # Hard-link check. Only meaningful while confinement is active: with
     # BINARY_MCP_ALLOW_ANY_PATH set there is no boundary left to bypass, so
@@ -573,7 +597,12 @@ def sanitize_binary_path(
                 f"File too large: {file_size} bytes (max: {max_size_bytes})"
             )
     except OSError as e:
-        raise ValueError(f"Cannot get file size: {e}")
+        # Not interpolated: the OSError's str carries the RESOLVED absolute
+        # path ("[Errno 13] Permission denied: '/home/<user>/...'"), so any
+        # handler echoing this ValueError printed the operator's username.
+        # The caller's own argument is enough to identify what failed.
+        logger.error("Cannot stat %s", binary_path, exc_info=e)
+        raise ValueError(f"Cannot read file size for: {binary_path}") from e
 
     return path
 
@@ -1012,8 +1041,12 @@ def get_allowed_dirs() -> list[Path] | None:
     Returns:
         List of allowed directory Paths, or None if not configured
     """
-    import os
-    dirs_config = os.environ.get("BINARY_MCP_ALLOWED_DIRS", "").strip()
+    # ENV_ALLOWED_DIRS, not the literal. This function is the only place that
+    # actually READS the variable, and the docs test now derives its canonical
+    # list from the module's ENV_* constants -- so a rename would have updated
+    # every refusal message and the docs assertion while this kept parsing the
+    # old name and silently returning None.
+    dirs_config = os.environ.get(ENV_ALLOWED_DIRS, "").strip()
     if not dirs_config:
         return None
     return [Path(d.strip()) for d in dirs_config.split(os.pathsep) if d.strip()]
@@ -1265,8 +1298,12 @@ def safe_error_message(
     # an arm" true of one file and false of the rest. Routing at the base
     # makes it true everywhere, including for tools added later.
     #
-    # Only these two types. Both are raised exclusively by this project's own
-    # path validators, so the category is unambiguous. FileNotFoundError is
+    # Only these three types. PathTraversalError and FileSizeError are raised
+    # exclusively by this project's own path validators;
+    # IsADirectoryError is unambiguous wherever it comes from, since "the path
+    # names a directory, not a file" is true of an open() on a directory too.
+    # That is exactly what the bare ValueError it replaced could not offer.
+    # FileNotFoundError is
     # NOT included even though PATH_ERROR_GUIDANCE has text for it: the Ghidra
     # detector raises it for a missing INSTALLATION, and answering that with
     # "check the name and extension" would trade a vague error for a
@@ -1277,7 +1314,9 @@ def safe_error_message(
     # one it then discards -- path_refusal_message mints its own, and the
     # caller's error_id (if any) is passed through so a caller that already
     # logged detail under it still gets an ID that resolves to that line.
-    if isinstance(internal_details, (PathTraversalError, FileSizeError)):
+    if isinstance(
+        internal_details, (PathTraversalError, FileSizeError, IsADirectoryError)
+    ):
         routed = path_refusal_message(
             user_message, internal_details, error_id=error_id
         )

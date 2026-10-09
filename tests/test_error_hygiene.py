@@ -110,8 +110,13 @@ class TestSafeToolError:
         hardlink = render(HardLinkError(LEAK_MARKER))
         confinement = render(PathTraversalError(LEAK_MARKER))
         oversize = render(FileSizeError(LEAK_MARKER))
+        # IsADirectoryError joined the routed set when sanitize_binary_path
+        # stopped signalling "not a file" with a bare ValueError. It is safe
+        # to route from anywhere, unlike ValueError, because "names a
+        # directory, not a file" is true of an open() on a directory too.
+        directory = render(IsADirectoryError(LEAK_MARKER))
 
-        for text in (hardlink, confinement, oversize):
+        for text in (hardlink, confinement, oversize, directory):
             assert_no_host_leak(text)
             # Asserted because downstream code depends on it: clean_cache's
             # `extra` block has to land before the ID, and
@@ -125,6 +130,7 @@ class TestSafeToolError:
         assert "outside the directories" in confinement
         assert "hard link" not in confinement
         assert "size limit" in oversize
+        assert "names a directory" in directory
 
         # Compared in full, not by first line. Every guidance value is a
         # single line today, so splitlines()[0] was the whole message and the
@@ -132,26 +138,29 @@ class TestSafeToolError:
         # the substring assertions above already rule out. Comparing the whole
         # string says what is meant and does not silently narrow if a guidance
         # entry is ever reflowed across two lines.
-        bodies = [_strip_reference_id(t) for t in (hardlink, confinement, oversize)]
-        assert len(set(bodies)) == 3, bodies
+        bodies = [
+            _strip_reference_id(t)
+            for t in (hardlink, confinement, oversize, directory)
+        ]
+        assert len(set(bodies)) == 4, bodies
 
     @pytest.mark.parametrize(
         "exc",
         [
             FileNotFoundError("missing"),
-            IsADirectoryError("a dir"),
             NotADirectoryError("not a dir"),
             PermissionError("denied"),
         ],
-        ids=["FileNotFoundError", "IsADirectoryError", "NotADirectoryError",
-             "PermissionError"],
+        ids=["FileNotFoundError", "NotADirectoryError", "PermissionError"],
     )
     def test_mapped_but_excluded_types_are_not_routed_at_the_base(self, exc):
         """
         The exclusions that can actually regress, tested at the base.
 
-        These four have PATH_ERROR_GUIDANCE entries but are deliberately NOT
-        in the base routing's isinstance tuple. The earlier version of this
+        These three have PATH_ERROR_GUIDANCE entries but are deliberately NOT
+        in the base routing's isinstance tuple. (IsADirectoryError was in this
+        list until sanitize_binary_path started raising it; it is routed now,
+        and asserted by the test above.) The earlier version of this
         test used a bare OSError for its negative case, which has no guidance
         entry and is not a PathTraversalError or FileSizeError -- so the
         isinstance check could never have matched it and the assertion could
@@ -795,6 +804,18 @@ def _exception_echoing_returns(path: Path) -> list[tuple[int, str, str]]:
                 continue
             if payload is None:
                 continue
+            # `raise e` re-raises the bound object and composes no string, so
+            # it is the same no-op as a bare `raise` and must not be flagged.
+            # RAISE ONLY: `return e` is a genuine leak, because returning the
+            # exception hands the caller its raw str. An earlier version of
+            # this exemption did not check the statement kind and silently
+            # stopped flagging `return e`, which the meta-test below caught.
+            if (
+                isinstance(node, ast.Raise)
+                and isinstance(payload, ast.Name)
+                and payload.id == handler.name
+            ):
+                continue
             if handler.name in _interpolated_names(payload):
                 offenders.append(
                     (node.lineno, ", ".join(clauses), ast.unparse(node)[:120])
@@ -897,6 +918,35 @@ def test_ast_guard_allows_the_sanctioned_raise_forms(body, tmp_path):
     path = tmp_path / "probe.py"
     path.write_text(body, encoding="utf-8")
     assert not _exception_echoing_returns(path)
+
+
+def test_the_bare_name_exemption_is_raise_only(tmp_path):
+    """
+    `raise e` is exempt; `return e` is not. Pinned because I got it wrong.
+
+    The first version of the exemption checked only that the payload was the
+    handler's bound name, not the statement kind, so it silently stopped
+    flagging `return e` -- which IS a leak, since returning the exception
+    hands the caller its raw str.
+    """
+    raise_form = tmp_path / "r.py"
+    raise_form.write_text(
+        "def f():\n    try:\n        pass\n"
+        "    except Exception as e:\n        raise e\n",
+        encoding="utf-8",
+    )
+    assert not _exception_echoing_returns(raise_form)
+
+    return_form = tmp_path / "t.py"
+    return_form.write_text(
+        "def f():\n    try:\n        pass\n"
+        "    except Exception as e:\n        return e\n",
+        encoding="utf-8",
+    )
+    assert _exception_echoing_returns(return_form), (
+        "`return e` must stay flagged -- returning the exception hands the "
+        "caller its raw str"
+    )
 
 
 def test_ast_guard_actually_catches_the_spellings_the_line_guard_missed():

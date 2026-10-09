@@ -2353,7 +2353,7 @@ def load_pdb(
         return wrap_untrusted('\n'.join(lines), "PDB symbol names")
 
     except FileNotFoundError as e:
-        return safe_path_error("load_pdb", e, "path")
+        return safe_path_error("load_pdb", e, "binary or PDB path")
     except (PathTraversalError, FileSizeError) as e:
         return safe_path_error("load_pdb", e, "binary or PDB path")
     except Exception as e:
@@ -4272,7 +4272,7 @@ def search_bytes(
         return wrap_untrusted('\n'.join(lines), "byte-search hits")
 
     except FileNotFoundError as e:
-        return safe_path_error("search_bytes", e, "path")
+        return safe_path_error("search_bytes", e, "binary path")
     except (PathTraversalError, FileSizeError) as e:
         return safe_path_error("search_bytes", e, "binary path")
     except Exception as e:
@@ -6117,7 +6117,7 @@ def detect_python_packer(binary_path: str) -> str:
     except (PathTraversalError, FileSizeError) as e:
         return safe_path_error("detect_python_packer", e, "binary path")
     except FileNotFoundError as e:
-        return safe_path_error("detect_python_packer", e, "path")
+        return safe_path_error("detect_python_packer", e, "binary path")
     except Exception as e:
         logger.error(f"detect_python_packer failed: {e}")
         return safe_tool_error("detect_python_packer", e)
@@ -6178,7 +6178,7 @@ def extract_python_packed(
         try:
             safe_output_dir = sanitize_output_dir(output_dir, EXTRACTION_OUTPUT_DIR)
         except PathTraversalError as e:
-            return safe_path_error("extract_python_packed", e, "path")
+            return safe_path_error("extract_python_packed", e, "binary path")
         except ValueError as e:
             return f"Error: invalid output directory: {e}"
 
@@ -6229,7 +6229,7 @@ def extract_python_packed(
     except (PathTraversalError, FileSizeError) as e:
         return safe_path_error("extract_python_packed", e, "binary path")
     except FileNotFoundError as e:
-        return safe_path_error("extract_python_packed", e, "path")
+        return safe_path_error("extract_python_packed", e, "binary path")
     except Exception as e:
         logger.error(f"extract_python_packed failed: {e}")
         return safe_tool_error("extract_python_packed", e)
@@ -6291,7 +6291,7 @@ def analyze_pyc_file(pyc_path: str) -> str:
     except (PathTraversalError, FileSizeError) as e:
         return safe_path_error("analyze_pyc_file", e, "pyc path")
     except FileNotFoundError as e:
-        return safe_path_error("analyze_pyc_file", e, "path")
+        return safe_path_error("analyze_pyc_file", e, "pyc path")
     except Exception as e:
         logger.error(f"analyze_pyc_file failed: {e}")
         return safe_tool_error("analyze_pyc_file", e)
@@ -6363,7 +6363,7 @@ def list_python_archive_contents(binary_path: str) -> str:
     except (PathTraversalError, FileSizeError) as e:
         return safe_path_error("list_python_archive_contents", e, "binary path")
     except FileNotFoundError as e:
-        return safe_path_error("list_python_archive_contents", e, "path")
+        return safe_path_error("list_python_archive_contents", e, "binary path")
     except Exception as e:
         logger.error(f"list_python_archive_contents failed: {e}")
         return safe_tool_error("list_python_archive_contents", e)

@@ -80,9 +80,12 @@ confinement is active a regular file with `st_nlink > 1` is refused.
 Two things bound the attack, and are worth knowing before you judge how much
 the refusal is buying. Hard links cannot cross filesystems, so the target must
 live on the same filesystem as the allowed directory -- an `os.link` from
-`/etc` into a tmpfs `/tmp` fails with `EXDEV`. And Linux sets
-`fs.protected_hardlinks=1` by default, which stops an unprivileged user
-linking to a file they neither own nor can write. What remains is a real
+`/etc` into a tmpfs `/tmp` fails with `EXDEV`. And `fs.protected_hardlinks=1`, which stops an
+unprivileged user linking to a file they neither own nor can write, is set by
+most distributions -- Debian, Ubuntu and Fedora among them -- though the
+mainline kernel ships it as 0, so on a minimal or embedded image, or a host
+whose `/etc/sysctl.d` has been trimmed, only the same-filesystem constraint
+applies. Check `sysctl fs.protected_hardlinks` rather than assuming. What remains is a real
 bypass with a narrower reach than "any file on the host": a same-filesystem
 file the caller owns or can write, republished under an in-bounds name.
 
@@ -92,8 +95,9 @@ it is legitimate. `BINARY_MCP_ALLOW_HARDLINKS=1` re-permits multiply-linked
 files and leaves directory confinement untouched -- deliberately a far smaller
 hammer than `BINARY_MCP_ALLOW_ANY_PATH`. Nothing this server writes trips the
 check; caches, carved output and dumps are all created with one link.
-Directories are exempt (`st_nlink` counts `..` entries, so any directory with a
-subdirectory has more than one).
+Directories are exempt, and that exemption is doing real work: **every**
+directory has `st_nlink >= 2`, not just ones with subdirectories, so without
+the regular-file check every directory reaching the test would be refused.
 
 **The check does not run on Windows at all**, and the allow-list should be
 treated as advisory there: `mklink /H` is the equivalent of the construction

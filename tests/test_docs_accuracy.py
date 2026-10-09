@@ -25,6 +25,7 @@ against the code rather than trusted.
 from __future__ import annotations
 
 import ast
+import json
 import re
 from pathlib import Path
 
@@ -39,6 +40,7 @@ README = REPO_ROOT / "README.md"
 # follow them to their new files rather than being dropped, and
 # test_readme_links_to_the_claim_docs keeps each one reachable from the front
 # page. A claim nobody can find is only marginally better than a false one.
+ARCHITECTURE_SCENE = REPO_ROOT / "docs" / "architecture.excalidraw"
 TOOLS_DOC = REPO_ROOT / "docs" / "tools.md"
 SECURITY_DOC = REPO_ROOT / "docs" / "security.md"
 CONFIG_DOC = REPO_ROOT / "docs" / "configuration.md"
@@ -156,6 +158,56 @@ def test_readme_tool_count_matches_code():
         f"README advertises {sorted(counts)} tools; the code registers "
         f"{count_registered_tools()}"
     )
+
+
+def test_architecture_diagram_tool_count_matches_code():
+    """
+    The README's architecture diagram states a tool count, and it drifts too.
+
+    It is a PNG on the page, which is why this reads the Excalidraw scene the
+    PNG is exported from instead. That distinction is the whole point of the
+    test: the diagram shipped claiming 290 tools against 147 registered, and
+    every other assertion in this file was blind to it, because a number
+    rasterised into an image is not text any of them can see. The scene is
+    JSON, so the claim is checkable at the one place an editor actually edits.
+
+    This asserts the count only. Everything else the diagram says is prose
+    about the architecture and is no more checkable here than it is in the
+    surrounding docs; a number that contradicts the README two screens up is a
+    different kind of wrong.
+    """
+    scene = json.loads(ARCHITECTURE_SCENE.read_text(encoding="utf-8"))
+    labels = [
+        element["text"]
+        for element in scene["elements"]
+        if element.get("type") == "text" and "MCP tools" in element.get("text", "")
+    ]
+    assert len(labels) == 1, (
+        f"expected exactly one 'N MCP tools' label in {ARCHITECTURE_SCENE.name}, found {labels}"
+    )
+    match = re.search(r"(\d+) MCP tools", labels[0])
+    assert match, f"the diagram's tool-count label lost its number: {labels[0]!r}"
+    assert int(match.group(1)) == count_registered_tools(), (
+        f"the architecture diagram advertises {match.group(1)} tools; the code "
+        f"registers {count_registered_tools()}. Edit "
+        f"{ARCHITECTURE_SCENE.name} and re-export both PNGs in docs/images/."
+    )
+
+
+def test_architecture_diagram_pngs_are_present():
+    """
+    The README references both themes; a missing one renders as a broken image.
+
+    Cheap to assert and easy to get wrong, because the scene and the exports
+    are three separate files that a careless edit updates one of.
+    """
+    for theme in ("dark", "light"):
+        png = REPO_ROOT / "docs" / "images" / f"architecture-{theme}.png"
+        assert png.is_file(), f"{png.relative_to(REPO_ROOT)} is missing"
+        assert png.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n", f"{png.name} is not a PNG"
+        assert f"architecture-{theme}.png" in README.read_text(encoding="utf-8"), (
+            f"architecture-{theme}.png is not referenced by README.md"
+        )
 
 
 def test_server_module_docstring_tool_count_matches_code():

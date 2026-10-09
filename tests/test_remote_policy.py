@@ -111,9 +111,7 @@ def _remote(monkeypatch, tls_pair, **overrides):
             monkeypatch.setenv(name, value)
 
 
-# ---------------------------------------------------------------------------
 # Host classification
-# ---------------------------------------------------------------------------
 
 
 class TestHostClassification:
@@ -175,9 +173,7 @@ class TestHeaderHostParsing:
         assert strip_origin(value) == expected
 
 
-# ---------------------------------------------------------------------------
 # Policy: stdio
-# ---------------------------------------------------------------------------
 
 
 class TestStdioDefault:
@@ -211,9 +207,7 @@ class TestStdioDefault:
             resolve_transport_config()
 
 
-# ---------------------------------------------------------------------------
 # Policy: loopback HTTP
-# ---------------------------------------------------------------------------
 
 
 class TestLoopbackHttp:
@@ -295,9 +289,7 @@ class TestPortAndPath:
             resolve_transport_config()
 
 
-# ---------------------------------------------------------------------------
 # Policy: the refusals that matter
-# ---------------------------------------------------------------------------
 
 
 class TestWildcardBindIsAlwaysRefused:
@@ -466,9 +458,7 @@ class TestDescribe:
         assert "no listener" in resolve_transport_config().describe()
 
 
-# ---------------------------------------------------------------------------
 # The gate
-# ---------------------------------------------------------------------------
 
 TOKEN = "f" * 64
 

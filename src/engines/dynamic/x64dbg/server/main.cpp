@@ -152,7 +152,6 @@ bool LoadAuthToken() {
     return true;
 }
 
-// ---------------------------------------------------------------------------
 // HTTP header lookup (CWE-20)
 //
 // Both header consumers here used to do a bare request.find("Content-Length:")
@@ -173,7 +172,7 @@ bool LoadAuthToken() {
 // name at the start of a line, and compares it case-insensitively up to the
 // colon. Header values may not span lines here (obs-fold is deprecated by
 // RFC 9110 and this API never emits it), so a per-line scan is complete.
-// ---------------------------------------------------------------------------
+
 // ASCII-only case-insensitive compare. Deliberately not tolower()/_stricmp:
 // those honour the C locale, and in a Turkish locale 'I' does not fold to 'i'
 // -- a locale-dependent header parser is a bug waiting for a non-English host.
@@ -421,7 +420,6 @@ public:
 // Global pipe client
 static PipeClient g_pipeClient;
 
-// ---------------------------------------------------------------------------
 // Finding F-19 -- pre-authentication unbounded request read.
 //
 // The old read path had three separate problems, all of them reachable BEFORE
@@ -445,7 +443,6 @@ static PipeClient g_pipeClient;
 // wall-clock deadline for the entire request regardless of how it is paced.
 // A violation is answered with 413 / 431 / 408 as appropriate and the
 // connection is closed WITHOUT the request ever reaching HandleHTTPRequest.
-// ---------------------------------------------------------------------------
 
 // Largest header section (request line + headers + the blank line) accepted.
 // 16 KiB is well above any legitimate request this API receives and is the

@@ -81,9 +81,7 @@ struct Options {
     bool MutualTls() const { return !tlsClientCaThumbprint.empty(); }
 };
 
-// --------------------------------------------------------------------------
 // Address parsing
-// --------------------------------------------------------------------------
 
 // Strict dotted-quad parse into a host-order address.
 //
@@ -234,9 +232,7 @@ inline bool ClientAllowed(const Options& options, uint32_t clientAddr) {
     return false;
 }
 
-// --------------------------------------------------------------------------
 // Host / Origin validation (DNS rebinding)
-// --------------------------------------------------------------------------
 
 // Return the host part of a Host-header value, without its port.
 //
@@ -372,9 +368,7 @@ inline bool HostAllowed(const Options& options, const std::string& hostValue) {
     return false;
 }
 
-// --------------------------------------------------------------------------
 // Command line
-// --------------------------------------------------------------------------
 
 // Is this 40 hex characters, as a SHA-1 certificate thumbprint must be?
 // Checked here rather than at the store lookup so a typo is a start-up refusal
@@ -513,7 +507,7 @@ inline bool ParseOptions(int argc, const char* const* argv, Options& outOptions,
 
     (void)portSeen;  // accepted either way; kept for readability of the branches
 
-    // --- the policy ------------------------------------------------------
+    // Policy checks.
 
     if (IsWildcardBind(options.bind)) {
         outError =

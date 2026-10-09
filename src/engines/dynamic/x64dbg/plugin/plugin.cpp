@@ -335,7 +335,7 @@ void InitCoverageLock() {
 }
 
 // Logging helpers
-// ---------------------------------------------------------------------------
+
 // Format-string checking for the log wrappers (CWE-686 / MSVC C4477)
 //
 // These are variadic wrappers around vsnprintf, and MSVC applies its C4477
@@ -361,7 +361,6 @@ void InitCoverageLock() {
 // <vcruntime.h> (so <cstdio> above is sufficient). The fallback below means a
 // toolchain without SAL still compiles: an annotation that documents intent
 // must never be the thing that breaks a build.
-// ---------------------------------------------------------------------------
 #ifndef _Printf_format_string_
 #define _Printf_format_string_
 #endif
@@ -542,7 +541,6 @@ std::string BuildJsonResponse(bool success, const std::string& data = "") {
     return response;
 }
 
-// ---------------------------------------------------------------------------
 // OUTPUT PATH CONFINEMENT -- finding F-27
 //
 // Two handlers used to take a filesystem path straight out of the request and
@@ -579,7 +577,6 @@ std::string BuildJsonResponse(bool success, const std::string& data = "") {
 // below it here. Three layers, none of them sufficient alone: the syntactic
 // rejections are a fast first pass, the prefix check is the lexical control,
 // and the reparse-point walk is the physical one.
-// ---------------------------------------------------------------------------
 
 // True if `path` exists AND is a reparse point (junction, directory symlink,
 // mount point). CWE-59.
@@ -2065,8 +2062,7 @@ std::string HandleHideDebugger(const std::string& request) {
 }
 
 // WAIT/SYNCHRONIZATION HANDLERS (Phase 1)
-//
-// ---------------------------------------------------------------------------
+
 // Finding F-20 -- plugin-image use-after-free on unload.
 //
 // These three handlers run on PipeServerThread and poll for up to five minutes
@@ -2090,7 +2086,6 @@ std::string HandleHideDebugger(const std::string& request) {
 //
 // AbortableSleep returns true if it slept the full interval, false if shutdown
 // was signalled (or the event is unusable, which is also a reason to stop).
-// ---------------------------------------------------------------------------
 static bool AbortableSleep(DWORD milliseconds) {
     if (!g_running.load()) {
         return false;
@@ -4308,7 +4303,6 @@ void OnSystemBreakpoint(CBTYPE cbType, PLUG_CB_SYSTEMBREAKPOINT* info) {
     );
 }
 
-// ---------------------------------------------------------------------------
 // EXECUTE_COMMAND gate -- AUTHORITATIVE. Allowlist, fails closed.
 //
 // What this used to be, and why it was replaced (audit findings F-4 / F-9):
@@ -4354,7 +4348,6 @@ void OnSystemBreakpoint(CBTYPE cbType, PLUG_CB_SYSTEMBREAKPOINT* info) {
 // EXECUTION commands (ticnd/tocnd/tibt/tobt) are present because the bridge's
 // conditional-tracing methods issue them and they only resume the debuggee,
 // which the dedicated run/step tools already permit.
-// ---------------------------------------------------------------------------
 static const char* ALLOWED_COMMANDS[] = {
     // Disassembly navigation and instruction queries (read-only)
     "dis", "disasm", "dis.prev", "dis.next", "dis.iscall", "dis.isbranch",
@@ -4413,7 +4406,6 @@ static const char* ALLOWED_COMMANDS[] = {
     nullptr  // sentinel
 };
 
-// ---------------------------------------------------------------------------
 // Finding F-16 (plugin side) -- the gate matched ONE token, DbgCmdExec runs
 // MANY commands.
 //
@@ -4438,7 +4430,6 @@ static const char* ALLOWED_COMMANDS[] = {
 //   * a ';' inside a quoted argument (log "a;b") is still treated as a
 //     separator, because this code does not model x64dbg's quoting rules and
 //     guessing them wrong in the permissive direction is how gates fail.
-// ---------------------------------------------------------------------------
 
 // Match ONE already-split command segment against ALLOWED_COMMANDS.
 // Every path that is not an exact table hit returns false.
@@ -4646,7 +4637,6 @@ static void ClosePipeServerHandle() {
     if (g_pipeHandleLockInit) LeaveCriticalSection(&g_pipeHandleLock);
 }
 
-// ---------------------------------------------------------------------------
 // Finding F-17 -- the named pipe had NO authentication and the wrong DACL.
 //
 // The pipe is the plugin's real control surface: every request that reaches the
@@ -4677,7 +4667,6 @@ static void ClosePipeServerHandle() {
 // to that process (g_serverProcess) for its whole lifetime, and Windows cannot
 // recycle a PID while a handle to the process is open. A zero g_serverProcessId
 // means no server has been spawned yet, which is a reject, not a bypass.
-// ---------------------------------------------------------------------------
 static bool IsPipeClientAuthorised(HANDLE pipe) {
     ULONG clientPid = 0;
     if (!GetNamedPipeClientProcessId(pipe, &clientPid)) {

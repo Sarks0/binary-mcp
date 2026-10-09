@@ -555,9 +555,7 @@ def resolve_transport_config() -> TransportConfig:
     )
 
 
-# ---------------------------------------------------------------------------
 # The other direction: the x64dbg endpoint this server dials
-# ---------------------------------------------------------------------------
 #
 # Same posture, mirrored. The listener above decides who may drive this server;
 # this decides what this server may drive. The asymmetry worth naming is which

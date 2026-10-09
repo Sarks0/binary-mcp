@@ -637,9 +637,7 @@ def test_windbg_docstring_does_not_claim_read_only():
         assert ok, f"{command!r} should still be permitted; the gate is a denylist"
 
 
-# ---------------------------------------------------------------------------
 # The configuration surface
-# ---------------------------------------------------------------------------
 #
 # CONFIG_KEYS in src/utils/config.py is the project's own description of the
 # knobs it honours, and `diagnose_setup` reports against it -- so a key listed

@@ -58,7 +58,7 @@ static void fail(const std::string& label, const std::string& detail) {
     printf("FAIL %s: %s\n", label.c_str(), detail.c_str());
 }
 
-// --- ParseOptions ---------------------------------------------------------
+// ParseOptions
 
 static void expect_ok(const std::string& label, std::vector<const char*> args,
                       const char* describeContains) {
@@ -187,7 +187,7 @@ static void test_parse_options() {
     expect_err("empty-allow-host", {"--allow-host", ""}, "non-empty");
 }
 
-// --- ParseIPv4 ------------------------------------------------------------
+// ParseIPv4
 
 static void expect_addr(const char* text, bool wantOk, uint32_t wantAddr) {
     uint32_t addr = 0;
@@ -225,7 +225,7 @@ static void test_parse_ipv4() {
     expect_addr("10.0.0.1", true, 0x0A000001u);
 }
 
-// --- ClientAllowed --------------------------------------------------------
+// ClientAllowed
 
 static Listener::Options with_allowlist(std::vector<const char*> entries) {
     Listener::Options options;
@@ -286,7 +286,7 @@ static void test_client_allowed() {
     expect_client("slash-32-out", exact, "10.0.0.6", false);
 }
 
-// --- Host / Origin --------------------------------------------------------
+// Host / Origin
 
 static void expect_host(const std::string& label, const Listener::Options& options,
                         const char* value, bool want) {
@@ -457,9 +457,7 @@ def test_policy_decisions(policy_binary):
     assert "failures=0" in run.stdout
 
 
-# --------------------------------------------------------------------------
 # Source-level guards for the Windows-only parts
-# --------------------------------------------------------------------------
 #
 # These cannot be executed here, so they are pinned by presence. Weaker than
 # running them, and better than nothing: each one is a line whose deletion
@@ -519,9 +517,7 @@ def test_server_checks_the_client_allowlist_at_accept():
     )
 
 
-# --------------------------------------------------------------------------
 # The documented setup is part of the contract
-# --------------------------------------------------------------------------
 #
 # docs/remote-access.md carries the PowerShell an operator pastes to expose the
 # listener. There is no PowerShell on the CI runners, so it cannot be executed

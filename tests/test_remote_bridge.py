@@ -89,9 +89,7 @@ def _remote(monkeypatch, ca_file, **overrides):
             monkeypatch.setenv(name, value)
 
 
-# ---------------------------------------------------------------------------
 # Loopback: the default, and the tunnel case
-# ---------------------------------------------------------------------------
 
 
 class TestLoopbackEndpoint:
@@ -175,9 +173,7 @@ class TestWildcardIsNotADestination:
             resolve_debugger_endpoint()
 
 
-# ---------------------------------------------------------------------------
 # The refusals that matter
-# ---------------------------------------------------------------------------
 
 
 class TestNonLoopbackRequiresAllThree:
@@ -333,9 +329,7 @@ class TestExceptionHierarchy:
         assert not issubclass(TransportConfigError, DebuggerEndpointError)
 
 
-# ---------------------------------------------------------------------------
 # The bridge
-# ---------------------------------------------------------------------------
 
 
 class TestBridgeUsesThePolicy:

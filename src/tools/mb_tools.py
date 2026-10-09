@@ -298,9 +298,7 @@ def download_sample(sha256: str) -> bytes:
     return raw
 
 
-# ---------------------------------------------------------------------------
 # Rendering
-# ---------------------------------------------------------------------------
 #
 # Which fields are attacker-controlled is the whole question for F-7 fencing.
 #
@@ -433,8 +431,15 @@ def register_mb_tools(app, session_manager=None):
                 output.append("")
                 output.append("1. Get a free key: https://auth.abuse.ch/")
                 output.append("2. Add it to the .env file in the project root:")
-                output.append(f"   {MB_API_KEY_ENV}=your_auth_key_here")
-                output.append(f"   (or export {MB_API_KEY_ENV}=... in the environment)")
+                output.append(f"   {ABUSECH_API_KEY_ENV}=your_auth_key_here")
+                output.append(
+                    f"   (or export {ABUSECH_API_KEY_ENV}=... in the environment)"
+                )
+                output.append(
+                    f"   {MB_API_KEY_ENV} is still read as an alias, but new setups "
+                    f"should use {ABUSECH_API_KEY_ENV}: one key covers MalwareBazaar, "
+                    "ThreatFox, URLhaus and YARAify."
+                )
                 return "\n".join(output)
 
             masked = api_key[:4] + "..." + api_key[-4:] if len(api_key) > 12 else "***"

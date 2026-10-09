@@ -89,9 +89,7 @@ def _sample(**overrides) -> dict:
     return entry
 
 
-# ---------------------------------------------------------------------------
 # The request body carries hashes and search terms, never file content
-# ---------------------------------------------------------------------------
 
 
 def test_request_body_is_form_encoded_scalars_only(monkeypatch):
@@ -161,9 +159,7 @@ def test_lookup_by_path_sends_only_the_digest(monkeypatch, tmp_path):
     assert expected in out
 
 
-# ---------------------------------------------------------------------------
 # Auth-Key is mandatory
-# ---------------------------------------------------------------------------
 
 
 def test_missing_auth_key_is_explained_not_crashed(monkeypatch):
@@ -201,9 +197,7 @@ def test_http_401_is_reported_as_a_key_problem(monkeypatch):
         mb_tools.query({"query": "get_info", "hash": "a" * 64})
 
 
-# ---------------------------------------------------------------------------
 # query_status handling
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -250,9 +244,7 @@ def test_oversize_json_reply_is_refused(monkeypatch):
         mb_tools.query({"query": "get_info", "hash": "a" * 64})
 
 
-# ---------------------------------------------------------------------------
 # Hash validation
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("raw", ["a" * 32, "B" * 40, "  " + "f" * 64 + " "])
@@ -271,9 +263,7 @@ def test_download_requires_a_full_sha256():
         normalise_hash("a" * 32, sha256_only=True)
 
 
-# ---------------------------------------------------------------------------
 # Search pivots
-# ---------------------------------------------------------------------------
 
 
 def test_search_maps_each_pivot_to_its_documented_query(monkeypatch):
@@ -344,9 +334,7 @@ def test_recent_sends_the_documented_selectors(monkeypatch):
     assert b"query=get_recent&selector=100" == seen[0].data
 
 
-# ---------------------------------------------------------------------------
 # F-7: submitter-authored text is fenced
-# ---------------------------------------------------------------------------
 
 
 def _sentinels(text: str) -> tuple[int, int]:
@@ -413,9 +401,7 @@ def test_object_valued_fields_render_as_text_not_a_dict_repr(monkeypatch):
     assert "{'rule_name'" not in out
 
 
-# ---------------------------------------------------------------------------
 # Download: opt-in, confined, never extracted
-# ---------------------------------------------------------------------------
 
 
 def _zip_bytes() -> bytes:
@@ -508,3 +494,18 @@ def test_a_hostile_sha256_never_becomes_a_printed_link(monkeypatch):
     )
     out = _register(monkeypatch)["mb_lookup"](file_hash="a" * 64)
     assert "bazaar.abuse.ch/sample/" not in out
+
+
+def test_check_api_points_at_the_canonical_variable(monkeypatch):
+    """
+    The not-configured branch used to tell the operator to set MB_API_KEY, the
+    deprecated alias, while require_key(), the docs and .env.example all name
+    ABUSECH_API_KEY.
+    """
+    monkeypatch.setattr(mb_tools, "_get_api_key", lambda: None)
+    out = _register(monkeypatch)["mb_check_api"]()
+
+    assert "ABUSECH_API_KEY=your_auth_key_here" in out
+    assert out.index("ABUSECH_API_KEY") < out.index("MB_API_KEY"), (
+        "the alias is offered before the canonical name"
+    )

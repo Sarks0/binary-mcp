@@ -1053,8 +1053,11 @@ _NO_SAMPLE_TEXT_MODULES: dict[str, str] = {
     # attacker-authored: it is a curated knowledge base written by MITRE and
     # served as static STIX files, in the same category as the sandbox-vendor
     # verdicts vt_behavior deliberately leaves outside its envelope. Nothing
-    # from a sample reaches these tools -- their inputs are an ATT&CK ID
-    # validated against a regex, or a search term supplied by the caller.
+    # from a sample reaches these tools. Their arguments are used only for
+    # in-memory lookup against the distilled index -- never as a path, a URL
+    # segment or a filename -- so there is nothing for them to be validated
+    # against. The one argument that does form a path, the matrix name, is
+    # checked against the ATTACK_DOMAINS allow-list in domain().
     "attack_tools": "renders MITRE-authored knowledge-base text, not sample-derived content",
     # job_tools constructs no sample-derived text of its own: job_result hands
     # back the payload the PRODUCING tool put in the job record, and job_tools

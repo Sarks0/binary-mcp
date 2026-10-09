@@ -50,9 +50,7 @@ def _client(**overrides) -> IntegrationClient:
     return IntegrationClient(_config(**overrides), IntegrationError)
 
 
-# ---------------------------------------------------------------------------
 # Structural: no caller can put bytes into a request body
-# ---------------------------------------------------------------------------
 
 
 def test_every_request_body_is_encoded_from_a_mapping():
@@ -101,9 +99,7 @@ def test_form_and_json_bodies_are_mutually_exclusive():
         _client().request(form={"a": "1"}, json_body={"a": 1})
 
 
-# ---------------------------------------------------------------------------
 # Key handling
-# ---------------------------------------------------------------------------
 
 
 def test_missing_key_names_the_variable_and_where_to_get_one(monkeypatch):
@@ -163,9 +159,7 @@ def test_the_key_travels_in_the_providers_header(monkeypatch):
     assert seen[0].headers["Auth-key"] == "secret-value"
 
 
-# ---------------------------------------------------------------------------
 # Timeout
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -202,9 +196,7 @@ def test_the_clamped_timeout_is_what_reaches_the_socket(monkeypatch):
     assert recorded["timeout"] == 17
 
 
-# ---------------------------------------------------------------------------
 # Encoding
-# ---------------------------------------------------------------------------
 
 
 def test_query_parameters_are_encoded_not_concatenated(monkeypatch):
@@ -244,9 +236,7 @@ def test_a_body_free_request_stays_a_get(monkeypatch):
     assert seen[0].data is None
 
 
-# ---------------------------------------------------------------------------
 # Bounded reads
-# ---------------------------------------------------------------------------
 
 
 def test_oversize_response_is_refused(monkeypatch):
@@ -283,9 +273,7 @@ def test_per_call_cap_overrides_the_provider_default(monkeypatch):
         client.request(expect_json=False, max_bytes=8)
 
 
-# ---------------------------------------------------------------------------
 # Decoding
-# ---------------------------------------------------------------------------
 
 
 def test_non_json_reply_to_a_json_request_is_an_error(monkeypatch):
@@ -311,9 +299,7 @@ def test_a_json_array_decodes_to_an_empty_payload(monkeypatch):
     assert client.request().payload == {}
 
 
-# ---------------------------------------------------------------------------
 # Error mapping
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -386,9 +372,7 @@ def test_reading_an_error_body_never_masks_the_failure(monkeypatch):
         client.request()
 
 
-# ---------------------------------------------------------------------------
 # Shared hash validation
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("raw", ["a" * 32, "B" * 40, "  " + "f" * 64 + " "])

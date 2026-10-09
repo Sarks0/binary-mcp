@@ -38,9 +38,7 @@ from tests.integration_stubs import (
     shrink_response_cap,
 )
 
-# ---------------------------------------------------------------------------
 # Helpers
-# ---------------------------------------------------------------------------
 
 
 def _capture_requests(monkeypatch, payload: dict | None = None) -> list:
@@ -72,9 +70,7 @@ def _register(monkeypatch) -> dict:
     return registered
 
 
-# ---------------------------------------------------------------------------
 # Hash validation: the argument is a hash, so enforce that
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -131,9 +127,7 @@ def test_behaviour_report_refuses_a_path_injecting_hash(monkeypatch):
     assert seen == []
 
 
-# ---------------------------------------------------------------------------
 # Endpoint contracts
-# ---------------------------------------------------------------------------
 
 
 def test_lookup_hash_calls_the_documented_file_endpoint(monkeypatch):
@@ -184,9 +178,7 @@ def test_search_returns_and_forwards_the_cursor(monkeypatch):
     assert "cursor=NEXT%3D%3D" in seen[1].full_url
 
 
-# ---------------------------------------------------------------------------
 # Timestamps
-# ---------------------------------------------------------------------------
 
 
 def test_timestamps_are_rendered_in_utc_regardless_of_server_zone(monkeypatch):
@@ -224,9 +216,7 @@ def test_summary_timestamps_carry_an_explicit_offset():
         assert summary[field].endswith("+00:00"), field
 
 
-# ---------------------------------------------------------------------------
 # Detection ratio
-# ---------------------------------------------------------------------------
 
 
 def test_detection_ratio_matches_virustotals_own_convention():
@@ -285,9 +275,7 @@ def test_summary_skips_engine_results_that_are_not_objects():
     assert [d["engine"] for d in summary["detections"]] == ["GoodEngine"]
 
 
-# ---------------------------------------------------------------------------
 # Behaviour rendering: object-valued fields
-# ---------------------------------------------------------------------------
 
 
 def test_registry_keys_set_renders_as_text_not_a_dict_repr():
@@ -363,9 +351,7 @@ def test_vt_behavior_rejects_a_malformed_hash_before_calling_out(monkeypatch):
     assert seen == []
 
 
-# ---------------------------------------------------------------------------
 # Error handling
-# ---------------------------------------------------------------------------
 
 
 def test_vt_error_detail_extracts_virustotals_own_sentence():
@@ -437,9 +423,7 @@ def test_non_json_response_is_reported_as_such(monkeypatch):
         vt_tools.lookup_hash("a" * 64)
 
 
-# ---------------------------------------------------------------------------
 # API key handling
-# ---------------------------------------------------------------------------
 
 
 def test_check_api_masks_the_key_and_never_prints_it_whole(monkeypatch):
@@ -499,3 +483,60 @@ def test_missing_api_key_is_a_configuration_error_not_a_crash(monkeypatch):
     monkeypatch.setattr(vt_tools, "_get_api_key", lambda: None)
     out = _register(monkeypatch)["vt_lookup"](file_hash="a" * 64)
     assert "not configured" in out
+
+
+def test_detections_are_truncated_once_and_counted_against_the_real_total(monkeypatch):
+    """
+    They used to be cut twice -- [:20] into the summary, then [:15] in the
+    renderer -- with "and N more" counted off the already-cut list. A sample
+    with 40 detections reported "20 shown", printed 15, and claimed 5 more.
+    """
+    results = {
+        f"Engine{i:02d}": {"category": "malicious", "result": f"Trojan.{i}"}
+        for i in range(40)
+    }
+    monkeypatch.setattr(
+        vt_tools, "lookup_hash",
+        lambda h: {"attributes": {"last_analysis_stats": {"malicious": 40,
+                                                          "undetected": 20},
+                                  "last_analysis_results": results}},
+    )
+
+    out = _register(monkeypatch)["vt_lookup"](file_hash="a" * 64)
+
+    assert "Detections (15 of 40):" in out
+    assert "... and 25 more" in out
+    assert len([ln for ln in out.splitlines() if ln.startswith("  - Engine")]) == 15
+
+
+def test_the_summary_keeps_every_detection(monkeypatch):
+    """The renderer truncates; the data the summary hands back does not."""
+    results = {
+        f"Engine{i:02d}": {"category": "malicious", "result": "x"} for i in range(40)
+    }
+    summary = vt_tools.format_detection_summary(
+        {"attributes": {"last_analysis_results": results}}
+    )
+    assert len(summary["detections"]) == 40
+
+
+def test_search_echoes_the_limit_it_actually_sent(monkeypatch):
+    """
+    It used to print and re-suggest the caller's raw value, so limit=99999
+    reported "Limit: 99999" while 300 went on the wire, and the paging hint
+    handed back a number VT would clamp again.
+    """
+    seen = _capture_requests(monkeypatch, {"data": [{"attributes": {}}],
+                                           "meta": {"cursor": "NEXT=="}})
+
+    out = _register(monkeypatch)["vt_search"]("tag:x", limit=99999)
+
+    assert f"limit={vt_tools.VT_SEARCH_MAX_LIMIT}" in seen[0].full_url
+    assert f"Limit: {vt_tools.VT_SEARCH_MAX_LIMIT}" in out
+    assert "99999" not in out
+
+
+def test_search_rejects_a_non_integer_limit(monkeypatch):
+    _capture_requests(monkeypatch)
+    out = _register(monkeypatch)["vt_search"]("tag:x", limit="lots")
+    assert "limit must be an integer" in out

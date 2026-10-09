@@ -386,13 +386,11 @@ def format_detection_summary(vt_data: dict) -> dict:
         "last_analysis": _utc_iso(attributes.get("last_analysis_date")),
         "tags": attributes.get("tags") or [],
         "names": list(names)[:5],  # First 5 names
-        "detections": detections[:20],  # Top 20 detections
+        "detections": detections,
     }
 
 
-# ---------------------------------------------------------------------------
 # Behaviour report rendering
-# ---------------------------------------------------------------------------
 #
 # Only a minority of behaviour_summary fields are plain lists of strings. The
 # previous renderer assumed they all were, and printed the rest through
@@ -618,14 +616,15 @@ def register_vt_tools(app, session_manager=None):
                 )
 
             # Show detections
-            if summary["detections"]:
+            detections = summary["detections"]
+            if detections:
+                shown = detections[:_DETECTIONS_SHOWN]
                 output.append("")
-                output.append(f"Detections ({len(summary['detections'])} shown):")
-                for det in summary["detections"][:_DETECTIONS_SHOWN]:
+                output.append(f"Detections ({len(shown)} of {len(detections)}):")
+                for det in shown:
                     output.append(f"  - {det['engine']}: {det['result']}")
-                if len(summary["detections"]) > _DETECTIONS_SHOWN:
-                    extra = len(summary["detections"]) - _DETECTIONS_SHOWN
-                    output.append(f"  ... and {extra} more")
+                if len(detections) > len(shown):
+                    output.append(f"  ... and {len(detections) - len(shown)} more")
 
             # Hashes for reference
             output.append("")
@@ -767,6 +766,13 @@ def register_vt_tools(app, session_manager=None):
             vt_search("tag:ransomware", limit=50)
         """
         try:
+            # search_files clamps to VT's 1-300 page range; clamp here too so
+            # the echo and the paging hint below report what was actually sent.
+            try:
+                limit = max(1, min(int(limit), VT_SEARCH_MAX_LIMIT))
+            except (TypeError, ValueError):
+                return f"Error: limit must be an integer, got {limit!r}"
+
             output = []
             output.append("VIRUSTOTAL SEARCH")
             output.append(f"Query: {query}")

@@ -26,13 +26,10 @@ https://yaraify.abuse.ch/api/). They are deliberately NOT uniform, which is why
 the transport lives in src/integrations rather than being hand-rolled per
 service:
 
-===========  =====================================  ============  ===========
-Service      Base URL                               Body          Path
-===========  =====================================  ============  ===========
-ThreatFox    https://threatfox-api.abuse.ch/api/v1/ JSON          fixed
-URLhaus      https://urlhaus-api.abuse.ch/v1/       form-encoded  per-endpoint
-YARAify      https://yaraify-api.abuse.ch/api/v1/   JSON          fixed
-===========  =====================================  ============  ===========
+* ThreatFox: https://threatfox-api.abuse.ch/api/v1/ -- JSON body, fixed path.
+* URLhaus:   https://urlhaus-api.abuse.ch/v1/ -- form-encoded body, and the
+  verb lives in the path (``url/``, ``host/``, ``payload/``).
+* YARAify:   https://yaraify-api.abuse.ch/api/v1/ -- JSON body, fixed path.
 
 All three POST, all three take the ``Auth-Key`` header, and all three answer
 with a ``query_status`` field where ``"ok"`` means ``data`` is populated.
@@ -192,6 +189,32 @@ def _rows(payload: dict) -> list[dict]:
     return [row for row in data if isinstance(row, dict)] if isinstance(data, list) else []
 
 
+def _yara_matches(entry: dict) -> list:
+    """
+    The YARA matches for one file, wherever YARAify put them.
+
+    This is the one response shape in this module that could not be verified
+    against the live API (abuse.ch is unreachable from the build environment).
+    YARAify's own examples show `static_results` on the file object, but its
+    task-oriented endpoints nest per-scan results under `tasks[]`. Reading only
+    the first shape would, if the second is what arrives, report "No public
+    YARA rules matched this sample" for a file that matched several -- a silent
+    wrong answer rather than an error. So accept either, and prefer the
+    documented one.
+    """
+    matches = entry.get("static_results")
+    if isinstance(matches, list) and matches:
+        return matches
+
+    for task in entry.get("tasks") or []:
+        if not isinstance(task, dict):
+            continue
+        nested = task.get("static_results")
+        if isinstance(nested, list) and nested:
+            return nested
+    return []
+
+
 def _scalar(value) -> str:
     """Render one field value as a single line."""
     if value is None:
@@ -220,9 +243,7 @@ def _fence(body_lines: list[str], kind: str) -> str:
     return wrap_untrusted("\n".join(body_lines).rstrip("\n"), kind=kind)
 
 
-# ---------------------------------------------------------------------------
 # What is attacker-controlled here
-# ---------------------------------------------------------------------------
 #
 # Nearly everything. ThreatFox IOCs ARE attacker infrastructure, written by
 # whoever registered it; URLhaus rows are live malware distribution URLs and
@@ -259,28 +280,33 @@ _THREATFOX_AUTHORED = (
     ("tags", "Tags"),
 )
 
-_URLHAUS_URL_TRUSTED = (
+_URLHAUS_URL_COMPUTED = (
     ("id", "URLhaus ID"),
     ("url_status", "Status"),
     ("date_added", "Added"),
     ("threat", "Threat"),
-    ("host", "Host"),
 )
-_URLHAUS_URL_UNTRUSTED = (
+_URLHAUS_URL_AUTHORED = (
     ("url", "URL"),
+    # The host is the attacker-registered domain or their IP -- the same string
+    # the fenced URL contains. Leaving it outside the envelope also skipped
+    # delimiter neutralisation on it.
+    ("host", "Host"),
     ("reporter", "Reporter"),
     ("tags", "Tags"),
     ("larted", "Abuse reported"),
 )
 
-_URLHAUS_PAYLOAD_TRUSTED = (
+_URLHAUS_PAYLOAD_COMPUTED = (
     ("sha256_hash", "SHA256"),
     ("md5_hash", "MD5"),
     ("file_size", "Size (bytes)"),
     ("file_type", "File Type"),
     ("firstseen", "First Seen"),
-    ("signature", "Signature"),
 )
+#: `signature` is a community-assigned family label, which mb_tools already
+#: treats as submitter-authored. One field, one classification.
+_URLHAUS_PAYLOAD_AUTHORED = (("signature", "Signature"),)
 
 _YARAIFY_TRUSTED = (
     ("sha256_hash", "SHA256"),
@@ -526,32 +552,38 @@ def register_abusech_tools(app, session_manager=None):
             entry = rows[0] if rows else payload
 
             output = ["URLHAUS URL LOOKUP"]
-            output.extend(_fields(entry, _URLHAUS_URL_TRUSTED, indent="  "))
+            output.extend(_fields(entry, _URLHAUS_URL_COMPUTED, indent="  "))
 
-            body = _fields(entry, _URLHAUS_URL_UNTRUSTED, indent="  ")
+            body = _fields(entry, _URLHAUS_URL_AUTHORED, indent="  ")
 
             payloads = entry.get("payloads")
             if isinstance(payloads, list) and payloads:
                 output.append("")
                 output.append(f"Payloads observed ({len(payloads)}):")
-                for item in payloads[:_ROW_LIMIT]:
+                for index, item in enumerate(payloads[:_ROW_LIMIT], 1):
                     if not isinstance(item, dict):
                         continue
+                    output.append(f" {index}.")
                     output.extend(_fields(item, (
                         ("response_sha256", "SHA256"),
                         ("response_md5", "MD5"),
                         ("response_size", "Size (bytes)"),
                         ("file_type", "File Type"),
-                        ("signature", "Signature"),
                     )))
-                    name = _scalar(item.get("filename"))
-                    if name:
-                        body.append(f"  Served filename: {name}")
+                    # The served filename and the family label are chosen by
+                    # whoever published the payload, so they go inside the
+                    # fence -- tagged with the payload number, because position
+                    # alone stops matching as soon as one payload omits a field.
+                    for field, label in (("filename", "served filename"),
+                                         ("signature", "signature")):
+                        value = _scalar(item.get(field))
+                        if value:
+                            body.append(f"  Payload {index} {label}: {value}")
                     output.append("")
                 if len(payloads) > _ROW_LIMIT:
                     output.append(f"  ... and {len(payloads) - _ROW_LIMIT} more")
 
-            fenced = _fence(body, "URLhaus URL, reporter and served file names")
+            fenced = _fence(body, "URLhaus URL, host, reporter and served file names")
             if fenced:
                 output.append("")
                 output.append(fenced)
@@ -606,7 +638,7 @@ def register_abusech_tools(app, session_manager=None):
                 for item in urls[:_ROW_LIMIT]:
                     if not isinstance(item, dict):
                         continue
-                    body.extend(_fields(item, _URLHAUS_URL_TRUSTED + _URLHAUS_URL_UNTRUSTED))
+                    body.extend(_fields(item, _URLHAUS_URL_COMPUTED + _URLHAUS_URL_AUTHORED))
                     body.append("")
                 if len(urls) > _ROW_LIMIT:
                     output.append(f"  (showing {_ROW_LIMIT})")
@@ -656,7 +688,8 @@ def register_abusech_tools(app, session_manager=None):
             payload = query(urlhaus_client, "payload/", form={field: digest})
 
             output = ["URLHAUS PAYLOAD LOOKUP", f"Hash: {digest}"]
-            output.extend(_fields(payload, _URLHAUS_PAYLOAD_TRUSTED, indent="  "))
+            output.extend(_fields(payload, _URLHAUS_PAYLOAD_COMPUTED, indent="  "))
+            body: list[str] = _fields(payload, _URLHAUS_PAYLOAD_AUTHORED, indent="  ")
 
             virustotal = payload.get("virustotal")
             if isinstance(virustotal, dict):
@@ -665,14 +698,13 @@ def register_abusech_tools(app, session_manager=None):
                     output.append(f"  VirusTotal: {ratio}")
 
             urls = payload.get("urls")
-            body: list[str] = []
             if isinstance(urls, list) and urls:
                 output.append("")
                 output.append(f"Distribution URLs ({len(urls)}):")
                 for item in urls[:_ROW_LIMIT]:
                     if not isinstance(item, dict):
                         continue
-                    body.extend(_fields(item, _URLHAUS_URL_TRUSTED + _URLHAUS_URL_UNTRUSTED))
+                    body.extend(_fields(item, _URLHAUS_URL_COMPUTED + _URLHAUS_URL_AUTHORED))
                     body.append("")
                 if len(urls) > _ROW_LIMIT:
                     output.append(f"  (showing {_ROW_LIMIT})")
@@ -729,8 +761,8 @@ def register_abusech_tools(app, session_manager=None):
             if name:
                 body.append(f"  Submitted name: {name}")
 
-            matches = entry.get("static_results")
-            if isinstance(matches, list) and matches:
+            matches = _yara_matches(entry)
+            if matches:
                 output.append("")
                 output.append(f"YARA rules matched ({len(matches)}):")
                 for match in matches[:_ROW_LIMIT]:

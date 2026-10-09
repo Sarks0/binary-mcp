@@ -12,6 +12,7 @@ Usage:
 
 import logging
 import os
+import re
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -91,6 +92,38 @@ def _parse_env_file(env_path: Path) -> dict[str, str]:
     return config
 
 
+# Keys whose value is a credential rather than a setting. These are served
+# from _config_cache only and deliberately NOT exported to os.environ: the
+# Ghidra subprocess inherits the environment wholesale (runner.py builds its
+# env from os.environ.copy()) and it runs analysis on untrusted samples, so a
+# bearer token exported here would sit readable in /proc/<jvm>/environ for the
+# length of a decompile. Every in-process reader goes through get_config(),
+# which finds them in the cache regardless.
+_SECRET_KEY_PATTERN = re.compile(r"TOKEN|SECRET|PASSWORD|CREDENTIAL|API_KEY", re.I)
+
+
+def _export_to_environ(values: dict[str, str]) -> None:
+    """Publish .env settings as real environment variables.
+
+    Not every setting is read through get_config(). Some are read straight off
+    os.environ -- by third-party libraries (requests resolves no_proxy through
+    urllib, which reads the environment per request) and by our own subprocess
+    plumbing (runner.py reads GHIDRA_MAX_HEAP_MB from os.environ to build
+    _JAVA_OPTIONS). While .env lived only in _config_cache those readers never
+    saw it at all, so such a key set in .env was silently ignored and the
+    built-in default won with nothing anywhere reporting the discrepancy.
+
+    setdefault preserves this module's documented precedence: a real
+    environment variable still beats .env.
+    """
+    for key, value in values.items():
+        if _SECRET_KEY_PATTERN.search(key):
+            continue
+        if key not in os.environ:
+            os.environ[key] = value
+            logger.debug("Exported %s from .env to the environment", key)
+
+
 def load_env():
     """Load configuration from .env file."""
     global _env_loaded, _config_cache
@@ -103,6 +136,7 @@ def load_env():
         logger.info(f"Loading configuration from: {env_file}")
         _config_cache = _parse_env_file(env_file)
         logger.debug(f"Loaded {len(_config_cache)} config values from .env")
+        _export_to_environ(_config_cache)
     else:
         logger.debug("No .env file found")
 

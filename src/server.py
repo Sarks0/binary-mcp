@@ -67,7 +67,7 @@ from src.utils.compatibility import (
     BinaryCompatibilityChecker,
     CompatibilityLevel,
 )
-from src.utils.config import get_config, get_config_int
+from src.utils.config import get_config, get_config_int, load_env
 from src.utils.decompiler_caveats import render_c_block
 from src.utils.file_lock import release_lock as _release_lock
 from src.utils.file_lock import try_lock as _try_lock
@@ -6434,6 +6434,13 @@ def _run_http(transport_config) -> None:
 
 def main():
     """Run the MCP server."""
+    # Before anything reads the environment. Settings that are consumed off
+    # os.environ rather than through get_config() -- no_proxy via requests,
+    # GHIDRA_MAX_HEAP_MB via the Ghidra runner -- only take effect once .env
+    # has been published there, and the lazy load inside get_config() is not a
+    # guarantee about ordering.
+    load_env()
+
     logger.info("Starting Binary MCP Server...")
     logger.info(f"Ghidra Path: {runner.ghidra_path}")
     logger.info(f"Cache Directory: {cache.cache_dir}")

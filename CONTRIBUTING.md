@@ -92,6 +92,49 @@ make test
 make test-cov
 ```
 
+### Dependency Updates
+
+Dependencies are bumped by Dependabot, configured in `.github/dependabot.yml`.
+It covers the dependencies `pyproject.toml` declares (resolved into `uv.lock`)
+and the actions referenced by `.github/workflows/`, and opens pull requests
+weekly. The comments in that file say what it does not cover, and why -- the
+x64dbg plugin SDK, cmake and `uvx bandit` are all resolved at run time, and
+Ghidra/Java/x64dbg/WinDbg are user installs.
+
+Reviewing one:
+
+- Two checks actually gate a Python bump: `uv run ruff check src/ tests/` and
+  `uv run pytest`. The bandit job carries `continue-on-error: true` and the
+  Codecov upload `fail_ci_if_error: false`, so neither can fail a pull request,
+  and the plugin compile check installs no Python dependencies -- a green tick
+  from those three says nothing about a dependency.
+- Action bumps arrive as majors, one per pull request. The `uses:` refs are
+  floating major tags (`@v4`), and Dependabot matches the precision of the ref
+  it finds, so `@v5` is normally the only update it can propose. Read the
+  action's release notes: a renamed input is exactly the kind of break no check
+  on the PR sees.
+- One exception, worth recognising rather than rejecting: where an action has
+  stopped publishing floating major tags, Dependabot rewrites the ref to an
+  exact version instead, and the jump can cross several majors. `setup-uv` is
+  that case -- it publishes only immutable exact tags since v8.0.0 -- so its
+  bump will change the shape of the pin, not just its number.
+- Release-only actions are exercised by no pull-request check at all.
+  `upload-artifact`, `download-artifact` and `action-gh-release` run only in
+  `release.yml`, which triggers on a `v*.*.*` tag. Validate a bump to those with
+  a prerelease tag (any tag carrying a hyphen, e.g. `v0.2.1-rc1`) before a full
+  release depends on them.
+- Runtime majors are each a real decision. Read the upstream changelog for the
+  parsers (`capstone`, `pefile`, `pyelftools`): they read attacker-controlled
+  input, and the test suite works from a small sample set that will not catch a
+  behaviour change on its own.
+
+To bump something by hand instead:
+
+```bash
+uv lock --upgrade-package <name>   # or `uv lock --upgrade` for everything
+make test
+```
+
 ## Code Style
 
 ### Python Style
@@ -308,6 +351,7 @@ Follow conventional commits:
 - `refactor`: Code restructuring
 - `test`: Adding tests
 - `chore`: Maintenance
+- `ci`: CI, release workflows and dependency configuration
 
 **Example:**
 

@@ -101,9 +101,36 @@ def _parse_env_file(env_path: Path) -> dict[str, str]:
 # which finds them in the cache regardless.
 _SECRET_KEY_PATTERN = re.compile(r"TOKEN|SECRET|PASSWORD|CREDENTIAL|API_KEY", re.I)
 
+# Keys whose value POINTS AT a credential: a filesystem path to a TLS private
+# key. The path is not the key, so exporting it discloses no key material --
+# but it does tell a sample that reaches code execution inside the Ghidra JVM
+# exactly where the key file lives, which it would otherwise have to guess,
+# and it can read that file as the same user. Nothing reads these off
+# os.environ (BINARY_MCP_REMOTE_TLS_KEY and X64DBG_TLS_CLIENT_KEY both go
+# through get_config in src/utils/remote.py), so holding them back costs
+# nothing. The matching *_TLS_CERT and *_TLS_CA paths are public material and
+# are not held back.
+_SECRET_PATH_PATTERN = re.compile(r"_KEY$", re.I)
+
+# Keys published to os.environ that are NOT in CONFIG_KEYS.
+#
+# They cannot be in CONFIG_KEYS: that surface is this project's own settings,
+# and tests/test_docs_accuracy.py::test_no_config_key_is_dead requires every
+# entry to be read by something under src/. Nothing of ours reads any of
+# these -- urllib resolves the proxy variables itself, per request -- which is
+# exactly why they have to reach the real environment rather than being served
+# from the cache. Declaring them here is what keeps them from being "works by
+# accident": before this list existed, no_proxy was exported only because the
+# filter happened to be a denylist over whatever the file contained.
+_PASSTHROUGH_ENV_KEYS = frozenset({
+    "no_proxy", "NO_PROXY",
+    "http_proxy", "HTTP_PROXY",
+    "https_proxy", "HTTPS_PROXY",
+})
+
 
 def _export_to_environ(values: dict[str, str]) -> None:
-    """Publish .env settings as real environment variables.
+    """Publish declared .env settings as real environment variables.
 
     Not every setting is read through get_config(). Some are read straight off
     os.environ -- by third-party libraries (requests resolves no_proxy through
@@ -113,11 +140,35 @@ def _export_to_environ(values: dict[str, str]) -> None:
     saw it at all, so such a key set in .env was silently ignored and the
     built-in default won with nothing anywhere reporting the discrepancy.
 
+    Two filters, in this order, because they answer different questions.
+
+    DECLARED: a key is exported only if this project knows about it. A .env is
+    an operator's own file and may hold anything -- a personal access token, a
+    cloud credential -- and the first version of this function was a denylist
+    over the whole file, so a credential whose name missed the pattern
+    (MY_GITHUB_PAT matches none of it) would have been handed to the JVM that
+    parses untrusted samples. Refusing the undeclared is the same fail-closed
+    posture the rest of this project takes, and it fails in the safe
+    direction: an unexported setting is ignored, which is visible, where an
+    over-exported secret is not.
+
+    NOT A CREDENTIAL: of the declared keys, those holding a secret or a path
+    to one stay in the cache. See the two patterns above.
+
     setdefault preserves this module's documented precedence: a real
     environment variable still beats .env.
+
+    CONFIG_KEYS is defined below this function; the reference resolves when
+    load_env() calls it, which never happens at import time.
     """
     for key, value in values.items():
-        if _SECRET_KEY_PATTERN.search(key):
+        if key not in CONFIG_KEYS and key not in _PASSTHROUGH_ENV_KEYS:
+            logger.debug(
+                "Not exporting %s from .env: not a declared setting. "
+                "get_config() still serves it in-process.", key
+            )
+            continue
+        if _SECRET_KEY_PATTERN.search(key) or _SECRET_PATH_PATTERN.search(key):
             continue
         if key not in os.environ:
             os.environ[key] = value

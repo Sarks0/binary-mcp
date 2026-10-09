@@ -1019,9 +1019,7 @@ def get_allowed_dirs() -> list[Path] | None:
     return [Path(d.strip()) for d in dirs_config.split(os.pathsep) if d.strip()]
 
 
-# ---------------------------------------------------------------------------
 # Non-disclosing text for path-validation failures (audit F-10)
-# ---------------------------------------------------------------------------
 #
 # The MESSAGE of a confinement failure is itself host state. _default_confinement
 # _denied() interpolates the resolved quarantine directory list and
@@ -1113,7 +1111,11 @@ def path_error_guidance(error: Exception) -> "str | None":
 
 
 def path_refusal_message(
-    operation: str, error: Exception, subject: str = "path", extra: str = None
+    operation: str,
+    error: Exception,
+    subject: str = "path",
+    extra: str = None,
+    error_id: str = None,
 ) -> str:
     """
     The one renderer for a path refusal: category to the caller, detail to the log.
@@ -1132,6 +1134,11 @@ def path_refusal_message(
         subject: What was being validated, e.g. ``"binary path"``. Named in the
             first line so the caller can tell which argument to fix, so it
             should match the parameter the tool actually takes.
+        error_id: Reuse a reference ID the caller already logged detail
+            under, instead of minting a new one. Without this the routed
+            branch of :func:`safe_error_message` discarded the caller's
+            ``error_id`` and returned a different one, which would resolve to
+            nothing in the server log.
         extra: Tool-specific remediation to add BEFORE the reference ID, for
             the cases where the tool knows something the guidance cannot --
             ``clean_cache`` can still wipe the cache of a binary that is no
@@ -1148,7 +1155,8 @@ def path_refusal_message(
     if guidance is None:
         return None
 
-    error_id = str(uuid.uuid4())[:8]
+    if error_id is None:
+        error_id = str(uuid.uuid4())[:8]
     # ERROR with a traceback, not WARNING without one: a stdio MCP server is
     # commonly run at level=ERROR, where a WARNING disappears and leaves the
     # caller holding a reference ID that resolves to nothing. These are also
@@ -1247,18 +1255,15 @@ def safe_error_message(
     Returns:
         Safe error message with reference ID
     """
-    if error_id is None:
-        error_id = str(uuid.uuid4())[:8]
-
     # A confinement refusal keeps its category, wherever it surfaces.
     #
-    # This is the structural half of the fix. The per-tool arms and
-    # safe_tool_error cover src/server.py, coverage_tools and dynamic_tools --
-    # but every catch-all in the other eleven tool modules lands HERE instead
-    # (15 in dotnet_tools alone, 0 safe_tool_error calls between them), so
+    # The per-tool arms and safe_tool_error cover src/server.py,
+    # coverage_tools and dynamic_tools. Every catch-all in the other 15
+    # modules under src/tools/ lands here instead (15 sites in dotnet_tools
+    # alone, and none of the 15 modules calls safe_tool_error at all), so
     # routing only there left "a tool cannot reintroduce the gap by forgetting
-    # an arm" true of one file and false of eleven. Routing at the base makes
-    # it true everywhere, including for tools added later.
+    # an arm" true of one file and false of the rest. Routing at the base
+    # makes it true everywhere, including for tools added later.
     #
     # Only these two types. Both are raised exclusively by this project's own
     # path validators, so the category is unambiguous. FileNotFoundError is
@@ -1267,14 +1272,36 @@ def safe_error_message(
     # "check the name and extension" would trade a vague error for a
     # confidently wrong one. A tool wanting that category names
     # FileNotFoundError in its own arm, where the provenance is known.
+    #
+    # Checked BEFORE minting an error_id so the routed path does not generate
+    # one it then discards -- path_refusal_message mints its own, and the
+    # caller's error_id (if any) is passed through so a caller that already
+    # logged detail under it still gets an ID that resolves to that line.
     if isinstance(internal_details, (PathTraversalError, FileSizeError)):
-        routed = path_refusal_message(user_message, internal_details)
+        routed = path_refusal_message(
+            user_message, internal_details, error_id=error_id
+        )
         if routed is not None:
             return routed
 
-    # Log internal details
+    if error_id is None:
+        error_id = str(uuid.uuid4())[:8]
+
+    # exc_info takes the EXCEPTION, not True.
+    #
+    # `exc_info=True` makes logging use sys.exc_info(), i.e. whatever
+    # exception is currently being handled -- not the one passed in. Called
+    # outside an except block (clean_cache does exactly this) that logs
+    # "NoneType: None" and the reference ID resolves to no stack at all.
+    # Called inside an except block for a DIFFERENT exception it is worse: the
+    # message names internal_details while the traceback attached belongs to
+    # the unrelated exception, so the ID resolves to a stack for another
+    # failure. Both were verified by running it. path_refusal_message had this
+    # right already.
     if internal_details:
-        logger.error(f"Error {error_id}: {internal_details}", exc_info=True)
+        logger.error(
+            f"Error {error_id}: {internal_details}", exc_info=internal_details
+        )
 
     # If the exception carries a curated diagnostic (e.g. GhidraAnalysisError
     # with extracted stderr context), surface it. The diagnostic is already

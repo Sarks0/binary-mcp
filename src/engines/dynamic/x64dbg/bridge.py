@@ -34,9 +34,7 @@ logger = logging.getLogger(__name__)
 MAX_DUMP_SIZE = 100 * 1024 * 1024
 
 
-# ---------------------------------------------------------------------------
 # x64dbg command-string structure (audit findings F-9 / F-16)
-# ---------------------------------------------------------------------------
 #
 # WHY THIS EXISTS: every gate this project had between a caller and x64dbg's
 # DbgCmdExec decided on the FIRST TOKEN of the WHOLE string. x64dbg does not

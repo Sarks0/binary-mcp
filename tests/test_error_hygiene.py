@@ -54,6 +54,14 @@ def assert_has_reference_id(text: str) -> None:
     assert re.search(r"Reference ID: [0-9a-f]{8}", text), text
 
 
+def _strip_reference_id(text: str) -> str:
+    """Drop the per-call reference ID so two messages can be compared."""
+    return "\n".join(
+        line for line in text.splitlines()
+        if not line.startswith("Reference ID:")
+    )
+
+
 # The helper itself
 
 
@@ -71,19 +79,21 @@ class TestSafeToolError:
         assert_no_host_leak(out)
         assert_has_reference_id(out)
 
-    def test_base_routing_covers_every_catch_all_in_the_project(self):
+    @pytest.mark.parametrize("entry", ["base", "tool"])
+    def test_a_confinement_refusal_keeps_its_category(self, entry):
         """
-        security.safe_error_message is where the routing has to live.
+        Both entry points must name the refusal, not collapse it.
 
-        This is the single highest-blast-radius line in the change: 203
-        call sites across 18 files reach safe_error_message, and every
-        catch-all in the eleven tool modules that have no safe_tool_error call
-        lands there. It was the only part of the change with no direct test --
-        the sweep enumerates src/server.py, whose tools have explicit arms and
-        so never reach the base at all, which is exactly how it stayed
-        uncovered.
+        Parametrized rather than written twice: these were two near-identical
+        assertion blocks differing only in which function they called, so the
+        next change to PATH_ERROR_GUIDANCE wording had to be chased in two
+        places and could be half-updated -- the duplication cost the code
+        under test documents at security.py's PATH_ERROR_GUIDANCE note.
 
-        Asserts the three categories it must route and the one it must not.
+        "base" is security.safe_error_message, where every catch-all in the 15
+        modules under src/tools/ that never call safe_tool_error lands (202
+        call sites across 17 files reach it). "tool" is safe_tool_error, which
+        adds the operation name. Both delegate to the one renderer.
         """
         from src.utils.security import (
             FileSizeError,
@@ -92,100 +102,79 @@ class TestSafeToolError:
             safe_error_message,
         )
 
-        hardlink = safe_error_message("Failed to do the thing", HardLinkError(LEAK_MARKER))
-        assert_no_host_leak(hardlink)
+        def render(exc):
+            if entry == "base":
+                return safe_error_message("Failed to do the thing", exc)
+            return safe_tool_error("get_functions", exc)
+
+        hardlink = render(HardLinkError(LEAK_MARKER))
+        confinement = render(PathTraversalError(LEAK_MARKER))
+        oversize = render(FileSizeError(LEAK_MARKER))
+
+        for text in (hardlink, confinement, oversize):
+            assert_no_host_leak(text)
+            # Asserted because downstream code depends on it: clean_cache's
+            # `extra` block has to land before the ID, and
+            # test_confinement_sweep's _without_reference_id helper assumes
+            # the ID is the last line.
+            assert_has_reference_id(text)
+            assert text.strip().splitlines()[-1].startswith("Reference ID:")
+
         assert "hard link" in hardlink
         assert "outside the directories" not in hardlink
-
-        confinement = safe_error_message(
-            "Failed to do the thing", PathTraversalError(LEAK_MARKER)
-        )
-        assert_no_host_leak(confinement)
         assert "outside the directories" in confinement
         assert "hard link" not in confinement
-
-        oversize = safe_error_message("Failed to do the thing", FileSizeError(LEAK_MARKER))
-        assert_no_host_leak(oversize)
         assert "size limit" in oversize
 
-        # The three stay distinguishable through the base, which is the B3
-        # guarantee for a tool with no path arm in a module with no
-        # safe_tool_error call -- i.e. for most of src/tools/.
-        firsts = {
-            text.splitlines()[0] for text in (hardlink, confinement, oversize)
-        }
-        assert len(firsts) == 3, firsts
+        # Compared in full, not by first line. Every guidance value is a
+        # single line today, so splitlines()[0] was the whole message and the
+        # check could only fail if two values became byte-identical -- which
+        # the substring assertions above already rule out. Comparing the whole
+        # string says what is meant and does not silently narrow if a guidance
+        # entry is ever reflowed across two lines.
+        bodies = [_strip_reference_id(t) for t in (hardlink, confinement, oversize)]
+        assert len(set(bodies)) == 3, bodies
 
-        # And an unrelated exception must NOT be dressed up as a path problem:
-        # the generic envelope still carries the caller's own user_message.
-        unrelated = safe_error_message("Failed to do the thing", OSError(LEAK_MARKER))
-        assert_no_host_leak(unrelated)
-        assert "Failed to do the thing" in unrelated
-        assert "Invalid path" not in unrelated
-
-    def test_confinement_refusal_reaching_a_catch_all_keeps_its_category(self):
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            FileNotFoundError("missing"),
+            IsADirectoryError("a dir"),
+            NotADirectoryError("not a dir"),
+            PermissionError("denied"),
+        ],
+        ids=["FileNotFoundError", "IsADirectoryError", "NotADirectoryError",
+             "PermissionError"],
+    )
+    def test_mapped_but_excluded_types_are_not_routed_at_the_base(self, exc):
         """
-        Thirteen read-only tools have no path arm; the catch-all must cover them.
+        The exclusions that can actually regress, tested at the base.
 
-        get_functions, get_strings, get_xrefs, extract_metadata and friends
-        validate only through get_analysis_context and end at
-        ``except Exception -> safe_tool_error``. Before this routing a refused
-        path came back as "<tool> failed" plus a reference ID, so a caller
-        could not tell a denied directory from a hard link from a broken
-        Ghidra install. Routing these two types here covers every such tool at
-        once, and means a tool added later cannot reintroduce the gap by
-        forgetting an arm.
+        These four have PATH_ERROR_GUIDANCE entries but are deliberately NOT
+        in the base routing's isinstance tuple. The earlier version of this
+        test used a bare OSError for its negative case, which has no guidance
+        entry and is not a PathTraversalError or FileSizeError -- so the
+        isinstance check could never have matched it and the assertion could
+        not fail.
+
+        These can. Widen the tuple to PATH_ERROR_GUIDANCE's keys and a
+        "Ghidra installation not found" FileNotFoundError starts telling the
+        caller to "check the name and extension" of its binary, which is the
+        confidently-wrong answer the exclusion exists to prevent.
         """
-        from src.utils.security import (
-            FileSizeError,
-            HardLinkError,
-            PathTraversalError,
-        )
+        from src.utils.security import PATH_ERROR_GUIDANCE, safe_error_message
 
-        hardlink = safe_tool_error(
-            "get_functions", HardLinkError(f"{LEAK_MARKER} is a hard link (2 names)")
-        )
-        assert_no_host_leak(hardlink)
-        assert "hard link" in hardlink
-
-        confinement = safe_tool_error(
-            "get_functions", PathTraversalError(f"outside: {LEAK_MARKER}")
-        )
-        assert_no_host_leak(confinement)
-        assert "outside the directories" in confinement
-
-        # The two stay distinguishable through the catch-all, which is the
-        # whole point -- this is the B3 guarantee for tools with no path arm.
-        assert hardlink.splitlines()[0] != confinement.splitlines()[0]
-
-        oversize = safe_tool_error("get_functions", FileSizeError(LEAK_MARKER))
-        assert_no_host_leak(oversize)
-        assert "size limit" in oversize
-
-    def test_file_not_found_is_deliberately_not_routed_as_a_path_error(self):
-        """
-        FileNotFoundError is excluded from that routing, on purpose.
-
-        PATH_ERROR_GUIDANCE has text for it -- "no file exists at the path
-        supplied. Check the name and extension" -- but the Ghidra detector
-        raises FileNotFoundError for a missing INSTALLATION
-        (engines/static/ghidra/runner.py), and so do plenty of unrelated
-        reads. Answering "check the name and extension of your binary" to
-        "Ghidra installation not found" would trade a vague error for a
-        confidently wrong one. A tool that wants the missing-file category
-        names FileNotFoundError in its own arm, where provenance is known --
-        analyze_binary and check_binary both do.
-        """
-        out = safe_tool_error(
-            "analyze_binary",
-            FileNotFoundError(
-                "Ghidra installation not found. Please set GHIDRA_HOME "
-                f"environment variable. Searched {LEAK_MARKER}"
-            ),
-        )
+        out = safe_error_message("Failed to do the thing", exc)
         assert_no_host_leak(out)
-        assert_has_reference_id(out)
-        assert "check the name and extension" not in out.lower()
+        # The generic envelope keeps the caller's own message...
+        assert "Failed to do the thing" in out
+        # ...and none of the path guidance text is substituted. Asserted
+        # against the mapping itself rather than the literal "Invalid path",
+        # which safe_path_error's own fallback can legitimately produce
+        # ("Invalid path for analyze_binary") and so was never a property of
+        # safe_error_message.
+        for guidance in PATH_ERROR_GUIDANCE.values():
+            assert guidance not in out
 
     def test_ghidra_diagnostic_passthrough_is_preserved(self):
         """
@@ -1248,7 +1237,6 @@ def test_reason_guard_allows_format_only_handlers(clause, tmp_path):
     assert not _reason_guard_flags("        raise E(S(reason=str(e)))", tmp_path, clause)
 
 
-# --------------------------------------------------------------------------
 # Audit F-10, third form: a parameter rebound to a RESOLVED path.
 #
 # The two guards above both key off an exception: one matches the literal
@@ -1268,7 +1256,6 @@ def test_reason_guard_allows_format_only_handlers(clause, tmp_path):
 # resolves and then misses -- so these returns are reachable with a resolved
 # path in hand. Echo os.path.basename(...), or keep the caller's own
 # reference in a separate name and echo that.
-# --------------------------------------------------------------------------
 
 _PATH_RESOLVERS = {"resolve_cached_binary"}
 

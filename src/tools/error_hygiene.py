@@ -133,9 +133,7 @@ def safe_tool_error(operation: str, error: Exception) -> str:
     )
 
 
-# ---------------------------------------------------------------------------
 # Path-validation errors (audit F-10, second pass)
-# ---------------------------------------------------------------------------
 #
 # The first remediation pass routed catch-all handlers through
 # safe_tool_error, but left ~12 handlers doing

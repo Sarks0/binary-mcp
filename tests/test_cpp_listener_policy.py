@@ -339,6 +339,66 @@ static void test_allow_host_entry_with_a_port() {
     expect_host("allow-host-port-wrong-name", options, "elsewhere.lan", false);
 }
 
+static void expect_token(const char* label, const std::string& token, bool want) {
+    std::string error;
+    if (Listener::IsPinnedToken(token, error) != want) {
+        fail(label, std::string("wanted ") + (want ? "accept" : "refuse") +
+                        (error.empty() ? "" : ("; said: " + error)));
+    }
+}
+
+static void test_pinned_token() {
+    // A generated token must remain pinnable: an operator's first move is to
+    // copy the one the plugin already made.
+    expect_token("tok-generated",
+                 "f164485605cf9d204dd790b7904c0512996281cdbbbb39d7102bf1f59f65a567", true);
+
+    // The length floor, from both sides.
+    expect_token("tok-32-exact", std::string(32, 'a'), true);
+    expect_token("tok-31-short", std::string(31, 'a'), false);
+    expect_token("tok-empty", "", false);
+    expect_token("tok-hunter2", "hunter2", false);
+
+    // The ceiling exists so a value the ini reader truncated cannot pass as a
+    // whole one.
+    expect_token("tok-256-exact", std::string(256, 'a'), true);
+    expect_token("tok-257-long", std::string(257, 'a'), false);
+
+    // Every token68 punctuation character, in one token.
+    expect_token("tok-punct", "ab.cd_ef~gh+ij/kl=mn-op0123456789", true);
+
+    // Whitespace is what a copy-paste out of Windows brings along, and it
+    // would make the bridge's token a different length from this one.
+    expect_token("tok-trailing-space", std::string(32, 'a') + " ", false);
+    expect_token("tok-embedded-space", std::string(16, 'a') + " " + std::string(16, 'b'), false);
+    expect_token("tok-trailing-cr", std::string(32, 'a') + "\r", false);
+    expect_token("tok-trailing-lf", std::string(32, 'a') + "\n", false);
+
+    // Characters that would break the header this ends up inside.
+    expect_token("tok-quote", std::string(32, 'a') + "\"", false);
+    expect_token("tok-colon", std::string(32, 'a') + ":", false);
+    expect_token("tok-semicolon", std::string(32, 'a') + ";", false);
+    expect_token("tok-non-ascii", std::string(32, 'a') + "\xc3\xa9", false);
+}
+
+// Printed so tests/test_cpp_listener_policy.py can compare this set against
+// _TOKEN_CHARS in src/utils/remote.py by EXECUTING both, rather than by
+// grepping two sources and hoping they were read the same way.
+static void print_token_charset() {
+    std::string accepted;
+    for (int c = 1; c < 128; c++) {
+        // 31 padding characters so the length floor can never be the reason a
+        // character is refused.
+        std::string candidate(31, 'a');
+        candidate.push_back((char)c);
+        std::string error;
+        if (Listener::IsPinnedToken(candidate, error)) {
+            accepted.push_back((char)c);
+        }
+    }
+    printf("token68=%s\n", accepted.c_str());
+}
+
 static void test_host_allowed() {
     Listener::Options loop;  // bind defaults to 127.0.0.1
 
@@ -430,8 +490,10 @@ int main() {
     test_parse_ipv4();
     test_client_allowed();
     test_allow_host_entry_with_a_port();
+    test_pinned_token();
     test_host_allowed();
     test_strip();
+    print_token_charset();
     printf("failures=%d\n", failures);
     return failures != 0;
 }
@@ -508,6 +570,7 @@ def test_policy_decisions(policy_binary):
 # would quietly re-open something this change closed.
 
 _MAIN_CPP = _SERVER_DIR / "main.cpp"
+_PLUGIN_CPP = _REPO / "src" / "engines" / "dynamic" / "x64dbg" / "plugin" / "plugin.cpp"
 
 
 def test_server_no_longer_sends_a_cors_wildcard():
@@ -718,3 +781,67 @@ def test_mutual_tls_still_checks_the_certificate_was_presented():
     assert "ClientCertificateChainsTo" in source, (
         "the CA thumbprint pin is gone, so any certificate would be accepted"
     )
+
+
+@requires_cxx
+def test_pinned_token_charset_agrees_with_the_bridge(policy_binary):
+    """The plugin and the bridge must accept exactly the same token characters.
+
+    The plugin validates a pinned obsidian.ini token with
+    Listener::IsPinnedToken; the bridge validates OBSIDIAN_AUTH_TOKEN with
+    _TOKEN_CHARS in src/utils/remote.py. A character one accepts and the other
+    refuses leaves an operator with a listener that starts, a client that
+    refuses its own configured token, and nothing naming the disagreement --
+    the same class of defect as a classifier reading an address differently
+    from the thing that binds it.
+
+    Both sides are EXECUTED here rather than compared by reading two sources:
+    the harness prints the set it accepts, and _TOKEN_CHARS is matched against
+    every ASCII character.
+    """
+    import src.utils.remote as remote_module
+
+    run = subprocess.run([str(policy_binary)], capture_output=True, text=True)
+    assert run.returncode == 0, run.stdout
+    printed = [line for line in run.stdout.splitlines() if line.startswith("token68=")]
+    assert printed, "the harness no longer prints the accepted character set"
+
+    cpp = set(printed[0].split("=", 1)[1])
+    python = {
+        chr(c) for c in range(1, 128) if remote_module._TOKEN_CHARS.match(chr(c))
+    }
+
+    assert cpp == python, (
+        "the two token character sets have drifted apart\n"
+        f"  C++ only:    {sorted(cpp - python)}\n"
+        f"  Python only: {sorted(python - cpp)}"
+    )
+    # Guard the guard: an empty intersection would make the comparison above
+    # pass vacuously if either side stopped accepting anything.
+    # 52 ALPHA + 10 DIGIT + 7 punctuation (- . _ ~ + / =). Spelled out because
+    # the first version of this line said 66 and the test caught it.
+    assert len(cpp) == 52 + 10 + 7, (
+        f"expected RFC 6750 token68 (69 characters), got {len(cpp)}: {sorted(cpp)}"
+    )
+
+
+def test_the_pinned_token_is_never_logged():
+    """A token in the x64dbg log is a token in every screenshot and bug report.
+
+    The plugin logs the source and the length, which is what diagnoses a
+    mismatch, and never the value.
+    """
+    source = _PLUGIN_CPP.read_text(encoding="utf-8")
+    setup = source[source.index("void pluginSetup()"):]
+    setup = setup[: setup.index("\nbool SpawnHTTPServer") if "\nbool SpawnHTTPServer" in setup else len(setup)]
+
+    for line in setup.splitlines():
+        stripped = line.strip()
+        if not (stripped.startswith("LogInfo(") or stripped.startswith("LogError(")):
+            continue
+        assert "token.c_str()" not in stripped, (
+            f"pluginSetup logs the token value: {stripped}"
+        )
+        assert "pinned.c_str()" not in stripped, (
+            f"pluginSetup logs the pinned token value: {stripped}"
+        )

@@ -35,6 +35,10 @@ set(PLUGIN_HEADERS
     plugin.h
     event_system.h
     ../pipe_protocol.h
+    # Shared with the server target: the plugin validates a pinned token with
+    # Listener::IsPinnedToken so both halves apply one rule. Listed so a change
+    # to it rebuilds the plugin, not just obsidian_server.
+    ../server/listener_policy.h
 )
 
 # Create the plugin DLL

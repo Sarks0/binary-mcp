@@ -384,6 +384,59 @@ inline bool HostAllowed(const Options& options, const std::string& hostValue) {
 
 // Command line
 
+// A pinned bearer token has to be long enough to be worth pinning. The
+// generated one is 64 hex characters and dies when x64dbg unloads; a pinned one
+// lives as long as the ini file does, so a short one is a real downgrade rather
+// than a convenience, and it is refused at start-up instead of served.
+static const size_t MIN_PINNED_TOKEN_LENGTH = 32;
+
+// Upper bound chosen against the reader, not the protocol. The plugin reads
+// this key with a 512-byte GetPrivateProfileString buffer, which TRUNCATES
+// silently -- and a truncated token is served happily by this half while the
+// bridge presents the full one, producing "Invalid token (wrong length)" with
+// nothing pointing at the ini. Refusing well under the buffer means a value
+// that was truncated cannot be mistaken for a valid one.
+static const size_t MAX_PINNED_TOKEN_LENGTH = 256;
+
+// May this be used as a pinned bearer token?
+//
+// The character set is RFC 6750 token68, which is exactly what
+// src/utils/remote.py enforces on OBSIDIAN_AUTH_TOKEN (_TOKEN_CHARS). The two
+// have to agree: a token this accepts and the bridge then refuses leaves an
+// operator with a listener that works, a client that will not talk to it, and
+// nothing naming the disagreement -- the same class of defect as a classifier
+// that reads an address differently from the thing that binds it.
+// tests/test_cpp_listener_policy.py asserts the two sets still match.
+inline bool IsPinnedToken(const std::string& token, std::string& outError) {
+    if (token.size() < MIN_PINNED_TOKEN_LENGTH) {
+        outError = "token is " + std::to_string(token.size()) +
+                   " characters; a pinned token must be at least " +
+                   std::to_string(MIN_PINNED_TOKEN_LENGTH) +
+                   " because it outlives the session, unlike the generated one";
+        return false;
+    }
+    if (token.size() > MAX_PINNED_TOKEN_LENGTH) {
+        outError = "token is longer than " +
+                   std::to_string(MAX_PINNED_TOKEN_LENGTH) +
+                   " characters; shorten it, or it cannot be distinguished from "
+                   "one the ini reader truncated";
+        return false;
+    }
+    for (size_t i = 0; i < token.size(); i++) {
+        const char c = token[i];
+        const bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                        (c >= '0' && c <= '9') || c == '-' || c == '.' ||
+                        c == '_' || c == '~' || c == '+' || c == '/' || c == '=';
+        if (!ok) {
+            outError = "token contains a character a bearer token may not hold; "
+                       "allowed: letters, digits and - . _ ~ + / = "
+                       "(RFC 6750 token68)";
+            return false;
+        }
+    }
+    return true;
+}
+
 // Is this 40 hex characters, as a SHA-1 certificate thumbprint must be?
 // Checked here rather than at the store lookup so a typo is a start-up refusal
 // with a clear message instead of "certificate not found".

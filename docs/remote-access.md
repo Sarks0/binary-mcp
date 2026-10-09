@@ -294,6 +294,50 @@ when clients dial a DNS name. Any value containing a character a flag cannot
 legitimately hold causes the whole file to be refused, rather than one setting
 being quietly dropped.
 
+#### Pinning the token
+
+By default the plugin generates a new token on every load and deletes its file
+on unload. On loopback that is invisible, because the bridge reads the file
+itself. For a remote endpoint the file is on the wrong machine, so **every
+restart of x64dbg invalidates the token Host A was configured with**, and the
+symptom is a 401 that reads like a misconfiguration rather than an expiry.
+
+A `token` key in `[listener]` fixes one instead:
+
+```ini
+[listener]
+bind=192.168.1.50
+port=8765
+tls_cert_thumbprint=A1B2C3D4E5F60718293A4B5C6D7E8F9012345678
+allow_clients=192.168.1.10
+token=<32 to 256 characters>
+```
+
+Generate one the same way you would any other secret — `openssl rand -hex 32`
+produces exactly the shape the plugin generates for itself. Then put the same
+value in Host A's `OBSIDIAN_AUTH_TOKEN` and it stays valid across restarts.
+
+The rules, enforced at start-up by `Listener::IsPinnedToken`:
+
+- **32 characters minimum.** A generated token dies with the session; a pinned
+  one lives as long as the file, so a short one is a real downgrade.
+- **256 maximum**, because the ini reader's buffer would truncate a longer one
+  and a truncated token cannot be told apart from a whole one. The symptom
+  would be `Invalid token (wrong length)` with nothing pointing at the ini.
+- **RFC 6750 token68 only** — letters, digits and `- . _ ~ + / =`. This is the
+  same set the bridge enforces on `OBSIDIAN_AUTH_TOKEN`, so a token one half
+  accepts cannot be one the other refuses. No spaces, and no stray `\r` from a
+  copy-paste.
+- **A token that breaks a rule stops the plugin setting up**, rather than
+  falling back to a generated one. Quietly rotating when a fixed token was
+  asked for would break the remote host at the next restart with nothing
+  connecting the two.
+
+The plugin logs the source and the length, never the value, and notes in the
+log that a pinned token does not change on restart — which is the point, and
+also means it stays valid if it leaks. Remove the key to go back to
+generate-and-rotate.
+
 A CIDR must be written as its network address: `10.0.0.0/24`, not
 `10.0.0.5/24`. The second is refused rather than read as the first, because
 someone writing a host address with a prefix means that host, and silently

@@ -1,6 +1,7 @@
 #include "plugin.h"
 #include "event_system.h"
 #include "../pipe_protocol.h"
+#include "../server/listener_policy.h"
 #include <cstdio>
 #include <cstdarg>
 #include <string>
@@ -5860,21 +5861,96 @@ static bool BuildCurrentUserOnlySecurity(SECURITY_ATTRIBUTES& sa, PSECURITY_DESC
     return true;
 }
 
+// A token pinned in obsidian.ini, or an empty string when the key is absent.
+//
+// WHY THIS EXISTS: the generated token is new on every plugin load and its file
+// is deleted on unload. That is invisible when the Python bridge reads the file
+// itself -- which it does for a loopback endpoint, on the same machine. For a
+// REMOTE endpoint the file is on the wrong machine, so every restart of x64dbg
+// silently invalidates the token the other host was configured with, and the
+// symptom is a 401 that reads like a misconfiguration rather than an expiry.
+// Pinning one lets a remote configuration survive a restart.
+//
+// Read separately from the flag settings in SpawnHTTPServer, with a different
+// character set, because this value is not a flag: it reaches the server
+// through the environment, never a command line, so the characters a flag
+// cannot hold are irrelevant here and the ones a BEARER TOKEN cannot hold are
+// what matter. Listener::IsPinnedToken is the shared rule.
+static std::string ReadPinnedToken() {
+    char pluginPath[MAX_PATH];
+    if (!GetModuleFileNameA(g_hModule, pluginPath, MAX_PATH)) {
+        LogError("Failed to get plugin path while reading obsidian.ini: %d",
+                 GetLastError());
+        return "";
+    }
+    char* lastSlash = strrchr(pluginPath, '\\');
+    if (lastSlash) {
+        *(lastSlash + 1) = '\0';
+    }
+
+    char iniPath[MAX_PATH];
+    snprintf(iniPath, sizeof(iniPath), "%sobsidian.ini", pluginPath);
+
+    char buffer[512] = {};
+    const DWORD length = GetPrivateProfileStringA("listener", "token", "", buffer,
+                                                  sizeof(buffer), iniPath);
+    std::string value(buffer, length);
+
+    // Trimmed for the same reason the flag reader trims: GetPrivateProfileString
+    // is not consistent about trailing whitespace across Windows versions, and
+    // refusing a token over a blank the operator cannot see would be its own bug.
+    size_t begin = 0;
+    size_t end = value.size();
+    while (begin < end && (value[begin] == ' ' || value[begin] == '\t')) begin++;
+    while (end > begin && (value[end - 1] == ' ' || value[end - 1] == '\t' ||
+                           value[end - 1] == '\r' || value[end - 1] == '\n')) end--;
+    return value.substr(begin, end - begin);
+}
+
 void pluginSetup() {
     LogInfo("Setting up plugin");
 
-    // Generate cryptographically secure random token (256 bits)
-    char token[65];  // 64 hex chars + null terminator
-    if (!GenerateSecureToken(token, sizeof(token))) {
-        LogError("Failed to generate secure token");
-        return;
+    std::string token;
+    const std::string pinned = ReadPinnedToken();
+
+    if (!pinned.empty()) {
+        // Refused rather than quietly replaced with a generated one. An
+        // operator who pinned a token and got a rotating one would have a
+        // listener that works and a remote host that breaks at the next
+        // restart, with nothing connecting the two -- the same reason a
+        // malformed flag refuses the whole ini instead of dropping one setting.
+        std::string tokenError;
+        if (!Listener::IsPinnedToken(pinned, tokenError)) {
+            LogError("obsidian.ini: [listener] %s", tokenError.c_str());
+            LogError("Not setting up: a pinned token was asked for and cannot be "
+                     "used. Fix it, or remove the key to go back to a freshly "
+                     "generated token each session.");
+            return;
+        }
+        token = pinned;
+    } else {
+        // Generate cryptographically secure random token (256 bits)
+        char generated[65];  // 64 hex chars + null terminator
+        if (!GenerateSecureToken(generated, sizeof(generated))) {
+            LogError("Failed to generate secure token");
+            return;
+        }
+        token = generated;
     }
 
-    LogInfo("Generated secure authentication token (256-bit)");
+    // Length and source, never the value.
+    LogInfo("Authentication token ready (%s, %zu chars)",
+            pinned.empty() ? "generated for this session"
+                           : "pinned in obsidian.ini",
+            token.size());
+    if (!pinned.empty()) {
+        LogInfo("NOTE: this token does not change when x64dbg restarts, so it "
+                "stays valid for a remote client -- and stays valid if it leaks.");
+    }
 
     // Pass token to server via environment variable (inherited by child process)
     // This avoids file system issues (permissions, 8.3 paths, FILE_ATTRIBUTE_TEMPORARY)
-    if (!SetEnvironmentVariableA("OBSIDIAN_AUTH_TOKEN", token)) {
+    if (!SetEnvironmentVariableA("OBSIDIAN_AUTH_TOKEN", token.c_str())) {
         LogError("Failed to set auth token environment variable: %d", GetLastError());
         return;
     }
@@ -5926,7 +6002,8 @@ void pluginSetup() {
 
         if (hFile != INVALID_HANDLE_VALUE) {
             DWORD bytesWritten;
-            if (WriteFile(hFile, token, (DWORD)strlen(token), &bytesWritten, nullptr)) {
+            if (WriteFile(hFile, token.c_str(), (DWORD)token.size(),
+                          &bytesWritten, nullptr)) {
                 LogInfo("Created auth token file: %s", tokenPath);
             } else {
                 LogError("Failed to write token file: %d", GetLastError());

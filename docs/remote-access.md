@@ -4,15 +4,17 @@ Running the MCP client on one host and the analysis tooling on another. The
 usual reason: the debugger and the sample belong in a disposable VM, and the
 client does not.
 
-Two arrangements are possible, and both work end to end. The one thing still
-outstanding is fetching plugin-written artifacts (minidumps, coverage exports)
-back from the debugger host; see [the remote access
-plan](remote-access-plan.md).
+This is the reference. For the short version with the settings to copy, see
+[Remote setup](remote-setup.md).
+
+Two arrangements are possible. The one thing still outstanding for both is
+fetching plugin-written artifacts (minidumps, coverage exports) back from the
+debugger host; see [the remote access plan](remote-access-plan.md).
 
 | | What crosses the network | Status |
 |---|---|---|
-| **Remote MCP server** | The MCP protocol itself. The whole server, Ghidra and x64dbg all live on the debugger host | Implemented |
-| **Remote x64dbg bridge** | Only the x64dbg HTTP hop. The server and Ghidra stay with the client | Implemented, with TLS in the plugin's own listener — see [below](#remote-x64dbg) |
+| **Remote MCP server** | The MCP protocol itself. The whole server, Ghidra and x64dbg all live on the debugger host | Implemented and unit-tested. Not yet run across two real hosts, so expect to debug the first setup |
+| **Remote x64dbg bridge** | Only the x64dbg HTTP hop. The server and Ghidra stay with the client | Implemented and verified on two hosts, with TLS in the plugin's own listener — see [below](#remote-x64dbg) |
 
 Throughout: **Host A** is where the MCP client runs, **Host B** is where
 x64dbg, the sample and (for the first arrangement) this server run.

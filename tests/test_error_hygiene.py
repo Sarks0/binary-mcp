@@ -1023,7 +1023,6 @@ def test_reason_guard_allows_format_only_handlers(clause, tmp_path):
     assert not _reason_guard_flags("        raise E(S(reason=str(e)))", tmp_path, clause)
 
 
-# --------------------------------------------------------------------------
 # Audit F-10, third form: a parameter rebound to a RESOLVED path.
 #
 # The two guards above both key off an exception: one matches the literal
@@ -1043,7 +1042,6 @@ def test_reason_guard_allows_format_only_handlers(clause, tmp_path):
 # resolves and then misses -- so these returns are reachable with a resolved
 # path in hand. Echo os.path.basename(...), or keep the caller's own
 # reference in a separate name and echo that.
-# --------------------------------------------------------------------------
 
 _PATH_RESOLVERS = {"resolve_cached_binary"}
 

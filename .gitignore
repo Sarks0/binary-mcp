@@ -90,6 +90,7 @@ security/
 DEVELOPMENT_ROADMAP.md
 WINDBG_INTEGRATION_PLAN.md
 AUDIT.md
+docs/gdb-linux-debugging-plan.md
 
 # Stray mock-cache trees. `MagicMock.__fspath__()` returns a plausible
 # relative path rather than raising, so a mocked cache_dir can become a real

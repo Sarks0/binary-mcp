@@ -4,7 +4,7 @@
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
-An MCP server for reverse engineering. It hands an AI assistant 147 tools for
+An MCP server for reverse engineering. It hands an AI assistant 166 tools for
 static analysis, live debugging, kernel debugging and .NET decompilation, so
 the whole workflow happens in one place instead of across four GUIs.
 
@@ -67,7 +67,7 @@ states each of those precisely and points at the code that enforces it.
 ## Documentation
 
 - [Installation](INSTALL.md), including supply-chain integrity
-- [Tool reference](docs/tools.md), all 147 tools by engine
+- [Tool reference](docs/tools.md), all 166 tools by engine
 - [Configuration](docs/configuration.md), environment variables and extras
 - [Security model](docs/security.md)
 - [All documentation](docs/), including guides for kernel debugging, large

@@ -6,6 +6,7 @@ import re
 import tempfile
 import uuid
 from pathlib import Path
+from stat import S_ISREG
 
 logger = logging.getLogger(__name__)
 
@@ -272,6 +273,28 @@ class PathTraversalError(SecurityError):
     pass
 
 
+class HardLinkError(PathTraversalError):
+    """
+    Raised when a multiply-linked regular file is refused (see
+    :func:`_reject_hardlinked_file`).
+
+    A SUBCLASS of :class:`PathTraversalError` on purpose. Roughly thirty tool
+    handlers catch ``PathTraversalError`` to mean "this path was refused", and
+    the refusal genuinely is a confinement refusal -- just not a *directory*
+    one. Subclassing keeps every one of those handlers working unchanged while
+    letting the ones that explain the failure tell the two cases apart.
+
+    That distinction is the whole reason the type exists. Both refusals used to
+    arrive as a bare ``PathTraversalError``, and
+    :data:`PATH_ERROR_GUIDANCE` keys on the exception TYPE, so a hard-linked
+    staging copy was described to the caller as "the path is outside the
+    directories this server is allowed to read" -- which is false, and sends
+    whoever reads it to re-check ``BINARY_MCP_ALLOWED_DIRS`` instead of the
+    link count. The only way to tell them apart was to read this file.
+    """
+    pass
+
+
 class FileSizeError(SecurityError):
     """Raised when file size exceeds limits."""
     pass
@@ -307,22 +330,32 @@ def _reject_hardlinked_file(path: Path, binary_path: str) -> None:
         a much smaller hammer than ``BINARY_MCP_ALLOW_ANY_PATH``.
       * NOTHING THIS SERVER WRITES trips it: cache entries, carved output,
         dumps and extracted files are all created fresh with one link.
-      * Directories are exempt: ``st_nlink`` counts subdirectory ``..``
-        entries, so any non-empty directory has nlink > 1. Only regular files
-        are checked. Symlinks never reach here as themselves (the caller has
+      * Directories are exempt, and the guard for that is load-bearing:
+        EVERY directory has ``st_nlink >= 2`` (its own entry plus ``.``), not
+        merely non-empty ones as earlier revisions of this comment claimed --
+        a freshly created empty directory reports 2. Without the S_ISREG
+        check below, every directory reaching here would be refused. Only
+        regular files are checked. Symlinks never reach here as themselves (the caller has
         already resolved them, and out-of-bounds targets were rejected above).
-      * POSIX ONLY. On Windows ``os.stat`` fills ``st_nlink`` from a different
-        API path and reports 0 or 1 for files that do have multiple NTFS hard
-        links, so the check would be simultaneously unreliable and unable to
-        catch the equivalent attack. Rather than pretend, it is skipped there
-        and the limitation is stated here.
+      * POSIX ONLY, and this is a GAP rather than a non-issue. ``mklink /H``
+        is the Windows equivalent of the construction above and nothing here
+        refuses it, so the allow-list is advisory on Windows. The skip is a
+        choice not to depend on ``st_nlink`` on a platform where this project
+        has never measured what CPython reports for a file with several NTFS
+        links -- the honest statement is "unverified", not "reports 0 or 1",
+        which earlier revisions of this comment asserted without a test to
+        back it. Measuring it on Windows would let the check be enabled there;
+        until someone does, docs/security.md tells operators to confine at the
+        filesystem instead.
 
     Args:
         path: Resolved, in-bounds path that is known to exist and be a file.
         binary_path: The caller's original argument, for the error message.
 
     Raises:
-        PathTraversalError: If ``path`` is a regular file with several links.
+        HardLinkError: If ``path`` is a regular file with several links. A
+            ``PathTraversalError`` subclass, so existing handlers still catch
+            it; see that class for why it is not the base type.
     """
     if os.name == "nt" or _hardlinks_allowed():
         return
@@ -334,8 +367,19 @@ def _reject_hardlinked_file(path: Path, binary_path: str) -> None:
         # must not turn into a confusing security denial.
         return
 
+    # "Only regular files are checked" is asserted by this function's own
+    # docstring, by HardLinkError's, and by docs/security.md -- but until this
+    # guard it was true only because sanitize_binary_path happens to run
+    # `if not path.is_file()` a few lines earlier. Any second caller, or a
+    # reordering of those two checks, would have made every non-empty
+    # directory raise a confinement refusal: st_nlink counts the '..' entry of
+    # each subdirectory, so a directory with two subdirectories reports three
+    # names. The invariant now holds wherever this is called from.
+    if not S_ISREG(st.st_mode):
+        return
+
     if st.st_nlink > 1:
-        raise PathTraversalError(
+        raise HardLinkError(
             f"Access denied: {binary_path} is a hard link (it has "
             f"{st.st_nlink} names). Directory confinement resolves symlinks "
             f"but cannot see through a hard link, so a multiply-linked file "
@@ -371,9 +415,14 @@ def sanitize_binary_path(
     Raises:
         PathTraversalError: If path is invalid, outside allowed directories,
             or confinement is required but unconfigured
+        HardLinkError: If the file has more than one name while confinement is
+            active. A ``PathTraversalError`` subclass, listed separately
+            because it is a different refusal with a different remedy
         FileSizeError: If file exceeds size limit
         FileNotFoundError: If file does not exist
-        ValueError: If path validation fails
+        IsADirectoryError: If the path names a directory
+        ValueError: If the path is neither a regular file nor a directory
+            (a FIFO, socket or device node), or validation otherwise fails
     """
     # Resolve the confinement policy centrally so every caller is confined
     # uniformly. Historically most call sites passed no allowed_dirs and thus
@@ -509,9 +558,28 @@ def sanitize_binary_path(
     if not path.exists():
         raise FileNotFoundError(f"File does not exist: {binary_path}")
 
-    # Must be a file, not directory
+    # Must be a file. A DIRECTORY gets IsADirectoryError, not ValueError.
+    #
+    # The bare ValueError this replaces was the root cause of four separate
+    # workarounds. PATH_ERROR_GUIDANCE has had an IsADirectoryError entry
+    # ("the path names a directory, not a file") the whole time, unreachable
+    # because nothing raised the type. Meanwhile ValueError could not be
+    # routed anywhere near the path layer, because json.JSONDecodeError IS a
+    # ValueError -- so a directory ended up with no reportable category at
+    # all, project_cache needed its lookups split by scope to avoid catching
+    # decode errors, several handlers bolted ValueError onto their
+    # FileNotFoundError arms, and the arms that echoed `{e}` for a ValueError
+    # leaked the resolved path.
+    #
+    # IsADirectoryError is an OSError subclass, so it is cleanly separable
+    # from a decode error and routes like every other refusal. Anything else
+    # that is not a regular file (a FIFO, socket or device node inside an
+    # allowed directory) keeps ValueError, because "is a directory" would be
+    # a lie about it.
+    if path.is_dir():
+        raise IsADirectoryError(f"Path is a directory, not a file: {binary_path}")
     if not path.is_file():
-        raise ValueError(f"Path is not a file: {binary_path}")
+        raise ValueError(f"Path is not a regular file: {binary_path}")
 
     # Hard-link check. Only meaningful while confinement is active: with
     # BINARY_MCP_ALLOW_ANY_PATH set there is no boundary left to bypass, so
@@ -529,7 +597,12 @@ def sanitize_binary_path(
                 f"File too large: {file_size} bytes (max: {max_size_bytes})"
             )
     except OSError as e:
-        raise ValueError(f"Cannot get file size: {e}")
+        # Not interpolated: the OSError's str carries the RESOLVED absolute
+        # path ("[Errno 13] Permission denied: '/home/<user>/...'"), so any
+        # handler echoing this ValueError printed the operator's username.
+        # The caller's own argument is enough to identify what failed.
+        logger.error("Cannot stat %s", binary_path, exc_info=e)
+        raise ValueError(f"Cannot read file size for: {binary_path}") from e
 
     return path
 
@@ -968,16 +1041,18 @@ def get_allowed_dirs() -> list[Path] | None:
     Returns:
         List of allowed directory Paths, or None if not configured
     """
-    import os
-    dirs_config = os.environ.get("BINARY_MCP_ALLOWED_DIRS", "").strip()
+    # ENV_ALLOWED_DIRS, not the literal. This function is the only place that
+    # actually READS the variable, and the docs test now derives its canonical
+    # list from the module's ENV_* constants -- so a rename would have updated
+    # every refusal message and the docs assertion while this kept parsing the
+    # old name and silently returning None.
+    dirs_config = os.environ.get(ENV_ALLOWED_DIRS, "").strip()
     if not dirs_config:
         return None
     return [Path(d.strip()) for d in dirs_config.split(os.pathsep) if d.strip()]
 
 
-# ---------------------------------------------------------------------------
 # Non-disclosing text for path-validation failures (audit F-10)
-# ---------------------------------------------------------------------------
 #
 # The MESSAGE of a confinement failure is itself host state. _default_confinement
 # _denied() interpolates the resolved quarantine directory list and
@@ -994,6 +1069,24 @@ def get_allowed_dirs() -> list[Path] | None:
 # the same text through StructuredError.reason, which curated_structured_text
 # deliberately preserves. A second copy is how that happened.
 PATH_ERROR_GUIDANCE: "dict[type, str]" = {
+    # Must stay distinct from the PathTraversalError text below. A hard-linked
+    # sample is refused for a reason that has nothing to do with WHERE it sits,
+    # and describing it as an out-of-bounds path sent at least one operator
+    # re-checking their allow-list for a refusal the allow-list did not cause.
+    # The link count is the operator's own staging choice, not host layout, so
+    # it is safe to name here -- what is still withheld is the directory list.
+    HardLinkError: (
+        "the file has more than one name (it is a hard link), and this server "
+        "refuses multiply-linked files while path confinement is active: "
+        "containment resolves symlinks but cannot see through a hard link, so "
+        "a link inside an allowed directory may be the same inode as a file "
+        "outside it. NOTE this is not an out-of-bounds path -- the directory "
+        "was accepted, the link count was not, so widening "
+        f"{ENV_ALLOWED_DIRS} will not help. Stage the sample with a copy "
+        f"rather than a link, or ask the operator to set "
+        f"{ENV_ALLOW_HARDLINKS}=1 if this corpus is deliberately "
+        "de-duplicated with links."
+    ),
     PathTraversalError: (
         "the path is outside the directories this server is allowed to read. "
         f"Analyse files from a directory the operator exposed via "
@@ -1025,9 +1118,17 @@ def path_error_guidance(error: Exception) -> "str | None":
     Return non-disclosing guidance for a path-validation error, or None.
 
     None means the exception type is not one whose category can be described
-    without echoing its text -- callers decide their own fallback. Iteration
-    order is irrelevant: the mapped types are siblings, never subclasses of one
-    another.
+    without echoing its text -- callers decide their own fallback.
+
+    Resolution is MOST SPECIFIC FIRST, by walking the exception's own MRO
+    rather than scanning the mapping with ``isinstance``. The mapped types used
+    to be siblings, so a scan in dict order was fine; :class:`HardLinkError`
+    broke that by subclassing :class:`PathTraversalError`, and a scan would
+    hand it whichever of the two happened to be inserted first -- i.e. the
+    correctness of the message would rest on the order of a dict literal. The
+    MRO walk makes it rest on the class hierarchy instead, so any future
+    subclass gets its own text, or inherits its parent's, without anyone having
+    to remember to keep this mapping sorted.
 
     Args:
         error: The caught path-validation exception.
@@ -1035,10 +1136,78 @@ def path_error_guidance(error: Exception) -> "str | None":
     Returns:
         Guidance text safe to show the model, or None if unmapped.
     """
-    for exc_type, text in PATH_ERROR_GUIDANCE.items():
-        if isinstance(error, exc_type):
+    for exc_type in type(error).__mro__:
+        text = PATH_ERROR_GUIDANCE.get(exc_type)
+        if text is not None:
             return text
     return None
+
+
+def path_refusal_message(
+    operation: str,
+    error: Exception,
+    subject: str = "path",
+    extra: str = None,
+    error_id: str = None,
+) -> str:
+    """
+    The one renderer for a path refusal: category to the caller, detail to the log.
+
+    Lives HERE, beside :data:`PATH_ERROR_GUIDANCE`, because three layers need
+    it and ``src/utils/`` cannot import from ``src/tools/``:
+    :func:`safe_error_message` below (the base every catch-all in the project
+    reaches), ``tools.error_hygiene.safe_path_error`` (the explicit per-tool
+    arms), and through that, ``safe_tool_error``. The note on
+    PATH_ERROR_GUIDANCE records what a second copy cost last time; this is the
+    same rule applied to the renderer rather than just the text.
+
+    Args:
+        operation: Short description of what failed, normally the tool name.
+        error: The caught path-validation exception.
+        subject: What was being validated, e.g. ``"binary path"``. Named in the
+            first line so the caller can tell which argument to fix, so it
+            should match the parameter the tool actually takes.
+        error_id: Reuse a reference ID the caller already logged detail
+            under, instead of minting a new one. Without this the routed
+            branch of :func:`safe_error_message` discarded the caller's
+            ``error_id`` and returned a different one, which would resolve to
+            nothing in the server log.
+        extra: Tool-specific remediation to add BEFORE the reference ID, for
+            the cases where the tool knows something the guidance cannot --
+            ``clean_cache`` can still wipe the cache of a binary that is no
+            longer on disk, for instance. It belongs here rather than
+            concatenated onto this function's return value, which is how the
+            reference ID ended up in the middle of a reply that every other
+            refusal in the project terminates with.
+
+    Returns:
+        Safe, still-actionable error text, or ``None`` if the exception's
+        category cannot be described without echoing its text.
+    """
+    guidance = path_error_guidance(error)
+    if guidance is None:
+        return None
+
+    if error_id is None:
+        error_id = str(uuid.uuid4())[:8]
+    # ERROR with a traceback, not WARNING without one: a stdio MCP server is
+    # commonly run at level=ERROR, where a WARNING disappears and leaves the
+    # caller holding a reference ID that resolves to nothing. These are also
+    # the events most worth keeping -- every confinement denial comes through
+    # here.
+    logger.error(
+        "Error %s: %s rejected %s: %s: %s",
+        error_id,
+        operation or "tool call",
+        subject,
+        type(error).__name__,
+        error,
+        exc_info=error,
+    )
+    body = f"Error: Invalid {subject} -- {guidance}"
+    if extra:
+        body = f"{body}\n{extra}"
+    return f"{body}\nReference ID: {error_id}"
 
 
 def safe_path_reason(error: Exception) -> str:
@@ -1119,12 +1288,59 @@ def safe_error_message(
     Returns:
         Safe error message with reference ID
     """
+    # A confinement refusal keeps its category, wherever it surfaces.
+    #
+    # The per-tool arms and safe_tool_error cover src/server.py,
+    # coverage_tools and dynamic_tools. Every catch-all in the other 15
+    # modules under src/tools/ lands here instead (15 sites in dotnet_tools
+    # alone, and none of the 15 modules calls safe_tool_error at all), so
+    # routing only there left "a tool cannot reintroduce the gap by forgetting
+    # an arm" true of one file and false of the rest. Routing at the base
+    # makes it true everywhere, including for tools added later.
+    #
+    # Only these three types. PathTraversalError and FileSizeError are raised
+    # exclusively by this project's own path validators;
+    # IsADirectoryError is unambiguous wherever it comes from, since "the path
+    # names a directory, not a file" is true of an open() on a directory too.
+    # That is exactly what the bare ValueError it replaced could not offer.
+    # FileNotFoundError is
+    # NOT included even though PATH_ERROR_GUIDANCE has text for it: the Ghidra
+    # detector raises it for a missing INSTALLATION, and answering that with
+    # "check the name and extension" would trade a vague error for a
+    # confidently wrong one. A tool wanting that category names
+    # FileNotFoundError in its own arm, where the provenance is known.
+    #
+    # Checked BEFORE minting an error_id so the routed path does not generate
+    # one it then discards -- path_refusal_message mints its own, and the
+    # caller's error_id (if any) is passed through so a caller that already
+    # logged detail under it still gets an ID that resolves to that line.
+    if isinstance(
+        internal_details, (PathTraversalError, FileSizeError, IsADirectoryError)
+    ):
+        routed = path_refusal_message(
+            user_message, internal_details, error_id=error_id
+        )
+        if routed is not None:
+            return routed
+
     if error_id is None:
         error_id = str(uuid.uuid4())[:8]
 
-    # Log internal details
+    # exc_info takes the EXCEPTION, not True.
+    #
+    # `exc_info=True` makes logging use sys.exc_info(), i.e. whatever
+    # exception is currently being handled -- not the one passed in. Called
+    # outside an except block (clean_cache does exactly this) that logs
+    # "NoneType: None" and the reference ID resolves to no stack at all.
+    # Called inside an except block for a DIFFERENT exception it is worse: the
+    # message names internal_details while the traceback attached belongs to
+    # the unrelated exception, so the ID resolves to a stack for another
+    # failure. Both were verified by running it. path_refusal_message had this
+    # right already.
     if internal_details:
-        logger.error(f"Error {error_id}: {internal_details}", exc_info=True)
+        logger.error(
+            f"Error {error_id}: {internal_details}", exc_info=internal_details
+        )
 
     # If the exception carries a curated diagnostic (e.g. GhidraAnalysisError
     # with extracted stderr context), surface it. The diagnostic is already

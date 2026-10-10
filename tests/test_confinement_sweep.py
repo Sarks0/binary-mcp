@@ -31,6 +31,8 @@ regression shows up as "the cache was asked about /outside/secret.bin" rather
 than as a vague assertion failure.
 """
 
+import inspect
+import os
 import sys
 import tempfile
 import zipfile
@@ -532,24 +534,36 @@ def test_find_related_sessions_confines_before_hashing(
     assert find.calls == []
 
 
+@pytest.fixture
+def hardlinked_sample(quarantine, tmp_path):
+    """
+    An in-bounds hard link to an out-of-bounds inode, plus that inode.
+
+    Shared because three tests needed the same six lines and the same skip
+    reason; the previous copies drifted only in variable names. Returns
+    ``(link, target)`` so a test can exercise the hard-link refusal and the
+    plain out-of-bounds refusal against the same fixture.
+    """
+    if os.name == "nt":
+        pytest.skip("the hard-link check is not enabled on Windows (see _reject_hardlinked_file)")
+
+    outside = tmp_path / "outside"
+    outside.mkdir(exist_ok=True)
+    target = outside / "secret"
+    target.write_bytes(b"MZ\x90\x00" + b"\x00" * 64)
+    link = quarantine / "sample.bin"
+    os.link(target, link)
+    return link, target
+
+
 def test_hardlinked_sample_is_refused_by_the_tool_layer(
-    server, quarantine, tmp_path, monkeypatch
+    server, hardlinked_sample, monkeypatch
 ):
     """
     End to end: the hard-link bypass is refused where a caller would hit it,
     not just in the validator's unit tests.
     """
-    import os
-
-    if os.name == "nt":
-        pytest.skip("st_nlink is not a reliable hard-link signal on Windows")
-
-    outside = tmp_path / "outside"
-    outside.mkdir(exist_ok=True)
-    secret = outside / "secret"
-    secret.write_bytes(b"MZ\x90\x00" + b"\x00" * 64)
-    link = quarantine / "sample.bin"
-    os.link(secret, link)
+    link, _ = hardlinked_sample
 
     check_compat = Recorder()
     monkeypatch.setattr(
@@ -560,6 +574,573 @@ def test_hardlinked_sample_is_refused_by_the_tool_layer(
 
     assert "Error" in result
     assert check_compat.calls == []
+
+
+@pytest.mark.parametrize("tool_name", ["check_binary", "analyze_binary"])
+def test_hardlink_refusal_is_not_reported_as_a_bad_path(
+    server, hardlinked_sample, tmp_path, monkeypatch, tool_name
+):
+    """
+    The refusal must say what was wrong WHERE a caller reads it.
+
+    The test above asserts only ``"Error" in result``, which is how this
+    shipped: ``analyze_binary`` and ``check_binary`` were the two handlers
+    still answering a refused path with ``safe_error_message("Invalid binary
+    file or path", e)``, i.e. four words and a reference ID. A hard-linked
+    staging copy and a genuine confinement violation were byte-identical, so
+    the link count could only be found by reading src/utils/security.py.
+
+    Both tools now route through ``safe_path_error``, which reconstructs the
+    category from the exception type -- and the type is now distinct.
+    """
+    _disable_auto_session(server, monkeypatch)
+    link, secret = hardlinked_sample
+
+    tool = getattr(server, tool_name)
+    hardlink_result = tool(binary_path=str(link))
+    # Same tool, same posture, a genuinely out-of-bounds path.
+    oob_result = tool(binary_path=str(secret))
+
+    assert "Error" in hardlink_result
+    assert "Error" in oob_result
+
+    # Distinguishable is only half of it: the refusal must still withhold host
+    # layout. Without this pair, the test is satisfied by ANY two different
+    # strings -- including the leaky "Access denied: ... is outside the default
+    # quarantine directories (<every resolved dir>)" that tools validating via
+    # get_analysis_context still return today, which interpolates the
+    # Path.home()-derived allow-list and so the operator's username. Asserting
+    # only "the texts differ" is what let that survive a review.
+    for label, text in (("hard link", hardlink_result), ("out of bounds", oob_result)):
+        assert str(tmp_path) not in text, (
+            f"{tool_name} echoed host layout in its {label} refusal; the "
+            f"resolved directory list belongs in the log, against the "
+            f"reference ID, not in the caller's transcript"
+        )
+
+    # Reference IDs are per-call, so compare the text without them.
+    def _without_reference_id(text):
+        return "\n".join(
+            line for line in text.splitlines() if not line.startswith("Reference ID:")
+        )
+
+    assert _without_reference_id(hardlink_result) != _without_reference_id(oob_result), (
+        f"{tool_name} reports a hard-link refusal and an out-of-bounds path "
+        f"with the same text, so the failure reads as 'wrong path' when the "
+        f"path was accepted and the link count was not"
+    )
+    assert "hard link" in hardlink_result
+    assert ENV_ALLOW_HARDLINKS in hardlink_result, (
+        f"{tool_name} refuses the link without naming the opt-out, leaving the "
+        f"caller to find it in the source"
+    )
+    assert "hard link" not in oob_result
+
+
+# Whole-surface sweep: every tool that takes a binary_path
+
+
+# Placeholders for the OTHER required arguments of each tool, so the sweep can
+# call it at all. Values are deliberately boring -- the point is to reach the
+# path check, which happens before any of these matter.
+_SWEEP_ARGS = {
+    "function_name": "main",
+    "function_names": ["main"],
+    "function": "main",
+    "name": "sweep",
+    "address": "0x1000",
+    "type_name": "T",
+    "pattern": "90",
+    "query": "x",
+    "output_path": "out.txt",
+    "rule_name": "r",
+    "tag": "t",
+    "session_id": "00000000-0000-4000-8000-000000000000",
+    # Added after the sweep was found to be silently dropping these: the
+    # for/else below `break`s out for any tool whose other required argument
+    # has no placeholder, so decrypt_xor, expand_callgraph and
+    # extract_python_packed -- all three of which had their path arms rewritten
+    # in the change that added this sweep -- were covered by nothing at all.
+    "key": "41",
+    "root": "main",
+    "output_dir": "out",
+    "note": "n",
+    "new_name": "renamed",
+}
+
+# Extra OPTIONAL arguments a few tools need before they will look at the path
+# at all. rename_function returns "Must provide either 'address' or 'old_name'"
+# from its own argument check, which runs first, so without this the sweep
+# drove it to an argument error and learned nothing about its path handling.
+# Kept explicit and per-tool rather than passing every optional argument the
+# sweep happens to have a value for, which would change what is under test.
+_SWEEP_EXTRA_ARGS = {
+    "rename_function": {"old_name": "main"},
+}
+
+# Module-level callables that take a binary_path but are not MCP tools, so the
+# sweep's "every tool returns a refusal string" contract does not apply: the
+# validators raise by design, and these helpers are called with a cache or a
+# resolved address by their real callers.
+_SWEEP_NON_TOOL_HELPERS = {
+    "auto_mark_reviewed",
+    "find_table_base_refs",
+}
+
+# Module-level helpers that happen to take a binary_path but are not MCP tools.
+# They are the validators themselves (and pdb_fetcher.auto_fetch_pdb, a helper
+# imported into the server namespace), so they RAISE rather than return a
+# refusal string -- which is the contract the tools below are built on.
+_SWEEP_NOT_TOOLS = {
+    "sanitize_binary_path",
+    "confine_binary_path",
+    "get_analysis_context",
+    "auto_fetch_pdb",
+}
+
+
+# Tools registered by register_all_tools(), which main() calls and imports do
+# not -- so on import only src/server.py's own @app.tool() functions exist, and
+# the ~105 tools in src/tools/* are invisible to any test that just imports the
+# module. That is why the first version of this sweep, which enumerated module
+# attributes, reported "whole surface" while covering a third of it. Calling
+# the registrar is what makes the claim checkable.
+
+
+class _RecordedTool:
+    """
+    Minimal stand-in for a FastMCP tool object.
+
+    ``apply_tool_catalog`` (src/tool_catalog.py:267) reads and rewrites
+    ``tool.tags``, so a bare function is not enough.
+    """
+
+    def __init__(self, fn):
+        self.fn = fn
+        self.name = getattr(fn, "__name__", repr(fn))
+        self.tags = set()
+
+
+class _ToolRecorder:
+    """
+    A stand-in for the FastMCP app that just records what gets registered.
+
+    Deliberately NOT ``app.get_tools()``. Other test modules stub the whole
+    ``fastmcp`` module in ``sys.modules`` before importing the server, and that
+    stub is global and leaks between files -- so in a full-suite run ``app`` is
+    a MagicMock whose ``get_tools()`` looks awaitable and blows up, while in a
+    single-file run it is the real thing. The sweep passed alone and failed in
+    the suite for exactly that reason. Recording the registration ourselves
+    depends on nothing but the decorator protocol.
+    """
+
+    def __init__(self):
+        self.tools = {}
+
+    def tool(self, *args, **kwargs):
+        # Supports both @app.tool() and @app.tool
+        if args and callable(args[0]) and not kwargs:
+            self.tools[args[0].__name__] = _RecordedTool(args[0])
+            return args[0]
+
+        def register(fn):
+            name = getattr(fn, "__name__", repr(fn))
+            self.tools[name] = _RecordedTool(fn)
+            return fn
+
+        return register
+
+    async def get_tools(self):
+        # register_all_tools() ends with
+        # `apply_tool_catalog(asyncio.run(app.get_tools()))`, so this has to be
+        # a real coroutine returning something dict-shaped.
+        return dict(self.tools)
+
+    def __getattr__(self, name):
+        # Any other app API a registrar happens to touch is a no-op here.
+        def permissive(*args, **kwargs):
+            return None
+
+        return permissive
+
+
+def _registered_path_tools(server):
+    """
+    Every REGISTERED tool with a path-shaped argument, from a real registration.
+
+    ``register_all_tools()`` is called only by ``main()``, so on import the
+    ~105 tools in ``src/tools/*`` do not exist -- which is why the earlier
+    module-attribute sweep covered a third of the surface while calling itself
+    whole-surface. This runs the registrar against a recorder to get the real
+    set.
+
+    Discovery is on ``*path*`` rather than ``binary_path`` specifically: the
+    module-attribute version missed analyze_pyc_file (``pyc_path``), the six
+    dotnet tools (``assembly_path``), vt_lookup (``file_path``) and
+    diff_binaries (``old_path``/``new_path``) purely because of the parameter
+    name, and those are where the surviving refusal defects were.
+
+    Returns ``(found, skipped)``; each found entry is
+    ``(name, fn, kwargs, path_param)``.
+    """
+    module = server._module
+    recorder = _ToolRecorder()
+    real_app = module.app
+    try:
+        module.app = recorder
+        module.register_all_tools()
+    finally:
+        module.app = real_app
+
+    found, skipped = [], []
+    for name, tool in sorted(recorder.tools.items()):
+        fn = getattr(tool, "fn", tool)
+        if not callable(fn):
+            continue
+        try:
+            signature = inspect.signature(fn)
+        except (TypeError, ValueError):
+            continue
+        path_params = [p for p in signature.parameters if "path" in p]
+        if not path_params:
+            continue
+        target = path_params[0]
+
+        kwargs = {}
+        unsupplied = [
+            pname
+            for pname, param in signature.parameters.items()
+            if pname != target
+            and param.default is inspect.Parameter.empty
+            and pname not in _SWEEP_ARGS
+        ]
+        if unsupplied:
+            skipped.append((name, unsupplied))
+            continue
+        for pname, param in signature.parameters.items():
+            if pname == target or param.default is not inspect.Parameter.empty:
+                continue
+            kwargs[pname] = _SWEEP_ARGS[pname]
+        kwargs.update(_SWEEP_EXTRA_ARGS.get(name, {}))
+        found.append((name, fn, kwargs, target))
+
+    # Union with src/server.py's own tools. Those are registered by the
+    # @app.tool() decorators at IMPORT time, against the real app, so
+    # register_all_tools() never sees them and the recorder cannot either --
+    # it captures only the src/tools/* registrars. Taking the recorder alone
+    # covered 37 of ~69 and would have called that the whole surface, which is
+    # the same mistake one layer along.
+    seen = {name for name, _, _, _ in found}
+    module_tools, module_skipped = _binary_path_tools(server)
+    for name, fn, kwargs in module_tools:
+        if name not in seen:
+            found.append((name, fn, kwargs, "binary_path"))
+    skipped.extend(
+        (name, args) for name, args in module_skipped if name not in seen
+    )
+    return found, skipped
+
+
+def test_the_registry_sweep_reaches_the_tool_modules(server):
+    """
+    The registry sweep must see far more than the module-attribute one.
+
+    Without this, a regression that stopped register_all_tools() running would
+    silently shrink the sweep back to src/server.py's own tools and every
+    assertion below would still pass.
+    """
+    found, _ = _registered_path_tools(server)
+    names = {n for n, _, _, _ in found}
+    assert len(found) >= 60, f"registry sweep found only {len(found)}"
+    for expected in (
+        # from the src/tools/* registrars...
+        "quick_scan", "get_pe_info", "analyze_dotnet", "vt_lookup",
+        # ...and from src/server.py's own import-time registrations.
+        "analyze_binary", "check_binary", "get_functions",
+    ):
+        assert expected in names, f"registry sweep does not reach {expected}"
+
+
+def test_no_registered_tool_leaks_host_layout_on_a_refused_path(
+    server, refused_paths, tmp_path, monkeypatch
+):
+    """
+    The real whole-surface guarantee, over the registry rather than one module.
+
+    The module-attribute sweep covered 32 tools and called itself
+    whole-surface. This covers every registered tool with a path argument, and
+    the difference is not cosmetic: the five refusal defects that survived
+    three reviews of this branch were all in tools the old sweep could not
+    reach -- vt_lookup and four coverage tools echoing a resolved path, and
+    coverage_index raising out of the tool entirely.
+    """
+    _disable_auto_session(server, monkeypatch)
+    found, _ = _registered_path_tools(server)
+
+    offenders = []
+    for name, fn, kwargs, target in found:
+        for label, path in refused_paths:
+            try:
+                result = str(fn(**{target: str(path)}, **kwargs))
+            except Exception as exc:  # noqa: BLE001 - reported, not swallowed
+                offenders.append(
+                    f"{name}[{label}] raised {type(exc).__name__} instead of "
+                    f"returning a refusal"
+                )
+                continue
+            if str(tmp_path) in result:
+                offenders.append(f"{name}[{label}] echoed host layout")
+
+    assert not offenders, (
+        "registered tools disclosed host layout, or raised instead of "
+        "returning a refusal:\n  " + "\n  ".join(offenders)
+    )
+
+
+def test_windbg_open_dump_validates_before_entering_dump_mode(
+    server, refused_paths, tmp_path, monkeypatch
+):
+    """
+    A Windows-only tool, pinned from every platform.
+
+    windbg_open_dump handed dump_path straight to the bridge, whose open_dump
+    sets the mode and returns True without reading the file. So a missing path
+    or a directory came back as "Opened crash dump" with the session in
+    dump-analysis mode against nothing, and the success line echoed the
+    caller's path. The registry sweep caught it on the Windows runner only --
+    on POSIX the tool returns its platform message and never reaches any of
+    this.
+
+    Forcing the platform check and a succeeding bridge reproduces the real
+    Windows path from any host, so the fix cannot regress on the one platform
+    CI would otherwise be the only place to notice.
+    """
+    _disable_auto_session(server, monkeypatch)
+    import src.tools.windbg_tools as windbg_tools
+
+    monkeypatch.setattr(windbg_tools, "_is_windows", lambda: True)
+    opened = []
+
+    class _Bridge:
+        def open_dump(self, path):
+            opened.append(path)
+            return True
+
+    monkeypatch.setattr(windbg_tools, "get_windbg_bridge", lambda: _Bridge())
+
+    found, _ = _registered_path_tools(server)
+    open_dump = next(fn for name, fn, _, _ in found if name == "windbg_open_dump")
+
+    cases = dict(refused_paths)
+    for label in ("missing", "directory"):
+        result = open_dump(dump_path=str(cases[label]))
+        assert "Invalid dump path" in result, (label, result)
+        assert "Opened crash dump" not in result, (
+            f"{label} reported success without a readable dump"
+        )
+        assert str(tmp_path) not in result, f"{label} echoed host layout"
+    assert not opened, "the bridge was handed a path that is not a readable file"
+
+    # A real file still opens, and the reply names it without the path.
+    result = open_dump(dump_path=str(cases["out of bounds"]))
+    assert "Opened crash dump" in result
+    assert str(tmp_path) not in result, "success line echoed the caller's path"
+    assert len(opened) == 1
+
+
+def _binary_path_tools(server):
+    """
+    Every callable in src.server taking ``binary_path`` we can drive.
+
+    Returns ``(found, skipped)``. The skipped list is the point: this used to
+    `break` out of the argument loop and move on, so a tool whose other
+    required argument had no placeholder simply vanished from the sweep. Seven
+    did, three of them modified by the change that added the sweep, and
+    nothing failed -- the guard test only checked a floor count and four
+    hardcoded names. Handing the list back lets the guard assert it.
+    """
+    found = []
+    skipped = []
+    for name in sorted(dir(server._module)):
+        if name.startswith("_") or name in _SWEEP_NOT_TOOLS:
+            continue
+        fn = getattr(server, name)
+        if not callable(fn) or inspect.isclass(fn):
+            continue
+        try:
+            signature = inspect.signature(fn)
+        except (TypeError, ValueError):
+            continue
+        if "binary_path" not in signature.parameters:
+            continue
+        kwargs = {}
+        unsupplied = [
+            pname
+            for pname, param in signature.parameters.items()
+            if pname != "binary_path"
+            and param.default is inspect.Parameter.empty
+            and pname not in _SWEEP_ARGS
+        ]
+        if unsupplied:
+            skipped.append((name, unsupplied))
+            continue
+        for pname, param in signature.parameters.items():
+            if pname == "binary_path" or param.default is not inspect.Parameter.empty:
+                continue
+            kwargs[pname] = _SWEEP_ARGS[pname]
+        kwargs.update(_SWEEP_EXTRA_ARGS.get(name, {}))
+        found.append((name, fn, kwargs))
+    return found, skipped
+
+
+def test_the_sweep_finds_the_tools_it_claims_to(server):
+    """
+    Guard the sweep itself: silent discovery failure would assert nothing.
+
+    The ``server`` fixture is a _ToolProxy, and ``dir()`` on the proxy returns
+    nothing -- an earlier version of this sweep enumerated the proxy instead
+    of the module and cheerfully reported that zero tools took a binary_path.
+    """
+    tools, skipped = _binary_path_tools(server)
+    names = {name for name, _, _ in tools}
+    assert len(tools) >= 20, f"sweep found only {len(tools)} tools: {sorted(names)}"
+    for expected in ("analyze_binary", "check_binary", "get_functions", "get_xrefs"):
+        assert expected in names, f"sweep no longer reaches {expected}"
+
+    # Nothing may drop out silently. A floor count and four names could not
+    # see it when seven tools vanished for want of an argument placeholder --
+    # add a required argument to any swept tool and it leaves the sweep
+    # without failing anything. Anything genuinely not a tool is named in
+    # _SWEEP_NON_TOOL_HELPERS, so the remainder has to be empty.
+    unexplained = [
+        (name, args) for name, args in skipped
+        if name not in _SWEEP_NON_TOOL_HELPERS
+    ]
+    assert not unexplained, (
+        "these binary_path tools are silently outside the sweep; add a "
+        "placeholder to _SWEEP_ARGS for each argument listed, or name the "
+        "callable in _SWEEP_NON_TOOL_HELPERS if it is not a tool:\n  "
+        + "\n  ".join(f"{n}: needs {a}" for n, a in unexplained)
+    )
+
+
+@pytest.fixture
+def refused_paths(quarantine, tmp_path):
+    """
+    Every shape of refusal a tool can be handed, as ``(label, path)``.
+
+    The hard-link case is appended only on POSIX, so the sweeps that use this
+    still run on Windows for the other two. An earlier version took the
+    hard-link fixture directly, which made the whole sweep skip on Windows --
+    throwing away out-of-bounds and missing-file leak coverage on the one
+    platform where the hard-link check is deliberately absent, and so the one
+    platform where the remaining refusals carry more of the weight.
+    """
+    outside = tmp_path / "outside"
+    outside.mkdir(exist_ok=True)
+    target = outside / "secret"
+    target.write_bytes(b"MZ\x90\x00" + b"\x00" * 64)
+
+    adir = quarantine / "a-directory"
+    adir.mkdir(exist_ok=True)
+
+    cases = [
+        ("out of bounds", target),
+        ("missing", quarantine / "nope.bin"),
+        # The directory case is the reason this list exists as a fixture. Its
+        # absence is how a live leak survived this very sweep: a directory is
+        # refused by sanitize_binary_path with ValueError, which was not in
+        # ProjectCache._REFUSALS, so the refusal was laundered into a cache
+        # miss, a Ghidra job was submitted for a directory, and the job
+        # record's raw error text came back to the caller.
+        ("directory", adir),
+    ]
+    if os.name != "nt":
+        link = quarantine / "sample.bin"
+        os.link(target, link)
+        cases.append(("hard link", link))
+    return cases
+
+
+def test_no_tool_leaks_host_layout_when_it_refuses_a_path(
+    server, refused_paths, tmp_path, monkeypatch
+):
+    """
+    No tool may echo the resolved allow-list, whatever refuses the path.
+
+    This is the structural form of the F-10 guarantee, and it exists because
+    the per-handler form was not enough. ``decompile_functions`` leaked the
+    whole quarantine list -- ``Path.home()``-derived, so the operator's
+    username -- through a chain no single handler owned: ``get_cached``
+    swallowed the refusal into a cache miss, the tool read that as "analyse
+    it", a job was submitted, ``get_analysis_context`` raised inside the job
+    work function, the job record stored the refusal's text, and
+    ``_run_or_degrade`` returned it as ``f"Error: {reason}"``. Every link was
+    locally defensible. Asserting on the whole surface is what catches that.
+    """
+    _disable_auto_session(server, monkeypatch)
+
+    offenders = []
+    for name, fn, kwargs in _binary_path_tools(server)[0]:
+        for label, path in refused_paths:
+            try:
+                result = str(fn(binary_path=str(path), **kwargs))
+            except Exception as exc:  # noqa: BLE001 - reported, not swallowed
+                offenders.append(f"{name} [{label}] raised {type(exc).__name__}")
+                continue
+            if str(tmp_path) in result:
+                offenders.append(f"{name} [{label}] echoed host layout")
+
+    assert not offenders, (
+        "tools disclosed host layout, or raised instead of returning a "
+        "refusal:\n  " + "\n  ".join(offenders)
+    )
+
+
+def test_every_tool_names_the_category_of_a_confinement_refusal(
+    server, refused_paths, monkeypatch
+):
+    """
+    A refusal has to say WHICH refusal it was, not just that one happened.
+
+    The B3 field report: a hard-linked staging copy and an out-of-bounds path
+    came back as the same four words plus a reference ID, so the failure read
+    as "wrong path" when the path had been accepted and only the link count
+    refused. Fixing the two handlers named in that report left ~25 tools still
+    collapsing, which is why this asserts over the surface instead.
+
+    Tools reach this guarantee two ways and the test does not care which: an
+    explicit ``except (PathTraversalError, FileSizeError)`` arm calling
+    safe_path_error, or the catch-all, since safe_tool_error routes those two
+    types through safe_path_error precisely so a tool cannot regress by
+    forgetting an arm.
+    """
+    _disable_auto_session(server, monkeypatch)
+    cases = dict(refused_paths)
+
+    vague = []
+    for name, fn, kwargs in _binary_path_tools(server)[0]:
+        oob_result = str(fn(binary_path=str(cases["out of bounds"]), **kwargs))
+        if "outside the directories" not in oob_result:
+            vague.append(f"{name}: out-of-bounds refusal does not say so")
+
+        # Only on POSIX: the hard-link check is not enabled on Windows, so
+        # there is no hard-link refusal to name there. The out-of-bounds half
+        # above does not depend on it and now runs everywhere -- taking the
+        # hard-link fixture directly made this whole test skip on Windows,
+        # which is the mistake refused_paths was introduced to fix and which
+        # was fixed in only one of the two sweeps the first time.
+        if "hard link" not in cases:
+            continue
+        hardlink_result = str(fn(binary_path=str(cases["hard link"]), **kwargs))
+        if "hard link" not in hardlink_result:
+            vague.append(f"{name}: hard-link refusal does not mention the link")
+        if hardlink_result == oob_result:
+            vague.append(f"{name}: the two refusals are identical")
+
+    assert not vague, (
+        "refusals that do not name their own category:\n  " + "\n  ".join(vague)
+    )
 
 
 # F-5: the second, unswept session store

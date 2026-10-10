@@ -68,6 +68,53 @@ allow-list:
 So `~/.ssh/id_rsa` and `/etc/shadow` are out of reach without you saying so.
 Report and rule output is separately confined to `~/.binary_mcp_output/`.
 
+### Hard links are refused, and that is a different refusal
+
+Containment is a prefix test on the resolved path, and `resolve()` follows
+symlinks only. A hard link has no target to follow -- it *is* the inode, under
+a second name -- so a link created inside an allowed directory, pointing at an
+inode outside it, passes every check above and reads back the outside file.
+There is no way to ask the kernel which other names an inode has, so while
+confinement is active a regular file with `st_nlink > 1` is refused.
+
+Two things bound the attack, and are worth knowing before you judge how much
+the refusal is buying. Hard links cannot cross filesystems, so the target must
+live on the same filesystem as the allowed directory -- an `os.link` from
+`/etc` into a tmpfs `/tmp` fails with `EXDEV`. And `fs.protected_hardlinks=1`, which stops an
+unprivileged user linking to a file they neither own nor can write, is set by
+most distributions -- Debian, Ubuntu and Fedora among them -- though the
+mainline kernel ships it as 0, so on a minimal or embedded image, or a host
+whose `/etc/sysctl.d` has been trimmed, only the same-filesystem constraint
+applies. Check `sysctl fs.protected_hardlinks` rather than assuming. What remains is a real
+bypass with a narrower reach than "any file on the host": a same-filesystem
+file the caller owns or can write, republished under an in-bounds name.
+
+That costs some false positives: a corpus de-duplicated with links (`cp -l`,
+`rsync --link-dest`, a content-addressed sample store) is refused even though
+it is legitimate. `BINARY_MCP_ALLOW_HARDLINKS=1` re-permits multiply-linked
+files and leaves directory confinement untouched -- deliberately a far smaller
+hammer than `BINARY_MCP_ALLOW_ANY_PATH`. Nothing this server writes trips the
+check; caches, carved output and dumps are all created with one link.
+Directories are exempt, and that exemption is doing real work: **every**
+directory has `st_nlink >= 2`, not just ones with subdirectories, so without
+the regular-file check every directory reaching the test would be refused.
+
+**The check does not run on Windows at all**, and the allow-list should be
+treated as advisory there: `mklink /H` is the equivalent of the construction
+above, and nothing refuses it. The skip is a deliberate choice not to rely on
+`st_nlink` on a platform where this project has not measured what CPython
+reports for a file with multiple NTFS links -- but an unmeasured platform
+difference is a reason to state the gap, not a reason to call the gap safe. If
+you run this server on Windows and the allow-list is load-bearing for you,
+confine it at the filesystem instead.
+
+The two refusals report separately. A hard-link refusal raises `HardLinkError`
+-- a `PathTraversalError` subclass, so existing handlers still catch it -- and
+says the link count was the problem and that widening
+`BINARY_MCP_ALLOWED_DIRS` will not help. An out-of-bounds path says the path is
+outside the allow-list. They used to be the same sentence, which sent operators
+to re-check an allow-list that had already accepted the directory.
+
 ## Symbol fetches leave the host
 
 A first import of a PE may fetch its PDB from a symbol server, which discloses
@@ -84,6 +131,7 @@ The keys below are documented in full in [Configuration](configuration.md).
 |----------|--------|
 | `BINARY_MCP_ALLOWED_DIRS` | Confine analysis to an explicit directory list |
 | `BINARY_MCP_REQUIRE_CONFINEMENT` | Fail closed: refuse any binary unless `BINARY_MCP_ALLOWED_DIRS` is set |
+| `BINARY_MCP_ALLOW_HARDLINKS` | Permit multiply-linked files. Keeps directory confinement in force |
 | `BINARY_MCP_ALLOW_ANY_PATH` | Opt out of confinement entirely. Not recommended |
 | `BINARY_MCP_ENABLE_RAW_WINDBG` | Enable `windbg_execute_command` behind its allowlist |
 | `BINARY_MCP_SYMBOL_OFFLINE` | Never contact the upstream symbol server |

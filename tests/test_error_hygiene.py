@@ -54,6 +54,14 @@ def assert_has_reference_id(text: str) -> None:
     assert re.search(r"Reference ID: [0-9a-f]{8}", text), text
 
 
+def _strip_reference_id(text: str) -> str:
+    """Drop the per-call reference ID so two messages can be compared."""
+    return "\n".join(
+        line for line in text.splitlines()
+        if not line.startswith("Reference ID:")
+    )
+
+
 # The helper itself
 
 
@@ -70,6 +78,112 @@ class TestSafeToolError:
         out = safe_tool_error("", RuntimeError(LEAK_MARKER))
         assert_no_host_leak(out)
         assert_has_reference_id(out)
+
+    @pytest.mark.parametrize("entry", ["base", "tool"])
+    def test_a_confinement_refusal_keeps_its_category(self, entry):
+        """
+        Both entry points must name the refusal, not collapse it.
+
+        Parametrized rather than written twice: these were two near-identical
+        assertion blocks differing only in which function they called, so the
+        next change to PATH_ERROR_GUIDANCE wording had to be chased in two
+        places and could be half-updated -- the duplication cost the code
+        under test documents at security.py's PATH_ERROR_GUIDANCE note.
+
+        "base" is security.safe_error_message, where every catch-all in the 15
+        modules under src/tools/ that never call safe_tool_error lands (202
+        call sites across 17 files reach it). "tool" is safe_tool_error, which
+        adds the operation name. Both delegate to the one renderer.
+        """
+        from src.utils.security import (
+            FileSizeError,
+            HardLinkError,
+            PathTraversalError,
+            safe_error_message,
+        )
+
+        def render(exc):
+            if entry == "base":
+                return safe_error_message("Failed to do the thing", exc)
+            return safe_tool_error("get_functions", exc)
+
+        hardlink = render(HardLinkError(LEAK_MARKER))
+        confinement = render(PathTraversalError(LEAK_MARKER))
+        oversize = render(FileSizeError(LEAK_MARKER))
+        # IsADirectoryError joined the routed set when sanitize_binary_path
+        # stopped signalling "not a file" with a bare ValueError. It is safe
+        # to route from anywhere, unlike ValueError, because "names a
+        # directory, not a file" is true of an open() on a directory too.
+        directory = render(IsADirectoryError(LEAK_MARKER))
+
+        for text in (hardlink, confinement, oversize, directory):
+            assert_no_host_leak(text)
+            # Asserted because downstream code depends on it: clean_cache's
+            # `extra` block has to land before the ID, and
+            # test_confinement_sweep's _without_reference_id helper assumes
+            # the ID is the last line.
+            assert_has_reference_id(text)
+            assert text.strip().splitlines()[-1].startswith("Reference ID:")
+
+        assert "hard link" in hardlink
+        assert "outside the directories" not in hardlink
+        assert "outside the directories" in confinement
+        assert "hard link" not in confinement
+        assert "size limit" in oversize
+        assert "names a directory" in directory
+
+        # Compared in full, not by first line. Every guidance value is a
+        # single line today, so splitlines()[0] was the whole message and the
+        # check could only fail if two values became byte-identical -- which
+        # the substring assertions above already rule out. Comparing the whole
+        # string says what is meant and does not silently narrow if a guidance
+        # entry is ever reflowed across two lines.
+        bodies = [
+            _strip_reference_id(t)
+            for t in (hardlink, confinement, oversize, directory)
+        ]
+        assert len(set(bodies)) == 4, bodies
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            FileNotFoundError("missing"),
+            NotADirectoryError("not a dir"),
+            PermissionError("denied"),
+        ],
+        ids=["FileNotFoundError", "NotADirectoryError", "PermissionError"],
+    )
+    def test_mapped_but_excluded_types_are_not_routed_at_the_base(self, exc):
+        """
+        The exclusions that can actually regress, tested at the base.
+
+        These three have PATH_ERROR_GUIDANCE entries but are deliberately NOT
+        in the base routing's isinstance tuple. (IsADirectoryError was in this
+        list until sanitize_binary_path started raising it; it is routed now,
+        and asserted by the test above.) The earlier version of this
+        test used a bare OSError for its negative case, which has no guidance
+        entry and is not a PathTraversalError or FileSizeError -- so the
+        isinstance check could never have matched it and the assertion could
+        not fail.
+
+        These can. Widen the tuple to PATH_ERROR_GUIDANCE's keys and a
+        "Ghidra installation not found" FileNotFoundError starts telling the
+        caller to "check the name and extension" of its binary, which is the
+        confidently-wrong answer the exclusion exists to prevent.
+        """
+        from src.utils.security import PATH_ERROR_GUIDANCE, safe_error_message
+
+        out = safe_error_message("Failed to do the thing", exc)
+        assert_no_host_leak(out)
+        # The generic envelope keeps the caller's own message...
+        assert "Failed to do the thing" in out
+        # ...and none of the path guidance text is substituted. Asserted
+        # against the mapping itself rather than the literal "Invalid path",
+        # which safe_path_error's own fallback can legitimately produce
+        # ("Invalid path for analyze_binary") and so was never a property of
+        # safe_error_message.
+        for guidance in PATH_ERROR_GUIDANCE.values():
+            assert guidance not in out
 
     def test_ghidra_diagnostic_passthrough_is_preserved(self):
         """
@@ -508,6 +622,18 @@ _AST_ALLOWED_HANDLERS = {
     #     non-negative int". Counts, kind names and the caller's own arguments;
     #     no raise site interpolates a path or any other host state.
     "CoverageError",
+    # urllib's two network error types, reviewed for the vt_tools raise sites
+    # the ast.Raise arm of this guard surfaced. Both interpolate ATTRIBUTES,
+    # never str(e): ``HTTPError.code`` is an int status and
+    # ``HTTPError.reason``/``URLError.reason`` is a status phrase or a socket
+    # error ("Not Found", "Name or service not known"). That is network state,
+    # not the host filesystem state F-10 is about, and it is the only thing
+    # that tells a user whether VirusTotal returned 404, 429 or refused the
+    # key -- collapsing it to a reference ID would make the VT tools
+    # materially harder to drive. Narrow handlers, not a blanket
+    # ``except Exception``, which is what keeps the audit bounded.
+    "HTTPError",
+    "URLError",
     # Third-party, reviewed: pefile raises PEFormatError with a fixed set of
     # structural descriptions ("DOS Header magic not found.", "Invalid NT
     # Headers signature.") and never interpolates the file path -- pefile is
@@ -631,7 +757,22 @@ def _walk_pruning_safe_helpers(node: ast.AST):
 
 def _exception_echoing_returns(path: Path) -> list[tuple[int, str, str]]:
     """
-    Find ``return f"...{e}..."`` statements governed by ``except ... as e``.
+    Find statements that echo a caught exception, governed by ``except ... as e``.
+
+    Covers ``return f"...{e}..."`` AND ``raise Foo(f"...{e}...")``. The guard
+    used to walk only ``ast.Return``, and that hole shipped a live leak: in
+    ``get_analysis_context`` a confinement refusal -- whose text interpolates
+    the resolved allow-list, and so ``Path.home()`` and the operator's
+    username -- was re-raised as
+
+        raise RuntimeError(f"Invalid binary path: {e}")
+
+    which is not a return, so this guard scored the file clean. The message
+    then became the job record's ``error`` and ``_run_or_degrade`` handed it
+    straight back to the caller. A ``raise`` is no safer than a ``return``
+    here: whether the string reaches the caller depends on what catches it,
+    and the whole point of the F-10 layer is not to have to reason about that
+    per call site.
 
     Returns ``(line_number, clause_text, source_text)`` for each offender,
     skipping handlers whose caught types are all on the allow-list.
@@ -652,9 +793,30 @@ def _exception_echoing_returns(path: Path) -> list[tuple[int, str, str]]:
         # exception if it names it, and the inner handler is visited on its
         # own turn for its own binding.
         for node in ast.walk(handler):
-            if not isinstance(node, ast.Return) or node.value is None:
+            # A bare `raise` (node.exc is None) re-raises the original object
+            # and composes no new string, so it cannot leak and is the fix this
+            # guard wants, not a finding.
+            if isinstance(node, ast.Return):
+                payload = node.value
+            elif isinstance(node, ast.Raise):
+                payload = node.exc
+            else:
                 continue
-            if handler.name in _interpolated_names(node.value):
+            if payload is None:
+                continue
+            # `raise e` re-raises the bound object and composes no string, so
+            # it is the same no-op as a bare `raise` and must not be flagged.
+            # RAISE ONLY: `return e` is a genuine leak, because returning the
+            # exception hands the caller its raw str. An earlier version of
+            # this exemption did not check the statement kind and silently
+            # stopped flagging `return e`, which the meta-test below caught.
+            if (
+                isinstance(node, ast.Raise)
+                and isinstance(payload, ast.Name)
+                and payload.id == handler.name
+            ):
+                continue
+            if handler.name in _interpolated_names(payload):
                 offenders.append(
                     (node.lineno, ", ".join(clauses), ast.unparse(node)[:120])
                 )
@@ -682,6 +844,108 @@ def test_no_returned_fstring_interpolates_a_caught_exception():
     assert not offenders, (
         "returned f-string interpolates a caught exception (audit F-10):\n  "
         + "\n  ".join(offenders)
+    )
+
+
+@pytest.mark.parametrize(
+    "label,body",
+    [
+        (
+            "the real get_analysis_context leak",
+            'def f():\n'
+            '    try:\n'
+            '        pass\n'
+            '    except (PathTraversalError, FileSizeError) as e:\n'
+            '        raise RuntimeError(f"Invalid binary path: {e}")\n',
+        ),
+        (
+            "raise from a catch-all",
+            'def f():\n'
+            '    try:\n'
+            '        pass\n'
+            '    except Exception as e:\n'
+            '        raise RuntimeError(f"Failed to analyze binary: {e}")\n',
+        ),
+        (
+            "raise with the exception as a bare arg",
+            'def f():\n'
+            '    try:\n'
+            '        pass\n'
+            '    except Exception as e:\n'
+            '        raise RuntimeError("boom: " + str(e))\n',
+        ),
+    ],
+)
+def test_ast_guard_catches_the_raise_spelling(label, body, tmp_path):
+    """
+    Meta-test: the ``raise`` arm must stay in the guard.
+
+    The guard walked only ``ast.Return`` for its first two passes, and that is
+    exactly how the get_analysis_context leak shipped -- a confinement
+    refusal, whose text carries the resolved allow-list and the operator's
+    username, re-raised through an f-string. Without this test a refactor
+    could narrow the walk back to returns and nothing would notice, because
+    the production tree would be clean either way.
+    """
+    path = tmp_path / "probe.py"
+    path.write_text(body, encoding="utf-8")
+    assert _exception_echoing_returns(path), (
+        f"guard no longer catches {label}; the raise spelling is how the "
+        f"F-10 leak in get_analysis_context reached production"
+    )
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # The sanctioned fix: re-raise the original object, compose nothing.
+        'def f():\n'
+        '    try:\n'
+        '        pass\n'
+        '    except (PathTraversalError, FileSizeError):\n'
+        '        raise\n',
+        # Chaining keeps the cause for the traceback without echoing its text.
+        'def f():\n'
+        '    try:\n'
+        '        pass\n'
+        '    except Exception as e:\n'
+        '        raise RuntimeError("Failed to analyze binary") from e\n',
+    ],
+)
+def test_ast_guard_allows_the_sanctioned_raise_forms(body, tmp_path):
+    """A bare re-raise and a ``from e`` chain compose no string, so neither
+    is a finding -- flagging them would push authors back toward f-strings."""
+    path = tmp_path / "probe.py"
+    path.write_text(body, encoding="utf-8")
+    assert not _exception_echoing_returns(path)
+
+
+def test_the_bare_name_exemption_is_raise_only(tmp_path):
+    """
+    `raise e` is exempt; `return e` is not. Pinned because I got it wrong.
+
+    The first version of the exemption checked only that the payload was the
+    handler's bound name, not the statement kind, so it silently stopped
+    flagging `return e` -- which IS a leak, since returning the exception
+    hands the caller its raw str.
+    """
+    raise_form = tmp_path / "r.py"
+    raise_form.write_text(
+        "def f():\n    try:\n        pass\n"
+        "    except Exception as e:\n        raise e\n",
+        encoding="utf-8",
+    )
+    assert not _exception_echoing_returns(raise_form)
+
+    return_form = tmp_path / "t.py"
+    return_form.write_text(
+        "def f():\n    try:\n        pass\n"
+        "    except Exception as e:\n        return e\n",
+        encoding="utf-8",
+    )
+    assert _exception_echoing_returns(return_form), (
+        "`return e` must stay flagged -- returning the exception hands the "
+        "caller its raw str"
     )
 
 
@@ -1023,7 +1287,6 @@ def test_reason_guard_allows_format_only_handlers(clause, tmp_path):
     assert not _reason_guard_flags("        raise E(S(reason=str(e)))", tmp_path, clause)
 
 
-# --------------------------------------------------------------------------
 # Audit F-10, third form: a parameter rebound to a RESOLVED path.
 #
 # The two guards above both key off an exception: one matches the literal
@@ -1043,7 +1306,6 @@ def test_reason_guard_allows_format_only_handlers(clause, tmp_path):
 # resolves and then misses -- so these returns are reachable with a resolved
 # path in hand. Echo os.path.basename(...), or keep the caller's own
 # reference in a separate name and echo that.
-# --------------------------------------------------------------------------
 
 _PATH_RESOLVERS = {"resolve_cached_binary"}
 

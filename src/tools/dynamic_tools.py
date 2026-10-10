@@ -464,7 +464,13 @@ def resolve_cached_binary(binary_ref: str) -> str:
     try:
         entries = [e for e in cache.list_cached() if e.get("binary_path")]
     except Exception as e:
-        raise BinaryResolutionError(f"Could not read the analysis cache index: {e}")
+        # Not interpolated: list_cached() failing is usually an OSError or a
+        # JSON error over a cache path, and those carry the cache root. The
+        # sentence is already the actionable part.
+        logger.error("Could not read the analysis cache index", exc_info=True)
+        raise BinaryResolutionError(
+            "Could not read the analysis cache index."
+        ) from e
 
     if not entries:
         raise BinaryResolutionError(

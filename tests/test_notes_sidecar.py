@@ -455,10 +455,14 @@ class TestLoadPdbAllowlist:
         )
 
         result = server_module.load_pdb(str(binary), pdb_path=str(pdb))
-        assert (
-            "outside the allowed directories" in result
-            or "Invalid PDB path" in result
-        ), result
+        # "outside the allowed directories" is deliberately NOT accepted any
+        # more. It was a hardcoded string on the PathTraversalError arm, and
+        # HardLinkError subclasses PathTraversalError -- so a hard-linked PDB
+        # inside an allowed directory was told its directory was wrong, the
+        # one false diagnosis this area was fixed to remove. The routed
+        # message names whichever refusal actually happened.
+        assert "Invalid PDB path" in result, result
+        assert str(pdb) not in result, "refusal echoed the caller's path"
 
     def test_user_supplied_missing_pdb_returns_friendly_error(
         self, server_module, tmp_path, monkeypatch
@@ -481,7 +485,14 @@ class TestLoadPdbAllowlist:
         )
 
         result = server_module.load_pdb(str(binary), pdb_path=str(missing))
-        assert "PDB not found" in result, result
+        # Was `assert "PDB not found" in result`. That message read
+        # `f"PDB not found at {pdb_path}"` -- friendly, and an echo of the
+        # caller's path, which is what error_hygiene exists to stop. Asserted
+        # on behaviour now: still says the file is missing, still actionable,
+        # no path.
+        assert "no file exists at the path supplied" in result, result
+        assert "Invalid PDB path" in result, result
+        assert str(missing) not in result, "refusal echoed the caller's path"
 
     def test_auto_fetched_pdb_bypasses_allowlist(
         self, server_module, tmp_path, monkeypatch

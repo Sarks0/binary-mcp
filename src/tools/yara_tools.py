@@ -307,6 +307,7 @@ def register_yara_tools(app, session_manager):
         app: FastMCP application instance
         session_manager: Session manager for accessing session data
     """
+    from src.tools.error_hygiene import safe_path_error
     from src.utils.security import (
         FileSizeError,
         PathTraversalError,
@@ -562,7 +563,7 @@ def register_yara_tools(app, session_manager):
             return _fence_rule(rule)
 
         except (PathTraversalError, FileSizeError) as e:
-            return safe_error_message("generate_yara_rule_from_strings", e)
+            return safe_path_error("generate_yara_rule_from_strings", e, "binary path")
         except Exception as e:
             logger.error(f"generate_yara_rule_from_strings failed: {e}")
             return safe_error_message("Failed to generate Yara rule from strings", e)

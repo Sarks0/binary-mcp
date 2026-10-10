@@ -35,8 +35,9 @@ import logging
 import uuid
 
 from src.utils.security import (
-    PATH_ERROR_GUIDANCE,
-    path_error_guidance,
+    FileSizeError,
+    PathTraversalError,
+    path_refusal_message,
     safe_error_message,
 )
 from src.utils.structured_errors import StructuredBaseError
@@ -101,14 +102,37 @@ def safe_tool_error(operation: str, error: Exception) -> str:
         )
         return f"{curated_structured_text(error)}\nReference ID: {error_id}"
 
+    # A confinement refusal that reaches a CATCH-ALL still gets its category.
+    #
+    # Thirteen read-only tools (get_functions, get_strings, get_xrefs,
+    # extract_metadata, ...) validate only through get_analysis_context and
+    # have no path arm of their own, so a refused path arrived here and came
+    # back as "<tool> failed" plus a reference ID -- no leak, but the caller
+    # could not tell a denied directory from a hard link from a broken Ghidra
+    # install. Routing these two types through safe_path_error fixes all of
+    # them at once, and means a tool added later cannot reintroduce the gap by
+    # forgetting an arm.
+    #
+    # Deliberately ONLY these two. Both are raised exclusively by this
+    # project's own path validators, so the category is unambiguous.
+    # FileNotFoundError is NOT included even though PATH_ERROR_GUIDANCE has
+    # text for it: the Ghidra detector raises it for a missing INSTALLATION
+    # ("Ghidra installation not found. Please set GHIDRA_HOME"), and answering
+    # that with "no file exists at the path supplied -- check the name and
+    # extension" would trade one vague error for a confidently wrong one. A
+    # tool that wants the missing-file category names FileNotFoundError in its
+    # own arm, where the provenance is known.
+    # safe_error_message routes these at the base too, so this branch is here
+    # only to supply the operation name -- which it has and the base does not.
+    if isinstance(error, (PathTraversalError, FileSizeError, IsADirectoryError)):
+        return safe_path_error(operation, error, "path")
+
     return safe_error_message(
         f"{operation} failed" if operation else "Tool call failed", error
     )
 
 
-# ---------------------------------------------------------------------------
 # Path-validation errors (audit F-10, second pass)
-# ---------------------------------------------------------------------------
 #
 # The first remediation pass routed catch-all handlers through
 # safe_tool_error, but left ~12 handlers doing
@@ -137,13 +161,14 @@ def safe_tool_error(operation: str, error: Exception) -> str:
 # and when it is not (a path taken from a session record or a cached context)
 # echoing it is another way host layout re-enters the transcript.
 
-# The mapping itself lives in src/utils/security.py so the src/utils/ producers
-# that raise StructuredBaseError from a path failure share exactly this text --
-# see the note there for why a second copy is what let the leak reopen.
-_PATH_ERROR_GUIDANCE = PATH_ERROR_GUIDANCE
+# The mapping and its renderer both live in src/utils/security.py; nothing in
+# this module holds a copy of either. See the note there for why a second copy
+# is what let the leak reopen last time.
 
 
-def safe_path_error(operation: str, error: Exception, subject: str = "path") -> str:
+def safe_path_error(
+    operation: str, error: Exception, subject: str = "path", extra: str = None
+) -> str:
     """
     Format a path-validation failure without disclosing host layout (F-10).
 
@@ -157,25 +182,12 @@ def safe_path_error(operation: str, error: Exception, subject: str = "path") -> 
     Returns:
         Safe, still-actionable error string carrying a reference ID.
     """
-    guidance = path_error_guidance(error)
+    routed = path_refusal_message(operation, error, subject, extra)
+    if routed is not None:
+        return routed
 
-    if guidance is None:
-        # A ValueError from sanitize_binary_path ("Path is not a file: ...")
-        # or the wrapped OSError from sanitize_output_path ("Invalid path:
-        # ...") -- both interpolate a resolved absolute path, so neither text
-        # can be forwarded. Fall back to the generic safe envelope.
-        return safe_error_message(f"Invalid {subject} for {operation}", error)
-
-    error_id = str(uuid.uuid4())[:8]
-    logger.warning(
-        "Error %s: %s rejected %s: %s: %s",
-        error_id,
-        operation or "tool call",
-        subject,
-        type(error).__name__,
-        error,
-    )
-    return (
-        f"Error: Invalid {subject} -- {guidance}\n"
-        f"Reference ID: {error_id}"
-    )
+    # None means the category cannot be described without echoing the text: a
+    # ValueError from sanitize_binary_path ("Path is not a file: ...") or the
+    # wrapped OSError from sanitize_output_path ("Invalid path: ..."), both of
+    # which interpolate a resolved absolute path. Generic envelope instead.
+    return safe_error_message(f"Invalid {subject} for {operation}", error)

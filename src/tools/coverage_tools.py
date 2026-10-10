@@ -236,7 +236,10 @@ def register_coverage_tools(app, session_manager, cache, runner=None):
             resolved_id, resolved_path = _resolve(binary_id, binary_path)
         except ValueError as exc:
             return _error(str(exc))
-        except (PathTraversalError, FileSizeError, FileNotFoundError) as exc:
+        except (
+            PathTraversalError, FileSizeError, FileNotFoundError,
+            IsADirectoryError,
+        ) as exc:
             return _error(safe_path_error("get_coverage_status", exc, "binary path"))
 
         if not resolved_id:
@@ -344,7 +347,10 @@ def register_coverage_tools(app, session_manager, cache, runner=None):
             resolved_id, resolved_path = _resolve(binary_id, binary_path)
         except ValueError as exc:
             return _error(str(exc))
-        except (PathTraversalError, FileSizeError, FileNotFoundError) as exc:
+        except (
+            PathTraversalError, FileSizeError, FileNotFoundError,
+            IsADirectoryError,
+        ) as exc:
             return _error(safe_path_error("get_next_unreviewed", exc, "binary path"))
 
         if not resolved_id:
@@ -441,7 +447,10 @@ def register_coverage_tools(app, session_manager, cache, runner=None):
         """
         try:
             path = str(sanitize_binary_path(binary_path))
-        except (PathTraversalError, FileSizeError, FileNotFoundError) as exc:
+        except (
+            PathTraversalError, FileSizeError, FileNotFoundError,
+            IsADirectoryError,
+        ) as exc:
             return _error(safe_path_error("coverage_index", exc, "binary path"))
 
         try:
@@ -513,7 +522,10 @@ def register_coverage_tools(app, session_manager, cache, runner=None):
             resolved_id, resolved_path = _resolve(binary_id, binary_path)
         except ValueError as exc:
             return _error(str(exc))
-        except (PathTraversalError, FileSizeError, FileNotFoundError) as exc:
+        except (
+            PathTraversalError, FileSizeError, FileNotFoundError,
+            IsADirectoryError,
+        ) as exc:
             return _error(safe_path_error("mark_function_reviewed", exc, "binary path"))
 
         if not resolved_id:
@@ -624,7 +636,10 @@ def register_coverage_tools(app, session_manager, cache, runner=None):
             resolved_id, resolved_path = _resolve(binary_id, binary_path)
         except ValueError as exc:
             return _error(str(exc))
-        except (PathTraversalError, FileSizeError, FileNotFoundError) as exc:
+        except (
+            PathTraversalError, FileSizeError, FileNotFoundError,
+            IsADirectoryError,
+        ) as exc:
             return _error(safe_path_error("mark_functions_examined", exc, "binary path"))
 
         if not resolved_id:
@@ -739,7 +754,10 @@ def register_coverage_tools(app, session_manager, cache, runner=None):
             resolved_id, resolved_path = _resolve(binary_id, binary_path)
         except ValueError as exc:
             return _error(str(exc))
-        except (PathTraversalError, FileSizeError, FileNotFoundError) as exc:
+        except (
+            PathTraversalError, FileSizeError, FileNotFoundError,
+            IsADirectoryError,
+        ) as exc:
             return _error(safe_path_error("reset_coverage", exc, "binary path"))
 
         if not resolved_id:

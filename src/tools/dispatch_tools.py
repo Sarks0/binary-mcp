@@ -293,6 +293,7 @@ def register_dispatch_tools(app, session_manager, cache, runner):
         runner: GhidraRunner instance (kept for signature parity; this
             tool is strictly cache-only and never invokes it).
     """
+    from src.tools.error_hygiene import safe_path_error
     from src.utils.security import (
         FileSizeError,
         PathTraversalError,
@@ -438,7 +439,7 @@ def register_dispatch_tools(app, session_manager, cache, runner):
             return "\n".join(output)
 
         except (PathTraversalError, FileSizeError) as e:
-            return safe_error_message("find_ioctl_handlers", e)
+            return safe_path_error("find_ioctl_handlers", e, "binary path")
         except Exception as e:
             logger.exception("find_ioctl_handlers failed")
             return safe_error_message("Failed to find IOCTL handlers", e)

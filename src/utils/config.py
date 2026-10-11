@@ -12,6 +12,7 @@ Usage:
 
 import logging
 import os
+import re
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -91,6 +92,89 @@ def _parse_env_file(env_path: Path) -> dict[str, str]:
     return config
 
 
+# Keys whose value is a credential rather than a setting. These are served
+# from _config_cache only and deliberately NOT exported to os.environ: the
+# Ghidra subprocess inherits the environment wholesale (runner.py builds its
+# env from os.environ.copy()) and it runs analysis on untrusted samples, so a
+# bearer token exported here would sit readable in /proc/<jvm>/environ for the
+# length of a decompile. Every in-process reader goes through get_config(),
+# which finds them in the cache regardless.
+_SECRET_KEY_PATTERN = re.compile(r"TOKEN|SECRET|PASSWORD|CREDENTIAL|API_KEY", re.I)
+
+# Keys whose value POINTS AT a credential: a filesystem path to a TLS private
+# key. The path is not the key, so exporting it discloses no key material --
+# but it does tell a sample that reaches code execution inside the Ghidra JVM
+# exactly where the key file lives, which it would otherwise have to guess,
+# and it can read that file as the same user. Nothing reads these off
+# os.environ (BINARY_MCP_REMOTE_TLS_KEY and X64DBG_TLS_CLIENT_KEY both go
+# through get_config in src/utils/remote.py), so holding them back costs
+# nothing. The matching *_TLS_CERT and *_TLS_CA paths are public material and
+# are not held back.
+_SECRET_PATH_PATTERN = re.compile(r"_KEY$", re.I)
+
+# Keys published to os.environ that are NOT in CONFIG_KEYS.
+#
+# They cannot be in CONFIG_KEYS: that surface is this project's own settings,
+# and tests/test_docs_accuracy.py::test_no_config_key_is_dead requires every
+# entry to be read by something under src/. Nothing of ours reads any of
+# these -- urllib resolves the proxy variables itself, per request -- which is
+# exactly why they have to reach the real environment rather than being served
+# from the cache. Declaring them here is what keeps them from being "works by
+# accident": before this list existed, no_proxy was exported only because the
+# filter happened to be a denylist over whatever the file contained.
+_PASSTHROUGH_ENV_KEYS = frozenset({
+    "no_proxy", "NO_PROXY",
+    "http_proxy", "HTTP_PROXY",
+    "https_proxy", "HTTPS_PROXY",
+})
+
+
+def _export_to_environ(values: dict[str, str]) -> None:
+    """Publish declared .env settings as real environment variables.
+
+    Not every setting is read through get_config(). Some are read straight off
+    os.environ -- by third-party libraries (requests resolves no_proxy through
+    urllib, which reads the environment per request) and by our own subprocess
+    plumbing (runner.py reads GHIDRA_MAX_HEAP_MB from os.environ to build
+    _JAVA_OPTIONS). While .env lived only in _config_cache those readers never
+    saw it at all, so such a key set in .env was silently ignored and the
+    built-in default won with nothing anywhere reporting the discrepancy.
+
+    Two filters, in this order, because they answer different questions.
+
+    DECLARED: a key is exported only if this project knows about it. A .env is
+    an operator's own file and may hold anything -- a personal access token, a
+    cloud credential -- and the first version of this function was a denylist
+    over the whole file, so a credential whose name missed the pattern
+    (MY_GITHUB_PAT matches none of it) would have been handed to the JVM that
+    parses untrusted samples. Refusing the undeclared is the same fail-closed
+    posture the rest of this project takes, and it fails in the safe
+    direction: an unexported setting is ignored, which is visible, where an
+    over-exported secret is not.
+
+    NOT A CREDENTIAL: of the declared keys, those holding a secret or a path
+    to one stay in the cache. See the two patterns above.
+
+    setdefault preserves this module's documented precedence: a real
+    environment variable still beats .env.
+
+    CONFIG_KEYS is defined below this function; the reference resolves when
+    load_env() calls it, which never happens at import time.
+    """
+    for key, value in values.items():
+        if key not in CONFIG_KEYS and key not in _PASSTHROUGH_ENV_KEYS:
+            logger.debug(
+                "Not exporting %s from .env: not a declared setting. "
+                "get_config() still serves it in-process.", key
+            )
+            continue
+        if _SECRET_KEY_PATTERN.search(key) or _SECRET_PATH_PATTERN.search(key):
+            continue
+        if key not in os.environ:
+            os.environ[key] = value
+            logger.debug("Exported %s from .env to the environment", key)
+
+
 def load_env():
     """Load configuration from .env file."""
     global _env_loaded, _config_cache
@@ -103,6 +187,7 @@ def load_env():
         logger.info(f"Loading configuration from: {env_file}")
         _config_cache = _parse_env_file(env_file)
         logger.debug(f"Loaded {len(_config_cache)} config values from .env")
+        _export_to_environ(_config_cache)
     else:
         logger.debug("No .env file found")
 
@@ -177,6 +262,7 @@ CONFIG_KEYS = {
 
     # Ghidra
     "GHIDRA_HOME": "Path to Ghidra installation directory",
+    "GHIDRA_INSTALL_DIR": "Alias for GHIDRA_HOME, which is the name Ghidra's own tooling uses. Checked after GHIDRA_HOME.",
     "GHIDRA_TIMEOUT": "Default wall-clock timeout for Ghidra analysis (seconds, 30-3600, default 1800)",
     "GHIDRA_FUNCTION_TIMEOUT": "Per-function decompilation timeout (seconds, default 30)",
     "GHIDRA_MAX_FUNCTIONS": "Cap on functions processed per Ghidra run (0 = unlimited)",
@@ -189,24 +275,61 @@ CONFIG_KEYS = {
     "GHIDRA_MAX_HEAP_MB": "JVM max heap for Ghidra subprocess in MB (default 4096). Bump to 6144-8192 for very large binaries.",
     "BINARY_MCP_INLINE_DEADLINE": "Seconds a Ghidra-invoking tool may block before returning a job handle instead (default 25, max 900). Raise it if your MCP client is patient -- under Claude Code, where long calls move to a background task after 2 min, 90-120 returns more answers inline.",
 
-    # x64dbg
-    "X64DBG_BRIDGE_URL": "URL for x64dbg HTTP bridge (default: http://localhost:27042)",
-    "X64DBG_TIMEOUT": "Default timeout for x64dbg commands (seconds)",
+    # x64dbg (the Obsidian plugin's HTTP listener)
+    "X64DBG_HOST": "Host the Obsidian plugin's HTTP listener is reachable on (default 127.0.0.1). A non-loopback host additionally requires BINARY_MCP_REMOTE_ALLOW, X64DBG_TLS_CA and OBSIDIAN_AUTH_TOKEN; a tunnel whose local end is 127.0.0.1 needs none of them.",
+    "X64DBG_PORT": "Port for that listener (default 8765, which is the port obsidian_server.exe binds).",
+    "X64DBG_TIMEOUT": "Default timeout for x64dbg commands (seconds, default 30)",
+    "X64DBG_TLS_CA": "PEM CA bundle that signs the debugger host's server certificate. Setting it selects https and verifies against this CA instead of the system trust store. Required for a non-loopback host. obsidian_server.exe serves TLS itself when its obsidian.ini names a certificate; a TLS terminator in front of it works the same from here.",
+    "X64DBG_TLS_CLIENT_CERT": "PEM client certificate this server presents to the debugger host, for mutual TLS. Requires X64DBG_TLS_CA.",
+    "X64DBG_TLS_CLIENT_KEY": "PEM private key matching X64DBG_TLS_CLIENT_CERT.",
+    "OBSIDIAN_AUTH_TOKEN": "Bearer token for the Obsidian plugin's HTTP API. For a loopback host it is optional: the bridge falls back to the token file the plugin writes in %TEMP%. For a non-loopback host it is REQUIRED, because that file is on the debugger host and not on this machine.",
+
+    # WinDbg / kernel debugging
+    "WINDBG_PATH": "Path to the Windows debuggers installation (auto-detected when unset).",
+    "WINDBG_TIMEOUT": "Timeout for a single WinDbg command (seconds, default 30)",
+    "WINDBG_DEBUG": "Set to any non-empty value for verbose dbgeng diagnostics.",
+    "KDNET_TIMEOUT": "Timeout for establishing a KDNET kernel connection (seconds, default 60)",
+    "BINARY_MCP_ENABLE_RAW_WINDBG": "Set to 1 to enable windbg_execute_command behind its fail-closed allowlist. Off by default.",
 
     # Symbol server (PDB fetch + WinDbg sympath - shared by static analysis and live debugging)
     "BINARY_MCP_SYMBOL_PATH": "Windows-style _NT_SYMBOL_PATH for PDB fetch (overrides _NT_SYMBOL_PATH).",
     "BINARY_MCP_SYMBOL_CACHE": "Override the on-disk symbol cache directory (defaults to ~/.cache/binary_mcp/symbols on POSIX, ~/.binary_mcp_cache/symbols on Windows). Shared by analyze_binary and live WinDbg sessions.",
     "BINARY_MCP_SYMBOL_SERVER": "Override upstream symbol server (default https://msdl.microsoft.com/download/symbols).",
     "BINARY_MCP_SYMBOL_OFFLINE": "Set to 1 to skip the upstream symbol server and serve only from the local cache (air-gapped sessions).",
+    "BINARY_MCP_ALLOW_PRIVATE_SYMBOL_SERVERS": "Set to 1 to permit a symbol server on a private or loopback address, for an internal symbol store. Off by default: a public name resolving into your network is an SSRF, not a symbol server.",
     "BINARY_MCP_ALLOW_HTTP_SYMBOLS": "Set to 1 to permit http:// symbol servers (off by default; PDBs are MITM-sensitive).",
     "BINARY_MCP_AUTO_PDB": "Fetch a PDB from the symbol server on a binary's first import: 'microsoft' (default; only binaries whose version info names Microsoft), 'always', or 'never'. Fetching sends the PDB name and GUID to the server, so keep 'microsoft' or 'never' for samples you don't want disclosed. load_pdb's own auto-fetch applies the same vendor check and refuses up front (no network, no re-analysis) when a third-party binary is pointed at the Microsoft-only public server; override per call with allow_non_microsoft=True.",
 
-    # Analysis
-    "BINARY_MCP_CACHE_DIR": "Directory for caching analysis results",
-    "BINARY_MCP_SESSION_DIR": "Directory for storing session data",
+    # Storage
+    #
+    # BINARY_CACHE_DIR is the real name of what this dict used to advertise as
+    # BINARY_MCP_CACHE_DIR -- a key nothing read. get_cache_dir() below is the
+    # only resolver, and it reads BINARY_CACHE_DIR.
+    "BINARY_CACHE_DIR": "Base directory for all on-disk state: the analysis cache, Ghidra projects, saved sessions, job records and per-engine error logs (default ~/ghidra_mcp_cache).",
+    "BINARY_MCP_CARVE_DIR": "Destination for carved embedded binaries (default ~/.cache/binary_mcp/carved on POSIX, ~/.binary_mcp_cache/carved on Windows).",
+    "BINARY_MCP_SESSION_DIR": "Directory for saved analysis sessions (default ~/.binary_mcp_sessions).",
+
+    # Path confinement -- see docs/security.md
+    "BINARY_MCP_ALLOWED_DIRS": "Directories analysis is confined to, separated by ':' (POSIX) or ';' (Windows). Unset falls back to the quarantine directories.",
+    "BINARY_MCP_REQUIRE_CONFINEMENT": "Fail closed: refuse any binary unless BINARY_MCP_ALLOWED_DIRS is set explicitly.",
+    "BINARY_MCP_ALLOW_ANY_PATH": "Opt out of path confinement entirely. Not recommended; ignored when BINARY_MCP_REQUIRE_CONFINEMENT is set.",
+    "BINARY_MCP_ALLOW_HARDLINKS": "Re-permit multiply linked regular files. Narrower than BINARY_MCP_ALLOW_ANY_PATH: directory confinement stays in force.",
+
+    # Transport -- see docs/remote-access.md
+    "BINARY_MCP_TRANSPORT": "MCP transport: 'stdio' (default) or 'http'. 'http' lets a client on another host connect instead of spawning the server itself.",
+    "BINARY_MCP_HTTP_HOST": "Address the HTTP transport binds (default 127.0.0.1). A non-loopback address additionally requires BINARY_MCP_REMOTE_ALLOW, TLS and an explicit token.",
+    "BINARY_MCP_HTTP_PORT": "Port the HTTP transport binds (default 8770).",
+    "BINARY_MCP_HTTP_PATH": "URL path the MCP endpoint is served at (default /mcp).",
+    "BINARY_MCP_HTTP_TOKEN": "Bearer token the HTTP transport requires. Generated and logged once per start when unset on loopback; REQUIRED for a non-loopback bind, so restarts do not invalidate the client's config.",
+    "BINARY_MCP_HTTP_ALLOWED_HOSTS": "Extra Host/Origin header values the HTTP transport accepts, comma-separated. The bind address is always accepted; add the DNS name clients dial so a name-based request is not refused as rebinding.",
+    "BINARY_MCP_REMOTE_ALLOW": "Master switch for binding the HTTP transport off loopback. Without it a non-loopback bind is refused.",
+    "BINARY_MCP_REMOTE_TLS_CERT": "PEM certificate chain for the HTTP transport. Required for a non-loopback bind.",
+    "BINARY_MCP_REMOTE_TLS_KEY": "PEM private key matching BINARY_MCP_REMOTE_TLS_CERT.",
+    "BINARY_MCP_REMOTE_TLS_CA": "PEM CA bundle used to verify client certificates. Setting it turns on mutual TLS: a client without a certificate this CA signed is refused at the TLS layer.",
+    "BINARY_MCP_REMOTE_CLIENT_ALLOWLIST": "Comma-separated client addresses or CIDRs allowed to reach the HTTP transport. Checked before authentication; unset means any address that gets past TLS may present a token.",
 
     # Logging
-    "BINARY_MCP_LOG_LEVEL": "Logging level (DEBUG, INFO, WARNING, ERROR)",
+    "BINARY_MCP_LOG_LEVEL": "Logging level (DEBUG, INFO, WARNING, ERROR; default INFO).",
 }
 
 

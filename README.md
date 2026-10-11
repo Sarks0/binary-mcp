@@ -19,6 +19,18 @@ the whole workflow happens in one place instead of across four GUIs.
 Requires Python 3.12+ and Java 21+ for Ghidra. Both debuggers are Windows only;
 everything else runs anywhere.
 
+## Architecture
+
+One server process per connected client. The assistant talks MCP over stdio;
+each engine runs behind its own boundary, and the sample itself is only ever
+read.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/architecture-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="docs/images/architecture-light.png">
+  <img alt="binary-mcp architecture: an AI assistant talks MCP over stdio to the binary-mcp server, whose tool layer sits behind guardrails, sessions, jobs and a shared cache, and which drives Ghidra, ILSpyCmd and pefile for static analysis on any OS and x64dbg and WinDbg for live debugging on Windows." src="docs/images/architecture-dark.png">
+</picture>
+
 ## Quick Start
 
 ```bash

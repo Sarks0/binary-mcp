@@ -1,6 +1,7 @@
 #include "plugin.h"
 #include "event_system.h"
 #include "../pipe_protocol.h"
+#include "../server/listener_policy.h"
 #include <cstdio>
 #include <cstdarg>
 #include <string>
@@ -335,7 +336,7 @@ void InitCoverageLock() {
 }
 
 // Logging helpers
-// ---------------------------------------------------------------------------
+
 // Format-string checking for the log wrappers (CWE-686 / MSVC C4477)
 //
 // These are variadic wrappers around vsnprintf, and MSVC applies its C4477
@@ -361,7 +362,6 @@ void InitCoverageLock() {
 // <vcruntime.h> (so <cstdio> above is sufficient). The fallback below means a
 // toolchain without SAL still compiles: an annotation that documents intent
 // must never be the thing that breaks a build.
-// ---------------------------------------------------------------------------
 #ifndef _Printf_format_string_
 #define _Printf_format_string_
 #endif
@@ -542,7 +542,6 @@ std::string BuildJsonResponse(bool success, const std::string& data = "") {
     return response;
 }
 
-// ---------------------------------------------------------------------------
 // OUTPUT PATH CONFINEMENT -- finding F-27
 //
 // Two handlers used to take a filesystem path straight out of the request and
@@ -579,7 +578,6 @@ std::string BuildJsonResponse(bool success, const std::string& data = "") {
 // below it here. Three layers, none of them sufficient alone: the syntactic
 // rejections are a fast first pass, the prefix check is the lexical control,
 // and the reparse-point walk is the physical one.
-// ---------------------------------------------------------------------------
 
 // True if `path` exists AND is a reparse point (junction, directory symlink,
 // mount point). CWE-59.
@@ -2065,8 +2063,7 @@ std::string HandleHideDebugger(const std::string& request) {
 }
 
 // WAIT/SYNCHRONIZATION HANDLERS (Phase 1)
-//
-// ---------------------------------------------------------------------------
+
 // Finding F-20 -- plugin-image use-after-free on unload.
 //
 // These three handlers run on PipeServerThread and poll for up to five minutes
@@ -2090,7 +2087,6 @@ std::string HandleHideDebugger(const std::string& request) {
 //
 // AbortableSleep returns true if it slept the full interval, false if shutdown
 // was signalled (or the event is unusable, which is also a reason to stop).
-// ---------------------------------------------------------------------------
 static bool AbortableSleep(DWORD milliseconds) {
     if (!g_running.load()) {
         return false;
@@ -4308,7 +4304,6 @@ void OnSystemBreakpoint(CBTYPE cbType, PLUG_CB_SYSTEMBREAKPOINT* info) {
     );
 }
 
-// ---------------------------------------------------------------------------
 // EXECUTE_COMMAND gate -- AUTHORITATIVE. Allowlist, fails closed.
 //
 // What this used to be, and why it was replaced (audit findings F-4 / F-9):
@@ -4354,7 +4349,6 @@ void OnSystemBreakpoint(CBTYPE cbType, PLUG_CB_SYSTEMBREAKPOINT* info) {
 // EXECUTION commands (ticnd/tocnd/tibt/tobt) are present because the bridge's
 // conditional-tracing methods issue them and they only resume the debuggee,
 // which the dedicated run/step tools already permit.
-// ---------------------------------------------------------------------------
 static const char* ALLOWED_COMMANDS[] = {
     // Disassembly navigation and instruction queries (read-only)
     "dis", "disasm", "dis.prev", "dis.next", "dis.iscall", "dis.isbranch",
@@ -4413,7 +4407,6 @@ static const char* ALLOWED_COMMANDS[] = {
     nullptr  // sentinel
 };
 
-// ---------------------------------------------------------------------------
 // Finding F-16 (plugin side) -- the gate matched ONE token, DbgCmdExec runs
 // MANY commands.
 //
@@ -4438,7 +4431,6 @@ static const char* ALLOWED_COMMANDS[] = {
 //   * a ';' inside a quoted argument (log "a;b") is still treated as a
 //     separator, because this code does not model x64dbg's quoting rules and
 //     guessing them wrong in the permissive direction is how gates fail.
-// ---------------------------------------------------------------------------
 
 // Match ONE already-split command segment against ALLOWED_COMMANDS.
 // Every path that is not an exact table hit returns false.
@@ -4646,7 +4638,6 @@ static void ClosePipeServerHandle() {
     if (g_pipeHandleLockInit) LeaveCriticalSection(&g_pipeHandleLock);
 }
 
-// ---------------------------------------------------------------------------
 // Finding F-17 -- the named pipe had NO authentication and the wrong DACL.
 //
 // The pipe is the plugin's real control surface: every request that reaches the
@@ -4677,7 +4668,6 @@ static void ClosePipeServerHandle() {
 // to that process (g_serverProcess) for its whole lifetime, and Windows cannot
 // recycle a PID while a handle to the process is open. A zero g_serverProcessId
 // means no server has been spawned yet, which is a reject, not a bypass.
-// ---------------------------------------------------------------------------
 static bool IsPipeClientAuthorised(HANDLE pipe) {
     ULONG clientPid = 0;
     if (!GetNamedPipeClientProcessId(pipe, &clientPid)) {
@@ -5287,11 +5277,141 @@ static bool SpawnHTTPServer() {
         return false;
     }
 
-    LogInfo("Spawning Obsidian server: %s", serverPath);
+    // Listener configuration comes from obsidian.ini beside the plugin.
+    //
+    // An ini read with GetPrivateProfileString rather than x64dbg's
+    // BridgeSettingGet: it is plain Win32 with no SDK surface to track, the
+    // operator can edit it without x64dbg's settings dialog, and install.ps1
+    // can write it during a -RemoteListener setup. It sits next to the server
+    // executable and its log, which is where someone looking for it will look.
+    //
+    // Absent or empty, every value defaults to what this plugin has always
+    // spawned: loopback, port 8765, no TLS. The server's own policy
+    // (server/listener_policy.h) is what refuses an unsafe combination; this
+    // only forwards.
+    char iniPath[MAX_PATH];
+    snprintf(iniPath, sizeof(iniPath), "%sobsidian.ini", pluginPath);
 
-    // Build command line (lpCommandLine must be writable per MSDN)
-    char cmdLine[MAX_PATH + 2];
-    snprintf(cmdLine, sizeof(cmdLine), "\"%s\"", serverPath);
+    std::string arguments;
+    bool iniRejected = false;
+
+    // Each ini value is passed on a command line, so it is restricted to the
+    // characters its flag can legitimately contain. The server validates
+    // thumbprints and addresses properly, but it validates them AFTER the
+    // command line has been split -- a value carrying a quote or a space could
+    // smuggle a second flag past the one being set. Refusing the whole ini is
+    // the right answer: a listener configured differently from how it was
+    // written is worse than one that does not start.
+    const auto readSetting = [&](const char* key, std::string& out) -> bool {
+        char buffer[512] = {};
+        const DWORD length = GetPrivateProfileStringA("listener", key, "", buffer,
+                                                      sizeof(buffer), iniPath);
+        out.assign(buffer, length);
+
+        // Trim before the character check, not after. GetPrivateProfileString
+        // is not consistent about trailing whitespace across Windows versions,
+        // and a value that came back as "192.168.1.50 " would otherwise fail
+        // the space check below -- refusing the whole ini over a trailing blank
+        // the operator cannot see.
+        size_t begin = 0;
+        size_t end = out.size();
+        while (begin < end && (out[begin] == ' ' || out[begin] == '\t')) begin++;
+        while (end > begin && (out[end - 1] == ' ' || out[end - 1] == '\t' ||
+                               out[end - 1] == '\r' || out[end - 1] == '\n')) end--;
+        out = out.substr(begin, end - begin);
+
+        for (size_t i = 0; i < out.size(); i++) {
+            const char c = out[i];
+            // The comma is in this set because allow_clients and allow_hosts
+            // are documented as comma-separated and appendList below exists to
+            // split them. Without it, the format docs/remote-access.md tells
+            // operators to write made iniRejected true, SpawnHTTPServer
+            // returned false, and NO listener started at all -- not even the
+            // loopback default -- with the only clue being a malformed-file
+            // message for a file written exactly as documented. It is safe to
+            // allow: Windows splits a command line on whitespace and quotes,
+            // so a comma inside a value cannot become a separate argument.
+            const bool safe = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                              (c >= '0' && c <= '9') || c == '.' || c == '-' ||
+                              c == '_' || c == '/' || c == ':' || c == ',';
+            if (!safe) {
+                LogError("obsidian.ini: [listener] %s contains an unexpected "
+                         "character; refusing the whole file", key);
+                iniRejected = true;
+                out.clear();
+                return false;
+            }
+        }
+        return !out.empty();
+    };
+
+    std::string bindAddress;
+    std::string port;
+    std::string certThumbprint;
+    std::string clientCaThumbprint;
+    std::string allowClients;
+    std::string allowHosts;
+
+    const bool haveBind = readSetting("bind", bindAddress);
+    const bool havePort = readSetting("port", port);
+    const bool haveCert = readSetting("tls_cert_thumbprint", certThumbprint);
+    const bool haveClientCa = readSetting("tls_client_ca_thumbprint", clientCaThumbprint);
+    const bool haveClients = readSetting("allow_clients", allowClients);
+    const bool haveHosts = readSetting("allow_hosts", allowHosts);
+    const bool machineStore =
+        GetPrivateProfileIntA("listener", "machine_store", 0, iniPath) != 0;
+
+    if (iniRejected) {
+        LogError("Not spawning the server: obsidian.ini is malformed. Fix or "
+                 "delete %s; deleting it restores the loopback default.", iniPath);
+        return false;
+    }
+
+    if (haveBind) arguments += " --bind " + bindAddress;
+    if (havePort) arguments += " --port " + port;
+    if (haveCert) arguments += " --tls-cert-thumbprint " + certThumbprint;
+    if (haveClientCa) arguments += " --tls-client-ca-thumbprint " + clientCaThumbprint;
+    if (machineStore) arguments += " --machine-store";
+
+    // Comma-separated in the ini, one flag each on the command line.
+    const auto appendList = [&](const std::string& list, const char* flag) {
+        size_t start = 0;
+        while (start <= list.size()) {
+            const size_t comma = list.find(',', start);
+            const size_t end = (comma == std::string::npos) ? list.size() : comma;
+            const std::string item = list.substr(start, end - start);
+            if (!item.empty()) {
+                arguments += std::string(" ") + flag + " " + item;
+            }
+            if (comma == std::string::npos) break;
+            start = comma + 1;
+        }
+    };
+    if (haveClients) appendList(allowClients, "--allow-client");
+    if (haveHosts) appendList(allowHosts, "--allow-host");
+
+    LogInfo("Spawning Obsidian server: %s", serverPath);
+    // The effective listener, in the x64dbg log, at startup. Whether this
+    // instance is reachable from the network is the one thing an analyst should
+    // be able to see at a glance rather than infer from an ini.
+    if (arguments.empty()) {
+        LogInfo("Listener: 127.0.0.1:8765, no TLS (default; no obsidian.ini settings)");
+    } else {
+        LogInfo("Listener options from obsidian.ini:%s", arguments.c_str());
+        if (haveBind && bindAddress != "127.0.0.1") {
+            LogInfo("NOTE: this listener is configured for %s -- it may be "
+                    "reachable from the network.", bindAddress.c_str());
+        }
+    }
+
+    // Build command line (lpCommandLine must be writable per MSDN).
+    // A std::vector, not a fixed char[MAX_PATH + 2]: the path plus two
+    // thumbprints and an allowlist is comfortably past MAX_PATH, and snprintf
+    // would have silently truncated the flags -- producing a listener
+    // configured differently from how it was asked to be.
+    const std::string commandLine = "\"" + std::string(serverPath) + "\"" + arguments;
+    std::vector<char> cmdLine(commandLine.begin(), commandLine.end());
+    cmdLine.push_back('\0');
 
     // Spawn process
     STARTUPINFOA si = {};
@@ -5300,7 +5420,7 @@ static bool SpawnHTTPServer() {
 
     if (!CreateProcessA(
         nullptr,       // lpApplicationName: NULL so lpCommandLine is used
-        cmdLine,       // Command line (writable buffer, quoted for spaces)
+        cmdLine.data(),  // Command line (writable buffer, quoted for spaces)
         nullptr,       // Process attributes
         nullptr,       // Thread attributes
         FALSE,         // Inherit handles
@@ -5347,7 +5467,14 @@ static bool SpawnHTTPServer() {
         } else if (exitCode == 0xC0000142) {
             LogError("Exit code 0xC0000142: DLL initialization failed");
         } else if (exitCode == 1) {
-            LogError("Server returned error 1 - check: pipe connection, auth token file, or port 8765 in use");
+            LogError("Server returned error 1 - check: pipe connection, auth token file, or the port already in use");
+        } else if (exitCode == 2) {
+            // The server refused its own configuration. Distinguished from
+            // exit 1 because retrying will not help and the pipe is not the
+            // problem: the flags built from obsidian.ini are.
+            LogError("Server refused its listener configuration (exit 2). The "
+                     "reason is in obsidian_server.log; fix [listener] in "
+                     "obsidian.ini, or delete the file for the loopback default.");
         }
         // F-17: the handle that pinned this PID is about to be closed, so the
         // PID may be recycled. Clear it, or the pipe would authorise whatever
@@ -5734,21 +5861,96 @@ static bool BuildCurrentUserOnlySecurity(SECURITY_ATTRIBUTES& sa, PSECURITY_DESC
     return true;
 }
 
+// A token pinned in obsidian.ini, or an empty string when the key is absent.
+//
+// WHY THIS EXISTS: the generated token is new on every plugin load and its file
+// is deleted on unload. That is invisible when the Python bridge reads the file
+// itself -- which it does for a loopback endpoint, on the same machine. For a
+// REMOTE endpoint the file is on the wrong machine, so every restart of x64dbg
+// silently invalidates the token the other host was configured with, and the
+// symptom is a 401 that reads like a misconfiguration rather than an expiry.
+// Pinning one lets a remote configuration survive a restart.
+//
+// Read separately from the flag settings in SpawnHTTPServer, with a different
+// character set, because this value is not a flag: it reaches the server
+// through the environment, never a command line, so the characters a flag
+// cannot hold are irrelevant here and the ones a BEARER TOKEN cannot hold are
+// what matter. Listener::IsPinnedToken is the shared rule.
+static std::string ReadPinnedToken() {
+    char pluginPath[MAX_PATH];
+    if (!GetModuleFileNameA(g_hModule, pluginPath, MAX_PATH)) {
+        LogError("Failed to get plugin path while reading obsidian.ini: %d",
+                 GetLastError());
+        return "";
+    }
+    char* lastSlash = strrchr(pluginPath, '\\');
+    if (lastSlash) {
+        *(lastSlash + 1) = '\0';
+    }
+
+    char iniPath[MAX_PATH];
+    snprintf(iniPath, sizeof(iniPath), "%sobsidian.ini", pluginPath);
+
+    char buffer[512] = {};
+    const DWORD length = GetPrivateProfileStringA("listener", "token", "", buffer,
+                                                  sizeof(buffer), iniPath);
+    std::string value(buffer, length);
+
+    // Trimmed for the same reason the flag reader trims: GetPrivateProfileString
+    // is not consistent about trailing whitespace across Windows versions, and
+    // refusing a token over a blank the operator cannot see would be its own bug.
+    size_t begin = 0;
+    size_t end = value.size();
+    while (begin < end && (value[begin] == ' ' || value[begin] == '\t')) begin++;
+    while (end > begin && (value[end - 1] == ' ' || value[end - 1] == '\t' ||
+                           value[end - 1] == '\r' || value[end - 1] == '\n')) end--;
+    return value.substr(begin, end - begin);
+}
+
 void pluginSetup() {
     LogInfo("Setting up plugin");
 
-    // Generate cryptographically secure random token (256 bits)
-    char token[65];  // 64 hex chars + null terminator
-    if (!GenerateSecureToken(token, sizeof(token))) {
-        LogError("Failed to generate secure token");
-        return;
+    std::string token;
+    const std::string pinned = ReadPinnedToken();
+
+    if (!pinned.empty()) {
+        // Refused rather than quietly replaced with a generated one. An
+        // operator who pinned a token and got a rotating one would have a
+        // listener that works and a remote host that breaks at the next
+        // restart, with nothing connecting the two -- the same reason a
+        // malformed flag refuses the whole ini instead of dropping one setting.
+        std::string tokenError;
+        if (!Listener::IsPinnedToken(pinned, tokenError)) {
+            LogError("obsidian.ini: [listener] %s", tokenError.c_str());
+            LogError("Not setting up: a pinned token was asked for and cannot be "
+                     "used. Fix it, or remove the key to go back to a freshly "
+                     "generated token each session.");
+            return;
+        }
+        token = pinned;
+    } else {
+        // Generate cryptographically secure random token (256 bits)
+        char generated[65];  // 64 hex chars + null terminator
+        if (!GenerateSecureToken(generated, sizeof(generated))) {
+            LogError("Failed to generate secure token");
+            return;
+        }
+        token = generated;
     }
 
-    LogInfo("Generated secure authentication token (256-bit)");
+    // Length and source, never the value.
+    LogInfo("Authentication token ready (%s, %zu chars)",
+            pinned.empty() ? "generated for this session"
+                           : "pinned in obsidian.ini",
+            token.size());
+    if (!pinned.empty()) {
+        LogInfo("NOTE: this token does not change when x64dbg restarts, so it "
+                "stays valid for a remote client -- and stays valid if it leaks.");
+    }
 
     // Pass token to server via environment variable (inherited by child process)
     // This avoids file system issues (permissions, 8.3 paths, FILE_ATTRIBUTE_TEMPORARY)
-    if (!SetEnvironmentVariableA("OBSIDIAN_AUTH_TOKEN", token)) {
+    if (!SetEnvironmentVariableA("OBSIDIAN_AUTH_TOKEN", token.c_str())) {
         LogError("Failed to set auth token environment variable: %d", GetLastError());
         return;
     }
@@ -5800,7 +6002,8 @@ void pluginSetup() {
 
         if (hFile != INVALID_HANDLE_VALUE) {
             DWORD bytesWritten;
-            if (WriteFile(hFile, token, (DWORD)strlen(token), &bytesWritten, nullptr)) {
+            if (WriteFile(hFile, token.c_str(), (DWORD)token.size(),
+                          &bytesWritten, nullptr)) {
                 LogInfo("Created auth token file: %s", tokenPath);
             } else {
                 LogError("Failed to write token file: %d", GetLastError());

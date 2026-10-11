@@ -238,6 +238,11 @@ class TestDynamicToolsDoNotLeak:
                 raise ConnectionRefusedError(f"no listener; tried {LEAK_MARKER}")
 
         monkeypatch.setattr(mod, "X64DbgBridge", _Bridge)
+        # 9999 has to be the CONFIGURED port, not just a requested one:
+        # x64dbg_connect refuses an endpoint the caller names over the
+        # operator's, so otherwise this never reaches connect() and tests the
+        # refusal instead of the connection failure it is about.
+        monkeypatch.setenv("X64DBG_PORT", "9999")
 
         out = tools["x64dbg_connect"](port=9999)
 
@@ -414,6 +419,9 @@ _VALIDATION_ONLY_HANDLERS = {
     "BinaryResolutionError",
     "AddressRebaseError",
     "FeatureUnavailableError",
+    # See the audit beside this name in _AST_ALLOWED_HANDLERS. Its parent
+    # DebuggerEndpointError is NOT included: that one can carry a path.
+    "EndpointOverrideError",
     "(BinaryResolutionError, AddressRebaseError)",
 }
 
@@ -535,6 +543,18 @@ _AST_ALLOWED_HANDLERS = {
     #     path. Surfacing it verbatim is the point: it is what stops a caller
     #     retrying and reconnecting against an endpoint that does not exist.
     "FeatureUnavailableError",
+    #   * EndpointOverrideError (src/utils/remote.py) -- raised from exactly
+    #     one function, refuse_caller_endpoint_override, in exactly two
+    #     places: "host='10.0.0.9' is not the configured debugger endpoint
+    #     (10.0.0.5). ... set X64DBG_HOST ..." and the same shape for port.
+    #     The only interpolated values are the caller's OWN argument and the
+    #     configured host/port, which x64dbg_connect already prints on the
+    #     success path as bridge.base_url. Its PARENT, DebuggerEndpointError,
+    #     is deliberately NOT here: _require_readable raises one with an
+    #     expanded absolute path in the text ("X64DBG_TLS_CA does not point at
+    #     a file: /home/<user>/ca.pem"), which is the F-10 disclosure exactly.
+    #     Adding a third raise site to this leaf means re-running this audit.
+    "EndpointOverrideError",
     #   * SymbolsOfflineError (src/utils/pdb_fetcher.py) -- one raise site,
     #     one message: "BINARY_MCP_SYMBOL_OFFLINE=1 and <name>.pdb is not in
     #     the local symbol cache; no symbol server was contacted...". The only
@@ -1023,7 +1043,6 @@ def test_reason_guard_allows_format_only_handlers(clause, tmp_path):
     assert not _reason_guard_flags("        raise E(S(reason=str(e)))", tmp_path, clause)
 
 
-# --------------------------------------------------------------------------
 # Audit F-10, third form: a parameter rebound to a RESOLVED path.
 #
 # The two guards above both key off an exception: one matches the literal
@@ -1043,7 +1062,6 @@ def test_reason_guard_allows_format_only_handlers(clause, tmp_path):
 # resolves and then misses -- so these returns are reachable with a resolved
 # path in hand. Echo os.path.basename(...), or keep the caller's own
 # reference in a separate name and echo that.
-# --------------------------------------------------------------------------
 
 _PATH_RESOLVERS = {"resolve_cached_binary"}
 

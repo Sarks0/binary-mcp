@@ -67,7 +67,7 @@ from src.utils.compatibility import (
     BinaryCompatibilityChecker,
     CompatibilityLevel,
 )
-from src.utils.config import get_config_int
+from src.utils.config import get_config, get_config_int, load_env
 from src.utils.decompiler_caveats import render_c_block
 from src.utils.file_lock import release_lock as _release_lock
 from src.utils.file_lock import try_lock as _try_lock
@@ -101,9 +101,16 @@ CRYPTO_OUTPUT_DIR = Path.home() / ".binary_mcp_output" / "crypto"
 # destination therefore cannot be caller-chosen -- see sanitize_output_dir.
 EXTRACTION_OUTPUT_DIR = Path.home() / ".binary_mcp_output" / "extracted"
 
-# Configure logging
+# Configure logging.
+#
+# BINARY_MCP_LOG_LEVEL was advertised in CONFIG_KEYS for its whole life without
+# anything reading it. An unrecognised name falls back to INFO rather than
+# raising: a typo in a log-level variable must not stop the server starting.
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.getLevelNamesMapping().get(
+        (get_config("BINARY_MCP_LOG_LEVEL") or "INFO").strip().upper(),
+        logging.INFO,
+    ),
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
@@ -6383,11 +6390,74 @@ def register_all_tools() -> None:
     _tools_registered = True
 
 
+def _run_http(transport_config) -> None:
+    """Serve the MCP endpoint over HTTP behind :class:`RemoteAccessGate`.
+
+    Imported here rather than at module scope so that a stdio server never
+    pulls in Starlette, and so a transport the operator did not ask for cannot
+    fail this module's import.
+    """
+    from starlette.middleware import Middleware
+
+    from src.utils.remote import RemoteAccessGate
+
+    if transport_config.token_was_generated:
+        # Written straight to stderr, NOT through logging, because this is the
+        # only place a generated token is ever shown and the log level is now
+        # operator-configurable. BINARY_MCP_LOG_LEVEL=ERROR is documented and
+        # supported, and it silenced the logger.warning this replaces -- which
+        # left a listener demanding a credential that existed nowhere: not in
+        # the log, not in describe() (it says only "generated-this-start"), and
+        # not on disk. Every request 401s and the only cure is a restart with
+        # BINARY_MCP_HTTP_TOKEN set.
+        #
+        # stderr and not stdout because stdio transport speaks the protocol on
+        # stdout; stderr is the channel that is a channel in both modes.
+        print(
+            f"binary-mcp: generated a bearer token for this start: "
+            f"{transport_config.token}\n"
+            f"binary-mcp: set BINARY_MCP_HTTP_TOKEN to keep it stable across "
+            f"restarts.",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    app.run(
+        transport="http",
+        host=transport_config.host,
+        port=transport_config.port,
+        path=transport_config.path,
+        middleware=[Middleware(RemoteAccessGate, config=transport_config)],
+        uvicorn_config=transport_config.uvicorn_config(),
+    )
+
+
 def main():
     """Run the MCP server."""
+    # Before anything reads the environment. Settings that are consumed off
+    # os.environ rather than through get_config() -- no_proxy via requests,
+    # GHIDRA_MAX_HEAP_MB via the Ghidra runner -- only take effect once .env
+    # has been published there, and the lazy load inside get_config() is not a
+    # guarantee about ordering.
+    load_env()
+
     logger.info("Starting Binary MCP Server...")
     logger.info(f"Ghidra Path: {runner.ghidra_path}")
     logger.info(f"Cache Directory: {cache.cache_dir}")
+
+    # Resolved BEFORE the tool registry is built and before the job sweep.
+    # A refused transport must cost nothing and leave nothing behind: there is
+    # no point analysing the environment's Ghidra setup, or reaping another
+    # process's jobs, on the way to exiting because the listener is unsafe.
+    from src.utils.remote import TransportConfigError, resolve_transport_config
+
+    try:
+        transport_config = resolve_transport_config()
+    except TransportConfigError as exc:
+        logger.error("Refusing to start: %s", exc)
+        raise SystemExit(2) from exc
+
+    logger.info("Transport: %s", transport_config.describe())
 
     register_all_tools()
 
@@ -6403,8 +6473,11 @@ def main():
     logger.info("Registered all analysis tools (static, dynamic, VT, triage, reporting, Yara, control flow, malware, function hash, PE structure, review, fid, coverage)")
     logger.info(f"Session Directory: {session_manager.store_dir}")
 
-    # Run the FastMCP server (handles stdio automatically)
-    app.run()
+    if transport_config.is_http:
+        _run_http(transport_config)
+    else:
+        # stdio: the client owns the process and the pipes are the transport.
+        app.run()
 
 
 if __name__ == "__main__":

@@ -14,6 +14,8 @@
 | Document | What it covers |
 |----------|----------------|
 | [Claude Code integration](claude-code-setup.md) | Wiring the server into Claude Code |
+| [Remote setup](remote-setup.md) | Two ways to run across machines, with the exact settings for each |
+| [Remote access reference](remote-access.md) | The long version: diagrams, every option, troubleshooting |
 | [Large binaries](large-binary-decompile.md) | Project reuse and targeted decompiles for multi-MB binaries |
 | [Background jobs](jobs.md) | Polling analysis that outlives the client timeout |
 | [Review coverage](coverage.md) | The review denominator, worklist and examination axis |
@@ -38,3 +40,4 @@ Regenerate the catalog with `python -m src.tool_catalog`.
 | [opencode issues](opencode-issues.md) | Two upstream opencode bugs and their workarounds |
 | [Vulnerability-research workflow](vr-workflow-enhancements.md) | Planned improvements for triaging large binaries |
 | [Activity log and tracing](activity-log-plan.md) | Proposed, not implemented |
+| [Remote access plan](remote-access-plan.md) | The design behind [Remote access](remote-access.md), and the phases still outstanding (artifact transfer, WinDbg user-mode remoting) |

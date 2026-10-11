@@ -23,7 +23,7 @@ cd binary-mcp
 ### Method 2: Direct Download
 
 Download the installer, look at it, then run it. This is the recommended form
-of Method 2 — see [Supply-Chain Integrity](#supply-chain-integrity) for why the
+of Method 2: see [Supply-Chain Integrity](#supply-chain-integrity) for why the
 one-line `curl | python3 -` / `irm | iex` variants are worth avoiding.
 
 **Linux / macOS:**
@@ -68,7 +68,7 @@ requires Administrator. It is worth knowing exactly what that trusts.
 Both installers are fetched over HTTPS, and both force TLS 1.2+ for their own
 downloads. TLS establishes *who served* the bytes; it does not establish *which*
 bytes were served. Piping a URL straight into an interpreter executes whatever
-came back immediately — there is no copy on disk to inspect, nothing to compare
+came back immediately: there is no copy on disk to inspect, nothing to compare
 a digest against, and no record afterwards of what ran. A tampered mirror or
 release asset, or an interception proxy whose root certificate the machine
 already trusts, is enough for that to be attacker-chosen code. On Windows it
@@ -99,7 +99,7 @@ downloaded script into an interpreter.
 
 ### What the installers verify
 
-> **Status — what is and is not actually checked.** `.github/workflows/release.yml`
+> **Status: what is and is not actually checked.** `.github/workflows/release.yml`
 > now generates a `SHA256SUMS` manifest in the same job that uploads the release
 > assets, and publishes it as a release asset. `install.ps1` reads that manifest
 > and verifies `obsidian.dp64`, `obsidian.dp32` and `obsidian_server.exe`
@@ -116,7 +116,7 @@ downloaded script into an interpreter.
 >   if you need assurance on an older release.
 > - **A manifest published in the same release as the assets does not survive a
 >   takeover of the release itself.** It defeats tampering with an individual
->   asset or its CDN copy. Only a pinned digest — one you obtained out of band —
+>   asset or its CDN copy. Only a pinned digest, one you obtained out of band,
 >   defends against a compromised release.
 >
 > The plugin binaries are also **not code-signed**, so the Authenticode check on
@@ -127,18 +127,18 @@ downloaded script into an interpreter.
 | binary-mcp release assets (`obsidian.dp64`, `obsidian.dp32`, `obsidian_server.exe`) | SHA-256 against the `SHA256SUMS` manifest published with the GitHub release, or an operator-pinned hash. Fails closed if the manifest exists but omits the asset. Releases predating the manifest are installed unverified, with a warning |
 | Ghidra release zip | SHA-256 from the checksum published with the Ghidra release, or an operator-pinned hash |
 | x64dbg snapshot zip | Operator-pinned hash (the `snapshot` tag is a rolling build with no fixed digest) |
-| uv / .NET install scripts | Operator-pinned hash only — astral.sh and dot.net publish no stable digest. Without a pin the script is written to disk, flagged loudly as unverified, and then run (refused under strict mode); it is never piped into an interpreter. On Windows its Mark-of-the-Web is left intact unless the hash verified |
-| Windows SDK bootstrapper | Authenticode signature, required to be valid and issued to Microsoft Corporation. A bad or missing signature **aborts** — the bootstrapper is otherwise run with Administrator rights. An operator-pinned hash is optional and additional |
-| `main` branch source zip | Cannot be verified — a branch archive changes with every push. Prefer the `git clone` path, which the installer already uses when git is present |
+| uv / .NET install scripts | Operator-pinned hash only: astral.sh and dot.net publish no stable digest. Without a pin the script is written to disk, flagged loudly as unverified, and then run (refused under strict mode); it is never piped into an interpreter. On Windows its Mark-of-the-Web is left intact unless the hash verified |
+| Windows SDK bootstrapper | Authenticode signature, required to be valid and issued to Microsoft Corporation. A bad or missing signature **aborts**: the bootstrapper is otherwise run with Administrator rights. An operator-pinned hash is optional and additional |
+| `main` branch source zip | Cannot be verified: a branch archive changes with every push. Prefer the `git clone` path, which the installer already uses when git is present |
 
 Anything that cannot be verified produces a loud, explicit warning naming the
-artifact, the URL, and the SHA-256 that was actually downloaded — the installer
+artifact, the URL, and the SHA-256 that was actually downloaded: the installer
 does not skip the check quietly.
 
 **About the Authenticode check on the plugins.** `install.ps1` runs
 `Get-AuthenticodeSignature` over each staged plugin binary, but Windows
 dispatches signature checks by file *extension* and does not recognise
-`.dp64`/`.dp32`, so it reports `UnknownError` — "cannot evaluate", not "bad
+`.dp64`/`.dp32`, so it reports `UnknownError`: "cannot evaluate", not "bad
 signature". The installer treats that (and a plain unsigned `.exe`) as *no
 signature information*, and does not fail on it. **The plugins' integrity rests
 entirely on the SHA-256 check**, which is why the `SHA256SUMS` manifest matters.
@@ -147,7 +147,7 @@ entirely on the SHA-256 check**, which is why the `SHA256SUMS` manifest matters.
 
 Releases built by the current workflow publish a `SHA256SUMS` asset covering the
 three plugin binaries and the release zip. (Releases predating that change do
-not have one — check the asset list.)
+not have one: check the asset list.)
 
 ```bash
 # download SHA256SUMS plus the assets you want, into the same directory
@@ -180,7 +180,7 @@ digest to use. The full set:
 
 The three `obsidian` entries are the only pins that override this project's own
 published `SHA256SUMS`. Use them when you want a digest you obtained out of band
-to win over the release — that is the only thing that survives a takeover of the
+to win over the release: that is the only thing that survives a takeover of the
 release itself.
 
 **Linux / macOS:**
@@ -343,7 +343,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\uv-install.ps1
 ```
 
 The vendor's documented one-liners (`curl … | sh`, `irm … | iex`) do the same
-thing without the inspection step — see [Supply-Chain
+thing without the inspection step: see [Supply-Chain
 Integrity](#supply-chain-integrity).
 
 ### 3. Clone Repository
@@ -377,7 +377,7 @@ export GHIDRA_HOME=/path/to/ghidra
 
 #### Ghidra 12.1+: Activate the Jython Extension
 
-Ghidra 12.1 unbundled Jython, which binary-mcp uses for its analysis scripts. The installer scripts do this automatically. If you installed Ghidra manually, activate the bundled Jython extension before first use — either via the Ghidra Front End (**File → Install Extensions → check Jython → restart**), or by extracting the bundled zip directly:
+Ghidra 12.1 unbundled Jython, which binary-mcp uses for its analysis scripts. The installer scripts do this automatically. If you installed Ghidra manually, activate the bundled Jython extension before first use, either via the Ghidra Front End (**File → Install Extensions → check Jython → restart**), or by extracting the bundled zip directly:
 
 The bundled archive ships under `Extensions/Ghidra/` and is extracted into the install-tree extensions dir `Ghidra/Extensions/`:
 
@@ -391,7 +391,7 @@ Expand-Archive -Path "$env:GHIDRA_HOME\Extensions\Ghidra\*Jython*.zip" -Destinat
 unzip "$GHIDRA_HOME"/Extensions/Ghidra/*Jython*.zip -d "$GHIDRA_HOME"/Ghidra/Extensions/
 ```
 
-Ghidra 12.0.x and earlier ship with Jython built in — no extra step needed.
+Ghidra 12.0.x and earlier ship with Jython built in: no extra step needed.
 
 ### 6. Install x64dbg (Windows Only, Optional)
 

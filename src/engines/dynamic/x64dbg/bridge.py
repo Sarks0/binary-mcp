@@ -17,6 +17,12 @@ from typing import Any
 
 import requests
 
+from src.utils.config import get_config
+from src.utils.remote import (
+    ENV_OBSIDIAN_TOKEN,
+    DebuggerEndpoint,
+    resolve_debugger_endpoint,
+)
 from src.utils.security import PathTraversalError, sanitize_output_path
 from src.utils.structured_errors import (
     StructuredBaseError,
@@ -34,9 +40,7 @@ logger = logging.getLogger(__name__)
 MAX_DUMP_SIZE = 100 * 1024 * 1024
 
 
-# ---------------------------------------------------------------------------
 # x64dbg command-string structure (audit findings F-9 / F-16)
-# ---------------------------------------------------------------------------
 #
 # WHY THIS EXISTS: every gate this project had between a caller and x64dbg's
 # DbgCmdExec decided on the FIRST TOKEN of the WHOLE string. x64dbg does not
@@ -452,24 +456,42 @@ class FeatureUnavailableError(Exception):
 class X64DbgBridge(Debugger):
     """Client for x64dbg MCP plugin HTTP API."""
 
-    def __init__(self, host: str = "127.0.0.1", port: int = 8765, timeout: int = 30):
+    def __init__(
+        self,
+        host: str | None = None,
+        port: int | None = None,
+        timeout: int = 30,
+    ):
         """
         Initialize x64dbg bridge.
 
         Args:
-            host: HTTP API host (default: localhost)
-            port: HTTP API port (default: 8765)
+            host: Plugin host. ``None`` resolves ``$X64DBG_HOST``, then the
+                loopback default -- so a configured endpoint is used by a
+                caller that passes nothing, which is what makes a remote
+                debugger reachable without every call site knowing about it.
+            port: Plugin port. ``None`` resolves ``$X64DBG_PORT``, then 8765.
             timeout: Request timeout in seconds
-        """
-        self.base_url = f"http://{host}:{port}"
 
-        # Security: Only allow loopback addresses
-        allowed_hosts = ("127.0.0.1", "::1", "localhost")
-        if host not in allowed_hosts:
-            raise ValueError(
-                f"x64dbg bridge only supports loopback connections. "
-                f"Got host='{host}', allowed: {allowed_hosts}"
-            )
+        Raises:
+            DebuggerEndpointError: If the endpoint is unparseable, or is a
+                non-loopback host without the opt-in, a CA and a token. See
+                :func:`src.utils.remote.resolve_debugger_endpoint` for the
+                policy and why each requirement is there.
+
+        This used to be a hardcoded loopback check that compared ``host``
+        against three spellings and raised ValueError on anything else -- so
+        the ``host`` argument that ``x64dbg_connect`` has always exposed, and
+        plumbed all the way here, could not actually be used. The policy it now
+        defers to is the same one the MCP listener uses in the other direction,
+        in one module, so the two cannot drift into disagreeing about what
+        "remote" costs.
+        """
+        self._endpoint: DebuggerEndpoint = resolve_debugger_endpoint(host=host, port=port)
+        self.base_url = self._endpoint.base_url
+        # TLS material for every requests call, resolved once. Empty dict for a
+        # plaintext loopback endpoint, so that path is unchanged.
+        self._request_kwargs = self._endpoint.requests_kwargs()
 
         self.timeout = timeout
         self.connected = False
@@ -481,7 +503,7 @@ class X64DbgBridge(Debugger):
         self._retry_delay = 0.1  # seconds
         self._max_reconnects = 2  # max reconnection attempts per request sequence
 
-        logger.info(f"Initialized x64dbg bridge: {self.base_url}")
+        logger.info(f"Initialized x64dbg bridge: {self._endpoint.describe()}")
         logger.info(f"Error logging enabled: {self._error_logger.error_dir}")
 
     def _detect_architecture(self) -> str:
@@ -676,8 +698,8 @@ class X64DbgBridge(Debugger):
         """
         Read authentication token from environment variable or file.
 
-        Tries OBSIDIAN_AUTH_TOKEN env var first, then falls back to
-        the token file created by the x64dbg plugin in %TEMP%.
+        Tries OBSIDIAN_AUTH_TOKEN first, then -- for a loopback endpoint only
+        -- the token file the x64dbg plugin writes in %TEMP%.
 
         Returns:
             Authentication token or None if not found
@@ -685,11 +707,31 @@ class X64DbgBridge(Debugger):
         Raises:
             RuntimeError: If token cannot be loaded from any source
         """
-        # Try environment variable first
-        env_token = os.environ.get("OBSIDIAN_AUTH_TOKEN", "").strip()
+        # Env var first. Read through get_config so a token in .env works here
+        # too; os.environ still wins, so monkeypatching it behaves as before.
+        env_token = (get_config(ENV_OBSIDIAN_TOKEN) or "").strip()
         if env_token:
             logger.debug(f"Read authentication token from env var ({len(env_token)} chars)")
             return env_token
+
+        if self._endpoint.token_must_come_from_env:
+            # The file fallback below reads THIS machine's %TEMP%. For a remote
+            # endpoint that is the wrong machine, and reporting "token file not
+            # found / ensure the plugin is loaded" sends the operator to check
+            # the debugger host's plugin -- which is loaded, and is not the
+            # problem. Say what is actually missing.
+            #
+            # resolve_debugger_endpoint already refuses to build a remote
+            # endpoint without this variable, so reaching here means it was
+            # unset after construction. Still worth answering precisely: the
+            # alternative is a lie about a file.
+            raise RuntimeError(
+                f"{ENV_OBSIDIAN_TOKEN} is not set, and this bridge points at "
+                f"{self.base_url}, whose %TEMP% is not on this machine.\n"
+                f"Read the token from the debugger host "
+                f"(%TEMP%\\x64dbg_mcp_token.txt) and set "
+                f"{ENV_OBSIDIAN_TOKEN} here."
+            )
 
         # Fall back to token file created by x64dbg plugin in %TEMP%
         temp_dir = tempfile.gettempdir()
@@ -794,10 +836,18 @@ class X64DbgBridge(Debugger):
 
         try:
             # Make request
+            # _request_kwargs carries verify= (the CA that signs the plugin
+            # host's certificate) and cert= (this server's client certificate,
+            # when mutual TLS is configured). Empty for a loopback endpoint.
             if data is None:
-                response = requests.get(url, headers=headers, timeout=self.timeout)
+                response = requests.get(
+                    url, headers=headers, timeout=self.timeout, **self._request_kwargs
+                )
             else:
-                response = requests.post(url, json=data, headers=headers, timeout=self.timeout)
+                response = requests.post(
+                    url, json=data, headers=headers, timeout=self.timeout,
+                    **self._request_kwargs,
+                )
 
             duration_ms = int((time.time() - start_time) * 1000)
 

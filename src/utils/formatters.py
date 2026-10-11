@@ -6,7 +6,6 @@ import re
 import unicodedata
 
 # Untrusted-content envelope (audit finding F-7)
-# ---------------------------------------------------------------------------
 # Almost everything this server hands back about a sample -- extracted
 # strings, decompiled pseudocode, reconstructed stack strings, IOCs and their
 # surrounding context, VirusTotal "names"/"tags" -- is text AUTHORED BY THE

@@ -26,7 +26,7 @@ consumers bind to the field names and assert invariants on the counts.
 They return a `dict`, not a serialized string, and that is load-bearing: FastMCP
 puts a `str` return under `structuredContent.result` *as a string*, so a client
 that peels one envelope layer lands on a string and its flat-object assumption
-breaks. Returning the object keeps every transport path flat —
+breaks. Returning the object keeps every transport path flat:
 `structuredContent`, `.data` and `content[0].text` all carry the same object,
 with no `result` / `data` / `coverage` wrapper.
 `tests/test_coverage_tools.py::TestWireShape` guards this.
@@ -73,26 +73,26 @@ returning bad numbers:
 - `remaining_in_scope == in_scope_total - reviewed_in_scope`
 - `in_scope_total <= total`, `reviewed_in_scope <= reviewed`
 - all counts are non-negative integers
-- `total + dropped_address_count == source_function_count` — the only one of
+- `total + dropped_address_count == source_function_count`: the only one of
   these that compares the denominator against something it did not derive
   itself; see [`dropped_address_count`](#dropped_address_count)
 
 `status` is `ready` | `not_indexed` | `indexing` | `stale`.
 
-On `not_indexed`, **every count is null, never zero** — the examination counts
+On `not_indexed`, **every count is null, never zero**: the examination counts
 included. Zero would read as "complete" and terminate a review loop on a binary
 nobody has looked at, which is the precise failure this store exists to prevent. Treat any non-`ready`
 status as "cannot conclude", never as "done".
 
 `stale` means the analysis cache this ledger counted has been evicted. It still
-returns the last known counts — they are the best available truth and they
-satisfy every invariant above — but they are not current, so they must not
+returns the last known counts: they are the best available truth and they
+satisfy every invariant above, but they are not current, so they must not
 settle a closure decision. The rule for a consumer asserting invariants:
 assert whenever `total is not None`, not only on `ready`.
 
 `indexing` is reserved; indexing is synchronous today and never returns it.
 
-There is deliberately no `reviewed_list` on this response — an 885-entry array
+There is deliberately no `reviewed_list` on this response: an 885-entry array
 on every poll saturates a model's context. Use `get_next_unreviewed`.
 
 ### `get_next_unreviewed(binary_id=None, count=20, scope="in_scope", binary_path=None, only_examined=False)`
@@ -100,12 +100,12 @@ on every poll saturates a model's context. Use `get_next_unreviewed`.
 Ordered by ascending numeric address. A client that crashes mid-batch and
 re-calls gets the same head of the queue, and makes forward progress once those
 are marked. `functions: []` with `remaining_after: 0` is the terminal
-condition — but only when `status == "ready"`.
+condition, but only when `status == "ready"`.
 
 `scope="all"` includes thunk / library / unreachable functions. They stay
 retrievable precisely so an under-counted scope cannot hide work.
 
-`only_examined=True` narrows to the machine-flagged leads — see
+`only_examined=True` narrows to the machine-flagged leads: see
 [the lead queue](#the-lead-queue).
 
 ## Auto-marking
@@ -113,7 +113,7 @@ retrievable precisely so an under-counted scope cannot hide work.
 These tools mark a function reviewed as a side effect:
 
 - `decompile_function`
-- `batch_decompile` — only functions whose pseudocode actually came back
+- `batch_decompile`: only functions whose pseudocode actually came back
 - `get_review_package`
 - `get_param_sinks`
 
@@ -129,14 +129,14 @@ is there to prevent. Over-marking is the dangerous direction; under-marking
 just means the operator re-marks.
 
 The rule, stated for the operator: **a function is marked reviewed only if its
-body — or a semantic analysis of that specific function — was returned to the
+body, or a semantic analysis of that specific function, was returned to the
 caller.** Never merely because the server read or produced its pseudocode
 internally.
 
 "Body" means code, not merely a non-empty string. Ghidra emits bodies that are
 only a banner comment (`/* WARNING: Globals starting with '_' overlap … */`)
 when it declines to decompile, and those are still returned to the caller but do
-not mark — showing a remark about a function is not showing the function. The
+not mark: showing a remark about a function is not showing the function. The
 test is a brace or a statement terminator, which keeps genuine empty stubs
 marking: `void FUN_140137c58(void) { return; }` is real, reviewable code, and
 http.sys has two of them. Across the 18500 pseudocode bodies in the cached
@@ -151,8 +151,8 @@ Marking is idempotent: re-decompiling does not double-count, and `reviewed_at`
 / `reviewed_by` record the *first* tool that marked it and are never
 overwritten.
 
-Use `mark_function_reviewed` for work done outside binary-mcp — a Ghidra GUI
-session, objdump, a debugger — and to attach a findings note.
+Use `mark_function_reviewed` for work done outside binary-mcp: a Ghidra GUI
+session, objdump, a debugger, and to attach a findings note.
 
 None of this changes for a machine pass, because a machine pass does not mark
 reviewed at all. It records on the separate axis below.
@@ -174,7 +174,7 @@ removes a function from `get_next_unreviewed`.
 This exists because the alternative was a choice between two lies. A diff that
 pairs 5,958 functions has reviewed none of them, so marking them reviewed
 inflates the denominator by thousands, silently, at exactly the scale where
-nobody can audit it — and marking nothing loses the fact that a pass ran at
+nobody can audit it, and marking nothing loses the fact that a pass ran at
 all, which is why script-driven diff work used to be invisible here. The honest
 answer is a column that says what actually happened.
 
@@ -183,8 +183,8 @@ Three kinds, and the vocabulary is closed:
 | `kind` | what it claims |
 |---|---|
 | `diff` | paired against a twin by a binary-diff run and its delta scored; the body was not necessarily read |
-| `sweep` | surfaced by a whole-binary pattern sweep (sink extraction, lock analysis, regex scan) — a hit, not a reading |
-| `external` | examined by a machine pass outside binary-mcp — a script driving the caches directly, BinDiff, Diaphora |
+| `sweep` | surfaced by a whole-binary pattern sweep (sink extraction, lock analysis, regex scan): a hit, not a reading |
+| `external` | examined by a machine pass outside binary-mcp: a script driving the caches directly, BinDiff, Diaphora |
 
 An unrecognized `kind` is refused rather than stored. Free-form values let a
 caller invent something that reads like a review (`"audited"`, `"cleared"`) and
@@ -196,7 +196,7 @@ park it in a field the counts do not police.
 six are unchanged, `remaining == total - reviewed` still holds exactly, and a
 consumer mirroring only the six keeps working untouched.
 
-`examined_unreviewed` is the number that drives work — the machine found a
+`examined_unreviewed` is the number that drives work: the machine found a
 reason to look at these and nobody has. `examined_by_kind` breaks the total
 down, always carrying every known kind including the zeros, so a consumer
 reading `breakdown["diff"]` never has to guard for a key that vanished when its
@@ -204,7 +204,7 @@ count dropped.
 
 The invariants are bounds, never subtractions: `examined <= total`,
 `examined_in_scope <= min(examined, in_scope_total)`, and
-`examined_unreviewed <= remaining`. That last one is the useful tripwire — every
+`examined_unreviewed <= remaining`. That last one is the useful tripwire: every
 examined-and-unreviewed function is by definition one of the unreviewed ones, so
 exceeding `remaining` means the examination set has acquired an address the
 ledger does not have.
@@ -216,7 +216,7 @@ diff, and the counts must be able to say it.
 ### The lead queue
 
 `get_next_unreviewed(only_examined=True)` narrows the worklist to functions a
-machine pass already flagged — read it as "what did the diff tell me to look at
+machine pass already flagged: read it as "what did the diff tell me to look at
 that I haven't looked at". It is a **narrowing filter, not a shorter path to
 closure**: emptying it means the leads are read, not that the binary is. The
 response therefore always carries `remaining_unfiltered` alongside
@@ -226,21 +226,21 @@ binary the way an empty unfiltered queue legitimately can.
 ### `diff_binaries`
 
 `diff_binaries` records `kind="diff"` for **the MODIFIED entries only**, on both
-binaries' ledgers — each side to its own record, since the ledger is keyed by
+binaries' ledgers: each side to its own record, since the ledger is keyed by
 the sha256 of the file's bytes and cross-writing would land phantom addresses in
 a ledger they do not exist in.
 
 Only MODIFIED, because those are the ones the tool actually analyses per
 function: it scores the bounds-check, stack-cookie, caller-count and size deltas
 and extracts the first changed line for each. ADDED and REMOVED are single-sided
-— a bucket, no pair, no delta — and the unchanged pairs are the ones it
+(a bucket, no pair, no delta) and the unchanged pairs are the ones it
 concluded nothing happened to. Recording either would inflate the examination
 axis with functions nothing analysed, which is the same dishonesty as inflating
 the review axis, one column over.
 
 The report header states what was written. `record_examination=False` gives a
 dry run against a ledger you do not want touched, and coverage failure is
-swallowed — a broken ledger must never cost you the diff.
+swallowed: a broken ledger must never cost you the diff.
 
 ### Bulk import
 
@@ -249,7 +249,7 @@ server: a script driving the Ghidra caches directly, BinDiff, Diaphora, an
 external sink extractor.
 
 Its cap is 20000 addresses per call, far above `mark_function_reviewed`'s 500,
-because the two are bounded by different things — a worklist batch has to fit in
+because the two are bounded by different things: a worklist batch has to fit in
 a model's context, whereas an import is a machine pass reporting what it touched
 and is only ever read back as a count. A whole-binary diff of a
 14000-function DLL has to fit in one call: sharding it means a partial failure
@@ -257,11 +257,11 @@ leaves the ledger half-written with no way to tell.
 
 For the same reason the response reports `requested` / `marked` / `already` /
 `unknown` as **counts, not lists**, with up to ten unknown addresses echoed in
-`unknown_sample` — enough to diagnose the usual cause (addresses taken from the
+`unknown_sample`: enough to diagnose the usual cause (addresses taken from the
 wrong side of the diff, or from a rebased image) without making the address dump
 the largest thing in the payload.
 
-Set `note` — `"lock/sink candidate from the KB5044273 twin-pair diff"` is what
+Set `note`: `"lock/sink candidate from the KB5044273 twin-pair diff"` is what
 makes the record auditable six weeks later, and it is carried on
 `get_next_unreviewed` entries as `examination_note`.
 
@@ -284,8 +284,8 @@ identity holds exactly:
 in_scope_total == total - (thunks + externals + FID-library matches)
 ```
 
-Verified on all 29 cached binaries — chakra 25026−78=24948, jscript9
-18065−73=17992, http.sys 4422−11=4411, bindflt 256−8=248. So do not read
+Verified on all 29 cached binaries: chakra 25026-78=24948, jscript9
+18065-73=17992, http.sys 4422-11=4411, bindflt 256-8=248. So do not read
 `in_scope_total` as "the reachable subset": it is "the not-obviously-skippable
 subset", and the call graph only explains *why* each function is there.
 
@@ -298,28 +298,28 @@ Entry points, in priority order:
 | `reachable:indirect_root` | any function with no direct caller anywhere in the binary |
 | `reachable:callee` | discovered downstream of one of the above |
 
-Exclusions are mechanical only — `excluded:thunk`, `excluded:external`,
+Exclusions are mechanical only: `excluded:thunk`, `excluded:external`,
 `excluded:thunk_or_external` (Ghidra's `decompile_status`), `excluded:fid_library`
 (a Function ID library match; requires `analyze_binary(enable_fid=True)`).
 Nothing is excluded on a name guess.
 
-**The blind spot, stated plainly.** Indirect calls — vtables, dispatch tables,
-registered callbacks — are invisible to a forward call-graph walk. That is why
+**The blind spot, stated plainly.** Indirect calls (vtables, dispatch tables,
+registered callbacks) are invisible to a forward call-graph walk. That is why
 every function with no direct caller is treated as a root: it over-approximates
 reachability, and over-approximating is the safe direction. Under-counting
 scope shrinks the denominator and manufactures false completion.
 
 "No direct caller" is not sufficient on its own, and the first implementation
-got this wrong. Every member of a call cycle has a direct caller — itself, or
-its partner — so a cycle reached only indirectly was never promoted, the walk
+got this wrong. Every member of a call cycle has a direct caller: itself, or
+its partner, so a cycle reached only indirectly was never promoted, the walk
 could not enter, and the entire subtree below it fell out as
 `excluded:unreachable`. That is a shrink. On the cached corpus it was dropping
 `HttppParseUtf16Sequence` and `UxDuoParseUnknownFragment` from http.sys and the
-whole chakra garbage collector — and 100% of that bucket was a false exclusion,
+whole chakra garbage collector, and 100% of that bucket was a false exclusion,
 not one genuine orphan across 10 binaries. After the layered walk settles the
 residual is now promoted to roots (`reachable:cycle_root`) until a fixpoint.
 Because that fixpoint drains the residual *entirely*, `excluded:unreachable` is
-now structurally unreachable rather than merely rare — the loop cannot exit
+now structurally unreachable rather than merely rare: the loop cannot exit
 while any non-excluded function lacks a reason. The branch that produces it is
 kept deliberately, as a tripwire: if a future change stops the residual
 draining, the failure is toward a **smaller** denominator, so it must surface in
@@ -327,7 +327,7 @@ the counts and in `scope_description` instead of being folded in silently.
 
 The practical consequence: scope leans almost entirely on the address-taken
 roots, so `in_scope_total` lands close to `total` and the only real reduction is
-the thunk/library set. This is not driver-specific — bindflt (one export)
+the thunk/library set. This is not driver-specific: bindflt (one export)
 reports 248 of 256, and jscript9 (98 exports) reports 17992 of 18065, the same
 ~0.4% reduction. That is the honest number, not a tighter one obtained by
 dropping the indirect surface.
@@ -342,20 +342,20 @@ the current extractor does not emit unparseable addresses.
 A non-zero value means the denominator under-counts the binary by that much, and
 no completion claim should rest on it. `scope_description` carries an explicit
 warning too. If *every* address fails to parse the tool reports `not_indexed`
-with null counts rather than `ready` with six zeros — six zeros is the
+with null counts rather than `ready` with six zeros: six zeros is the
 documented terminal condition, and reporting it for a binary nobody read is the
 exact failure this store exists to prevent.
 
 The count is also cross-checked: `total + dropped_address_count` must equal
 `source_function_count`, which was recorded from the analysis cache's own
 function list. A record that fails it is rebuilt. This is the one count check
-that is not a restatement of its own arithmetic — the remaining/total/reviewed
+that is not a restatement of its own arithmetic: the remaining/total/reviewed
 relations are derived and asserted a few lines apart, and cannot see a `total`
 that silently lost functions.
 
 Note that a genuinely non-zero drop is deliberately **not** a rebuild trigger:
-a binary that really does carry unparseable addresses would then re-index —
-decompressing the whole analysis cache — on every status poll, forever,
+a binary that really does carry unparseable addresses would then re-index,
+decompressing the whole analysis cache, on every status poll, forever,
 producing the identical record each time.
 
 `remaining_in_scope == 0` therefore means the in-scope worklist is finished,
@@ -371,8 +371,8 @@ per origin:
 |---|---|
 | `export` | direct calls from an export-table entry |
 | `ioctl_dispatch` | direct calls from a recovered dispatch entry |
-| `indirect_root` | nothing calls it directly — promoted as an address-taken / callback root |
-| `cycle_root` | a call cycle nothing enters directly — promoted to break it |
+| `indirect_root` | nothing calls it directly: promoted as an address-taken / callback root |
+| `cycle_root` | a call cycle nothing enters directly: promoted to break it |
 
 The last two rows are the part of the denominator that the call graph can't
 explain: in scope because the fixpoint refuses to shrink the denominator, not
@@ -394,29 +394,29 @@ A `<sha256>.coverage.json` side-car beside the analysis cache, sharing the same
 root (`$BINARY_CACHE_DIR`, else `~/ghidra_mcp_cache`) and the same sha stem as
 `<sha>.json.gz` / `<sha>.funcidx.json` / `<sha>.notes.json`.
 
-- **Key** — lowercase sha256 hexdigest of the file bytes. The same key
+- **Key**: lowercase sha256 hexdigest of the file bytes. The same key
   `ProjectCache` already uses, so re-analysis of the same file on a different
   host resumes the same coverage row. Queries by `binary_id` work even after
   the staged file is deleted.
-- **Addresses** — canonical lowercase hex, `0x` prefix, no zero padding
+- **Addresses**: canonical lowercase hex, `0x` prefix, no zero padding
   (`0x140006d8c`). Note that the analysis cache itself stores them *bare*;
   normalizing is this module's job.
-  These are loader virtual addresses at the image base as loaded — not file
+  These are loader virtual addresses at the image base as loaded, not file
   offsets, not RVAs, not runtime-rebased debugger addresses. `image_base` is
   reported so a mismatch is detectable rather than silent.
-- **Writes** — whole-file and atomic (`os.replace`), under a per-binary lock
+- **Writes**: whole-file and atomic (`os.replace`), under a per-binary lock
   file (`.<sha>.coverage.lock`, `flock` / `msvcrt.locking`). Every
   read-modify-write (marking, examining, resetting, re-indexing) holds it, so
   two sessions on the same binary serialize instead of the later write dropping
   the earlier one's marks. A writer that can't get the lock within 30 s gets an
   error rather than writing anyway.
-- **`seq`** — bumped by one on every write and reported in the status payload.
+- **`seq`**: bumped by one on every write and reported in the status payload.
   `write()` refuses a record whose `seq` isn't the one on disk (it was read
   before someone else wrote), which catches any writer that bypasses the lock.
   A consumer mirroring the counts should refuse a snapshot with a lower `seq`
   than the one it already holds, which stops an out-of-order sync from
   winding the mirror backwards.
-- **Lifecycle** — survives `ProjectCache.invalidate` (so `force_reanalyze` and
+- **Lifecycle**: survives `ProjectCache.invalidate` (so `force_reanalyze` and
   `load_pdb` do not destroy a review history; the key is a content hash, so
   addresses cannot have shifted). Dropped by `clear_all`.
 
@@ -424,7 +424,7 @@ Indexing happens automatically after `analyze_binary`, and on the first status
 query for a binary that was analyzed before coverage existed. The index rebuilds
 itself when the analysis cache grows (an incremental run), when `scope_version`
 changes, when `schema_version` is older than the current one, or when the
-record's own numbers do not add up — **review marks, examinations, timestamps
+record's own numbers do not add up: **review marks, examinations, timestamps
 and notes are preserved across a rebuild.**
 
 Examinations survive on their own terms, not the review mark's. The state worth
@@ -435,29 +435,29 @@ nobody has read yet, and that is the state where `reviewed` is false.
 
 Two independent version stamps:
 
-- `schema_version` — the on-disk layout. Validated on read.
-- `scope_version` — how scope was computed. Any mismatch rebuilds.
+- `schema_version`: the on-disk layout. Validated on read.
+- `scope_version`: how scope was computed. Any mismatch rebuilds.
 
 The current `schema_version` is **5**; the minimum readable is 1. A v4 record
 has no `seq` and no per-function `reach_origin`; it is rebuilt once, marks
 preserved, and its sequence starts from 0. A v2 record
 cannot say a function was machine-examined, so every function in one reads as
-never-examined. That is the safe direction — it under-states the leads rather
-than over-stating the reviews — so v2 records are read and rebuilt with an empty
+never-examined. That is the safe direction: it under-states the leads rather
+than over-stating the reviews, so v2 records are read and rebuilt with an empty
 examination set, review marks preserved. A v3 record is rebuilt once to
-acquire `source_index_count` — see below.
+acquire `source_index_count`: see below.
 
 ### The staleness probe compares like with like
 
 `ProjectCache` writes `function_count` into `<sha>.meta.json` as
-`len(_build_function_index(data))` — a dict keyed on the raw address, so a
+`len(_build_function_index(data))`: a dict keyed on the raw address, so a
 function with a falsy address vanishes and duplicates collapse. The record
 stores `source_index_count`, derived exactly the same way, and the probe
 compares those two.
 
 It used to compare the meta value against `source_function_count`, which counts
 the raw function list. Those are different quantities, and on a binary with a
-duplicate address or an address-less function they differ *permanently* — so
+duplicate address or an address-less function they differ *permanently*, so
 the probe read stale on every status poll and re-indexed forever,
 decompressing the whole analysis cache each time. `source_function_count`
 remains the honest denominator cross-check
@@ -474,7 +474,7 @@ Refusing a *future* layout rather than best-effort parsing it is deliberate:
 fields this reader does not know about may be what make the counts mean what
 they say, and the per-entry coercion (`bool(entry.get("reviewed"))`) would turn
 anything unrecognized into a confident `False`. Losing marks is the safe
-direction — it asks for work to be redone rather than claiming work that was
+direction: it asks for work to be redone rather than claiming work that was
 never done.
 
 The scope downgrade is silent by design but detectable: the consumer reads
@@ -485,7 +485,7 @@ The scope downgrade is silent by design but detectable: the consumer reads
 Marks are preserved aggressively, and auto-marking is silent. Together those
 make one accident easy: a scripted sweep, a bulk `mark_function_reviewed`, or a
 tool run against the wrong path leaves a binary recorded as reviewed that nobody
-read. That record is worse than having none — the next campaign polls it, sees
+read. That record is worse than having none: the next campaign polls it, sees
 `remaining_in_scope: 0`, and stops.
 
 `reset_coverage` is the way out. It is deliberately a tool and not a documented
@@ -497,7 +497,7 @@ neighbouring binaries with it.
 | `reset_coverage(binary_path=...)` | clears every mark on both axes; keeps the stored function list and scope exactly as built. |
 | `reset_coverage(binary_path=..., clear_reviewed=False)` | clears only the examinations. |
 | `reset_coverage(binary_path=..., clear_examined=False)` | clears only the review marks. |
-| `reset_coverage(binary_path=..., drop_index=True)` | deletes the side-car, then rebuilds it from the current analysis cache under current scope logic. **Refused when there is no analysis cache to rebuild from** — see below. |
+| `reset_coverage(binary_path=..., drop_index=True)` | deletes the side-car, then rebuilds it from the current analysis cache under current scope logic. **Refused when there is no analysis cache to rebuild from**: see below. |
 
 The two axes get independent flags because they contaminate independently: a
 diff pointed at the wrong pair floods the examinations while the reviews stay
@@ -513,8 +513,8 @@ the next status query re-indexes automatically.
 **Without the analysis cache, `drop_index=True` is refused.** That is not a
 hypothetical state: `ProjectCache.invalidate` evicts the analysis and
 deliberately spares this side-car, which is exactly how a ledger ends up
-`stale`. A `stale` record still carries the last known counts — it is the only
-surviving account of what was reviewed — and dropping it there is
+`stale`. A `stale` record still carries the last known counts: it is the only
+surviving account of what was reviewed, and dropping it there is
 unrecoverable. The refusal keeps it and points at the two ways forward: re-run
 `analyze_binary` to restore the rebuild source, or reset without `drop_index`
 to clear the marks while keeping the denominator.
@@ -522,7 +522,7 @@ to clear the marks while keeping the denominator.
 Every `reset_coverage` response carries every count key, null when no record
 could be read. An **omitted** key is not a null: a consumer reading
 `payload.get("total", 0)` off a response that dropped the key lands on `0`, and
-`0` reads as "complete" — the same false completion the null-not-zero rule
+`0` reads as "complete": the same false completion the null-not-zero rule
 exists to prevent, arrived at through the client's default instead of the
 server's value.
 
@@ -531,9 +531,9 @@ The default keeps the scope as it was computed, whenever that was; the drop
 recomputes it under the current `scope_version` and the current contents of the
 analysis cache. Prefer the default: clearing marks unlearns the claim that
 functions were read while keeping the denominator you already trust. Reach for
-`drop_index=True` when the index itself is suspect — built under scope logic you
+`drop_index=True` when the index itself is suspect: built under scope logic you
 no longer trust, or predating an incremental re-analysis that added functions.
 
 The response reports `cleared` (how many marks were removed) so the operator
 sees the size of what was undone. Resetting a binary with no record is an error,
-not a silent no-op — it usually means the wrong `binary_id`.
+not a silent no-op: it usually means the wrong `binary_id`.

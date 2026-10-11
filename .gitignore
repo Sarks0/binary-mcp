@@ -31,6 +31,7 @@ env/
 .env
 .env.local
 .env.*.local
+.env.bak*
 
 # IDEs
 .vscode/
@@ -96,3 +97,7 @@ AUDIT.md
 # directory if any code path creates one. The code no longer does; this is the
 # tripwire, because these names contain characters Windows cannot check out.
 MagicMock/
+
+# TLS trust anchor for the remote x64dbg bridge. Host-specific and pulled from
+# the debugger VM, so it never belongs in the tree.
+obsidian-cert.pem

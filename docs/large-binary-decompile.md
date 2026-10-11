@@ -6,8 +6,8 @@ those targets on demand.
 
 That workflow used to have a hole in the middle. The structural pass was cheap
 as advertised, but **every** targeted decompile that followed cost a full
-re-analysis of the binary first — about seven minutes on a 17 MB, ~30K-function
-DLL — to produce one function body. Decompiling twenty candidates meant twenty
+re-analysis of the binary first: about seven minutes on a 17 MB, ~30K-function
+DLL: to produce one function body. Decompiling twenty candidates meant twenty
 re-analyses. The cache filled up with function *names* while the code stayed
 one Ghidra run away, per function, forever.
 
@@ -21,7 +21,7 @@ analyzeHeadless <projects> <name> -import <binary> -overwrite ... -postScript co
 
 `-import ... -overwrite` re-imports the binary and re-runs Ghidra's whole
 auto-analyzer suite. `keep_project=True` was already being passed, so the
-analyzed project was *kept* — but nothing ever opened it again. The expensive
+analyzed project was *kept*, but nothing ever opened it again. The expensive
 artifact was produced, saved, and then ignored on the next call.
 
 ## Project reuse
@@ -51,8 +51,8 @@ import:
 ```
 
 A run reuses the project only when the record's `binary_hash` matches the
-binary in hand and `analyzed` is true. Reuse is refused — and a normal import
-runs — when:
+binary in hand and `analyzed` is true. Reuse is refused, and a normal import
+runs, when:
 
 | Condition | Why |
 |---|---|
@@ -70,7 +70,7 @@ retries as an import. The worst case is the behaviour that existed before.
 ### Projects are keyed on content
 
 Project names are now `<stem>_<hash8>` rather than the file stem alone. An old
-and a new build of one DLL — the patch-diff case this server exists for — used
+and a new build of one DLL, the patch-diff case this server exists for, used
 to share a single project, so switching sides re-imported every time, and a
 project reused across that collision would have decompiled the wrong build.
 Separate projects mean both sides stay warm.
@@ -85,8 +85,8 @@ Ghidra is now told exactly which entry points to process, via
 
 - looks each address up directly instead of walking every function in the
   program (a 30K-function sweep to reach the one you asked for);
-- skips the program-wide extractions — memory map, imports, exports, strings,
-  data types — which are re-derived from a whole-program walk and were the
+- skips the program-wide extractions: memory map, imports, exports, strings,
+  data types, which are re-derived from a whole-program walk and were the
   bulk of what a "targeted" run spent its time on;
 - writes no resume manifest, since the address list already *is* the work list.
 
@@ -126,7 +126,7 @@ To fill in pseudocode for a whole binary that was analyzed structurally:
 analyze_binary(path, analysis_depth="full", wait=False)
 ```
 
-With a warm project this no longer re-imports or re-analyzes — it goes straight
+With a warm project this no longer re-imports or re-analyzes: it goes straight
 to decompiling. That is still tens of thousands of decompiles on a large DLL,
 so run it as a job; the per-function work is the irreducible part.
 
@@ -136,7 +136,7 @@ For a 17 MB DLL with ~30K functions:
 
 | Operation | Before | After |
 |---|---|---|
-| First `structural` analysis | ~7 min | ~7 min (unchanged — the import must happen) |
+| First `structural` analysis | ~7 min | ~7 min (unchanged: the import must happen) |
 | Targeted decompile, 1 function | ~7 min | one decompile on a warm project |
 | Targeted decompile, 20 functions | ~20 × 7 min | one run for the batch |
 | `expand_callgraph`, frontier of 12 | 12 runs | 1 run |

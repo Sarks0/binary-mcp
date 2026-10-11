@@ -1,4 +1,4 @@
-# Activity Log & Real-Time Tracing — Concept & Plan
+# Activity Log & Real-Time Tracing: Concept & Plan
 
 Status: **proposed, not implemented.** Captured during a session where
 `load_pdb` on `mpengine.dll` ran for 13+ minutes with no visible
@@ -22,9 +22,9 @@ Long-running binary-mcp operations are opaque from the outside:
 - `ghidra_debug.log` only gets written *after* Ghidra returns, so
   it's useless for live monitoring of the longest single phase.
 
-The diagnostic moves we ended up using during this session — `Get-Process
+The diagnostic moves we ended up using during this session: `Get-Process
 java`, `Get-Item ghidra_debug.log | Select LastWriteTime`, manual CPU
-inspection — are all manual proxy signals. We need first-class
+inspection: are all manual proxy signals. We need first-class
 observability.
 
 ## Goals
@@ -37,7 +37,7 @@ observability.
    so failures show up at the phase boundary, not buried in
    subprocess output.
 3. **In-conversation introspection** via an MCP tool that returns
-   recent activity — the model can ask "what was happening 5 minutes
+   recent activity: the model can ask "what was happening 5 minutes
    ago?" without external shell access.
 4. **No noise.** Activity log emits one line per logical event, not
    debug-level chatter. Grep-friendly, low-volume.
@@ -54,9 +54,9 @@ observability.
   Logging stays for stack traces and debug-level detail; activity log
   captures the structured high-level phase narrative.
 
-## Layered design — 4 levels, each shippable independently
+## Layered design: 4 levels, each shippable independently
 
-### Layer 1 — Activity log file with phase markers (highest value, lowest risk)
+### Layer 1: Activity log file with phase markers (highest value, lowest risk)
 
 New module `src/utils/activity_log.py` that exposes:
 
@@ -93,21 +93,21 @@ Conventions:
 Risk: minimal. New file, new module, no behavioural changes to existing
 code paths.
 
-### Layer 2 — Phase markers wired into long-running tools
+### Layer 2: Phase markers wired into long-running tools
 
 Add `phase()` context managers in:
 
-- `load_pdb` — bracket fetch_pdb / cache.invalidate / stage_pdb /
+- `load_pdb`: bracket fetch_pdb / cache.invalidate / stage_pdb /
   ghidra_analyze / cache_write phases.
-- `analyze_binary` — bracket cache check / ghidra_analyze / post-script
+- `analyze_binary`: bracket cache check / ghidra_analyze / post-script
   / cache_write.
-- `expand_callgraph` — bracket each iteration of the BFS, each
+- `expand_callgraph`: bracket each iteration of the BFS, each
   per-function decompile.
-- `runner.analyze` — bracket subprocess spawn / wall-clock wait / kill /
+- `runner.analyze`: bracket subprocess spawn / wall-clock wait / kill /
   drain phases. Especially valuable: a `phase=ghidra_subprocess`
   marker captures total Ghidra wall-clock independently of any other
   Python overhead.
-- `fetch_pdb` — bracket CodeView extract / URL build / per-server
+- `fetch_pdb`: bracket CodeView extract / URL build / per-server
   attempt with HTTP code recorded.
 
 Each `phase()` context manager handles start + end + duration + error
@@ -117,14 +117,14 @@ fields automatically. Adding a phase to a function is a 2-line change
 Risk: low. Additive only. The context manager swallows logging errors,
 so a broken activity log can never fail an analysis.
 
-### Layer 3 — Real-time Ghidra stderr streaming (highest value for the actual UX problem, medium risk)
+### Layer 3: Real-time Ghidra stderr streaming (highest value for the actual UX problem, medium risk)
 
 The 13-minute opaque wait the user just hit is *inside* a single Ghidra
 subprocess call. Phase markers help frame it ("we're in
 ghidra_subprocess for 13 min so far") but don't help diagnose *what
 phase of Ghidra* is slow. Ghidra's auto-analysis pipeline emits
-progress messages to stderr — Decompiler Switch Analysis, Reference
-analyzer, PdbUniversalAnalyzer, etc. — but currently those are buffered
+progress messages to stderr: Decompiler Switch Analysis, Reference
+analyzer, PdbUniversalAnalyzer, etc., but currently those are buffered
 and only flushed when the subprocess exits.
 
 Replace `runner.analyze`'s `proc.communicate(timeout=...)` pattern with
@@ -157,7 +157,7 @@ tests around timeout, kill, and stream draining. Worth doing because
 this is what would have actually told the user *why* their 13-minute
 wait was 13 minutes.
 
-### Layer 4 — `tail_activity` MCP tool (low effort, useful but secondary)
+### Layer 4: `tail_activity` MCP tool (low effort, useful but secondary)
 
 ```python
 @app.tool()
@@ -206,7 +206,7 @@ Risk: trivial. Read-only file access.
 1. **Layer 1** (~ 1 hour, ~ 150 lines including tests):
    - Create `src/utils/activity_log.py` with `emit`, `phase`, `tail`,
      `get_activity_log_path`. Pure stdlib (no new deps).
-   - `tests/test_activity_log.py` — file write/read, phase context
+   - `tests/test_activity_log.py`: file write/read, phase context
      manager success path, phase context manager error path,
      `tail()` filtering.
 2. **Layer 2** (~ 2 hours, ~ 80 lines across 5 files):
@@ -260,7 +260,7 @@ the complete visibility story.
   Analysis taking minutes and know it was working.
 - The earlier 36-minute Windows hang on PR #117 would have shown
   `phase=ghidra_subprocess status=start` and then no further events
-  for 36 minutes — instantly diagnostic of "subprocess wedged."
+  for 36 minutes: instantly diagnostic of "subprocess wedged."
 - The 2-hour `Cogitated for 1h 59m 12s` block from the BMEnvVarReceiver
   session would still have been opaque (that's the model thinking,
   not the tool), but every tool call inside it would have left phase

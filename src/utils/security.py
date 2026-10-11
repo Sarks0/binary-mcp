@@ -975,9 +975,7 @@ def get_allowed_dirs() -> list[Path] | None:
     return [Path(d.strip()) for d in dirs_config.split(os.pathsep) if d.strip()]
 
 
-# ---------------------------------------------------------------------------
 # Non-disclosing text for path-validation failures (audit F-10)
-# ---------------------------------------------------------------------------
 #
 # The MESSAGE of a confinement failure is itself host state. _default_confinement
 # _denied() interpolates the resolved quarantine directory list and

@@ -18,6 +18,7 @@ import uuid
 from enum import Enum
 from pathlib import Path
 
+from src.utils.config import get_config
 from src.utils.security import safe_regex_compile
 
 logger = logging.getLogger(__name__)
@@ -106,10 +107,20 @@ class UnifiedSessionManager:
         Initialize unified session manager.
 
         Args:
-            store_dir: Directory for session storage. Defaults to ~/.binary_mcp_sessions
+            store_dir: Directory for session storage. Defaults to
+                ``$BINARY_MCP_SESSION_DIR``, then ~/.binary_mcp_sessions.
+
+        The environment is consulted only when no directory is passed, so a
+        caller that names one (every test, and any embedder) still wins.
+        ``BINARY_MCP_SESSION_DIR`` was advertised in ``CONFIG_KEYS`` for its
+        whole life without anything reading it; this is the read.
         """
         if store_dir is None:
-            self.store_dir = Path.home() / ".binary_mcp_sessions"
+            configured = (get_config("BINARY_MCP_SESSION_DIR") or "").strip()
+            self.store_dir = (
+                Path(configured) if configured
+                else Path.home() / ".binary_mcp_sessions"
+            )
         else:
             self.store_dir = Path(store_dir)
 

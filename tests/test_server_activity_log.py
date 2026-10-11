@@ -86,7 +86,7 @@ inline BOOL DeleteFileA(const char*){ return 1; }
 DRIVER = r"""
 #include "activity_log.h"
 int main() {
-    ActivityLog::Init("./", "1.1.0-rc1", 8765);
+    ActivityLog::Init("./", "1.1.0-rc1", 8765, "https://192.168.1.50:8765 tls=mutual REMOTE");
     unsigned long long id = ActivityLog::NextRequestId();
     unsigned long long t0 = ActivityLog::NowMs();
     ActivityLog::Event("request.received")
@@ -177,6 +177,17 @@ class TestActivityLog:
         assert start["version"] == "1.1.0-rc1"
         assert start["port"] == 8765
         assert start["pid"] == 8124
+
+    def test_start_records_the_listener(self, tmp_path):
+        """server.start must name the bind address and TLS mode.
+
+        Without it a log from a LAN-exposed, mutual-TLS run reads exactly like
+        one from the loopback default -- which is the first thing anyone wants
+        to know when reading a log after the fact, and the thing that decides
+        whether an entry in it is interesting at all.
+        """
+        start = _run(tmp_path)[0]
+        assert start["listener"] == "https://192.168.1.50:8765 tls=mutual REMOTE"
 
     def test_requests_are_correlated_by_id(self, tmp_path):
         events = _run(tmp_path)

@@ -259,7 +259,7 @@ jobs:
         Get-ChildItem artifact/obsidian-plugins
 
     - name: Upload plugin artifacts
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         # Same reasoning as OBSIDIAN_BUILD_SHA above: name the download after
         # the commit it was built from, not after a merge commit that exists

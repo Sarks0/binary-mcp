@@ -160,6 +160,44 @@ def test_readme_tool_count_matches_code():
     )
 
 
+def test_src_never_disables_tls_verification():
+    """
+    No code under src/ may turn off certificate or hostname verification.
+
+    TLS is the only transport this project allows off loopback, so a single
+    `verify=False` would quietly undo the whole remote story: the handshake
+    still succeeds, the connection still looks encrypted, and nothing in a
+    log or a test output says the peer was never checked. That is the kind
+    of line that gets added while debugging a certificate problem and then
+    stays.
+
+    Written because the pull request claimed this property was asserted by a
+    test and it was not. The claim was true of the code and false about the
+    enforcement, which is the more dangerous combination: a reader trusts it
+    and no mechanism keeps it true.
+
+    requests' `verify=`, ssl's CERT_NONE and `check_hostname` all appear here
+    because they are three different ways to reach the same place, and a
+    reviewer grepping for one of them would miss the others.
+    """
+    forbidden = (
+        "verify=False",
+        "CERT_NONE",
+        "check_hostname = False",
+        "check_hostname=False",
+    )
+    offenders = []
+    for path in sorted(SRC.rglob("*.py")):
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            code = line.split("#", 1)[0]
+            for needle in forbidden:
+                if needle in code:
+                    offenders.append(f"{path.relative_to(REPO_ROOT)}:{number}: {needle}")
+    assert not offenders, (
+        "TLS verification must never be disabled in src/:\n" + "\n".join(offenders)
+    )
+
+
 def test_no_file_uses_an_em_dash_or_its_lookalikes():
     """
     Em dashes are not used in this project's prose; ordinary punctuation is.

@@ -14,7 +14,7 @@ debugger host; see [the remote access plan](remote-access-plan.md).
 | | What crosses the network | Status |
 |---|---|---|
 | **Remote MCP server** | The MCP protocol itself. The whole server, Ghidra and x64dbg all live on the debugger host | Implemented and unit-tested. Not yet run across two real hosts, so expect to debug the first setup |
-| **Remote x64dbg bridge** | Only the x64dbg HTTP hop. The server and Ghidra stay with the client | Implemented and verified on two hosts, with TLS in the plugin's own listener — see [below](#remote-x64dbg) |
+| **Remote x64dbg bridge** | Only the x64dbg HTTP hop. The server and Ghidra stay with the client | Implemented and verified on two hosts, with TLS in the plugin's own listener: see [below](#remote-x64dbg) |
 
 Throughout: **Host A** is where the MCP client runs, **Host B** is where
 x64dbg, the sample and (for the first arrangement) this server run.
@@ -43,8 +43,8 @@ x64dbg, the sample and (for the first arrangement) this server run.
                                        └──────────────────────────────┘
 ```
 
-Everything the server touches — the sample, the Ghidra cache, memory dumps,
-trace logs — is on one filesystem, so no artifact ends up on the wrong host.
+Everything the server touches: the sample, the Ghidra cache, memory dumps,
+trace logs: is on one filesystem, so no artifact ends up on the wrong host.
 The bridge hop inside Host B stays on loopback, so none of the x64dbg-side
 remote configuration applies. Cost: Ghidra runs inside the malware VM.
 
@@ -62,7 +62,7 @@ BINARY_MCP_HTTP_TOKEN=$(openssl rand -hex 32) \
 uv run python -m src.server
 ```
 
-Keep the token you generated — you need it on Host A. (Leave
+Keep the token you generated: you need it on Host A. (Leave
 `BINARY_MCP_HTTP_TOKEN` unset and the server mints one and logs it at startup,
 but it changes on every restart.)
 
@@ -82,7 +82,7 @@ loopback bind accepts `localhost`, `127.0.0.1` and `::1`.
 
 Use this when a tunnel is impractical. The server refuses to bind a
 non-loopback address unless all three of the following are set, and refuses a
-wildcard address (`0.0.0.0`, `::`, `*`) under any configuration — name the
+wildcard address (`0.0.0.0`, `::`, `*`) under any configuration: name the
 interface.
 
 ```bash
@@ -104,7 +104,7 @@ claude mcp add --transport http binary-mcp https://192.168.1.50:8770/mcp \
 ```
 
 If clients dial a DNS name rather than the address, add it to
-`BINARY_MCP_HTTP_ALLOWED_HOSTS` — otherwise the request is refused as a
+`BINARY_MCP_HTTP_ALLOWED_HOSTS`: otherwise the request is refused as a
 possible rebinding attempt:
 
 ```bash
@@ -149,7 +149,7 @@ Two things worth knowing before you expose it:
 | `403 {"error":"Client address not permitted"}` | The peer is outside `BINARY_MCP_REMOTE_CLIENT_ALLOWLIST` |
 
 Every refusal above is logged at WARNING with the client address and the
-reason, so it is already visible at the default log level — there is no need to
+reason, so it is already visible at the default log level: there is no need to
 raise `BINARY_MCP_LOG_LEVEL` to see why a request was turned away. Raise it to
 `DEBUG` only for the successful path (which endpoint was resolved, where the
 token came from).
@@ -158,7 +158,7 @@ token came from).
 
 ## Remote x64dbg
 
-The other arrangement — this server and Ghidra on Host A, only the x64dbg hop
+The other arrangement: this server and Ghidra on Host A, only the x64dbg hop
 crossing the network. Use it when the analysis brain should stay outside the
 malware VM, or when Ghidra wants a bigger machine than the VM.
 
@@ -217,7 +217,7 @@ plaintext exactly as it always has.
 The policy it enforces (`server/listener_policy.h`, exercised by
 `tests/test_cpp_listener_policy.py`) mirrors the Python side:
 
-- a wildcard bind — `0.0.0.0`, `::`, `*` — is refused outright, with or without
+- a wildcard bind (`0.0.0.0`, `::`, `*`) is refused outright, with or without
   TLS;
 - a non-loopback bind without `tls_cert_thumbprint` is refused;
 - an address the policy cannot classify as a dotted quad is refused rather than
@@ -227,7 +227,7 @@ The policy it enforces (`server/listener_policy.h`, exercised by
 
 #### On Host B (where x64dbg runs)
 
-**1. Make a certificate for the address Host A will dial.** No admin needed —
+**1. Make a certificate for the address Host A will dial.** No admin needed:
 `CurrentUser\My` is the store the server process reads, because x64dbg spawns
 it as that user.
 
@@ -243,7 +243,7 @@ $cert.Thumbprint
 ```
 
 The `TextExtension` line is the subject alternative name. Without it the
-certificate has no SAN for the address and Host A's verification fails — which
+certificate has no SAN for the address and Host A's verification fails, which
 is the correct failure, but a confusing one to debug.
 
 **2. Export the public certificate** so Host A has something to verify
@@ -279,7 +279,7 @@ openssl x509 -in obsidian-debugger.pem -noout -subject -ext subjectAltName
 ```
 
 **3. Write `obsidian.ini`** next to `obsidian.dp64` and
-`obsidian_server.exe` — ASCII, no BOM, and no spaces around `=`:
+`obsidian_server.exe`: ASCII, no BOM, and no spaces around `=`:
 
 ```ini
 [listener]
@@ -290,7 +290,7 @@ allow_clients=192.168.1.10
 ```
 
 `allow_clients` takes addresses or CIDRs, comma-separated, and is checked at
-`accept()` — before the TLS handshake, before any HTTP is parsed, and before
+`accept()`: before the TLS handshake, before any HTTP is parsed, and before
 the token is compared. `allow_hosts` does the same for `Host` header values
 when clients dial a DNS name. Any value containing a character a flag cannot
 legitimately hold causes the whole file to be refused, rather than one setting
@@ -315,7 +315,7 @@ allow_clients=192.168.1.10
 token=<32 to 256 characters>
 ```
 
-Generate one the same way you would any other secret — `openssl rand -hex 32`
+Generate one the same way you would any other secret: `openssl rand -hex 32`
 produces exactly the shape the plugin generates for itself. Then put the same
 value in Host A's `OBSIDIAN_AUTH_TOKEN` and it stays valid across restarts.
 
@@ -326,7 +326,7 @@ The rules, enforced at start-up by `Listener::IsPinnedToken`:
 - **256 maximum**, because the ini reader's buffer would truncate a longer one
   and a truncated token cannot be told apart from a whole one. The symptom
   would be `Invalid token (wrong length)` with nothing pointing at the ini.
-- **RFC 6750 token68 only** — letters, digits and `- . _ ~ + / =`. This is the
+- **RFC 6750 token68 only**: letters, digits and `- . _ ~ + / =`. This is the
   same set the bridge enforces on `OBSIDIAN_AUTH_TOKEN`, so a token one half
   accepts cannot be one the other refuses. No spaces, and no stray `\r` from a
   copy-paste.
@@ -336,21 +336,21 @@ The rules, enforced at start-up by `Listener::IsPinnedToken`:
   connecting the two.
 
 The plugin logs the source and the length, never the value, and notes in the
-log that a pinned token does not change on restart — which is the point, and
+log that a pinned token does not change on restart, which is the point, and
 also means it stays valid if it leaks. Remove the key to go back to
 generate-and-rotate.
 
 A CIDR must be written as its network address: `10.0.0.0/24`, not
 `10.0.0.5/24`. The second is refused rather than read as the first, because
 someone writing a host address with a prefix means that host, and silently
-admitting 254 more would be the wrong way to resolve the ambiguity — write
+admitting 254 more would be the wrong way to resolve the ambiguity: write
 `10.0.0.5` on its own for a single client. The same rule applies to
 `BINARY_MCP_REMOTE_CLIENT_ALLOWLIST` on the Python listener. An entry in
 `allow_hosts` may carry a port or not (`analysis.lan` and
 `analysis.lan:8765` behave identically); the port is stripped before
 comparing, as it is on every incoming `Host`.
 
-**4. Add a firewall rule, scoped to the client** — not to `Any`. This is the
+**4. Add a firewall rule, scoped to the client**, not to `Any`. This is the
 one step that needs an elevated prompt.
 
 Needed even on a network that is already open to this traffic: Windows
@@ -359,7 +359,7 @@ blocks unsolicited inbound by default on every profile, and
 `obsidian_server.exe` is spawned without a window so it never gets the
 first-run allow prompt a GUI application would. `Get-NetFirewallProfile |
 Select-Object Name, Enabled` says whether it is on. The symptom when it blocks
-is a timeout, which is also the symptom of a wrong `allow_clients` — so rule
+is a timeout, which is also the symptom of a wrong `allow_clients`, so rule
 this out first:
 
 ```powershell
@@ -384,7 +384,7 @@ says so; the reason is in `obsidian_server.log` beside the executable.
 
 Put these in a `.env` beside the server rather than exporting them. The server
 searches upwards for one, so a file in the repository root is found without
-any shell involvement — and a shell that loses its exports (a new terminal, a
+any shell involvement, and a shell that loses its exports (a new terminal, a
 restarted service) is otherwise indistinguishable from a broken endpoint:
 `$X64DBG_TLS_CA` unset makes curl report `the file '' provided to --cacert
 does not exist`, and an unset token gets you a 401.
@@ -447,8 +447,8 @@ $store.Open('ReadWrite'); $store.Add($ca); $store.Close()
 ```
 
 `CurrentUser\Root`, not `LocalMachine\Root`: that scopes the trust to the one
-account x64dbg runs as, on a VM you revert. It is still real trust — that CA
-can now vouch for any host to that account — which is the cost of pinning on
+account x64dbg runs as, on a VM you revert. It is still real trust: that CA
+can now vouch for any host to that account, which is the cost of pinning on
 top of chain validation rather than instead of it. If that trade is wrong for
 your setup, use the SSH tunnel instead and skip certificates entirely.
 
@@ -461,7 +461,7 @@ tls_client_ca_thumbprint=0011223344556677889900AABBCCDDEEFF001122
 Schannel then fails the handshake for a client without a certificate, and the
 server additionally checks two things the chain alone does not: that the
 certificate is valid **for client authentication** (a server certificate from
-the same CA is refused), and that the pinned CA appears in its chain — so a
+the same CA is refused), and that the pinned CA appears in its chain, so a
 different CA in the same trust store cannot vouch for a client here.
 
 On Host A, split the PFX into a PEM certificate and key (`openssl pkcs12
@@ -476,7 +476,7 @@ export X64DBG_TLS_CLIENT_KEY=/path/to/analyst.key
 #### Still works: a TLS terminator
 
 Putting stunnel, nginx or Caddy on Host B in front of a loopback
-`obsidian_server.exe` also works and always did — Host A's side is identical,
+`obsidian_server.exe` also works and always did: Host A's side is identical,
 since it verifies whatever certificate the thing it dials presents. Use it if
 you already run one, or if you want TLS 1.3 (the plugin's listener negotiates
 TLS 1.2 with strong cipher suites; TLS 1.3 needs a Schannel API this does not
@@ -485,7 +485,7 @@ use yet).
 ### What works, and what does not
 
 Either option gives you every x64dbg tool: memory read and write, breakpoints,
-stepping, events, coverage, and `x64dbg_dump_module` — which streams bytes over
+stepping, events, coverage, and `x64dbg_dump_module`, which streams bytes over
 the API and writes the file on Host A, where the static tools can reach it.
 
 Two limitations remain, both from the same cause: some artifacts are written by
@@ -507,13 +507,13 @@ removes the first.
 |---|---|
 | `X64DBG_HOST=... is not a loopback address` | The endpoint needs `BINARY_MCP_REMOTE_ALLOW`. A tunnel needs no opt-in and is simpler |
 | `... so TLS is required: set X64DBG_TLS_CA` | No CA configured for a remote host. Point it at the certificate exported from Host B |
-| Server log says `Invalid token (wrong length)` | The presented token is not 64 characters — a truncated paste, or a `\r` picked up from the Windows file. `printf '%s' "$OBSIDIAN_AUTH_TOKEN" \| wc -c` should print 64 |
+| Server log says `Invalid token (wrong length)` | The presented token is not 64 characters: a truncated paste, or a `\r` picked up from the Windows file. `printf '%s' "$OBSIDIAN_AUTH_TOKEN" \| wc -c` should print 64 |
 | Server log says `Invalid token (mismatch)` | 64 characters but the wrong value, which means the token rotated: x64dbg has been restarted since you read it |
 | `OBSIDIAN_AUTH_TOKEN must be set for a non-loopback endpoint` | The plugin's token file is on Host B. Read it there |
 | `OBSIDIAN_AUTH_TOKEN is not set, and this bridge points at ...` | Same cause, hit at request time rather than construction |
 | `SSLError` / certificate verify failed | The certificate Host B serves is not the one in `X64DBG_TLS_CA`, or its subject alternative name does not cover `X64DBG_HOST` (the `TextExtension` line) |
 | Plugin log says `Server refused its listener configuration (exit 2)` | The flags built from `obsidian.ini` were rejected. The reason is in `obsidian_server.log`; deleting the ini restores the loopback default |
-| Plugin log says `obsidian.ini is malformed` | A value contains a character a flag cannot hold — usually a stray space or quote. The whole file is refused rather than one setting dropped |
+| Plugin log says `obsidian.ini is malformed` | A value contains a character a flag cannot hold: usually a stray space or quote. The whole file is refused rather than one setting dropped |
 | Server log says `client certificate chain is not trusted (status 0x00000020)` | `CERT_TRUST_IS_UNTRUSTED_ROOT`: the client CA is not in a trust store the server can read. Import it into `Cert:\CurrentUser\Root` |
 | Server log says `was not issued under the CA named by --tls-client-ca-thumbprint` | The certificate is trusted but came from a different CA than the pinned one |
 | Nothing listens, and the server log says `no certificate with that thumbprint` | The thumbprint is from a different store. `--machine-store` / `machine_store=1` selects `LocalMachine\My`; the default is `CurrentUser\My`, which is what x64dbg's own user can read |
@@ -531,12 +531,12 @@ secret-dependent first, so a denial never depends on comparing a token the
 caller was never going to get right.
 
 The chain below is `obsidian_server.exe`. The Python gate
-(`RemoteAccessGate` in `src/utils/remote.py`) runs steps 1 and 4–7; steps 2
+(`RemoteAccessGate` in `src/utils/remote.py`) runs steps 1 and 4-7; steps 2
 and 3 are uvicorn's.
 
 Step 1 is the one asymmetry between the two. `obsidian_server.exe` closes the
-socket and sends nothing — the check runs before the TLS handshake, so there
-is no channel to send a status over — so a client denied by `allow_clients`
+socket and sends nothing: the check runs before the TLS handshake, so there
+is no channel to send a status over, so a client denied by `allow_clients`
 sees a connection reset, not a 403. The Python gate, which sits behind a
 handshake that has already completed, does answer 403. If an `allow_clients`
 entry is wrong, expect the port to look firewalled; `obsidian_server.log`
@@ -568,7 +568,7 @@ records the refusal with the peer address.
 
 A duplicate `Host` is refused rather than resolved (step 4) because a gate
 deciding on the first value while a proxy in front decided on the last is a
-gate that can be walked past — and a TLS terminator in front of a loopback
+gate that can be walked past, and a TLS terminator in front of a loopback
 listener is a supported deployment.
 
 ## What the policy demands

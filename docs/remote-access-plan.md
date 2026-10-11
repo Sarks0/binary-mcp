@@ -3,16 +3,16 @@
 **Status:** Phases 0 to 3 are implemented. See
 [Remote access](remote-access.md) for the resulting setup. Phase 4 (artifact
 transfer) and Phase 5 (WinDbg user-mode remoting) are still proposed, and two
-items inside Phase 3 were deliberately not done — see the notes under it.
+items inside Phase 3 were deliberately not done: see the notes under it.
 
 ## The target topology
 
 Two machines on one LAN:
 
-- **Host A** — the analyst's workstation. Runs the MCP client (Claude Code,
+- **Host A**: the analyst's workstation. Runs the MCP client (Claude Code,
   Claude Desktop, opencode) and, today, the whole `binary-mcp` Python server
   plus Ghidra.
-- **Host B** — the disposable Windows VM or second box. Runs x64dbg, the
+- **Host B**: the disposable Windows VM or second box. Runs x64dbg, the
   `obsidian.dp64` plugin, `obsidian_server.exe`, and the sample.
 
 Everything in this repo currently assumes A and B are the same machine. This
@@ -21,9 +21,9 @@ the work to remove it.
 
 ---
 
-## Part 1 — Where the same-host assumption lives
+## Part 1: Where the same-host assumption lives
 
-### 1.1 The C++ HTTP server binds loopback, unconditionally — FIXED
+### 1.1 The C++ HTTP server binds loopback, unconditionally: FIXED
 
 `src/engines/dynamic/x64dbg/server/main.cpp:901`
 
@@ -33,9 +33,9 @@ serverAddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);  // 127.0.0.1 only
 
 There is no bind-address argument, no environment variable, and no setting
 file. `main()` (`main.cpp:1071-1076`) takes a port from `argv[1]` and defaults
-to 8765 — but the plugin never passes one.
+to 8765, but the plugin never passes one.
 
-### 1.2 The plugin spawns the server with no arguments — FIXED
+### 1.2 The plugin spawns the server with no arguments: FIXED
 
 `src/engines/dynamic/x64dbg/plugin/plugin.cpp:5263-5345` (`SpawnHTTPServer`)
 builds the command line as a bare quoted path:
@@ -47,10 +47,10 @@ snprintf(cmdLine, sizeof(cmdLine), "\"%s\"", serverPath);
 So the port is always 8765 and the bind address is always loopback, even though
 `main()` would accept a different port. The auth token is handed over by
 setting `OBSIDIAN_AUTH_TOKEN` in the environment before `CreateProcessA` and
-clearing it immediately after (`plugin.cpp:5336`) — a good pattern that already
+clearing it immediately after (`plugin.cpp:5336`): a good pattern that already
 works for a remote client, see 1.4.
 
-### 1.3 The Python bridge refuses any non-loopback host — FIXED
+### 1.3 The Python bridge refuses any non-loopback host: FIXED
 
 `src/engines/dynamic/x64dbg/bridge.py:466-471`
 
@@ -67,12 +67,12 @@ rejects anything but loopback. The parameter exists; the gate makes it inert.
 
 Replaced by `resolve_debugger_endpoint` in `src/utils/remote.py`, the same
 module the listener's policy lives in. `get_x64dbg_bridge()` no longer reads
-`X64DBG_HOST`/`X64DBG_PORT` itself — two readers of one setting is how a
+`X64DBG_HOST`/`X64DBG_PORT` itself: two readers of one setting is how a
 default drifts. A side effect worth noting: the old check accepted `::1` as a
 loopback spelling and then built `http://::1:8765`, which is not a URL, so that
 spelling had never worked. The endpoint brackets IPv6 literals.
 
-### 1.4 Token provisioning is same-machine by default — but not exclusively
+### 1.4 Token provisioning is same-machine by default, but not exclusively
 
 `bridge.py:675-725` (`_read_auth_token`) reads `OBSIDIAN_AUTH_TOKEN` first, and
 only falls back to `%TEMP%/x64dbg_mcp_token.txt`. The plugin writes that file
@@ -84,13 +84,13 @@ with a current-user-only DACL (`plugin.cpp:5661-5685`,
 precedence, so a token copied from Host B out-of-band is already accepted on
 Host A with no code change. See Part 2.
 
-### 1.5 No transport security at all — FIXED
+### 1.5 No transport security at all: FIXED
 
 The wire format is plain HTTP/1.1 with `Authorization: Bearer <64 hex chars>`.
 The token is compared in constant time (`main.cpp:242-281`, `SecureCompare`),
 which is the right thing for a loopback threat model and almost irrelevant once
 the token crosses a LAN in cleartext. There is no TLS, no mTLS, no client-IP
-allowlist, and no `Host`-header or `Origin` check — so the moment the listener
+allowlist, and no `Host`-header or `Origin` check, so the moment the listener
 leaves loopback it is also exposed to DNS rebinding from a browser on any host
 that can resolve a name to Host B's address.
 
@@ -98,17 +98,17 @@ What a stolen token buys an attacker is the full dynamic surface: arbitrary
 memory read **and write** in the debuggee (`/api/memory/read`,
 `/api/memory/write`, `/api/memory/protect`, `/api/memory/alloc`), register
 writes, breakpoints, thread suspend/resume, and the allowlisted command gate.
-`docs/security.md` is careful to say no tool can start a sample — that holds,
+`docs/security.md` is careful to say no tool can start a sample: that holds,
 but it was written for a listener only the local user could reach.
 
-### 1.6 The accept loop serves one connection at a time — STILL TRUE, BY DECISION
+### 1.6 The accept loop serves one connection at a time: STILL TRUE, BY DECISION
 
 `main.cpp:920-947`: a single-threaded `select()` loop with a 1-second accept
 timeout, 5-second `SO_RCVTIMEO`/`SO_SNDTIMEO`, a 15-second request deadline
 (`REQUEST_DEADLINE_MS`, `main.cpp:454`), a 16 KiB header cap
 (`MAX_HEADER_SIZE`, `main.cpp:445`) and a 1 MiB body cap
 (`MAX_CONTENT_LENGTH` = `Protocol::MAX_MESSAGE_SIZE`, `main.cpp:450`). Every
-connection is closed after one request — no keep-alive.
+connection is closed after one request: no keep-alive.
 
 Over loopback that is fine. Over a LAN it means one round trip per TCP
 handshake for each of the dozens of calls a single tool makes, and one slow
@@ -126,7 +126,7 @@ guess, and the two candidates do not deserve equal weight:
   cache makes a resumed handshake one round trip with no asymmetric operation,
   which is most of what a per-request handshake costs. Against that, adding
   persistent connections to a hand-rolled HTTP parser adds request-smuggling
-  surface — this parser ignores `Transfer-Encoding` entirely, which is harmless
+  surface: this parser ignores `Transfer-Encoding` entirely, which is harmless
   when every connection closes after one request and is a framing
   vulnerability when it does not.
 
@@ -140,7 +140,7 @@ turns out to be visibly slow, the fix is keep-alive *plus* explicit rejection of
 This is the part that no amount of socket configuration fixes, and the main
 reason a plain tunnel is not the whole answer.
 
-**Already remote-safe** — the plugin streams bytes over HTTP and *Python*
+**Already remote-safe**: the plugin streams bytes over HTTP and *Python*
 writes the file, so the artifact lands on Host A where the static tools can
 reach it:
 
@@ -148,7 +148,7 @@ reach it:
 |---|---|
 | `dump_module` | `bridge.py:4624-4790` (reads memory, `open(output_path,'wb')` locally) |
 
-**Plugin-side writes** — the path is sent to Host B and the file appears there,
+**Plugin-side writes**: the path is sent to Host B and the file appears there,
 under the plugin's own output root `%TEMP%\obsidian_x64dbg\output\`
 (`plugin.cpp:615-656`, `GetOutputRoot`):
 
@@ -178,11 +178,11 @@ Host A (copied once, same bytes → same hash → the cache lines up fine), or t
 whole static side is unavailable. This needs to be stated explicitly rather
 than discovered.
 
-### 1.9 The MCP server itself is stdio-only — FIXED
+### 1.9 The MCP server itself is stdio-only: FIXED
 
 `src/server.py:6386-6407` ends in a bare `app.run()`, which is FastMCP's stdio
 transport. The client must therefore spawn the server as a subprocess on its
-own machine — there is no way for a client on Host A to attach to a server
+own machine: there is no way for a client on Host A to attach to a server
 process on Host B. `fastmcp>=2.13,<3` (`pyproject.toml`) does support
 `app.run(transport="http", host=..., port=...)`, so this is a small change
 gated mostly on auth and docs.
@@ -191,13 +191,13 @@ gated mostly on auth and docs.
 
 `src/engines/dynamic/windbg/bridge.py` drives dbgeng in-process via Pybag, so
 it must run on a Windows host. It already has genuinely remote *kernel*
-transports — `connect_kernel_net` (KDNET, `bridge.py:879-937`),
-`connect_kernel_serial` (`:938-991`), `connect_kernel_pipe` (`:992-1021`) — and
+transports: `connect_kernel_net` (KDNET, `bridge.py:879-937`),
+`connect_kernel_serial` (`:938-991`), `connect_kernel_pipe` (`:992-1021`), and
 a local-kernel read-only mode (`connect_kernel_local`, `:1122+`). What it does
 *not* have is user-mode dbgeng remoting (`-premote tcp:...`). So for WinDbg,
 "remote" means either topology B below, or a separate dbgeng-remoting project.
 
-### 1.11 Configuration keys are documented wrong — FIXED
+### 1.11 Configuration keys are documented wrong: FIXED
 
 `src/utils/config.py:193` declares:
 
@@ -219,11 +219,11 @@ nothing.
 `obsidian.dp64`, `obsidian.dp32` and `obsidian_server.exe` into x64dbg's plugin
 directories, with release-digest verification. Neither has a notion of "install
 the debugger half here and the analysis half there", and neither opens a
-firewall port (correctly, today — there is nothing to expose).
+firewall port (correctly, today: there is nothing to expose).
 
 ---
 
-## Part 2 — What already works: tunnelled remote, zero code changes
+## Part 2: What already works, tunnelled remote with zero code changes
 
 Worth doing first, because it is free and it validates the rest of the plan
 against a real two-host setup.
@@ -248,7 +248,7 @@ export X64DBG_PORT=8765
 ```
 
 The bridge connects to `127.0.0.1:8765`, passes its own loopback check, and
-SSH carries the traffic — authenticated, encrypted, and with no new listener on
+SSH carries the traffic: authenticated, encrypted, and with no new listener on
 the LAN.
 
 **What works:** every read/write/control endpoint, the command gate, events,
@@ -258,16 +258,16 @@ coverage collection, `dump_module` (lands on Host A).
 on Host B and report a Host A path (1.7); the static side needs a copy of the
 sample on Host A (1.8).
 
-Deliverables for this phase are documentation plus two tests — one that
+Deliverables for this phase are documentation plus two tests: one that
 `OBSIDIAN_AUTH_TOKEN` genuinely bypasses the token file, one that the three
 mismatched artifact methods are at least *honest* about which host they wrote
 on.
 
 ---
 
-## Part 3 — Two topologies, and which to build
+## Part 3: Two topologies, and which to build
 
-### Topology A — remote Obsidian bridge
+### Topology A: remote Obsidian bridge
 
 MCP server + Ghidra stay on Host A; only the x64dbg HTTP hop crosses the
 network.
@@ -287,7 +287,7 @@ Host A                                   Host B
 - **Against:** needs TLS + token provisioning in C++, needs artifact transfer
   (1.7), needs the sample on both hosts (1.8).
 
-### Topology B — remote MCP server
+### Topology B: remote MCP server
 
 The whole of `binary-mcp` runs on Host B next to x64dbg; the client on Host A
 speaks MCP over HTTP.
@@ -316,15 +316,15 @@ Host A                        Host B
 Build **B first, then A.** B is a far smaller change (one transport call, one
 auth provider, docs) and it is the one that fully solves the stated scenario
 without leaving artifacts stranded. A is the better long-term posture for
-malware work — analysis brain outside the infected VM — but it is only
+malware work, analysis brain outside the infected VM, but it is only
 *complete* once artifact transfer and path-origin semantics exist, which is
 Phase 4 below. Both share Phase 1.
 
 ---
 
-## Part 4 — Phased implementation
+## Part 4: Phased implementation
 
-### Phase 0 — Fix the configuration surface (prerequisite, ~small) — DONE
+### Phase 0 (Fix the configuration surface (prerequisite, ~small)) DONE
 
 | Change | Files |
 |---|---|
@@ -334,7 +334,7 @@ Phase 4 below. Both share Phase 1.
 Doing this first means the remote keys added later land in a surface that is
 actually true. The new test is the thing that stops key #11 recurring.
 
-### Phase 1 — Shared remote groundwork — DONE
+### Phase 1, Shared remote groundwork, DONE
 
 - **Done.** `src/utils/remote.py` parses and validates a remote endpoint
   (host, port, TLS material, token, Host allow-set, client allowlist) from one
@@ -356,7 +356,7 @@ actually true. The new test is the thing that stops key #11 recurring.
   a loopback endpoint. One shared exception base, `RemoteConfigError`, with
   `TransportConfigError` and `DebuggerEndpointError` under it.
 
-### Phase 2 — Topology B: remote MCP transport — DONE
+### Phase 2, Topology B: remote MCP transport, DONE
 
 | Change | Files |
 |---|---|
@@ -371,16 +371,16 @@ Tests: refuses non-loopback bind without the switch; refuses without TLS;
 rejects a missing/wrong token; rejects a mismatched `Host` header; stdio
 remains the default when nothing is set.
 
-### Phase 3 — Topology A: remote Obsidian listener — DONE
+### Phase 3, Topology A: remote Obsidian listener, DONE
 
-**Policy** — new, and the reason the rest of this could be verified at all.
+**Policy**: new, and the reason the rest of this could be verified at all.
 `src/engines/dynamic/x64dbg/server/listener_policy.h` holds every decision as a
 string or integer decision, with no Windows headers, so
 `tests/test_cpp_listener_policy.py` compiles the shipped header with g++ and
 *runs* it. It refuses a wildcard bind with or without TLS, refuses a
 non-loopback bind with no certificate, refuses an address it cannot parse as a
 dotted quad (rather than handing it to `inet_addr`, which accepts `0`, `127.1`
-and `0177.0.0.1` — a classifier that disagrees with the thing performing the
+and `0177.0.0.1`: a classifier that disagrees with the thing performing the
 bind is one that can be walked past), validates thumbprints and ports, and
 parses the client allowlist.
 
@@ -398,8 +398,8 @@ parses the client allowlist.
 - The client allowlist is checked at `accept()`, before the handshake, before
   any HTTP is parsed, and before the token is compared.
 - `Host` and `Origin` are validated before the token, and the
-  `Access-Control-Allow-Origin: *` that used to be on every response —
-  including the 401 — is gone. `OPTIONS` is no longer exempt from
+  `Access-Control-Allow-Origin: *` that used to be on every response;
+  including the 401: is gone. `OPTIONS` is no longer exempt from
   authentication, there being no preflight left to serve. **This was not in the
   original plan**; §1.5 named the missing Host check as a finding and it would
   have been a live rebinding hole the moment the listener left loopback.
@@ -417,7 +417,7 @@ parses the client allowlist.
   forwards the values as flags. An ini rather than `BridgeSettingGet`: plain
   Win32 with no SDK surface to track, editable without x64dbg's settings
   dialog, and next to the server executable and its log where someone looking
-  for it will look. Default unchanged — no ini means loopback, 8765, no TLS.
+  for it will look. Default unchanged: no ini means loopback, 8765, no TLS.
 - Values are restricted to the characters their flag can hold, and a violation
   refuses the **whole file**. The server validates thumbprints and addresses,
   but only after the command line has been split; a value carrying a space or a
@@ -428,17 +428,17 @@ parses the client allowlist.
   from exit 1 (ran and stopped): retrying will not help and the pipe is not the
   problem.
 
-**Python bridge** — done in Phase 1; nothing left. It already dialled an
+**Python bridge**: done in Phase 1; nothing left. It already dialled an
 `https` endpoint and verified it against `X64DBG_TLS_CA`, so this phase needed
 no Python change at all: an operator drops the TLS terminator and points
 `X64DBG_HOST` at the plugin.
 
-**Installer / release** — two deviations, both deliberate:
+**Installer / release**: two deviations, both deliberate:
 
 - The planned `install.ps1 -RemoteListener` mode became a documented command
   sequence in [Remote access](remote-access.md) instead. There is no PowerShell
   on any runner this work could reach, so the script could not have been
-  syntax-checked, let alone run — and an unverifiable installer that creates
+  syntax-checked, let alone run, and an unverifiable installer that creates
   certificates and firewall rules is a worse outcome than commands an operator
   pastes one at a time and sees the result of. The two properties that make the
   sequence safe rather than merely convenient (`-RemoteAddress` on the firewall
@@ -460,9 +460,9 @@ Linux (~90 decisions). `schannel_tls.h` and the changed `main.cpp` were
 type-checked against stub Windows headers, which catches typos, wrong member
 names and sign defects but cannot catch a misremembered Win32 signature.
 Neither has been executed. The first real test is the CI compile job, which
-runs on a pull request to `main` or `develop` — not on a branch push.
+runs on a pull request to `main` or `develop`, not on a branch push.
 
-### Phase 4 — Artifact transfer and path-origin semantics
+### Phase 4: Artifact transfer and path-origin semantics
 
 This is what makes Topology A actually usable, and it is independently useful
 on a single host because it removes the "reported a path it did not write"
@@ -477,24 +477,24 @@ class of bug that §1.7 still contains.
   read, confined to the output root via the existing `GetOutputRoot` +
   reparse-point checks) so the bridge can pull an artifact to Host A and hand
   the static tools a local path.
-- A `host` field on every artifact-producing tool's response — `"local"` or the
-  remote endpoint — so the model is never told a file is somewhere it is not.
+- A `host` field on every artifact-producing tool's response: `"local"` or the
+  remote endpoint, so the model is never told a file is somewhere it is not.
 - For Phase 2 (Topology B) this is a no-op, since local *is* the debugger host:
   one more reason to sequence B first.
 
-### Phase 5 — WinDbg remote (optional, later)
+### Phase 5: WinDbg remote (optional, later)
 
 Topology B covers WinDbg already. Native user-mode dbgeng remoting
 (`-premote tcp:port=...,server=...`, mirroring the existing
 `connect_kernel_net`/`_serial`/`_pipe` family at
 `windbg/bridge.py:879-1021`) is a separate piece of work with its own command
-gate implications — `windbg_execute_command` is already off unless
+gate implications: `windbg_execute_command` is already off unless
 `BINARY_MCP_ENABLE_RAW_WINDBG=1`, and a remote target changes what "read-only
 inspection" means. Not in scope until A and B are both landed.
 
 ---
 
-## Part 5 — Test plan
+## Part 5: Test plan
 
 New test modules, mirroring the existing naming:
 
@@ -508,13 +508,13 @@ New test modules, mirroring the existing naming:
 
 Extend existing suites:
 
-- `tests/test_docs_accuracy.py` — every new `BINARY_MCP_REMOTE_*` key is named
+- `tests/test_docs_accuracy.py`: every new `BINARY_MCP_REMOTE_*` key is named
   in `docs/configuration.md` and `docs/security.md`; the loopback-by-default
   claim is pinned against the code, the same way the confinement and symbol
   claims already are.
-- `tests/test_installer_integrity.py` — the new installer mode does not weaken
+- `tests/test_installer_integrity.py`: the new installer mode does not weaken
   digest verification, and the firewall rule is never created with scope `Any`.
-- `tests/test_confinement_sweep.py` / `tests/test_path_confinement.py` — the
+- `tests/test_confinement_sweep.py` / `tests/test_path_confinement.py`: the
   co-resident Topology B case.
 
 Manual two-host validation, in order: Part 2 tunnel first (proves the protocol
@@ -522,11 +522,11 @@ works across a network at all), then Topology B, then Topology A.
 
 ---
 
-## Part 6 — Open questions
+## Part 6: Open questions
 
 1. **Does Topology A pay for itself?** If the answer for most users is "install
    everything in the VM and connect Claude to it", Phase 3 and 4 are a lot of
-   C++ and artifact plumbing for a minority topology — and the Part 2 tunnel
+   C++ and artifact plumbing for a minority topology, and the Part 2 tunnel
    already covers the determined user. Worth deciding before writing Schannel
    code.
 2. **mTLS or token-over-TLS?** mTLS is the honest answer for a listener that

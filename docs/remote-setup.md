@@ -17,7 +17,7 @@ The full reference, with diagrams and a troubleshooting table, is
 
 ---
 
-## Setup A — whole server remote
+## Setup A: whole server remote
 
 Use this when the heavy machine should do the work: Ghidra, the cache, the
 samples. Your laptop just talks to it.
@@ -53,7 +53,7 @@ BINARY_MCP_ALLOWED_DIRS=/srv/samples
 ```
 
 `chmod 600 .env`. Samples live on **this** machine now, inside
-`BINARY_MCP_ALLOWED_DIRS` — nothing copies them there for you.
+`BINARY_MCP_ALLOWED_DIRS`: nothing copies them there for you.
 
 Optional, worth setting:
 
@@ -76,7 +76,7 @@ as the CA.
 
 ---
 
-## Setup B — x64dbg remote only
+## Setup B: x64dbg remote only
 
 Use this when the server stays local and only the debugger is elsewhere.
 

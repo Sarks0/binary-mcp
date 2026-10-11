@@ -109,7 +109,7 @@ line flags; the server's policy
 (`src/engines/dynamic/x64dbg/server/listener_policy.h`) is what decides whether
 the combination is servable. It refuses a wildcard bind outright, refuses a
 non-loopback bind with no certificate, and refuses an address it cannot parse
-as a dotted quad rather than passing it to `inet_addr` — which accepts forms
+as a dotted quad rather than passing it to `inet_addr`, which accepts forms
 the policy does not, and a classifier that disagrees with the thing performing
 the bind is one that can be walked past.
 
@@ -118,7 +118,7 @@ server exits 2 (distinct from its exit 1 for a pipe or port failure) when it
 refuses its own configuration.
 
 TLS is Schannel, TLS 1.2 with `SCH_USE_STRONG_CRYPTO`, and the certificate is
-named by SHA-1 thumbprint from a Windows certificate store — no PEM parser in
+named by SHA-1 thumbprint from a Windows certificate store: no PEM parser in
 the server, and no new runtime dependency on the binary that gets copied into
 an analyst's plugins directory. There is no keep-alive: every request is its
 own connection, which is affordable because Schannel's session cache makes a

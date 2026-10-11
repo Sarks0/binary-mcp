@@ -160,6 +160,53 @@ def test_readme_tool_count_matches_code():
     )
 
 
+def test_no_file_uses_an_em_dash_or_its_lookalikes():
+    """
+    Em dashes are not used in this project's prose; ordinary punctuation is.
+
+    This is a house style rule, so it needs a test for the same reason the
+    banner comments did: a rule nothing enforces is one that comes back a
+    commit at a time, and the character is invisible in review because it
+    looks like punctuation rather than a mistake.
+
+    The lookalikes are included because replacing one dash with a slightly
+    different dash is the obvious way to satisfy the letter of the rule and
+    miss it: U+2013 EN DASH reads almost identically at small sizes, and
+    U+2212 MINUS SIGN was in docs/coverage.md doing arithmetic where ASCII
+    '-' belongs. ASCII hyphen-minus is always fine and is not checked.
+    """
+    forbidden = {
+        "\u2010": "HYPHEN",
+        "\u2011": "NON-BREAKING HYPHEN",
+        "\u2012": "FIGURE DASH",
+        "\u2013": "EN DASH",
+        "\u2014": "EM DASH",
+        "\u2015": "HORIZONTAL BAR",
+        "\u2212": "MINUS SIGN",
+        "\ufe58": "SMALL EM DASH",
+        "\uff0d": "FULLWIDTH HYPHEN-MINUS",
+    }
+    skip_dirs = {".git", ".venv", "node_modules", "__pycache__", ".pytest_cache", ".ruff_cache"}
+    # Checked where a human writes prose. uv.lock and the Excalidraw scene are
+    # generated or tool-owned, and LICENSE is not ours to edit.
+    suffixes = {".md", ".py", ".txt", ".yml", ".yaml", ".toml", ".cpp", ".h", ".ps1", ".sh"}
+    offenders = []
+    for path in sorted(REPO_ROOT.rglob("*")):
+        if not path.is_file() or path.suffix not in suffixes:
+            continue
+        if set(path.relative_to(REPO_ROOT).parts) & skip_dirs:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        for char, name in forbidden.items():
+            if char in text:
+                line = text[: text.index(char)].count("\n") + 1
+                offenders.append(f"{path.relative_to(REPO_ROOT)}:{line} has {name}")
+    assert not offenders, "Use ordinary punctuation instead:\n" + "\n".join(offenders)
+
+
 def test_architecture_diagram_tool_count_matches_code():
     """
     The README's architecture diagram states a tool count, and it drifts too.

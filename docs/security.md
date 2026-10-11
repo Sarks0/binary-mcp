@@ -83,7 +83,7 @@ subprocess and the transport is a pair of pipes. Nothing listens, so nothing on
 the network can reach it, and the rest of this page was written for that shape.
 
 `BINARY_MCP_TRANSPORT=http` changes that shape. The server becomes a listener,
-and a client that reaches it can drive every tool in the roster — including
+and a client that reaches it can drive every tool in the roster: including
 debuggee memory writes, register writes and breakpoints. Treat the bearer token
 as equivalent to a debugger session on that host.
 
@@ -107,7 +107,7 @@ What the code enforces, pinned by `tests/test_remote_policy.py`:
   in `BINARY_MCP_HTTP_ALLOWED_HOSTS`. This is the DNS-rebinding control: a
   browser on any host that can resolve a name to this address would otherwise
   be able to drive the server through a page you never visited. There is
-  deliberately no CORS support — an `Access-Control-Allow-Origin` header here
+  deliberately no CORS support: an `Access-Control-Allow-Origin` header here
   would undo the check.
 - **Optional client-address allowlist.** `BINARY_MCP_REMOTE_CLIENT_ALLOWLIST`
   takes addresses and CIDRs, checked before authentication, so a client outside
@@ -120,7 +120,7 @@ What it does *not* do: there is no rate limiting, no audit log of refused
 requests beyond the server log, and no revocation short of restarting with a
 new token. The transport also trusts the peer address the socket reports, so
 it must not be placed behind a reverse proxy without re-thinking the
-allowlist — `X-Forwarded-For` is not consulted.
+allowlist: `X-Forwarded-For` is not consulted.
 
 Path confinement matters *more* in this mode, not less: the server now shares a
 filesystem with the sample it is analysing. See
@@ -155,7 +155,7 @@ policy mirrors the listener's, and is enforced in the same module:
 - **Optional mutual TLS** via `X64DBG_TLS_CLIENT_CERT` / `_KEY`.
 - **The plugin's token file is only read for a loopback endpoint.** It lives in
   `%TEMP%` on the host x64dbg runs on, so for a remote endpoint this machine's
-  copy is a different file — reading it would authenticate with the wrong
+  copy is a different file: reading it would authenticate with the wrong
   token.
 
 Note that `BINARY_MCP_REMOTE_TLS_CA` and `X64DBG_TLS_CA` are deliberately
@@ -170,7 +170,7 @@ also trusted to impersonate the debugger.
 configured by an `obsidian.ini` beside the plugin. With no ini it binds
 `127.0.0.1:8765` in plaintext, exactly as it always has.
 
-- **A wildcard bind is refused outright** — `0.0.0.0`, `::`, `*` — with or
+- **A wildcard bind is refused outright** (`0.0.0.0`, `::`, `*`) with or
   without TLS.
 - **A non-loopback bind requires a server certificate**
   (`tls_cert_thumbprint`), named by SHA-1 thumbprint from a Windows
@@ -183,8 +183,8 @@ configured by an `obsidian.ini` beside the plugin. With no ini it binds
   now read the same parser.
 - **`Host` and `Origin` are validated** against the bind address plus
   `allow_hosts`, before the token is compared. The
-  `Access-Control-Allow-Origin: *` header that used to be on every response —
-  including the 401 — is gone; there is no browser client, so it granted
+  `Access-Control-Allow-Origin: *` header that used to be on every response;
+  including the 401: is gone; there is no browser client, so it granted
   nothing legitimate. `OPTIONS` is no longer exempt from authentication,
   because there is no preflight left to serve.
 - **An optional client allowlist** (`allow_clients`, addresses or CIDRs) is
@@ -194,12 +194,12 @@ configured by an `obsidian.ini` beside the plugin. With no ini it binds
   are enforced after the handshake, not by it: with `ASC_REQ_MUTUAL_AUTH` set,
   Schannel asks for a certificate but still completes the handshake when the
   client answers with an empty list. The server then requires that a
-  certificate was presented *and* that its chain reaches *that* CA — the
+  certificate was presented *and* that its chain reaches *that* CA: the
   thumbprint pinned in `obsidian.ini`, not anything in the machine's trust
   stores.
 - **A malformed `obsidian.ini` is refused whole.** Any value containing a
   character its flag cannot legitimately hold fails the file, rather than one
-  setting being quietly dropped — a listener configured differently from how it
+  setting being quietly dropped: a listener configured differently from how it
   was written is worse than one that does not start.
 
 The decisions above live in `src/engines/dynamic/x64dbg/server/listener_policy.h`,
@@ -210,7 +210,7 @@ job in `.github/workflows/ci.yml` does for both architectures with
 warnings-as-errors on every pull request.
 
 Two things it does not do: there is no keep-alive (every request is one
-connection), and TLS 1.3 is not negotiated — that needs an SSPI credential
+connection), and TLS 1.3 is not negotiated: that needs an SSPI credential
 structure this code does not use. A TLS terminator in front of a loopback
 listener remains supported and is the way to get either.
 

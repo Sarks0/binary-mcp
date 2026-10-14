@@ -666,6 +666,33 @@ _SWEEP_ARGS = {
     "output_dir": "out",
     "note": "n",
     "new_name": "renamed",
+    # Added when the registry sweep's own skip list was first asserted: these
+    # two names alone accounted for 10 of its 16 silent drops.
+    "function_name_or_address": "main",
+    "functions": ["main"],
+}
+
+# Why a path-taking tool is NOT swept. Every skip must be listed here or the
+# guard fails -- the registry sweep dropped 16 tools for want of an argument
+# placeholder and said nothing, which is the same blind spot that was fixed in
+# the module-attribute sweep and not carried across to this one.
+_SWEEP_SKIP_REASONS = {
+    "auto_mark_reviewed": "not a tool; its callers pass a cache object",
+    "find_table_base_refs": "not a tool; a src/utils/table_refs.py helper",
+    "diff_binaries": "takes two binary paths (old_path, new_path); a "
+                     "placeholder for the second would itself be a path under "
+                     "test, so which argument was refused becomes ambiguous",
+    "find_similar_functions": "same: needs a second binary to compare against",
+    # The four grouped x64dbg dispatchers take an `op`, and the valid set is
+    # per group. Covering them means picking an op whose own argument check
+    # accepts binary_path -- and these groups include attach/detach/connect,
+    # which change debugger state. Not worth a sweep guessing at.
+    "x64dbg_module": "grouped dispatcher; needs an `op`, and its group "
+                     "includes state-changing operations",
+    "x64dbg_session": "grouped dispatcher; needs an `op`, and its group "
+                      "includes attach/detach/connect",
+    "x64dbg_symbols": "grouped dispatcher; needs an `op`",
+    "x64dbg_trace": "grouped dispatcher; needs an `op`",
 }
 
 # Extra OPTIONAL arguments a few tools need before they will look at the path
@@ -849,9 +876,22 @@ def test_the_registry_sweep_reaches_the_tool_modules(server):
     silently shrink the sweep back to src/server.py's own tools and every
     assertion below would still pass.
     """
-    found, _ = _registered_path_tools(server)
+    found, skipped = _registered_path_tools(server)
     names = {n for n, _, _, _ in found}
     assert len(found) >= 60, f"registry sweep found only {len(found)}"
+
+    # Every skip explained, or this guard fails. Without it the sweep silently
+    # covered 69 of 85 path-taking tools while calling itself whole-surface.
+    unexplained = [
+        (name, args) for name, args in skipped
+        if name not in _SWEEP_SKIP_REASONS
+    ]
+    assert not unexplained, (
+        "these path-taking tools are outside the registry sweep with no "
+        "reason given; add a placeholder to _SWEEP_ARGS for each argument "
+        "listed, or an entry to _SWEEP_SKIP_REASONS saying why not:\n  "
+        + "\n  ".join(f"{n}: needs {a}" for n, a in unexplained)
+    )
     for expected in (
         # from the src/tools/* registrars...
         "quick_scan", "get_pe_info", "analyze_dotnet", "vt_lookup",

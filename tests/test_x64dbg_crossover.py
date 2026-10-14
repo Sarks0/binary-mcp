@@ -439,6 +439,10 @@ class TestFeatureUnavailable:
         bridge.timeout = 5
         bridge._auth_token = "token"
         bridge._error_logger = MagicMock()
+        # The TLS material _request splats into requests. Empty is what a
+        # loopback endpoint resolves to, which is the endpoint base_url above
+        # describes.
+        bridge._request_kwargs = {}
 
         response = MagicMock()
         response.status_code = status

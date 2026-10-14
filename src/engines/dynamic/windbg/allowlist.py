@@ -610,7 +610,6 @@ def _is_allowed(first: str, part: str) -> bool:
     return False
 
 
-
 def _quoted_region_hides_a_separator(part: str) -> bool:
     """True if a quoted region in ``part`` contains ';' or a newline.
 

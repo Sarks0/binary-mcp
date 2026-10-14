@@ -31,7 +31,7 @@ The in-process C++ HTTP server consistently crashed with `BEX64` (Buffer Executi
 │ obsidian_server.exe Process (Isolated)                │
 │                                                           │
 │  ┌─────────────────────────────────────────────────┐   │
-│  │ HTTP Server on port 8765                        │   │
+│  │ HTTP Server on port 8765 (TLS optional)         │   │
 │  │                                                  │   │
 │  │  • Fully isolated process                       │   │
 │  │  • No x64dbg dependencies                       │   │
@@ -40,7 +40,7 @@ The in-process C++ HTTP server consistently crashed with `BEX64` (Buffer Executi
 │  │  • Easy to debug independently                  │   │
 │  │                                                  │   │
 │  │  [HTTP Server Thread]                           │   │
-│  │    ↕️ TCP 0.0.0.0:8765                           │   │
+│  │    ↕️ TCP 127.0.0.1:8765 (see Listener below)    │   │
 │  │                                                  │   │
 │  │  [Named Pipe Client]                            │   │
 │  │    ↕️ \\.\pipe\x64dbg_mcp                        │   │
@@ -87,6 +87,47 @@ src/engines/dynamic/x64dbg/
 └── server/
     └── main.cpp              # NEW: HTTP server executable
 ```
+
+## Listener
+
+The server binds `127.0.0.1:8765` in plaintext by default, which is what the
+diagram above shows. An `obsidian.ini` beside the plugin can move it:
+
+```ini
+[listener]
+bind=192.168.1.50
+port=8765
+tls_cert_thumbprint=A1B2C3D4E5F60718293A4B5C6D7E8F9012345678
+tls_client_ca_thumbprint=0011223344556677889900AABBCCDDEEFF001122
+machine_store=0
+allow_clients=192.168.1.10
+allow_hosts=analysis.lan
+```
+
+The plugin reads it in `SpawnHTTPServer` and forwards the values as command
+line flags; the server's policy
+(`src/engines/dynamic/x64dbg/server/listener_policy.h`) is what decides whether
+the combination is servable. It refuses a wildcard bind outright, refuses a
+non-loopback bind with no certificate, and refuses an address it cannot parse
+as a dotted quad rather than passing it to `inet_addr`, which accepts forms
+the policy does not, and a classifier that disagrees with the thing performing
+the bind is one that can be walked past.
+
+A malformed ini fails the whole file rather than dropping one setting, and the
+server exits 2 (distinct from its exit 1 for a pipe or port failure) when it
+refuses its own configuration.
+
+TLS is Schannel, TLS 1.2 with `SCH_USE_STRONG_CRYPTO`, and the certificate is
+named by SHA-1 thumbprint from a Windows certificate store: no PEM parser in
+the server, and no new runtime dependency on the binary that gets copied into
+an analyst's plugins directory. There is no keep-alive: every request is its
+own connection, which is affordable because Schannel's session cache makes a
+resumed handshake one round trip, and because every request serialises on the
+single named pipe to the plugin anyway.
+
+See [Remote access](remote-access.md) for the setup and
+[Security model](security.md#the-plugins-own-listener) for what the listener
+enforces.
 
 ## Communication Protocol
 
@@ -173,7 +214,7 @@ C:\x64dbg\x64\plugins\
 1. Start x64dbg
 2. Check log for: `[MCP] HTTP server process started (PID: ...)`
 3. Server connects via pipe: `[MCP] HTTP server connected to pipe`
-4. Test HTTP endpoint: `curl http://localhost:8765/health`
+4. Test HTTP endpoint: `curl -H "Authorization: Bearer $(cat "$TEMP/x64dbg_mcp_token.txt")" http://localhost:8765/health` -- `/health` requires authentication like every other endpoint
 
 ## Advantages
 

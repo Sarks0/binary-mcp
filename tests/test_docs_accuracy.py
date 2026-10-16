@@ -797,6 +797,7 @@ PROJECT_ENV_PREFIXES = (
     "BINARY_MCP_",
     "BINARY_CACHE_DIR",
     "GHIDRA_",
+    "GDB_",
     "X64DBG_",
     "WINDBG_",
     "KDNET_",

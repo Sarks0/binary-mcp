@@ -122,8 +122,6 @@ yaraify_client = _make_client("YARAify", YARAIFY_API_BASE)
 #: with its raw token, so a status abuse.ch adds later is visible rather than
 #: flattened into "no results".
 _STATUS_MESSAGES: dict[str, str] = {
-    "no_result": "No records matched.",
-    "no_results": "No records matched.",
     "ok": "",
     "illegal_search_term": "The search term was rejected as malformed.",
     "illegal_hash": "The hash was rejected as malformed.",
@@ -152,6 +150,16 @@ _STATUS_MESSAGES: dict[str, str] = {
 }
 
 
+#: ``query_status`` values that mean the query ran and matched nothing.
+#:
+#: An empty answer is a result, not a failure: "ThreatFox knows nothing about
+#: this hash" is exactly what a triage caller asked for, and the renderers all
+#: carry a no-rows branch that says so. Raising on these instead turned every
+#: clean miss into "abuse.ch error: No records matched." -- which reads as a
+#: broken lookup to the model consuming it, and left those branches dead.
+_EMPTY_STATUSES = frozenset({"no_result", "no_results"})
+
+
 def _status(payload: dict) -> str:
     """The reply's ``query_status``, or "" if it is not a safe token."""
     status = str(payload.get("query_status", "")).strip().lower()
@@ -171,12 +179,17 @@ def query(client: _AbuseChClient, path: str = "", *, json_body=None, form=None) 
     """
     Run one abuse.ch query and return its payload, or raise with a sentence.
 
+    A reply whose ``query_status`` is in :data:`_EMPTY_STATUSES` is returned as
+    it arrived: ``_rows`` reads no rows out of it and the caller reports the
+    miss in its own words.
+
     Raises:
-        AbuseChError: When ``query_status`` is anything other than ``ok``.
+        AbuseChError: When ``query_status`` is neither ``ok`` nor a documented
+            way of saying nothing matched.
     """
     payload = client.request(path, json_body=json_body, form=form).payload
     status = _status(payload)
-    if status != "ok":
+    if status != "ok" and status not in _EMPTY_STATUSES:
         raise AbuseChError(_status_message(client.config.name, status))
     return payload
 
@@ -379,9 +392,14 @@ def register_abusech_tools(app, session_manager=None):
             output.append(f"Auth-Key configured: {masked}")
             output.append("")
 
+            # Each probe is the cheapest documented call the service has, so
+            # a reachability check does not pull a working set. ThreatFox's
+            # get_iocs takes only `days` -- its minimum, one day, is still
+            # every IOC the platform saw yesterday -- where `taginfo` takes a
+            # documented `limit`, which is what mb_check_api already uses.
             probes = (
                 ("ThreatFox", threatfox_client, "",
-                 {"json_body": {"query": "get_iocs", "days": 1}}),
+                 {"json_body": {"query": "taginfo", "tag": "exe", "limit": 1}}),
                 ("URLhaus", urlhaus_client, "host/",
                  {"form": {"host": "urlhaus.abuse.ch"}}),
                 ("YARAify", yaraify_client, "",
@@ -392,7 +410,11 @@ def register_abusech_tools(app, session_manager=None):
                     payload = query(client, path, **kwargs)
                     output.append(f"{label}: reachable ({len(_rows(payload))} row(s))")
                 except AbuseChError as e:
-                    # A "no results" answer still proves the key was accepted.
+                    # A probe that matched nothing no longer arrives here: it
+                    # is a successful reply with no rows, reported as reachable
+                    # above. What reaches this branch is a rejected Auth-Key or
+                    # a service that answered something unexpected, which is
+                    # the distinction this tool exists to draw.
                     output.append(f"{label}: {e}")
 
             return "\n".join(output)

@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, field
+from http.client import HTTPException
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -261,6 +262,22 @@ class IntegrationClient:
         except URLError as e:
             raise self.error_cls(
                 f"Network error connecting to {self.config.name}: {e.reason}"
+            ) from None
+        except (OSError, HTTPException) as e:
+            # urlopen turns a connect-phase failure into URLError, but the
+            # read above happens after the response is open, and a failure
+            # there -- a socket timeout, a reset, a truncated body -- has
+            # nothing to map it. Unmapped it leaves this transport as a bare
+            # OSError and is then diagnosed by whichever except clause the
+            # caller happens to have reached first: attack_status reported a
+            # read timeout as an invalid ATT&CK cache directory, sending the
+            # operator to look at a filesystem that was never the problem.
+            # URLError is an OSError too, so this clause must stay below it.
+            # Only the condition's name is echoed, for the same reason the
+            # clause above quotes e.reason rather than e.
+            raise self.error_cls(
+                f"Network error reading the {self.config.name} response "
+                f"({type(e).__name__})"
             ) from None
 
         if len(raw) > cap:

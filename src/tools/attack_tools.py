@@ -463,6 +463,11 @@ def register_attack_tools(app, session_manager=None):
         STIX repository, reduced to a compact index, and then served entirely
         from disk -- so every other attack_* tool works offline after this.
 
+        That first fetch is ~51MB and happens inline on whichever attack_*
+        call finds the cache empty, which on a slow link is tens of seconds
+        inside someone's lookup. Calling this tool once is how to pay that
+        cost deliberately rather than inside a technique lookup.
+
         Args:
             refresh: Re-download the bundle and rebuild the index.
 

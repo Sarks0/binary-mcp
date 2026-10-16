@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ast
 import json
+from http.client import IncompleteRead
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 
@@ -400,3 +401,79 @@ def test_sha256_only_rejects_the_shorter_digests():
     for raw in ("a" * 32, "a" * 40, "a" * 96):
         with pytest.raises(ValueError, match="SHA256"):
             normalise_hash(raw, sha256_only=True)
+
+
+# A failure during the read, not the connect
+
+
+class _FailingBody:
+    """A response that opens cleanly and then fails partway through read()."""
+
+    def __init__(self, error: BaseException):
+        self._error = error
+
+    def read(self, _amount=None):
+        raise self._error
+
+    def close(self):
+        return None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+
+@pytest.mark.parametrize(
+    "error,name",
+    [
+        (TimeoutError("The read operation timed out"), "TimeoutError"),
+        (ConnectionResetError(104, "Connection reset by peer"), "ConnectionResetError"),
+        (IncompleteRead(b"", 512), "IncompleteRead"),
+    ],
+)
+def test_a_failure_while_reading_is_mapped_like_any_other(monkeypatch, error, name):
+    """
+    urlopen maps a connect-phase failure to URLError, but the body is read
+    after the response is open, and a failure there arrives unmapped.
+
+    Unmapped it leaves the transport as a bare OSError, which the caller then
+    diagnoses with whichever except clause it reaches first: attack_status
+    caught it as OSError and reported a read timeout as an invalid ATT&CK cache
+    directory, sending the operator to inspect a filesystem that was fine.
+    """
+    client = _client()
+    monkeypatch.setattr(client, "api_key", lambda: "k")
+    monkeypatch.setattr(
+        integration_base, "urlopen", lambda request, timeout=None: _FailingBody(error)
+    )
+
+    with pytest.raises(IntegrationError) as caught:
+        client.request("thing")
+
+    assert "TestProvider" in str(caught.value)
+    assert name in str(caught.value)
+
+
+def test_a_read_failure_does_not_echo_the_exception_text(monkeypatch):
+    """
+    Only the condition's name is reported, for the same reason the URLError
+    branch quotes e.reason rather than e: this package is inside the F-10
+    guard precisely because it is where a raw urllib exception, with whatever
+    host detail it carries, is most likely to reach a model-facing string.
+    """
+    client = _client()
+    monkeypatch.setattr(client, "api_key", lambda: "k")
+    monkeypatch.setattr(
+        integration_base,
+        "urlopen",
+        lambda request, timeout=None: _FailingBody(
+            OSError(13, "Permission denied", "/home/someone/.secret")
+        ),
+    )
+
+    with pytest.raises(IntegrationError) as caught:
+        client.request("thing")
+
+    assert "/home/someone" not in str(caught.value)

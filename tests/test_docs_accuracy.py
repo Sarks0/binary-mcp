@@ -948,6 +948,9 @@ PROJECT_ENV_PREFIXES = (
     "KDNET_",
     "VT_",
     "OBSIDIAN_",
+    "ABUSECH_",
+    "MB_",
+    "ATTACK_",
 )
 
 # Variables that are real, read by src/, and deliberately absent from

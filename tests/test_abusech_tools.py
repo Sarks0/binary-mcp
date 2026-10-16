@@ -652,3 +652,26 @@ def test_check_api_reports_an_empty_probe_as_reachable(monkeypatch):
     out = _register(monkeypatch)["abusech_check_api"]()
 
     assert "ThreatFox: reachable (0 row(s))" in out
+
+
+# The two single-record URLhaus tools build their report field by field, so
+# an empty record left them emitting a bare header -- an answer with no
+# content, which is worse than the error it replaced.
+@pytest.mark.parametrize(
+    "tool,argument,expected",
+    [
+        ("urlhaus_lookup_url", "http://evil-domain.test/a",
+         "No URLhaus record for this URL."),
+        ("urlhaus_lookup_payload", "f" * 64,
+         "No URLhaus record for this payload."),
+    ],
+)
+def test_urlhaus_single_record_misses_say_so(monkeypatch, tool, argument, expected):
+    _capture(monkeypatch, abusech_tools.urlhaus_client,
+             {"query_status": "no_results", "data": None})
+
+    out = _register(monkeypatch)[tool](argument)
+
+    assert expected in out
+    assert "error" not in out.lower()
+    assert len(out.splitlines()) > 1

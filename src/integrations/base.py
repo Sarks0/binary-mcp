@@ -132,7 +132,7 @@ class IntegrationClient:
         self.config = config
         self.error_cls = error_cls
 
-    # -- configuration ----------------------------------------------------
+    # configuration
 
     def api_key(self) -> str | None:
         """First configured key among ``key_config_keys``, or None."""
@@ -184,7 +184,7 @@ class IntegrationClient:
         configured = get_config_int(self.config.timeout_config_key, self.config.default_timeout)
         return max(self.config.min_timeout, min(configured, self.config.max_timeout))
 
-    # -- requests ---------------------------------------------------------
+    # requests
 
     def build_url(self, path: str = "", params: dict | None = None) -> str:
         url = f"{self.config.base_url}{path}"
@@ -299,7 +299,7 @@ class IntegrationClient:
             return {}
         return parsed if isinstance(parsed, dict) else {}
 
-    # -- error mapping ----------------------------------------------------
+    # error mapping
 
     def read_error_body(self, error: HTTPError) -> bytes:
         """

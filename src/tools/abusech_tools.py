@@ -427,7 +427,7 @@ def register_abusech_tools(app, session_manager=None):
             logger.error(f"abusech_check_api failed: {e}")
             return safe_error_message("Failed to check abuse.ch status", e)
 
-    # -- ThreatFox --------------------------------------------------------
+    # ThreatFox
 
     @app.tool()
     def threatfox_lookup_ioc(ioc: str) -> str:
@@ -544,7 +544,7 @@ def register_abusech_tools(app, session_manager=None):
             logger.error(f"threatfox_by_malware failed: {e}")
             return safe_error_message("Failed to query malware family", e)
 
-    # -- URLhaus ----------------------------------------------------------
+    # URLhaus
 
     @app.tool()
     def urlhaus_lookup_url(url: str) -> str:
@@ -609,6 +609,16 @@ def register_abusech_tools(app, session_manager=None):
             if fenced:
                 output.append("")
                 output.append(fenced)
+
+            # Nothing to fence and nothing computed means URLhaus holds no
+            # record. Say so: a lone header is not an answer, and this is the
+            # ordinary outcome for a URL that was never seen distributing
+            # malware. The URL itself is not echoed here -- it is caller text
+            # classified as authored everywhere else in this module, and a
+            # one-line answer has nowhere to fence it.
+            if len(output) == 1:
+                output.append("")
+                output.append("No URLhaus record for this URL.")
 
             return "\n".join(output)
 
@@ -735,6 +745,14 @@ def register_abusech_tools(app, session_manager=None):
             if fenced:
                 output.append(fenced)
 
+            # Header plus the hash and nothing else means URLhaus has never
+            # seen this payload served anywhere, which is the ordinary answer
+            # for a sample that did not arrive over the web. Say it, rather
+            # than returning two lines that look like a truncated report.
+            if len(output) == 2:
+                output.append("")
+                output.append("No URLhaus record for this payload.")
+
             return "\n".join(output)
 
         except ValueError as e:
@@ -745,7 +763,7 @@ def register_abusech_tools(app, session_manager=None):
             logger.error(f"urlhaus_lookup_payload failed: {e}")
             return safe_error_message("Failed to look up payload", e)
 
-    # -- YARAify ----------------------------------------------------------
+    # YARAify
 
     @app.tool()
     def yaraify_lookup_hash(file_hash: str) -> str:

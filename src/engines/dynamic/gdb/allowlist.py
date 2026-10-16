@@ -6,24 +6,19 @@ and friends do one thing each. The *console* surface is the whole of GDB's
 command language, and it is hostile. Everything below was executed against GNU
 gdb 15.1 in this repository, with a file on disk as the proof of execution:
 
-===========================================  =======================================
-input                                        result
-===========================================  =======================================
-``shell touch FILE``                         file created
-``!touch FILE``                              file created (``!`` aliases ``shell``)
-``python open('FILE','w')``                  file created
-``print $_shell("touch FILE")``              **file created** -- see below
-``pipe show version | head -1 > FILE``       file written with GDB's own output
-``x/1x $_shell("touch FILE")``               **file created**, then the read failed
-``eval "print %d", 1+1``                     command constructed and run
-===========================================  =======================================
+``shell touch FILE``                   created the file
+``!touch FILE``                        created the file (``!`` aliases ``shell``)
+``python open('FILE','w')``            created the file
+``print $_shell("touch FILE")``        created the file
+``x/1x $_shell("touch FILE")``         created the file, then the read failed
+``pipe show version | head -1 > F``    wrote the file with GDB's own output
 
-The two starred rows are why this module is an allowlist of *command names and
-argument shapes* rather than a list of dangerous commands. ``$_shell`` is a
-convenience function, so the escape lives in the **expression grammar**, not in
-the command name: any command that evaluates an expression can reach a shell,
-whichever name it is spelled with. Blocking ``shell`` and ``python`` while
-allowing ``print`` or ``x`` would be security theatre.
+The ``$_shell`` and ``pipe`` rows are why this module is an allowlist of
+command names and argument shapes rather than a list of dangerous commands.
+``$_shell`` is a convenience function, so the escape lives in the expression
+grammar, not in the command name: any command that evaluates an expression can
+reach a shell, whichever name it is spelled with. Blocking ``shell`` and
+``python`` while allowing ``print`` or ``x`` would be security theatre.
 
 Two structural findings, also measured, which make this simpler than the WinDbg
 validator:

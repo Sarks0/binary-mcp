@@ -365,14 +365,24 @@ _TRUSTED_FIELDS: tuple[tuple[str, str], ...] = (
 
 
 def _scalar(value) -> str:
-    """Render one MalwareBazaar field value as a single line."""
+    """
+    Render one MalwareBazaar field value as a single line.
+
+    Every branch flattens newlines. A field printed OUTSIDE the F-7 envelope
+    has to occupy exactly the line it was given, and a list of tags carrying
+    one would have started a second line the envelope does not cover. The
+    dict branch was already safe -- json.dumps escapes them -- which is
+    exactly why the gap in the branch beside it was easy to miss.
+    """
     if value is None:
         return ""
     if isinstance(value, (list, tuple)):
-        return ", ".join(str(v) for v in value)
-    if isinstance(value, dict):
-        return json.dumps(value, sort_keys=True, default=str)
-    return str(value).replace("\r", " ").replace("\n", " ")
+        text = ", ".join(str(item) for item in value)
+    elif isinstance(value, dict):
+        text = json.dumps(value, sort_keys=True, default=str)
+    else:
+        text = str(value)
+    return text.replace("\r", " ").replace("\n", " ")
 
 
 def _trusted_lines(entry: dict) -> list[str]:

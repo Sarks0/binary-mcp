@@ -486,22 +486,62 @@ def test_docs_carry_isolated_vm_guidance():
         )
 
 
-def test_no_tool_can_launch_a_sample():
-    """
-    Backs the README's "no tool can execute a sample" claim.
+# The GDB engine is the one tool layer allowed to load and run a sample,
+# because debugging a Linux binary means executing it. Every other module is
+# still held to the original "nothing here starts a process" rule.
+_MAY_LAUNCH_A_SAMPLE = {"gdb_tools"}
 
-    bridge.load_binary() and the plugin's LOAD_BINARY handler both exist; the
-    claim rests entirely on nothing in the tool layer calling them. Assert that
-    instead of trusting it.
+
+def test_only_the_gdb_tool_layer_can_launch_a_sample():
     """
+    Backs the narrowed claim in README and docs/security.md.
+
+    This test used to assert that NO tool could launch a sample, and the GDB
+    Linux engine made that false: its whole purpose is live execution of an
+    ELF. Deleting the test would have given up the part that is still true and
+    still worth protecting -- that no OTHER engine's tool layer can start a
+    process -- so the assertion is narrowed to one named module instead.
+
+    x64dbg's bridge.load_binary() and the C++ plugin's LOAD_BINARY handler both
+    still exist and are both still unreachable from a client; that is what the
+    exclusion set keeps honest. A second engine acquiring the ability has to
+    edit this set, which is the review prompt the original test provided.
+    """
+    offenders = []
     for path in sorted((SRC / "tools").rglob("*.py")):
+        if path.stem in _MAY_LAUNCH_A_SAMPLE:
+            continue
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-                assert node.func.attr != "load_binary", (
-                    f"{path} calls load_binary(); the README claim that no MCP tool "
-                    f"can execute a sample is no longer true"
-                )
+                if node.func.attr == "load_binary":
+                    offenders.append(f"{path.name}:{node.lineno}")
+
+    assert not offenders, (
+        "tool module(s) outside the GDB engine call load_binary(), so the "
+        "documented claim that only gdb_run can execute a sample is no longer "
+        "true: " + ", ".join(offenders)
+    )
+
+
+def test_the_gdb_launch_exclusion_is_not_stale():
+    """A module named in the exclusion set has to exist and actually load.
+
+    Without this, the set above is a way to silence the guard for a module
+    that was renamed or deleted -- the same omission failure the F-7 rollout
+    guard hit when coverage_tools joined neither of its sets.
+    """
+    for name in sorted(_MAY_LAUNCH_A_SAMPLE):
+        path = SRC / "tools" / f"{name}.py"
+        assert path.is_file(), (
+            f"{name} is excluded from the launch guard but no longer exists; a "
+            f"stale exclusion makes the guard look narrower than it is"
+        )
+        source = path.read_text(encoding="utf-8")
+        assert "load_binary" in source, (
+            f"{name} is excluded from the launch guard but does not call "
+            f"load_binary(); drop it from _MAY_LAUNCH_A_SAMPLE"
+        )
 
 
 def test_docs_document_confinement_controls():

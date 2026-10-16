@@ -291,6 +291,10 @@ CONFIG_KEYS = {
     "KDNET_TIMEOUT": "Timeout for establishing a KDNET kernel connection (seconds, default 60)",
     "BINARY_MCP_ENABLE_RAW_WINDBG": "Set to 1 to enable windbg_execute_command behind its fail-closed allowlist. Off by default.",
 
+    # GDB (Linux dynamic analysis)
+    "GDB_PATH": "Path to the gdb executable (default: first 'gdb' on PATH)",
+    "GDB_TIMEOUT": "Default timeout for GDB/MI commands (seconds, default 30)",
+
     # Symbol server (PDB fetch + WinDbg sympath - shared by static analysis and live debugging)
     "BINARY_MCP_SYMBOL_PATH": "Windows-style _NT_SYMBOL_PATH for PDB fetch (overrides _NT_SYMBOL_PATH).",
     "BINARY_MCP_SYMBOL_CACHE": "Override the on-disk symbol cache directory (defaults to ~/.cache/binary_mcp/symbols on POSIX, ~/.binary_mcp_cache/symbols on Windows). Shared by analyze_binary and live WinDbg sessions.",

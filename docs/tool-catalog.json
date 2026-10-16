@@ -14,7 +14,7 @@
     "jobs": "Background job control for long-running analysis calls.",
     "admin": "Setup diagnostics and cache maintenance.",
     "threat-intel": "External reputation / sandbox lookups (VirusTotal).",
-    "debugger": "Live debugging via x64dbg or WinDbg against a running target or dump."
+    "debugger": "Live debugging via x64dbg, WinDbg or GDB against a running target or dump."
   },
   "facets": {
     "code-output": "The response can contain decompiled code, pseudocode excerpts, C# source or IL/disassembly listings -- including replays of earlier tool output. Gate on this to keep code out of the model's context.",
@@ -29,6 +29,7 @@
       "decompile_function",
       "decompile_functions",
       "find_inlined_clones",
+      "gdb_disassemble",
       "get_dotnet_il",
       "get_param_sinks",
       "get_review_package",
@@ -353,6 +354,92 @@
     },
     "find_vtables": {
       "category": "census",
+      "facets": []
+    },
+    "gdb_attach": {
+      "category": "debugger",
+      "facets": []
+    },
+    "gdb_continue": {
+      "category": "debugger",
+      "facets": []
+    },
+    "gdb_delete_breakpoint": {
+      "category": "debugger",
+      "facets": []
+    },
+    "gdb_detach": {
+      "category": "debugger",
+      "facets": []
+    },
+    "gdb_disassemble": {
+      "category": "debugger",
+      "facets": [
+        "code-output"
+      ]
+    },
+    "gdb_disconnect": {
+      "category": "debugger",
+      "facets": []
+    },
+    "gdb_execute_console": {
+      "category": "debugger",
+      "facets": []
+    },
+    "gdb_get_modules": {
+      "category": "debugger",
+      "facets": []
+    },
+    "gdb_get_registers": {
+      "category": "debugger",
+      "facets": []
+    },
+    "gdb_list_breakpoints": {
+      "category": "debugger",
+      "facets": []
+    },
+    "gdb_load_binary": {
+      "category": "debugger",
+      "facets": []
+    },
+    "gdb_pause": {
+      "category": "debugger",
+      "facets": []
+    },
+    "gdb_read_memory": {
+      "category": "debugger",
+      "facets": []
+    },
+    "gdb_resolve_static_address": {
+      "category": "debugger",
+      "facets": []
+    },
+    "gdb_run": {
+      "category": "debugger",
+      "facets": []
+    },
+    "gdb_set_breakpoint": {
+      "category": "debugger",
+      "facets": []
+    },
+    "gdb_status": {
+      "category": "debugger",
+      "facets": []
+    },
+    "gdb_step_into": {
+      "category": "debugger",
+      "facets": []
+    },
+    "gdb_step_out": {
+      "category": "debugger",
+      "facets": []
+    },
+    "gdb_step_over": {
+      "category": "debugger",
+      "facets": []
+    },
+    "gdb_write_memory": {
+      "category": "debugger",
       "facets": []
     },
     "generate_iocs": {

@@ -1,11 +1,12 @@
 """
 Binary MCP Server for comprehensive binary analysis.
 
-Provides 166 tools for static and dynamic binary analysis:
+Provides 187 tools for static and dynamic binary analysis:
 - Static analysis via Ghidra (headless mode) for native binaries
 - Static analysis via ILSpyCmd for .NET assemblies
 - Dynamic analysis via x64dbg (native plugin)
 - Kernel and crash-dump debugging via WinDbg/CDB (Windows only)
+- Dynamic analysis via GDB/MI (Linux only)
 - Control flow analysis (CFG, cyclomatic complexity, loops, dead code)
 - Malware behavior detection (10 categories, anti-analysis, API call chains)
 - Function hashing and cross-binary matching
@@ -16,12 +17,16 @@ tools actually registered by main(), so it cannot silently drift (audit
 finding F-11: this said "245" while 279 were registered, and a documented
 capability count that overstates reality is a claim a caller may act on).
 
-Samples are never executed by this server and never uploaded anywhere: no
-tool can launch a binary (see docs/security.md), the VirusTotal integration is
+Samples are never uploaded anywhere: the VirusTotal integration is
 lookup-only, and the MalwareBazaar integration sends hashes and search terms
 but never file content. MalwareBazaar can DOWNLOAD a sample, and is the one
 place this server writes malware to disk -- that tool is off unless the
 operator sets MB_ALLOW_DOWNLOAD=1, and it leaves the archive encrypted.
+
+Execution is confined to the GDB engine on Linux, where it is what the engine
+is for -- gdb_run is the only tool that starts a sample, and it stops at the
+entry point before any user code runs unless told otherwise. No other engine's
+tool layer can launch a binary; see docs/security.md.
 """
 
 import asyncio
@@ -61,6 +66,7 @@ from src.tools.dynamic_tools import register_dynamic_tools
 from src.tools.error_hygiene import safe_path_error, safe_tool_error
 from src.tools.fid_tools import register_fid_tools
 from src.tools.function_hash_tools import register_function_hash_tools
+from src.tools.gdb_tools import register_gdb_tools
 from src.tools.indirect_call_tools import register_indirect_call_tools
 from src.tools.job_tools import register_job_tools
 from src.tools.malware_tools import register_malware_tools
@@ -6795,6 +6801,12 @@ def register_all_tools(
             app._local_provider.remove_tool("windbg_execute_command")
     else:
         logger.info("WinDbg tools not registered: they need Windows with Pybag")
+
+    # Register GDB Linux debugging tools (with session logging). Registered on
+    # every platform, like the WinDbg tools: the roster must not depend on the
+    # host OS, or a tool list cached on one platform is wrong on another. Each
+    # handler refuses at call time off Linux.
+    register_gdb_tools(app, session_manager)
 
     # Register VirusTotal tools
     register_vt_tools(app, session_manager)

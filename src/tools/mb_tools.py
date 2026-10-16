@@ -120,15 +120,22 @@ MB_SEARCH_PIVOTS: tuple[tuple[str, str, str], ...] = (
 
 MB_SEARCH_MAX_LIMIT = 1000
 
+#: Rows rendered in one report, matching the abuse.ch tools next door.
+#:
+#: The query limit and the render limit are different numbers on purpose. A
+#: caller asking for 1000 wants the COUNT -- "this imphash has 847 samples" is
+#: the finding -- not 847 rendered blocks, which measured ~200KB of model
+#: context for one call. The count line above the rows carries the total.
+_ROW_LIMIT = 15
+
 #: ``query_status`` values worth an explanation rather than an echo. Anything
 #: not listed is reported with its raw token so a new status is visible rather
 #: than swallowed.
 _STATUS_MESSAGES: dict[str, str] = {
-    "no_results": "No samples matched.",
-    "hash_not_found": "Hash not found in MalwareBazaar.",
+    # The four "nothing matched" statuses are not here: see _EMPTY_STATUSES.
+    # file_not_found is, because it answers mb_download, which asks for one
+    # specific archive rather than a result set.
     "file_not_found": "MalwareBazaar has no downloadable file for that SHA256.",
-    "tag_not_found": "No samples carry that tag.",
-    "signature_not_found": "No samples carry that malware family signature.",
     "illegal_hash": "MalwareBazaar rejected the hash format.",
     "illegal_sha256_hash": "MalwareBazaar requires a full SHA256 for this query.",
     "illegal_tag": "MalwareBazaar rejected the tag.",
@@ -243,6 +250,21 @@ def _request(fields: dict[str, str | int], expect_json: bool = True) -> tuple[di
     return response.payload, response.raw
 
 
+#: ``query_status`` values that mean the query ran and matched nothing.
+#:
+#: An empty answer is a result, not a failure. Raising on these turned a clean
+#: miss into "MalwareBazaar error: Hash not found in MalwareBazaar.", which
+#: discarded the report header the caller had already built -- including the
+#: SHA256 this server computed locally, which is the one line that makes the
+#: miss worth reading -- and left the no-rows branch in every caller dead.
+_EMPTY_STATUSES = frozenset({
+    "no_results",
+    "hash_not_found",
+    "tag_not_found",
+    "signature_not_found",
+})
+
+
 def _status(payload: dict) -> str:
     """Return the reply's ``query_status``, or "" if it is not a safe token."""
     status = str(payload.get("query_status", "")).strip().lower()
@@ -262,12 +284,17 @@ def query(fields: dict[str, str | int]) -> list[dict]:
     """
     Run one JSON MalwareBazaar query and return its ``data`` rows.
 
+    A ``query_status`` in :data:`_EMPTY_STATUSES` yields no rows, and the
+    caller reports the miss in its own words against its own header.
+
     Raises:
         MalwareBazaarError: With a curated sentence when ``query_status`` is
-            anything other than ``ok``.
+            neither ``ok`` nor a documented way of saying nothing matched.
     """
     payload, _ = _request(fields)
     status = _status(payload)
+    if status in _EMPTY_STATUSES:
+        return []
     if status != "ok":
         raise MalwareBazaarError(_status_message(status))
 
@@ -686,12 +713,14 @@ def register_mb_tools(app, session_manager=None):
                 return "\n".join(output)
 
             output.append(f"Found {len(rows)} sample(s):")
+            if len(rows) > _ROW_LIMIT:
+                output.append(f"(showing {_ROW_LIMIT} of {len(rows)})")
             output.append("")
 
             # F-7: every row leads with a submitter-chosen file name and carries
             # community tags and a family label -- free text from the corpus.
             body: list[str] = []
-            for index, entry in enumerate(rows, 1):
+            for index, entry in enumerate(rows[:_ROW_LIMIT], 1):
                 body.extend(_row(entry, index))
                 body.append("")
 
@@ -746,10 +775,12 @@ def register_mb_tools(app, session_manager=None):
                 return "\n".join(output)
 
             output.append(f"Found {len(rows)} sample(s):")
+            if len(rows) > _ROW_LIMIT:
+                output.append(f"(showing {_ROW_LIMIT} of {len(rows)})")
             output.append("")
 
             body: list[str] = []
-            for index, entry in enumerate(rows, 1):
+            for index, entry in enumerate(rows[:_ROW_LIMIT], 1):
                 body.extend(_row(entry, index))
                 body.append("")
 

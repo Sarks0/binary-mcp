@@ -200,11 +200,11 @@ def test_http_401_is_reported_as_a_key_problem(monkeypatch):
 # query_status handling
 
 
+# The "nothing matched" statuses are deliberately absent: they are not errors,
+# and test_empty_result_reports_the_miss_not_an_error covers them.
 @pytest.mark.parametrize(
     "status,fragment",
     [
-        ("hash_not_found", "not found"),
-        ("no_results", "No samples matched"),
         ("illegal_hash", "rejected the hash"),
         ("no_auth_key", "requires an Auth-Key"),
         ("http_post_expected", "bug in binary-mcp"),
@@ -509,3 +509,83 @@ def test_check_api_points_at_the_canonical_variable(monkeypatch):
     assert out.index("ABUSECH_API_KEY") < out.index("MB_API_KEY"), (
         "the alias is offered before the canonical name"
     )
+
+
+# A clean miss is a result, not a failure. Before _EMPTY_STATUSES these came
+# back as "MalwareBazaar error: Hash not found in MalwareBazaar.", throwing
+# away the report header the caller had already built -- which carries the
+# SHA256 this server computed locally, the one line that makes a miss useful.
+@pytest.mark.parametrize(
+    "status,tool,kwargs,expected",
+    [
+        ("hash_not_found", "mb_lookup", {"file_hash": "a" * 64},
+         "Hash not found in MalwareBazaar."),
+        ("no_results", "mb_search", {"tag": "nosuchtag"}, "No results found."),
+        ("tag_not_found", "mb_search", {"tag": "nosuchtag"}, "No results found."),
+        ("signature_not_found", "mb_search", {"signature": "NoSuchFamily"},
+         "No results found."),
+    ],
+)
+def test_empty_result_reports_the_miss_not_an_error(
+    monkeypatch, status, tool, kwargs, expected
+):
+    _capture(monkeypatch, {"query_status": status, "data": None})
+
+    out = _register(monkeypatch)[tool](**kwargs)
+
+    assert expected in out
+    assert "error" not in out.lower()
+
+
+def test_a_miss_keeps_the_locally_computed_hash(monkeypatch):
+    """The header is the point: it says WHICH hash MalwareBazaar does not know."""
+    _capture(monkeypatch, {"query_status": "hash_not_found", "data": None})
+
+    out = _register(monkeypatch)["mb_lookup"](file_hash="a" * 64)
+
+    assert "a" * 64 in out
+
+
+def test_a_real_bad_status_is_still_an_error(monkeypatch):
+    _capture(monkeypatch, {"query_status": "illegal_hash"})
+
+    out = _register(monkeypatch)["mb_lookup"](file_hash="a" * 64)
+
+    assert "MalwareBazaar error" in out
+    assert "rejected the hash" in out
+
+
+def test_query_returns_no_rows_rather_than_raising(monkeypatch):
+    _capture(monkeypatch, {"query_status": "no_results", "data": None})
+    assert mb_tools.query({"query": "get_taginfo", "tag": "x"}) == []
+
+
+# A caller asking for 1000 wants the count, not 1000 rendered blocks.
+@pytest.mark.parametrize(
+    "tool,kwargs,query_status_key",
+    [
+        ("mb_search", {"tag": "exe", "limit": 1000}, "ok"),
+        ("mb_recent", {}, "ok"),
+    ],
+)
+def test_reports_are_bounded_but_still_carry_the_total(
+    monkeypatch, tool, kwargs, query_status_key
+):
+    rows = [_sample(sha256_hash=f"{index:064x}") for index in range(40)]
+    _capture(monkeypatch, {"query_status": query_status_key, "data": rows})
+
+    out = _register(monkeypatch)[tool](**kwargs)
+
+    assert "Found 40 sample(s):" in out
+    assert f"(showing {mb_tools._ROW_LIMIT} of 40)" in out
+    assert out.count("SHA256:") == mb_tools._ROW_LIMIT
+
+
+def test_a_report_under_the_limit_says_nothing_about_showing(monkeypatch):
+    rows = [_sample(sha256_hash=f"{index:064x}") for index in range(3)]
+    _capture(monkeypatch, {"query_status": "ok", "data": rows})
+
+    out = _register(monkeypatch)["mb_search"](tag="exe")
+
+    assert "Found 3 sample(s):" in out
+    assert "showing" not in out

@@ -263,11 +263,11 @@ def test_rejected_auth_key_is_reported_as_such(monkeypatch):
 # query_status handling
 
 
+# The two "nothing matched" statuses are deliberately absent: they are not
+# errors, and test_empty_result_reports_the_miss_not_an_error covers them.
 @pytest.mark.parametrize(
     "status,fragment",
     [
-        ("no_result", "No records matched"),
-        ("no_results", "No records matched"),
         ("illegal_search_term", "rejected as malformed"),
         ("no_auth_key", "Auth-Key is required"),
         ("http_post_expected", "bug in binary-mcp"),
@@ -569,3 +569,86 @@ def test_no_matches_still_says_so(monkeypatch):
              {"query_status": "ok", "data": [{"sha256_hash": "e" * 64}]})
     out = _register(monkeypatch)["yaraify_lookup_hash"]("e" * 64)
     assert "No public YARA rules matched this sample." in out
+
+
+# A clean miss is a result, not a failure. Before _EMPTY_STATUSES these four
+# answers all came back as "abuse.ch error: ... No records matched.", which
+# reads to the model as a broken lookup rather than as "nothing known about
+# this indicator" -- and left every no-rows branch below unreachable.
+@pytest.mark.parametrize(
+    "client_name,tool,argument,status,expected",
+    [
+        ("threatfox_client", "threatfox_lookup_ioc", "evil-domain.test",
+         "no_result", "No ThreatFox records matched."),
+        ("threatfox_client", "threatfox_lookup_hash", "f" * 64,
+         "no_result", "No ThreatFox records matched."),
+        ("urlhaus_client", "urlhaus_lookup_host", "evil-domain.test",
+         "no_results", "No malware URLs recorded for this host."),
+        ("yaraify_client", "yaraify_lookup_hash", "f" * 64,
+         "no_result", "No public YARA rules matched this sample."),
+    ],
+)
+def test_empty_result_reports_the_miss_not_an_error(
+    monkeypatch, client_name, tool, argument, status, expected
+):
+    _capture(monkeypatch, getattr(abusech_tools, client_name),
+             {"query_status": status, "data": None})
+
+    out = _register(monkeypatch)[tool](argument)
+
+    assert expected in out
+    assert "error" not in out.lower()
+
+
+def test_a_real_bad_status_is_still_an_error(monkeypatch):
+    """The empty set must not swallow a rejected key or a malformed query."""
+    _capture(monkeypatch, abusech_tools.threatfox_client,
+             {"query_status": "illegal_search_term"})
+
+    out = _register(monkeypatch)["threatfox_lookup_ioc"]("evil-domain.test")
+
+    assert "abuse.ch error" in out
+    assert "rejected as malformed" in out
+
+
+def test_query_returns_an_empty_payload_rather_than_raising(monkeypatch):
+    _capture(monkeypatch, abusech_tools.threatfox_client,
+             {"query_status": "no_result", "data": None})
+
+    payload = abusech_tools.query(
+        abusech_tools.threatfox_client,
+        json_body={"query": "search_ioc", "search_term": "x"},
+    )
+
+    assert abusech_tools._rows(payload) == []
+
+
+def test_threatfox_probe_asks_for_one_row(monkeypatch):
+    """
+    get_iocs takes only `days`, whose minimum of 1 is still a day of IOCs --
+    a working set pulled to answer "is the key accepted". taginfo takes a
+    documented limit, which is the shape mb_check_api already probes with.
+    """
+    seen = _capture(monkeypatch, abusech_tools.threatfox_client,
+                    {"query_status": "ok", "data": []})
+    monkeypatch.setattr(abusech_tools.urlhaus_client, "api_key", lambda: "k")
+    monkeypatch.setattr(abusech_tools.yaraify_client, "api_key", lambda: "k")
+
+    _register(monkeypatch)["abusech_check_api"]()
+
+    body = json.loads(seen[0].data.decode())
+    assert body["query"] == "taginfo"
+    assert body["limit"] == 1
+    assert "days" not in body
+
+
+def test_check_api_reports_an_empty_probe_as_reachable(monkeypatch):
+    """A tag with no IOCs still proves the Auth-Key was accepted."""
+    _capture(monkeypatch, abusech_tools.threatfox_client,
+             {"query_status": "no_result", "data": None})
+    monkeypatch.setattr(abusech_tools.urlhaus_client, "api_key", lambda: "k")
+    monkeypatch.setattr(abusech_tools.yaraify_client, "api_key", lambda: "k")
+
+    out = _register(monkeypatch)["abusech_check_api"]()
+
+    assert "ThreatFox: reachable (0 row(s))" in out

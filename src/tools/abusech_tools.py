@@ -229,14 +229,26 @@ def _yara_matches(entry: dict) -> list:
 
 
 def _scalar(value) -> str:
-    """Render one field value as a single line."""
+    """
+    Render one field value as a single line.
+
+    Every branch flattens newlines, not just the scalar one. A field printed
+    OUTSIDE the F-7 envelope has to occupy exactly the line it was given: a
+    value carrying a newline starts a second line that the envelope does not
+    cover, which is the escape the classification exists to prevent. The
+    scalar branch already guarded against that; the list and dict branches
+    did not, and nothing here can verify the shape abuse.ch sends, so the
+    guard belongs after the join rather than inside one branch of it.
+    """
     if value is None:
         return ""
     if isinstance(value, (list, tuple)):
-        return ", ".join(str(v) for v in value)
-    if isinstance(value, dict):
-        return " | ".join(f"{k}={v}" for k, v in sorted(value.items()))
-    return str(value).replace("\r", " ").replace("\n", " ")
+        text = ", ".join(str(item) for item in value)
+    elif isinstance(value, dict):
+        text = " | ".join(f"{key}={item}" for key, item in sorted(value.items()))
+    else:
+        text = str(value)
+    return text.replace("\r", " ").replace("\n", " ")
 
 
 def _fields(entry: dict, spec: tuple[tuple[str, str], ...], indent: str = "   ") -> list[str]:

@@ -1021,6 +1021,7 @@ class TestDotnetToolsEnvelope:
 # module genuinely does not emit sample text, take it out of this set with a
 # comment saying why, rather than leaving it in and unasserted.
 _SAMPLE_TEXT_MODULES = {
+    "abusech_tools",
     "control_flow_tools",
     "diff_tools",
     "dispatch_tools",
@@ -1030,6 +1031,7 @@ _SAMPLE_TEXT_MODULES = {
     "function_hash_tools",
     "indirect_call_tools",
     "malware_tools",
+    "mb_tools",
     "pe_tools",
     "reporting",
     "review_tools",
@@ -1047,6 +1049,16 @@ _SAMPLE_TEXT_MODULES = {
 # a module drifting into neither set and being silently unasserted.
 _NO_SAMPLE_TEXT_MODULES: dict[str, str] = {
     "error_hygiene": "helper module, defines no tools and returns no sample text",
+    # ATT&CK is the one network source in this server whose content is NOT
+    # attacker-authored: it is a curated knowledge base written by MITRE and
+    # served as static STIX files, in the same category as the sandbox-vendor
+    # verdicts vt_behavior deliberately leaves outside its envelope. Nothing
+    # from a sample reaches these tools. Their arguments are used only for
+    # in-memory lookup against the distilled index -- never as a path, a URL
+    # segment or a filename -- so there is nothing for them to be validated
+    # against. The one argument that does form a path, the matrix name, is
+    # checked against the ATTACK_DOMAINS allow-list in domain().
+    "attack_tools": "renders MITRE-authored knowledge-base text, not sample-derived content",
     # job_tools constructs no sample-derived text of its own: job_result hands
     # back the payload the PRODUCING tool put in the job record, and job_tools
     # cannot know which of a payload's fields came from the binary. The fence

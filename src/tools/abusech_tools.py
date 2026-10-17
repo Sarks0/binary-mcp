@@ -470,7 +470,13 @@ def register_abusech_tools(app, session_manager=None):
                 threatfox_client,
                 json_body={"query": "search_ioc", "search_term": ioc},
             )
-            return _render_threatfox(f"THREATFOX IOC LOOKUP\nIOC: {ioc}", payload)
+            # F-7: the indicator reaches this tool from extract_iocs, so it
+            # is sample-derived text being echoed onto a line no envelope
+            # covers. _scalar flattens the newline that would otherwise
+            # start a second, unfenced line of the caller's choosing.
+            return _render_threatfox(
+                f"THREATFOX IOC LOOKUP\nIOC: {_scalar(ioc)}", payload
+            )
 
         except ValueError as e:
             return f"Configuration error: {e}"
@@ -545,7 +551,9 @@ def register_abusech_tools(app, session_manager=None):
                 json_body={"query": "malwareinfo", "malware": malware, "limit": limit},
             )
             return _render_threatfox(
-                f"THREATFOX MALWARE FAMILY\nFamily: {malware}\nLimit: {limit}", payload
+                f"THREATFOX MALWARE FAMILY\nFamily: {_scalar(malware)}\n"
+                f"Limit: {limit}",
+                payload,
             )
 
         except ValueError as e:
@@ -667,7 +675,7 @@ def register_abusech_tools(app, session_manager=None):
 
             payload = query(urlhaus_client, "host/", form={"host": host})
 
-            output = ["URLHAUS HOST LOOKUP", f"Host: {host}"]
+            output = ["URLHAUS HOST LOOKUP", f"Host: {_scalar(host)}"]
             output.extend(_fields(payload, (
                 ("firstseen", "First Seen"),
                 ("url_count", "Known malware URLs"),
@@ -830,9 +838,21 @@ def register_abusech_tools(app, session_manager=None):
                         body.append(f"   Rule: {_scalar(match)}")
                 if len(matches) > _ROW_LIMIT:
                     output.append(f"  (showing {_ROW_LIMIT})")
-            else:
+            elif entry:
                 output.append("")
                 output.append("No public YARA rules matched this sample.")
+            else:
+                # Different answers, and the difference is the useful part:
+                # "scanned, nothing matched" says no one has written detection
+                # for this family yet, while "no record" says YARAify has
+                # never seen the file and has matched nothing against it.
+                # Reporting the second as the first is a quiet wrong answer.
+                output.append("")
+                output.append(
+                    "YARAify has no record of this file, so no rules have been "
+                    "run against it. That is not the same as a sample it "
+                    "scanned and nothing matched."
+                )
 
             clamav = entry.get("clamav_results")
             if isinstance(clamav, list) and clamav:

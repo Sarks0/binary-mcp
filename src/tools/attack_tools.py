@@ -61,6 +61,15 @@ class AttackDataError(IntegrationError):
     """
 
 
+class AttackFetchPending(Exception):  # noqa: N818 - not an error; see below
+    """The dataset is downloading in the background; the message is the handle.
+
+    Not a failure. It is what a caller gets when the one slow thing these
+    tools ever do -- the first ~51MB download -- outlasts the server's inline
+    deadline, and it carries the job id to poll rather than a reason.
+    """
+
+
 ATTACK_INDEX_URL_BASE = "https://raw.githubusercontent.com/mitre-attack/attack-stix-data/master/"
 
 ATTACK_DIR_ENV = "ATTACK_DATA_DIR"
@@ -274,6 +283,24 @@ def fetch_index(matrix: str | None = None) -> dict:
     return distil(bundle, version)
 
 
+def _read_cached(cached: Path) -> dict | None:
+    """The cached index, or None when there is not a usable one on disk.
+
+    Existing and being usable are different questions, and answering the
+    second with the first is what let attack_status report "served from the
+    local cache (no network access)" about a corrupt cache it had just
+    re-downloaded. One reader, so the fast path and the provenance line cannot
+    disagree about what the cache holds.
+    """
+    if not cached.exists():
+        return None
+    try:
+        return json.loads(cached.read_text(encoding="utf-8"))
+    except (ValueError, OSError) as e:
+        logger.warning(f"ATT&CK index at {cached} unreadable, refetching: {e}")
+        return None
+
+
 def load_index(matrix: str | None = None, refresh: bool = False) -> dict:
     """
     Return the distilled index, fetching it if it is missing or stale.
@@ -289,11 +316,10 @@ def load_index(matrix: str | None = None, refresh: bool = False) -> dict:
     matrix = matrix or domain()
     cached = index_path(matrix)
 
-    if not refresh and cached.exists():
-        try:
-            return json.loads(cached.read_text(encoding="utf-8"))
-        except (ValueError, OSError) as e:
-            logger.warning(f"ATT&CK index at {cached} unreadable, refetching: {e}")
+    if not refresh:
+        usable = _read_cached(cached)
+        if usable is not None:
+            return usable
 
     if _offline():
         # Two different situations, and the old single message was false in one
@@ -310,24 +336,28 @@ def load_index(matrix: str | None = None, refresh: bool = False) -> dict:
             "so it cannot be downloaded. Unset it once to populate the cache."
         )
 
-    cached.parent.mkdir(parents=True, exist_ok=True)
+    return _fetch_through_jobs(matrix, cached, refresh)
 
-    # Serialise the fetch, and write through a temporary file.
-    #
-    # Two cold-cache callers would otherwise each download ~51MB and then
-    # interleave their writes into the same path, and a concurrent reader would
-    # see a half-written file -- parsed as corrupt, which sends it back to the
-    # network too. The lock makes the second caller wait and then find the
-    # cache populated; os.replace makes the swap atomic for readers.
+
+def _cache_index(matrix: str, cached: Path, refresh: bool) -> dict:
+    """Download, distil and cache one matrix. The slow half of load_index.
+
+    Serialised, and written through a temporary file. Two cold-cache callers
+    would otherwise each download ~51MB and then interleave their writes into
+    the same path, and a concurrent reader would see a half-written file --
+    parsed as corrupt, which sends it back to the network too. The lock makes
+    the second caller wait and then find the cache populated; os.replace makes
+    the swap atomic for readers.
+    """
     lock_path = cached.with_suffix(".lock")
     try:
+        cached.parent.mkdir(parents=True, exist_ok=True)
         with exclusive_lock(lock_path, wait_seconds=client.timeout() + 60):
             # The caller that held the lock may have just populated it.
-            if not refresh and cached.exists():
-                try:
-                    return json.loads(cached.read_text(encoding="utf-8"))
-                except (ValueError, OSError):
-                    pass
+            if not refresh:
+                usable = _read_cached(cached)
+                if usable is not None:
+                    return usable
             index = fetch_index(matrix)
             tmp_path = cached.with_suffix(".tmp")
             tmp_path.write_text(json.dumps(index), encoding="utf-8")
@@ -339,6 +369,128 @@ def load_index(matrix: str | None = None, refresh: bool = False) -> dict:
         # only cost is that this result is not the one cached.
         logger.warning("ATT&CK cache lock still held; fetching without caching")
         return fetch_index(matrix)
+    except OSError as e:
+        # F-10. Converted here rather than left to propagate, because this
+        # function runs inside a job as well as inline: the registry records a
+        # failure as str(exc), and the caller re-raises that string, so an
+        # OSError escaping would put a resolved host path into model-facing
+        # text -- past the handler that exists to scrub it. Raising the
+        # module's own type keeps one message for both paths and keeps
+        # AttackDataError's "no path can reach it" audit true.
+        logger.error(f"Could not write the ATT&CK cache for {matrix}: {e}")
+        raise AttackDataError(
+            f"Could not write the {matrix} dataset to its cache directory. "
+            f"Check that {ATTACK_DIR_ENV} points somewhere writable; the "
+            "server log has the path and the reason."
+        ) from None
+
+
+#: Set once by the server; see use_job_registry.
+_job_degrade: tuple[object, object] | None = None
+
+
+def use_job_registry(registry, inline_deadline) -> None:
+    """Let a cold fetch degrade to a job handle instead of blocking the caller.
+
+    A setter rather than an import, for two reasons. src.server imports this
+    module to register its tools, so reaching back for its registry at module
+    scope is a cycle. And looking the server up in sys.modules instead would
+    make this module's behaviour depend on whether something else happened to
+    import it -- which is not a property worth having anywhere, least of all
+    in the path that decides whether a call blocks.
+
+    Without this call the fetch runs inline, which is what these tools do as a
+    plain library: there is no registry to submit to and nobody to poll a
+    handle.
+    """
+    global _job_degrade
+    _job_degrade = (registry, inline_deadline)
+
+
+def _server_degrade() -> tuple[object, float] | None:
+    """The registry and the resolved deadline, or None to fetch inline."""
+    if _job_degrade is None:
+        return None
+    registry, inline_deadline = _job_degrade
+    try:
+        return registry, float(inline_deadline())
+    except Exception:  # noqa: BLE001 - a bad deadline must not block the fetch
+        logger.warning("Could not read the inline deadline; fetching inline")
+        return None
+
+
+def _fetch_job(matrix: str, cached: Path, refresh: bool):
+    """The job body: cache the index and return nothing.
+
+    Returning nothing is the point. JobRegistry stores whatever fn returns in
+    the job record, and the distilled index is ~2.7MB -- handing it back would
+    copy the whole thing into the record and then into any job_result() call,
+    which is exactly what reading it from the file the job just wrote avoids.
+    The registry takes a JobContext it does not need here.
+    """
+
+    def run(_context) -> None:
+        _cache_index(matrix, cached, refresh)
+
+    return run
+
+
+def _fetch_through_jobs(matrix: str, cached: Path, refresh: bool) -> dict:
+    """Fetch the index without blocking the caller past the inline deadline.
+
+    The first call on a cold cache pulls ~51MB, which on a slow link is tens
+    of seconds inside what looks like a local lookup -- long enough for a
+    client to abandon the call. The repo's answer to exactly that is the job
+    registry: answer inline when the work is quick, hand back a handle when it
+    is not. This is the one place in these tools where that can happen, and it
+    happens once per matrix per install.
+
+    Raises:
+        AttackFetchPending: Still downloading at the deadline.
+        AttackDataError: The download failed, with its reason.
+    """
+    degrade = _server_degrade()
+    if degrade is None:
+        return _cache_index(matrix, cached, refresh)
+
+    registry, deadline = degrade
+    submitted = registry.submit(
+        kind="attack-index",
+        key=f"attack-index:{matrix}",
+        fn=_fetch_job(matrix, cached, refresh),
+    )
+    if submitted.get("error"):
+        raise AttackDataError(str(submitted["error"]))
+
+    job_id = submitted["job_id"]
+    record = registry.wait(job_id, timeout=deadline)
+    if record is None:
+        raise AttackDataError(
+            f"The ATT&CK download job {job_id} disappeared while waiting for it. "
+            "Check job_list()."
+        )
+
+    state = record.get("state")
+    if state == "succeeded":
+        # Read what the job wrote rather than routing a 2.7MB index through
+        # the job record, which is the same trade the Ghidra tools make.
+        try:
+            return json.loads(cached.read_text(encoding="utf-8"))
+        except (ValueError, OSError) as e:
+            logger.warning(f"ATT&CK index unreadable after a successful fetch: {e}")
+            return _cache_index(matrix, cached, refresh=False)
+    if state in ("failed", "cancelled", "orphaned"):
+        raise AttackDataError(str(record.get("error") or f"the download {state}"))
+
+    raise AttackFetchPending(
+        f"Downloading the {matrix} dataset (~51MB); it did not finish within "
+        f"{deadline:.0f}s, so this returned a handle rather than risk the call "
+        f"being abandoned mid-download.\n"
+        f"job_id: {job_id}\n\n"
+        "The download continues regardless of this call. Poll job_status(job_id), "
+        "or simply call any attack_* tool again once it reports succeeded -- the "
+        "dataset is then served from disk and every later call is local."
+    )
 
 
 # Query helpers
@@ -463,10 +615,12 @@ def register_attack_tools(app, session_manager=None):
         STIX repository, reduced to a compact index, and then served entirely
         from disk -- so every other attack_* tool works offline after this.
 
-        That first fetch is ~51MB and happens inline on whichever attack_*
-        call finds the cache empty, which on a slow link is tens of seconds
-        inside someone's lookup. Calling this tool once is how to pay that
-        cost deliberately rather than inside a technique lookup.
+        That first fetch is ~51MB. Whichever attack_* call finds the cache
+        empty starts it and answers inline if it finishes within
+        BINARY_MCP_INLINE_DEADLINE; past that it hands back a job handle and
+        the download carries on, so a slow link cannot leave a lookup blocked
+        until the client gives up. Calling this tool once is still the way to
+        pay that cost deliberately rather than inside a technique lookup.
 
         Args:
             refresh: Re-download the bundle and rebuild the index.
@@ -481,7 +635,10 @@ def register_attack_tools(app, session_manager=None):
         try:
             matrix = domain()
             cached = index_path(matrix)
-            existed = cached.exists()
+            # Whether a usable index is already on disk, not merely whether
+            # the file exists: a corrupt one is re-downloaded, and saying "no
+            # network access" about that is false where it matters most.
+            served_from_cache = not refresh and _read_cached(cached) is not None
 
             index = load_index(matrix, refresh=refresh)
 
@@ -498,7 +655,7 @@ def register_attack_tools(app, session_manager=None):
             ]
             if refresh:
                 output.append("Refreshed from MITRE's STIX repository.")
-            elif existed:
+            elif served_from_cache:
                 output.append("Served from the local cache (no network access).")
             else:
                 output.append("Downloaded and cached; later calls are offline.")
@@ -519,6 +676,10 @@ def register_attack_tools(app, session_manager=None):
 
         except ValueError as e:
             return f"Configuration error: {e}"
+        except AttackFetchPending as e:
+            # Not a failure: the dataset is still downloading. Returned as the
+            # handle text so the caller polls rather than reading "error".
+            return str(e)
         except AttackDataError as e:
             return f"ATT&CK error: {e}"
         except OSError as e:
@@ -586,6 +747,10 @@ def register_attack_tools(app, session_manager=None):
 
         except ValueError as e:
             return f"Configuration error: {e}"
+        except AttackFetchPending as e:
+            # Not a failure: the dataset is still downloading. Returned as the
+            # handle text so the caller polls rather than reading "error".
+            return str(e)
         except AttackDataError as e:
             return f"ATT&CK error: {e}"
         except Exception as e:
@@ -639,6 +804,10 @@ def register_attack_tools(app, session_manager=None):
 
         except ValueError as e:
             return f"Configuration error: {e}"
+        except AttackFetchPending as e:
+            # Not a failure: the dataset is still downloading. Returned as the
+            # handle text so the caller polls rather than reading "error".
+            return str(e)
         except AttackDataError as e:
             return f"ATT&CK error: {e}"
         except Exception as e:
@@ -693,6 +862,10 @@ def register_attack_tools(app, session_manager=None):
 
         except ValueError as e:
             return f"Configuration error: {e}"
+        except AttackFetchPending as e:
+            # Not a failure: the dataset is still downloading. Returned as the
+            # handle text so the caller polls rather than reading "error".
+            return str(e)
         except AttackDataError as e:
             return f"ATT&CK error: {e}"
         except Exception as e:
@@ -782,6 +955,10 @@ def register_attack_tools(app, session_manager=None):
 
         except ValueError as e:
             return f"Configuration error: {e}"
+        except AttackFetchPending as e:
+            # Not a failure: the dataset is still downloading. Returned as the
+            # handle text so the caller polls rather than reading "error".
+            return str(e)
         except AttackDataError as e:
             return f"ATT&CK error: {e}"
         except Exception as e:

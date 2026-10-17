@@ -51,7 +51,7 @@ from src.tool_catalog import CODE as CODE_OUTPUT
 from src.tool_catalog import apply_catalog as apply_tool_catalog
 from src.tool_catalog import classify as classify_tool
 from src.tools.abusech_tools import register_abusech_tools
-from src.tools.attack_tools import register_attack_tools
+from src.tools.attack_tools import register_attack_tools, use_job_registry
 from src.tools.control_flow_tools import register_control_flow_tools
 from src.tools.coverage_tools import register_coverage_tools
 from src.tools.diff_tools import register_diff_tools
@@ -6808,6 +6808,11 @@ def register_all_tools(
 
     # Register MITRE ATT&CK lookups (no API key; cached locally after first fetch)
     register_attack_tools(app, session_manager)
+    # The one ATT&CK call that can be slow is the first ~51MB download.
+    # Hand it the same registry and deadline every other long call uses,
+    # so a cold start degrades to a handle rather than blocking until the
+    # client gives up.
+    use_job_registry(jobs, _inline_deadline)
 
     # Register triage tools
     register_triage_tools(app, session_manager)

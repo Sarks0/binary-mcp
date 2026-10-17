@@ -431,3 +431,145 @@ class TestRecordedDepthIsHonest:
         assert 'effective_depth = analysis_depth' in source
         assert 'if skip_decompile and analysis_depth == "full":' in source
         assert 'meta["analysis_depth"] = effective_depth' in source
+
+
+class TestJobFailureTextIsTheSameChannelAsASynchronousCall:
+    """What a failed job's `error` is allowed to say.
+
+    A job's work function runs the same validators the synchronous tools do,
+    so this is the one place a confinement refusal's text -- which interpolates
+    the resolved allow-list, and so the operator's username -- could be written
+    into a record that three consumers hand to the caller: _run_or_degrade, and
+    job_status / job_result in tools/job_tools.py. src/engines/jobs.py imports
+    nothing from src, so the policy is injected from here; these tests drive it
+    through the real registry rather than calling the formatter directly,
+    because the injection itself is what broke once.
+    """
+
+    HOME = str(Path.home())
+
+    @staticmethod
+    def _failing_job(server, monkeypatch, exc):
+        """Queue a decompile whose Ghidra run raises `exc`, and read the record."""
+        cold = _ctx([_func("Parse", "0x1000")])
+        monkeypatch.setattr(server.cache, "get_cached", lambda p: cold)
+
+        def _raise(*a, **kw):
+            raise exc
+
+        monkeypatch.setattr(server, "get_analysis_context", _raise)
+        result = server.decompile_function(TEST_BINARY, "Parse", wait=False)
+        record = _wait_done(server, _job_id(result))
+        assert record["state"] == "failed"
+        return record["error"]
+
+    def test_a_confinement_refusal_does_not_write_the_allow_list_into_the_record(
+        self, server, monkeypatch
+    ):
+        from src.utils.security import PathTraversalError
+
+        leak = f"{self.HOME}/quarantine, {self.HOME}/samples"
+        error = self._failing_job(
+            server, monkeypatch,
+            PathTraversalError(f"Path is outside allowed directories: {leak}"),
+        )
+
+        assert self.HOME not in error, error
+        # Still diagnosable: the category says which refusal it was, which is
+        # the whole point of B3 -- a hard link and an out-of-bounds path had
+        # been indistinguishable.
+        assert "outside the directories" in error
+        assert "Reference ID:" in error
+
+    def test_a_hard_link_refusal_reads_the_same_in_a_job_as_in_a_sync_call(
+        self, server, monkeypatch
+    ):
+        from src.utils.security import HardLinkError
+
+        error = self._failing_job(
+            server, monkeypatch, HardLinkError(f"{self.HOME}/quarantine/x.dll"),
+        )
+        assert self.HOME not in error, error
+        assert "hard link" in error
+        assert "outside the directories" not in error
+
+    def test_an_oserror_does_not_write_its_filename_into_the_record(
+        self, server, monkeypatch
+    ):
+        """OSError.__str__ renders `filename`, so the stdlib leaks the path."""
+        leak = f"{self.HOME}/quarantine/secret.bin"
+        error = self._failing_job(
+            server, monkeypatch, PermissionError(13, "Permission denied", leak),
+        )
+        assert leak not in error, error
+        assert self.HOME not in error, error
+        assert "Reference ID:" in error
+
+    def test_a_ghidra_diagnostic_survives_the_thread_boundary(
+        self, server, monkeypatch
+    ):
+        """
+        The diagnostic is the reason a user can self-remediate, so it passes.
+
+        str(GhidraAnalysisError) is the message ALONE -- `diagnostic` is a
+        separate attribute -- so a formatter that passed the text through
+        would drop it. The analysis job folds it in itself before raising,
+        but the targeted decompile here does not, which is why the formatter
+        renders this type rather than stringifying it.
+        """
+        from src.engines.static.ghidra.runner import GhidraAnalysisError
+
+        error = self._failing_job(
+            server, monkeypatch,
+            GhidraAnalysisError(
+                "Ghidra analysis failed (exit 1)",
+                diagnostic="UnsupportedClassVersionError: class file version 65.0",
+            ),
+        )
+        assert "UnsupportedClassVersionError" in error, error
+        assert "OSGi cache may be stale" in error
+
+    def test_a_structured_error_keeps_its_envelope_and_drops_debug_info(
+        self, server, monkeypatch
+    ):
+        """debug_info is the one field carrying verbatim external-tool output."""
+        from src.utils.structured_errors import (
+            ErrorCode,
+            StructuredBaseError,
+            StructuredError,
+        )
+
+        error = self._failing_job(
+            server, monkeypatch,
+            StructuredBaseError(StructuredError(
+                error=ErrorCode.OPERATION_FAILED,
+                message="Analysis failed",
+                suggestions=["Re-run with analysis_depth='full'"],
+                debug_info={"search_path": f"srv*{self.HOME}*symbols"},
+            )),
+        )
+        assert self.HOME not in error, error
+        assert "Debug information" not in error
+        assert "Analysis failed" in error
+        assert "Re-run with analysis_depth='full'" in error
+
+    def test_a_curated_user_facing_error_passes_through(self, server, monkeypatch):
+        """
+        Collapsing every failure into a reference ID is the failure mode to avoid.
+
+        docs/ghidra-mcp-defender-issues.md (Issue 2) records that it is what
+        made Ghidra problems undiagnosable. UserFacingError already separates
+        its curated half from the half it logged in __init__, so its text is
+        shown verbatim.
+        """
+        from src.utils.security import UserFacingError
+
+        error = self._failing_job(
+            server, monkeypatch,
+            UserFacingError(
+                "The binary has no symbol table; load a PDB first.",
+                internal_details=f"missing {self.HOME}/pdbs/test.pdb",
+            ),
+        )
+        assert "no symbol table" in error, error
+        assert self.HOME not in error, error

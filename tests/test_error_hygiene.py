@@ -434,6 +434,9 @@ def _guarded_sources() -> list[Path]:
 # module name or an address -- never a resolved host path.
 _VALIDATION_ONLY_HANDLERS = {
     "ValueError",
+    # Audited beside this name in _AST_ALLOWED_HANDLERS: a handle this module
+    # wrote, not a caught failure.
+    "AttackFetchPending",
     "BinaryResolutionError",
     "AddressRebaseError",
     "FeatureUnavailableError",
@@ -551,6 +554,14 @@ _AST_ALLOWED_HANDLERS = {
     #     -- a failed cache write -- is an OSError routed through
     #     safe_path_error in the handler, not through this type.
     "AttackDataError",
+    #   * AttackFetchPending (src/tools/attack_tools.py) -- the same module's
+    #     "still downloading" handle, which is not a failure at all. It has a
+    #     single raise site, and the sentence there is written in this repo
+    #     with three substitutions: the matrix name, which is one of
+    #     ATTACK_DOMAINS; the inline deadline, a float; and the job id the
+    #     registry generated. No external text and no path can reach it, and
+    #     the handle is useless to the caller if it is not echoed verbatim.
+    "AttackFetchPending",
     #   * CoverageError (src/engines/static/ghidra/coverage_store.py) -- every
     #     raise site was audited when it was added here: "invariant violated:
     #     remaining != total - reviewed", "unknown examination kind 'x';

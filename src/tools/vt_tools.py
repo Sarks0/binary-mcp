@@ -26,6 +26,7 @@ Requires the VT_API_KEY environment variable (or a .env entry).
 import hashlib
 import json
 import logging
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.error import HTTPError
@@ -251,6 +252,17 @@ def get_behavior_report(file_hash: str) -> dict:
     file_hash = normalise_hash(file_hash)
     response = _vt_request(f"/files/{quote(file_hash, safe='')}/behaviour_summary")
     return response.get("data", {})
+
+
+#: What a VirusTotal paging cursor may contain before this server prints it.
+#:
+#: The cursor comes back over the network and is echoed OUTSIDE the untrusted
+#: envelope, inside a double-quoted argument in a suggested call. A cursor
+#: carrying a quote or a newline would close that string and continue on a
+#: line nothing fences -- so it is checked against the opaque base64url-ish
+#: token VirusTotal actually returns, the same way mb_lookup validates a
+#: network-returned SHA256 before printing it unfenced.
+_CURSOR_RE = re.compile(r"\A[A-Za-z0-9=_-]{1,512}\Z")
 
 
 def search_files(query: str, limit: int = 10, cursor: str = "") -> tuple[list[dict], str]:
@@ -822,9 +834,16 @@ def register_vt_tools(app, session_manager=None):
             )
             output.append("")
 
-            if next_cursor:
+            if next_cursor and _CURSOR_RE.match(next_cursor):
                 output.append("More results are available. To fetch the next page:")
                 output.append(f'  vt_search(query={query!r}, limit={limit}, cursor="{next_cursor}")')
+            elif next_cursor:
+                logger.warning("Discarded a VirusTotal cursor with unexpected characters")
+                output.append(
+                    "More results are available, but VirusTotal returned a paging "
+                    "cursor in a shape this server does not print. Narrow the query "
+                    "instead."
+                )
 
             return "\n".join(output)
 

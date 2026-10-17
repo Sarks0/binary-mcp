@@ -68,8 +68,15 @@ These are the controls described in the [security model](security.md#file-access
 | `BINARY_MCP_ALLOWED_DIRS` | Directories analysis is confined to, separated by `:` (POSIX) or `;` (Windows) | Unset, falls back to the quarantine directories |
 | `BINARY_MCP_REQUIRE_CONFINEMENT` | Fail closed: refuse to open any binary unless `BINARY_MCP_ALLOWED_DIRS` is set explicitly | Off |
 | `BINARY_MCP_ALLOW_ANY_PATH` | Opt out of path confinement entirely. Not recommended: every file this process can read becomes reachable through the server. Warns once per process, and is ignored when `BINARY_MCP_REQUIRE_CONFINEMENT` is set | Off |
-| `BINARY_MCP_ALLOW_HARDLINKS` | Re-permit multiply linked regular files. Narrower than `BINARY_MCP_ALLOW_ANY_PATH`: directory confinement stays in force | Off |
+| `BINARY_MCP_ALLOW_HARDLINKS` | Re-permit multiply linked regular files. Confinement resolves symlinks but cannot see through a hard link, so these are refused while confinement is active. Narrower than `BINARY_MCP_ALLOW_ANY_PATH`: directory confinement stays in force | Off |
 | `BINARY_MCP_ENABLE_RAW_WINDBG` | Enable `windbg_execute_command` behind its fail-closed allowlist | Off |
+
+If you stage samples into a directory of your own, point
+`BINARY_MCP_ALLOWED_DIRS` at it and stage with a **copy**. Hard-linking into an
+allow-listed directory is the one case that looks like it should work and does
+not: the directory is accepted and the file is then refused on its link count.
+The refusal says so, and names `BINARY_MCP_ALLOW_HARDLINKS` as the alternative
+if copying is not an option.
 
 ## Transport
 

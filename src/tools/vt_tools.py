@@ -396,7 +396,7 @@ def register_vt_tools(app, session_manager=None):
             return "\n".join(output)
 
         except (PathTraversalError, FileSizeError) as e:
-            return safe_error_message("vt_lookup", e)
+            return safe_path_error("vt_lookup", e, "file path")
         except ValueError as e:
             return f"Configuration error: {e}"
         except VirusTotalError as e:

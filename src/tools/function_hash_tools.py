@@ -507,6 +507,7 @@ def register_function_hash_tools(app, session_manager, cache, runner):
         cache: ProjectCache instance for accessing cached analysis data
         runner: GhidraRunner instance (unused here but kept for interface consistency)
     """
+    from src.tools.error_hygiene import safe_path_error
     from src.utils.security import (
         FileSizeError,
         PathTraversalError,
@@ -607,7 +608,7 @@ def register_function_hash_tools(app, session_manager, cache, runner):
             return "\n".join(output)
 
         except (PathTraversalError, FileSizeError) as e:
-            return safe_error_message("get_function_hash", e)
+            return safe_path_error("get_function_hash", e, "binary path")
         except ImportError as e:
             logger.error(f"get_function_hash missing library: {e}")
             return safe_error_message("Required library not available for function hashing", e)
@@ -732,7 +733,7 @@ def register_function_hash_tools(app, session_manager, cache, runner):
             return "\n".join(output)
 
         except (PathTraversalError, FileSizeError) as e:
-            return safe_error_message("batch_decompile", e)
+            return safe_path_error("batch_decompile", e, "binary path")
         except Exception as e:
             logger.error(f"batch_decompile failed: {e}")
             return safe_error_message("Failed to batch decompile", e)
@@ -982,7 +983,7 @@ def register_function_hash_tools(app, session_manager, cache, runner):
             return "\n".join(output)
 
         except (PathTraversalError, FileSizeError) as e:
-            return safe_error_message("analyze_function_completeness", e)
+            return safe_path_error("analyze_function_completeness", e, "binary path")
         except Exception as e:
             logger.error(f"analyze_function_completeness failed: {e}")
             return safe_error_message("Failed to analyze function completeness", e)
@@ -1245,7 +1246,7 @@ def register_function_hash_tools(app, session_manager, cache, runner):
             return "\n".join(output)
 
         except (PathTraversalError, FileSizeError) as e:
-            return safe_error_message("find_similar_functions", e)
+            return safe_path_error("find_similar_functions", e, "binary path")
         except ImportError as e:
             logger.error(f"find_similar_functions missing library: {e}")
             return safe_error_message("Required library not available for function comparison", e)
@@ -1414,7 +1415,7 @@ def register_function_hash_tools(app, session_manager, cache, runner):
             return "\n".join(output)
 
         except (PathTraversalError, FileSizeError) as e:
-            return safe_error_message("find_inlined_clones", e)
+            return safe_path_error("find_inlined_clones", e, "binary path")
         except ImportError as e:
             logger.error(f"find_inlined_clones missing library: {e}")
             return safe_error_message("Required library not available for clone detection", e)

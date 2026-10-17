@@ -113,6 +113,82 @@ class TestBasicLifecycle:
         )
         assert "ghidra fell over" in registry.read(submitted["job_id"])["error"]
 
+    def test_an_oserror_does_not_write_its_filename_into_the_record(
+        self, registry
+    ):
+        """
+        The job record is read by three consumers, so the leak is plugged here.
+
+        OSError renders `filename` in its __str__, so "[Errno 13] Permission
+        denied: '/home/<user>/quarantine/x'" is the stdlib handing a resolved
+        path to whoever formats it -- and a failed job's `error` reaches the
+        caller through server._run_or_degrade and through job_status /
+        job_result in tools/job_tools.py. Sanitising at the producer covers
+        all three; sanitising at a sink covers one and cannot see the
+        exception's type.
+
+        This is the DEFAULT formatter, with nothing injected: a registry built
+        without one must not be the thing that reopens the leak.
+        """
+        leak = "/home/operator/quarantine/secret.bin"
+
+        def _boom(ctx):
+            raise PermissionError(13, "Permission denied", leak)
+
+        submitted = registry.submit(kind="test", key="oserr", fn=_boom)
+        assert _wait_for(
+            lambda: _record(registry, submitted["job_id"]).get("state") == STATE_FAILED
+        )
+        recorded = registry.read(submitted["job_id"])["error"]
+        assert leak not in recorded, recorded
+        # Still says what kind of failure it was, and where the detail went.
+        assert "PermissionError" in recorded
+        assert "Reference ID:" in recorded
+
+    def test_a_curated_message_still_passes_through(self, registry):
+        """
+        The counterweight: not collapsing every failure is a deliberate choice.
+
+        docs/ghidra-mcp-defender-issues.md (Issue 2) records that turning every
+        analysis failure into an opaque reference ID is what made Ghidra
+        problems undiagnosable. So a non-OSError message -- a sentence this
+        project wrote -- must still reach the caller. Asserted alongside the
+        test above so a future tightening cannot quietly trade diagnosability
+        for a leak it was not carrying.
+        """
+        def _boom(ctx):
+            raise RuntimeError("produced no pseudocode; the cache is structural")
+
+        submitted = registry.submit(kind="test", key="curated", fn=_boom)
+        assert _wait_for(
+            lambda: _record(registry, submitted["job_id"]).get("state") == STATE_FAILED
+        )
+        recorded = registry.read(submitted["job_id"])["error"]
+        assert "produced no pseudocode" in recorded, recorded
+
+    def test_a_formatter_that_raises_cannot_strand_the_job(self, registry):
+        """
+        The formatter runs inside the worker's except block, so it must not throw.
+
+        Found the hard way: the injected formatter referenced a name server.py
+        had not imported, and the NameError fired inside the worker thread's
+        finalize path -- so jobs never reached a terminal state at all and four
+        unrelated tests failed with "job never finished" rather than anything
+        pointing at the formatter. A formatter is a hook now, and a hook that
+        raises must degrade, not strand the job.
+        """
+        registry._error_formatter = lambda exc: 1 / 0  # noqa: ARG005
+
+        def _boom(ctx):
+            raise RuntimeError("the real failure")
+
+        submitted = registry.submit(kind="test", key="badfmt", fn=_boom)
+        assert _wait_for(
+            lambda: _record(registry, submitted["job_id"]).get("state") == STATE_FAILED
+        ), "a throwing formatter stranded the job in a non-terminal state"
+        recorded = registry.read(submitted["job_id"])["error"]
+        assert recorded, "the job finalized with no reason at all"
+
     def test_progress_is_readable_while_running(self, registry):
         release = threading.Event()
 

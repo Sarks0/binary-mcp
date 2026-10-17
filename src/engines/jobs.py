@@ -251,6 +251,38 @@ class JobContext:
         return self._cancelled.is_set()
 
 
+def _default_error_formatter(exc: Exception) -> str:
+    """
+    Fallback when no formatter is injected: pass the text through, except OSError.
+
+    A failed job's text IS meant to reach the caller. That is a deliberate
+    decision, not an oversight -- see docs/ghidra-mcp-defender-issues.md
+    (Issue 2): collapsing every analysis failure into an opaque reference ID
+    is what made Ghidra problems undiagnosable, and the messages that arrive
+    here ("produced no pseudocode", "analysis_depth='full' was lowered",
+    "ghidra fell over") are sentences this project writes.
+
+    OSError is the exception. Its ``__str__`` renders ``filename`` and
+    ``filename2`` when set, so "[Errno 13] Permission denied:
+    '/home/<user>/quarantine/x'" is the stdlib handing a resolved path to
+    whoever formats it -- and the job record is read by _run_or_degrade and by
+    job_status / job_result. Its subclasses are the ones that matter most here
+    (FileNotFoundError, IsADirectoryError, PermissionError).
+
+    This module imports nothing from ``src.``, so it can only reason about
+    stdlib types. src/server.py injects a formatter that additionally knows
+    this project's own path-refusal types and its curated-error envelopes.
+    """
+    if isinstance(exc, OSError):
+        error_id = uuid.uuid4().hex[:8]
+        logger.error("job failed [%s]", error_id, exc_info=exc)
+        return (
+            f"Error: the job failed ({type(exc).__name__}); the path it names "
+            f"is in the server log.\nReference ID: {error_id}"
+        )
+    return str(exc)
+
+
 class JobRegistry:
     """File-backed job store shared by every server process on a cache root."""
 
@@ -259,10 +291,17 @@ class JobRegistry:
         cache_dir,
         stale_after: int = STALE_AFTER_SECONDS,
         heartbeat_interval: int = HEARTBEAT_INTERVAL_SECONDS,
+        error_formatter=None,
     ):
         self.root = Path(cache_dir) / "jobs"
         self.stale_after = stale_after
         self.heartbeat_interval = heartbeat_interval
+        # How a failed job's exception becomes the record's model-facing
+        # `error`. Injected because the policy lives in the tool layer and this
+        # module imports nothing from src. -- see _default_error_formatter for
+        # what happens when nobody injects, and why the default is the strict
+        # one rather than str(exc).
+        self._error_formatter = error_formatter or _default_error_formatter
         self._lock = threading.RLock()
         self._local: dict[str, JobContext] = {}
         self._stop = threading.Event()
@@ -730,6 +769,35 @@ class JobRegistry:
             return None
         return record
 
+    def _failure_text(self, exc: Exception) -> str:
+        """
+        Render a failure through the formatter without letting it strand a job.
+
+        The formatter is an injected hook and this call sits inside the worker's
+        ``except`` block, immediately before the only write that moves a job to
+        a terminal state. Found the hard way: an injected formatter referenced a
+        name its own module had not imported, the NameError fired here, and jobs
+        stopped reaching a terminal state at all -- the symptom was unrelated
+        tests hanging on "job never finished", with nothing pointing at the
+        formatter.
+
+        The fallback does not retry via _default_error_formatter: that one
+        passes non-OSError text through, and the injected formatter is the
+        stricter of the two, so reaching past a broken policy layer would
+        re-open the channel the injection exists to close. The original
+        exception was already logged with its job id by the caller.
+        """
+        try:
+            return self._error_formatter(exc)
+        except Exception:
+            error_id = uuid.uuid4().hex[:8]
+            logger.exception("job error formatter failed [%s]", error_id)
+            return (
+                f"Error: the job failed ({type(exc).__name__}) and the reason "
+                f"could not be rendered; both are in the server log.\n"
+                f"Reference ID: {error_id}"
+            )
+
     def _run(self, job_id: str, key: str, fn, context: JobContext) -> None:
         beat = threading.Thread(
             target=self._heartbeat, args=(job_id, context),
@@ -745,7 +813,20 @@ class JobRegistry:
                                progress="complete")
         except Exception as exc:
             logger.exception("job %s failed", job_id)
-            self._finalize(job_id, state=STATE_FAILED, error=str(exc), progress="failed")
+            # NOT str(exc). A job's work function runs the same validators the
+            # synchronous tools do, so this is the one place a confinement
+            # refusal's text -- which interpolates the resolved allow-list, and
+            # so the operator's username -- could be written into a record that
+            # three separate consumers hand to the caller: _run_or_degrade's
+            # `f"Error: {reason}"`, and job_status / job_result via
+            # tools/job_tools.py. Sanitising here covers all three, which is
+            # why it belongs at the producer and not at each sink.
+            self._finalize(
+                job_id,
+                state=STATE_FAILED,
+                error=self._failure_text(exc),
+                progress="failed",
+            )
         finally:
             # Cleanup must not be able to kill the worker thread. The terminal
             # state is already written by this point, so a failure here is

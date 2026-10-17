@@ -585,7 +585,7 @@ def test_no_matches_still_says_so(monkeypatch):
         ("urlhaus_client", "urlhaus_lookup_host", "evil-domain.test",
          "no_results", "No malware URLs recorded for this host."),
         ("yaraify_client", "yaraify_lookup_hash", "f" * 64,
-         "no_result", "No public YARA rules matched this sample."),
+         "no_result", "YARAify has no record of this file"),
     ],
 )
 def test_empty_result_reports_the_miss_not_an_error(
@@ -695,3 +695,47 @@ def test_every_scalar_branch_stays_on_one_line(value):
     rendered = abusech_tools._scalar(value)
     assert "\n" not in rendered
     assert "\r" not in rendered
+
+
+# "No record" and "scanned, nothing matched" are different answers, and the
+# difference is the useful part: one says nobody has written detection for
+# this family, the other says YARAify has never seen the file.
+def test_a_scanned_sample_with_no_matches_says_so(monkeypatch):
+    _capture(monkeypatch, abusech_tools.yaraify_client,
+             {"query_status": "ok", "data": [{"sha256_hash": "e" * 64}]})
+
+    out = _register(monkeypatch)["yaraify_lookup_hash"]("e" * 64)
+
+    assert "No public YARA rules matched this sample." in out
+    assert "no record of this file" not in out
+
+
+def test_an_unknown_sample_is_not_reported_as_unmatched(monkeypatch):
+    _capture(monkeypatch, abusech_tools.yaraify_client,
+             {"query_status": "no_result", "data": None})
+
+    out = _register(monkeypatch)["yaraify_lookup_hash"]("e" * 64)
+
+    assert "no record of this file" in out
+    assert "No public YARA rules matched this sample." not in out
+
+
+# A caller's own argument echoed into the header lands on a line no envelope
+# covers, and these indicators arrive from extract_iocs -- so they are
+# sample-derived text. A newline in one would start a second unfenced line.
+@pytest.mark.parametrize(
+    "tool,client_name",
+    [
+        ("threatfox_lookup_ioc", "threatfox_client"),
+        ("threatfox_by_malware", "threatfox_client"),
+        ("urlhaus_lookup_host", "urlhaus_client"),
+    ],
+)
+def test_an_echoed_indicator_cannot_start_a_line(monkeypatch, tool, client_name):
+    _capture(monkeypatch, getattr(abusech_tools, client_name),
+             {"query_status": "no_result", "data": None})
+
+    out = _register(monkeypatch)[tool](f"evil-domain.test\n{INJECTION}")
+
+    assert not any(line.startswith("SYSTEM:") for line in out.splitlines())
+    assert "\r" not in out

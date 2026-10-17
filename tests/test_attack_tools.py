@@ -23,6 +23,7 @@ from src.integrations import base as integration_base
 from src.tools import attack_tools
 from src.tools.attack_tools import (
     AttackDataError,
+    AttackFetchPending,
     distil,
     related,
     resolve,
@@ -573,3 +574,200 @@ def test_a_held_lock_still_answers_rather_than_failing(tmp_path, monkeypatch, in
 
     monkeypatch.setattr(attack_tools, "exclusive_lock", always_timeout)
     assert attack_tools.load_index()["entities"]["T1055"]["name"] == "Process Injection"
+
+
+# The cold fetch, and not blocking the caller through it
+
+
+class _FakeRegistry:
+    """Enough of JobRegistry for the degrade path, recording what it was asked.
+
+    It calls ``fn(context)``, because the real registry does (jobs.py ``_run``)
+    -- an earlier version of this fake called ``fn()`` and every test here
+    passed while the real path raised TypeError inside the job on the first
+    cold fetch. A fake that is easier to satisfy than the thing it stands in
+    for tests nothing.
+    """
+
+    def __init__(self, state, *, run=True, error=None, submit_error=None):
+        self.state = state
+        self.run = run
+        self.error = error
+        self.submit_error = submit_error
+        self.submitted = []
+        self.waited = []
+
+    def submit(self, *, kind, key, fn):
+        self.submitted.append((kind, key))
+        if self.submit_error:
+            return {"error": self.submit_error}
+        if self.run:
+            fn(MagicMock())
+        return {"job_id": "job-1", "state": self.state, "attached": False}
+
+    def wait(self, job_id, timeout):
+        self.waited.append((job_id, timeout))
+        if self.state is None:
+            return None
+        return {"state": self.state, "error": self.error}
+
+
+@pytest.fixture(autouse=True)
+def _no_registry_by_default(monkeypatch):
+    """Every test starts as a plain library: no registry unless it asks for one."""
+    monkeypatch.setattr(attack_tools, "_job_degrade", None)
+
+
+def _with_server(monkeypatch, registry, deadline=25.0):
+    """Wire the registry in the way the server does at startup."""
+    monkeypatch.setattr(attack_tools, "_job_degrade", (registry, lambda: deadline))
+
+
+def _cold_cache(monkeypatch, tmp_path, bundle_index):
+    """A data dir with no cached index, and a fetch that returns bundle_index."""
+    monkeypatch.setattr(attack_tools, "data_dir", lambda: tmp_path)
+    monkeypatch.setattr(attack_tools, "fetch_index", lambda matrix=None: bundle_index)
+
+
+def test_a_cold_fetch_runs_inline_when_no_server_is_driving(monkeypatch, tmp_path, index):
+    """As a plain library there is no registry and nobody to poll a handle."""
+    assert attack_tools._job_degrade is None  # the autouse fixture's doing
+    _cold_cache(monkeypatch, tmp_path, index)
+
+    loaded = attack_tools.load_index("enterprise-attack")
+
+    assert loaded["entities"] == index["entities"]
+    assert (tmp_path / "enterprise-attack-index.json").exists()
+
+
+def test_a_cold_fetch_is_submitted_as_a_job_when_the_server_is(monkeypatch, tmp_path, index):
+    registry = _FakeRegistry("succeeded")
+    _with_server(monkeypatch, registry, deadline=25.0)
+    _cold_cache(monkeypatch, tmp_path, index)
+
+    loaded = attack_tools.load_index("enterprise-attack")
+
+    assert registry.submitted == [("attack-index", "attack-index:enterprise-attack")]
+    assert registry.waited == [("job-1", 25.0)]
+    assert loaded["entities"] == index["entities"]
+
+
+def test_a_download_past_the_deadline_hands_back_a_handle(monkeypatch, tmp_path, index):
+    """The finding: ~51MB inline is long enough for a client to abandon the call."""
+    registry = _FakeRegistry("running", run=False)
+    _with_server(monkeypatch, registry, deadline=25.0)
+    _cold_cache(monkeypatch, tmp_path, index)
+
+    with pytest.raises(AttackFetchPending) as pending:
+        attack_tools.load_index("enterprise-attack")
+
+    message = str(pending.value)
+    assert "job-1" in message
+    assert "25s" in message
+    assert "enterprise-attack" in message
+
+
+def test_every_tool_returns_that_handle_rather_than_an_error(monkeypatch, tmp_path, index):
+    registry = _FakeRegistry("running", run=False)
+    _with_server(monkeypatch, registry, deadline=25.0)
+    _cold_cache(monkeypatch, tmp_path, index)
+    tools = _tools(monkeypatch)
+
+    calls = {
+        "attack_status": (),
+        "attack_lookup_technique": ("T1055",),
+        "attack_lookup_group": ("APT38",),
+        "attack_lookup_software": ("Mimikatz",),
+        "attack_search": ("inject",),
+    }
+    assert set(calls) == set(tools)
+
+    for name, args in calls.items():
+        out = tools[name](*args)
+        assert "job_id: job-1" in out, name
+        assert not out.startswith("Error"), name
+        assert "ATT&CK error" not in out, name
+
+
+@pytest.mark.parametrize("state", ["failed", "cancelled", "orphaned"])
+def test_a_failed_download_is_still_an_error(monkeypatch, tmp_path, index, state):
+    registry = _FakeRegistry(state, run=False, error="the network went away")
+    _with_server(monkeypatch, registry, deadline=25.0)
+    _cold_cache(monkeypatch, tmp_path, index)
+
+    with pytest.raises(AttackDataError, match="the network went away"):
+        attack_tools.load_index("enterprise-attack")
+
+
+def test_a_refused_submit_is_an_error_not_a_handle(monkeypatch, tmp_path, index):
+    registry = _FakeRegistry("running", run=False, submit_error="could not claim job key")
+    _with_server(monkeypatch, registry, deadline=25.0)
+    _cold_cache(monkeypatch, tmp_path, index)
+
+    with pytest.raises(AttackDataError, match="could not claim job key"):
+        attack_tools.load_index("enterprise-attack")
+
+
+def test_a_warm_cache_never_reaches_the_registry(monkeypatch, tmp_path, index):
+    """The fast path is the whole point: 99.99% of calls must not pay for this."""
+    registry = _FakeRegistry("succeeded")
+    _with_server(monkeypatch, registry)
+    monkeypatch.setattr(attack_tools, "data_dir", lambda: tmp_path)
+    (tmp_path / "enterprise-attack-index.json").write_text(json.dumps(index))
+
+    loaded = attack_tools.load_index("enterprise-attack")
+
+    assert registry.submitted == []
+    assert loaded["entities"] == index["entities"]
+
+
+def test_offline_still_refuses_before_any_job_is_submitted(monkeypatch, tmp_path, index):
+    registry = _FakeRegistry("succeeded")
+    _with_server(monkeypatch, registry)
+    monkeypatch.setattr(attack_tools, "data_dir", lambda: tmp_path)
+    monkeypatch.setattr(attack_tools, "_offline", lambda: True)
+
+    with pytest.raises(AttackDataError, match="cannot be downloaded"):
+        attack_tools.load_index("enterprise-attack")
+    assert registry.submitted == []
+
+
+def test_an_unreadable_deadline_falls_back_to_fetching_inline(monkeypatch, tmp_path, index):
+    """A misconfigured BINARY_MCP_INLINE_DEADLINE must not block the dataset."""
+    registry = _FakeRegistry("succeeded")
+
+    def boom():
+        raise ValueError("BINARY_MCP_INLINE_DEADLINE must be 0-900")
+
+    monkeypatch.setattr(attack_tools, "_job_degrade", (registry, boom))
+    _cold_cache(monkeypatch, tmp_path, index)
+
+    loaded = attack_tools.load_index("enterprise-attack")
+
+    assert registry.submitted == []
+    assert loaded["entities"] == index["entities"]
+
+
+def test_the_real_registry_can_actually_run_the_fetch(monkeypatch, tmp_path, index):
+    """End to end against JobRegistry itself, not a fake.
+
+    The fake above is shaped to the registry's contract, but a fake is only
+    ever as good as the reading that produced it -- and the first version of
+    this one called ``fn()`` where the registry calls ``fn(context)``, so the
+    whole degrade path raised TypeError inside the job while every test here
+    reported green. This one submits through the real registry, so that class
+    of mistake fails here rather than on a user's first cold start.
+    """
+    from src.engines.jobs import JobRegistry
+
+    registry = JobRegistry(tmp_path / "jobs")
+    try:
+        monkeypatch.setattr(attack_tools, "_job_degrade", (registry, lambda: 30.0))
+        _cold_cache(monkeypatch, tmp_path, index)
+
+        loaded = attack_tools.load_index("enterprise-attack")
+
+        assert loaded["entities"] == index["entities"]
+        assert (tmp_path / "enterprise-attack-index.json").exists()
+    finally:
+        registry.shutdown()

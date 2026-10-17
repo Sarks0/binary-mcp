@@ -44,6 +44,7 @@ ARCHITECTURE_SCENE = REPO_ROOT / "docs" / "architecture.excalidraw"
 TOOLS_DOC = REPO_ROOT / "docs" / "tools.md"
 SECURITY_DOC = REPO_ROOT / "docs" / "security.md"
 CONFIG_DOC = REPO_ROOT / "docs" / "configuration.md"
+LARGE_BINARY_DOC = REPO_ROOT / "docs" / "large-binary-decompile.md"
 CLAIM_DOCS = (README, TOOLS_DOC, SECURITY_DOC, CONFIG_DOC)
 PYPROJECT = REPO_ROOT / "pyproject.toml"
 SERVER_PY = SRC / "server.py"
@@ -628,6 +629,64 @@ def test_documented_auto_pdb_default_matches_code():
         assert "`microsoft`" in text, (
             f"{path.name} no longer states the default symbol-fetch policy"
         )
+
+
+def test_large_binary_doc_matches_the_chunking_and_heap_facts():
+    """
+    The chunking workflow existed in code and was documented nowhere.
+
+    Reported as "this host cannot analyze a 294 MB DLL". The honest answer was
+    that ranged runs already accumulate into one cache, so the module can be
+    covered a range at a time -- the operator had no way to find that out, and
+    the only sizing advice on offer pointed the wrong way for a host short on
+    RAM. A workflow nobody can find is close to one that does not exist, so the
+    page now states it; these are the code facts it rests on.
+
+    Deliberately pinned to names and to the one literal the prose quotes, not
+    to behaviour: the behaviour has its own tests (auto-promotion and the
+    manifest in tests/test_ghidra_perf.py, the merge in its delta-merge cases).
+    What is unpinned without this is the page going stale against a rename or
+    a changed default, which is exactly how the gap arose.
+    """
+    text = LARGE_BINARY_DOC.read_text(encoding="utf-8")
+    for claim in (
+        "start_address",
+        "end_address",
+        "_merge_delta_into_cache",
+        "resume_manifest_<stem>.json",
+        "GHIDRA_MAX_HEAP_MB",
+        "_JAVA_OPTIONS",
+    ):
+        assert claim in text, f"the page no longer mentions {claim}"
+
+    server_src = SERVER_PY.read_text(encoding="utf-8")
+    tree = ast.parse(server_src)
+    defined = {
+        node.name for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+    }
+    for name in ("_merge_delta_into_cache", "_write_resume_manifest"):
+        assert name in defined, (
+            f"{name} was renamed or removed; the page names it as the thing "
+            f"that makes chunked coverage accumulate"
+        )
+    assert "resume_manifest_" in server_src, "the sidecar filename changed"
+    assert "complete_addresses" in server_src, (
+        "the manifest's address-list key changed; the page describes it"
+    )
+
+    runner_src = (SRC / "engines" / "static" / "ghidra" / "runner.py").read_text(
+        encoding="utf-8"
+    )
+    assert re.search(
+        r'GHIDRA_MAX_HEAP_MB["\']\s*,\s*["\']4096', runner_src
+    ), (
+        "the GHIDRA_MAX_HEAP_MB default is no longer 4096; both "
+        "docs/large-binary-decompile.md and docs/configuration.md quote it"
+    )
+    assert "4096" in CONFIG_DOC.read_text(encoding="utf-8"), (
+        "configuration.md no longer states the heap default the page defers to"
+    )
 
 
 # F-6: x64dbg_execute_command docstring

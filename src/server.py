@@ -91,6 +91,7 @@ from src.utils.security import (
     validate_numeric_range,
     validate_session_id,
 )
+from src.utils.structured_errors import StructuredBaseError
 from src.utils.table_refs import find_table_base_refs
 
 # Allowed output directory for decrypted/decoded files
@@ -120,9 +121,63 @@ app = FastMCP("binary-mcp")
 runner = GhidraRunner()
 cache = ProjectCache()
 session_manager = UnifiedSessionManager()
+
+
+def _job_failure_text(exc: Exception) -> str:
+    """
+    Turn a failed job's exception into the record's model-facing `error`.
+
+    Injected into JobRegistry because the policy is the tool layer's and
+    src/engines/jobs.py imports nothing from src. Its own fallback is
+    deliberately strict; this keeps the four passthroughs the synchronous
+    handlers already surface, so moving work into a job stops costing the
+    caller its diagnosis:
+
+      * UserFacingError -- built to be shown verbatim. Its __str__ is the
+        curated user_message plus a reference ID, and the untrusted half is
+        logged in __init__ and never rendered, which is why the F-10 AST guard
+        allow-lists it.
+      * StructuredBaseError -- safe_tool_error renders the curated envelope
+        (code, message, reason, suggestions) and drops debug_info, the one
+        field carrying verbatim external-tool output.
+      * GhidraAnalysisError -- rendered through _ghidra_failure_message, the
+        same text the synchronous handler returns. str() alone would drop
+        `diagnostic`, which is curated from Ghidra's own stderr and is how a
+        user learns their JDK is mismatched or the OSGi cache poisoned. The
+        analysis job folds it in itself before raising; the targeted-decompile
+        job does not, and lets the error through unwrapped.
+      * A path refusal -- routed to its category, so a hard link in a job
+        reads the same as a hard link in a synchronous call.
+
+    Anything else passes through as its own text, which is deliberate: see
+    docs/ghidra-mcp-defender-issues.md (Issue 2). Collapsing every analysis
+    failure into a reference ID is what made Ghidra problems undiagnosable,
+    and these are sentences this project writes. What does NOT pass through
+    is the set of types whose str() is host state -- a path refusal, or any
+    OSError, which renders its filename.
+    """
+    if isinstance(exc, UserFacingError):
+        return str(exc)
+    if isinstance(exc, GhidraAnalysisError):
+        return _ghidra_failure_message(exc)
+    if isinstance(exc, StructuredBaseError):
+        # Curated envelope, and debug_info dropped -- that is the one field
+        # carrying verbatim external-tool output (raw CDB stdout, host search
+        # paths, the x64dbg plugin's own message).
+        return safe_tool_error("the job", exc)
+    if isinstance(exc, (PathTraversalError, FileSizeError, OSError)):
+        # The leak this exists to close. A confinement denial's text
+        # interpolates the resolved allow-list, and OSError renders its
+        # filename, so these are the types whose str() is host state.
+        # safe_tool_error gives a path refusal its category and anything else
+        # the generic envelope.
+        return safe_tool_error("the job", exc)
+    return str(exc)
+
+
 # Shared with every other server process on this cache root -- that is how
 # two agents analyzing the same binary end up on one Ghidra run instead of two.
-jobs = JobRegistry(cache.cache_dir)
+jobs = JobRegistry(cache.cache_dir, error_formatter=_job_failure_text)
 api_patterns = APIPatterns()
 crypto_patterns = CryptoPatterns()
 compatibility_checker = BinaryCompatibilityChecker()
@@ -1491,7 +1546,16 @@ def _run_or_degrade(
     if state in JOB_TERMINAL_STATES:
         # Failed / cancelled / orphaned. Surface the reason rather than a job
         # id the caller would poll only to be told the same thing.
+        #
+        # A failed job's `error` is now a complete envelope from
+        # _job_failure_text, already carrying "Error:" and a reference ID, so
+        # prefixing it again gives "Error: Error: ...". The other reasons the
+        # registry writes are bare phrases it composed itself ("cancelled;
+        # reaped 2 subprocess(es)", "server process exited before completion")
+        # and a bare state name, all of which still want the prefix.
         reason = record.get("error") or state
+        if str(reason).startswith("Error:"):
+            return str(reason)
         return f"Error: {reason}"
 
     # Still running at the deadline. This is the degrade, and it is a normal

@@ -689,6 +689,54 @@ def test_large_binary_doc_matches_the_chunking_and_heap_facts():
     )
 
 
+def test_security_doc_states_the_one_unconfined_path_tool():
+    """
+    The confinement section would otherwise read as covering every path.
+
+    `windbg_open_dump` does not consult the allow-list, and that is the
+    operator's decision rather than a gap left open: a crash dump lives where
+    Windows wrote it, and confining the tool would refuse the workflow the
+    README documents. A security page that describes confinement and omits its
+    one exception is the kind of doc an operator plans around and is wrong.
+
+    Pinned from both ends, because either half can drift. If confinement is
+    ever added to the tool, this fails and points at the page; if the page
+    stops naming the exception, it fails too. The behaviour itself is pinned
+    by test_windbg_open_dump_validates_before_entering_dump_mode, which opens
+    an out-of-bounds dump on purpose.
+    """
+    text = SECURITY_DOC.read_text(encoding="utf-8")
+    assert "windbg_open_dump" in text, (
+        "docs/security.md no longer names the one tool that is not confined"
+    )
+    assert "not confined" in text or "unconfined" in text, (
+        "docs/security.md no longer states that crash dumps are unconfined"
+    )
+
+    tree = ast.parse(WINDBG_TOOLS.read_text(encoding="utf-8"))
+    open_dump = next(
+        (
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "windbg_open_dump"
+        ),
+        None,
+    )
+    assert open_dump is not None, "windbg_open_dump was renamed or removed"
+    called = {
+        node.func.id for node in ast.walk(open_dump)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    confining = called & {
+        "confine_binary_path", "sanitize_binary_path", "get_allowed_dirs"
+    }
+    assert not confining, (
+        f"windbg_open_dump now confines its path ({sorted(confining)}), which "
+        f"contradicts docs/security.md and refuses C:\\Windows\\MEMORY.DMP. "
+        f"If the posture changed on purpose, update the page and "
+        f"test_windbg_open_dump_validates_before_entering_dump_mode with it"
+    )
+
+
 # F-6: x64dbg_execute_command docstring
 
 

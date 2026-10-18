@@ -981,9 +981,18 @@ def test_windbg_open_dump_validates_before_entering_dump_mode(
         assert str(tmp_path) not in result, f"{label} echoed host layout"
     assert not opened, "the bridge was handed a path that is not a readable file"
 
-    # A real file still opens, and the reply names it without the path.
+    # A real file still opens, and the reply names it without the path. The
+    # file chosen is deliberately the OUT-OF-BOUNDS one: this tool does not
+    # consult the allow-list, by the operator's decision, because a crash dump
+    # lives where Windows wrote it and C:\Windows\MEMORY.DMP is the project's
+    # own worked example. docs/security.md states the exception, and this
+    # assertion is what would fail if someone confined the tool without
+    # changing that -- the two are meant to move together.
     result = open_dump(dump_path=str(cases["out of bounds"]))
-    assert "Opened crash dump" in result
+    assert "Opened crash dump" in result, (
+        "an out-of-bounds dump must still open: dumps are intentionally "
+        "unconfined, see docs/security.md"
+    )
     assert str(tmp_path) not in result, "success line echoed the caller's path"
     assert len(opened) == 1
 

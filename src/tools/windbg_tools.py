@@ -408,11 +408,15 @@ def register_windbg_tools(
             # and the session entered dump-analysis mode against nothing. The
             # confinement sweep found it on Windows, where it is reachable.
             #
-            # Existence and file-ness only: NOT the allow-list. A crash dump
-            # legitimately lives outside any quarantine directory --
-            # C:\Windows\MEMORY.DMP is the README's own worked example -- so
-            # confining this path is an operator policy decision, not a bug
-            # fix, and is deliberately not made here.
+            # Existence and file-ness only: NOT the allow-list, and that is
+            # settled rather than pending. A crash dump lives where Windows
+            # wrote it, and C:\Windows\MEMORY.DMP is this project's own worked
+            # example, so confining this path would refuse the documented
+            # workflow. The operator's call was to leave dumps unconfined;
+            # docs/security.md states the exception and what it costs, and
+            # test_windbg_open_dump_validates_before_entering_dump_mode pins
+            # it by opening an out-of-bounds dump on purpose. Do not add
+            # confinement here without changing both.
             candidate = Path(dump_path)
             if candidate.is_dir():
                 return path_refusal_message(

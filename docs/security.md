@@ -115,6 +115,22 @@ says the link count was the problem and that widening
 outside the allow-list. They used to be the same sentence, which sent operators
 to re-check an allow-list that had already accepted the directory.
 
+### Crash dumps are deliberately not confined
+
+`windbg_open_dump` is the one path-taking tool that does not consult the
+allow-list. A kernel or process dump lives wherever Windows wrote it, and
+`C:\Windows\MEMORY.DMP` is this project's own worked example, so confining the
+tool would refuse its documented workflow. It does check that the path exists
+and names a file -- it used to answer "Opened crash dump" for a missing path or
+a directory and enter dump-analysis mode against nothing -- and the reply names
+the file rather than echoing the path back.
+
+What that costs: a caller who can reach this server can have WinDbg open any
+dump file the server's user can read, wherever it sits. No setting narrows
+that; `BINARY_MCP_ALLOWED_DIRS` does not apply to this tool. If that is too
+wide for your install, confine it outside the server -- run it as a user with
+no read access to the dumps you want withheld.
+
 ## Symbol fetches leave the host
 
 A first import of a PE may fetch its PDB from a symbol server, which discloses

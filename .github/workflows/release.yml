@@ -203,7 +203,7 @@ jobs:
         Get-ChildItem release/obsidian-plugins/
 
     - name: Upload Build Artifacts
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: obsidian-plugins
         path: release/*
@@ -225,7 +225,7 @@ jobs:
         fetch-depth: 0
 
     - name: Download Build Artifacts
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@v7
       with:
         name: obsidian-plugins
         path: release/

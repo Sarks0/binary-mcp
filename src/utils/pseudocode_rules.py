@@ -21,12 +21,12 @@ Rule kinds:
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
-from enum import Enum
+from enum import StrEnum
 
 SEVERITY_ORDER = ("info", "low", "medium", "high", "critical")
 
 
-class RuleKind(str, Enum):
+class RuleKind(StrEnum):
     """Classifies how a ``PseudocodeRule`` is applied to pseudocode."""
 
     REGEX = "regex"

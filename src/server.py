@@ -43,7 +43,9 @@ from src.engines.static.ghidra.coverage_store import CoverageStore, has_reviewab
 from src.engines.static.ghidra.coverage_store import auto_mark as auto_mark_reviewed
 from src.engines.static.ghidra.project_cache import ProjectCache
 from src.engines.static.ghidra.runner import GhidraAnalysisError, GhidraRunner
+from src.tool_catalog import CODE as CODE_OUTPUT
 from src.tool_catalog import apply_catalog as apply_tool_catalog
+from src.tool_catalog import classify as classify_tool
 from src.tools.control_flow_tools import register_control_flow_tools
 from src.tools.coverage_tools import register_coverage_tools
 from src.tools.diff_tools import register_diff_tools
@@ -75,6 +77,10 @@ from src.utils.formatters import (
     neutralise_untrusted_delimiters,
     strip_untrusted_envelope,
     wrap_untrusted,
+)
+from src.utils.output_budget import (
+    CODE_OUTPUT_CHAR_BUDGET,
+    code_output_budget_middleware,
 )
 from src.utils.patterns import APIPatterns, CryptoPatterns
 from src.utils.pdb_fetcher import auto_fetch_pdb
@@ -3108,12 +3114,40 @@ def get_xrefs(
         return safe_tool_error("get_xrefs", e)
 
 
+def _pseudocode_window(
+    pseudocode: str,
+    start_line: int,
+    budget: int = CODE_OUTPUT_CHAR_BUDGET - 2_000,
+) -> tuple[str, int, int, int]:
+    """The run of pseudocode lines from START_LINE that fits in BUDGET.
+
+    Returns ``(window, first, last, total)`` with 1-based inclusive line
+    numbers. The 2,000 characters held back cover the header, the envelope
+    and the caveat summary. At least one line is always returned, so a
+    single enormous line still makes progress.
+    """
+    lines = pseudocode.splitlines()
+    total = len(lines)
+    if total == 0:
+        return pseudocode, 1, 0, 0
+    first = min(max(int(start_line), 1), total)
+    used = 0
+    last = first - 1
+    for line in lines[first - 1:]:
+        if last >= first and used + len(line) + 1 > budget:
+            break
+        used += len(line) + 1
+        last += 1
+    return "\n".join(lines[first - 1:last]), first, last, total
+
+
 @app.tool()
 @log_to_session
 def decompile_function(
     binary_path: str,
     function_name: str,
     wait: bool = True,
+    start_line: int = 1,
 ) -> str:
     """
     Decompile a function to C-like pseudocode.
@@ -3147,6 +3181,9 @@ def decompile_function(
             answer here, not an error. ``wait=False`` returns the handle
             immediately. Either way, calling this tool again once the job has
             landed returns the body from the now-warm cache.
+        start_line: First pseudocode line to show (1-based). A body longer
+            than the output budget is shown one window at a time, and the
+            header above the code names the ``start_line`` of the next window.
 
     Returns:
         Decompiled C pseudocode, or a ``job_id`` when a targeted decompile was
@@ -3248,24 +3285,40 @@ def decompile_function(
                     f"attempted and did not produce a body for this function."
                 )
 
+        window, first, last, total = _pseudocode_window(pseudocode, start_line)
+        complete = first == 1 and last == total
+
         # Coverage side effect: the pseudocode is about to be handed to the
         # caller, so this function counts as reviewed. Best-effort -- never
         # let the ledger break a decompile. A body that is only a decompiler
         # banner comment is still returned, but showing a remark about the
-        # function is not showing the function, so it does not mark.
-        if has_reviewable_body(pseudocode):
+        # function is not showing the function, so it does not mark. Nor does
+        # one window of a body too long to show at once: the caller has seen
+        # part of the function, not the function.
+        if complete and has_reviewable_body(pseudocode):
             auto_mark_reviewed(
                 cache, binary_path, [function.get("address")],
                 tool="decompile_function", context=context,
             )
 
-        # Format output
+        # Format output. The paging line is the server's own arithmetic and
+        # goes above the envelope, where a client that truncates from the end
+        # cannot lose it.
+        header = ""
+        if not complete:
+            header = f"*Lines {first}-{last} of {total} shown (output budget)."
+            if last < total:
+                header += f" Next: start_line={last + 1}."
+            header += (
+                " Not marked reviewed from a partial view; call"
+                " mark_function_reviewed once you have read it all.*\n\n"
+            )
         result = f"**Decompiled: {function_name}**\n\n"
         result += f"Address: `{function.get('address')}`\n"
         result += f"Signature: `{function.get('signature')}`\n\n"
-        result += "\n".join(render_c_block(pseudocode)) + "\n"
+        result += "\n".join(render_c_block(window)) + "\n"
 
-        return wrap_untrusted(result, "decompiled pseudocode")
+        return header + wrap_untrusted(result, "decompiled pseudocode")
 
     except (PathTraversalError, FileSizeError) as e:
         return safe_error_message("Invalid binary path", e)
@@ -3334,7 +3387,7 @@ def decompile_functions(
     function_names: list[str],
     wait: bool = True,
     include_bodies: bool = True,
-    max_body_chars: int = 120000,
+    max_body_chars: int = CODE_OUTPUT_CHAR_BUDGET,
 ) -> str:
     """
     Decompile several functions in ONE Ghidra run and cache all the bodies.
@@ -3362,9 +3415,11 @@ def decompile_functions(
         include_bodies: Return the pseudocode inline. Set False when you only
             want the cache populated -- the report is then a short status
             table.
-        max_body_chars: Total budget for inline bodies. Bodies past the budget
-            are listed as decompiled-but-not-shown; read them individually
-            with ``decompile_function``.
+        max_body_chars: Total budget for inline bodies (default 24,000
+            characters, about 9,000 tokens, under the inline limit of common
+            MCP clients). Bodies past the budget are cached but not shown;
+            they are counted at the top of the report and named first in the
+            block, so read them individually with ``decompile_function``.
 
     Returns:
         Per-function status, plus the bodies when ``include_bodies``.
@@ -3476,7 +3531,7 @@ def decompile_functions(
         if include_bodies and produced:
             budget = max_body_chars
             withheld: list[str] = []
-            detail.append("")
+            bodies: list[str] = [""]
             for name, fn in produced:
                 body = fn.get("pseudocode") or ""
                 if len(body) > budget:
@@ -3485,17 +3540,22 @@ def decompile_functions(
                 budget -= len(body)
                 if has_reviewable_body(body):
                     shown.append(fn.get("address"))
-                detail.append(f"### {name} @ `{fn.get('address')}`")
-                detail.append(f"Signature: `{fn.get('signature')}`")
-                detail.extend(render_c_block(body))
-                detail.append("")
+                bodies.append(f"### {name} @ `{fn.get('address')}`")
+                bodies.append(f"Signature: `{fn.get('signature')}`")
+                bodies.extend(render_c_block(body))
+                bodies.append("")
+            # Withheld work is reported first: the count with the server's
+            # tallies above the envelope, the names (sample-authored) at the
+            # top of it. A client that truncates cuts from the end, which is
+            # where this note used to be.
             if withheld:
-                detail.append(
-                    f"*{len(withheld)} body/bodies withheld to stay inside "
-                    f"max_body_chars ({max_body_chars}). They ARE cached -- "
-                    f"read them with decompile_function, which is now warm: "
-                    f"{', '.join(withheld[:10])}*"
+                lines.append(
+                    f"- Bodies withheld by max_body_chars ({max_body_chars:,}): "
+                    f"{len(withheld)}. They ARE cached; read each with "
+                    f"decompile_function, which is now warm."
                 )
+                detail.append(f"Withheld: {', '.join(withheld[:20])}")
+            detail.extend(bodies)
         elif produced:
             lines.append("")
             lines.append(
@@ -6411,6 +6471,16 @@ def register_all_tools() -> None:
         )
 
     drop_text_output_schemas(tools)
+
+    # One output budget for every tool that can return code (see
+    # src/utils/output_budget.py). The decompile tools page themselves; this
+    # catches the rest before a client truncates them blindly.
+    app.add_middleware(
+        code_output_budget_middleware(
+            name for name in tools
+            if (entry := classify_tool(name)) and CODE_OUTPUT in entry.facets
+        )
+    )
 
     # Last, not first. Set before the work, a raising register_*_tools (a bad
     # import in a tool module, a duplicate tool name) left the flag standing:

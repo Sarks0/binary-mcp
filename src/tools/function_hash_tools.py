@@ -19,6 +19,7 @@ from pathlib import Path
 from src.engines.static.ghidra.coverage_store import auto_mark, has_reviewable_body
 from src.utils.decompiler_caveats import render_c_block
 from src.utils.formatters import wrap_untrusted
+from src.utils.output_budget import CODE_OUTPUT_CHAR_BUDGET
 
 logger = logging.getLogger(__name__)
 
@@ -162,21 +163,6 @@ class FunctionHashCache:
             self._dirty = False
         except OSError as exc:
             logger.debug("could not write function-hash side-car %s: %s", self._path, exc)
-
-
-def _fence_banner(name: str, address: str) -> str:
-    """
-    Fence a per-function banner (audit F-7).
-
-    ``batch_decompile`` prints ``--- <name> @ <addr> ---`` above each result.
-    When there is pseudocode the banner rides inside that block's envelope;
-    when there is not (thunk, external, failed decompile) the banner is the
-    only sample-derived text on the line, and a function NAME is a string the
-    sample author chose, so it still needs the boundary.
-    """
-    return wrap_untrusted(
-        f"--- {name} @ {address} ---", kind="function name from the sample"
-    )
 
 
 def _get_capstone_mode(binary_path: str):
@@ -665,14 +651,29 @@ def register_function_hash_tools(app, session_manager, cache, runner):
             # Only functions whose pseudocode actually came back get marked --
             # a "not found" or "thunk, no pseudocode" line reviewed nothing.
             decompiled: list[str] = []
+            # Bodies past the shared code-output budget are left out whole
+            # rather than cut mid-function, and reported first.
+            budget = CODE_OUTPUT_CHAR_BUDGET
+            withheld: list[str] = []
+
+            # Audit F-7: pseudocode is the single largest sample-authored blob
+            # the static tools return -- Ghidra reproduces the sample's string
+            # literals and, where symbols exist, its own identifiers -- and
+            # the per-function "--- name @ addr ---" banner is sample-derived
+            # too, because the NAME is. Every per-function block therefore
+            # goes inside ONE envelope for the whole batch: a fence per
+            # function cost about 140 tokens each and protected nothing a
+            # single fence does not. The batch header and the tally stay
+            # outside.
+            detail: list[str] = []
 
             for func_ref in requested:
                 func = _lookup_function(all_functions, func_ref)
 
                 if not func:
-                    output.append(f"--- {func_ref} ---")
-                    output.append("Error: Function not found")
-                    output.append("")
+                    detail.append(f"--- {func_ref} ---")
+                    detail.append("Error: Function not found")
+                    detail.append("")
                     failed += 1
                     continue
 
@@ -680,26 +681,18 @@ def register_function_hash_tools(app, session_manager, cache, runner):
                 address = func.get("address", "unknown")
                 pseudocode = func.get("pseudocode")
 
-                # Audit F-7: this is the single largest sample-authored blob
-                # the static tools return -- Ghidra pseudocode reproduces the
-                # sample's string literals and, where symbols exist, its own
-                # identifiers. The per-function "--- name @ addr ---" banner
-                # is fenced with it because the NAME in that banner is
-                # sample-derived too; the batch header and the success/failure
-                # tally stay outside.
                 if pseudocode:
+                    if len(pseudocode) > budget:
+                        withheld.append(name)
+                        succeeded += 1
+                        continue
+                    budget -= len(pseudocode)
                     signature = func.get("signature", "")
-                    block = [f"--- {name} @ {address} ---"]
+                    detail.append(f"--- {name} @ {address} ---")
                     if signature:
-                        block.append(f"Signature: {signature}")
-                    block.append("")
-                    block.extend(render_c_block(pseudocode, fence=False))
-                    output.append(
-                        wrap_untrusted(
-                            "\n".join(block),
-                            kind="decompiled pseudocode from the sample",
-                        )
-                    )
+                        detail.append(f"Signature: {signature}")
+                    detail.append("")
+                    detail.extend(render_c_block(pseudocode, fence=False))
                     succeeded += 1
                     # Printed either way -- a banner-comment-only body is still
                     # worth showing -- but only actual code advances the
@@ -707,19 +700,38 @@ def register_function_hash_tools(app, session_manager, cache, runner):
                     if has_reviewable_body(pseudocode):
                         decompiled.append(address)
                 elif func.get("is_thunk"):
-                    output.append(_fence_banner(name, address))
-                    output.append("(thunk function - no pseudocode)")
+                    detail.append(f"--- {name} @ {address} ---")
+                    detail.append("(thunk function - no pseudocode)")
                     failed += 1
                 elif func.get("is_external"):
-                    output.append(_fence_banner(name, address))
-                    output.append("(external function - no pseudocode)")
+                    detail.append(f"--- {name} @ {address} ---")
+                    detail.append("(external function - no pseudocode)")
                     failed += 1
                 else:
                     status = func.get("decompile_status", "unknown")
-                    output.append(_fence_banner(name, address))
-                    output.append(f"(decompilation not available - status: {status})")
+                    detail.append(f"--- {name} @ {address} ---")
+                    detail.append(f"(decompilation not available - status: {status})")
                     failed += 1
 
+                detail.append("")
+
+            if withheld:
+                output.append(
+                    f"{len(withheld)} decompiled body/bodies withheld to stay "
+                    f"inside the {CODE_OUTPUT_CHAR_BUDGET:,}-character output "
+                    f"budget; they are named first below. Read each with "
+                    f"decompile_function."
+                )
+                output.append("")
+                detail.insert(0, f"Withheld: {', '.join(withheld)}\n")
+
+            if detail:
+                output.append(
+                    wrap_untrusted(
+                        "\n".join(detail).strip("\n"),
+                        kind="decompiled pseudocode from the sample",
+                    )
+                )
                 output.append("")
 
             output.append(f"Summary: {succeeded} succeeded, {failed} failed")

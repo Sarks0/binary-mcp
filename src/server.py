@@ -1769,96 +1769,57 @@ def analyze_binary(
     """
     Analyze a binary file with Ghidra headless analyzer.
 
-    This is the foundation tool that must be called before using other analysis tools.
-    It loads the binary, runs Ghidra's auto-analysis, and extracts comprehensive data.
-
-    IMPORTANT: This tool automatically checks binary compatibility before analysis.
-    For .NET assemblies or packed binaries, it will return recommendations for better tools.
-    Use skip_compatibility_check=True to bypass this check if you want to proceed anyway.
+    The foundation tool: run it before the other static-analysis tools. It
+    imports the binary, runs Ghidra's auto-analysis and caches functions,
+    imports, strings, xrefs, the memory map and pseudocode. It first checks
+    compatibility and, for .NET assemblies or packed binaries, recommends a
+    better tool instead (``skip_compatibility_check=True`` proceeds anyway).
 
     Args:
         binary_path: Path to the binary file to analyze
         force_reanalyze: Force re-analysis even if cached (default: False)
-        processor: Optional processor spec when AutoImporter fails (e.g., "x86:LE:64:default")
-        loader: Optional loader name when AutoImporter fails (e.g., "PeLoader" for Windows PE)
-        skip_compatibility_check: Skip pre-analysis compatibility check (default: False)
-        skip_decompile: Skip decompilation for a fast structural pass (no pseudocode).
-            Recommended for a first pass on very large binaries -- functions,
-            imports, strings, and memory map are still extracted.
-        max_functions: Cap how many functions to process this run (pairs with
+        processor: Processor spec when AutoImporter fails with "No load spec
+            found" (e.g. "x86:LE:64:default")
+        loader: Loader when AutoImporter fails: PeLoader, ElfLoader,
+            MachoLoader, BinaryLoader or CoffLoader
+        skip_compatibility_check: Skip the pre-analysis compatibility check
+        skip_decompile: Structural pass without pseudocode; functions,
+            imports, strings and the memory map are still extracted.
+        max_functions: Cap functions processed this run (pairs with
             ``incremental`` for multi-pass coverage of huge binaries).
-        function_timeout: Per-function decompile timeout (seconds). Lower values
-            skip anti-analysis code faster.
-        incremental: When True, extend an existing cache instead of starting
-            fresh. Previously-analyzed functions are skipped and preserved.
-        start_address / end_address: Hex bounds to restrict the run to an
+        function_timeout: Per-function decompile timeout in seconds; lower
+            values skip anti-analysis code faster.
+        incremental: Extend an existing cache instead of starting fresh.
+        start_address / end_address: Hex bounds restricting the run to an
             address range (e.g. ``"0x61abbc"``).
-        pdb_path: Path to a Windows PDB file. Staged next to the binary so
-            Ghidra's PdbUniversalAnalyzer can apply symbolic function names.
-            When omitted, a first (non-shallow) import of a PE tries the
-            symbol server first, per ``BINARY_MCP_AUTO_PDB`` (default: only
-            binaries whose version info names Microsoft -- the public server
-            holds no PDBs for third-party code, so for those the summary
-            reports the fetch as skipped and ``load_pdb`` will refuse it too
-            unless you supply a ``pdb_path`` or vendor ``symbol_path``). The
-            summary's **Symbols** line says what happened; "fetch FAILED" is
-            not the same as "not published".
-        enable_fid: Run Ghidra's Function ID library fingerprinting; matches
-            are stored per-function in ``fid_match``. Query via ``fid_match``
-            tool after analysis.
-        analysis_depth: Analysis tier. ``"full"`` (default) runs all auto-analyzers
-            and decompiles every function. ``"structural"`` runs auto-analyzers
-            but skips decompilation (equivalent to ``skip_decompile=True``).
-            ``"shallow"`` adds Ghidra's ``-noanalysis`` flag for the fastest
-            possible pass: function table from PE/ELF symbols + basic disasm,
-            no xrefs, no decompile. Use shallow for VR triage on multi-MB
-            binaries, then upgrade with ``analysis_depth="structural"`` or
-            ``"full"`` once you've narrowed the target.
+        pdb_path: Windows PDB staged next to the binary so Ghidra applies its
+            symbols. When omitted, a first non-shallow PE import tries the
+            symbol server per ``BINARY_MCP_AUTO_PDB`` (default: only binaries
+            whose version info names Microsoft). The summary's **Symbols**
+            line says what happened; "fetch FAILED" is not "not published".
+        enable_fid: Run Ghidra Function ID fingerprinting; query the matches
+            with ``fid_match``.
+        analysis_depth: ``"full"`` (default) runs every analyzer and
+            decompiles every function. ``"structural"`` skips decompilation.
+            ``"shallow"`` adds ``-noanalysis``: symbols and basic disassembly
+            only, no xrefs, for triage of multi-MB binaries. The Ghidra
+            project is kept, so later ``decompile_function`` /
+            ``decompile_functions`` calls reopen it instead of re-importing.
+        wait: The analysis always runs as a background job. ``wait=True``
+            (default) blocks on it for up to ``BINARY_MCP_INLINE_DEADLINE``
+            seconds (default 25), then returns a ``job_id``; ``wait=False``
+            returns the ``job_id`` at once. Collect with ``job_status`` /
+            ``job_result``, or call again once the cache is warm. A second
+            agent asking for the same analysis attaches to the running job
+            instead of starting another Ghidra run.
 
-            A structural first pass is cheap to build on: the analyzed Ghidra
-            project is kept, and later targeted decompiles
-            (``decompile_function`` / ``decompile_functions``) reopen it
-            instead of re-importing the binary. On a 17 MB, 30K-function DLL
-            that is the difference between seconds per decompile and a full
-            re-analysis each time.
-
-        wait: Whether to block on the analysis before answering.
-
-            Note what ``wait=True`` (the default) does NOT mean: it does not
-            block until the analysis finishes. The analysis always runs as a
-            background job; ``wait=True`` blocks on that job for up to
-            ``BINARY_MCP_INLINE_DEADLINE`` seconds (default 25) and then
-            returns a ``job_id`` if it is still going. So on a multi-MB binary
-            you should expect a ``job_id`` back even with the default, and a
-            full summary on a warm cache or a quick run.
-
-            ``wait=False`` skips the blocking window entirely and returns the
-            ``job_id`` straight away.
-
-            Either way the work survives this call, and the result lands in the
-            shared cache. Collect with ``job_status`` / ``job_result``, or just
-            call this tool again -- once the cache is warm it answers directly.
-
-            Jobs are keyed on the binary and the analysis parameters and
-            registered in the shared cache directory, so a second agent asking
-            for the same analysis **attaches to the running job** rather than
-            starting a competing Ghidra run. That is what stops N agents from
-            saturating the box with N copies of the same work.
     Returns:
-        Analysis summary with basic statistics, or compatibility warning if issues detected
+        Analysis summary with basic statistics, a ``job_id``, or a
+        compatibility warning.
 
-    Note:
-        If Ghidra's AutoImporter fails with "No load spec found", you can manually specify:
-        - For x86-64 Windows PE: processor="x86:LE:64:default", loader="PeLoader"
-        - For x86-64 Linux ELF: processor="x86:LE:64:default", loader="ElfLoader"
-        - For macOS Mach-O: processor="x86:LE:64:default", loader="MachoLoader"
-
-        Common Ghidra loaders: PeLoader, ElfLoader, MachoLoader, BinaryLoader, CoffLoader
-
-        Large-binary workflow (e.g. 17MB+ with 60K+ functions):
-        1. First pass: ``analyze_binary(..., skip_decompile=True)`` -- structure only.
-        2. Extend: ``analyze_binary(..., incremental=True, max_functions=5000)``
-           repeatedly, or target a range with ``start_address``/``end_address``.
+    Large binaries (17 MB+, 60K+ functions): first pass with
+    ``skip_decompile=True``, then extend with ``incremental=True,
+    max_functions=5000`` or an address range.
     """
     # Store compatibility info for inclusion in output
     compat_warning = None

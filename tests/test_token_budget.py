@@ -349,3 +349,96 @@ class TestUntrustedEnvelopeOverhead:
                 UNTRUSTED_END_MARKER,
             ])
             assert strip_untrusted_envelope(stored) == "evil.example.com"
+
+
+# tools/list as compact JSON, measured by src/token_report.py. A ratchet, not
+# a target: lower it whenever a change shrinks the list, and never raise it to
+# make room for a new tool without trimming something else. 156,303 bytes when
+# this was set.
+TOOLS_LIST_BYTE_BUDGET = 158_000
+
+# Clients cut tool descriptions (and server instructions) at this many
+# characters, and tool search only matches what is left.
+DESCRIPTION_CHAR_LIMIT = 4_096
+
+
+class TestToolListBudget:
+    def test_tools_list_stays_inside_its_budget(self, roster):
+        from src.token_report import wire_size, wire_tools
+
+        server_module, _ = roster
+        size = wire_size(wire_tools(server_module.app))
+        assert size <= TOOLS_LIST_BYTE_BUDGET, (
+            f"tools/list is {size:,} bytes, over its {TOOLS_LIST_BYTE_BUDGET:,}-byte "
+            "budget. Every client that loads tools up front sends this on every "
+            "request. Trim a description (cut Args/Returns prose the schema already "
+            "carries) rather than raising the budget; run `python -m src.token_report` "
+            "to see the heaviest tools."
+        )
+
+    def test_no_description_is_cut_off_by_clients(self, roster):
+        too_long = sorted(
+            (len(t.description or ""), t.name)
+            for t in _listed(roster)
+            if len(t.description or "") > DESCRIPTION_CHAR_LIMIT
+        )
+        assert not too_long, (
+            f"descriptions past {DESCRIPTION_CHAR_LIMIT} characters are truncated, "
+            f"and tool search never sees the rest: {too_long}"
+        )
+
+    def test_report_runs(self, roster):
+        from src.token_report import report, wire_tools
+
+        server_module, _ = roster
+        text = report(wire_tools(server_module.app), server_module.SERVER_INSTRUCTIONS, 3)
+        assert "tools/list wire size:" in text
+        assert "heaviest 3 definitions" in text
+
+
+class TestTokenCount:
+    """--count-tokens sends what a model-facing client would: name, description and
+    input_schema per tool, plus the instructions as the system prompt."""
+
+    def test_request_shape_and_deltas(self, monkeypatch):
+        import types
+
+        from src import token_report
+
+        calls = []
+
+        class FakeMessages:
+            def count_tokens(self, **kwargs):
+                calls.append(kwargs)
+                tokens = 10
+                tokens += 100 if kwargs.get("system") else 0
+                tokens += 1000 if kwargs.get("tools") else 0
+                return types.SimpleNamespace(input_tokens=tokens)
+
+        fake = types.SimpleNamespace(
+            Anthropic=lambda: types.SimpleNamespace(messages=FakeMessages())
+        )
+        monkeypatch.setitem(sys.modules, "anthropic", fake)
+
+        tools = [{
+            "name": "get_functions",
+            "description": "List functions.",
+            "inputSchema": {"type": "object", "properties": {}},
+            "_meta": {"_fastmcp": {"tags": ["category:census"]}},
+        }]
+        counts = token_report.count_model_tokens(tools, "be careful", "model-x")
+
+        assert counts == {
+            "model": "model-x",
+            "instructions": 100,
+            "tool_definitions": 1000,
+            "total": 1100,
+        }
+        sent = calls[-1]
+        assert sent["model"] == "model-x"
+        assert sent["system"] == "be careful"
+        assert sent["tools"] == [{
+            "name": "get_functions",
+            "description": "List functions.",
+            "input_schema": {"type": "object", "properties": {}},
+        }]

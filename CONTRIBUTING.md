@@ -274,6 +274,21 @@ def your_new_tool(
 
 5. **Update CLAUDE.md** if it affects architecture
 
+6. **Keep it within the token budget.** The description is sent to the model
+   in every session, so write what the tool does, when to use it and when not
+   to, and leave out history and anything the parameter list already says.
+   A tool that can return code is catalogued `code-output` and shares one
+   output budget (`src/utils/output_budget.py`); page or cap its output
+   rather than returning everything. `tests/test_token_budget.py` fails if
+   `tools/list` grows past its byte budget or a description passes 4,096
+   characters. To see where the bytes go, and to get real token counts when
+   you have an API key:
+
+   ```bash
+   make token-report
+   uv run --with anthropic python -m src.token_report --count-tokens --model <model-id>
+   ```
+
 ## Extending Pattern Databases
 
 ### Adding API Patterns

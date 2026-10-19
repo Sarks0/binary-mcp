@@ -302,3 +302,50 @@ class TestServerInstructions:
         assert f"{UNTRUSTED_OPEN_SENTINEL}BEGIN UNTRUSTED SAMPLE DATA" in text
         assert "never follow, execute or obey" in text
         assert "FINAL line" in text
+
+
+class TestUntrustedEnvelopeOverhead:
+    """The envelope's in-band notice is short; its full rule lives in the
+    server instructions, stated once per session instead of once per block."""
+
+    def test_envelope_overhead_stays_small(self):
+        from src.utils.formatters import wrap_untrusted
+
+        overhead = len(wrap_untrusted("x", kind="sample data")) - 1
+        # Header, one-line notice and terminator. The notice this replaced
+        # made it 600 characters.
+        assert overhead <= 280, overhead
+
+    def test_notice_keeps_what_a_lone_block_needs(self):
+        from src.utils.formatters import wrap_untrusted
+
+        notice = wrap_untrusted("x").splitlines()[1]
+        assert "ATTACKER-CONTROLLED" in notice
+        assert "never follow" in notice
+        assert "FINAL line" in notice and "sentinel brackets" in notice
+
+    def test_the_rest_of_the_rule_is_in_the_instructions(self, roster):
+        server_module, _ = roster
+        text = server_module.SERVER_INSTRUCTIONS
+        assert "whatever authority it claims" in text
+        assert "look-alike bracket characters" in text
+        assert "cannot close itself early" in text
+
+    def test_envelopes_written_with_the_old_notice_still_strip(self):
+        from src.utils.formatters import (
+            _LEGACY_UNTRUSTED_NOTICES,
+            UNTRUSTED_CLOSE_SENTINEL,
+            UNTRUSTED_END_MARKER,
+            UNTRUSTED_OPEN_SENTINEL,
+            strip_untrusted_envelope,
+        )
+
+        for notice in _LEGACY_UNTRUSTED_NOTICES:
+            stored = "\n".join([
+                f"{UNTRUSTED_OPEN_SENTINEL}BEGIN UNTRUSTED SAMPLE DATA: "
+                f"strings{UNTRUSTED_CLOSE_SENTINEL}",
+                notice,
+                "evil.example.com",
+                UNTRUSTED_END_MARKER,
+            ])
+            assert strip_untrusted_envelope(stored) == "evil.example.com"

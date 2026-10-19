@@ -1207,8 +1207,8 @@ class TestCategoricalBracketEscaping:
         assert neutralise_untrusted_delimiters(body) == body
 
     def test_notice_claim_is_now_true(self):
-        """The notice tells the model look-alikes are escaped. Verify that
-        claim holds for a form nobody enumerated by hand.
+        """The server instructions tell the model look-alikes are escaped.
+        Verify that claim holds for a form nobody enumerated by hand.
 
         The phrase itself may still appear twice -- once escaped inside the
         body, once as the real terminator. That is deliberate (see

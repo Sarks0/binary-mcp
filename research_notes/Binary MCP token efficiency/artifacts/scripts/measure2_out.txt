@@ -1,0 +1,18 @@
+=== A. 4 KB dump, 200 bytes data + zero fill ===
+full hexdump -C (no * collapsing), 256 lines               chars= 20223 o200k= 10754 cl100k= 10756
+hexdump -C default (* collapses repeated lines)            chars=  1116 o200k=   684 cl100k=   686
+run-length note: "00401000-00401fff: 3640 x 00"            chars=  1062 o200k=   654 cl100k=   656
+
+=== B. Continuation / truncation hints (fixed cost per response) ===
+short hint                                                 chars=    50 o200k=    20 cl100k=    20
+verbose hint                                               chars=   270 o200k=    61 cl100k=    61
+cursor-style hint                                          chars=    57 o200k=    29 cl100k=    34
+offset-style hint                                          chars=    16 o200k=     5 cl100k=     5
+UUID handle                                                chars=    44 o200k=    39 cl100k=    39
+short handle                                               chars=    10 o200k=     4 cl100k=     4
+typical boilerplate footer                                 chars=   185 o200k=    48 cl100k=    48
+
+=== C. Markdown table output as FastMCP structuredContent (JSON-escaped) ===
+markdown table text (as content[].text)                    chars=  3624 o200k=  1828 cl100k=  1828
+JSON.stringify({result: md}) (structuredContent-only path) chars=  3738 o200k=  1933 cl100k=  1933
+both copies (if a client fed content + structuredContent)  chars=  7362 o200k=  3761 cl100k=  3761

@@ -1,0 +1,201 @@
+=== 1. Address / number representations (single values, token pieces) ===
+0x00401000             o200k=5 ["0","x","004","010","00"]  cl100k=5 ["0","x","004","010","00"]
+0x401000               o200k=4 ["0","x","401","000"]  cl100k=4 ["0","x","401","000"]
+00401000               o200k=3 ["004","010","00"]  cl100k=3 ["004","010","00"]
+401000                 o200k=2 ["401","000"]  cl100k=2 ["401","000"]
+4198400                o200k=3 ["419","840","0"]  cl100k=3 ["419","840","0"]
+0x0040A1F0             o200k=8 ["0","x","004","0","A","1","F","0"]  cl100k=8 ["0","x","004","0","A","1","F","0"]
+0x0040a1f0             o200k=8 ["0","x","004","0","a","1","f","0"]  cl100k=8 ["0","x","004","0","a","1","f","0"]
+0x00007ff6a1b21000     o200k=11 ["0","x","000","07","ff","6","a","1","b","210","00"]  cl100k=11 ["0","x","000","07","ff","6","a","1","b","210","00"]
+0x7ff6a1b21000         o200k=10 ["0","x","7","ff","6","a","1","b","210","00"]  cl100k=10 ["0","x","7","ff","6","a","1","b","210","00"]
+00007FF6A1B21000       o200k=9 ["000","07","FF","6","A","1","B","210","00"]  cl100k=9 ["000","07","FF","6","A","1","B","210","00"]
+00007ff6a1b21000       o200k=9 ["000","07","ff","6","a","1","b","210","00"]  cl100k=9 ["000","07","ff","6","a","1","b","210","00"]
+7ff6a1b21000           o200k=8 ["7","ff","6","a","1","b","210","00"]  cl100k=8 ["7","ff","6","a","1","b","210","00"]
+00000000`00401000      o200k=7 ["000","000","00","`","004","010","00"]  cl100k=7 ["000","000","00","`","004","010","00"]
++0x1a10                o200k=6 ["+","0","x","1","a","10"]  cl100k=6 ["+","0","x","1","a","10"]
+FUN_00401a10           o200k=6 ["FUN","_","004","01","a","10"]  cl100k=6 ["FUN","_","004","01","a","10"]
+sub_401A10             o200k=5 ["sub","_","401","A","10"]  cl100k=5 ["sub","_","401","A","10"]
+LAB_00401a3c           o200k=7 ["LAB","_","004","01","a","3","c"]  cl100k=7 ["LAB","_","004","01","a","3","c"]
+DAT_0040b008           o200k=6 ["DAT","_","004","0","b","008"]  cl100k=6 ["DAT","_","004","0","b","008"]
+
+=== 1b. Average tokens per address over 1000 random addresses (space-separated list) ===
+32-bit 0x%08x (0x00401a10)               o200k=7.04 tok/addr  cl100k=7.04 tok/addr
+32-bit 0x%x (0x401a10)                   o200k=6.21 tok/addr  cl100k=6.20 tok/addr
+32-bit %08x (00401a10)                   o200k=5.04 tok/addr  cl100k=5.04 tok/addr
+32-bit %08X (00401A10)                   o200k=5.05 tok/addr  cl100k=5.07 tok/addr
+32-bit decimal                           o200k=4.00 tok/addr  cl100k=4.00 tok/addr
+32-bit RVA 0x%x (0x1a10)                 o200k=5.94 tok/addr  cl100k=5.93 tok/addr
+64-bit 0x%016x                           o200k=12.85 tok/addr  cl100k=12.85 tok/addr
+64-bit 0x%x (0x7ff6a1b21000)             o200k=11.85 tok/addr  cl100k=11.85 tok/addr
+64-bit %016X (x64dbg style)              o200k=10.88 tok/addr  cl100k=10.91 tok/addr
+64-bit %016x (WinDbg w/o backtick)       o200k=10.85 tok/addr  cl100k=10.85 tok/addr
+64-bit WinDbg 00007ff6`a1b21000          o200k=11.85 tok/addr  cl100k=11.85 tok/addr
+64-bit module+RVA (test+0x1a10)          o200k=6.71 tok/addr  cl100k=6.70 tok/addr
+
+=== 2. Function listing (name,address,size,xrefs) (100 records) ===
+JSON pretty (indent 2) [base]                  chars=  9934 o200k=  4267 cl100k=  4267
+JSON pretty (indent 4)                         chars= 11934 o200k=  4267 cl100k=  4267  (o200k 100% of base, cl100k 100%)
+JSON minified                                  chars=  6933 o200k=  2667 cl100k=  2667  (o200k 63% of base, cl100k 63%)
+JSON columnar {cols,rows} minified             chars=  3783 o200k=  1881 cl100k=  1880  (o200k 44% of base, cl100k 44%)
+JSONL                                          chars=  6931 o200k=  2765 cl100k=  2765  (o200k 65% of base, cl100k 65%)
+YAML (js-yaml)                                 chars=  6932 o200k=  3364 cl100k=  3364  (o200k 79% of base, cl100k 79%)
+TOON (comma)                                   chars=  3368 o200k=  1874 cl100k=  1874  (o200k 44% of base, cl100k 44%)
+TOON (tab delimiter)                           chars=  3369 o200k=  1875 cl100k=  1875  (o200k 44% of base, cl100k 44%)
+CSV                                            chars=  3155 o200k=  1770 cl100k=  1770  (o200k 41% of base, cl100k 41%)
+TSV                                            chars=  3155 o200k=  1770 cl100k=  1770  (o200k 41% of base, cl100k 41%)
+Markdown table compact |a|b|                   chars=  3367 o200k=  1880 cl100k=  1879  (o200k 44% of base, cl100k 44%)
+Markdown table padded/aligned                  chars=  5609 o200k=  2426 cl100k=  2426  (o200k 57% of base, cl100k 57%)
+Markdown key-value blocks                      chars=  6622 o200k=  3363 cl100k=  3363  (o200k 79% of base, cl100k 79%)
+Plain text, space-separated                    chars=  3131 o200k=  1764 cl100k=  1764  (o200k 41% of base, cl100k 41%)
+Plain text, column-aligned                     chars=  4499 o200k=  2064 cl100k=  2064  (o200k 48% of base, cl100k 48%)
+-- TOON sample:
+items[3]{name,address,size,xrefs}:
+  FUN_00401000,0x00401000,101,12
+  FUN_00401137,0x00401137,159,4
+  WinMain_2,0x00401226,591,3
+-- per-record marginal cost (o200k): JSON-min 26.8, CSV 17.8, TOON 18.8
+
+=== 3. Import listing (dll,function,iat) (80 records) ===
+JSON pretty (indent 2) [base]                  chars=  7352 o200k=  2860 cl100k=  2827
+JSON pretty (indent 4)                         chars=  8632 o200k=  2860 cl100k=  2827  (o200k 100% of base, cl100k 100%)
+JSON minified                                  chars=  5431 o200k=  1821 cl100k=  1788  (o200k 64% of base, cl100k 63%)
+JSON columnar {cols,rows} minified             chars=  3632 o200k=  1431 cl100k=  1318  (o200k 50% of base, cl100k 47%)
+JSONL                                          chars=  5429 o200k=  1898 cl100k=  1865  (o200k 66% of base, cl100k 66%)
+YAML (js-yaml)                                 chars=  5190 o200k=  2238 cl100k=  2207  (o200k 78% of base, cl100k 78%)
+TOON (comma)                                   chars=  3138 o200k=  1443 cl100k=  1414  (o200k 50% of base, cl100k 50%)
+TOON (tab delimiter)                           chars=  3139 o200k=  1406 cl100k=  1377  (o200k 49% of base, cl100k 49%)
+CSV                                            chars=  2966 o200k=  1338 cl100k=  1309  (o200k 47% of base, cl100k 46%)
+TSV                                            chars=  2966 o200k=  1300 cl100k=  1271  (o200k 45% of base, cl100k 45%)
+Markdown table compact |a|b|                   chars=  3136 o200k=  1429 cl100k=  1396  (o200k 50% of base, cl100k 49%)
+Markdown table padded/aligned                  chars=  4181 o200k=  1651 cl100k=  1620  (o200k 58% of base, cl100k 57%)
+Markdown key-value blocks                      chars=  5099 o200k=  2237 cl100k=  2206  (o200k 78% of base, cl100k 78%)
+Plain text, space-separated                    chars=  2949 o200k=  1257 cl100k=  1226  (o200k 44% of base, cl100k 43%)
+Plain text, column-aligned                     chars=  3599 o200k=  1417 cl100k=  1386  (o200k 50% of base, cl100k 49%)
+
+=== 4. String listing with backslashes/quotes (60 records) ===
+JSON pretty (indent 2) [base]                  chars=  6973 o200k=  2849 cl100k=  2854
+JSON pretty (indent 4)                         chars=  8173 o200k=  2849 cl100k=  2854  (o200k 100% of base, cl100k 100%)
+JSON minified                                  chars=  5172 o200k=  1903 cl100k=  1908  (o200k 67% of base, cl100k 67%)
+JSON columnar {cols,rows} minified             chars=  3420 o200k=  1489 cl100k=  1434  (o200k 52% of base, cl100k 50%)
+JSONL                                          chars=  5170 o200k=  1960 cl100k=  1965  (o200k 69% of base, cl100k 69%)
+YAML (js-yaml)                                 chars=  5051 o200k=  2274 cl100k=  2273  (o200k 80% of base, cl100k 80%)
+TOON (comma)                                   chars=  3140 o200k=  1544 cl100k=  1549  (o200k 54% of base, cl100k 54%)
+TOON (tab delimiter)                           chars=  3141 o200k=  1581 cl100k=  1586  (o200k 55% of base, cl100k 56%)
+CSV                                            chars=  2828 o200k=  1393 cl100k=  1398  (o200k 49% of base, cl100k 49%)
+TSV                                            chars=  2828 o200k=  1387 cl100k=  1380  (o200k 49% of base, cl100k 48%)
+Markdown table compact |a|b|                   chars=  2960 o200k=  1483 cl100k=  1476  (o200k 52% of base, cl100k 52%)
+Markdown table padded/aligned                  chars=  4959 o200k=  1731 cl100k=  1730  (o200k 61% of base, cl100k 61%)
+Markdown key-value blocks                      chars=  4776 o200k=  2251 cl100k=  2250  (o200k 79% of base, cl100k 79%)
+Plain text, space-separated                    chars=  2806 o200k=  1291 cl100k=  1290  (o200k 45% of base, cl100k 45%)
+Plain text, column-aligned                     chars=  4319 o200k=  1494 cl100k=  1482  (o200k 52% of base, cl100k 52%)
+
+=== 5. Nested call graph (depth 3) ===
+JSON pretty [base]                             chars=  4445 o200k=  1226 cl100k=  1226
+JSON minified                                  chars=  2061 o200k=   785 cl100k=   787  (o200k 64% of base, cl100k 64%)
+YAML                                           chars=  2824 o200k=   927 cl100k=   927  (o200k 76% of base, cl100k 76%)
+TOON                                           chars=  2798 o200k=   957 cl100k=   957  (o200k 78% of base, cl100k 78%)
+Indented text tree (2 spaces)                  chars=  1062 o200k=   546 cl100k=   545  (o200k 45% of base, cl100k 44%)
+
+=== 6. Decompiled code (Ghidra style, 43 lines) ===
+Ghidra default (2-space indent) [base]         chars=  1250 o200k=   504 cl100k=   495
+4-space indent                                 chars=  1346 o200k=   504 cl100k=   495  (o200k 100% of base, cl100k 100%)
+tab indent                                     chars=  1202 o200k=   494 cl100k=   484  (o200k 98% of base, cl100k 98%)
+no indent                                      chars=  1154 o200k=   469 cl100k=   460  (o200k 93% of base, cl100k 93%)
+no blank/whitespace-only lines                 chars=  1246 o200k=   504 cl100k=   495  (o200k 100% of base, cl100k 100%)
+JSON-escaped string ("...")                    chars=  1308 o200k=   557 cl100k=   548  (o200k 111% of base, cl100k 111%)
+structuredContent {"result": ...} (FastMCP str) chars=  1319 o200k=   559 cl100k=   550  (o200k 111% of base, cl100k 111%)
+fenced ```c block                              chars=  1259 o200k=   509 cl100k=   500  (o200k 101% of base, cl100k 101%)
+with right-aligned line numbers                chars=  1508 o200k=   641 cl100k=   632  (o200k 127% of base, cl100k 128%)
+with per-line addresses (00401a10)             chars=  1680 o200k=   689 cl100k=   680  (o200k 137% of base, cl100k 137%)
+
+=== 7. Disassembly (40 instructions) ===
+x64dbg padded columns w/ bytes [base]          chars=  3559 o200k=  1067 cl100k=  1058
+same, unpadded (single spaces)                 chars=  1696 o200k=   903 cl100k=   894  (o200k 85% of base, cl100k 84%)
+addr (no zero pad) + mnemonic, no bytes        chars=  1205 o200k=   639 cl100k=   630  (o200k 60% of base, cl100k 60%)
+RVA + mnemonic, no bytes                       chars=   925 o200k=   423 cl100k=   414  (o200k 40% of base, cl100k 39%)
+JSON pretty [{address,bytes,instruction}]      chars=  4339 o200k=  1792 cl100k=  1783  (o200k 168% of base, cl100k 169%)
+
+=== 8. Register dump (18 regs) ===
+x64dbg style "RAX    : 0000000000000001"       chars=   467 o200k=   236 cl100k=   236
+WinDbg style rax=0000000000000001              chars=   378 o200k=   181 cl100k=   181  (o200k 77% of base, cl100k 77%)
+no zero padding rax=1                          chars=   171 o200k=   109 cl100k=   109  (o200k 46% of base, cl100k 46%)
+non-zero only                                  chars=   129 o200k=    78 cl100k=    78  (o200k 33% of base, cl100k 33%)
+JSON pretty {"RAX":"0x0000000000000001"}       chars=   561 o200k=   294 cl100k=   294  (o200k 125% of base, cl100k 125%)
+
+=== 9. Hexdump, 256 bytes, PE header (zero-heavy) ===
+hexdump -C style w/ ASCII [base]               chars=  1263 o200k=   696 cl100k=   696  (o200k 100% of base, cl100k 100%)
+                                               -> o200k 2.72 tok/byte, cl100k 2.72 tok/byte
+hexdump -C style, no ASCII column              chars=   943 o200k=   628 cl100k=   628  (o200k 90% of base, cl100k 90%)
+                                               -> o200k 2.45 tok/byte, cl100k 2.45 tok/byte
+uppercase bytes, no ASCII                      chars=   943 o200k=   628 cl100k=   628  (o200k 90% of base, cl100k 90%)
+                                               -> o200k 2.45 tok/byte, cl100k 2.45 tok/byte
+WinDbg db style                                chars=  1359 o200k=   726 cl100k=   728  (o200k 104% of base, cl100k 105%)
+                                               -> o200k 2.84 tok/byte, cl100k 2.84 tok/byte
+offset + packed hex per row                    chars=   671 o200k=   289 cl100k=   289  (o200k 42% of base, cl100k 42%)
+                                               -> o200k 1.13 tok/byte, cl100k 1.13 tok/byte
+one packed hex string                          chars=   512 o200k=   199 cl100k=   199  (o200k 29% of base, cl100k 29%)
+                                               -> o200k 0.78 tok/byte, cl100k 0.78 tok/byte
+base64                                         chars=   344 o200k=    99 cl100k=   103  (o200k 14% of base, cl100k 15%)
+                                               -> o200k 0.39 tok/byte, cl100k 0.40 tok/byte
+
+=== 9. Hexdump, 256 bytes, random/encrypted bytes ===
+hexdump -C style w/ ASCII [base]               chars=  1263 o200k=   799 cl100k=   803  (o200k 100% of base, cl100k 100%)
+                                               -> o200k 3.12 tok/byte, cl100k 3.14 tok/byte
+hexdump -C style, no ASCII column              chars=   943 o200k=   635 cl100k=   635  (o200k 79% of base, cl100k 79%)
+                                               -> o200k 2.48 tok/byte, cl100k 2.48 tok/byte
+uppercase bytes, no ASCII                      chars=   943 o200k=   635 cl100k=   635  (o200k 79% of base, cl100k 79%)
+                                               -> o200k 2.48 tok/byte, cl100k 2.48 tok/byte
+WinDbg db style                                chars=  1359 o200k=   822 cl100k=   827  (o200k 103% of base, cl100k 103%)
+                                               -> o200k 3.21 tok/byte, cl100k 3.23 tok/byte
+offset + packed hex per row                    chars=   671 o200k=   374 cl100k=   372  (o200k 47% of base, cl100k 46%)
+                                               -> o200k 1.46 tok/byte, cl100k 1.45 tok/byte
+one packed hex string                          chars=   512 o200k=   293 cl100k=   291  (o200k 37% of base, cl100k 36%)
+                                               -> o200k 1.14 tok/byte, cl100k 1.14 tok/byte
+base64                                         chars=   344 o200k=   249 cl100k=   259  (o200k 31% of base, cl100k 32%)
+                                               -> o200k 0.97 tok/byte, cl100k 1.01 tok/byte
+
+=== 10. Untrusted-content envelope overhead (fixed, per wrapped block) ===
+binary-mcp wrap_untrusted (markers + notice)   chars=   605 o200k=   141 cl100k=   135
+notice sentence alone                          chars=   523 o200k=   109 cl100k=   107
+binary-mcp markers only (no notice)            chars=    81 o200k=    32 cl100k=    28
+nonce XML tag <untrusted id=..>                chars=    45 o200k=    20 cl100k=    20
+nonce tag with 1-line inline note              chars=    98 o200k=    29 cl100k=    29
+
+=== 11. Spotlighting datamarking/encoding cost on content ===
+strings block (60 lines) [base]                chars=  2267 o200k=  1093 cl100k=  1092
+  datamark: whitespace -> "^"                  chars=  2267 o200k=  1195 cl100k=  1188  (o200k 109% of base, cl100k 109%)
+  datamark: whitespace -> "ˆ" (U+02C6)         chars=  2267 o200k=  1183 cl100k=  1302  (o200k 108% of base, cl100k 119%)
+  datamark: whitespace -> U+E000 (PUA)         chars=  2267 o200k=  1327 cl100k=  1446  (o200k 121% of base, cl100k 132%)
+  encoding: base64                             chars=  3024 o200k=  2043 cl100k=  2206  (o200k 187% of base, cl100k 202%)
+  JSON string escaping                         chars=  2412 o200k=  1103 cl100k=  1108  (o200k 101% of base, cl100k 101%)
+Ghidra pseudocode [base]                       chars=  1250 o200k=   504 cl100k=   495
+  datamark: whitespace -> "^"                  chars=  1189 o200k=   563 cl100k=   555  (o200k 112% of base, cl100k 112%)
+  datamark: whitespace -> "ˆ" (U+02C6)         chars=  1189 o200k=   578 cl100k=   702  (o200k 115% of base, cl100k 142%)
+  datamark: whitespace -> U+E000 (PUA)         chars=  1189 o200k=   717 cl100k=   840  (o200k 142% of base, cl100k 170%)
+  encoding: base64                             chars=  1668 o200k=  1065 cl100k=  1158  (o200k 211% of base, cl100k 234%)
+  JSON string escaping                         chars=  1308 o200k=   557 cl100k=   548  (o200k 111% of base, cl100k 111%)
+
+=== 12. Repeated JSON keys: cost of keys alone in function listing ===
+minified JSON total o200k=2667; key-string scaffolding alone ~1000 (37%)
+
+=== 13. Whitespace & punctuation micro-costs (o200k / cl100k) ===
+"    "                             o200k=1 cl100k=1
+"  "                               o200k=1 cl100k=1
+"\t"                               o200k=1 cl100k=1
+"        "                         o200k=1 cl100k=1
+"\n"                               o200k=1 cl100k=1
+"\n\n"                             o200k=1 cl100k=1
+" | "                              o200k=2 cl100k=2
+"|"                                o200k=1 cl100k=1
+"| --- |"                          o200k=3 cl100k=3
+"|---|"                            o200k=3 cl100k=3
+"\",\""                            o200k=1 cl100k=1
+"\":\""                            o200k=1 cl100k=1
+"\\n"                              o200k=1 cl100k=1
+"\\\""                             o200k=1 cl100k=1
+"\\\\"                             o200k=1 cl100k=1
+"⟦"                                o200k=3 cl100k=2
+"⟧"                                o200k=3 cl100k=2
+"`"                                o200k=1 cl100k=1
+"```"                              o200k=1 cl100k=1
+"...[truncated 12345 chars]..."    o200k=9 cl100k=10

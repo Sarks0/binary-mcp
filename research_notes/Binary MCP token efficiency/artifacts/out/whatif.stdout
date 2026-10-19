@@ -1,0 +1,41 @@
+envelope_overhead[function list]                             140
+envelope_overhead[extracted strings]                         140
+envelope_overhead[decompiled pseudocode from the sample]     145
+notice_alone                                                 109
+notice_chars                                                 523
+sentinel_pair_tokens                                         6
+minimal_envelope_overhead_example                            21
+get_functions_100_current                                    7017
+get_functions_100_tsv_with_sig                               3270
+get_functions_100_minimal_addr_name_calls                    1095
+get_strings_100_current                                      3998
+get_strings_100_tsv_with_xref_addrs                          1910
+get_strings_100_tsv_count_only                               1345
+get_imports_180_current                                      2928
+get_imports_180_grouped_csv                                  885
+decompile_signature_line_tokens                              24
+caveat_summary_current_tokens                                180
+caveat_summary_short_tokens                                  47
+caveat_kinds_in_example                                      4
+scan_pseudocode_50_findings_body_current                     5820
+scan_pseudocode_50_grouped_by_rule                           3499
+scan_pseudocode_50_grouped_no_excerpt                        801
+scan_pseudocode_findings_parsed                              49
+scan_pseudocode_rules                                        1
+batch_decompile_10_envelopes                                 10
+batch_decompile_10_envelope_tokens_saved_if_one              1305
+all_calls_wire_o200k                                         508975
+all_calls_text_o200k                                         235557
+all_calls_structured_o200k                                   253216
+calls_measured                                               86
+calls_with_structured_equal_to_text                          80
+all_calls_envelope_overhead_o200k                            9898
+all_calls_caveat_o200k                                       4792
+x64dbg_read_memory_256B_simulated_o200k                      927
+x64dbg_read_memory_256B_hex_only_o200k                       299
+x64dbg_read_memory_256B_base64_o200k                         240
+start_session_o200k                                          161
+sum_of_5_call_outputs_o200k                                  20161
+get_session_summary_o200k                                    342
+load_full_session_o200k                                      20149
+generate_report_o200k                                        1071

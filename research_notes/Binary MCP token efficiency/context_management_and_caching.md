@@ -16,28 +16,28 @@ Tool definitions are the first segment of the cached prefix (tools → system �
 ### Cited Findings
 
 **Anthropic API: prefix order and invalidation [Vendor docs]**
-- Caching "references the entire prompt: `tools`, `system`, and `messages` (in that order), up to and including the block designated with `cache_control`". The order is a hierarchy, and "changes at each level invalidate that level and all subsequent levels." — [Anthropic prompt caching docs](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
+- Caching "references the entire prompt: `tools`, `system`, and `messages` (in that order), up to and including the block designated with `cache_control`". The order is a hierarchy, and "changes at each level invalidate that level and all subsequent levels." See [Anthropic prompt caching docs](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
 - Invalidation table:
   - Changing tool definitions ("names, descriptions, or parameters") invalidates the tools, system and messages caches.
   - Toggling web search or citations, or switching `speed`, invalidates system and messages.
   - Changing `tool_choice`, or adding or removing images, invalidates only messages.
   - Thinking-parameter and `effort` changes always invalidate messages, and invalidate tools/system on some models.
   
-  — [Anthropic prompt caching docs](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
-- Changing `disable_parallel_tool_use` also invalidates the messages cache. — [Tool use with prompt caching](https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-use-with-prompt-caching)
-- "Cache hits require 100% identical prompt segments." Reordering tools therefore changes the prefix bytes, which is an inference from this exact-match rule; the docs give no separate statement on ordering. — [Anthropic prompt caching docs](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
+See [Anthropic prompt caching docs](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
+- Changing `disable_parallel_tool_use` also invalidates the messages cache. See [Tool use with prompt caching](https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-use-with-prompt-caching)
+- "Cache hits require 100% identical prompt segments." Reordering tools therefore changes the prefix bytes, which is an inference from this exact-match rule; the docs give no separate statement on ordering. See [Anthropic prompt caching docs](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
 - The API offers two cache-preserving escape hatches:
   - A mid-conversation tool-changes beta (`inline-tools-2026-09-15`) "lets you add tools without editing `tools`, so the cache still matches".
   - On supported models, appending a `{"role": "system"}` message to `messages` adds an instruction without invalidating the system or message caches. This is not available on Claude Sonnet 5.
   
-  The tool-changes feature is a beta whose header name may change. No beta is mentioned for the system-message form. — [Anthropic prompt caching docs](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
-- Putting `cache_control` on the last tool caches the whole tool-definitions prefix. For MCP-connector toolsets the docs say "You don't control tool order within an MCP toolset, so place the breakpoint on the `mcp_toolset` entry itself." — [Tool use with prompt caching](https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-use-with-prompt-caching)
-- A request can carry at most 4 breakpoints. Each breakpoint checks "at most 20 positions" backwards, and a run of consecutive `tool_use` blocks or of consecutive `tool_result` blocks counts as one position. Cache writes happen only at breakpoints. — [Anthropic prompt caching docs](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
-- Organisations never share caches. Caches are isolated per workspace on the Claude API, Claude Platform on AWS and Foundry, and per organisation on Bedrock and Google Cloud. — [Anthropic prompt caching docs](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
+  The tool-changes feature is a beta whose header name may change. No beta is mentioned for the system-message form. See [Anthropic prompt caching docs](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
+- Putting `cache_control` on the last tool caches the whole tool-definitions prefix. For MCP-connector toolsets the docs say "You don't control tool order within an MCP toolset, so place the breakpoint on the `mcp_toolset` entry itself." See [Tool use with prompt caching](https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-use-with-prompt-caching)
+- A request can carry at most 4 breakpoints. Each breakpoint checks "at most 20 positions" backwards, and a run of consecutive `tool_use` blocks or of consecutive `tool_result` blocks counts as one position. Cache writes happen only at breakpoints. See [Anthropic prompt caching docs](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
+- Organisations never share caches. Caches are isolated per workspace on the Claude API, Claude Platform on AWS and Foundry, and per organisation on Bedrock and Google Cloud. See [Anthropic prompt caching docs](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
 
 **Anthropic API: prices, TTLs, minimum lengths, latency [Vendor docs / Vendor claim]**
-- The default lifetime is 5 minutes, "refreshed for no additional cost each time the cached content is used". The lifetime "is measured from the start of the request", so a response that streams for 4 minutes leaves about 1 minute for the next request. An optional 1-hour TTL exists, and longer-TTL entries must come before shorter ones. — [Anthropic prompt caching docs](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
-- Multipliers on base input price: 5-minute write **1.25×**, 1-hour write **2×**, cache read **0.1×**. The read exceptions are **0.05×** on Claude Opus 5.5 and Sonnet 5.5, and **0.025×** on Claude Fable 5.1 and Mythos 5.1. The multipliers "stack with" the Batch discount, long-context pricing and data residency. — [Anthropic prompt caching docs](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
+- The default lifetime is 5 minutes, "refreshed for no additional cost each time the cached content is used". The lifetime "is measured from the start of the request", so a response that streams for 4 minutes leaves about 1 minute for the next request. An optional 1-hour TTL exists, and longer-TTL entries must come before shorter ones. See [Anthropic prompt caching docs](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
+- Multipliers on base input price: 5-minute write **1.25×**, 1-hour write **2×**, cache read **0.1×**. The read exceptions are **0.05×** on Claude Opus 5.5 and Sonnet 5.5, and **0.025×** on Claude Fable 5.1 and Mythos 5.1. The multipliers "stack with" the Batch discount, long-context pricing and data residency. See [Anthropic prompt caching docs](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
 - Per-model prices in $/MTok (base / 5m write / 1h write / cache read / output):
 
   | Model | Base | 5m write | 1h write | Cache read | Output |
@@ -49,66 +49,66 @@ Tool definitions are the first segment of the cached prefix (tools → system �
   | Haiku 5.5 (≤100K tokens) | 0.10 | 0.125 | 0.20 | 0.01 | 0.50 |
   | Fable 5.1 | 10 | 12.50 | 20 | 0.25 | 50 |
 
-  — [Anthropic prompt caching docs](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
+See [Anthropic prompt caching docs](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
 - Minimum cacheable prompt length:
   - **512 tokens**: Opus 5.5, Opus 5, Sonnet 5.5, Haiku 5.5, Fable 5/5.1, Mythos 5/5.1.
   - **1,024**: Opus 4.8, Sonnet 5, Sonnet 4.6/4.5, Opus 4.1/4, Sonnet 4.
   - **2,048**: Opus 4.7, Mythos Preview, Haiku 3.5.
   - **4,096**: Opus 4.6/4.5, Haiku 4.5.
   
-  Shorter prompts are "processed without caching and no error is returned". — [Anthropic prompt caching docs](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
-- The docs state that cache hits "are not deducted against your rate limit". The statement appears in the 1-hour TTL section. — [Anthropic prompt caching docs](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
-- Latency: "You will generally see improved time-to-first-token for long documents." The 5m and 1h TTLs "behave the same with respect to latency", and caching has "no effect on output token generation". The current page gives no number. — [Anthropic prompt caching docs](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
+  Shorter prompts are "processed without caching and no error is returned". See [Anthropic prompt caching docs](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
+- The docs state that cache hits "are not deducted against your rate limit". The statement appears in the 1-hour TTL section. See [Anthropic prompt caching docs](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
+- Latency: "You will generally see improved time-to-first-token for long documents." The 5m and 1h TTLs "behave the same with respect to latency", and caching has "no effect on output token generation". The current page gives no number. See [Anthropic prompt caching docs](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
 - The launch post claims "costs by up to 90% and latency by up to 85% for long prompts" **[Vendor claim, 2024-era models; absolute numbers likely superseded]**. The fetch tool rendered the post as dated 14 Aug 2025, but the page carries a 17 Dec 2024 GA update note, so 14 Aug 2024 is the consistent date. Its table:
 
   | Use case | Latency (TTFT) | Cost |
   |---|---|---|
-  | Chat with a book (100K-token cached prompt) | 11.5 s → 2.4 s (−79%) | −90% |
-  | Many-shot prompting (10K tokens) | 1.6 s → 1.1 s (−31%) | −86% |
-  | 10-turn chat with a long system prompt | ~10 s → ~2.5 s (−75%) | −53% |
+  | Chat with a book (100K-token cached prompt) | 11.5 s → 2.4 s (-79%) | -90% |
+  | Many-shot prompting (10K tokens) | 1.6 s → 1.1 s (-31%) | -86% |
+  | 10-turn chat with a long system prompt | ~10 s → ~2.5 s (-75%) | -53% |
 
-  — [Anthropic, "Prompt caching with Claude"](https://claude.com/blog/prompt-caching)
+See [Anthropic, "Prompt caching with Claude"](https://claude.com/blog/prompt-caching)
 
 **Tool search / `defer_loading` and caching [Vendor docs / Vendor claim]**
-- "Deferred tools are not included in the system-prompt prefix." A discovered tool is "appended inline as a `tool_reference` block in the conversation history. The prefix is untouched, so prompt caching is preserved." The page also says "adding tools dynamically through tool search does not break your cache." — [Tool use with prompt caching](https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-use-with-prompt-caching)
+- "Deferred tools are not included in the system-prompt prefix." A discovered tool is "appended inline as a `tool_reference` block in the conversation history. The prefix is untouched, so prompt caching is preserved." The page also says "adding tools dynamically through tool search does not break your cache." See [Tool use with prompt caching](https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-use-with-prompt-caching)
 - Mechanics of `defer_loading`:
   - "You still send every tool's full definition in the `tools` array on every request, including the deferred ones."
   - At least one tool must be non-deferred.
-  - "Keep your 3–5 most frequently used tools non-deferred."
+  - "Keep your 3-5 most frequently used tools non-deferred."
   - A tool with `defer_loading: true` "can't also carry `cache_control`" (the API returns a 400).
   
-  — [Tool search tool docs](https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-search-tool)
+See [Tool search tool docs](https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-search-tool)
 - Claims and limits **[Vendor claim]**:
-  - A five-server setup "can consume ~55k tokens in definitions"; tool search "typically reduces this by over 85 percent, loading only the 3–5 tools Claude needs".
-  - "Claude's ability to pick the right tool degrades once you exceed 30–50 available tools."
+  - A five-server setup "can consume ~55k tokens in definitions"; tool search "typically reduces this by over 85 percent, loading only the 3-5 tools Claude needs".
+  - "Claude's ability to pick the right tool degrades once you exceed 30-50 available tools."
   - Recommended when you have ≥10 tools or >10k tokens of definitions.
   - Search covers tool names, descriptions, argument names and argument descriptions, and returns 5 results by default. Up to 10,000 deferred tools are allowed.
   - Consistent name prefixes (for example `github_`) let "one search match the whole group".
   - Discovered definitions "count as input tokens like any other tool definition".
   
-  — [Tool search tool docs](https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-search-tool)
+See [Tool search tool docs](https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-search-tool)
 - "Advanced tool use" (24 Nov 2025) **[Vendor claim, internal evals]**:
   - Upfront tool definitions of ~77K tokens fell to ~8.7K with tool search (85% reduction).
   - MCP-eval accuracy rose from 49% to 74% on Opus 4 and from 79.5% to 88.1% on Opus 4.5.
   - Anthropic had seen 134K tokens of tool definitions before optimisation.
   - Deferred tools are "excluded from the initial prompt entirely", so caching is not broken.
   
-  — [Anthropic, Advanced tool use](https://www.anthropic.com/engineering/advanced-tool-use)
+See [Anthropic, Advanced tool use](https://www.anthropic.com/engineering/advanced-tool-use)
 
 **Claude Code (the main client) [Vendor docs]**
-- Claude Code orders each request in three layers: a System prompt layer ("Core instructions, tool definitions", changes when "the set of loaded tool definitions changes"), then Project context (CLAUDE.md, memory), then Conversation. "A change to the system prompt invalidates everything." — [Claude Code: How Claude Code uses prompt caching](https://code.claude.com/docs/en/prompt-caching)
+- Claude Code orders each request in three layers: a System prompt layer ("Core instructions, tool definitions", changes when "the set of loaded tool definitions changes"), then Project context (CLAUDE.md, memory), then Conversation. "A change to the system prompt invalidates everything." See [Claude Code: How Claude Code uses prompt caching](https://code.claude.com/docs/en/prompt-caching)
 - With tool search deferring MCP tools, which is the default on supported models:
   - "Claude Code keeps the tool list from the conversation's first request for the whole conversation, so a server connecting or disconnecting mid-session doesn't disturb anything already cached."
   - A server that connects late "supplies its tools as deferred definitions".
   
-  — [Claude Code prompt caching](https://code.claude.com/docs/en/prompt-caching)
+See [Claude Code prompt caching](https://code.claude.com/docs/en/prompt-caching)
 - With tools loaded upfront (tool search below its `auto` threshold, disabled, or unavailable, for example behind a non-first-party `ANTHROPIC_BASE_URL` gateway):
   - "A server connects, or a dynamic tool update adds tools" → cache invalidated.
   - Deliberately removing a tool → invalidated.
   - A stdio server that drops out → cache kept; its definitions stay and calls return errors.
   
-  — [Claude Code prompt caching](https://code.claude.com/docs/en/prompt-caching)
-- On a `list_changed` notification, an interactive Claude Code session "fetches the updated list from that server". With `-p` or the Agent SDK it "refreshes only the tool list". If a refresh fails, the previous lists are kept. — [Claude Code MCP docs](https://code.claude.com/docs/en/mcp)
+See [Claude Code prompt caching](https://code.claude.com/docs/en/prompt-caching)
+- On a `list_changed` notification, an interactive Claude Code session "fetches the updated list from that server". With `-p` or the Agent SDK it "refreshes only the tool list". If a refresh fails, the previous lists are kept. See [Claude Code MCP docs](https://code.claude.com/docs/en/mcp)
 - Tool search is "enabled by default". "Only tool names and server instructions load at session start." `ENABLE_TOOL_SEARCH` accepts:
   - unset (default): defer all;
   - `true`;
@@ -116,31 +116,31 @@ Tool definitions are the first segment of the cached prefix (tools → system �
   - `auto:N`;
   - `false`.
   
-  Tool search is turned off by default when `ANTHROPIC_BASE_URL` points to a non-first-party host. — [Claude Code MCP docs](https://code.claude.com/docs/en/mcp)
-- Claude Code cuts "Server instructions, and the description of a tool that loads upfront" at **4,096 characters**, and "the description of a tool that Claude loads through tool search" at **16,384 characters**. Tool-search matching reads only text within the shorter limit, so "put the words Claude would search for near the start too". Before v2.1.296 the shorter limit was 2,048. — [Claude Code MCP docs](https://code.claude.com/docs/en/mcp)
-- A server can mark one tool to load upfront with `_meta["anthropic/alwaysLoad"]: true`. Users can set `alwaysLoad` for a whole server in their configuration. — [Claude Code MCP docs](https://code.claude.com/docs/en/mcp)
-- The docs tell MCP server authors that server instructions "become more useful with tool search enabled". Instructions should explain "what category of tasks your tools handle", "when Claude should search for your tools", and "key capabilities". — [Claude Code MCP docs](https://code.claude.com/docs/en/mcp)
+  Tool search is turned off by default when `ANTHROPIC_BASE_URL` points to a non-first-party host. See [Claude Code MCP docs](https://code.claude.com/docs/en/mcp)
+- Claude Code cuts "Server instructions, and the description of a tool that loads upfront" at **4,096 characters**, and "the description of a tool that Claude loads through tool search" at **16,384 characters**. Tool-search matching reads only text within the shorter limit, so "put the words Claude would search for near the start too". Before v2.1.296 the shorter limit was 2,048. See [Claude Code MCP docs](https://code.claude.com/docs/en/mcp)
+- A server can mark one tool to load upfront with `_meta["anthropic/alwaysLoad"]: true`. Users can set `alwaysLoad` for a whole server in their configuration. See [Claude Code MCP docs](https://code.claude.com/docs/en/mcp)
+- The docs tell MCP server authors that server instructions "become more useful with tool search enabled". Instructions should explain "what category of tasks your tools handle", "when Claude should search for your tools", and "key capabilities". See [Claude Code MCP docs](https://code.claude.com/docs/en/mcp)
 - Cache TTL in Claude Code:
   - The main conversation gets **1 hour** on a Claude subscription within plan usage, and **5 minutes** on API keys, usage credits and cloud providers.
   - Subagents, compaction and other side requests get 5 minutes by default.
   - Overrides: `promptCacheTtl`/`CLAUDE_CODE_PROMPT_CACHE_TTL`, `subagentPromptCacheTtl`, `FORCE_PROMPT_CACHING_5M`, `ENABLE_PROMPT_CACHING_1H`.
   
-  — [Claude Code prompt caching](https://code.claude.com/docs/en/prompt-caching)
-- "In Claude Code, the cache is effectively scoped to one machine and directory." The system prompt embeds memory paths and the conversation opens with an environment announcement. Parallel sessions in the same directory read each other's cache. — [Claude Code prompt caching](https://code.claude.com/docs/en/prompt-caching)
+See [Claude Code prompt caching](https://code.claude.com/docs/en/prompt-caching)
+- "In Claude Code, the cache is effectively scoped to one machine and directory." The system prompt embeds memory paths and the conversation opens with an environment announcement. Parallel sessions in the same directory read each other's cache. See [Claude Code prompt caching](https://code.claude.com/docs/en/prompt-caching)
 - Cost mechanics from the costs page:
   - "Claude Code sends your full conversation with every request, and each time Claude uses tools it sends another request carrying that batch of tool results".
   - The first message after a break longer than the TTL "misses the cache and reprocesses your full context".
   - "`/compact` reads the conversation it summarizes".
   
-  — [Claude Code: Manage costs](https://code.claude.com/docs/en/costs)
-- `/usage` prints a "Prompt cache (main)" line. The documented example reads "14 requests · 91% of input tokens from cache · 2 misses … 1 expected rebuild (compaction or tool-result clearing)", and the line can name a likely miss cause such as "tool definitions changed". The example session block shows "1.2k input, 5.3k output, 940.0k cache read, 50.0k cache write". These are illustrative doc examples, not measurements. — [Claude Code costs](https://code.claude.com/docs/en/costs)
-- The Claude Code team "runs alerts on the cache hit rate, declaring SEVs when the rate gets too low" **[via search summary; the claude.com/claude.dev post could not be fetched]**. — [Lessons from building Claude Code: Prompt caching is everything](https://claude.com/blog/lessons-from-building-claude-code-prompt-caching-is-everything)
+See [Claude Code: Manage costs](https://code.claude.com/docs/en/costs)
+- `/usage` prints a "Prompt cache (main)" line. The documented example reads "14 requests · 91% of input tokens from cache · 2 misses … 1 expected rebuild (compaction or tool-result clearing)", and the line can name a likely miss cause such as "tool definitions changed". The example session block shows "1.2k input, 5.3k output, 940.0k cache read, 50.0k cache write". These are illustrative doc examples, not measurements. See [Claude Code costs](https://code.claude.com/docs/en/costs)
+- The Claude Code team "runs alerts on the cache hit rate, declaring SEVs when the rate gets too low" **[via search summary; the claude.com/claude.dev post could not be fetched]**. See [Lessons from building Claude Code: Prompt caching is everything](https://claude.com/blog/lessons-from-building-claude-code-prompt-caching-is-everything)
 
 **OpenAI, for comparison [Vendor docs, via search summary]**
-- Caching is automatic with "no additional fees" for prompts of ≥1,024 tokens. Hits need exact prefix matches, so static content goes first. `cached_tokens` is reported in usage. OpenAI claims it "can reduce latency by up to 80% and input token costs by up to 90%". — [OpenAI prompt caching guide](https://developers.openai.com/api/docs/guides/prompt-caching)
-- Retention: the default in-memory cache lasts 5–10 minutes of inactivity. Extended retention up to 24 hours is set with `prompt_cache_retention: "24h"` on specific models; the snippet says gpt-5.5/gpt-5.5-pro support only 24h. `prompt_cache_key` improves routing, and routing hashes the prompt's initial prefix (the snippet says the first 256 tokens). — [OpenAI prompt caching guide](https://developers.openai.com/api/docs/guides/prompt-caching)
-- OpenAI's cookbook reports cached requests are 7% faster at 1,024-token prompts but 67% faster to first token at 150K+ tokens **[Vendor claim]**. — [OpenAI Prompt Caching 201 cookbook](https://developers.openai.com/cookbook/examples/prompt_caching_201)
-- "Both the messages array and the list of available tools can be cached" **[Secondary: a gateway's mirror of OpenAI's docs]**. — [Portkey OpenAI prompt caching docs](https://portkey.ai/docs/integrations/llms/openai/prompt-caching-openai)
+- Caching is automatic with "no additional fees" for prompts of ≥1,024 tokens. Hits need exact prefix matches, so static content goes first. `cached_tokens` is reported in usage. OpenAI claims it "can reduce latency by up to 80% and input token costs by up to 90%". See [OpenAI prompt caching guide](https://developers.openai.com/api/docs/guides/prompt-caching)
+- Retention: the default in-memory cache lasts 5-10 minutes of inactivity. Extended retention up to 24 hours is set with `prompt_cache_retention: "24h"` on specific models; the snippet says gpt-5.5/gpt-5.5-pro support only 24h. `prompt_cache_key` improves routing, and routing hashes the prompt's initial prefix (the snippet says the first 256 tokens). See [OpenAI prompt caching guide](https://developers.openai.com/api/docs/guides/prompt-caching)
+- OpenAI's cookbook reports cached requests are 7% faster at 1,024-token prompts but 67% faster to first token at 150K+ tokens **[Vendor claim]**. See [OpenAI Prompt Caching 201 cookbook](https://developers.openai.com/cookbook/examples/prompt_caching_201)
+- "Both the messages array and the list of available tools can be cached" **[Secondary: a gateway's mirror of OpenAI's docs]**. See [Portkey OpenAI prompt caching docs](https://portkey.ai/docs/integrations/llms/openai/prompt-caching-openai)
 
 ### Inferences
 
@@ -170,8 +170,8 @@ Tool definitions are the first segment of the cached prefix (tools → system �
 4. **Add short, static server `instructions`.** Under deferral the model sees only tool names plus instructions, and binary-mcp currently sends no instructions.
    - Keep them under the 4,096-character cut.
    - Put the category map and search keywords first ("decompile", "xrefs", "debug", ".NET", "PE triage").
-   - Name the handle/job conventions and the 3–5 entry-point tools.
-5. **Mark only 3–5 hot tools `_meta["anthropic/alwaysLoad"]`**, for example triage, decompile and xrefs. Every tool-search call adds a search round-trip and expands definitions as input tokens, so hot tools should not need a search; everything else stays deferred.
+   - Name the handle/job conventions and the 3-5 entry-point tools.
+5. **Mark only 3-5 hot tools `_meta["anthropic/alwaysLoad"]`**, for example triage, decompile and xrefs. Every tool-search call adds a search round-trip and expands definitions as input tokens, so hot tools should not need a search; everything else stays deferred.
    - This assumes FastMCP 2.13 can emit per-tool `_meta`, which the FastMCP research thread should verify.
 6. **Put search keywords in the first sentence of each description.** Use consistent group prefixes or keywords (`ghidra_*`, `x64dbg_*` and so on, or equivalent keywords if renaming is too disruptive), because regex/BM25 search and hook matchers both key on them.
 7. **For API-based harnesses** (Agent SDK, or the MCP connector), place `cache_control` on the `mcp_toolset` entry and use `defer_loading` at the toolset level, since the server does not control order inside the toolset.
@@ -192,13 +192,13 @@ Anthropic's guidance has four parts:
 - **Just-in-time retrieval:** pass lightweight identifiers, not bodies.
 - **Compaction and tool-result clearing:** clearing is called the "lightest touch" form of compaction.
 - **Structured notes** kept outside the context window.
-- **Sub-agents** that return summaries of 1–2K tokens.
+- **Sub-agents** that return summaries of 1-2K tokens.
 
 Anthropic reports that context editing cut tokens 84% on a 100-turn eval, a vendor number. In Claude Code, on 1M-context models, auto-compaction by default waits until about 967K tokens. Large MCP results are persisted to disk only beyond 25K tokens or 50K characters, and compaction discards full tool outputs. A long RE session therefore re-reads every decompilation it has received on every later tool call until compaction. Result size and how long a result stays in context, more than description text, drive the bill.
 
 ### Cited Findings
 
-**Anthropic, "Effective context engineering for AI agents" (29 Sep 2025) [Vendor guidance]** — [Anthropic engineering](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents)
+**Anthropic, "Effective context engineering for AI agents" (29 Sep 2025) [Vendor guidance]**; see [Anthropic engineering](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents)
 - Recall degrades as context grows ("context rot"). LLMs have an "attention budget", and transformers create "n² pairwise relationships for n tokens".
 - Guiding principle: "find the smallest set of high-signal tokens that maximize the likelihood of your desired outcome."
 - Tools should return "information that is token efficient" and "have minimal overlap in functionality".
@@ -209,7 +209,7 @@ Anthropic reports that context editing cut tokens 84% on a 100-turn eval, a vend
 - Structured note-taking: notes "persisted to memory outside of the context window", for example a NOTES.md, or the Pokémon agent's running tallies.
 - Sub-agents work "with clean context windows". They may use "tens of thousands of tokens or more" but return "a condensed, distilled summary of its work (often 1,000-2,000 tokens)".
 
-**Context editing API [Vendor docs]** — [Context editing docs](https://platform.claude.com/docs/en/build-with-claude/context-editing)
+**Context editing API [Vendor docs]**; see [Context editing docs](https://platform.claude.com/docs/en/build-with-claude/context-editing)
 - Beta header `context-management-2025-06-27`. The `clear_tool_uses_20250919` strategy takes:
   - `trigger`: default 100,000 input tokens, or set as a count of tool uses;
   - `keep`: default the last 3 tool uses;
@@ -222,12 +222,12 @@ Anthropic reports that context editing cut tokens 84% on a 100-turn eval, a vend
 - Responses report `context_management.applied_edits` with `cleared_input_tokens`.
 - The SDK's client-side compaction defaults to a 100,000-token threshold. Its default summary has five sections: Task Overview, Current State, Important Discoveries, Next Steps, Context to Preserve.
 
-**Reported numbers for context editing and the memory tool (29 Sep 2025) [Vendor claim, internal evals]** — [Claude blog: Managing context on the Claude Developer Platform](https://claude.com/blog/context-management)
+**Reported numbers for context editing and the memory tool (29 Sep 2025) [Vendor claim, internal evals]**; see [Claude blog: Managing context on the Claude Developer Platform](https://claude.com/blog/context-management)
 - Memory tool plus context editing improved performance by **39%** over baseline on "an internal evaluation set for agentic search". Context editing alone improved it by **29%**.
 - On a **100-turn web search evaluation**, context editing "reduced token consumption by **84%**" and let agents finish workflows that would otherwise fail on context exhaustion.
 - The memory tool is file-based, runs client-side, and persists across conversations in a directory the developer controls. Launched with Sonnet 4.5 in public beta on the Claude Developer Platform, Bedrock and Vertex AI.
 
-**Compaction API [Vendor docs]** — [Compaction overview](https://platform.claude.com/docs/en/build-with-claude/compaction)
+**Compaction API [Vendor docs]**; see [Compaction overview](https://platform.claude.com/docs/en/build-with-claude/compaction)
 - Compaction keeps the active context small "because response quality degrades as a conversation grows".
 - Two server-side modes exist: compaction at a token threshold, and newer on-demand compaction (beta `compact-2026-09-04`). On-demand compaction supports keeping recent turns verbatim and running in the background.
 
@@ -235,21 +235,21 @@ Anthropic reports that context editing cut tokens 84% on a 100-turn eval, a vend
 - Without a configured window, Claude Code compacts at the model's context limit:
   - Native-1M models (Fable, Sonnet 5 and later, Haiku 5.5, Opus 4.7 and later, so Opus 5.5 too) compact at "about 967K tokens by default".
   - Sonnet/Opus 4.6 without extended context compact at the 200K boundary.
-  - The window is configurable with `/autocompact 500k`, the `autoCompactWindow` setting, `--autocompact`, or `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, in the range 100K–1M.
+  - The window is configurable with `/autocompact 500k`, the `autoCompactWindow` setting, `--autocompact`, or `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, in the range 100K-1M.
   
-  — [Claude Code model configuration](https://code.claude.com/docs/en/model-config)
+See [Claude Code model configuration](https://code.claude.com/docs/en/model-config)
 - The compaction summary keeps "your requests and intent, key technical concepts, files examined or modified with important code snippets, errors and how they were fixed, pending tasks, and current work". "Full tool outputs and intermediate reasoning are gone." Claude Code then:
   - re-reads "up to five of the files modified most recently";
   - re-injects invoked skills, capped at 5,000 tokens per skill;
   - reloads the system prompt, CLAUDE.md, memory and MCP tools;
   - does not reload the skill listing.
   
-  — [Claude Code: Explore the context window](https://code.claude.com/docs/en/context-window)
-- Compaction sends "a separate request with the same system prompt, tools, and history as your conversation, plus a summarization instruction". While the cache is warm it reads the prefix from cache, so "a mid-session `/compact` costs a fraction of what the context size suggests". After a TTL gap it reprocesses the full history uncached. `/rewind` truncates back to an already-cached prefix instead. — [Claude Code prompt caching](https://code.claude.com/docs/en/prompt-caching)
-- `/compact Focus on …` takes custom instructions, and a "# Compact instructions" section in CLAUDE.md customises compaction. `/context` shows what is consuming space. "`/clear` costs nothing." — [Claude Code costs](https://code.claude.com/docs/en/costs)
-- Hooks can intercept compaction: `PreCompact` (matcher `manual`/`auto`; exit code 2 blocks compaction), `PostCompact`, and `SessionStart` with matcher `compact`, which accepts `additionalContext`. — [Claude Code hooks](https://code.claude.com/docs/en/hooks)
+See [Claude Code: Explore the context window](https://code.claude.com/docs/en/context-window)
+- Compaction sends "a separate request with the same system prompt, tools, and history as your conversation, plus a summarization instruction". While the cache is warm it reads the prefix from cache, so "a mid-session `/compact` costs a fraction of what the context size suggests". After a TTL gap it reprocesses the full history uncached. `/rewind` truncates back to an already-cached prefix instead. See [Claude Code prompt caching](https://code.claude.com/docs/en/prompt-caching)
+- `/compact Focus on …` takes custom instructions, and a "# Compact instructions" section in CLAUDE.md customises compaction. `/context` shows what is consuming space. "`/clear` costs nothing." See [Claude Code costs](https://code.claude.com/docs/en/costs)
+- Hooks can intercept compaction: `PreCompact` (matcher `manual`/`auto`; exit code 2 blocks compaction), `PostCompact`, and `SessionStart` with matcher `compact`, which accepts `additionalContext`. See [Claude Code hooks](https://code.claude.com/docs/en/hooks)
 
-**Claude Code: large MCP outputs [Vendor docs]** — [Claude Code MCP docs](https://code.claude.com/docs/en/mcp)
+**Claude Code: large MCP outputs [Vendor docs]**; see [Claude Code MCP docs](https://code.claude.com/docs/en/mcp)
 - Size limits:
   - A warning appears when "any MCP tool output exceeds 10,000 tokens" (a fixed threshold).
   - Output is limited "to 25,000 tokens by default", changeable with `MAX_MCP_OUTPUT_TOKENS`.
@@ -261,23 +261,23 @@ Anthropic reports that context editing cut tokens 84% on a 100-turn eval, a vend
 - "A foreground call still running after two minutes moves to a background task, and the result arrives as a task notification when the call settles."
 - Image results appear inline (possibly downscaled), and the original bytes are also saved to a file whose path Claude receives.
 
-**Claude Code: subagents [Vendor docs]** — [Claude Code subagents](https://code.claude.com/docs/en/sub-agents)
+**Claude Code: subagents [Vendor docs]**; see [Claude Code subagents](https://code.claude.com/docs/en/sub-agents)
 - Each subagent has its own context window; "the verbose output stays in the subagent's context while only the relevant summary returns to your main conversation."
 - MCP tools are inherited by default. A server defined inline in a subagent's `mcpServers` keeps "its tool descriptions" out of the main conversation: "The subagent gets the tools; the parent conversation doesn't."
 - Subagents can run on a cheaper model (`model: haiku`).
 - Subagent transcripts are separate files and are unaffected by main-conversation compaction. A warning appears when custom subagent descriptions exceed 15,000 tokens.
-- The context-window simulation's example: the subagent "read 6,100 tokens of files. You got a 420-token result". The token counts are illustrative. — [Claude Code: Explore the context window](https://code.claude.com/docs/en/context-window)
-- A subagent's first request "doesn't read the parent's cache, because the two prefixes differ", and it gets a 5-minute TTL by default. A fork inherits the parent's prefix and does read the parent's cache. — [Claude Code prompt caching](https://code.claude.com/docs/en/prompt-caching)
-- Claude Code's own cost advice is to delegate "running tests, fetching documentation, or processing log files" to subagents. — [Claude Code costs](https://code.claude.com/docs/en/costs)
+- The context-window simulation's example: the subagent "read 6,100 tokens of files. You got a 420-token result". The token counts are illustrative. See [Claude Code: Explore the context window](https://code.claude.com/docs/en/context-window)
+- A subagent's first request "doesn't read the parent's cache, because the two prefixes differ", and it gets a 5-minute TTL by default. A fork inherits the parent's prefix and does read the parent's cache. See [Claude Code prompt caching](https://code.claude.com/docs/en/prompt-caching)
+- Claude Code's own cost advice is to delegate "running tests, fetching documentation, or processing log files" to subagents. See [Claude Code costs](https://code.claude.com/docs/en/costs)
 
 **Claude Code: automatic tool-result clearing ("micro-compaction")**
-- Officially, Claude Code counts an "expected rebuild" when it rewrites the conversation "by compaction or by clearing old tool results from context". — [Claude Code costs](https://code.claude.com/docs/en/costs)
+- Officially, Claude Code counts an "expected rebuild" when it rewrites the conversation "by compaction or by clearing old tool results from context". See [Claude Code costs](https://code.claude.com/docs/en/costs)
 - Thresholds and scope are documented only by third parties **[Secondary, conflicting]**:
   - The clearable set is file reads, shell commands, grep, glob, web fetches and edits, with the most recent results kept.
-  - Trigger thresholds are quoted variously as ~60–70% or ~75–80% of the window.
+  - Trigger thresholds are quoted variously as ~60-70% or ~75-80% of the window.
   - A time-based variant fires after roughly an hour idle.
   
-  — [ClaudeLog: micro-compact](https://claudelog.com/faqs/what-is-micro-compact/); [MorphLLM: Claude Code compact](https://morphllm.com/claude-code-compact)
+See [ClaudeLog: micro-compact](https://claudelog.com/faqs/what-is-micro-compact/); [MorphLLM: Claude Code compact](https://morphllm.com/claude-code-compact)
 
 ### Inferences
 - **Each tool call re-reads the whole history, and Claude Code's default compaction point on 1M models is very late (~967K).** Per-request history re-read cost on Opus 5.5 at $0.20/MTok:
@@ -296,11 +296,11 @@ Anthropic reports that context editing cut tokens 84% on a 100-turn eval, a vend
   - That net turns an oversized result into an opaque "saved to <path>" message, and only in Claude Code.
   - Server-side shaping is portable and can provide a structured summary plus an ID: a header with signature, size, key callees, strings and APIs, and the body on request or in pages.
   - Raising `anthropic/maxResultSizeChars` would *increase* the tokens that stay in context, so it should be used sparingly.
-- **Delegating bulk reads to a subagent is the strongest session-level lever for decompile-heavy phases.** The documented example returned 420 tokens from 6,100 tokens read, and Anthropic suggests 1–2K-token summaries. Trade-offs:
+- **Delegating bulk reads to a subagent is the strongest session-level lever for decompile-heavy phases.** The documented example returned 420 tokens from 6,100 tokens read, and Anthropic suggests 1-2K-token summaries. Trade-offs:
   - The subagent pays its own uncached prefix on its first request.
   - If binary-mcp is scoped *only* to the subagent through inline `mcpServers`, the main agent cannot call it.
   - A plugin could ship a "bulk reader" subagent definition that pairs with a cheaper model.
-- **Clearing break-even** (my arithmetic). Clearing C tokens whose rewrite region is S tokens costs an extra (S − C)·w − S·r on that request and saves C·r on every later request, where w is the write multiplier and r the read multiplier. With S = 150K and C = 50K, it breaks even after about **22 more requests** at r = 0.1 and about **47** at r = 0.05.
+- **Clearing break-even** (my arithmetic). Clearing C tokens whose rewrite region is S tokens costs an extra (S - C)·w - S·r on that request and saves C·r on every later request, where w is the write multiplier and r the read multiplier. With S = 150K and C = 50K, it breaks even after about **22 more requests** at r = 0.1 and about **47** at r = 0.05.
   - Clearing therefore pays off in dollars only in long sessions. Its main justifications are window limits and quality.
   - A server that makes cleared results expensive to restore (a full re-decompile re-sent at full size) erodes the savings. Restorable handles plus memoisation keep re-fetches small.
 - **Keep error results short.** Claude Code middle-truncates errors over about 11K characters, and an error repeated over several retries stays resident like any other result.
@@ -325,41 +325,41 @@ For tool outputs this means: lead with the answer, avoid re-sending near-duplica
 
 ### Cited Findings
 
-**Manus, "Context Engineering for AI Agents: Lessons from Building Manus" (Yichao "Peak" Ji, 18 Jul 2025) [Vendor experience report; via search summary, original not fetched]** — [Manus blog](https://manus.im/blog/Context-Engineering-for-AI-Agents-Lessons-from-Building-Manus)
-- Manus treats KV-cache hit rate as its key production metric. Its average input:output token ratio is around **100:1**. On Claude Sonnet, cached input costs **$0.30/MTok versus $3.00/MTok** uncached, a 10× difference. — [Manus blog](https://manus.im/blog/Context-Engineering-for-AI-Agents-Lessons-from-Building-Manus); [agentic-ai.readthedocs summary](https://agentic-ai.readthedocs.io/en/latest/ContextEngineering/manus/) **[Secondary]**
-- "Even a single-token difference can invalidate the cache from that token onward." A timestamp at the start of the system prompt is a common mistake, and non-deterministic JSON key ordering silently breaks caching. — [Manus blog](https://manus.im/blog/Context-Engineering-for-AI-Agents-Lessons-from-Building-Manus) (via search summary)
-- "Mask, don't remove": removing tools mid-task changes the early part of the context, which invalidates the cache. Manus keeps tool definitions fixed and uses a context-aware state machine with logit masking to block or force actions. Consistent tool-name prefixes (`browser_*`, `shell_*`) make group-level constraints easy. — [Manus blog](https://manus.im/blog/Context-Engineering-for-AI-Agents-Lessons-from-Building-Manus) (via search summary)
-- Secondary write-ups add that without constrained decoding, removing tools tends to cause schema violations or hallucinated actions. — [Manus search summary](https://agentic-ai.readthedocs.io/en/latest/ContextEngineering/manus/) **[Secondary]**
-- The file system serves as external context, with **restorable** compression: "a web page's body can be dropped if its URL is kept, and a document's contents can be omitted if its path remains available in the sandbox". — [Manus blog](https://manus.im/blog/Context-Engineering-for-AI-Agents-Lessons-from-Building-Manus) (via search summary)
-- Recitation: for complex tasks Manus keeps a `todo.md` and rewrites it as work proceeds, "reciting its objectives into the end of the context". — [Manus blog](https://manus.im/blog/Context-Engineering-for-AI-Agents-Lessons-from-Building-Manus) (via search summary)
-- "A typical Manus task requires around 50 tool calls" appears only in a secondary summary. — [agentic-ai.readthedocs](https://agentic-ai.readthedocs.io/en/latest/ContextEngineering/manus/) **[Secondary]**
-- A December 2025 follow-up says Manus's harness "has evolved beyond the original post", so details may be superseded. — [Phil Schmid, Context Engineering Part 2](https://www.philschmid.de/context-engineering-part-2) **[Secondary]**
+**Manus, "Context Engineering for AI Agents: Lessons from Building Manus" (Yichao "Peak" Ji, 18 Jul 2025) [Vendor experience report; via search summary, original not fetched]**; see [Manus blog](https://manus.im/blog/Context-Engineering-for-AI-Agents-Lessons-from-Building-Manus)
+- Manus treats KV-cache hit rate as its key production metric. Its average input:output token ratio is around **100:1**. On Claude Sonnet, cached input costs **$0.30/MTok versus $3.00/MTok** uncached, a 10× difference. See [Manus blog](https://manus.im/blog/Context-Engineering-for-AI-Agents-Lessons-from-Building-Manus); [agentic-ai.readthedocs summary](https://agentic-ai.readthedocs.io/en/latest/ContextEngineering/manus/) **[Secondary]**
+- "Even a single-token difference can invalidate the cache from that token onward." A timestamp at the start of the system prompt is a common mistake, and non-deterministic JSON key ordering silently breaks caching. See [Manus blog](https://manus.im/blog/Context-Engineering-for-AI-Agents-Lessons-from-Building-Manus) (via search summary)
+- "Mask, don't remove": removing tools mid-task changes the early part of the context, which invalidates the cache. Manus keeps tool definitions fixed and uses a context-aware state machine with logit masking to block or force actions. Consistent tool-name prefixes (`browser_*`, `shell_*`) make group-level constraints easy. See [Manus blog](https://manus.im/blog/Context-Engineering-for-AI-Agents-Lessons-from-Building-Manus) (via search summary)
+- Secondary write-ups add that without constrained decoding, removing tools tends to cause schema violations or hallucinated actions. See [Manus search summary](https://agentic-ai.readthedocs.io/en/latest/ContextEngineering/manus/) **[Secondary]**
+- The file system serves as external context, with **restorable** compression: "a web page's body can be dropped if its URL is kept, and a document's contents can be omitted if its path remains available in the sandbox". See [Manus blog](https://manus.im/blog/Context-Engineering-for-AI-Agents-Lessons-from-Building-Manus) (via search summary)
+- Recitation: for complex tasks Manus keeps a `todo.md` and rewrites it as work proceeds, "reciting its objectives into the end of the context". See [Manus blog](https://manus.im/blog/Context-Engineering-for-AI-Agents-Lessons-from-Building-Manus) (via search summary)
+- "A typical Manus task requires around 50 tool calls" appears only in a secondary summary. See [agentic-ai.readthedocs](https://agentic-ai.readthedocs.io/en/latest/ContextEngineering/manus/) **[Secondary]**
+- A December 2025 follow-up says Manus's harness "has evolved beyond the original post", so details may be superseded. See [Phil Schmid, Context Engineering Part 2](https://www.philschmid.de/context-engineering-part-2) **[Secondary]**
 
-**Chroma, "Context Rot: How Increasing Input Tokens Impacts LLM Performance" (Hong, Troynikov, Huber, 14 Jul 2025) [Independent-ish: research by a retrieval-infrastructure vendor, with open-source reproduction code]** — [Chroma research](https://trychroma.com/research/context-rot); [code](https://github.com/chroma-core/context-rot)
-- The study covered **18 LLMs**, including GPT-4.1, Claude 4, Gemini 2.5 and Qwen3. Its central finding: models "do not use their context uniformly", and performance "grows increasingly unreliable as input length grows". The tasks were deliberately simple (LongMemEval conversational QA, repeated-word copying), to isolate the effect of length. — [Chroma research](https://trychroma.com/research/context-rot) (via search summary)
-- "Needle-question similarity, presence of distractors, haystack structure, and semantic relationships" all affect performance non-uniformly as length grows. — [ZenML summary](https://www.zenml.io/llmops-database/context-rot-evaluating-llm-performance-degradation-with-increasing-input-tokens) **[Secondary]**
+**Chroma, "Context Rot: How Increasing Input Tokens Impacts LLM Performance" (Hong, Troynikov, Huber, 14 Jul 2025) [Independent-ish: research by a retrieval-infrastructure vendor, with open-source reproduction code]**; see [Chroma research](https://trychroma.com/research/context-rot); [code](https://github.com/chroma-core/context-rot)
+- The study covered **18 LLMs**, including GPT-4.1, Claude 4, Gemini 2.5 and Qwen3. Its central finding: models "do not use their context uniformly", and performance "grows increasingly unreliable as input length grows". The tasks were deliberately simple (LongMemEval conversational QA, repeated-word copying), to isolate the effect of length. See [Chroma research](https://trychroma.com/research/context-rot) (via search summary)
+- "Needle-question similarity, presence of distractors, haystack structure, and semantic relationships" all affect performance non-uniformly as length grows. See [ZenML summary](https://www.zenml.io/llmops-database/context-rot-evaluating-llm-performance-degradation-with-increasing-input-tokens) **[Secondary]**
 - Secondary write-ups of the findings:
   - Shuffled haystacks outperformed logically coherent ones across all 18 models.
   - A single plausible distractor reduces accuracy, and four reduce it further.
-  - LongMemEval with a focused ~300-token input beat the full ~113K-token history for every model family. The size of the gap varies by write-up (quoted as roughly 30% to 30–60%).
+  - LongMemEval with a focused ~300-token input beat the full ~113K-token history for every model family. The size of the gap varies by write-up (quoted as roughly 30% to 30-60%).
   - Claude models abstain more often when unsure, while GPT models hallucinate more confidently.
   
-  — [PromptHub](https://www.prompthub.us/blog/why-long-context-windows-still-dont-work); [MorphLLM](https://www.morphllm.com/context-rot) **[Secondary; exact figures unverified]**
+See [PromptHub](https://www.prompthub.us/blog/why-long-context-windows-still-dont-work); [MorphLLM](https://www.morphllm.com/context-rot) **[Secondary; exact figures unverified]**
 
-**Liu et al., "Lost in the Middle: How Language Models Use Long Contexts" (arXiv July 2023; TACL 2024) [Independent, peer-reviewed]** — [arXiv 2307.03172](https://arxiv.org/abs/2307.03172); [TACL](https://aclanthology.org/2024.tacl-1.9/)
-- "Performance is often highest when relevant information occurs at the beginning or end of the input context, and significantly degrades when models must access relevant information in the middle of long contexts", even for explicitly long-context models. — (via search summary of the abstract)
-- The tasks were multi-document QA over NaturalQuestions-Open with 10/20/30 documents, and key-value retrieval. Models included GPT-3.5-Turbo, GPT-4, Claude-1.3, MPT-30B and LongChat-13B. Secondary sources put GPT-3.5's best-to-worst-position drop at about 20 points, with inconsistent exact figures. — [aktagon paper summary](https://ai-papers.aktagon.com/papers/lost-middle/); [Liner review](https://liner.com/review/lost-in-middle-how-language-models-use-long-contexts) **[Secondary]**
+**Liu et al., "Lost in the Middle: How Language Models Use Long Contexts" (arXiv July 2023; TACL 2024) [Independent, peer-reviewed]**; see [arXiv 2307.03172](https://arxiv.org/abs/2307.03172); [TACL](https://aclanthology.org/2024.tacl-1.9/)
+- "Performance is often highest when relevant information occurs at the beginning or end of the input context, and significantly degrades when models must access relevant information in the middle of long contexts", even for explicitly long-context models. (via search summary of the abstract)
+- The tasks were multi-document QA over NaturalQuestions-Open with 10/20/30 documents, and key-value retrieval. Models included GPT-3.5-Turbo, GPT-4, Claude-1.3, MPT-30B and LongChat-13B. Secondary sources put GPT-3.5's best-to-worst-position drop at about 20 points, with inconsistent exact figures. See [aktagon paper summary](https://ai-papers.aktagon.com/papers/lost-middle/); [Liner review](https://liner.com/review/lost-in-middle-how-language-models-use-long-contexts) **[Secondary]**
 - The models tested are from 2023, so absolute effects are likely smaller on 2026 models. Chroma's 2025 results suggest the general length sensitivity persists.
 
 **Other evidence**
-- Anthropic says tool-selection ability "degrades once you exceed 30–50 available tools" **[Vendor claim]**. — [Tool search docs](https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-search-tool)
-- Anthropic's compaction docs state that "response quality degrades as a conversation grows" **[Vendor docs]**. — [Compaction overview](https://platform.claude.com/docs/en/build-with-claude/compaction)
-- LangChain's framing (2 Jul 2025): context engineering is **write** (save outside the window), **select** (pull in what the step needs), **compress** (keep only needed tokens) and **isolate** (split across sub-agents or state). — [LangChain blog: Context engineering](https://www.langchain.com/blog/context-engineering); [langchain-ai/context_engineering](https://github.com/langchain-ai/context_engineering) **[Vendor guidance]**
+- Anthropic says tool-selection ability "degrades once you exceed 30-50 available tools" **[Vendor claim]**. See [Tool search docs](https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-search-tool)
+- Anthropic's compaction docs state that "response quality degrades as a conversation grows" **[Vendor docs]**. See [Compaction overview](https://platform.claude.com/docs/en/build-with-claude/compaction)
+- LangChain's framing (2 Jul 2025): context engineering is **write** (save outside the window), **select** (pull in what the step needs), **compress** (keep only needed tokens) and **isolate** (split across sub-agents or state). See [LangChain blog: Context engineering](https://www.langchain.com/blog/context-engineering); [langchain-ai/context_engineering](https://github.com/langchain-ai/context_engineering) **[Vendor guidance]**
 
 ### Inferences
 Concrete output rules for binary-mcp tools:
 1. **Lead with the answer.** Every decompile, listing or debug result should start with a compact header: identity (address, name, signature), size, key callees, imported APIs and strings, a one-line verdict or summary, and an artifact ID or content hash. The body comes after the header or behind the ID. Position effects and summariser behaviour both favour what comes first. Claude Code also middle-truncates long errors, keeping the head and tail.
-2. **Do not re-send near-duplicate bodies.** Sibling functions, re-decompiles after renames, and the same function shown in both pseudocode and disassembly are exactly the "plausible distractor" content that Chroma found most harmful. Prefer diffs ("same as FUN_x except lines 12–18"), references to an earlier artifact ID, or opt-in full bodies.
+2. **Do not re-send near-duplicate bodies.** Sibling functions, re-decompiles after renames, and the same function shown in both pseudocode and disassembly are exactly the "plausible distractor" content that Chroma found most harmful. Prefer diffs ("same as FUN_x except lines 12-18"), references to an earlier artifact ID, or opt-in full bodies.
 3. **Make every elision restorable.** Each truncated or summarised result should name the ID, path or URI, and the paging parameters, needed to get the rest (Manus's URL/path rule). The memoised analysis cache makes restoration cheap and byte-identical.
 4. **Recite briefly.** A short ledger delta, for example "reviewed 37/412 functions; 3 flagged; next candidates…", occasionally appended keeps the goal in recent attention (Manus `todo.md`). It should be a delta of a few lines, not the full ledger on every call.
 5. **Keep the action space static** (section 1, rule 1). Express "debugger not attached" or "Ghidra project not loaded" as tool-result state with a next step, not by changing the tool list.
@@ -390,14 +390,14 @@ The dollar savings from moving static text are modest, because cached text is ch
   - **Level 3+**, bundled files: no cost "until accessed"; "Scripts run through bash, and only their output enters context".
   - Limits: `name` ≤64 characters, `description` ≤1,024 characters.
   
-  — [Agent Skills overview](https://platform.claude.com/docs/en/agents-and-tools/agent-skills/overview)
+See [Agent Skills overview](https://platform.claude.com/docs/en/agents-and-tools/agent-skills/overview)
 - Where skills are available **[Vendor docs]**:
   - Claude API, which requires the code execution tool.
   - Claude Code: filesystem `~/.claude/skills/` or `.claude/skills/`, "Can also be shared through Claude Code Plugins".
   - claude.ai custom skills: zip upload, on Pro/Max/Team/Enterprise plans with code execution enabled, per user only.
   - "Custom Skills do not sync across surfaces."
   
-  — [Agent Skills overview](https://platform.claude.com/docs/en/agents-and-tools/agent-skills/overview)
+See [Agent Skills overview](https://platform.claude.com/docs/en/agents-and-tools/agent-skills/overview)
 - In Claude Code **[Vendor docs]**:
   - A skill's description is "always in context", unless `disable-model-invocation: true`.
   - The combined `description` and `when_to_use` text "is truncated at 1,536 characters in the skill listing".
@@ -407,24 +407,24 @@ The dollar savings from moving static text are modest, because cached text is ch
   - `context: fork` runs a skill in a subagent.
   - Plugin skills live at `<plugin>/skills/<skill-name>/SKILL.md` and are invoked as `/plugin-name:skill-name`.
   
-  — [Claude Code skills](https://code.claude.com/docs/en/skills)
-- The skill *listing* "is not re-injected after `/compact`. Only skills you actually invoked get preserved." — [Claude Code: Explore the context window](https://code.claude.com/docs/en/context-window)
+See [Claude Code skills](https://code.claude.com/docs/en/skills)
+- The skill *listing* "is not re-injected after `/compact`. Only skills you actually invoked get preserved." See [Claude Code: Explore the context window](https://code.claude.com/docs/en/context-window)
 - Cache effects in Claude Code **[Vendor docs]**:
   - "Skills and commands inject their instructions as user messages at the point of invocation. Nothing earlier in the conversation changes."
   - "Claude Code never invalidates the cache for a plugin's skills, commands, agents, hooks, monitors, or themes."
   - A plugin's MCP servers follow the same rules as connecting or removing an MCP server.
   
-  — [Claude Code prompt caching](https://code.claude.com/docs/en/prompt-caching)
-- Plugin-bundled MCP tools are named `mcp__plugin_<plugin-name>_<server-name>__<tool>` for hook matching. — [Claude Code hooks](https://code.claude.com/docs/en/hooks)
-- Claude Code leaves out any MCP tool whose full name exceeds 128 characters. — [Claude Code MCP docs](https://code.claude.com/docs/en/mcp)
+See [Claude Code prompt caching](https://code.claude.com/docs/en/prompt-caching)
+- Plugin-bundled MCP tools are named `mcp__plugin_<plugin-name>_<server-name>__<tool>` for hook matching. See [Claude Code hooks](https://code.claude.com/docs/en/hooks)
+- Claude Code leaves out any MCP tool whose full name exceeds 128 characters. See [Claude Code MCP docs](https://code.claude.com/docs/en/mcp)
 - Claude Code's cost guidance:
   - Move specialised workflow instructions from CLAUDE.md into skills, because skills "load on-demand only when invoked". Keep CLAUDE.md under 200 lines.
   - A domain-knowledge skill lets Claude get context "immediately instead of spending tokens reading multiple files".
   
-  — [Claude Code costs](https://code.claude.com/docs/en/costs)
-- Server instructions and upfront tool descriptions are cut at 4,096 characters, and deferred-tool descriptions at 16,384. — [Claude Code MCP docs](https://code.claude.com/docs/en/mcp)
-- MCP **prompts** appear in Claude Code as `/mcp__servername__promptname` commands, and "Prompt results are injected directly into the conversation". — [Claude Code MCP docs](https://code.claude.com/docs/en/mcp)
-- "Code execution with MCP" (4 Nov 2025) **[Vendor claim]**: presenting tools as files and filtering data in code cut one workflow from "150,000 tokens to 2,000 tokens" (98.7%). Agents can save working code as reusable functions with a SKILL.md, turning it "into a structured skill". — [Anthropic, Code execution with MCP](https://www.anthropic.com/engineering/code-execution-with-mcp)
+See [Claude Code costs](https://code.claude.com/docs/en/costs)
+- Server instructions and upfront tool descriptions are cut at 4,096 characters, and deferred-tool descriptions at 16,384. See [Claude Code MCP docs](https://code.claude.com/docs/en/mcp)
+- MCP **prompts** appear in Claude Code as `/mcp__servername__promptname` commands, and "Prompt results are injected directly into the conversation". See [Claude Code MCP docs](https://code.claude.com/docs/en/mcp)
+- "Code execution with MCP" (4 Nov 2025) **[Vendor claim]**: presenting tools as files and filtering data in code cut one workflow from "150,000 tokens to 2,000 tokens" (98.7%). Agents can save working code as reusable functions with a SKILL.md, turning it "into a structured skill". See [Anthropic, Code execution with MCP](https://www.anthropic.com/engineering/code-execution-with-mcp)
 
 ### Inferences
 - **Token economics** (my arithmetic, Opus 5.5 prices; a "request" is one model call, and each tool call adds one):
@@ -433,7 +433,7 @@ The dollar savings from moving static text are modest, because cached text is ch
   - *Guidance as a skill.* About 100 tokens of description always load (≤1,536 characters shown). A 3,000-token body loads once per session that needs it: about $0.015 to write plus 300 × 3,000 × $0.20/MTok ≈ $0.18 of re-reads over 300 requests, so about $0.20 per session. Up to 5,000 tokens are re-attached after compaction.
   - *For comparison*, one 10K-token decompilation that stays resident for 200 requests costs about $0.45 (section 5). Shrinking results matters more in dollars than relocating guidance. Relocating guidance is still worth doing for truncation, relevance and attention reasons.
 - **Suggested split for binary-mcp:**
-  1. A short static **server-instructions map**, ≤4,096 characters and ideally ≤1,000 tokens: tool categories, when to search, the 3–5 entry-point tools, and the handle/job/ledger conventions.
+  1. A short static **server-instructions map**, ≤4,096 characters and ideally ≤1,000 tokens: tool categories, when to search, the 3-5 entry-point tools, and the handle/job/ledger conventions.
   2. **Per-workflow skills**, each under 5K tokens with references in separate files: PE/malware triage, static decompile/xref loop, dynamic debugging, .NET. Only the relevant one loads.
   3. Minimal **per-tool descriptions** covering what the tool does, its key parameters, and its output shape with size controls.
   4. A Claude Code **plugin** that bundles the server, the skills, optional hooks (section 6) and possibly a "bulk-reader" subagent on a cheaper model.
@@ -470,35 +470,35 @@ MCP sampling is not a viable summarisation path in 2026. It is **deprecated** as
   - When truncating, steer the agent toward narrower, token-efficient follow-ups.
   - Replacing UUIDs with interpretable identifiers improved precision.
   
-  — [Anthropic, Writing effective tools for agents](https://www.anthropic.com/engineering/writing-tools-for-agents)
-- Programmatic tool calling cut average tokens on complex research tasks from **43,588 to 27,297 (−37%)**. In a budget example, raw data of 200 KB was reduced to about 1 KB of output **[Vendor claim]**. — [Anthropic, Advanced tool use](https://www.anthropic.com/engineering/advanced-tool-use)
+See [Anthropic, Writing effective tools for agents](https://www.anthropic.com/engineering/writing-tools-for-agents)
+- Programmatic tool calling cut average tokens on complex research tasks from **43,588 to 27,297 (-37%)**. In a budget example, raw data of 200 KB was reduced to about 1 KB of output **[Vendor claim]**. See [Anthropic, Advanced tool use](https://www.anthropic.com/engineering/advanced-tool-use)
 - "Code execution with MCP" **[Vendor claim]**:
   - Intermediate results pass through the model, so "a 2-hour sales meeting transcript could add about 50,000 tokens because it passes through the model twice".
   - Filtering in code means the agent sees five rows instead of 10,000.
   - Agents can persist intermediate results to files.
   - Caveat: code execution "requires a secure execution environment with appropriate sandboxing".
   
-  — [Anthropic, Code execution with MCP](https://www.anthropic.com/engineering/code-execution-with-mcp)
-- Just-in-time retrieval through "lightweight identifiers (file paths, stored queries, web links, etc.)". — [Anthropic, Effective context engineering](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents)
-- Manus's restorable compression: keep the URL or path and drop the body. — [Manus blog](https://manus.im/blog/Context-Engineering-for-AI-Agents-Lessons-from-Building-Manus) (via search summary)
-- Claude Code already persists large MCP results to disk: over 25K tokens by default, or over 50K characters, results are saved and replaced with a path. Long calls are auto-backgrounded after 2 minutes, with a task notification on completion. — [Claude Code MCP docs](https://code.claude.com/docs/en/mcp)
-- Context editing replaces cleared results with a placeholder that tells Claude the result was removed, and Claude can re-fetch from memory. — [Context editing docs](https://platform.claude.com/docs/en/build-with-claude/context-editing)
-- Client-side dedup exists in the wild. OpenCode's Dynamic Context Pruning plugin keeps only the most recent output of repeated calls (same tool, same arguments), purges errored-call inputs after 4 turns by default, and swaps pruned content for placeholders before sending **[Secondary/third-party plugin]**. — [Opencode-DCP on GitHub](https://github.com/Opencode-DCP/opencode-dynamic-context-pruning)
-- OpenCode V2's built-in compaction: `auto` is on by default. `prune` "is accepted by the V2 schema but currently has no runtime effect", and V2 "does not clear old tool outputs in place". Older OpenCode versions pruned old tool outputs, keeping the most recent ~40K tokens **[Secondary for the older behaviour]**. — [OpenCode V2 compaction docs](https://v2.opencode.ai/compaction); [learnopencode](https://learnopencode.com/en/5-advanced/20-compaction)
+See [Anthropic, Code execution with MCP](https://www.anthropic.com/engineering/code-execution-with-mcp)
+- Just-in-time retrieval through "lightweight identifiers (file paths, stored queries, web links, etc.)". See [Anthropic, Effective context engineering](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents)
+- Manus's restorable compression: keep the URL or path and drop the body. See [Manus blog](https://manus.im/blog/Context-Engineering-for-AI-Agents-Lessons-from-Building-Manus) (via search summary)
+- Claude Code already persists large MCP results to disk: over 25K tokens by default, or over 50K characters, results are saved and replaced with a path. Long calls are auto-backgrounded after 2 minutes, with a task notification on completion. See [Claude Code MCP docs](https://code.claude.com/docs/en/mcp)
+- Context editing replaces cleared results with a placeholder that tells Claude the result was removed, and Claude can re-fetch from memory. See [Context editing docs](https://platform.claude.com/docs/en/build-with-claude/context-editing)
+- Client-side dedup exists in the wild. OpenCode's Dynamic Context Pruning plugin keeps only the most recent output of repeated calls (same tool, same arguments), purges errored-call inputs after 4 turns by default, and swaps pruned content for placeholders before sending **[Secondary/third-party plugin]**. See [Opencode-DCP on GitHub](https://github.com/Opencode-DCP/opencode-dynamic-context-pruning)
+- OpenCode V2's built-in compaction: `auto` is on by default. `prune` "is accepted by the V2 schema but currently has no runtime effect", and V2 "does not clear old tool outputs in place". Older OpenCode versions pruned old tool outputs, keeping the most recent ~40K tokens **[Secondary for the older behaviour]**. See [OpenCode V2 compaction docs](https://v2.opencode.ai/compaction); [learnopencode](https://learnopencode.com/en/5-advanced/20-compaction)
 - **MCP sampling is deprecated** **[Spec, via search summary; fetch blocked]**:
   - "The Sampling feature is deprecated as of protocol version 2026-07-28 (SEP-2577)".
   - Under the feature lifecycle policy (SEP-2596) it remains "for at least twelve months", and "New implementations SHOULD NOT adopt it".
   - The migration path is to "integrate directly with LLM provider APIs".
   - The `includeContext` values `thisServer`/`allServers` are also deprecated.
   
-  — [MCP 2026-07-28 changelog](https://modelcontextprotocol.io/specification/2026-07-28/changelog); [noze.it summary](https://www.noze.it/en/insights/mcp-2026-07-28-stateless/) **[Secondary]**
-- One MCP SDK's documentation notes that "on modern connections sampling fails because a 2026-07-28 session has no channel to carry one". The search summary did not name the SDK; the results included the Python SDK's deprecated-features page and the Ruby gem's `MCP::ProtocolDeprecations`. — [MCP Python SDK: deprecated features](https://py.sdk.modelcontextprotocol.io/deprecated/) (via search summary; attribution unconfirmed)
+See [MCP 2026-07-28 changelog](https://modelcontextprotocol.io/specification/2026-07-28/changelog); [noze.it summary](https://www.noze.it/en/insights/mcp-2026-07-28-stateless/) **[Secondary]**
+- One MCP SDK's documentation notes that "on modern connections sampling fails because a 2026-07-28 session has no channel to carry one". The search summary did not name the SDK; the results included the Python SDK's deprecated-features page and the Ruby gem's `MCP::ProtocolDeprecations`. See [MCP Python SDK: deprecated features](https://py.sdk.modelcontextprotocol.io/deprecated/) (via search summary; attribution unconfirmed)
 - Client support for sampling:
   - **Claude Code**: still lacks sampling. Feature request #1785 has been "open since June 2025 and was still open … in August 2026" **[Secondary]**. The retrieved text of Claude Code's MCP docs covers roots, elicitation (form and URL capabilities declared on 2026-07-28 connections) and protocol revision 2026-07-28 on the v2 runtime, and never mentions sampling.
   - **Claude Desktop**: sources conflict. The newest says it is not supported, while an older comparison claims full support.
   - **VS Code**: supports sampling.
   
-  — [Developers Digest, MCP client features 2026](https://www.developersdigest.tech/blog/mcp-client-features-explained-2026); [Claude Code MCP docs](https://code.claude.com/docs/en/mcp); conflicting: [Pondero MCP client comparison](https://pondero.ai/mcps/guides/mcp-client-comparison/)
+See [Developers Digest, MCP client features 2026](https://www.developersdigest.tech/blog/mcp-client-features-explained-2026); [Claude Code MCP docs](https://code.claude.com/docs/en/mcp); conflicting: [Pondero MCP client comparison](https://pondero.ai/mcps/guides/mcp-client-comparison/)
 
 ### Inferences
 - **Memoisation and token savings are separate concerns.** binary-mcp's analysis cache already avoids re-running Ghidra. Tokens fall only if responses get smaller. The cache key should include the binary hash, function address, engine version and options, so that hashes in results are stable across a session and a restart.
@@ -549,29 +549,29 @@ Yes, in Claude Code only, as of October 2026:
 These make a Claude Code plugin a good place for user-tunable token policy. Server-side shaping remains the portable baseline, since Claude Desktop and OpenCode do not share this hook system.
 
 ### Cited Findings
-- PostToolUse input includes `tool_input` and `tool_response`, plus `mcp_server` for MCP tools. — [Claude Code hooks](https://code.claude.com/docs/en/hooks)
+- PostToolUse input includes `tool_input` and `tool_response`, plus `mcp_server` for MCP tools. See [Claude Code hooks](https://code.claude.com/docs/en/hooks)
 - `updatedToolOutput`:
   - "Replaces the tool's output with the provided value before it is sent to Claude. The value must match the tool's output shape."
   - "For built-in tools, a value that doesn't match the tool's output schema is ignored … MCP tool output is passed through without schema validation."
   - The older `updatedMCPToolOutput` works for MCP tools only; the docs say to "Prefer `updatedToolOutput`, which works for all tools".
   
-  — [Claude Code hooks](https://code.claude.com/docs/en/hooks)
-- "`updatedToolOutput` only changes what Claude sees. The tool has already run … Telemetry such as OpenTelemetry tool spans … captures the original output." With `decision: "block"`, "Claude still sees the original output; to replace it, use `updatedToolOutput`." — [Claude Code hooks](https://code.claude.com/docs/en/hooks)
+See [Claude Code hooks](https://code.claude.com/docs/en/hooks)
+- "`updatedToolOutput` only changes what Claude sees. The tool has already run … Telemetry such as OpenTelemetry tool spans … captures the original output." With `decision: "block"`, "Claude still sees the original output; to replace it, use `updatedToolOutput`." See [Claude Code hooks](https://code.claude.com/docs/en/hooks)
 - PreToolUse fields:
   - `permissionDecision`: `allow`/`deny`/`ask`/`defer`, with precedence "`deny` > `defer` > `ask` > `allow`".
   - `permissionDecisionReason`: for `deny` it is "shown to Claude".
   - `updatedInput`: "Modifies the tool's input parameters before execution. Replaces the entire input object".
   - `additionalContext`.
   
-  The docs do not say Claude will then pick a different tool; they only say the reason is shown to Claude. — [Claude Code hooks](https://code.claude.com/docs/en/hooks)
-- `PostToolBatch` "fires exactly once with the full batch" before the next model request. Its input carries the serialised `tool_result` content "the model receives", and its `additionalContext` is "injected once before the next model call". — [Claude Code hooks](https://code.claude.com/docs/en/hooks)
-- Hook handler types are `command`, `http`, `mcp_tool` (call an MCP server's tool, with `${path}` substitution from the input), `prompt` and `agent`; agent hooks are experimental. Default timeouts are 600 s for command/http/mcp_tool, 30 s for prompt and 60 s for agent. — [Claude Code hooks](https://code.claude.com/docs/en/hooks)
-- MCP matchers use `mcp__<server>__<tool>`; matchers containing regex characters are unanchored JavaScript regexes, for example `mcp__memory__.*`. Plugin servers use `mcp__plugin_<plugin>_<server>__<tool>`. — [Claude Code hooks](https://code.claude.com/docs/en/hooks)
-- A hook's `additionalContext`, `systemMessage`, `initialUserMessage` and plain stdout are each "capped at 10,000 characters". Over the cap, Claude Code saves the output to a file and passes "the file path and a preview of up to the first 2,000 characters". — [Claude Code hooks](https://code.claude.com/docs/en/hooks)
-- Compaction-related events: `PreCompact` (matcher `manual`/`auto`; exit 2 "Blocks compaction"), `PostCompact`, and `SessionStart` with matcher `compact`, which accepts `additionalContext`. — [Claude Code hooks](https://code.claude.com/docs/en/hooks)
-- Claude Code's own cost guide shows a PreToolUse hook that rewrites test commands, through `updatedInput`, to output only failures. It states that hooks can cut a 10,000-line log "from tens of thousands of tokens to hundreds". — [Claude Code costs](https://code.claude.com/docs/en/costs)
-- Plugin hooks never invalidate the prompt cache. — [Claude Code prompt caching](https://code.claude.com/docs/en/prompt-caching)
-- OpenCode has plugin events `tool.execute.before`/`tool.execute.after`. Whether and how the after-hook can rewrite output is not officially documented in sources I found **[Secondary]**. — [skills.sh: writing OpenCode plugins](https://skills.sh/ian-pascoe/dotfiles/writing-plugins)
+  The docs do not say Claude will then pick a different tool; they only say the reason is shown to Claude. See [Claude Code hooks](https://code.claude.com/docs/en/hooks)
+- `PostToolBatch` "fires exactly once with the full batch" before the next model request. Its input carries the serialised `tool_result` content "the model receives", and its `additionalContext` is "injected once before the next model call". See [Claude Code hooks](https://code.claude.com/docs/en/hooks)
+- Hook handler types are `command`, `http`, `mcp_tool` (call an MCP server's tool, with `${path}` substitution from the input), `prompt` and `agent`; agent hooks are experimental. Default timeouts are 600 s for command/http/mcp_tool, 30 s for prompt and 60 s for agent. See [Claude Code hooks](https://code.claude.com/docs/en/hooks)
+- MCP matchers use `mcp__<server>__<tool>`; matchers containing regex characters are unanchored JavaScript regexes, for example `mcp__memory__.*`. Plugin servers use `mcp__plugin_<plugin>_<server>__<tool>`. See [Claude Code hooks](https://code.claude.com/docs/en/hooks)
+- A hook's `additionalContext`, `systemMessage`, `initialUserMessage` and plain stdout are each "capped at 10,000 characters". Over the cap, Claude Code saves the output to a file and passes "the file path and a preview of up to the first 2,000 characters". See [Claude Code hooks](https://code.claude.com/docs/en/hooks)
+- Compaction-related events: `PreCompact` (matcher `manual`/`auto`; exit 2 "Blocks compaction"), `PostCompact`, and `SessionStart` with matcher `compact`, which accepts `additionalContext`. See [Claude Code hooks](https://code.claude.com/docs/en/hooks)
+- Claude Code's own cost guide shows a PreToolUse hook that rewrites test commands, through `updatedInput`, to output only failures. It states that hooks can cut a 10,000-line log "from tens of thousands of tokens to hundreds". See [Claude Code costs](https://code.claude.com/docs/en/costs)
+- Plugin hooks never invalidate the prompt cache. See [Claude Code prompt caching](https://code.claude.com/docs/en/prompt-caching)
+- OpenCode has plugin events `tool.execute.before`/`tool.execute.after`. Whether and how the after-hook can rewrite output is not officially documented in sources I found **[Secondary]**. See [skills.sh: writing OpenCode plugins](https://skills.sh/ian-pascoe/dotfiles/writing-plugins)
 
 ### Inferences
 - **What a binary-mcp Claude Code plugin's hooks could do:**

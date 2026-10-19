@@ -1,0 +1,3 @@
+windbg_execute_command is disabled by default.
+Set BINARY_MCP_ENABLE_RAW_WINDBG=1 in the server environment to enable raw WinDbg command execution.
+The 32 structured WinDbg tools are unaffected and are the supported way to drive the debugger: windbg_status, windbg_get_stack, windbg_get_thread, windbg_get_process, windbg_dt, windbg_get_registers, windbg_read_memory, windbg_disassemble, windbg_get_modules, windbg_list_breakpoints, windbg_set_breakpoint, windbg_set_conditional_breakpoint, windbg_set_hardware_breakpoint, windbg_switch_thread, windbg_step_into, windbg_step_over and the connection/session tools.

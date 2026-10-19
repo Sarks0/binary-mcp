@@ -1,0 +1,44 @@
+Error 26372a6b: boom
+NoneType: None
+factories=20 o200k min=74 median=102 max=125 mean=98
+  125 create_windbg_not_found_error              suggestions=4
+  110 create_breakpoint_set_failed_error         suggestions=4
+  109 create_module_not_loaded_error             suggestions=4
+  106 create_symbol_not_found_error              suggestions=4
+  105 create_kernel_not_connected_error          suggestions=4
+  104 create_memory_read_failed_error            suggestions=4
+  104 create_address_invalid_error               suggestions=3
+  103 create_disassembly_failed_error            suggestions=4
+  103 create_breakpoint_hw_limit_error           suggestions=3
+  102 create_kernel_driver_not_found_error       suggestions=3
+  100 create_debugger_not_connected_error        suggestions=4
+   99 create_timeout_error                       suggestions=3
+   96 create_memory_write_failed_error           suggestions=3
+   95 create_windbg_command_failed_error         suggestions=3
+   94 create_symbol_resolve_failed_error         suggestions=4
+   86 create_address_missing_error               suggestions=3
+   85 create_debugger_not_paused_error           suggestions=3
+   85 create_debugger_no_binary_error            suggestions=3
+   77 create_api_error                           suggestions=3
+   74 create_parameter_error                     suggestions=2
+---- largest example ----
+Error [WINDBG_NOT_FOUND]: WinDbg debugger not found
+Reason: Could not locate a WinDbg installation on this system
+
+Suggested actions:
+  1. Install the Windows SDK or WinDbg Preview from the Microsoft Store
+  2. Ensure WinDbg is in your system PATH or set the WINDBG_PATH environment variable
+  3. Download WinDbg Preview: https://aka.ms/windbg/download
+  4. Check both 'C:\Program Files (x86)\Windows Kits\10\Debuggers' and Microsoft Store paths
+Reference ID: 1a2b3c4d
+---- safe_error_message example ----
+24 'Error: get_pe_info\nReference ID: 26372a6b\nPlease contact support with this reference ID.'
+---- path guidance strings ----
+92 <class 'src.utils.security.PathTraversalError'> :: the path is outside the directories this server is allowed to read. Analyse files from a directory the operator exposed via BINARY_MCP_ALLOWED_DIRS (or the defa
+24 <class 'src.utils.security.FileSizeError'> :: the file is larger than this server's analysis size limit. Carve out the region of interest and analyse that instead.
+24 <class 'FileNotFoundError'> :: no file exists at the path supplied. Check the name and extension, and confirm the sample was copied onto this host.
+10 <class 'IsADirectoryError'> :: the path names a directory, not a file.
+10 <class 'NotADirectoryError'> :: a component of the path is not a directory.
+12 <class 'PermissionError'> :: this server does not have permission to read the path supplied.
+---- default confinement denial (no BINARY_MCP_ALLOWED_DIRS) ----
+393 Access denied: /etc/passwd is outside the default quarantine directories (/tmp, /tmp/claude-0/-home-user-binary-mcp/72b3831f-3b41-5165-8cb6-d19747cd4e63/scratchpad/cache, /tmp/claude-0/-home-user-binary-mcp/72b3831f-3b41-5165-8cb6-d19747cd4e63/scratchpad/home/.binary_mcp_cache, /tmp/claude-0/-home-user-binary-mcp/72b3831f-3b41-5165-8cb6-d19747cd4e63/scratchpad/xdg_cache/binary_mcp, /tmp/claude-0/-home-user-binary-mcp/72b3831f-3b41-5165-8cb6-d19747cd4e63/scratchpad/home/.cache/binary_mcp, /tmp/claude-0/-home-user-binary-mcp/72b3831f-3b41-5165-8cb6-d19747cd4e63/scratchpad/home/.binary_mcp_output). BINARY_MCP_ALLOWED_DIRS is not set, so this server confines analysis to those directories by default. To analyse files elsewhere, set BINARY_MCP_ALLOWED_DIRS to the directories you want to expose, separated by ':', e.g. BINARY_MCP_ALLOWED_DIRS=/srv/samples:/tmp/claude-0/-home-user-binary-mcp/72b3831f-3b41-5165-8cb6-d19747cd4e63/scratchpad/home/quarantine . To restore the previous unrestricted behaviour set BINARY_MCP_ALLOW_ANY_PATH=1 (not recommended: every file readable by this process then becomes reachable through this server).

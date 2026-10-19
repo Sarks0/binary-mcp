@@ -1,0 +1,15 @@
+import { createRequire } from 'node:module';
+import path from 'node:path';
+const NM = process.argv[2];
+const require = createRequire(path.join(NM, 'x.js'));
+const o = require(path.join(NM, 'gpt-tokenizer/cjs/encoding/o200k_base.js'));
+const p = (s) => console.log(JSON.stringify(s).slice(0, 70).padEnd(72), o.encode(s).length, JSON.stringify(o.encode(s).map((id) => o.decode([id]))));
+p('00400000  4d 5a 90 00 03 00 00 00  04 00 00 00 ff ff 00 00  |MZ..............|');
+p('00400000 4d5a90000300000004000000ffff0000');
+p('TVqQAAMAAAAEAAAA//8AAA==');
+p('  if (param_1 == (char *)0x0) {\n    return 0xffffffff;\n  }');
+p('{"result":"  if (param_1 == (char *)0x0) {\\n    return 0xffffffff;\\n  }"}');
+p('| FUN_00401000 | 0x00401000 | 101 |');
+p('FUN_00401000,0x00401000,101,12');
+p('{"name":"FUN_00401000","address":"0x00401000","size":101,"xrefs":12}');
+p('3f2b9c1e-8a4d-4f6b-9e2a-7c1d5b8e0f3a');

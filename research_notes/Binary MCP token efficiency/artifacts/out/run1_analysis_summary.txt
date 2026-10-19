@@ -1,0 +1,62 @@
+WIRE TOTAL {'bytes': 178213, 'chars': 178213, 'chars_div4': 44553, 'o200k': 43373, 'cl100k': 42489, 'claude_legacy': 46514}
+TOOLS ARRAY {'bytes': 178169, 'chars': 178169, 'chars_div4': 44542, 'o200k': 43357, 'cl100k': 42474, 'claude_legacy': 46500}
+PROJECTION name+desc+input {'bytes': 151824, 'chars': 151824, 'chars_div4': 37956, 'o200k': 36452, 'cl100k': 35867, 'claude_legacy': 39458}
+PROJECTION name+input {'bytes': 37834, 'chars': 37834, 'chars_div4': 9458, 'o200k': 9345, 'cl100k': 8874, 'claude_legacy': 9960}
+KEYS {'name': 147, 'description': 147, 'inputSchema': 147, 'outputSchema': 147, '_meta': 147}
+COMPONENT TOTALS
+  name           {'bytes': 3790, 'chars': 3790, 'chars_div4': 951, 'o200k': 978, 'cl100k': 968, 'claude_legacy': 1324}
+  description    {'bytes': 113843, 'chars': 113843, 'chars_div4': 28458, 'o200k': 27100, 'cl100k': 26989, 'claude_legacy': 29580}
+  inputSchema    {'bytes': 33308, 'chars': 33308, 'chars_div4': 8326, 'o200k': 8365, 'cl100k': 7904, 'claude_legacy': 8634}
+  outputSchema   {'bytes': 17725, 'chars': 17725, 'chars_div4': 4397, 'o200k': 4377, 'cl100k': 4240, 'claude_legacy': 4651}
+  _meta          {'bytes': 8473, 'chars': 8473, 'chars_div4': 2119, 'o200k': 2518, 'cl100k': 2514, 'claude_legacy': 2528}
+TOP25 share o200k 17875
+  analyze_binary                         analysis-run  tot= 1643 desc= 1333 in= 253 out= 31 meta= 19 bytes=6813
+  windbg_execute_command                 debugger      tot= 1396 desc= 1319 in=  22 out= 31 meta= 16 bytes=4875
+  diff_binaries                          detection     tot= 1059 desc=  892 in= 109 out= 31 meta= 20 bytes=4423
+  x64dbg_breakpoint                      debugger      tot= 1032 desc=  622 in= 354 out= 31 meta= 16 bytes=4381
+  load_pdb                               analysis-run  tot=  980 desc=  816 in= 105 out= 31 meta= 21 bytes=4126
+  x64dbg_trace                           debugger      tot=  820 desc=  382 in= 383 out= 31 meta= 16 bytes=3314
+  get_coverage_status                    coverage      tot=  803 desc=  715 in=  51 out= 13 meta= 15 bytes=3213
+  mark_functions_examined                coverage      tot=  788 desc=  647 in= 104 out= 13 meta= 15 bytes=3271
+  x64dbg_memory                          debugger      tot=  732 desc=  379 in= 298 out= 31 meta= 16 bytes=2971
+  scan_pseudocode                        review        tot=  615 desc=  393 in= 157 out= 31 meta= 26 bytes=2534
+  x64dbg_symbols                         debugger      tot=  607 desc=  323 in= 229 out= 31 meta= 16 bytes=2604
+  decompile_function                     decompile     tot=  593 desc=  487 in=  46 out= 31 meta= 22 bytes=2476
+  x64dbg_execution                       debugger      tot=  592 desc=  397 in= 140 out= 31 meta= 16 bytes=2469
+  reset_coverage                         coverage      tot=  579 desc=  455 in=  88 out= 13 meta= 15 bytes=2552
+  x64dbg_session                         debugger      tot=  572 desc=  277 in= 240 out= 31 meta= 16 bytes=2278
+  get_next_unreviewed                    coverage      tot=  556 desc=  432 in=  86 out= 13 meta= 15 bytes=2290
+  get_xrefs                              census        tot=  551 desc=  392 in=  98 out= 31 meta= 23 bytes=2148
+  x64dbg_annotate                        debugger      tot=  533 desc=  282 in= 194 out= 31 meta= 16 bytes=2180
+  decompile_functions                    decompile     tot=  519 desc=  379 in=  80 out= 31 meta= 22 bytes=2210
+  expand_callgraph                       decompile     tot=  502 desc=  363 in=  82 out= 31 meta= 19 bytes=2086
+  find_inlined_clones                    detection     tot=  493 desc=  380 in=  50 out= 31 meta= 23 bytes=2161
+  find_stack_strings                     detection     tot=  491 desc=  381 in=  48 out= 31 meta= 23 bytes=1962
+  extract_embedded_binaries              triage        tot=  491 desc=  378 in=  57 out= 31 meta= 16 bytes=1775
+  x64dbg_types                           debugger      tot=  476 desc=  263 in= 158 out= 31 meta= 16 bytes=1888
+  x64dbg_state                           debugger      tot=  452 desc=  151 in= 246 out= 31 meta= 16 bytes=1855
+BY CATEGORY
+  debugger      {'tools': 49, 'o200k': 14049, 'cl100k': 13675, 'bytes': 56270, 'desc_o200k': 7577, 'input_o200k': 3752}
+  detection     {'tools': 18, 'o200k': 5653, 'cl100k': 5540, 'bytes': 24046, 'desc_o200k': 3910, 'input_o200k': 701}
+  triage        {'tools': 16, 'o200k': 3944, 'cl100k': 3865, 'bytes': 15695, 'desc_o200k': 2524, 'input_o200k': 544}
+  coverage      {'tools': 6, 'o200k': 3353, 'cl100k': 3286, 'bytes': 13979, 'desc_o200k': 2676, 'input_o200k': 457}
+  census        {'tools': 14, 'o200k': 3233, 'cl100k': 3143, 'bytes': 13211, 'desc_o200k': 1712, 'input_o200k': 744}
+  analysis-run  {'tools': 3, 'o200k': 2819, 'cl100k': 2764, 'bytes': 11739, 'desc_o200k': 2251, 'input_o200k': 394}
+  decompile     {'tools': 7, 'o200k': 2461, 'cl100k': 2416, 'bytes': 10205, 'desc_o200k': 1687, 'input_o200k': 357}
+  session       {'tools': 10, 'o200k': 1782, 'cl100k': 1737, 'bytes': 7479, 'desc_o200k': 866, 'input_o200k': 383}
+  review        {'tools': 5, 'o200k': 1649, 'cl100k': 1607, 'bytes': 6910, 'desc_o200k': 1006, 'input_o200k': 336}
+  reporting     {'tools': 4, 'o200k': 1275, 'cl100k': 1252, 'bytes': 5370, 'desc_o200k': 855, 'input_o200k': 199}
+  annotation    {'tools': 4, 'o200k': 1048, 'cl100k': 1015, 'bytes': 4292, 'desc_o200k': 612, 'input_o200k': 216}
+  jobs          {'tools': 4, 'o200k': 1024, 'cl100k': 988, 'bytes': 3983, 'desc_o200k': 770, 'input_o200k': 113}
+  threat-intel  {'tools': 4, 'o200k': 695, 'cl100k': 676, 'bytes': 2702, 'desc_o200k': 367, 'input_o200k': 99}
+  admin         {'tools': 3, 'o200k': 517, 'cl100k': 508, 'bytes': 2140, 'desc_o200k': 287, 'input_o200k': 70}
+DEBUGGER {'x64dbg': 16, 'windbg': 33, 'o200k': 14049, 'x64dbg_o200k': 7824, 'windbg_o200k': 6225}
+FACETS {'runs-engine': {'tools': 41, 'o200k': 12969}, 'pseudocode-derived': {'tools': 10, 'o200k': 4664}, 'network': {'tools': 5, 'o200k': 1675}, 'code-output': {'tools': 13, 'o200k': 4307}}
+DOC SECTIONS {'Args': {'tools': 114, 'o200k': 7601, 'chars': 31856}, 'Returns': {'tools': 112, 'o200k': 2949, 'chars': 13172}, 'Notes': {'tools': 4, 'o200k': 278, 'chars': 1069}, 'Examples': {'tools': 41, 'o200k': 1002, 'chars': 3771}}
+schema params 439 with description 0 tools w/ Args and zero schema desc 114
+DESC STATS {'max': (1275, 'analyze_binary'), 'min': (9, 'windbg_pause'), 'median': 112, 'mean': 169.7, 'over_1000': 2, 'over_500': 7, 'under_100': 60}
+DESC MARKERS {'audit': 3, 'F-NN finding id': 4, 'used to / previously': 5, 'docs/ reference': 1}
+INPUT KW COUNTS {'default': 299, 'default_null': 179, 'anyOf': 179, 'anyOf_with_null': 179, 'items': 11, 'additionalProperties': 1}
+OUTPUT SHAPES {'wrapped:{"type":"string"}': 137, 'object:{"additionalProperties":true,"type":"object"}': 10}
+SCHEMA SAVINGS {'collapse anyOf[X,null] -> X': 1450, 'drop default:null': 537, 'collapse anyOf-null + drop default:null': 2165, 'drop all defaults': 998, 'drop additionalProperties': 5, 'remove outputSchema (whole tools/list)': 4240, 'remove _meta (whole tools/list)': 2528} base tools 43357 base input 7780
+DESC WHAT-IF {'strip Args': 8113, 'strip Returns': 3189, 'strip Args+Returns': 11333, 'strip Args+Returns+Examples+Notes': 12866, 'first paragraph only': 25160}

@@ -1,0 +1,2 @@
+WinDbg tools require Windows with Pybag installed.
+Install with: pip install binary-mcp[windbg]

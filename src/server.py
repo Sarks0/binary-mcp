@@ -6311,6 +6311,31 @@ def list_python_archive_contents(binary_path: str) -> str:
 _tools_registered = False
 
 
+def drop_text_output_schemas(tools: dict) -> list[str]:
+    """Remove FastMCP's auto-generated ``{"result": string}`` output schemas.
+
+    FastMCP gives every ``-> str`` tool an output schema that wraps the string
+    under ``result``, and then returns each call twice: once as text content
+    and once as ``structuredContent``. VS Code and Codex feed the structured
+    copy to the model in place of the text (others reportedly do too),
+    so the Markdown these tools format arrives as one JSON-escaped string,
+    and the wire carries roughly twice the bytes. The wrapper adds no
+    structure, so it goes. Tools returning a real object keep their schema.
+
+    Returns the names whose schema was dropped.
+    """
+    dropped = []
+    for name, tool in tools.items():
+        schema = tool.output_schema
+        if not schema or not schema.get("x-fastmcp-wrap-result"):
+            continue
+        if schema.get("properties", {}).get("result", {}).get("type") != "string":
+            continue
+        tool.output_schema = None
+        dropped.append(name)
+    return sorted(dropped)
+
+
 def register_all_tools() -> None:
     """Register every tool module on ``app`` and tag the roster from the catalog.
 
@@ -6374,14 +6399,18 @@ def register_all_tools() -> None:
     # Register job-control tools (the poll side of the async transport)
     register_job_tools(app, jobs)
 
+    tools = asyncio.run(app.get_tools())
+
     # Category/facet tags so integrators can select tools by what they do
     # (see src/tool_catalog.py). An unclassified tool is a catalog bug.
-    uncategorized = apply_tool_catalog(asyncio.run(app.get_tools()))
+    uncategorized = apply_tool_catalog(tools)
     if uncategorized:
         logger.error(
             "Tools missing from src/tool_catalog.py (tagged uncategorized): %s",
             ", ".join(uncategorized),
         )
+
+    drop_text_output_schemas(tools)
 
     # Last, not first. Set before the work, a raising register_*_tools (a bad
     # import in a tool module, a duplicate tool name) left the flag standing:

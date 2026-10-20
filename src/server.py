@@ -63,7 +63,8 @@ from src.tools.reporting import register_reporting_tools
 from src.tools.review_tools import register_review_tools
 from src.tools.triage_tools import register_triage_tools
 from src.tools.vt_tools import register_vt_tools
-from src.tools.windbg_tools import register_windbg_tools
+from src.tools.windbg_tools import _is_windows as _is_windows_host
+from src.tools.windbg_tools import _raw_windbg_enabled, register_windbg_tools
 from src.tools.yara_tools import register_yara_tools
 from src.utils.compatibility import (
     BinaryCompatibilityChecker,
@@ -6416,14 +6417,35 @@ def drop_text_output_schemas(tools: dict) -> list[str]:
     return sorted(dropped)
 
 
-def register_all_tools() -> None:
+def register_all_tools(
+    *, windows: bool | None = None, raw_windbg: bool | None = None
+) -> None:
     """Register every tool module on ``app`` and tag the roster from the catalog.
 
     Idempotent: ``main()`` and ``python -m src.tool_catalog`` both call it.
+
+    Two parts of the roster depend on the host, because a tool the host can
+    never run still costs every session its definition:
+
+    - ``windows``: the WinDbg tools drive dbgeng through Pybag, which exists
+      only on Windows, so elsewhere they are not registered at all. (The
+      x64dbg tools stay everywhere: their bridge can reach a debugger on
+      another host through ``X64DBG_HOST``.)
+    - ``raw_windbg``: ``windbg_execute_command`` refuses every call unless
+      ``BINARY_MCP_ENABLE_RAW_WINDBG`` is set, so without it the tool is not
+      listed. The tool still checks the variable at call time.
+
+    Left as None, both come from the running host and environment. The
+    catalog manifest and the tests pass explicit values, so the roster they
+    see does not depend on the machine running them.
     """
     global _tools_registered
     if _tools_registered:
         return
+    if windows is None:
+        windows = _is_windows_host()
+    if raw_windbg is None:
+        raw_windbg = _raw_windbg_enabled()
 
     # Register .NET analysis tools
     register_dotnet_tools(app)
@@ -6432,7 +6454,12 @@ def register_all_tools() -> None:
     register_dynamic_tools(app, session_manager)
 
     # Register WinDbg kernel debugging tools (with session logging)
-    register_windbg_tools(app, session_manager)
+    if windows:
+        register_windbg_tools(app, session_manager)
+        if not raw_windbg:
+            app.remove_tool("windbg_execute_command")
+    else:
+        logger.info("WinDbg tools not registered: they need Windows with Pybag")
 
     # Register VirusTotal tools
     register_vt_tools(app, session_manager)

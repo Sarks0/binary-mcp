@@ -82,7 +82,8 @@ def roster(tmp_path_factory):
 
             import src.server as server_module
 
-            server_module.register_all_tools()
+            # The full roster, whatever host runs the suite.
+            server_module.register_all_tools(windows=True, raw_windbg=True)
             tools = asyncio.run(server_module.app.get_tools())
             yield server_module.app, tools, Client
     finally:

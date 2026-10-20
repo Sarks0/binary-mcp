@@ -75,8 +75,10 @@ control, software/hardware/conditional breakpoints, register, memory and thread
 inspection, structure display (`dt`), disassembly, module and process listing,
 symbol path management, and raw WinDbg command execution.
 
-Windows only; every tool returns a platform message elsewhere. See the [WinDbg
-and kernel debugging guide](windbg-kernel-debugging.md).
+Windows only: on other hosts these tools are not registered, so they cost a
+client nothing there. `windbg_execute_command` is listed only when
+`BINARY_MCP_ENABLE_RAW_WINDBG=1` is set. See the [WinDbg and kernel debugging
+guide](windbg-kernel-debugging.md).
 
 ### .NET Analysis (ILSpyCmd) - 7 tools
 

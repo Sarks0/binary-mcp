@@ -31,8 +31,12 @@ import tempfile
 from pathlib import Path
 
 
-def load_server():
-    """Import src.server and register every tool, stubbing Ghidra if absent."""
+def load_server(windows: bool | None = None, raw_windbg: bool | None = None):
+    """Import src.server and register its tools, stubbing Ghidra if absent.
+
+    ``windows`` and ``raw_windbg`` pick the host-dependent part of the roster
+    (see register_all_tools); left None they follow this machine.
+    """
     try:
         import src.server as server_module
     except Exception:
@@ -45,7 +49,7 @@ def load_server():
         os.environ["GHIDRA_HOME"] = str(stub)
         import src.server as server_module
 
-    server_module.register_all_tools()
+    server_module.register_all_tools(windows=windows, raw_windbg=raw_windbg)
     return server_module
 
 
@@ -139,11 +143,16 @@ def _main(argv: list[str] | None = None) -> None:
         help="also ask the token-counting endpoint for real counts (needs --model)",
     )
     parser.add_argument("--model", help="model ID to count tokens for")
+    parser.add_argument(
+        "--windows",
+        action="store_true",
+        help="measure the roster a Windows host lists, whatever this host is",
+    )
     args = parser.parse_args(argv)
     if args.count_tokens and not args.model:
         parser.error("--count-tokens needs --model")
 
-    server_module = load_server()
+    server_module = load_server(windows=True if args.windows else None)
     tools = wire_tools(server_module.app)
     instructions = server_module.app.instructions or ""
     print(report(tools, instructions, args.top))

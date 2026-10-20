@@ -69,7 +69,7 @@ These are the controls described in the [security model](security.md#file-access
 | `BINARY_MCP_REQUIRE_CONFINEMENT` | Fail closed: refuse to open any binary unless `BINARY_MCP_ALLOWED_DIRS` is set explicitly | Off |
 | `BINARY_MCP_ALLOW_ANY_PATH` | Opt out of path confinement entirely. Not recommended: every file this process can read becomes reachable through the server. Warns once per process, and is ignored when `BINARY_MCP_REQUIRE_CONFINEMENT` is set | Off |
 | `BINARY_MCP_ALLOW_HARDLINKS` | Re-permit multiply linked regular files. Narrower than `BINARY_MCP_ALLOW_ANY_PATH`: directory confinement stays in force | Off |
-| `BINARY_MCP_ENABLE_RAW_WINDBG` | Enable `windbg_execute_command` behind its fail-closed allowlist | Off |
+| `BINARY_MCP_ENABLE_RAW_WINDBG` | Register and enable `windbg_execute_command` behind its fail-closed allowlist (read at startup for the tool list, and again on every call) | Off |
 
 ## Transport
 

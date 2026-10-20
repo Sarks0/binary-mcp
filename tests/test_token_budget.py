@@ -14,6 +14,7 @@ at roughly 4, so read a character budget with that ratio in mind.
 """
 
 import asyncio
+import contextlib
 import sys
 
 import pytest
@@ -27,13 +28,14 @@ def _mcp_modules() -> dict:
     }
 
 
-@pytest.fixture(scope="module")
-def roster(tmp_path_factory):
-    """Import the server against a stub Ghidra and register every tool.
+@contextlib.contextmanager
+def _server_roster(tmp_path_factory, **register_kwargs):
+    """Import the server against a stub Ghidra and register its tools.
 
     Same isolation as tests/test_tool_catalog.py: several modules swap
     ``fastmcp``/``mcp`` for MagicMocks at import time, and these budgets are
-    about the real registry.
+    about the real registry. Each use imports a fresh server module, because
+    registration is once per process.
     """
     saved = _mcp_modules()
     for name in saved:
@@ -51,7 +53,7 @@ def roster(tmp_path_factory):
 
             import src.server as server_module
 
-            server_module.register_all_tools()
+            server_module.register_all_tools(**register_kwargs)
             yield server_module, Client
     finally:
         for name in _mcp_modules():
@@ -60,6 +62,14 @@ def roster(tmp_path_factory):
         sys.modules.pop("src.server", None)
         if saved_server is not None:
             sys.modules["src.server"] = saved_server
+
+
+@pytest.fixture(scope="module")
+def roster(tmp_path_factory):
+    # A Windows host with default settings: the largest roster a client sees
+    # unless an operator opts in to the raw WinDbg tool.
+    with _server_roster(tmp_path_factory, windows=True, raw_windbg=False) as r:
+        yield r
 
 
 def _listed(roster):
@@ -353,9 +363,10 @@ class TestUntrustedEnvelopeOverhead:
 
 # tools/list as compact JSON, measured by src/token_report.py. A ratchet, not
 # a target: lower it whenever a change shrinks the list, and never raise it to
-# make room for a new tool without trimming something else. 156,303 bytes when
-# this was set.
-TOOLS_LIST_BYTE_BUDGET = 158_000
+# make room for a new tool without trimming something else. Measured on the
+# roster a Windows host lists by default (the largest a client normally
+# sees): 153,945 bytes when this was set.
+TOOLS_LIST_BYTE_BUDGET = 155_000
 
 # Clients cut tool descriptions (and server instructions) at this many
 # characters, and tool search only matches what is left.
@@ -442,3 +453,30 @@ class TestTokenCount:
             "description": "List functions.",
             "input_schema": {"type": "object", "properties": {}},
         }]
+
+
+class TestHostDependentRoster:
+    """A tool the host can never run still costs every session its definition."""
+
+    def _names(self, tmp_path_factory, **kwargs):
+        with _server_roster(tmp_path_factory, **kwargs) as r:
+            return {t.name for t in _listed(r)}
+
+    def test_windbg_tools_are_listed_only_on_windows(self, tmp_path_factory):
+        elsewhere = self._names(tmp_path_factory, windows=False, raw_windbg=True)
+        assert not any(n.startswith("windbg_") for n in elsewhere)
+        # x64dbg can reach a debugger on another host, so it stays.
+        assert any(n.startswith("x64dbg_") for n in elsewhere)
+
+    def test_raw_windbg_is_listed_only_when_enabled(self, tmp_path_factory, roster):
+        default = {t.name for t in _listed(roster)}
+        assert "windbg_status" in default
+        assert "windbg_execute_command" not in default
+        enabled = self._names(tmp_path_factory, windows=True, raw_windbg=True)
+        assert "windbg_execute_command" in enabled
+
+    def test_host_detection_follows_the_platform(self, tmp_path_factory, monkeypatch):
+        import src.tools.windbg_tools as windbg_tools
+
+        monkeypatch.setattr(windbg_tools.platform, "system", lambda: "Linux")
+        assert not any(n.startswith("windbg_") for n in self._names(tmp_path_factory))

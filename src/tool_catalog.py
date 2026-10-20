@@ -228,7 +228,7 @@ TOOL_CATALOG: dict[str, ToolEntry] = {
     "vt_check_api": _e("threat-intel", NET),
 }
 
-# The ~190 debugger tools share one shape; listing each by hand would add
+# The debugger tools share one shape; listing each by hand would add
 # nothing. Exact entries in TOOL_CATALOG win over these, which is how the
 # disassembly tools below pick up ``code-output``.
 PREFIX_RULES: dict[str, ToolEntry] = {
@@ -302,7 +302,8 @@ def _main() -> None:
 
     from src.server import app, register_all_tools
 
-    register_all_tools()
+    # The full roster, whatever host generates the manifest.
+    register_all_tools(windows=True, raw_windbg=True)
     tools = asyncio.run(app.get_tools())
     print(manifest_json(tools), end="")
 

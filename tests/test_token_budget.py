@@ -365,8 +365,8 @@ class TestUntrustedEnvelopeOverhead:
 # a target: lower it whenever a change shrinks the list, and never raise it to
 # make room for a new tool without trimming something else. Measured on the
 # roster a Windows host lists by default (the largest a client normally
-# sees): 153,945 bytes when this was set.
-TOOLS_LIST_BYTE_BUDGET = 155_000
+# sees): 146,260 bytes when this was set.
+TOOLS_LIST_BYTE_BUDGET = 147_000
 
 # Clients cut tool descriptions (and server instructions) at this many
 # characters, and tool search only matches what is left.
@@ -480,3 +480,34 @@ class TestHostDependentRoster:
 
         monkeypatch.setattr(windbg_tools.platform, "system", lambda: "Linux")
         assert not any(n.startswith("windbg_") for n in self._names(tmp_path_factory))
+
+
+class TestOptionalParameterSchemas:
+    """``x: T | None = None`` is advertised as plain ``T``, left optional."""
+
+    def test_no_parameter_advertises_a_null_branch(self, roster):
+        offenders = [
+            f"{t.name}.{name}"
+            for t in _listed(roster)
+            for name, prop in t.inputSchema.get("properties", {}).items()
+            if {"type": "null"} in prop.get("anyOf", [])
+        ]
+        assert not offenders, offenders
+
+    def test_collapsed_parameters_stay_optional(self, roster):
+        tool = next(t for t in _listed(roster) if t.name == "analyze_binary")
+        props = tool.inputSchema["properties"]
+        assert props["processor"] == {"type": "string"}
+        assert "processor" not in tool.inputSchema.get("required", [])
+
+    def test_union_keeps_its_other_branches(self, roster):
+        tool = next(t for t in _listed(roster) if t.name == "start_analysis_session")
+        tags = tool.inputSchema["properties"]["tags"]
+        assert {"type": "string"} in tags["anyOf"]
+        assert {"type": "null"} not in tags["anyOf"]
+
+    def test_null_is_still_accepted_on_call(self, roster):
+        # The signature still allows None; only the advertised schema changed.
+        result = _call(roster, "job_list", {"state": None})
+        assert not result.isError
+        assert result.content

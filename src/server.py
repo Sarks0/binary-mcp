@@ -6417,6 +6417,32 @@ def drop_text_output_schemas(tools: dict) -> list[str]:
     return sorted(dropped)
 
 
+def collapse_optional_schemas(tools: dict) -> int:
+    """Advertise ``x: T | None = None`` parameters as plain ``T``.
+
+    Pydantic renders each such parameter as ``anyOf: [T, {"type": "null"}]``
+    plus ``default: null``, which is about 15 tokens of schema per parameter
+    to say "optional", something leaving it out of ``required`` already says.
+    The function signature still accepts None, and FastMCP validates calls
+    against the signature, so a client that sends null is not refused.
+    Returns the number of parameters rewritten.
+    """
+    collapsed = 0
+    for tool in tools.values():
+        properties = (tool.parameters or {}).get("properties", {})
+        for name, prop in list(properties.items()):
+            variants = prop.get("anyOf")
+            if not variants or "default" not in prop or prop["default"] is not None:
+                continue
+            kept = [v for v in variants if v != {"type": "null"}]
+            if len(kept) == len(variants) or not kept:
+                continue
+            rest = {k: v for k, v in prop.items() if k not in ("anyOf", "default")}
+            properties[name] = {**kept[0], **rest} if len(kept) == 1 else {"anyOf": kept, **rest}
+            collapsed += 1
+    return collapsed
+
+
 def register_all_tools(
     *, windows: bool | None = None, raw_windbg: bool | None = None
 ) -> None:
@@ -6518,6 +6544,7 @@ def register_all_tools(
         )
 
     drop_text_output_schemas(tools)
+    collapse_optional_schemas(tools)
 
     # One output budget for every tool that can return code (see
     # src/utils/output_budget.py). The decompile tools page themselves; this

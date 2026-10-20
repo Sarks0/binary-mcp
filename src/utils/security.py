@@ -1398,22 +1398,16 @@ def safe_error_message(
             f"Diagnostic:\n{diagnostic}"
         )
 
-    # Only our own security exceptions. FileNotFoundError and PermissionError
-    # are in PATH_ERROR_GUIDANCE for callers that already know the failure is
-    # a path check (safe_path_error). Routing every one of those through here
-    # would mis-label a missing Ghidra binary or a locked job file as a bad
-    # sample path. PathTraversalError and FileSizeError are not raised for
-    # those.
-    guidance = (
-        path_error_guidance(internal_details)
-        if isinstance(internal_details, (PathTraversalError, FileSizeError))
-        else None
-    )
-    if guidance:
-        return (
-            f"Error: {user_message}\n"
-            f"Reference ID: {error_id}\n"
-            f"{guidance}"
-        )
+    # #33 added a second guidance branch here, for PathTraversalError and
+    # FileSizeError, while this branch was routing the same two types (plus
+    # IsADirectoryError) through path_refusal_message above. Rebasing brought
+    # both into one function, where the later one was unreachable: the routed
+    # branch returns first for exactly those types, and it falls through only
+    # when path_error_guidance returns None -- the same lookup this branch
+    # would then repeat. Removed rather than left dead, because two renderers
+    # for one refusal is the drift path_refusal_message exists to close, and a
+    # dead branch that formats differently is one narrowing of the type list
+    # away from being live again. Its reasoning about FileNotFoundError and
+    # PermissionError is the same as the routed branch's and is recorded there.
 
     return f"Error: {user_message}\nReference ID: {error_id}\nPlease contact support with this reference ID."

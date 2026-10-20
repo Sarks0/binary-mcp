@@ -247,7 +247,18 @@ class TestPathDenialStaysActionable:
         assert "BINARY_MCP_ALLOWED_DIRS" in out
         assert "Please contact support" not in out
         assert_has_reference_id(out)
-        assert out.splitlines()[0] == "Error: Invalid binary file or path"
+        # Reconciled with the single renderer this branch introduced: the first
+        # line now names what was refused and its category ("Error: Invalid
+        # path -- the path is outside ...") instead of repeating the caller's
+        # user_message, and the reference ID is the last line, which is how
+        # every refusal in the project ends -- clean_cache's extra guidance and
+        # the confinement sweep's helper both rely on that position. The
+        # property this assertion was added for, that the reply opens by
+        # saying what was refused and carries no path, is asserted directly.
+        first = out.splitlines()[0]
+        assert first.startswith("Error: Invalid"), first
+        assert LEAK_MARKER not in first
+        assert out.strip().splitlines()[-1].startswith("Reference ID:")
 
     def test_unmapped_exception_stays_opaque(self):
         from src.utils.security import safe_error_message

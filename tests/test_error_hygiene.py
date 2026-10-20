@@ -111,6 +111,118 @@ class TestSafeToolError:
         assert_has_reference_id(out)
 
 
+class TestPathDenialStaysActionable:
+    """A confinement denial must name the variable, never the host layout.
+
+    Routing PathTraversalError through safe_error_message used to collapse it
+    to "Please contact support", which is indistinguishable from a crash.
+    """
+
+    def test_path_denial_keeps_guidance_and_drops_the_path(self):
+        from src.utils.security import PathTraversalError, safe_error_message
+
+        err = PathTraversalError(
+            f"Access denied: {LEAK_MARKER} is outside the default quarantine "
+            f"directories ({HOME}/ghidra_mcp_cache)."
+        )
+        out = safe_error_message("Invalid binary file or path", err)
+
+        assert_no_host_leak(out)
+        assert LEAK_MARKER not in out
+        assert "ghidra_mcp_cache" not in out
+        assert "BINARY_MCP_ALLOWED_DIRS" in out
+        assert "Please contact support" not in out
+        assert_has_reference_id(out)
+        assert out.splitlines()[0] == "Error: Invalid binary file or path"
+
+    def test_unmapped_exception_stays_opaque(self):
+        from src.utils.security import safe_error_message
+
+        out = safe_error_message("Analysis failed unexpectedly", OSError(LEAK_MARKER))
+
+        assert_no_host_leak(out)
+        assert "Please contact support" in out
+        assert "BINARY_MCP_ALLOWED_DIRS" not in out
+
+    def test_file_size_denial_names_the_limit_not_the_path(self):
+        from src.utils.security import FileSizeError, safe_error_message
+
+        err = FileSizeError(f"File too large: {LEAK_MARKER} is 900000000 bytes")
+        out = safe_error_message("Invalid binary file or path", err)
+
+        assert_no_host_leak(out)
+        assert LEAK_MARKER not in out
+        assert "size limit" in out
+        assert "Please contact support" not in out
+
+    def test_status_line_does_not_list_configured_directories(self, monkeypatch):
+        import os
+
+        from src.utils.security import confinement_status_line
+
+        monkeypatch.delenv("BINARY_MCP_ALLOW_ANY_PATH", raising=False)
+        monkeypatch.delenv("BINARY_MCP_REQUIRE_CONFINEMENT", raising=False)
+        # os.pathsep, not a hardcoded colon: Windows splits on ';', and a
+        # colon-joined value is one entry there.
+        monkeypatch.setenv(
+            "BINARY_MCP_ALLOWED_DIRS",
+            os.pathsep.join((f"{HOME}/secret-samples", "/srv/quarantine")),
+        )
+
+        text = confinement_status_line()
+
+        assert "2" in text
+        assert "BINARY_MCP_ALLOWED_DIRS" in text
+        assert HOME not in text
+        assert "secret-samples" not in text
+        assert "/srv/quarantine" not in text
+
+    def test_status_line_names_the_unset_posture(self, monkeypatch):
+        from src.utils.security import confinement_status_line
+
+        monkeypatch.delenv("BINARY_MCP_ALLOWED_DIRS", raising=False)
+        monkeypatch.delenv("BINARY_MCP_ALLOW_ANY_PATH", raising=False)
+        monkeypatch.delenv("BINARY_MCP_REQUIRE_CONFINEMENT", raising=False)
+
+        text = confinement_status_line()
+
+        assert "default quarantine" in text
+        assert "BINARY_MCP_ALLOWED_DIRS" in text
+        assert HOME not in text
+        assert "/tmp" not in text
+
+    def test_explicit_list_wins_over_allow_any_path(self, monkeypatch):
+        import os
+
+        from src.utils.security import confinement_status_line
+
+        monkeypatch.setenv("BINARY_MCP_ALLOW_ANY_PATH", "1")
+        monkeypatch.setenv("BINARY_MCP_ALLOWED_DIRS", os.pathsep.join(("/srv/a", "/srv/b")))
+        text = confinement_status_line()
+        assert "explicit allow-list" in text
+        assert "disabled" not in text
+
+    def test_require_confinement_wins_over_allow_any_path(self, monkeypatch):
+        from src.utils.security import confinement_status_line
+
+        monkeypatch.delenv("BINARY_MCP_ALLOWED_DIRS", raising=False)
+        monkeypatch.setenv("BINARY_MCP_ALLOW_ANY_PATH", "1")
+        monkeypatch.setenv("BINARY_MCP_REQUIRE_CONFINEMENT", "1")
+        text = confinement_status_line()
+        assert "refuse every path" in text
+        assert "disabled" not in text
+
+    def test_unrelated_file_not_found_stays_opaque(self):
+        from src.utils.security import safe_error_message
+
+        err = FileNotFoundError(2, "analyzeHeadless not found", LEAK_MARKER)
+        out = safe_error_message("analyze_binary failed", err)
+        assert_no_host_leak(out)
+        assert "Please contact support" in out
+        assert "no file exists" not in out
+
+
+
 class TestCuratedStructuredText:
     def test_debug_info_block_is_dropped(self):
         """

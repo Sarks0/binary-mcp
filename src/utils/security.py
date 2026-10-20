@@ -975,6 +975,44 @@ def get_allowed_dirs() -> list[Path] | None:
     return [Path(d.strip()) for d in dirs_config.split(os.pathsep) if d.strip()]
 
 
+def confinement_status_line() -> str:
+    """One non-disclosing line describing the path-confinement posture.
+
+    ``diagnose_setup`` prints this. The configured directories are host layout
+    (audit F-10), so the line names the posture and the variable that changes
+    it, never the paths. A model that only sees "Setup looks good" cannot tell
+    a healthy Ghidra install from a confinement denial.
+    """
+    # Same order as sanitize_binary_path. An explicit allow-list wins over
+    # both flags. With no list, REQUIRE_CONFINEMENT wins over ALLOW_ANY_PATH
+    # (the looser flag must not downgrade a demanded hard boundary). Checking
+    # ALLOW_ANY_PATH first would report "disabled" while the server still
+    # confined, or still refused every path.
+    configured = get_allowed_dirs()
+    if configured:
+        noun = "entry" if len(configured) == 1 else "entries"
+        return (
+            f"Path confinement: explicit allow-list "
+            f"({len(configured)} {ENV_ALLOWED_DIRS} {noun})."
+        )
+    if _confinement_required():
+        return (
+            f"Path confinement: required ({ENV_REQUIRE_CONFINEMENT} is set) "
+            f"but {ENV_ALLOWED_DIRS} is not configured. Binary tools will "
+            f"refuse every path until it is set."
+        )
+    if _unrestricted_access_requested():
+        return (
+            f"Path confinement: disabled ({ENV_ALLOW_ANY_PATH} is set). "
+            f"Every file this process can read is reachable through this server."
+        )
+    return (
+        f"Path confinement: default quarantine ({ENV_ALLOWED_DIRS} is unset). "
+        f"Only the system temp directory and this server's own cache and "
+        f"output directories are readable. Set {ENV_ALLOWED_DIRS} to analyse "
+        f"files elsewhere."
+    )
+
 # Non-disclosing text for path-validation failures (audit F-10)
 #
 # The MESSAGE of a confinement failure is itself host state. _default_confinement
@@ -1109,6 +1147,11 @@ def safe_error_message(
     """
     Create a safe error message for users without exposing internals.
 
+    A path-validation failure keeps the non-disclosing guidance from
+    :func:`path_error_guidance` (which variable to set, not which directories
+    are configured). Collapsing that case to "contact support" is what makes a
+    confinement denial look like a broken server.
+
     Args:
         user_message: User-friendly error description
         internal_details: Exception or details to log internally
@@ -1135,6 +1178,24 @@ def safe_error_message(
             f"Error: {user_message}\n"
             f"Reference ID: {error_id}\n\n"
             f"Diagnostic:\n{diagnostic}"
+        )
+
+    # Only our own security exceptions. FileNotFoundError and PermissionError
+    # are in PATH_ERROR_GUIDANCE for callers that already know the failure is
+    # a path check (safe_path_error). Routing every one of those through here
+    # would mis-label a missing Ghidra binary or a locked job file as a bad
+    # sample path. PathTraversalError and FileSizeError are not raised for
+    # those.
+    guidance = (
+        path_error_guidance(internal_details)
+        if isinstance(internal_details, (PathTraversalError, FileSizeError))
+        else None
+    )
+    if guidance:
+        return (
+            f"Error: {user_message}\n"
+            f"Reference ID: {error_id}\n"
+            f"{guidance}"
         )
 
     return f"Error: {user_message}\nReference ID: {error_id}\nPlease contact support with this reference ID."

@@ -74,16 +74,19 @@ model has no way to know the data was truncated.
 
 PR #114 added pagination + summary mode to the noisiest tools:
 
-- `scan_pseudocode(summary_only=True, offset=N, limit=M)` returns one
-  line per finding instead of full pseudocode excerpts; combine with
-  offset/limit to walk the result set without overflowing.
+- `scan_pseudocode(mode="summary", offset=N, limit=M)` returns one line
+  per function instead of full pseudocode excerpts; combine with
+  offset/limit to walk the result set without overflowing. Summary is now
+  the default; `mode="findings"` gives the full report.
 - `analyze_binary(skip_decompile=True)` skips per-function pseudocode
   entirely - large structural metadata only.
 
 When adding new tools that can produce large payloads, follow the same
-pattern: surface a `summary_only` flag and `offset`/`limit` for
-pagination so the model can drive the cut intentionally rather than
-discovering it post-hoc.
+pattern: default to the compact form, surface the full one behind a
+`mode` or `detail` argument, and take `offset`/`limit` for pagination so
+the model can drive the cut intentionally rather than discovering it
+post-hoc. Tools that return code share the budget in
+`src/utils/output_budget.py`.
 
 ### Client-side fix (optional, on opencode itself)
 

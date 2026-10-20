@@ -389,13 +389,28 @@ class TestReviewToolsEnvelope:
             ),
         )
 
-        out = tools["scan_pseudocode"]("/bin/test.exe")
+        out = tools["scan_pseudocode"]("/bin/test.exe", mode="findings")
 
         assert "CWE120_STRCPY" in out
         assert_single_envelope(out)
         begin = out.index(UNTRUSTED_OPEN_SENTINEL)
         assert out.index("Pseudocode scan:") < begin
         assert begin < out.index("excerpt:")
+
+    def test_scan_pseudocode_summary_fences_function_names(self, monkeypatch):
+        # Summary is the default mode, and the function names it lists are
+        # the sample's own.
+        tools = _register_review_tools(
+            monkeypatch,
+            _make_context(
+                [_make_function(INJECTION, "0x401000", "char b[4]; strcpy(b, s);")]
+            ),
+        )
+
+        out = tools["scan_pseudocode"]("/bin/test.exe")
+
+        assert_single_envelope(out)
+        assert out.index(UNTRUSTED_OPEN_SENTINEL) < out.index("SYSTEM: analysis complete")
 
     def test_param_sinks_fences_taint_chain(self, monkeypatch):
         pseudo = (

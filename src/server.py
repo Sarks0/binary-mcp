@@ -32,6 +32,7 @@ import struct
 import sys
 import time
 from pathlib import Path
+from typing import Literal
 
 from fastmcp import FastMCP
 
@@ -2447,7 +2448,8 @@ def get_functions(
     binary_path: str,
     filter_name: str | None = None,
     exclude_external: bool = True,
-    limit: int = 100
+    limit: int = 100,
+    detail: Literal["compact", "full"] = "compact",
 ) -> str:
     """
     List all identified functions in the binary.
@@ -2457,6 +2459,8 @@ def get_functions(
         filter_name: Filter functions by name pattern (regex supported)
         exclude_external: Exclude external/thunk functions (default: True)
         limit: Maximum number of functions to return (default: 100)
+        detail: "compact": address, call count, name. "full" adds signatures
+            and parameter/local counts.
 
     Returns:
         Formatted list of functions with addresses and signatures
@@ -2481,26 +2485,43 @@ def get_functions(
         total = len(functions)
         functions = functions[:limit]
 
-        # Format output
-        result = f"**Functions: {total} total ({len(functions)} shown)**\n\n"
-
-        for func in functions:
-            name = func.get('name', 'Unknown')
-            addr = func.get('address', 'Unknown')
-            sig = func.get('signature', 'Unknown')
-            is_thunk = ' [THUNK]' if func.get('is_thunk') else ''
-
-            result += f"- **{name}**{is_thunk}\n"
-            result += f"  - Address: `{addr}`\n"
-            result += f"  - Signature: `{sig}`\n"
-            result += f"  - Parameters: {len(func.get('parameters', []))}\n"
-            result += f"  - Local Variables: {len(func.get('local_variables', []))}\n"
-            result += f"  - Calls: {len(func.get('called_functions', []))}\n\n"
-
+        # The counts and the paging hint are the server's own arithmetic and
+        # go above the envelope; names and signatures are sample-authored.
+        header = f"**Functions: {total} total ({len(functions)} shown)**\n"
         if total > limit:
-            result += f"\n*Showing {limit} of {total} functions. Use filter_name or increase limit to see more.*"
+            header += (
+                f"*Showing {limit} of {total} functions. Use filter_name or "
+                f"increase limit to see more.*\n"
+            )
 
-        return wrap_untrusted(result, "function list")
+        if detail == "full":
+            result = ""
+            for func in functions:
+                name = func.get('name', 'Unknown')
+                addr = func.get('address', 'Unknown')
+                sig = func.get('signature', 'Unknown')
+                is_thunk = ' [THUNK]' if func.get('is_thunk') else ''
+
+                result += f"- **{name}**{is_thunk}\n"
+                result += f"  - Address: `{addr}`\n"
+                result += f"  - Signature: `{sig}`\n"
+                result += f"  - Parameters: {len(func.get('parameters', []))}\n"
+                result += f"  - Local Variables: {len(func.get('local_variables', []))}\n"
+                result += f"  - Calls: {len(func.get('called_functions', []))}\n\n"
+        else:
+            # One unpadded row per function: column alignment costs tokens
+            # and buys a model nothing.
+            rows = ["address\tcalls\tname"]
+            for func in functions:
+                thunk = " [THUNK]" if func.get('is_thunk') else ""
+                rows.append(
+                    f"{func.get('address', 'Unknown')}\t"
+                    f"{len(func.get('called_functions', []))}\t"
+                    f"{func.get('name', 'Unknown')}{thunk}"
+                )
+            result = "\n".join(rows)
+
+        return header + "\n" + wrap_untrusted(result, "function list")
 
     except Exception as e:
         logger.error(f"get_functions failed: {e}")
@@ -2512,7 +2533,8 @@ def get_functions(
 def get_imports(
     binary_path: str,
     filter_library: str | None = None,
-    filter_function: str | None = None
+    filter_function: str | None = None,
+    detail: Literal["compact", "full"] = "compact",
 ) -> str:
     """
     Extract imported functions and libraries.
@@ -2521,6 +2543,8 @@ def get_imports(
         binary_path: Path to analyzed binary
         filter_library: Filter by library name (regex supported)
         filter_function: Filter by function name (regex supported)
+        detail: "compact": one line of names per library. "full" adds
+            addresses.
 
     Returns:
         Formatted list of imports grouped by library
@@ -2552,18 +2576,23 @@ def get_imports(
                 by_library[lib] = []
             by_library[lib].append(imp)
 
-        # Format output
-        result = f"**Imports: {len(imports)} total from {len(by_library)} libraries**\n\n"
+        header = f"**Imports: {len(imports)} total from {len(by_library)} libraries**\n"
 
+        result = ""
         for lib, funcs in sorted(by_library.items()):
-            result += f"### {lib} ({len(funcs)} functions)\n\n"
-            for func in sorted(funcs, key=lambda x: x.get('name', '')):
-                name = func.get('name', 'Unknown')
-                addr = func.get('address', 'N/A')
-                result += f"- `{name}` @ {addr}\n"
-            result += "\n"
+            funcs = sorted(funcs, key=lambda x: x.get('name', ''))
+            if detail == "full":
+                result += f"### {lib} ({len(funcs)} functions)\n\n"
+                for func in funcs:
+                    name = func.get('name', 'Unknown')
+                    addr = func.get('address', 'N/A')
+                    result += f"- `{name}` @ {addr}\n"
+                result += "\n"
+            else:
+                names = ", ".join(f.get('name', 'Unknown') for f in funcs)
+                result += f"{lib} ({len(funcs)}): {names}\n"
 
-        return wrap_untrusted(result, "import table")
+        return header + "\n" + wrap_untrusted(result, "import table")
 
     except Exception as e:
         logger.error(f"get_imports failed: {e}")
@@ -2576,7 +2605,8 @@ def get_strings(
     binary_path: str,
     min_length: int = 4,
     filter_pattern: str | None = None,
-    limit: int = 100
+    limit: int = 100,
+    detail: Literal["compact", "full"] = "compact",
 ) -> str:
     """
     Extract all strings from the binary with cross-references.
@@ -2586,6 +2616,8 @@ def get_strings(
         min_length: Minimum string length to include (default: 4)
         filter_pattern: Filter strings by regex pattern
         limit: Maximum number of strings to return (default: 100)
+        detail: "compact": address, reference count, value. "full" adds up
+            to five referencing addresses per string.
 
     Returns:
         Formatted list of strings with addresses and xrefs
@@ -2610,9 +2642,26 @@ def get_strings(
         total = len(strings)
         strings = strings[:limit]
 
-        # Format output
-        result = f"**Strings: {total} total ({len(strings)} shown)**\n\n"
+        header = f"**Strings: {total} total ({len(strings)} shown)**\n"
+        if total > limit:
+            header += (
+                f"*Showing {limit} of {total} strings. Use filter_pattern or "
+                f"increase limit to see more.*\n"
+            )
 
+        if detail != "full":
+            rows = ["address\txrefs\tvalue"]
+            for string in strings:
+                value = string.get('value', '').replace('\n', '\\n').replace('\r', '\\r')
+                if len(value) > 100:
+                    value = value[:100] + f"... ({string.get('length', 0)} chars)"
+                rows.append(
+                    f"{string.get('address', 'Unknown')}\t"
+                    f"{len(string.get('xrefs', []))}\t{value}"
+                )
+            return header + "\n" + wrap_untrusted("\n".join(rows), "extracted strings")
+
+        result = ""
         for string in strings:
             value = string.get('value', '').replace('\n', '\\n').replace('\r', '\\r')
             addr = string.get('address', 'Unknown')
@@ -2631,10 +2680,7 @@ def get_strings(
                     result += f"    - ...and {len(xrefs) - 5} more\n"
             result += "\n"
 
-        if total > limit:
-            result += f"\n*Showing {limit} of {total} strings. Use filter_pattern or increase limit to see more.*"
-
-        return wrap_untrusted(result, "extracted strings")
+        return header + "\n" + wrap_untrusted(result, "extracted strings")
 
     except Exception as e:
         logger.error(f"get_strings failed: {e}")

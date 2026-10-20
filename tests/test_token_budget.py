@@ -511,3 +511,66 @@ class TestOptionalParameterSchemas:
         result = _call(roster, "job_list", {"state": None})
         assert not result.isError
         assert result.content
+
+
+def _listing_context():
+    functions = [
+        {
+            "name": f"FUN_{0x401000 + i * 0x40:08x}",
+            "address": f"0x{0x401000 + i * 0x40:08x}",
+            "signature": f"undefined4 FUN_{0x401000 + i * 0x40:08x}(int param_1, char *param_2)",
+            "parameters": [{}, {}],
+            "local_variables": [{}] * 6,
+            "called_functions": [{}] * (i % 7),
+        }
+        for i in range(100)
+    ]
+    strings = [
+        {"value": f"https://c2-{i}.example.com/gate.php", "address": f"0x{0x420000 + i * 0x30:08x}",
+         "length": 36, "xrefs": [{"from": "0x401000", "type": "DATA"}] * 3}
+        for i in range(100)
+    ]
+    imports = [
+        {"name": f"Api{i}", "library": f"LIB{i % 6}.DLL", "address": f"0x{0x450000 + i * 8:08x}"}
+        for i in range(180)
+    ]
+    return {"functions": functions, "strings": strings, "imports": imports, "metadata": {}}
+
+
+class TestCompactListings:
+    """Listings default to one unpadded row per item; detail="full" keeps
+    the old layout. Counts and paging sit above the envelope."""
+
+    @pytest.fixture
+    def listing(self, roster, monkeypatch):
+        server_module, _ = roster
+        ctx = _listing_context()
+        monkeypatch.setattr(server_module, "get_analysis_context", lambda *a, **k: ctx)
+        return server_module
+
+    @pytest.mark.parametrize(
+        ("tool", "kwargs", "max_ratio"),
+        [
+            ("get_functions", {}, 0.5),
+            ("get_strings", {}, 0.6),
+            ("get_imports", {}, 0.5),
+        ],
+    )
+    def test_compact_is_much_smaller_than_full(self, listing, tool, kwargs, max_ratio):
+        fn = getattr(listing, tool).fn
+        compact = fn("/bin/x.exe", **kwargs)
+        full = fn("/bin/x.exe", detail="full", **kwargs)
+        assert len(compact) < max_ratio * len(full), (len(compact), len(full))
+
+    def test_counts_and_paging_hint_sit_above_the_envelope(self, listing):
+        from src.utils.formatters import UNTRUSTED_OPEN_SENTINEL
+
+        out = listing.get_functions.fn("/bin/x.exe", limit=10)
+        begin = out.index(UNTRUSTED_OPEN_SENTINEL)
+        assert out.index("**Functions: 100 total (10 shown)**") < begin
+        assert out.index("Showing 10 of 100 functions") < begin
+        assert "address\tcalls\tname" in out
+
+    def test_scan_pseudocode_defaults_to_summary(self, roster):
+        tool = next(t for t in _listed(roster) if t.name == "scan_pseudocode")
+        assert tool.inputSchema["properties"]["mode"]["default"] == "summary"

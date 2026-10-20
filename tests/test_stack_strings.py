@@ -344,6 +344,37 @@ class TestToolIntegration:
         assert "build_url" in output
         assert "http://malware.example.com/c2" in output
 
+    def test_output_is_limited_highest_confidence_first(self, tmp_path):
+        from src.tools.malware_tools import register_malware_tools
+        from src.utils.patterns import APIPatterns
+
+        pe_path = tmp_path / "fake.exe"
+        pe_path.write_bytes(b"MZ" + b"\x00" * 128)
+
+        app, registered = self._make_app_and_collect_tools()
+        cache = MagicMock()
+        ctx = {
+            "metadata": {"name": "fake.exe"},
+            "functions": [
+                {
+                    "name": f"build_{i}", "address": f"0x40{i:04x}",
+                    "called_functions": [],
+                    "pseudocode": _local_byte_writes(f"http://c2-{i}.example/x".encode()),
+                    "basic_blocks": [], "parameters": [],
+                    "local_variables": [], "is_thunk": False, "is_external": False,
+                }
+                for i in range(12)
+            ],
+            "imports": [], "strings": [], "memory_map": [],
+        }
+        cache.get_cached.return_value = ctx
+
+        register_malware_tools(app, MagicMock(), cache, MagicMock(), APIPatterns())
+        output = registered["find_stack_strings"](str(pe_path), limit=5)
+
+        assert "Showing 5 of 12 strings" in output
+        assert output.count("http://c2-") == 5
+
     def test_ioc_only_filters_through(self, tmp_path):
         from src.tools.malware_tools import register_malware_tools
         from src.utils.patterns import APIPatterns

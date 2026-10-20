@@ -574,3 +574,71 @@ class TestCompactListings:
     def test_scan_pseudocode_defaults_to_summary(self, roster):
         tool = next(t for t in _listed(roster) if t.name == "scan_pseudocode")
         assert tool.inputSchema["properties"]["mode"]["default"] == "summary"
+
+
+SESSION_ID = "123e4567-e89b-42d3-a456-426614174000"
+
+
+def _session(n_calls: int, output_chars: int) -> dict:
+    return {
+        "session_id": SESSION_ID,
+        "name": "triage",
+        "binary_name": "sample.exe",
+        "binary_hash": "ab" * 32,
+        "created_at": 0,
+        "tool_calls": [
+            {
+                "tool_name": f"decompile_function_{i}",
+                "timestamp": 0,
+                "arguments": {"function_name": f"FUN_{i:08x}"},
+                "output": "x" * output_chars,
+                "analysis_type": "static",
+            }
+            for i in range(n_calls)
+        ],
+    }
+
+
+class TestBoundedTools:
+    """Tools that used to return everything now return a page and say so."""
+
+    @pytest.fixture
+    def server(self, roster, monkeypatch):
+        server_module, _ = roster
+        ctx = _listing_context()
+        monkeypatch.setattr(server_module, "get_analysis_context", lambda *a, **k: ctx)
+        return server_module
+
+    def test_get_imports_is_limited_and_says_so(self, server):
+        out = server.get_imports.fn("/bin/x.exe", limit=10)
+        assert "Showing 10 of 180 imports" in out
+        assert out.count("Api") == 10
+
+    def test_small_session_replays_in_full(self, server, monkeypatch):
+        monkeypatch.setattr(
+            server.session_manager, "get_session", lambda sid: _session(3, 100)
+        )
+        out = server.load_full_session.fn(SESSION_ID)
+        assert "x" * 100 in out
+        assert "digest" not in out
+
+    def test_large_session_replays_as_a_digest(self, server, monkeypatch):
+        monkeypatch.setattr(
+            server.session_manager, "get_session", lambda sid: _session(20, 5_000)
+        )
+        out = server.load_full_session.fn(SESSION_ID)
+        assert "this is a digest" in out
+        assert "x" * 200 not in out
+        assert "decompile_function_19\t5,000 chars" in out
+        assert len(out) < 5_000
+
+    def test_session_section_pages_tool_calls(self, server, monkeypatch):
+        monkeypatch.setattr(
+            server.session_manager,
+            "get_section",
+            lambda **kw: {"tool_calls": _session(25, 50)["tool_calls"]},
+        )
+        out = server.load_session_section.fn(SESSION_ID, "tools", offset=10, limit=5)
+        assert out.startswith("*Calls 11-15 of 25. Next: offset=15.*")
+        assert "decompile_function_10" in out and "decompile_function_14" in out
+        assert "decompile_function_15" not in out

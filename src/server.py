@@ -2535,6 +2535,7 @@ def get_imports(
     filter_library: str | None = None,
     filter_function: str | None = None,
     detail: Literal["compact", "full"] = "compact",
+    limit: int = 500,
 ) -> str:
     """
     Extract imported functions and libraries.
@@ -2545,11 +2546,10 @@ def get_imports(
         filter_function: Filter by function name (regex supported)
         detail: "compact": one line of names per library. "full" adds
             addresses.
-
-    Returns:
-        Formatted list of imports grouped by library
+        limit: Maximum number of imports to return (default: 500)
     """
     try:
+        limit = validate_numeric_range(limit, 1, 100_000, "limit")
         context = get_analysis_context(binary_path)
         imports = context.get("imports", [])
 
@@ -2568,6 +2568,11 @@ def get_imports(
             except ValueError as e:
                 return f"Error: Invalid filter_function pattern: {e}"
 
+        total = len(imports)
+        imports = sorted(
+            imports, key=lambda i: (i.get('library', 'Unknown'), i.get('name', ''))
+        )[:limit]
+
         # Group by library
         by_library = {}
         for imp in imports:
@@ -2576,7 +2581,12 @@ def get_imports(
                 by_library[lib] = []
             by_library[lib].append(imp)
 
-        header = f"**Imports: {len(imports)} total from {len(by_library)} libraries**\n"
+        header = f"**Imports: {total} total from {len(by_library)} libraries**\n"
+        if total > limit:
+            header += (
+                f"*Showing {limit} of {total} imports. Use filter_library or "
+                f"filter_function, or increase limit, to see more.*\n"
+            )
 
         result = ""
         for lib, funcs in sorted(by_library.items()):
@@ -3995,7 +4005,8 @@ def get_call_graph(
 def find_api_calls(
     binary_path: str,
     category: str | None = None,
-    suspicious_only: bool = False
+    suspicious_only: bool = False,
+    limit: int = 50,
 ) -> str:
     """
     Find Windows API calls categorized by behavior.
@@ -4004,11 +4015,13 @@ def find_api_calls(
         binary_path: Path to analyzed binary
         category: Filter by category (process, memory, file, network, registry, crypto, anti-debug)
         suspicious_only: Only return high-risk APIs (default: False)
+        limit: Maximum number of APIs to return, most severe first (default: 50)
 
     Returns:
-        Categorized API calls with severity ratings
+        API calls by category, with severity and calling functions
     """
     try:
+        limit = validate_numeric_range(limit, 1, 10_000, "limit")
         context = get_analysis_context(binary_path)
         imports = context.get("imports", [])
         functions = context.get("functions", [])
@@ -4042,8 +4055,19 @@ def find_api_calls(
                     'call_sites': call_sites
                 })
 
-        # Format output
-        result = f"**API Calls Analysis: {len(api_calls)} APIs found**\n\n"
+        total = len(api_calls)
+        rank = {'critical': 0, 'high': 1, 'medium': 2, 'low': 3}
+        api_calls = sorted(
+            api_calls, key=lambda a: (rank.get(a['severity'], 4), a['name'])
+        )[:limit]
+
+        header = f"**API Calls Analysis: {total} APIs found**\n"
+        if total > limit:
+            header += (
+                f"*Showing the {limit} most severe of {total}. Use category or "
+                f"suspicious_only, or increase limit, to see more.*\n"
+            )
+        result = ""
 
         # Group by category
         by_category = {}
@@ -4070,7 +4094,7 @@ def find_api_calls(
                     result += f"  Called from: {', '.join(api['call_sites'][:5])}\n"
                 result += "\n"
 
-        return wrap_untrusted(result, "API call sites")
+        return header + "\n" + wrap_untrusted(result, "API call sites")
 
     except Exception as e:
         logger.error(f"find_api_calls failed: {e}")
@@ -4080,22 +4104,27 @@ def find_api_calls(
 @app.tool()
 @log_to_session
 def get_memory_map(
-    binary_path: str
+    binary_path: str,
+    limit: int = 100,
 ) -> str:
     """
-    Extract memory layout and sections with entropy analysis.
+    List the memory sections: ranges, sizes, permissions and initialization.
 
     Args:
         binary_path: Path to analyzed binary
-
-    Returns:
-        Memory map with section details and entropy
+        limit: Maximum number of sections to return (default: 100)
     """
     try:
+        limit = validate_numeric_range(limit, 1, 100_000, "limit")
         context = get_analysis_context(binary_path)
         memory_blocks = context.get("memory_map", [])
+        total = len(memory_blocks)
+        memory_blocks = memory_blocks[:limit]
 
-        result = f"**Memory Map: {len(memory_blocks)} sections**\n\n"
+        header = f"**Memory Map: {total} sections**\n"
+        if total > limit:
+            header += f"*Showing the first {limit} of {total}. Increase limit to see more.*\n"
+        result = ""
 
         for block in memory_blocks:
             name = block.get('name', 'Unknown')
@@ -4120,7 +4149,7 @@ def get_memory_map(
                 result += f"- Comment: {block.get('comment')}\n"
             result += "\n"
 
-        return wrap_untrusted(result, "section layout")
+        return header + "\n" + wrap_untrusted(result, "section layout")
 
     except Exception as e:
         logger.error(f"get_memory_map failed: {e}")
@@ -4353,24 +4382,29 @@ def search_bytes(
 @app.tool()
 @log_to_session
 def detect_crypto(
-    binary_path: str
+    binary_path: str,
+    limit: int = 50,
 ) -> str:
     """
     Identify cryptographic constants and algorithms.
 
     Args:
         binary_path: Path to analyzed binary
-
-    Returns:
-        List of detected cryptographic patterns
+        limit: Maximum number of detections to return (default: 50)
     """
     try:
+        limit = validate_numeric_range(limit, 1, 10_000, "limit")
         context = get_analysis_context(binary_path)
-
-        result = "**Cryptography Detection**\n\n"
 
         # Search for crypto constants in functions and strings
         detected = crypto_patterns.detect_in_context(context)
+        total = len(detected)
+        detected = detected[:limit]
+
+        header = f"**Cryptography Detection: {total} detection(s)**\n"
+        if total > limit:
+            header += f"*Showing the first {limit} of {total}. Increase limit to see more.*\n"
+        result = ""
 
         if detected:
             for crypto in detected:
@@ -4380,7 +4414,7 @@ def detect_crypto(
         else:
             result += "No known cryptographic constants detected.\n"
 
-        return wrap_untrusted(result, "crypto constants")
+        return header + "\n" + wrap_untrusted(result, "crypto constants")
 
     except Exception as e:
         logger.error(f"detect_crypto failed: {e}")
@@ -5400,12 +5434,12 @@ def get_session_summary(session_id: str) -> str:
 def load_session_section(
     session_id: str,
     section: str,
-    tool_filter: str | None = None
+    tool_filter: str | None = None,
+    offset: int = 0,
+    limit: int = 10,
 ) -> str:
     """
-    Load a specific section of session data (chunked retrieval).
-
-    Use this to load only the data you need, avoiding context overflow.
+    Load one section of a saved session, a page of tool calls at a time.
 
     Args:
         session_id: UUID of the session
@@ -5416,11 +5450,12 @@ def load_session_section(
             - "static_tools": Only static analysis tool calls
             - "dynamic_tools": Only dynamic analysis tool calls
         tool_filter: Optional tool name filter (e.g., "decompile_function", "x64dbg_get_registers")
-
-    Returns:
-        Requested section data
+        offset: First tool call to return (0-based), for the tool sections
+        limit: Tool calls per page (default 10)
     """
     try:
+        offset = validate_numeric_range(offset, 0, 1_000_000, "offset")
+        limit = validate_numeric_range(limit, 1, 1_000, "limit")
         # F-5 (UX): a malformed session ID must say so rather than being
         # reported as a missing session -- see delete_session.
         try:
@@ -5469,13 +5504,31 @@ def load_session_section(
                 "static_tools": "Static Analysis Outputs",
                 "dynamic_tools": "Dynamic Analysis Outputs"
             }
+            total = len(tool_calls)
+            page = tool_calls[offset:offset + limit]
+            # The paging line is server arithmetic and goes above the
+            # envelope; replayed outputs can be long and clients cut from
+            # the end.
+            header = ""
+            if offset + len(page) < total or offset:
+                header = (
+                    f"*Calls {offset + 1}-{offset + len(page)} of {total}."
+                    + (
+                        f" Next: offset={offset + len(page)}.*\n\n"
+                        if offset + len(page) < total
+                        else "*\n\n"
+                    )
+                )
+            if not page:
+                return f"Offset {offset} is past the last of {total} calls."
+
             result = f"**{section_labels.get(section, 'Tool Outputs')}** (Session: {session_id[:8]}...)\n"
             if tool_filter:
                 result += f"**Filtered by:** {tool_filter}\n"
-            result += f"\n**Total Calls:** {len(tool_calls)}\n\n"
+            result += f"\n**Total Calls:** {total}\n\n"
             result += "---\n\n"
 
-            for i, call in enumerate(tool_calls, 1):
+            for i, call in enumerate(page, offset + 1):
                 tool_name = call.get('tool_name')
                 timestamp = call.get('timestamp')
                 # Sessions written before storage-side stripping still hold
@@ -5499,7 +5552,7 @@ def load_session_section(
                 result += f"\n{output}\n\n"
                 result += "---\n\n"
 
-            return wrap_untrusted(result, "session section")
+            return header + wrap_untrusted(result, "session section")
 
         return f"Error: Unknown section type: {section}. Valid sections: metadata, summary, tools, static_tools, dynamic_tools"
 
@@ -5511,16 +5564,15 @@ def load_session_section(
 @app.tool()
 def load_full_session(session_id: str) -> str:
     """
-    Load ALL data from a session (WARNING: may be very large).
+    Load ALL data from a session.
 
-    Only use this for small sessions or when you need everything at once.
-    For large sessions, use load_session_section() instead.
+    Returns every stored tool output when the whole transcript fits the
+    code-output budget. A larger session comes back as a digest instead (one
+    line per call with its tool, arguments and output size); read the calls
+    you need with load_session_section(session_id, "tools", offset=N).
 
     Args:
         session_id: UUID of the session
-
-    Returns:
-        Complete session data with all tool outputs
     """
     try:
         # F-5 (UX): a malformed session ID must say so rather than being
@@ -5543,6 +5595,31 @@ def load_full_session(session_id: str) -> str:
 
         tool_calls = session_data.get('tool_calls', [])
         result += f"**Tool Calls:** {len(tool_calls)}\n\n"
+
+        # A replay used to resend every stored output, so loading a long
+        # session cost as much as the session itself. Past the budget, send
+        # a digest and let the caller page the calls it needs.
+        outputs = [strip_untrusted_envelope(c.get('output', '')) for c in tool_calls]
+        if sum(len(o) for o in outputs) > CODE_OUTPUT_CHAR_BUDGET:
+            digest = []
+            for i, (call, output) in enumerate(zip(tool_calls, outputs)):
+                args = call.get('arguments', {}) or {}
+                arg_str = ", ".join(f"{k}={v}" for k, v in args.items())
+                if len(arg_str) > 120:
+                    arg_str = arg_str[:117] + "..."
+                digest.append(
+                    f"{i}\t{call.get('tool_name')}\t{len(output):,} chars\t{arg_str}"
+                )
+            note = (
+                f"*Session outputs total {sum(len(o) for o in outputs):,} characters, "
+                f"over the {CODE_OUTPUT_CHAR_BUDGET:,}-character budget, so this "
+                f"is a digest. Read calls with load_session_section(session_id, "
+                f"\"tools\", offset=<index>, limit=<n>) or filter with "
+                f"tool_filter.*\n\n"
+            )
+            result += "index\ttool\toutput\targuments\n" + "\n".join(digest) + "\n"
+            return note + wrap_untrusted(result, "session digest")
+
         result += "---\n\n"
 
         for i, call in enumerate(tool_calls, 1):

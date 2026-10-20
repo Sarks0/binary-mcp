@@ -100,6 +100,7 @@ from src.utils.security import (
     validate_session_id,
 )
 from src.utils.table_refs import find_table_base_refs
+from src.utils.tool_docs import shape_tool_docs
 
 # Allowed output directory for decrypted/decoded files
 CRYPTO_OUTPUT_DIR = Path.home() / ".binary_mcp_output" / "crypto"
@@ -2130,38 +2131,20 @@ def load_pdb(
     """
     Apply a Windows PDB to an analyzed binary.
 
-    Stages the PDB next to the binary (Ghidra's PdbUniversalAnalyzer
-    expects ``<binary-stem>.pdb`` adjacency), invalidates any existing
-    cache, and re-runs analysis so symbolic function names propagate.
+    Stages the PDB next to the binary, invalidates the cache and re-runs
+    analysis so symbolic function names propagate. With ``pdb_path``
+    omitted (or ``"auto"``), downloads the PDB matching the binary's
+    CodeView record from the Microsoft public symbol server.
 
-    When ``pdb_path`` is omitted (or set to ``"auto"``), reads the binary's
-    CodeView (RSDS) debug record and downloads the matching PDB from the
-    Microsoft public symbol server, caching it under
-    ``~/.binary_mcp_cache/symbols/``.
+    That server carries Microsoft's PDBs only. For a binary whose version
+    info does not name Microsoft the auto-fetch is refused up front, at no
+    cost; supply the vendor's ``pdb_path``, point ``symbol_path`` at a
+    server that has it, or skip symbols.
 
-    That auto-fetch only works for Microsoft's own binaries. The public
-    symbol server (msdl.microsoft.com) carries Microsoft PDBs and nothing
-    else, so a third-party target -- steam.exe, a game, a vendor driver,
-    a malware sample -- has no PDB there to fetch, and asking costs a 404,
-    a disclosure of the PDB name and GUID to Microsoft, and a discarded
-    cache plus a full Ghidra re-analysis for zero new names. This tool
-    therefore refuses the auto-fetch up front when the binary's version
-    info does not name Microsoft and every configured symbol server is
-    the Microsoft public one; the refusal is free (no network, no cache
-    invalidation) and names the alternatives. For a third-party binary,
-    supply the vendor's ``pdb_path``, point ``symbol_path`` at a server
-    that carries it, or skip symbols and run a structural pass
-    (``analyze_binary(analysis_depth="structural")``) -- FUN_* names are
-    all there is to work with.
-
-    On big binaries (e.g. mpengine.dll, 47K functions) this runs in
-    structural mode by default -- auto-analyse + apply PDB symbols, but
-    skip the per-function decompile pass. That trims a 60-90 minute
-    wait down to ~10-15 min, and pseudocode is still available on
-    demand via ``decompile_function`` (each call decompiles one
-    function in seconds against the now-symbolic cache). If you
-    genuinely want a full decompile pass with the PDB applied, pass
-    ``skip_decompile=False`` and ``analysis_depth="full"``.
+    Big binaries run in structural mode by default (symbols applied, no
+    decompile pass), which cuts a 60-90 minute run to 10-15 minutes;
+    ``decompile_function`` still works on demand. Pass
+    ``skip_decompile=False, analysis_depth="full"`` for a full pass.
 
     Args:
         binary_path: Path to the binary
@@ -6540,6 +6523,21 @@ def drop_text_output_schemas(tools: dict) -> list[str]:
     return sorted(dropped)
 
 
+# Entry points a deferring client should load in full from the start.
+# Clients that defer MCP tools behind a tool search show only their names;
+# ``anthropic/alwaysLoad`` in a tool's _meta asks for that one up front. Each
+# costs its whole definition in every session, so keep this to the calls
+# nearly every session starts with. Other clients ignore the key.
+ALWAYS_LOADED_TOOLS = ("check_binary", "analyze_binary", "get_functions", "decompile_function")
+
+
+def mark_always_loaded(tools: dict) -> None:
+    for name in ALWAYS_LOADED_TOOLS:
+        tool = tools.get(name)
+        if tool is not None:
+            tool.meta = {**(tool.meta or {}), "anthropic/alwaysLoad": True}
+
+
 def collapse_optional_schemas(tools: dict) -> int:
     """Advertise ``x: T | None = None`` parameters as plain ``T``.
 
@@ -6667,7 +6665,9 @@ def register_all_tools(
         )
 
     drop_text_output_schemas(tools)
+    shape_tool_docs(tools)
     collapse_optional_schemas(tools)
+    mark_always_loaded(tools)
 
     # One output budget for every tool that can return code (see
     # src/utils/output_budget.py). The decompile tools page themselves; this

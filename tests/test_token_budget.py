@@ -365,8 +365,8 @@ class TestUntrustedEnvelopeOverhead:
 # a target: lower it whenever a change shrinks the list, and never raise it to
 # make room for a new tool without trimming something else. Measured on the
 # roster a Windows host lists by default (the largest a client normally
-# sees): 146,260 bytes when this was set.
-TOOLS_LIST_BYTE_BUDGET = 147_000
+# sees): 124,837 bytes when this was set.
+TOOLS_LIST_BYTE_BUDGET = 126_000
 
 # Clients cut tool descriptions (and server instructions) at this many
 # characters, and tool search only matches what is left.
@@ -497,7 +497,8 @@ class TestOptionalParameterSchemas:
     def test_collapsed_parameters_stay_optional(self, roster):
         tool = next(t for t in _listed(roster) if t.name == "analyze_binary")
         props = tool.inputSchema["properties"]
-        assert props["processor"] == {"type": "string"}
+        assert props["processor"]["type"] == "string"
+        assert "anyOf" not in props["processor"] and "default" not in props["processor"]
         assert "processor" not in tool.inputSchema.get("required", [])
 
     def test_union_keeps_its_other_branches(self, roster):
@@ -642,3 +643,28 @@ class TestBoundedTools:
         assert out.startswith("*Calls 11-15 of 25. Next: offset=15.*")
         assert "decompile_function_10" in out and "decompile_function_14" in out
         assert "decompile_function_15" not in out
+
+
+class TestShapedDefinitions:
+    """Parameter docs live in the schema; restating sections are not sent."""
+
+    def test_no_description_carries_args_or_returns(self, roster):
+        offenders = [
+            t.name for t in _listed(roster)
+            if any(f"\n{s}:\n" in f"\n{t.description}\n" for s in ("Args", "Returns", "Example"))
+        ]
+        assert not offenders, offenders
+
+    def test_parameters_carry_their_docs(self, roster):
+        tool = next(t for t in _listed(roster) if t.name == "get_functions")
+        props = tool.inputSchema["properties"]
+        assert props["binary_path"]["description"] == "Path to analyzed binary"
+        assert "regex" in props["filter_name"]["description"]
+
+    def test_entry_points_are_always_loaded(self, roster):
+        server_module, _ = roster
+        flagged = {
+            t.name for t in _listed(roster)
+            if (t.meta or {}).get("anthropic/alwaysLoad") is True
+        }
+        assert flagged == set(server_module.ALWAYS_LOADED_TOOLS)

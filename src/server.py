@@ -82,6 +82,7 @@ from src.utils.security import (
     FileSizeError,
     PathTraversalError,
     UserFacingError,
+    confinement_status_line,
     get_allowed_dirs,
     safe_error_message,
     safe_regex_compile,
@@ -4372,6 +4373,12 @@ def diagnose_setup() -> str:
         if session_stats['active_session']:
             result += f"- Active Session: `{session_stats['active_session'][:8]}...`\n"
         result += "\n"
+
+        # Ghidra being healthy does not mean a sample path will be accepted.
+        # The denial those tools return used to be an opaque reference ID, so
+        # this is the line that tells the operator which posture is in force
+        # without listing the directories (those are host layout).
+        result += f"\n**{confinement_status_line()}**\n"
 
         if not diag['ghidra_exists']:
             result += "\n**WARNING:** Ghidra not found! Please install Ghidra or set GHIDRA_HOME environment variable.\n"

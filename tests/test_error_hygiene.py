@@ -156,12 +156,17 @@ class TestPathDenialStaysActionable:
         assert "Please contact support" not in out
 
     def test_status_line_does_not_list_configured_directories(self, monkeypatch):
+        import os
+
         from src.utils.security import confinement_status_line
 
         monkeypatch.delenv("BINARY_MCP_ALLOW_ANY_PATH", raising=False)
         monkeypatch.delenv("BINARY_MCP_REQUIRE_CONFINEMENT", raising=False)
+        # os.pathsep, not a hardcoded colon: Windows splits on ';', and a
+        # colon-joined value is one entry there.
         monkeypatch.setenv(
-            "BINARY_MCP_ALLOWED_DIRS", f"{HOME}/secret-samples:/srv/quarantine"
+            "BINARY_MCP_ALLOWED_DIRS",
+            os.pathsep.join((f"{HOME}/secret-samples", "/srv/quarantine")),
         )
 
         text = confinement_status_line()
@@ -185,6 +190,37 @@ class TestPathDenialStaysActionable:
         assert "BINARY_MCP_ALLOWED_DIRS" in text
         assert HOME not in text
         assert "/tmp" not in text
+
+    def test_explicit_list_wins_over_allow_any_path(self, monkeypatch):
+        import os
+
+        from src.utils.security import confinement_status_line
+
+        monkeypatch.setenv("BINARY_MCP_ALLOW_ANY_PATH", "1")
+        monkeypatch.setenv("BINARY_MCP_ALLOWED_DIRS", os.pathsep.join(("/srv/a", "/srv/b")))
+        text = confinement_status_line()
+        assert "explicit allow-list" in text
+        assert "disabled" not in text
+
+    def test_require_confinement_wins_over_allow_any_path(self, monkeypatch):
+        from src.utils.security import confinement_status_line
+
+        monkeypatch.delenv("BINARY_MCP_ALLOWED_DIRS", raising=False)
+        monkeypatch.setenv("BINARY_MCP_ALLOW_ANY_PATH", "1")
+        monkeypatch.setenv("BINARY_MCP_REQUIRE_CONFINEMENT", "1")
+        text = confinement_status_line()
+        assert "refuse every path" in text
+        assert "disabled" not in text
+
+    def test_unrelated_file_not_found_stays_opaque(self):
+        from src.utils.security import safe_error_message
+
+        err = FileNotFoundError(2, "analyzeHeadless not found", LEAK_MARKER)
+        out = safe_error_message("analyze_binary failed", err)
+        assert_no_host_leak(out)
+        assert "Please contact support" in out
+        assert "no file exists" not in out
+
 
 
 class TestCuratedStructuredText:

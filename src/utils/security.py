@@ -983,11 +983,11 @@ def confinement_status_line() -> str:
     it, never the paths. A model that only sees "Setup looks good" cannot tell
     a healthy Ghidra install from a confinement denial.
     """
-    if _unrestricted_access_requested():
-        return (
-            f"Path confinement: disabled ({ENV_ALLOW_ANY_PATH} is set). "
-            f"Every file this process can read is reachable through this server."
-        )
+    # Same order as sanitize_binary_path. An explicit allow-list wins over
+    # both flags. With no list, REQUIRE_CONFINEMENT wins over ALLOW_ANY_PATH
+    # (the looser flag must not downgrade a demanded hard boundary). Checking
+    # ALLOW_ANY_PATH first would report "disabled" while the server still
+    # confined, or still refused every path.
     configured = get_allowed_dirs()
     if configured:
         noun = "entry" if len(configured) == 1 else "entries"
@@ -1000,6 +1000,11 @@ def confinement_status_line() -> str:
             f"Path confinement: required ({ENV_REQUIRE_CONFINEMENT} is set) "
             f"but {ENV_ALLOWED_DIRS} is not configured. Binary tools will "
             f"refuse every path until it is set."
+        )
+    if _unrestricted_access_requested():
+        return (
+            f"Path confinement: disabled ({ENV_ALLOW_ANY_PATH} is set). "
+            f"Every file this process can read is reachable through this server."
         )
     return (
         f"Path confinement: default quarantine ({ENV_ALLOWED_DIRS} is unset). "
@@ -1175,7 +1180,17 @@ def safe_error_message(
             f"Diagnostic:\n{diagnostic}"
         )
 
-    guidance = path_error_guidance(internal_details) if internal_details else None
+    # Only our own security exceptions. FileNotFoundError and PermissionError
+    # are in PATH_ERROR_GUIDANCE for callers that already know the failure is
+    # a path check (safe_path_error). Routing every one of those through here
+    # would mis-label a missing Ghidra binary or a locked job file as a bad
+    # sample path. PathTraversalError and FileSizeError are not raised for
+    # those.
+    guidance = (
+        path_error_guidance(internal_details)
+        if isinstance(internal_details, (PathTraversalError, FileSizeError))
+        else None
+    )
     if guidance:
         return (
             f"Error: {user_message}\n"

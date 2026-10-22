@@ -44,6 +44,7 @@ ARCHITECTURE_SCENE = REPO_ROOT / "docs" / "architecture.excalidraw"
 TOOLS_DOC = REPO_ROOT / "docs" / "tools.md"
 SECURITY_DOC = REPO_ROOT / "docs" / "security.md"
 CONFIG_DOC = REPO_ROOT / "docs" / "configuration.md"
+LARGE_BINARY_DOC = REPO_ROOT / "docs" / "large-binary-decompile.md"
 CLAIM_DOCS = (README, TOOLS_DOC, SECURITY_DOC, CONFIG_DOC)
 PYPROJECT = REPO_ROOT / "pyproject.toml"
 SERVER_PY = SRC / "server.py"
@@ -508,22 +509,61 @@ def test_docs_document_confinement_controls():
     """
     Every confinement knob has to be documented somewhere a reader can find.
 
-    docs/configuration.md is the reference and must name all three;
-    docs/security.md must at least name the allow-list, since that is where the
-    default posture is explained and an operator who reads only that page still
-    needs to know the variable exists.
-    """
-    config_text = CONFIG_DOC.read_text(encoding="utf-8")
-    for var in (
-        "BINARY_MCP_ALLOWED_DIRS",
-        "BINARY_MCP_REQUIRE_CONFINEMENT",
-        "BINARY_MCP_ALLOW_ANY_PATH",
-    ):
-        assert var in config_text, f"docs/configuration.md no longer documents {var}"
+    docs/configuration.md is the reference and must name all four;
+    docs/security.md must at least name the allow-list and the hard-link
+    opt-out, since that is where the default posture is explained and an
+    operator who reads only that page still needs to know they exist.
 
-    assert "BINARY_MCP_ALLOWED_DIRS" in SECURITY_DOC.read_text(encoding="utf-8"), (
-        "docs/security.md explains the default confinement posture but no longer "
-        "names the variable that changes it"
+    BINARY_MCP_ALLOW_HARDLINKS earns its place here the hard way. The refusal
+    message tells the operator to set it, and for a while the variable appeared
+    in no document at all -- the only way to find it was to read
+    src/utils/security.py, which is exactly what a field report said it took.
+    A knob an error message names must be findable in the docs.
+    """
+    # The config-reference half is covered by (and derived in)
+    # test_every_env_var_named_in_a_refusal_message_is_documented below; what
+    # is only asserted here is the SECURITY doc, which names a deliberate
+    # subset rather than every knob.
+    security_text = SECURITY_DOC.read_text(encoding="utf-8")
+    for var in ("BINARY_MCP_ALLOWED_DIRS", "BINARY_MCP_ALLOW_HARDLINKS"):
+        assert var in security_text, (
+            f"docs/security.md explains the default confinement posture but no "
+            f"longer names {var}"
+        )
+
+
+def test_every_env_var_named_in_a_refusal_message_is_documented():
+    """
+    No refusal may name a variable the docs do not.
+
+    The generalisation of the BINARY_MCP_ALLOW_HARDLINKS gap: a denial that
+    says "set X" is only actionable if X can be looked up. Any future
+    confinement knob that reaches an error message is caught here rather than
+    after someone has read the source to find it.
+    """
+    from src.utils import security
+
+    # DERIVED, not listed. A hardcoded tuple could not keep the promise in the
+    # docstring above: the fifth knob would simply be absent from it and the
+    # test would keep passing while the gap reopened. Reading the ENV_*
+    # constants off the module means adding one is enough to be covered.
+    discovered = sorted(
+        value
+        for name, value in vars(security).items()
+        if name.startswith("ENV_") and isinstance(value, str)
+    )
+    assert discovered, (
+        "no ENV_* constants found on src.utils.security -- the naming "
+        "convention this test derives from has changed, and the test is now "
+        "asserting nothing"
+    )
+
+    config_text = CONFIG_DOC.read_text(encoding="utf-8")
+    undocumented = [var for var in discovered if var not in config_text]
+    assert not undocumented, (
+        f"{', '.join(undocumented)} named in a confinement refusal but absent "
+        f"from docs/configuration.md, so an operator who hits the refusal "
+        f"cannot look it up"
     )
 
 
@@ -589,6 +629,112 @@ def test_documented_auto_pdb_default_matches_code():
         assert "`microsoft`" in text, (
             f"{path.name} no longer states the default symbol-fetch policy"
         )
+
+
+def test_large_binary_doc_matches_the_chunking_and_heap_facts():
+    """
+    The chunking workflow existed in code and was documented nowhere.
+
+    Reported as "this host cannot analyze a 294 MB DLL". The honest answer was
+    that ranged runs already accumulate into one cache, so the module can be
+    covered a range at a time -- the operator had no way to find that out, and
+    the only sizing advice on offer pointed the wrong way for a host short on
+    RAM. A workflow nobody can find is close to one that does not exist, so the
+    page now states it; these are the code facts it rests on.
+
+    Deliberately pinned to names and to the one literal the prose quotes, not
+    to behaviour: the behaviour has its own tests (auto-promotion and the
+    manifest in tests/test_ghidra_perf.py, the merge in its delta-merge cases).
+    What is unpinned without this is the page going stale against a rename or
+    a changed default, which is exactly how the gap arose.
+    """
+    text = LARGE_BINARY_DOC.read_text(encoding="utf-8")
+    for claim in (
+        "start_address",
+        "end_address",
+        "_merge_delta_into_cache",
+        "resume_manifest_<stem>.json",
+        "GHIDRA_MAX_HEAP_MB",
+        "_JAVA_OPTIONS",
+    ):
+        assert claim in text, f"the page no longer mentions {claim}"
+
+    server_src = SERVER_PY.read_text(encoding="utf-8")
+    tree = ast.parse(server_src)
+    defined = {
+        node.name for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+    }
+    for name in ("_merge_delta_into_cache", "_write_resume_manifest"):
+        assert name in defined, (
+            f"{name} was renamed or removed; the page names it as the thing "
+            f"that makes chunked coverage accumulate"
+        )
+    assert "resume_manifest_" in server_src, "the sidecar filename changed"
+    assert "complete_addresses" in server_src, (
+        "the manifest's address-list key changed; the page describes it"
+    )
+
+    runner_src = (SRC / "engines" / "static" / "ghidra" / "runner.py").read_text(
+        encoding="utf-8"
+    )
+    assert re.search(
+        r'GHIDRA_MAX_HEAP_MB["\']\s*,\s*["\']4096', runner_src
+    ), (
+        "the GHIDRA_MAX_HEAP_MB default is no longer 4096; both "
+        "docs/large-binary-decompile.md and docs/configuration.md quote it"
+    )
+    assert "4096" in CONFIG_DOC.read_text(encoding="utf-8"), (
+        "configuration.md no longer states the heap default the page defers to"
+    )
+
+
+def test_security_doc_states_the_one_unconfined_path_tool():
+    """
+    The confinement section would otherwise read as covering every path.
+
+    `windbg_open_dump` does not consult the allow-list, and that is the
+    operator's decision rather than a gap left open: a crash dump lives where
+    Windows wrote it, and confining the tool would refuse the workflow the
+    README documents. A security page that describes confinement and omits its
+    one exception is the kind of doc an operator plans around and is wrong.
+
+    Pinned from both ends, because either half can drift. If confinement is
+    ever added to the tool, this fails and points at the page; if the page
+    stops naming the exception, it fails too. The behaviour itself is pinned
+    by test_windbg_open_dump_validates_before_entering_dump_mode, which opens
+    an out-of-bounds dump on purpose.
+    """
+    text = SECURITY_DOC.read_text(encoding="utf-8")
+    assert "windbg_open_dump" in text, (
+        "docs/security.md no longer names the one tool that is not confined"
+    )
+    assert "not confined" in text or "unconfined" in text, (
+        "docs/security.md no longer states that crash dumps are unconfined"
+    )
+
+    tree = ast.parse(WINDBG_TOOLS.read_text(encoding="utf-8"))
+    open_dump = next(
+        (
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "windbg_open_dump"
+        ),
+        None,
+    )
+    assert open_dump is not None, "windbg_open_dump was renamed or removed"
+    called = {
+        node.func.id for node in ast.walk(open_dump)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    confining = called & {
+        "confine_binary_path", "sanitize_binary_path", "get_allowed_dirs"
+    }
+    assert not confining, (
+        f"windbg_open_dump now confines its path ({sorted(confining)}), which "
+        f"contradicts docs/security.md and refuses C:\\Windows\\MEMORY.DMP. "
+        f"If the posture changed on purpose, update the page and "
+        f"test_windbg_open_dump_validates_before_entering_dump_mode with it"
+    )
 
 
 # F-6: x64dbg_execute_command docstring

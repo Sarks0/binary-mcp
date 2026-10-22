@@ -487,6 +487,7 @@ def register_control_flow_tools(app, session_manager=None, cache=None, runner=No
         cache: ProjectCache instance for cached analysis data
         runner: GhidraRunner instance for on-demand analysis
     """
+    from src.tools.error_hygiene import safe_path_error
     from src.utils.security import (
         FileSizeError,
         PathTraversalError,
@@ -633,7 +634,7 @@ def register_control_flow_tools(app, session_manager=None, cache=None, runner=No
             return "\n".join(out)
 
         except (PathTraversalError, FileSizeError) as e:
-            return safe_error_message("analyze_control_flow", e)
+            return safe_path_error("analyze_control_flow", e, "binary path")
         except Exception as e:
             logger.error(f"analyze_control_flow failed: {e}")
             return safe_error_message("Failed to analyze control flow", e)
@@ -755,7 +756,7 @@ def register_control_flow_tools(app, session_manager=None, cache=None, runner=No
             return "\n".join(out)
 
         except (PathTraversalError, FileSizeError) as e:
-            return safe_error_message("detect_loops", e)
+            return safe_path_error("detect_loops", e, "binary path")
         except Exception as e:
             logger.error(f"detect_loops failed: {e}")
             return safe_error_message("Failed to detect loops", e)
@@ -899,7 +900,7 @@ def register_control_flow_tools(app, session_manager=None, cache=None, runner=No
             return "\n".join(out)
 
         except (PathTraversalError, FileSizeError) as e:
-            return safe_error_message("find_dead_code", e)
+            return safe_path_error("find_dead_code", e, "binary path")
         except Exception as e:
             logger.error(f"find_dead_code failed: {e}")
             return safe_error_message("Failed to find dead code", e)
@@ -1066,7 +1067,7 @@ def register_control_flow_tools(app, session_manager=None, cache=None, runner=No
             return "\n".join(out)
 
         except (PathTraversalError, FileSizeError) as e:
-            return safe_error_message("get_function_complexity", e)
+            return safe_path_error("get_function_complexity", e, "binary path")
         except Exception as e:
             logger.error(f"get_function_complexity failed: {e}")
             return safe_error_message("Failed to compute complexity", e)

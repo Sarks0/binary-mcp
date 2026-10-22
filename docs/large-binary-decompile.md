@@ -130,6 +130,59 @@ With a warm project this no longer re-imports or re-analyzes: it goes straight
 to decompiling. That is still tens of thousands of decompiles on a large DLL,
 so run it as a job; the per-function work is the irreducible part.
 
+## Chunked coverage: ranged runs accumulate
+
+A host too small to analyze a module in one run can still cover it whole, a
+range at a time:
+
+```
+analyze_binary(path, start_address="0x180000000", end_address="0x180200000")
+analyze_binary(path, start_address="0x180200000", end_address="0x180400000")
+```
+
+Three things make those runs add up instead of overwriting each other:
+
+- A range supplied without `incremental=True` **auto-promotes** to incremental.
+  A ranged run is a partial view of the binary, so letting its result replace
+  the cache would delete every function outside the range. The server promotes
+  instead, and logs that it did. (A range run with no cache yet does not
+  promote: there is nothing to merge into, so it is a normal first analysis.)
+- The merge is per address. `_merge_delta_into_cache` replaces the entries the
+  run touched, appends ones it found, and keeps every address it did not visit.
+  The program-wide extractions -- strings, imports, exports, memory map, data
+  types -- are kept from the existing cache whenever the run skipped them, so a
+  ranged or targeted run cannot empty them.
+- Each incremental run writes a `resume_manifest_<stem>.json` sidecar holding
+  the addresses already complete, and the Jython script skips those. "Complete"
+  depends on the run: when decompilation is skipped every cached entry counts,
+  otherwise only entries that have pseudocode, plus thunks and externals, which
+  are never decompiled. So a later chunk pays only for what is left. The
+  manifest is a flat address list rather than the cache itself, because loading
+  a multi-GB cache JSON inside the JVM is its own OOM.
+
+The first range still pays for the import and auto-analysis. The ones after it
+do not, because the project is reused.
+
+## Sizing the JVM heap
+
+`GHIDRA_MAX_HEAP_MB` defaults to 4096, and
+[configuration.md](configuration.md) suggests 6144-8192 for multi-MB binaries.
+That assumes the host has the headroom. On a machine with a few GB free the
+default alone already tells the JVM it may grow to roughly all of it, and
+raising it there trades a Ghidra OOM for an OS one; the answer on a small host
+is the opposite one -- lower the heap and cover the binary in ranges, as above.
+
+The heap reaches the JVM through `_JAVA_OPTIONS`, because Ghidra's own launcher
+spawns it. Two consequences when a run runs out of memory anyway:
+
+- Reading the `java` command line reports the wrong number. The JVM's own
+  "Picked up _JAVA_OPTIONS:" line, which lands in `ghidra_debug.log`, reports
+  the one actually in force.
+- An `-Xmx` already present in an inherited `_JAVA_OPTIONS` wins and is left
+  alone, since an explicit `_JAVA_OPTIONS` is the operator's call. An inherited
+  `-Xmx2g` therefore caps Ghidra at 2 GB while `GHIDRA_MAX_HEAP_MB` still reads
+  4096. The runner logs a warning naming both numbers when it sees that.
+
 ## Cost, roughly
 
 For a 17 MB DLL with ~30K functions:

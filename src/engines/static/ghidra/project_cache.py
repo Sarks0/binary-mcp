@@ -250,8 +250,72 @@ class ProjectCache:
         """
         return self.cache_dir / f"{binary_hash}.notes.json"
 
+    # A confinement refusal is NOT a cache miss.
+    #
+    # ``_get_binary_hash`` is the documented confinement chokepoint for this
+    # class and raises PathTraversalError / HardLinkError / FileSizeError /
+    # FileNotFoundError. The three lookups below used to wrap it in a blanket
+    # ``except Exception -> return None/False``, which turned every one of
+    # those refusals into "nothing cached" and let the caller carry on. In
+    # ``decompile_functions`` that meant a refused path produced a cache miss,
+    # a submitted analysis JOB, and then a leak: the job record stored the
+    # refusal's text -- which interpolates the resolved allow-list -- and
+    # ``_run_or_degrade`` returned it to the caller verbatim.
+    #
+    # Refusals therefore propagate from the two LOOKUPS -- get_cached and
+    # get_cache_path -- whose None return is what a caller reads as "nothing
+    # cached, go and analyse it". Every caller's path arm now sees the refusal
+    # before any work is scheduled. Genuine cache faults (corrupt JSON, a
+    # truncated gzip member, an unreadable cache file) keep their old
+    # swallow-and-miss behaviour: re-analysing is the right answer to a bad
+    # cache entry, and is not the right answer to a denied path.
+    #
+    # The split is by SCOPE, not by exception type, and the first attempt at
+    # this got that wrong in both directions. It matched a type tuple over a
+    # try block covering validation AND the cache read, which
+    #
+    #   * MISSED the directory case. sanitize_binary_path refuses a non-file
+    #     with ValueError, which was not in the tuple, so a directory was
+    #     still laundered into a cache miss -- submitting a Ghidra job for a
+    #     directory and handing the caller the refusal's raw text through the
+    #     job record. The leak this class was fixed for, still live.
+    #   * Listed IsADirectoryError, which nothing in this project raises, so
+    #     that entry was dead.
+    #   * And would have MISREPORTED a real cache fault: FileNotFoundError
+    #     from a cache file unlinked between _resolve_cache_path's exists()
+    #     check and the open (a concurrent clean_cache, invalidate, or
+    #     external GC) is indistinguishable by type from a missing binary, so
+    #     the caller was told "no file exists at the path supplied" about a
+    #     binary sitting on disk, and the analysis was abandoned instead of
+    #     re-run.
+    #
+    # Adding ValueError to a type tuple would not have helped either: a
+    # corrupt cache file raises json.JSONDecodeError, which IS a ValueError,
+    # so the tuple would have turned the commonest genuine cache fault into a
+    # hard refusal. Validation and I/O are now in separate try blocks, which
+    # is what the distinction actually is -- everything the validator raises
+    # propagates, everything the read raises degrades to a miss.
+    #
+    # has_cached deliberately does NOT propagate; see its own docstring.
+
     def has_cached(self, binary_path: str) -> bool:
-        """Check if analysis results are cached for a binary."""
+        """Check if analysis results are cached for a binary.
+
+        Unlike :meth:`get_cached` this still answers False for a refused path
+        rather than raising. It is a boolean predicate: its nine callers turn
+        a False into a fixed sentence and stop, so nothing leaks and no work is
+        scheduled on the refused path, which is the property that mattered.
+
+        It is NOT a good answer, though, and the limitation is worth stating
+        rather than dressing up. Six of those callers (``src/tools/
+        dynamic_tools.py``) say "No Ghidra analysis cache found for 'x'" --
+        a false statement about a binary that was refused for its link count
+        or its directory, and one that sends the caller off to analyse
+        something that will be refused again. Making this propagate means
+        giving nine x64dbg/malware handlers a path arm they do not have; that
+        is a change to those tools, not to this method, and it is not in the
+        change that wrote this docstring.
+        """
         try:
             binary_hash = self._get_binary_hash(binary_path)
             return self._resolve_cache_path(binary_hash) is not None
@@ -260,9 +324,19 @@ class ProjectCache:
             return False
 
     def get_cached(self, binary_path: str) -> dict | None:
-        """Retrieve cached analysis results (gz or legacy)."""
+        """Retrieve cached analysis results (gz or legacy).
+
+        Raises:
+            Whatever :func:`sanitize_binary_path` raises for a refused path --
+            PathTraversalError (including HardLinkError), FileSizeError,
+            FileNotFoundError or ValueError. See the note above.
+        """
+        # Validation: everything propagates. Deliberately OUTSIDE the try
+        # below, so the split is by scope rather than by exception type.
+        binary_hash = self._get_binary_hash(binary_path)
+
+        # Cache I/O: everything degrades to a miss.
         try:
-            binary_hash = self._get_binary_hash(binary_path)
             cache_path = self._resolve_cache_path(binary_hash)
 
             if cache_path is None:
@@ -293,8 +367,9 @@ class ProjectCache:
         Callers (e.g. resumable analysis) need the path to hand to Ghidra
         without paying the cost of loading the JSON.
         """
+        # Same split as get_cached: validation propagates, resolution degrades.
+        binary_hash = self._get_binary_hash(binary_path)
         try:
-            binary_hash = self._get_binary_hash(binary_path)
             return self._resolve_cache_path(binary_hash)
         except Exception as e:
             logger.error(f"Error resolving cache path: {e}")

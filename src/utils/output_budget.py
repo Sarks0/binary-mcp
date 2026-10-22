@@ -68,41 +68,45 @@ def cap_output(
     return f"{notice}\n\n{kept}"
 
 
+class CodeOutputBudgetMiddleware:
+    """FastMCP middleware applying cap_output to the named tools' text results.
+
+    FastMCP calls a middleware as ``middleware(context, call_next=...)``, so a
+    plain callable is enough. Not subclassing ``fastmcp``'s Middleware, and
+    importing its types only when a tool call arrives, keeps registration
+    free of FastMCP imports: several test modules replace ``fastmcp`` with a
+    stub before importing tool code, and registration has to work under it.
+    """
+
+    def __init__(self, tool_names: Iterable[str], budget: int = CODE_OUTPUT_CHAR_BUDGET):
+        self.tool_names = frozenset(tool_names)
+        self.budget = budget
+
+    async def __call__(self, context, call_next):
+        result = await call_next(context)
+        if getattr(context, "method", None) != "tools/call":
+            return result
+        if context.message.name not in self.tool_names:
+            return result
+
+        from fastmcp.tools.tool import ToolResult
+        from mcp.types import TextContent
+
+        changed = False
+        content = []
+        for block in result.content:
+            if isinstance(block, TextContent) and len(block.text) > self.budget:
+                block = TextContent(type="text", text=cap_output(block.text, self.budget))
+                changed = True
+            content.append(block)
+        if not changed:
+            return result
+        return ToolResult(content=content, structured_content=result.structured_content)
+
+
 def code_output_budget_middleware(
     tool_names: Iterable[str],
     budget: int = CODE_OUTPUT_CHAR_BUDGET,
-):
-    """FastMCP middleware applying cap_output to the named tools' text results.
-
-    Built on demand rather than defined at import: several test modules
-    replace ``fastmcp`` with a MagicMock before importing tool code, and a
-    class statement subclassing that would fail at import time.
-    """
-    from fastmcp.server.middleware import Middleware
-    from fastmcp.tools.tool import ToolResult
-    from mcp.types import TextContent
-
-    names = frozenset(tool_names)
-
-    class CodeOutputBudgetMiddleware(Middleware):
-        tool_names = names
-
-        async def on_call_tool(self, context, call_next):
-            result = await call_next(context)
-            if context.message.name not in names:
-                return result
-
-            changed = False
-            content = []
-            for block in result.content:
-                if isinstance(block, TextContent) and len(block.text) > budget:
-                    block = TextContent(type="text", text=cap_output(block.text, budget))
-                    changed = True
-                content.append(block)
-            if not changed:
-                return result
-            return ToolResult(
-                content=content, structured_content=result.structured_content
-            )
-
-    return CodeOutputBudgetMiddleware()
+) -> CodeOutputBudgetMiddleware:
+    """The middleware the server registers for its code-output tools."""
+    return CodeOutputBudgetMiddleware(tool_names, budget)

@@ -488,7 +488,12 @@ def register_mb_tools(app, session_manager=None):
                 output.append("API connection successful")
                 output.append(f"Test query (tag:exe, limit 1) returned {len(rows)} sample(s)")
             except MalwareBazaarError as e:
-                # "no results" still proves the key was accepted.
+                # A probe that matched nothing no longer arrives here: it is a
+                # successful reply with no rows, reported as a connection above.
+                # What reaches this branch is a rejected Auth-Key or a reply
+                # the module did not expect -- the distinction this tool exists
+                # to draw. Echoed verbatim because MalwareBazaarError carries
+                # only this module's own sentences (audit F-10).
                 output.append(f"API test returned: {e}")
 
             output.append("")

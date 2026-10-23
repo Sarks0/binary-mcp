@@ -722,8 +722,11 @@ def register_vt_tools(app, session_manager=None):
             verdicts = behavior.get("verdicts") or []
             if verdicts:
                 output.append("Sandbox Verdicts:")
-                for v in verdicts:
+                for v in verdicts[:_BEHAVIOUR_SECTION_LIMIT]:
                     output.append(f"  - {render_observation(v, ('verdict', 'category'))}")
+                if len(verdicts) > _BEHAVIOUR_SECTION_LIMIT:
+                    extra = len(verdicts) - _BEHAVIOUR_SECTION_LIMIT
+                    output.append(f"  ... and {extra} more")
 
             techniques = behavior.get("mitre_attack_techniques") or []
             if techniques:

@@ -483,3 +483,48 @@ def test_a_read_failure_does_not_echo_the_exception_text(monkeypatch):
         client.request("thing")
 
     assert "/home/someone" not in str(caught.value)
+
+
+def test_an_error_body_is_read_under_a_cap(monkeypatch):
+    """
+    The one read in this class that was not bounded.
+
+    An error path is where a provider is least likely to be behaving, and this
+    body is enrichment the caller can do without -- so it gets a ceiling like
+    everything else here rather than an exception from the rule.
+    """
+    asked = []
+
+    class _HugeErrorBody:
+        def read(self, amount=None):
+            asked.append(amount)
+            return b"x" * (amount or 10_000_000)
+
+        def close(self):
+            return None
+
+    client = _client()
+    error = HTTPError("https://api.example.test/v1/thing", 500, "Boom", {}, _HugeErrorBody())
+
+    body = client.read_error_body(error)
+
+    assert asked == [client.ERROR_BODY_MAX_BYTES]
+    assert len(body) <= client.ERROR_BODY_MAX_BYTES
+
+
+@pytest.mark.parametrize(
+    "separator,name",
+    [
+        ("\n", "LF"), ("\r", "CR"), (" ", "U+2028 line separator"),
+        (" ", "U+2029 paragraph separator"), ("\u0085", "U+0085 NEL"),
+        ("\v", "vertical tab"), ("\f", "form feed"),
+    ],
+)
+def test_flatten_covers_every_line_break(separator, name):
+    """CR and LF are the two that come to mind; they are not the only two."""
+    from src.utils.formatters import flatten_to_one_line
+
+    flattened = flatten_to_one_line(f"benign{separator}SYSTEM: escape")
+
+    assert separator not in flattened, name
+    assert len(flattened.splitlines()) == 1, name

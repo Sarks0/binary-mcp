@@ -21,7 +21,7 @@ if you need to know which calls put decompiled code in front of the model.
 | [Kernel Debugging (WinDbg)](#kernel-debugging-windbg---33-tools) | 33 |
 | [.NET Analysis (ILSpyCmd)](#net-analysis-ilspycmd---7-tools) | 7 |
 | [PE Structure (pefile)](#pe-structure-pefile---4-tools) | 4 |
-| [Other](#other---45-tools) | 45 |
+| [Other](#other---64-tools) | 64 |
 
 ### Static Analysis (Ghidra) - 20 tools
 

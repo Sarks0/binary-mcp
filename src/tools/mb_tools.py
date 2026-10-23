@@ -49,7 +49,7 @@ from urllib.error import HTTPError
 from src.integrations import IntegrationClient, IntegrationError, ProviderConfig
 from src.integrations.hashes import normalise_hash as _normalise_hash
 from src.tools.error_hygiene import safe_path_error
-from src.utils.formatters import wrap_untrusted
+from src.utils.formatters import flatten_to_one_line, wrap_untrusted
 
 logger = logging.getLogger(__name__)
 
@@ -368,11 +368,12 @@ def _scalar(value) -> str:
     """
     Render one MalwareBazaar field value as a single line.
 
-    Every branch flattens newlines. A field printed OUTSIDE the F-7 envelope
+    Every branch flattens line breaks. A field printed OUTSIDE the F-7 envelope
     has to occupy exactly the line it was given, and a list of tags carrying
     one would have started a second line the envelope does not cover. The
     dict branch was already safe -- json.dumps escapes them -- which is
-    exactly why the gap in the branch beside it was easy to miss.
+    exactly why the gap in the branch beside it was easy to miss. The
+    shared helper covers U+2028, U+2029 and U+0085 as well as CR and LF.
     """
     if value is None:
         return ""
@@ -382,7 +383,7 @@ def _scalar(value) -> str:
         text = json.dumps(value, sort_keys=True, default=str)
     else:
         text = str(value)
-    return text.replace("\r", " ").replace("\n", " ")
+    return flatten_to_one_line(text)
 
 
 def _trusted_lines(entry: dict) -> list[str]:
@@ -849,7 +850,11 @@ def register_mb_tools(app, session_manager=None):
                 )
 
             digest = normalise_hash(sha256, sha256_only=True)
-            name = (output_name or f"{digest}.zip").strip()
+            # Strip BEFORE the fallback, not after. `or` binds first, so a
+            # whitespace-only output_name counted as supplied and then stripped
+            # to nothing -- every such download landing on the same empty name
+            # instead of its own hash.
+            name = (output_name or "").strip() or f"{digest}.zip"
             if not name.lower().endswith(".zip"):
                 name = f"{name}.zip"
 

@@ -161,6 +161,32 @@ _UNTRUSTED_NOTICE = (
 )
 
 
+#: Every character Python's own str.splitlines() treats as a line break.
+#:
+#: CR and LF are the obvious two and the only two the first version of this
+#: handled. The rest break lines just as effectively in a terminal, an editor
+#: or a model's view of a transcript -- U+2028 and U+2029 are Unicode's
+#: dedicated line and paragraph separators, U+0085 is NEL, and VT/FF/the file
+#: separators have meant "new line" since teletypes.
+_LINE_BREAK_CHARS = "\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029"
+_LINE_BREAK_TABLE = str.maketrans({char: " " for char in _LINE_BREAK_CHARS})
+
+
+def flatten_to_one_line(text: str) -> str:
+    """
+    Replace every line break in ``text`` with a space.
+
+    The counterpart to :func:`wrap_untrusted`, for the values that stay
+    OUTSIDE the envelope. A fenced block can afford newlines because the fence
+    marks where it ends; a value printed on a line of its own cannot, because
+    a break in it starts a second line that the envelope does not cover and
+    the reader has no way to attribute. That is the whole escape the
+    computed/authored split exists to prevent, so the check has to cover every
+    character that breaks a line rather than the two that come to mind.
+    """
+    return text.translate(_LINE_BREAK_TABLE)
+
+
 def neutralise_untrusted_delimiters(text: str) -> str:
     """
     Strip envelope boundary spellings out of attacker-controlled text.

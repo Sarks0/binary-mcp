@@ -48,7 +48,7 @@ from urllib.error import HTTPError
 from src.integrations import IntegrationClient, IntegrationError, ProviderConfig
 from src.integrations.hashes import normalise_hash
 from src.tools.mb_tools import ABUSECH_API_KEY_ENV, MB_API_KEY_ENV
-from src.utils.formatters import wrap_untrusted
+from src.utils.formatters import flatten_to_one_line, wrap_untrusted
 
 logger = logging.getLogger(__name__)
 
@@ -232,7 +232,7 @@ def _scalar(value) -> str:
     """
     Render one field value as a single line.
 
-    Every branch flattens newlines, not just the scalar one. A field printed
+    Every branch flattens line breaks, not just the scalar one. A field printed
     OUTSIDE the F-7 envelope has to occupy exactly the line it was given: a
     value carrying a newline starts a second line that the envelope does not
     cover, which is the escape the classification exists to prevent. The
@@ -248,7 +248,7 @@ def _scalar(value) -> str:
         text = " | ".join(f"{key}={item}" for key, item in sorted(value.items()))
     else:
         text = str(value)
-    return text.replace("\r", " ").replace("\n", " ")
+    return flatten_to_one_line(text)
 
 
 def _fields(entry: dict, spec: tuple[tuple[str, str], ...], indent: str = "   ") -> list[str]:

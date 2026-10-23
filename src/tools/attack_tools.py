@@ -638,9 +638,14 @@ def register_attack_tools(app, session_manager=None):
             # Whether a usable index is already on disk, not merely whether
             # the file exists: a corrupt one is re-downloaded, and saying "no
             # network access" about that is false where it matters most.
-            served_from_cache = not refresh and _read_cached(cached) is not None
+            #
+            # Read once and keep it. load_index's warm path returns exactly
+            # this, so calling it again here would parse the same ~2.7MB file
+            # a second time for a one-line answer.
+            on_disk = None if refresh else _read_cached(cached)
+            served_from_cache = on_disk is not None
 
-            index = load_index(matrix, refresh=refresh)
+            index = on_disk if served_from_cache else load_index(matrix, refresh=refresh)
 
             kinds: dict[str, int] = {}
             for entity in (index.get("entities") or {}).values():

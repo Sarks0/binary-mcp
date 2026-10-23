@@ -426,14 +426,14 @@ class _FailingBody:
 
 
 @pytest.mark.parametrize(
-    "error,name",
+    "error,leaked",
     [
-        (TimeoutError("The read operation timed out"), "TimeoutError"),
-        (ConnectionResetError(104, "Connection reset by peer"), "ConnectionResetError"),
+        (TimeoutError("The read operation timed out"), "timed out"),
+        (ConnectionResetError(104, "Connection reset by peer"), "reset by peer"),
         (IncompleteRead(b"", 512), "IncompleteRead"),
     ],
 )
-def test_a_failure_while_reading_is_mapped_like_any_other(monkeypatch, error, name):
+def test_a_failure_while_reading_is_mapped_like_any_other(monkeypatch, error, leaked):
     """
     urlopen maps a connect-phase failure to URLError, but the body is read
     after the response is open, and a failure there arrives unmapped.
@@ -442,6 +442,10 @@ def test_a_failure_while_reading_is_mapped_like_any_other(monkeypatch, error, na
     diagnoses with whichever except clause it reaches first: attack_status
     caught it as OSError and reported a read timeout as an invalid ATT&CK cache
     directory, sending the operator to inspect a filesystem that was fine.
+
+    The mapped message names the provider and carries a reference ID, and says
+    nothing the exception said: this clause catches OSError, the one type that
+    routinely carries a resolved path.
     """
     client = _client()
     monkeypatch.setattr(client, "api_key", lambda: "k")
@@ -452,8 +456,10 @@ def test_a_failure_while_reading_is_mapped_like_any_other(monkeypatch, error, na
     with pytest.raises(IntegrationError) as caught:
         client.request("thing")
 
-    assert "TestProvider" in str(caught.value)
-    assert name in str(caught.value)
+    message = str(caught.value)
+    assert "TestProvider" in message
+    assert "Reference ID" in message
+    assert leaked not in message
 
 
 def test_a_read_failure_does_not_echo_the_exception_text(monkeypatch):

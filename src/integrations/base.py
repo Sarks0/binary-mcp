@@ -273,11 +273,20 @@ class IntegrationClient:
             # read timeout as an invalid ATT&CK cache directory, sending the
             # operator to look at a filesystem that was never the problem.
             # URLError is an OSError too, so this clause must stay below it.
-            # Only the condition's name is echoed, for the same reason the
-            # clause above quotes e.reason rather than e.
+            #
+            # The condition goes through safe_error_message rather than into
+            # the sentence. The clause above may quote e.reason because
+            # URLError and HTTPError are audited types whose reason is a
+            # status phrase; this one catches OSError, which is exactly the
+            # type that carries a resolved path, so it gets the same treatment
+            # every other unaudited handler in this repo gets -- the detail
+            # logged against a reference ID rather than echoed on trust.
+            from src.utils.security import safe_error_message
+
             raise self.error_cls(
-                f"Network error reading the {self.config.name} response "
-                f"({type(e).__name__})"
+                safe_error_message(
+                    f"Network error reading the {self.config.name} response", e
+                )
             ) from None
 
         if len(raw) > cap:

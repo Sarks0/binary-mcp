@@ -570,3 +570,15 @@ def test_only_a_well_formed_cursor_is_echoed(monkeypatch, cursor, printed):
     assert not any(line.startswith("SYSTEM:") for line in out.splitlines())
     if not printed:
         assert "a shape this server does not print" in out
+
+
+def test_sandbox_verdicts_are_capped_like_every_other_section(monkeypatch):
+    """The one list in the behaviour renderer that rendered unbounded."""
+    limit = vt_tools._BEHAVIOUR_SECTION_LIMIT
+    verdicts = [{"verdict": f"MALICIOUS_{i}", "category": "c"} for i in range(limit + 7)]
+    _capture_requests(monkeypatch, {"data": {"verdicts": verdicts}})
+
+    out = _register(monkeypatch)["vt_behavior"]("a" * 64)
+
+    assert out.count("MALICIOUS_") == limit
+    assert "... and 7 more" in out

@@ -310,6 +310,11 @@ class IntegrationClient:
 
     # error mapping
 
+    #: Ceiling on an error body. Generous for the JSON object a provider
+    #: actually sends, and nothing like the success-path cap, because an error
+    #: body is read only to lift a sentence out of it.
+    ERROR_BODY_MAX_BYTES = 64 * 1024
+
     def read_error_body(self, error: HTTPError) -> bytes:
         """
         Best-effort read of an error response body.
@@ -317,9 +322,14 @@ class IntegrationClient:
         Providers put their most useful diagnostics here -- which privilege is
         missing, which quota tripped -- and the status line does not say it.
         Never allowed to mask the original failure, hence the broad catch.
+
+        Bounded like every other read in this class. It was the one that was
+        not, which is the wrong exception to make: an error path is exactly
+        where a provider is least likely to be behaving, and this body is
+        enrichment the caller can do without.
         """
         try:
-            return error.read() or b""
+            return error.read(self.ERROR_BODY_MAX_BYTES) or b""
         except Exception:  # nosec B110 - body is best-effort enrichment only
             return b""
 

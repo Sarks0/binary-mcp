@@ -320,6 +320,43 @@ def test_tool_reference_category_counts_sum_to_total():
     assert sum(section_counts) == count_registered_tools()
 
 
+def test_tool_reference_summary_table_matches_its_sections():
+    """
+    The summary table's rows must match the section headings below it.
+
+    The test above sums the '### Name - N tools' headings, so a heading that
+    is updated and a table row that is not both pass it while contradicting
+    each other on the same page. That is exactly what happened: the Other
+    section went to 64 while its row stayed at 45, the rows summed to 147
+    against a 166 headline, and the row's anchor link pointed at a heading
+    that no longer existed.
+    """
+    text = TOOLS_DOC.read_text(encoding="utf-8")
+
+    sections = {
+        name.strip(): int(count)
+        for name, count in re.findall(r"^### (.+) - (\d+) tools?$", text, re.M)
+    }
+    rows = re.findall(r"^\| \[(.+?)\]\((#[^)]+)\) \| (\d+) \|$", text, re.M)
+    assert rows, "docs/tools.md no longer has a capability summary table"
+
+    mismatched = []
+    broken_anchors = []
+    for name, anchor, count in rows:
+        expected = sections.get(name.strip())
+        if expected is None or expected != int(count):
+            mismatched.append(f"{name}: table says {count}, sections say {expected}")
+        # GitHub's anchor for "### Name - N tools".
+        slug = f"{name.strip()} - {expected} tools".lower()
+        slug = "#" + re.sub(r"[^a-z0-9 -]", "", slug).replace(" ", "-")
+        if expected is not None and anchor != slug:
+            broken_anchors.append(f"{name}: links to {anchor}, heading is {slug}")
+
+    assert not mismatched, "summary table disagrees with its sections:\n  " + "\n  ".join(mismatched)
+    assert not broken_anchors, "summary table link is dead:\n  " + "\n  ".join(broken_anchors)
+    assert sum(int(c) for _, _, c in rows) == count_registered_tools()
+
+
 def test_every_tool_module_is_registered_from_main():
     """
     Every module that defines tools must actually be wired up by main().

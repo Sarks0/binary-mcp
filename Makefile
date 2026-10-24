@@ -1,4 +1,4 @@
-.PHONY: help install install-dev test test-cov run compile-sample diagnose clean clean-all lint format
+.PHONY: help install install-dev test test-cov run compile-sample diagnose token-report clean clean-all lint format
 
 help:
 	@echo "Binary MCP Server - Development Commands"
@@ -9,6 +9,7 @@ help:
 	@echo "  make run           - Run MCP server"
 	@echo "  make compile-sample - Compile test malware sample"
 	@echo "  make diagnose      - Run diagnostic checks"
+	@echo "  make token-report  - Show what tools/list and the instructions cost a model"
 	@echo "  make clean         - Clean cache and temporary files"
 	@echo "  make clean-all     - Clean everything including dependencies"
 	@echo "  make lint          - Run code linting with ruff"
@@ -37,6 +38,9 @@ compile-sample:
 diagnose:
 	@echo "Running diagnostic checks..."
 	@uv run python -c "from src.engines.static.ghidra.runner import GhidraRunner; import json; r = GhidraRunner(); print(json.dumps(r.diagnose(), indent=2))"
+
+token-report:
+	uv run python -m src.token_report
 
 clean:
 	@echo "Cleaning cache and temporary files..."

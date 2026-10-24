@@ -82,8 +82,9 @@ def roster(tmp_path_factory):
 
             import src.server as server_module
 
-            server_module.register_all_tools()
-            tools = asyncio.run(server_module.app.get_tools())
+            # The full roster, whatever host runs the suite.
+            server_module.register_all_tools(windows=True, raw_windbg=True)
+            tools = {t.name: t for t in asyncio.run(server_module.app.list_tools())}
             yield server_module.app, tools, Client
     finally:
         for name in _mcp_modules():
@@ -127,7 +128,7 @@ def test_tags_reach_tools_list(roster):
 
     async def listed():
         async with client_cls(app) as client:
-            return {t.name: set(t.meta["_fastmcp"]["tags"]) for t in await client.list_tools()}
+            return {t.name: set(t.meta["fastmcp"]["tags"]) for t in await client.list_tools()}
 
     tags = asyncio.run(listed())
     assert "category:uncategorized" not in set().union(*tags.values())

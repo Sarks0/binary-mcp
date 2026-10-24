@@ -31,7 +31,9 @@ command chained after an allowed one cannot slip past on the strength of the
 first token.
 
 `windbg_execute_command` is **disabled unless the operator sets
-`BINARY_MCP_ENABLE_RAW_WINDBG=1`** in the server environment. When enabled it
+`BINARY_MCP_ENABLE_RAW_WINDBG=1`** in the server environment. Without it the
+tool is not even listed, and it still refuses at call time if the variable is
+cleared after startup. When enabled it
 is gated by a fail-closed allowlist: a subcommand runs only if its command name
 appears in a curated read-only inspection list, and anything unrecognised (a
 new verb, an extension export, a misspelling) is refused. The gate splits

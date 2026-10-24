@@ -738,14 +738,20 @@ class _RecordedTool:
     """
     Minimal stand-in for a FastMCP tool object.
 
-    ``apply_tool_catalog`` (src/tool_catalog.py:267) reads and rewrites
-    ``tool.tags``, so a bare function is not enough.
+    ``apply_tool_catalog`` (src/tool_catalog.py) reads and rewrites
+    ``tool.tags``, and the rest of register_all_tools() shapes each tool's
+    output schema, description, parameter schema and metadata, so a bare
+    function is not enough.
     """
 
     def __init__(self, fn):
         self.fn = fn
         self.name = getattr(fn, "__name__", repr(fn))
         self.tags = set()
+        self.output_schema = None
+        self.description = getattr(fn, "__doc__", None) or ""
+        self.parameters = {"type": "object", "properties": {}}
+        self.meta = None
 
 
 class _ToolRecorder:
@@ -777,11 +783,11 @@ class _ToolRecorder:
 
         return register
 
-    async def get_tools(self):
-        # register_all_tools() ends with
-        # `apply_tool_catalog(asyncio.run(app.get_tools()))`, so this has to be
-        # a real coroutine returning something dict-shaped.
-        return dict(self.tools)
+    async def list_tools(self):
+        # register_all_tools() builds `{t.name: t for t in
+        # asyncio.run(app.list_tools())}`, so this must be a real coroutine
+        # returning a list of tool-like objects carrying a .name.
+        return list(self.tools.values())
 
     def __getattr__(self, name):
         # Any other app API a registrar happens to touch is a no-op here.
@@ -815,7 +821,10 @@ def _registered_path_tools(server):
     real_app = module.app
     try:
         module.app = recorder
-        module.register_all_tools()
+        # The full roster on every host. register_all_tools() otherwise leaves
+        # the WinDbg tools out off Windows, and this sweep is the
+        # whole-surface guarantee, Windows-only tools included.
+        module.register_all_tools(windows=True, raw_windbg=True)
     finally:
         module.app = real_app
 

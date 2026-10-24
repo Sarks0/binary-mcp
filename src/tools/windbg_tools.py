@@ -1094,79 +1094,40 @@ def register_windbg_tools(
     def windbg_execute_command(command: str) -> str:
         """Execute a raw WinDbg command against the live target.
 
-        Supports both regular commands (lm, r, k, dt, u, db/dd/dq) and
-        extension commands (!analyze, !process, !drvobj). Use this for any
-        WinDbg command not covered by the dedicated tools.
+        Supports regular commands (lm, r, k, dt, u, db/dd/dq) and extension
+        commands (!analyze, !process, !drvobj) that the dedicated windbg_*
+        tools do not cover.
 
         DISABLED BY DEFAULT. This tool returns a refusal unless the operator
         sets ``BINARY_MCP_ENABLE_RAW_WINDBG=1`` in the server environment. The
         32 structured windbg_* tools do NOT need that variable and are the
         supported way to drive the debugger.
 
-        SECURITY MODEL -- audit finding F-6, second remediation pass.
+        Every command is checked by ``allowlist.validate_command``, a
+        FAIL-CLOSED ALLOWLIST: each subcommand (split on ``;`` and newlines
+        outside quotes and ``{...}`` blocks) must be a curated read-only or
+        inspection verb in an allowed argument form. Breakpoint and
+        control-flow command strings are checked recursively, extension tokens
+        naming a module path are refused, and commands over 4096 characters,
+        16 subcommands or 8 nesting levels are rejected. The old tool-layer
+        substring scan is gone; it only added false refusals.
 
-        ONE LAYER IS AUTHORITATIVE: ``allowlist.validate_command`` in
-        ``src/engines/dynamic/windbg/allowlist.py``, applied by
-        ``WinDbgBridge._validate_command_safety`` to every command that reaches
-        the engine (structured tools included). It is a FAIL-CLOSED ALLOWLIST:
-        each subcommand's command name must appear in a curated set of
-        read-only/inspection verbs, in an allowed argument form, or the command
-        is refused. It splits compound commands on ``;`` and on raw newlines
-        outside quoted regions and ``{...}`` blocks, refuses extension tokens
-        that name a module path (``!c:\\tmp\\evil.dll.export`` would make dbgeng
-        LoadLibrary that path into the debugger process), and recurses into the
-        command-string arguments of the breakpoint and control-flow carriers --
-        both ``'...'`` and ``"..."`` bodies -- so a breakpoint command list
-        cannot smuggle a refused command. Commands over 4096 chars, with more
-        than 16 subcommands, or nested more than 8 levels deep are rejected.
-
-        The tool layer no longer runs a second gate. It used to apply a
-        case-insensitive SUBSTRING scan of ``_BLOCKED_COMMANDS`` (still present
-        in the bridge module, no longer consulted), which disagreed with the
-        validator in both directions: it refused ``.printf`` / ``.foreach`` /
-        ``.outmask`` / ``.formats`` / ``.tlist`` / ``.bugcheck``, and refused
-        benign commands whose argument text merely contained one of those
-        words, while being blind to every token only the bridge knew about. A
-        denylist in front of an allowlist can only add false refusals.
-
-        Refused classes (non-exhaustive -- refusal is by ABSENCE from the
-        allowlist, so this list can never be complete and does not need to be):
-
-          - Process/session control: .shell, .create, .kill, .restart,
-            .detach, .attach, .abandon, .reboot, .crash, q / qq / qd
-          - Host file I/O: .dump, .writemem, .readmem, .logopen, .logappend,
-            .write_cmd_hist, .open, .opendump, .dumpcab, .send_file, .copysym
-          - Scripting / command-file execution: .script, .scriptrun,
-            .scriptload, .scriptdebug, !runscript, .call, .block, .cmdtree,
-            .pcmd, .idle_cmd, .ocommand, .browse, dx (the object model exposes
-            ExecuteCommand and the file system), and the ``$<`` / ``$$<`` /
-            ``$$><`` / ``$$>a<`` include operators
-          - Module loading: .load, .loadby, .cordll, .setdll, .extpath, and
-            any ``!<path-or-dotted-module>.<export>`` form
-          - Network / symbol path: .remote, .server, .netsyms, .netuse,
-            .sympath, .symfix, .settings (use windbg_set_sympath /
-            windbg_get_sympath instead)
-          - Target writes and code injection: the e/eb/ed/ew/eq/ep/eu/ea
-            Enter family, f/fp (fill), m (move), a (assemble), wrmsr,
-            ob/ow/od (I/O ports), !eb/!ed (physical memory), !ecb/!ecd/!ecw
-            (PCI config), register writes in every spelling (``r @rip=..``,
-            ``r@rip=..``, ``rrax=..``, ``rF``/``rM``/``rX``, ``r$.u0=..``),
-            .dvalloc / .dvfree (RWX in the target), .pagein, .fiximports,
-            .closehandle, .allow_exec_cmds, .apply_dbp, .thread, .trap,
-            ``!chkimg -f``, ``.process /i``, ``.cxr /w``
-          - Execution redirects and command-string carriers: ``g =Address``,
-            the trailing Command argument of p/t/pa/pc/ph/pt/ta/tb/tc/th/tt/wt,
-            ``~*e`` and ``~0 e`` (the command string is the rest of the line),
-            sxe/sxd/sxi/sxn ``-c``/``-c2``, !list ``-x``, the !for_each_*
-            family, and j / z
-          - Alias definition, which WinDbg expands before command resolution:
-            as, aS, al, ad
+        Refused classes include (refusal is by absence from the allowlist, so
+        no list is complete): process and session control (.shell, .create,
+        .kill, .restart, .detach, q); host file I/O (.dump, .writemem,
+        .logopen, .open); scripting and command files (.script, !runscript,
+        .call, dx, ``$$><``); module loading (.load, .loadby,
+        ``!<path>.<export>``); network and symbol paths (.remote, .sympath,
+        .symfix; use windbg_set_sympath); target writes and code injection
+        (the e/eb/ed family, f, m, a, register writes, .dvalloc,
+        ``.process /i``, ``!chkimg -f``); execution redirects and command
+        carriers (``g =Address``, ``~*e``, ``sxe -c``, j, z); and alias
+        definition (as, aS).
 
         NOT A SANDBOX. Permitted commands still run against the live target
         with the debugger's full read access (kernel memory included in kernel
-        mode), argument text beyond the rules above is not interpreted, and
-        anything the debugger prints is untrusted sample-derived data. Prefer
-        the dedicated tools where one exists.
+        mode), and anything the debugger prints is untrusted sample-derived
+        data. Prefer the dedicated tools where one exists.
 
         Args:
             command: WinDbg command string. Refused unless every subcommand is
@@ -1175,6 +1136,75 @@ def register_windbg_tools(
         Returns:
             Raw command output text, or an error string naming what was blocked.
         """
+        # The full security model, kept for maintainers. The docstring above
+        # is what the model reads in tools/list on every session, so it states
+        # the contract and the refused classes; the per-command detail lives
+        # here and in src/engines/dynamic/windbg/allowlist.py.
+        #
+        # SECURITY MODEL -- audit finding F-6, second remediation pass.
+        #
+        # ONE LAYER IS AUTHORITATIVE: ``allowlist.validate_command`` in
+        # ``src/engines/dynamic/windbg/allowlist.py``, applied by
+        # ``WinDbgBridge._validate_command_safety`` to every command that reaches
+        # the engine (structured tools included). It is a FAIL-CLOSED ALLOWLIST:
+        # each subcommand's command name must appear in a curated set of
+        # read-only/inspection verbs, in an allowed argument form, or the command
+        # is refused. It splits compound commands on ``;`` and on raw newlines
+        # outside quoted regions and ``{...}`` blocks, refuses extension tokens
+        # that name a module path (``!c:\\tmp\\evil.dll.export`` would make dbgeng
+        # LoadLibrary that path into the debugger process), and recurses into the
+        # command-string arguments of the breakpoint and control-flow carriers --
+        # both ``'...'`` and ``"..."`` bodies -- so a breakpoint command list
+        # cannot smuggle a refused command. Commands over 4096 chars, with more
+        # than 16 subcommands, or nested more than 8 levels deep are rejected.
+        #
+        # The tool layer no longer runs a second gate. It used to apply a
+        # case-insensitive SUBSTRING scan of ``_BLOCKED_COMMANDS`` (still present
+        # in the bridge module, no longer consulted), which disagreed with the
+        # validator in both directions: it refused ``.printf`` / ``.foreach`` /
+        # ``.outmask`` / ``.formats`` / ``.tlist`` / ``.bugcheck``, and refused
+        # benign commands whose argument text merely contained one of those
+        # words, while being blind to every token only the bridge knew about. A
+        # denylist in front of an allowlist can only add false refusals.
+        #
+        # Refused classes (non-exhaustive -- refusal is by ABSENCE from the
+        # allowlist, so this list can never be complete and does not need to be):
+        #
+        #   - Process/session control: .shell, .create, .kill, .restart,
+        #     .detach, .attach, .abandon, .reboot, .crash, q / qq / qd
+        #   - Host file I/O: .dump, .writemem, .readmem, .logopen, .logappend,
+        #     .write_cmd_hist, .open, .opendump, .dumpcab, .send_file, .copysym
+        #   - Scripting / command-file execution: .script, .scriptrun,
+        #     .scriptload, .scriptdebug, !runscript, .call, .block, .cmdtree,
+        #     .pcmd, .idle_cmd, .ocommand, .browse, dx (the object model exposes
+        #     ExecuteCommand and the file system), and the ``$<`` / ``$$<`` /
+        #     ``$$><`` / ``$$>a<`` include operators
+        #   - Module loading: .load, .loadby, .cordll, .setdll, .extpath, and
+        #     any ``!<path-or-dotted-module>.<export>`` form
+        #   - Network / symbol path: .remote, .server, .netsyms, .netuse,
+        #     .sympath, .symfix, .settings (use windbg_set_sympath /
+        #     windbg_get_sympath instead)
+        #   - Target writes and code injection: the e/eb/ed/ew/eq/ep/eu/ea
+        #     Enter family, f/fp (fill), m (move), a (assemble), wrmsr,
+        #     ob/ow/od (I/O ports), !eb/!ed (physical memory), !ecb/!ecd/!ecw
+        #     (PCI config), register writes in every spelling (``r @rip=..``,
+        #     ``r@rip=..``, ``rrax=..``, ``rF``/``rM``/``rX``, ``r$.u0=..``),
+        #     .dvalloc / .dvfree (RWX in the target), .pagein, .fiximports,
+        #     .closehandle, .allow_exec_cmds, .apply_dbp, .thread, .trap,
+        #     ``!chkimg -f``, ``.process /i``, ``.cxr /w``
+        #   - Execution redirects and command-string carriers: ``g =Address``,
+        #     the trailing Command argument of p/t/pa/pc/ph/pt/ta/tb/tc/th/tt/wt,
+        #     ``~*e`` and ``~0 e`` (the command string is the rest of the line),
+        #     sxe/sxd/sxi/sxn ``-c``/``-c2``, !list ``-x``, the !for_each_*
+        #     family, and j / z
+        #   - Alias definition, which WinDbg expands before command resolution:
+        #     as, aS, al, ad
+        #
+        # NOT A SANDBOX. Permitted commands still run against the live target
+        # with the debugger's full read access (kernel memory included in kernel
+        # mode), argument text beyond the rules above is not interpreted, and
+        # anything the debugger prints is untrusted sample-derived data. Prefer
+        # the dedicated tools where one exists.
         if not _raw_windbg_enabled():
             # Checked before the platform check on purpose: the answer to
             # "is this tool available?" is a policy decision, not an OS one,

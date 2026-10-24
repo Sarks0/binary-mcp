@@ -913,33 +913,16 @@ def register_diff_tools(app, session_manager, cache, runner):
         """
         Diff two analyzed binaries and rank likely security fixes.
 
-        Pairs functions across two cached Ghidra contexts in three phases
-        (PDB-name -> opcode hash -> callee-set Jaccard >= 0.85 with matching
-        basic-block count) and emits ADDED / REMOVED / MODIFIED buckets.
-        In ``mode="security"`` modified entries are ranked by a heuristic
-        fix-likelihood score combining bounds-check delta, stack-cookie
-        delta, caller-count delta (from Wave 1A's ``xrefs_to_function``
-        index) and size delta. ``mode="none"`` returns modified entries
-        in source order with the score suppressed.
+        Pairs functions across two cached Ghidra contexts (PDB name, then
+        opcode hash, then callee-set similarity) into ADDED / REMOVED /
+        MODIFIED buckets. ``mode="security"`` ranks modified functions by a
+        fix-likelihood score (bounds-check, stack-cookie, caller-count and
+        size deltas). Both binaries must already be analyzed; this tool does
+        not run Ghidra, and repeat diffs of the same pair are fast.
 
-        Both binaries must already be analyzed; this tool does not invoke
-        Ghidra. ``group_by="module"`` groups MODIFIED entries by C++
-        class prefix (``A::B::method`` -> ``A::B``); ``"none"`` emits a
-        flat list.
-
-        Opcode hashes are cached to a ``<sha256>.fnhash.json`` side-car per
-        binary, so re-running a diff of the same pair skips the dominant cost
-        of a cold run. The side-car is keyed on the binary's content hash and
-        each entry is guarded by its function's basic-block extents, so a
-        re-analysis that redraws them recomputes rather than serving a stale
-        hash.
-
-        The report is bounded by default. An unbounded one on a large pair
-        runs to 20000 lines and cannot come back through an MCP client at
-        all, so the buckets are capped and every cut says how much it
-        omitted. Nothing is lost: whenever the returned report is truncated
-        the complete one is written next to the analysis caches and the
-        header carries its path.
+        The report is bounded, and every cut says how much it omitted. When
+        it is truncated, the complete report is written next to the analysis
+        caches and the header gives its path.
 
         Args:
             old_path: Path to the OLD analyzed binary.

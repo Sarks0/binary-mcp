@@ -466,7 +466,7 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
         confidence_floor: int = 0,
         limit: int = 50,
         offset: int = 0,
-        mode: str = "findings",
+        mode: str = "summary",
     ) -> str:
         """
         Scan cached pseudocode for CWE / vulnerability patterns.
@@ -482,10 +482,12 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
              so the model can confirm or reject each candidate.
 
         Modes:
-          - "findings" (default): full per-finding report with excerpt and
-            recommendation, sorted by severity then confidence desc.
-          - "summary": one line per function showing finding count, max
-            confidence in that function, and severity breakdown.
+          - "summary" (default): one line per function showing finding
+            count, max confidence in that function, and severity breakdown.
+            About a fifth the size of "findings".
+          - "findings": full per-finding report with excerpt and
+            recommendation, sorted by severity then confidence desc. Narrow
+            it with function_filter or confidence_floor first.
 
         Args:
             binary_path: Path to analyzed binary (must have been analyzed
@@ -650,26 +652,32 @@ def register_review_tools(app, session_manager, cache, runner, api_patterns=None
                     )
                     return "\n".join(lines)
 
+                next_offset = offset + len(page)
+                if next_offset < total_funcs_with_findings:
+                    lines.append(
+                        f"_Showing {offset + 1}-{next_offset} of "
+                        f"{total_funcs_with_findings}. "
+                        f"Call again with offset={next_offset} for the next page._"
+                    )
+                    lines.append("")
+
+                # Audit F-7: the function names are the sample's own (symbols,
+                # or anything a packer wrote into the export table), so the
+                # rows are fenced. Summary is the default mode, which makes
+                # this the scan output a model sees most.
+                rows = []
                 for row in page:
                     sev_breakdown = " ".join(
                         f"{sev}={row['by_severity'][sev]}"
                         for sev in ("critical", "high", "medium", "low", "info")
                         if row["by_severity"].get(sev)
                     )
-                    lines.append(
+                    rows.append(
                         f"- {row['name']} @ {row['address']}  "
                         f"(conf={row['max_confidence']}, {row['total']} total) "
                         f"{sev_breakdown}"
                     )
-
-                next_offset = offset + len(page)
-                if next_offset < total_funcs_with_findings:
-                    lines.append("")
-                    lines.append(
-                        f"_Showing {offset + 1}-{next_offset} of "
-                        f"{total_funcs_with_findings}. "
-                        f"Call again with offset={next_offset} for the next page._"
-                    )
+                lines.append(wrap_untrusted("\n".join(rows), "function names from the sample"))
                 return "\n".join(lines)
 
             page = all_findings[offset : offset + limit]

@@ -12,7 +12,7 @@ name list enforces nothing on the tools it missed.
 Every registered tool gets exactly one **category** and zero or more
 **facets**. Both are applied as FastMCP tags (``category:<name>`` plus the
 bare facet names), so they appear on every ``tools/list`` entry under
-``_meta._fastmcp.tags``. For consumers that can't call the server (a hook
+``_meta.fastmcp.tags``. For consumers that can't call the server (a hook
 script), the same data is exported as JSON::
 
     python -m src.tool_catalog            # manifest for the full roster
@@ -228,7 +228,7 @@ TOOL_CATALOG: dict[str, ToolEntry] = {
     "vt_check_api": _e("threat-intel", NET),
 }
 
-# The ~190 debugger tools share one shape; listing each by hand would add
+# The debugger tools share one shape; listing each by hand would add
 # nothing. Exact entries in TOOL_CATALOG win over these, which is how the
 # disassembly tools below pick up ``code-output``.
 PREFIX_RULES: dict[str, ToolEntry] = {
@@ -302,8 +302,9 @@ def _main() -> None:
 
     from src.server import app, register_all_tools
 
-    register_all_tools()
-    tools = asyncio.run(app.get_tools())
+    # The full roster, whatever host generates the manifest.
+    register_all_tools(windows=True, raw_windbg=True)
+    tools = {t.name: t for t in asyncio.run(app.list_tools())}
     print(manifest_json(tools), end="")
 
 

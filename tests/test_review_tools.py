@@ -155,7 +155,7 @@ class TestScanPseudocode:
         fn = _make_function(pseudocode="char buf[16]; strcpy(buf, input);")
         tools = _register(monkeypatch, _make_context(functions=[fn]))
 
-        result = tools["scan_pseudocode"]("/bin/test.exe")
+        result = tools["scan_pseudocode"]("/bin/test.exe", mode="findings")
         assert "CWE120_STRCPY" in result
         assert "CWE-120" in result
 
@@ -163,7 +163,7 @@ class TestScanPseudocode:
         fn = _make_function(pseudocode="char buf[16]; gets(buf);")
         tools = _register(monkeypatch, _make_context(functions=[fn]))
 
-        result = tools["scan_pseudocode"]("/bin/test.exe")
+        result = tools["scan_pseudocode"]("/bin/test.exe", mode="findings")
         assert "CWE120_GETS" in result
         assert "CRITICAL" in result
 
@@ -172,14 +172,14 @@ class TestScanPseudocode:
         tools = _register(monkeypatch, _make_context(functions=[fn]))
 
         # sscanf is CWE676_DANGEROUS_FN at severity "low" -- floor=high should drop it
-        result = tools["scan_pseudocode"]("/bin/test.exe", severity_floor="high")
+        result = tools["scan_pseudocode"]("/bin/test.exe", severity_floor="high", mode="findings")
         assert "CWE676_DANGEROUS_FN" not in result
 
     def test_no_findings_clean_code(self, monkeypatch):
         fn = _make_function(pseudocode="int f() { return 42; }")
         tools = _register(monkeypatch, _make_context(functions=[fn]))
 
-        result = tools["scan_pseudocode"]("/bin/test.exe")
+        result = tools["scan_pseudocode"]("/bin/test.exe", mode="findings")
         assert "No findings" in result
 
     def test_function_filter_regex(self, monkeypatch):
@@ -190,7 +190,7 @@ class TestScanPseudocode:
         tools = _register(monkeypatch, _make_context(functions=[hits, misses]))
 
         result = tools["scan_pseudocode"](
-            "/bin/test.exe", function_filter="^vuln_"
+            "/bin/test.exe", function_filter="^vuln_", mode="findings"
         )
         assert "vuln_handler" in result
         assert "safe_handler" not in result
@@ -221,7 +221,7 @@ class TestScanPseudocode:
         for rule_id, snippet in samples.items():
             fn = _make_function(pseudocode=snippet)
             tools = _register(monkeypatch, _make_context(functions=[fn]))
-            result = tools["scan_pseudocode"]("/bin/test.exe")
+            result = tools["scan_pseudocode"]("/bin/test.exe", mode="findings")
             assert rule_id in result, (
                 f"Rule {rule_id} did not fire on snippet: {snippet}\n"
                 f"Output: {result}"
@@ -375,7 +375,7 @@ class TestScanPseudocodeFiltering:
         fn = _make_function(pseudocode="strcpy(a,b); gets(c);")
         tools = _register(monkeypatch, _make_context(functions=[fn]))
         result = tools["scan_pseudocode"](
-            "/bin/test.exe", exclude_rule_ids=["CWE120_STRCPY"]
+            "/bin/test.exe", exclude_rule_ids=["CWE120_STRCPY"], mode="findings"
         )
         assert "CWE120_STRCPY" not in result
         assert "CWE120_GETS" in result
@@ -386,12 +386,12 @@ class TestScanPseudocodeFiltering:
         tools = _register(monkeypatch, _make_context(functions=[fn]))
 
         low = tools["scan_pseudocode"](
-            "/bin/test.exe", confidence_floor=0
+            "/bin/test.exe", confidence_floor=0, mode="findings"
         )
         assert "CWE798_HARDCODED_PASSWORD" in low
 
         high = tools["scan_pseudocode"](
-            "/bin/test.exe", confidence_floor=50
+            "/bin/test.exe", confidence_floor=50, mode="findings"
         )
         assert "CWE798_HARDCODED_PASSWORD" not in high
         assert "dropped" in high.lower()
@@ -406,7 +406,7 @@ class TestScanPseudocodeFiltering:
             name="fb", address="0x2000", pseudocode="system(cmd);",
         )
         tools = _register(monkeypatch, _make_context(functions=[a, b]))
-        result = tools["scan_pseudocode"]("/bin/test.exe")
+        result = tools["scan_pseudocode"]("/bin/test.exe", mode="findings")
         gets_idx = result.find("CWE120_GETS")
         sys_idx = result.find("CWE78_COMMAND_INJECTION")
         assert gets_idx >= 0 and sys_idx >= 0
@@ -597,12 +597,12 @@ class TestMemoryCorruptionRulesEndToEnd:
         tools = _register(monkeypatch, _make_context(functions=[fn]))
 
         low_result = tools["scan_pseudocode"](
-            "/bin/test.exe", severity_floor="low"
+            "/bin/test.exe", severity_floor="low", mode="findings"
         )
         assert "CWE125_STRLEN_UNTRUSTED_PTR" in low_result
 
         high_result = tools["scan_pseudocode"](
-            "/bin/test.exe", severity_floor="high"
+            "/bin/test.exe", severity_floor="high", mode="findings"
         )
         assert "CWE125_STRLEN_UNTRUSTED_PTR" not in high_result
 
@@ -618,7 +618,7 @@ class TestMemoryCorruptionRulesEndToEnd:
         tools = _register(monkeypatch, _make_context(functions=[fn]))
 
         result = tools["scan_pseudocode"](
-            "/bin/test.exe", rule_ids=["CWE416_USE_AFTER_FREE"]
+            "/bin/test.exe", rule_ids=["CWE416_USE_AFTER_FREE"], mode="findings"
         )
         assert "CWE416_USE_AFTER_FREE" in result
         assert "CWE805_MEMCPY_HEADER_DRIVEN_LEN" not in result
@@ -656,19 +656,19 @@ class TestScanPseudocodePagination:
 
     def test_default_limit_returns_first_page(self, monkeypatch):
         tools = self._build(monkeypatch)
-        result = tools["scan_pseudocode"]("/bin/test.exe", limit=10)
+        result = tools["scan_pseudocode"]("/bin/test.exe", limit=10, mode="findings")
         assert "25 finding" in result
         assert "Showing 1-10 of 25" in result
         assert "offset=10" in result
 
     def test_offset_returns_next_page(self, monkeypatch):
         tools = self._build(monkeypatch)
-        result = tools["scan_pseudocode"]("/bin/test.exe", limit=10, offset=10)
+        result = tools["scan_pseudocode"]("/bin/test.exe", limit=10, offset=10, mode="findings")
         assert "Showing 11-20 of 25" in result
 
     def test_offset_past_end(self, monkeypatch):
         tools = self._build(monkeypatch)
-        result = tools["scan_pseudocode"]("/bin/test.exe", offset=999)
+        result = tools["scan_pseudocode"]("/bin/test.exe", offset=999, mode="findings")
         assert "beyond the result set" in result
 
     def test_summary_mode(self, monkeypatch):
@@ -1145,7 +1145,7 @@ class TestContextRuleScanPseudocodeIntegration:
         )
         tools = _register(monkeypatch, _make_context(functions=[fn_dict]))
 
-        result = tools["scan_pseudocode"]("/bin/test.exe")
+        result = tools["scan_pseudocode"]("/bin/test.exe", mode="findings")
 
         assert "USER_FETCH" in result
         assert "vuln" in result
@@ -1174,7 +1174,7 @@ class TestContextRuleScanPseudocodeIntegration:
 
         # severity_floor=medium suppresses an info-severity context rule.
         result = tools["scan_pseudocode"](
-            "/bin/test.exe", severity_floor="medium"
+            "/bin/test.exe", severity_floor="medium", mode="findings"
         )
         assert "INFO_RULE" not in result
 
@@ -1205,7 +1205,7 @@ class TestContextRuleScanPseudocodeIntegration:
         tools = _register(monkeypatch, _make_context(functions=[fn_dict]))
 
         result = tools["scan_pseudocode"](
-            "/bin/test.exe", rule_ids=["CTX_A"]
+            "/bin/test.exe", rule_ids=["CTX_A"], mode="findings"
         )
         assert "CTX_A" in result
         assert "CTX_B" not in result
@@ -1562,7 +1562,7 @@ class TestKernelDoubleFetch:
         )
         tools = _register(monkeypatch, _make_context(functions=[f]))
         result = tools["scan_pseudocode"](
-            "/bin/test.sys", rule_ids=["KERNEL_DOUBLE_FETCH"]
+            "/bin/test.sys", rule_ids=["KERNEL_DOUBLE_FETCH"], mode="findings"
         )
 
         assert "KERNEL_DOUBLE_FETCH" in result

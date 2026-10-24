@@ -10,7 +10,7 @@ FastMCP tags and checked in at [`tool-catalog.json`](tool-catalog.json)
 (regenerate with `python -m src.tool_catalog`). Gate on the `code-output` facet
 if you need to know which calls put decompiled code in front of the model.
 
-## Capabilities (147 tools)
+## Capabilities (166 tools)
 
 | Group | Tools |
 |-------|-------|
@@ -21,7 +21,7 @@ if you need to know which calls put decompiled code in front of the model.
 | [Kernel Debugging (WinDbg)](#kernel-debugging-windbg---33-tools) | 33 |
 | [.NET Analysis (ILSpyCmd)](#net-analysis-ilspycmd---7-tools) | 7 |
 | [PE Structure (pefile)](#pe-structure-pefile---4-tools) | 4 |
-| [Other](#other---45-tools) | 45 |
+| [Other](#other---64-tools) | 64 |
 
 ### Static Analysis (Ghidra) - 20 tools
 
@@ -91,7 +91,7 @@ decoded characteristic flags, compiler attribution and malware indicators. Plus
 Authenticode signature inspection, embedded-binary carving, and similarity
 hashing.
 
-### Other - 45 tools
+### Other - 64 tools
 
 | Area | Tools | What it covers |
 |------|-------|----------------|
@@ -103,6 +103,9 @@ hashing.
 | Review coverage | 6 | Per-binary review denominator, reachability scope, a deterministic unreviewed worklist, and a separate machine-examination axis so a diff run is recorded without counting as a review ([docs](coverage.md)) |
 | Background jobs | 4 | Poll long-running analysis that outlives the MCP client timeout, with one Ghidra run per binary shared across server processes and orphan reaping ([docs](jobs.md)) |
 | VirusTotal | 4 | Hash lookups, sandbox behavior reports, Intelligence search, API-key check. Read-only, see [Security model](security.md) |
+| MalwareBazaar | 5 | Sample lookup by hash, corpus pivots (tag, family signature, file type, ClamAV signature, imphash, TLSH, telfhash, gimphash, icon dhash, YARA rule), recent uploads, Auth-Key check, and an opt-in sample download. Downloading is off unless `MB_ALLOW_DOWNLOAD=1`, see [Security model](security.md) |
+| ThreatFox, URLhaus, YARAify | 9 | IOC-to-malware-family identification, malware distribution history for a URL/host/payload (including the payload hashes served from a host), and public YARA rule matching by hash or by rule name, imphash, TLSH, telfhash, gimphash, icon dhash or ClamAV signature. Shares one abuse.ch Auth-Key with MalwareBazaar |
+| MITRE ATT&CK | 5 | Technique, threat-actor group and malware/tool lookups with alias resolution, plus keyword search across the matrix. No API key and no rate limit: the STIX bundle is fetched once from MITRE's public repository, distilled to a compact index, and served from disk thereafter, so these work offline. That first fetch is ~51MB; whichever `attack_*` call finds the cache empty starts it, answers inline if it completes within `BINARY_MCP_INLINE_DEADLINE`, and otherwise hands back a job handle while the download continues |
 | Reporting | 2 | Structured analysis reports, IOC export |
 | YARA | 2 | Rule *generation* from session data or extracted strings. The server emits rule text; it does not compile or run rules, so no YARA library is required or installed |
 | IOCTL dispatch | 1 | Recover driver IOCTL handlers |

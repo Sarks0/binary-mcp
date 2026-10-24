@@ -51,6 +51,29 @@ nothing can leave your host through it, deliberately or by accident.
 Sending a hash still tells VirusTotal you have the sample; sending the file
 would tell everyone with VT Intelligence access.
 
+The abuse.ch integrations (MalwareBazaar, ThreatFox, URLhaus, YARAify) hold the
+same property by a different mechanism, and the difference is worth stating
+plainly: those APIs are POST-only, so unlike the VirusTotal tools these calls
+do carry a request body. What goes in it is a hash, a tag, a family name or a
+rule name, never file content. `mb_lookup(file_path=...)` hashes the file
+locally and sends the digest alone. There is no `add_file` call anywhere in
+the module, and `tests/test_mb_tools.py` plus `tests/test_integrations_base.py`
+pin that every request body is assembled only from scalar fields, so sample
+bytes have no path to the wire.
+
+The MITRE ATT&CK tools send nothing at all about the sample: they fetch a
+public dataset once and then answer from a local cache.
+
+## Downloading a sample is off by default
+
+`mb_download` is the one tool in this server that writes malware to disk. It
+refuses unless the operator sets `MB_ALLOW_DOWNLOAD=1`; it writes only inside
+`~/.binary_mcp_output/malwarebazaar/`, via `sanitize_output_path`; and it
+stores abuse.ch's **encrypted** zip without ever extracting it, so nothing this
+server does leaves a runnable copy on the host. The archive password is the
+abuse.ch convention, `infected`. Extract it in your analysis VM, not on the
+machine running this server.
+
 ## File access is confined by default
 
 Binary paths go through `sanitize_binary_path` (`src/utils/security.py`), which

@@ -67,7 +67,10 @@ CATEGORIES: dict[str, str] = {
     "jobs": "Background job control for long-running analysis calls.",
     "admin": "Setup diagnostics and cache maintenance.",
     "threat-intel": "External reputation / sandbox lookups (VirusTotal).",
-    "debugger": "Live debugging via x64dbg or WinDbg against a running target or dump.",
+    "debugger": (
+        "Live debugging via x64dbg, WinDbg or GDB against a running target or "
+        "dump."
+    ),
 }
 
 FACETS: dict[str, str] = {
@@ -234,9 +237,10 @@ TOOL_CATALOG: dict[str, ToolEntry] = {
 PREFIX_RULES: dict[str, ToolEntry] = {
     "x64dbg_": _e("debugger"),
     "windbg_": _e("debugger"),
+    "gdb_": _e("debugger"),
 }
 
-DEBUGGER_CODE_OUTPUT = ("x64dbg_disasm", "windbg_disassemble")
+DEBUGGER_CODE_OUTPUT = ("x64dbg_disasm", "windbg_disassemble", "gdb_disassemble")
 for _name in DEBUGGER_CODE_OUTPUT:
     TOOL_CATALOG[_name] = _e("debugger", CODE)
 

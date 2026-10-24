@@ -932,6 +932,44 @@ class TestBatchDecompileTool:
         assert "withheld" in result
         assert "Decompiled this run: 2" in result
 
+    def test_output_stays_within_the_cap_the_middleware_would_cut(
+        self, tmp_path, monkeypatch, server_module
+    ):
+        """A body marked reviewed must survive to the caller.
+
+        Budgeting only body text, at the full cap, let per-function framing
+        and the envelope push the assembled result over the code-output
+        middleware's cap; the middleware then cut bodies this tool had already
+        marked. Each body here is large enough that two would overflow, so the
+        tool must withhold the overflow and mark only what it returns.
+        """
+        from src.utils.output_budget import CODE_OUTPUT_CHAR_BUDGET
+
+        binary, _ = _seed_analyzed_binary(tmp_path, monkeypatch, server_module)
+
+        def fake_context(bp, **kwargs):
+            ctx = server_module.cache.get_cached(bp)
+            for fn in ctx["functions"]:
+                # Real code so it counts as reviewable, sized so two bodies
+                # plus framing overflow the cap but one fits.
+                fn["pseudocode"] = "void f(void) { return; }\n" + "x" * 11_000
+            server_module.cache.save_cached(bp, ctx)
+            return ctx
+
+        marked = []
+        monkeypatch.setattr(server_module, "get_analysis_context", fake_context)
+        monkeypatch.setattr(
+            server_module, "auto_mark_reviewed",
+            lambda c, bp, addrs, **kw: marked.extend(addrs),
+        )
+
+        # Default max_body_chars equals the middleware cap, the regressing case.
+        result = server_module.decompile_functions(str(binary), ["Parse", "Helper"])
+
+        assert len(result) <= CODE_OUTPUT_CHAR_BUDGET
+        assert "withheld" in result
+        assert len(marked) == 1
+
 
 class TestInlineDeadline:
     """Deadline-then-degrade: block only as long as is safe, then hand back a

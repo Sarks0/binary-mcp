@@ -2629,9 +2629,9 @@ def get_functions(
             for func in functions:
                 thunk = " [THUNK]" if func.get('is_thunk') else ""
                 rows.append(
-                    f"{func.get('address', 'Unknown')}\t"
+                    f"{_tsv_cell(str(func.get('address', 'Unknown')))}\t"
                     f"{len(func.get('called_functions', []))}\t"
-                    f"{func.get('name', 'Unknown')}{thunk}"
+                    f"{_tsv_cell(str(func.get('name', 'Unknown')))}{thunk}"
                 )
             result = "\n".join(rows)
 
@@ -2683,6 +2683,11 @@ def get_imports(
                 return f"Error: Invalid filter_function pattern: {e}"
 
         total = len(imports)
+        # Library count comes from the full set, not the shown slice: a slice
+        # sorted by (library, name) groups the first libraries alphabetically,
+        # so counting the slice both undercounts and hides which libraries
+        # were dropped entirely.
+        all_libraries = sorted({i.get('library', 'Unknown') for i in imports})
         imports = sorted(
             imports, key=lambda i: (i.get('library', 'Unknown'), i.get('name', ''))
         )[:limit]
@@ -2695,12 +2700,21 @@ def get_imports(
                 by_library[lib] = []
             by_library[lib].append(imp)
 
-        header = f"**Imports: {total} total from {len(by_library)} libraries**\n"
+        header = f"**Imports: {total} total from {len(all_libraries)} libraries**\n"
         if total > limit:
+            omitted = [lib for lib in all_libraries if lib not in by_library]
             header += (
                 f"*Showing {limit} of {total} imports. Use filter_library or "
                 f"filter_function, or increase limit, to see more.*\n"
             )
+            if omitted:
+                shown_omitted = ", ".join(omitted[:20])
+                more = f", and {len(omitted) - 20} more" if len(omitted) > 20 else ""
+                header += (
+                    f"*No imports shown from {len(omitted)} librar"
+                    f"{'y' if len(omitted) == 1 else 'ies'}: {shown_omitted}{more}. "
+                    f"Filter by one to see them.*\n"
+                )
 
         result = ""
         for lib, funcs in sorted(by_library.items()):
@@ -2776,11 +2790,11 @@ def get_strings(
         if detail != "full":
             rows = ["address\txrefs\tvalue"]
             for string in strings:
-                value = string.get('value', '').replace('\n', '\\n').replace('\r', '\\r')
+                value = _tsv_cell(string.get('value', ''))
                 if len(value) > 100:
                     value = value[:100] + f"... ({string.get('length', 0)} chars)"
                 rows.append(
-                    f"{string.get('address', 'Unknown')}\t"
+                    f"{_tsv_cell(str(string.get('address', 'Unknown')))}\t"
                     f"{len(string.get('xrefs', []))}\t{value}"
                 )
             return header + "\n" + wrap_untrusted("\n".join(rows), "extracted strings")
@@ -2837,6 +2851,20 @@ def _function_containing(functions: list[dict], va: int) -> dict | None:
         if start <= va < start + int(fn.get("size") or 0):
             fallback = fn
     return fallback
+
+
+def _tsv_cell(value: str) -> str:
+    """Escape a tab-separated cell so sample-authored text can't shift columns.
+
+    Function and symbol names come from the binary, so a crafted name
+    containing a tab or newline would split or move the row's columns and a
+    model parsing the rows would misread the fields. The envelope already
+    marks the text as attacker-controlled; this keeps the row structure
+    intact as well.
+    """
+    return value.replace("\\", "\\\\").replace("\t", "\\t").replace(
+        "\r", "\\r"
+    ).replace("\n", "\\n")
 
 
 def _normalize_xref_addr(raw: str | None) -> str:
@@ -3720,28 +3748,41 @@ def decompile_functions(
         shown: list[str] = []
 
         if include_bodies and produced:
-            budget = max_body_chars
+            # Budget the whole framed chunk (header, signature, fenced body),
+            # not the body text alone, and against a ceiling that leaves room
+            # for the status table and the envelope. The code-output
+            # middleware caps the assembled result at CODE_OUTPUT_CHAR_BUDGET;
+            # budgeting only body text used to let framing push the total over
+            # that cap, so the middleware truncated bodies this loop had
+            # already marked reviewed -- a false ledger entry. A function is
+            # marked only once its chunk is known to fit, matching
+            # decompile_function's -2000 headroom.
+            budget = min(max_body_chars, CODE_OUTPUT_CHAR_BUDGET - 2000)
             withheld: list[str] = []
             bodies: list[str] = [""]
             for name, fn in produced:
                 body = fn.get("pseudocode") or ""
-                if len(body) > budget:
+                chunk = [
+                    f"### {name} @ `{fn.get('address')}`",
+                    f"Signature: `{fn.get('signature')}`",
+                    *render_c_block(body),
+                    "",
+                ]
+                chunk_len = len("\n".join(chunk)) + 1
+                if chunk_len > budget:
                     withheld.append(name)
                     continue
-                budget -= len(body)
+                budget -= chunk_len
                 if has_reviewable_body(body):
                     shown.append(fn.get("address"))
-                bodies.append(f"### {name} @ `{fn.get('address')}`")
-                bodies.append(f"Signature: `{fn.get('signature')}`")
-                bodies.extend(render_c_block(body))
-                bodies.append("")
+                bodies.extend(chunk)
             # Withheld work is reported first: the count with the server's
             # tallies above the envelope, the names (sample-authored) at the
             # top of it. A client that truncates cuts from the end, which is
             # where this note used to be.
             if withheld:
                 lines.append(
-                    f"- Bodies withheld by max_body_chars ({max_body_chars:,}): "
+                    f"- Bodies withheld to stay within the output budget: "
                     f"{len(withheld)}. They ARE cached; read each with "
                     f"decompile_function, which is now warm."
                 )

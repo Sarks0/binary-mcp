@@ -226,20 +226,29 @@ class TestCodeOutputBudget:
 
         from src.tools import function_hash_tools
         from src.utils.formatters import UNTRUSTED_END_MARKER, UNTRUSTED_OPEN_SENTINEL
+        from src.utils.output_budget import CODE_OUTPUT_CHAR_BUDGET
 
         monkeypatch.setenv("BINARY_MCP_ALLOW_ANY_PATH", "1")
         monkeypatch.delenv("BINARY_MCP_ALLOWED_DIRS", raising=False)
         sample = tmp_path / "sample.exe"
         sample.write_bytes(b"MZ" + b"\x00" * 512)
 
-        body = "\n".join(["int v = 0;"] * 1000)  # ~11,000 characters
+        # Six bodies at 40% of the budget each cannot all fit, so some are
+        # withheld whole.
+        body = "\n".join(["int v = 0;"] * 960)
+        names = [f"f{i}" for i in range(6)]
         functions = [
-            {"name": f"f{i}", "address": f"0x40{i}000", "pseudocode": body,
-             "signature": f"void f{i}(void)"}
-            for i in range(3)
+            {"name": n, "address": f"0x40{i}000", "pseudocode": body,
+             "signature": f"void {n}(void)"}
+            for i, n in enumerate(names)
         ]
+        marked = []
         cache = MagicMock()
         cache.get_cached.return_value = {"functions": functions, "metadata": {}}
+        monkeypatch.setattr(
+            function_hash_tools, "auto_mark",
+            lambda c, bp, addrs, **kw: marked.extend(addrs),
+        )
 
         captured = {}
         app = MagicMock()
@@ -250,13 +259,22 @@ class TestCodeOutputBudget:
             app, MagicMock(), cache, MagicMock()
         )
 
-        out = captured["batch_decompile"](str(sample), "f0,f1,f2")
+        out = captured["batch_decompile"](str(sample), ",".join(names))
 
+        # Fenced exactly once.
         opens = out.count(f"{UNTRUSTED_OPEN_SENTINEL}BEGIN UNTRUSTED SAMPLE DATA")
         assert opens == 1 and out.count(UNTRUSTED_END_MARKER) == 1
+        # Something was withheld, and the note is above the envelope.
+        assert "withheld" in out
         assert out.index("withheld") < out.index(UNTRUSTED_OPEN_SENTINEL)
-        assert out.count("--- f") == 2
-        assert "Withheld: f2" in out
+        shown = out.count("--- f")
+        assert 0 < shown < len(names)
+        # The result stays within the budget the middleware would otherwise cut
+        # (so no shown body is lost after being marked).
+        assert len(out) <= CODE_OUTPUT_CHAR_BUDGET
+        # The ledger records exactly the bodies that were shown, never a
+        # withheld one.
+        assert len(marked) == shown
 
 
 class TestServerInstructions:
@@ -614,6 +632,39 @@ class TestBoundedTools:
         out = server.get_imports.fn("/bin/x.exe", limit=10)
         assert "Showing 10 of 180 imports" in out
         assert out.count("Api") == 10
+
+    def test_get_imports_counts_all_libraries_and_names_dropped_ones(self, server):
+        # The fixture has 180 imports across 6 libraries. A limit of 10 shows
+        # only the first library (sorted), so the other five are dropped.
+        out = server.get_imports.fn("/bin/x.exe", limit=10)
+        # Count is the full library count, not the shown slice's.
+        assert "from 6 libraries" in out
+        # Dropped libraries are named, not silently omitted.
+        assert "No imports shown from 5 libraries" in out
+        assert "LIB5.DLL" in out
+
+    def test_tsv_cell_escapes_tabs_and_newlines(self):
+        from src.token_report import load_server
+
+        server = load_server(windows=True, raw_windbg=False)
+        assert server._tsv_cell("a\tb\nc") == "a\\tb\\nc"
+        assert "\t" not in server._tsv_cell("x\ty") and "\n" not in server._tsv_cell("x\ny")
+
+    def test_compact_function_row_escapes_a_crafted_name(self, server, monkeypatch):
+        ctx = {
+            "functions": [
+                {"name": "evil\tcol\ninject", "address": "0x401000",
+                 "called_functions": [], "signature": "void f(void)"}
+            ],
+            "strings": [], "imports": [], "metadata": {},
+        }
+        monkeypatch.setattr(server, "get_analysis_context", lambda *a, **k: ctx)
+        out = server.get_functions.fn("/bin/x.exe")
+        # One header row plus exactly one data row: the crafted tabs/newlines
+        # did not split the function across rows.
+        data_rows = [r for r in out.splitlines() if r.startswith("0x401000")]
+        assert len(data_rows) == 1
+        assert "evil\\tcol\\ninject" in out
 
     def test_small_session_replays_in_full(self, server, monkeypatch):
         monkeypatch.setattr(

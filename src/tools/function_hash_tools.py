@@ -654,7 +654,14 @@ def register_function_hash_tools(app, session_manager, cache, runner):
             decompiled: list[str] = []
             # Bodies past the shared code-output budget are left out whole
             # rather than cut mid-function, and reported first.
-            budget = CODE_OUTPUT_CHAR_BUDGET
+            # Budget the whole detail block (per-function banners, signatures
+            # and fenced bodies) against a ceiling below the code-output
+            # middleware's cap, so the assembled envelope never gets truncated
+            # after a body here was marked reviewed. Without the headroom,
+            # framing pushed the total over CODE_OUTPUT_CHAR_BUDGET and the
+            # middleware cut bodies the ledger already recorded.
+            budget = CODE_OUTPUT_CHAR_BUDGET - 2000
+            used = 0
             withheld: list[str] = []
 
             # Audit F-7: pseudocode is the single largest sample-authored blob
@@ -672,9 +679,9 @@ def register_function_hash_tools(app, session_manager, cache, runner):
                 func = _lookup_function(all_functions, func_ref)
 
                 if not func:
-                    detail.append(f"--- {func_ref} ---")
-                    detail.append("Error: Function not found")
-                    detail.append("")
+                    entry = [f"--- {func_ref} ---", "Error: Function not found", ""]
+                    detail.extend(entry)
+                    used += len("\n".join(entry)) + 1
                     failed += 1
                     continue
 
@@ -683,38 +690,44 @@ def register_function_hash_tools(app, session_manager, cache, runner):
                 pseudocode = func.get("pseudocode")
 
                 if pseudocode:
-                    if len(pseudocode) > budget:
+                    signature = func.get("signature", "")
+                    chunk = [f"--- {name} @ {address} ---"]
+                    if signature:
+                        chunk.append(f"Signature: {signature}")
+                    chunk.append("")
+                    chunk.extend(render_c_block(pseudocode, fence=False))
+                    chunk.append("")
+                    chunk_len = len("\n".join(chunk)) + 1
+                    if used + chunk_len > budget:
                         withheld.append(name)
                         succeeded += 1
                         continue
-                    budget -= len(pseudocode)
-                    signature = func.get("signature", "")
-                    detail.append(f"--- {name} @ {address} ---")
-                    if signature:
-                        detail.append(f"Signature: {signature}")
-                    detail.append("")
-                    detail.extend(render_c_block(pseudocode, fence=False))
+                    used += chunk_len
+                    detail.extend(chunk)
                     succeeded += 1
                     # Printed either way -- a banner-comment-only body is still
                     # worth showing -- but only actual code advances the
-                    # denominator.
+                    # denominator, and only once the chunk is known to fit.
                     if has_reviewable_body(pseudocode):
                         decompiled.append(address)
+                    continue
                 elif func.get("is_thunk"):
-                    detail.append(f"--- {name} @ {address} ---")
-                    detail.append("(thunk function - no pseudocode)")
+                    entry = [f"--- {name} @ {address} ---", "(thunk function - no pseudocode)"]
                     failed += 1
                 elif func.get("is_external"):
-                    detail.append(f"--- {name} @ {address} ---")
-                    detail.append("(external function - no pseudocode)")
+                    entry = [f"--- {name} @ {address} ---", "(external function - no pseudocode)"]
                     failed += 1
                 else:
                     status = func.get("decompile_status", "unknown")
-                    detail.append(f"--- {name} @ {address} ---")
-                    detail.append(f"(decompilation not available - status: {status})")
+                    entry = [
+                        f"--- {name} @ {address} ---",
+                        f"(decompilation not available - status: {status})",
+                    ]
                     failed += 1
 
-                detail.append("")
+                entry.append("")
+                detail.extend(entry)
+                used += len("\n".join(entry)) + 1
 
             if withheld:
                 output.append(

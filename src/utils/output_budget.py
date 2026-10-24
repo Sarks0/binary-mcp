@@ -32,8 +32,9 @@ CODE_OUTPUT_CHAR_BUDGET = 24_000
 _ENVELOPE_OPEN = f"{UNTRUSTED_OPEN_SENTINEL}BEGIN UNTRUSTED SAMPLE DATA"
 
 DEFAULT_HINT = (
-    "Narrow the request to see the rest: fewer functions or types, a later "
-    "start_line, a smaller count, or one session section at a time."
+    "Narrow the request to see the rest, using whichever this tool accepts: "
+    "fewer items, a smaller limit or count, a later start_line, a filter, or "
+    "fetching one item at a time."
 )
 
 

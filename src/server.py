@@ -6784,7 +6784,9 @@ def register_all_tools(
     if windows:
         register_windbg_tools(app, session_manager)
         if not raw_windbg:
-            app.remove_tool("windbg_execute_command")
+            # FastMCP 4.x moved tool removal off the server object onto its
+            # local provider; the top-level app.remove_tool() no longer exists.
+            app._local_provider.remove_tool("windbg_execute_command")
     else:
         logger.info("WinDbg tools not registered: they need Windows with Pybag")
 
@@ -6833,7 +6835,11 @@ def register_all_tools(
     # Register job-control tools (the poll side of the async transport)
     register_job_tools(app, jobs)
 
-    tools = asyncio.run(app.get_tools())
+    # FastMCP 4 renamed get_tools() to the async list_tools(), which returns
+    # a list; key it by name so the post-processing helpers below keep their
+    # name->tool contract. The objects are live, so mutating them here still
+    # changes what clients receive.
+    tools = {t.name: t for t in asyncio.run(app.list_tools())}
 
     # Category/facet tags so integrators can select tools by what they do
     # (see src/tool_catalog.py). An unclassified tool is a catalog bug.

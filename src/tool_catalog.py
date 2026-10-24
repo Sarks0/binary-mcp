@@ -12,7 +12,7 @@ name list enforces nothing on the tools it missed.
 Every registered tool gets exactly one **category** and zero or more
 **facets**. Both are applied as FastMCP tags (``category:<name>`` plus the
 bare facet names), so they appear on every ``tools/list`` entry under
-``_meta._fastmcp.tags``. For consumers that can't call the server (a hook
+``_meta.fastmcp.tags``. For consumers that can't call the server (a hook
 script), the same data is exported as JSON::
 
     python -m src.tool_catalog            # manifest for the full roster
@@ -304,7 +304,7 @@ def _main() -> None:
 
     # The full roster, whatever host generates the manifest.
     register_all_tools(windows=True, raw_windbg=True)
-    tools = asyncio.run(app.get_tools())
+    tools = {t.name: t for t in asyncio.run(app.list_tools())}
     print(manifest_json(tools), end="")
 
 

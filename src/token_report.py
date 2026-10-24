@@ -61,7 +61,7 @@ def wire_tools(app) -> list[dict]:
         async with Client(app) as client:
             return await client.list_tools()
 
-    return [t.model_dump(mode="json", exclude_none=True) for t in asyncio.run(go())]
+    return [t.model_dump(mode="json", by_alias=True, exclude_none=True) for t in asyncio.run(go())]
 
 
 def wire_size(tools: list[dict]) -> int:

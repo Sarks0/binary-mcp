@@ -64,7 +64,7 @@ def registered():
     """Register the tools once and return (tools_by_name, op_registry)."""
     app = _real_fastmcp()("test")
     dynamic_tools.register_dynamic_tools(app)
-    tools = asyncio.run(app.get_tools())
+    tools = {t.name: t for t in asyncio.run(app.list_tools())}
     return tools, dynamic_tools._OP_REGISTRY
 
 

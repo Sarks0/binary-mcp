@@ -90,7 +90,7 @@ class CodeOutputBudgetMiddleware:
         if context.message.name not in self.tool_names:
             return result
 
-        from fastmcp.tools.tool import ToolResult
+        from fastmcp.tools import ToolResult
         from mcp.types import TextContent
 
         changed = False

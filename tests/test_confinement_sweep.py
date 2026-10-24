@@ -783,11 +783,11 @@ class _ToolRecorder:
 
         return register
 
-    async def get_tools(self):
-        # register_all_tools() ends with
-        # `apply_tool_catalog(asyncio.run(app.get_tools()))`, so this has to be
-        # a real coroutine returning something dict-shaped.
-        return dict(self.tools)
+    async def list_tools(self):
+        # register_all_tools() builds `{t.name: t for t in
+        # asyncio.run(app.list_tools())}`, so this must be a real coroutine
+        # returning a list of tool-like objects carrying a .name.
+        return list(self.tools.values())
 
     def __getattr__(self, name):
         # Any other app API a registrar happens to touch is a no-op here.

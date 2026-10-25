@@ -4,7 +4,7 @@
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
-An MCP server for reverse engineering. It hands an AI assistant 147 tools for
+An MCP server for reverse engineering. It hands an AI assistant 168 tools for
 static analysis, live debugging, kernel debugging and .NET decompilation, so
 the whole workflow happens in one place instead of across four GUIs.
 
@@ -13,11 +13,12 @@ the whole workflow happens in one place instead of across four GUIs.
 | Ghidra (headless) | Analysis, decompilation, xrefs, call graphs | Linux, macOS, Windows |
 | x64dbg | Live user-mode debugging | Windows |
 | WinDbg / KD | Kernel debugging and crash dumps | Windows |
+| GDB (MI2) | Live user-mode debugging of ELF binaries | Linux |
 | ILSpyCmd | .NET assemblies to C# and IL | Linux, macOS, Windows |
 | pefile and built-ins | PE structure, triage, carving, hashing | Linux, macOS, Windows |
 
-Requires Python 3.12+ and Java 21+ for Ghidra. Both debuggers are Windows only;
-everything else runs anywhere.
+Requires Python 3.12+ and Java 21+ for Ghidra. Live debugging is per-platform:
+x64dbg and WinDbg on Windows, GDB on Linux. Everything else runs anywhere.
 
 ## Architecture
 
@@ -71,15 +72,19 @@ Decompile the type MyNamespace.MyClass to C#
 This is a malware-analysis tool. Analyze samples in an isolated VM, on a host
 you can revert.
 
-No tool can execute a sample, samples are never uploaded anywhere, file access
-is confined to a quarantine allow-list by default, and raw debugger commands
-are gated by fail-closed allowlists. The [security model](docs/security.md)
-states each of those precisely and points at the code that enforces it.
+Only the GDB engine can execute a sample, and only when you ask it to:
+`gdb_run` is the one tool that starts a binary, it stops at the entry point
+before any user code runs by default, and it exists only on Linux. No other
+engine's tools can launch anything. Samples are never uploaded anywhere, file
+access is confined to a quarantine allow-list by default, and raw debugger
+commands are gated by fail-closed allowlists. The [security
+model](docs/security.md) states each of those precisely and points at the code
+that enforces it.
 
 ## Documentation
 
 - [Installation](INSTALL.md), including supply-chain integrity
-- [Tool reference](docs/tools.md), all 147 tools by engine
+- [Tool reference](docs/tools.md), all 168 tools by engine
 - [Configuration](docs/configuration.md), environment variables and extras
 - [Security model](docs/security.md)
 - [All documentation](docs/), including guides for kernel debugging, large

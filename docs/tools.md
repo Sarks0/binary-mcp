@@ -10,7 +10,7 @@ FastMCP tags and checked in at [`tool-catalog.json`](tool-catalog.json)
 (regenerate with `python -m src.tool_catalog`). Gate on the `code-output` facet
 if you need to know which calls put decompiled code in front of the model.
 
-## Capabilities (147 tools)
+## Capabilities (168 tools)
 
 | Group | Tools |
 |-------|-------|
@@ -19,6 +19,7 @@ if you need to know which calls put decompiled code in front of the model.
 | [Sessions & Server Utilities](#sessions--server-utilities---15-tools) | 15 |
 | [Dynamic Analysis (x64dbg)](#dynamic-analysis-x64dbg---16-tools) | 16 |
 | [Kernel Debugging (WinDbg)](#kernel-debugging-windbg---33-tools) | 33 |
+| [Linux Debugging (GDB)](#linux-debugging-gdb---21-tools) | 21 |
 | [.NET Analysis (ILSpyCmd)](#net-analysis-ilspycmd---7-tools) | 7 |
 | [PE Structure (pefile)](#pe-structure-pefile---4-tools) | 4 |
 | [Other](#other---45-tools) | 45 |
@@ -79,6 +80,45 @@ Windows only: on other hosts these tools are not registered, so they cost a
 client nothing there. `windbg_execute_command` is listed only when
 `BINARY_MCP_ENABLE_RAW_WINDBG=1` is set. See the [WinDbg and kernel debugging
 guide](windbg-kernel-debugging.md).
+
+### Linux Debugging (GDB) - 21 tools
+
+Live user-mode debugging of ELF binaries on Linux, driving
+`gdb --interpreter=mi2` over stdio. This is the Linux counterpart to the
+x64dbg tier, and the only part of the server that executes a sample; see
+[the security model](security.md) for what bounds that.
+
+| Area | What it does |
+|------|--------------|
+| Session | Load an ELF (inert), attach to a PID, detach, disconnect, status |
+| Execution control | Run (stopping at the entry point by default), continue, pause, step into/over/out |
+| Breakpoints | Set and delete by runtime address, list everything GDB holds |
+| Memory | Read as a hexdump, write with a verifying read-back |
+| State | Registers, disassembly, loaded shared objects |
+| PIE rebasing | Map a link-time address from static analysis to its runtime address |
+| Console | Read-only GDB console commands through a fail-closed allowlist |
+
+Two things are worth knowing before using it:
+
+**Addresses are runtime addresses.** Ghidra reports link-time addresses, and
+PIE has been the toolchain default on mainstream Linux for years, so a Ghidra
+address set as a breakpoint verbatim lands on unrelated code. Convert it with
+`gdb_resolve_static_address` once the target is running -- a PIE binary has no
+load base until it is mapped.
+
+**The console is an allowlist, not a filter.** GDB's console is a programming
+language: `shell` and `!` spawn a shell, `python` runs arbitrary code, and
+`print` and `x` evaluate expressions in which `$_shell("...")` is a function
+call. `gdb_execute_console` therefore admits no expression-evaluating command
+at all, which is why `print`, `x`, `call` and `set` are absent from it.
+
+Attaching needs the kernel to allow it: Yama's `ptrace_scope` of 1 or more
+blocks attaching to a process that is not a descendant of the debugger, and
+`gdb_attach` reports that explicitly rather than passing on GDB's own
+unhelpful error.
+
+Linux only; every tool returns a platform message elsewhere. macOS is not
+supported, because its GDB cannot ptrace without a codesigning entitlement.
 
 ### .NET Analysis (ILSpyCmd) - 7 tools
 

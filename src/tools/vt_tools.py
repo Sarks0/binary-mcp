@@ -30,7 +30,7 @@ import re
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.error import HTTPError
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from src.integrations import IntegrationClient, IntegrationError, ProviderConfig
 from src.integrations.hashes import normalise_hash
@@ -79,6 +79,32 @@ _BEHAVIOUR_SECTION_LIMIT = 10
 _DETECTIONS_SHOWN = 15
 
 
+def _vt_endpoint_kind(error: HTTPError) -> str:
+    """
+    Which VirusTotal endpoint a failure came from, read off the error itself.
+
+    The path is classified and then discarded, never quoted back. ``/files/``
+    carries the sample's hash and ``/users/<key>/overall_quotas`` carries the
+    API key itself, so echoing "not found: <path>" would put a credential into
+    model-facing text to improve an error message.
+
+    Taken from ``HTTPError.url`` rather than threaded through as an argument,
+    because the error already knows which request produced it and a parameter
+    would be one more thing every call site has to remember to pass.
+    """
+    try:
+        path = urlsplit(getattr(error, "url", "") or "").path
+    except ValueError:
+        return "other"
+    if "/intelligence/search" in path:
+        return "search"
+    if "/overall_quotas" in path:
+        return "quota"
+    if "/files/" in path:
+        return "file"
+    return "other"
+
+
 class _VirusTotalClient(IntegrationClient):
     """VirusTotal's status codes, which say more than the shared defaults."""
 
@@ -90,7 +116,27 @@ class _VirusTotalClient(IntegrationClient):
         suffix = f" ({detail})" if detail else ""
 
         if error.code == 404:
-            return VirusTotalError("Hash not found in VirusTotal database")
+            # Only the file endpoints are about a hash. vt_search asks
+            # /intelligence/search and vt_check_api asks /users/.../
+            # overall_quotas, and reporting either as a missing hash sends the
+            # caller looking for a sample that was never part of the request.
+            kind = _vt_endpoint_kind(error)
+            if kind == "file":
+                return VirusTotalError(
+                    f"Hash not found in VirusTotal database{suffix}"
+                )
+            if kind == "search":
+                return VirusTotalError(
+                    "VirusTotal returned 404 for the Intelligence search "
+                    "endpoint. That endpoint is part of VT Enterprise and is "
+                    f"not available to a public API key{suffix}"
+                )
+            if kind == "quota":
+                return VirusTotalError(
+                    "VirusTotal has no quota record for this API key"
+                    f"{suffix}"
+                )
+            return VirusTotalError(f"VirusTotal has no such resource{suffix}")
         if error.code == 400:
             return VirusTotalError(f"VirusTotal rejected the request{suffix}")
         if error.code == 401:

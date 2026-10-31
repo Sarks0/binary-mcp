@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 from unittest.mock import MagicMock
+from urllib.error import HTTPError
 
 import pytest
 
@@ -582,3 +583,63 @@ def test_sandbox_verdicts_are_capped_like_every_other_section(monkeypatch):
 
     assert out.count("MALICIOUS_") == limit
     assert "... and 7 more" in out
+
+
+# A 404 is not always about a hash. Reported from live testing: a
+# /intelligence/search probe came back as "Hash not found in VirusTotal
+# database", sending the caller after a sample that was never in the request.
+@pytest.mark.parametrize(
+    "path,expected,unexpected",
+    [
+        ("/files/" + "a" * 64, "Hash not found in VirusTotal database", None),
+        (
+            "/files/" + "a" * 64 + "/behaviour_summary",
+            "Hash not found in VirusTotal database",
+            None,
+        ),
+        ("/intelligence/search", "Intelligence search", "Hash not found"),
+        ("/users/SECRETKEY/overall_quotas", "quota record", "Hash not found"),
+        ("/something/else", "no such resource", "Hash not found"),
+    ],
+)
+def test_a_404_describes_the_endpoint_it_came_from(path, expected, unexpected):
+    error = HTTPError(f"https://www.virustotal.com/api/v3{path}", 404, "Not Found", {}, None)
+
+    mapped = str(vt_tools._client.map_http_error(error))
+
+    assert expected in mapped
+    if unexpected:
+        assert unexpected not in mapped
+
+
+def test_a_404_never_quotes_the_path_it_classified():
+    """
+    /users/<key>/overall_quotas carries the API key and /files/<hash> the
+    sample's hash, so the path is classified and discarded, not echoed back.
+    """
+    secret = "s3cr3tapikeyvalue"
+    error = HTTPError(
+        f"https://www.virustotal.com/api/v3/users/{secret}/overall_quotas",
+        404, "Not Found", {}, None,
+    )
+
+    mapped = str(vt_tools._client.map_http_error(error))
+
+    assert secret not in mapped
+    assert "/users/" not in mapped
+    assert "overall_quotas" not in mapped
+
+
+def test_a_malformed_error_url_still_maps(monkeypatch):
+    """The classifier must not turn a bad URL into a crash on the error path."""
+    error = HTTPError("", 404, "Not Found", {}, None)
+    assert "VirusTotal" in str(vt_tools._client.map_http_error(error))
+
+
+def test_the_live_reported_case(monkeypatch):
+    """End to end: vt_search on a 404 no longer mentions a hash."""
+    _raise_http(monkeypatch, 404)
+
+    out = _register(monkeypatch)["vt_search"]("type:peexe")
+
+    assert "Hash not found" not in out

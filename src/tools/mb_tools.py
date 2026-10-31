@@ -643,13 +643,10 @@ def register_mb_tools(app, session_manager=None):
         """
         Find samples on MalwareBazaar by one corpus pivot.
 
-        Exactly ONE pivot may be given per call -- MalwareBazaar has a separate
-        query per selector, so combining them is not a thing the API can do.
-
-        The structural pivots are the ones worth reaching for after a static
-        analysis pass: imphash and gimphash cluster by import table, TLSH and
-        ssdeep by byte similarity, dhash_icon by embedded icon, yara_rule by a
-        rule that already fired.
+        Exactly ONE pivot per call: MalwareBazaar has a separate query per
+        selector. After a static pass the structural ones are what to reach
+        for -- imphash and gimphash cluster by import table, TLSH by byte
+        similarity, dhash_icon by icon, yara_rule by a rule that fired.
 
         Args:
             tag: Community tag, e.g. "AgentTesla", "exe", "RAT"
@@ -822,15 +819,11 @@ def register_mb_tools(app, session_manager=None):
         """
         Download a malware sample from MalwareBazaar as an encrypted zip.
 
-        DISABLED BY DEFAULT. The operator must set MB_ALLOW_DOWNLOAD=1 in the
-        server environment; without it this tool refuses and explains how to
-        enable it. This is the only tool in this server that writes malware to
-        disk.
-
-        What lands on disk is abuse.ch's password-protected zip, saved under
-        ~/.binary_mcp_output/malwarebazaar/ and NEVER extracted by this tool.
-        The archive password is "infected". Extract it yourself, in an isolated
-        analysis VM, when you actually intend to run or open the sample.
+        DISABLED BY DEFAULT: the operator must set MB_ALLOW_DOWNLOAD=1. This is
+        the only tool here that writes malware to disk. It saves abuse.ch's
+        password-protected zip (password "infected") under
+        ~/.binary_mcp_output/malwarebazaar/ and NEVER extracts it -- do that
+        yourself, in an isolated analysis VM.
 
         Args:
             sha256: Full SHA256 of the sample (MalwareBazaar requires SHA256)

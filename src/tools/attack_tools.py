@@ -611,16 +611,11 @@ def register_attack_tools(app, session_manager=None):
         """
         Show the cached MITRE ATT&CK dataset, and optionally refresh it.
 
-        ATT&CK needs no API key. The data is fetched once from MITRE's public
-        STIX repository, reduced to a compact index, and then served entirely
-        from disk -- so every other attack_* tool works offline after this.
-
-        That first fetch is ~51MB. Whichever attack_* call finds the cache
-        empty starts it and answers inline if it finishes within
-        BINARY_MCP_INLINE_DEADLINE; past that it hands back a job handle and
-        the download carries on, so a slow link cannot leave a lookup blocked
-        until the client gives up. Calling this tool once is still the way to
-        pay that cost deliberately rather than inside a technique lookup.
+        No API key. The data is fetched once from MITRE's STIX repository,
+        reduced to a compact index and then served from disk, so every other
+        attack_* tool works offline. That first fetch is ~51MB and may hand
+        back a job handle rather than block; calling this once pays the cost
+        deliberately. See docs/tools.md for the deadline it degrades on.
 
         Args:
             refresh: Re-download the bundle and rebuild the index.

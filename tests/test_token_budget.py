@@ -390,7 +390,24 @@ class TestUntrustedEnvelopeOverhead:
 # instead of forwarding them). Both are framework-emitted and not description
 # bloat, so the baseline rose once to take them in; this test still catches a
 # contributor growing a description from here.
-TOOLS_LIST_BYTE_BUDGET = 132_000
+#
+# Raised once more for the threat-intel integrations, which add 19 tools
+# (147 -> 166). The arithmetic, because "it did not fit" is not a reason on
+# its own: the roster measured 144,466 bytes with them, against 132,000.
+# Descriptions were trimmed first, as this comment requires -- the five
+# fattest among the new tools came down by 796 bytes -- but trimming cannot
+# close a gap this size. Prose is only 5,668 bytes of the 15,302 those tools
+# cost; the other 9,634 is per-tool framing and input schema, and the budget
+# had 978 bytes of headroom. Nineteen tools cannot fit in 978 bytes even with
+# every description deleted, so the choice was to raise the figure or to ship
+# fewer tools.
+#
+# The lever that is left is schema, not prose: mb_search declares 11 pivot
+# parameters (1,228 bytes) and yaraify_search 8, where the tool accepts
+# exactly one of them per call. Collapsing each to (pivot, value) would make
+# the schema state that rule and save roughly another 1.5 KB. That is an API
+# change to a published tool, so it is noted here rather than taken quietly.
+TOOLS_LIST_BYTE_BUDGET = 145_500
 
 # Clients cut tool descriptions (and server instructions) at this many
 # characters, and tool search only matches what is left.

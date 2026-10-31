@@ -564,19 +564,12 @@ def register_vt_tools(app, session_manager=None):
         file_path: str = "",
     ) -> str:
         """
-        Look up a file on VirusTotal by hash or path.
-
-        Queries VirusTotal for detection results, file metadata, and tags.
-        Requires VT_API_KEY environment variable.
+        Look up a file on VirusTotal by hash or path. Needs VT_API_KEY.
 
         Nothing is uploaded: with file_path the file is hashed locally and only
-        the hash is sent. Sending a hash still tells VirusTotal you hold the
-        sample.
-
-        The detection ratio is malicious engines over engines that returned a
-        verdict, matching the number shown on the VirusTotal web page. Engines
-        that do not support the file type, or that failed, are excluded from
-        the denominator.
+        the hash is sent -- though sending a hash still tells VirusTotal you
+        hold the sample. The detection ratio is malicious engines over engines
+        that returned a verdict, matching VirusTotal's own page.
 
         Args:
             file_hash: MD5, SHA1, or SHA256 hash to look up

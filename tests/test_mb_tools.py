@@ -288,30 +288,48 @@ def test_search_maps_each_pivot_to_its_documented_query(monkeypatch):
 
     for argument, (api_query, api_field) in expected.items():
         seen.clear()
-        tools["mb_search"](**{argument: "value"}, limit=5)
+        tools["mb_search"](argument, "value", limit=5)
         body = seen[0].data
         assert b"query=" + api_query in body, argument
         assert api_field + b"=value" in body, argument
         assert b"limit=5" in body, argument
 
 
-def test_search_requires_exactly_one_pivot(monkeypatch):
+def test_search_validates_the_pivot_it_was_given(monkeypatch):
+    """
+    The selector is one argument now, so "exactly one" is the schema's job and
+    what is left to check here is that an empty or unknown one says so, and
+    names the pivots it would accept.
+    """
     _capture(monkeypatch)
     tools = _register(monkeypatch)
 
-    assert "exactly one search pivot" in tools["mb_search"]()
-    assert "one pivot per query" in tools["mb_search"](tag="x", signature="y")
+    blank = tools["mb_search"]("", "value")
+    assert "Provide a search pivot" in blank
+    assert "imphash" in blank
+
+    unknown = tools["mb_search"]("sha256", "value")
+    assert "Unknown pivot" in unknown
+    assert "imphash" in unknown
+
+    assert "Provide a value" in tools["mb_search"]("tag", "   ")
+
+
+def test_a_pivot_is_matched_case_insensitively(monkeypatch):
+    seen = _capture(monkeypatch, {"query_status": "ok", "data": [_sample()]})
+    _register(monkeypatch)["mb_search"]("ImpHash", "abc")
+    assert b"query=get_imphash" in seen[0].data
 
 
 def test_search_clamps_the_limit(monkeypatch):
     seen = _capture(monkeypatch, {"query_status": "ok", "data": [_sample()]})
     tools = _register(monkeypatch)
 
-    tools["mb_search"](tag="exe", limit=99999)
+    tools["mb_search"]("tag", "exe", limit=99999)
     assert b"limit=1000" in seen[0].data
 
     seen.clear()
-    tools["mb_search"](tag="exe", limit=0)
+    tools["mb_search"]("tag", "exe", limit=0)
     assert b"limit=1" in seen[0].data
 
 
@@ -364,7 +382,7 @@ def test_search_results_are_fenced_once(monkeypatch):
         lambda fields: [_sample(file_name=INJECTION), _sample(file_name="b.exe")],
     )
 
-    out = _register(monkeypatch)["mb_search"](tag="AgentTesla")
+    out = _register(monkeypatch)["mb_search"]("tag", "AgentTesla")
 
     assert _sentinels(out) == (2, 2)
     begin = out.index(UNTRUSTED_OPEN_SENTINEL)
@@ -516,22 +534,22 @@ def test_check_api_points_at_the_canonical_variable(monkeypatch):
 # away the report header the caller had already built -- which carries the
 # SHA256 this server computed locally, the one line that makes a miss useful.
 @pytest.mark.parametrize(
-    "status,tool,kwargs,expected",
+    "status,tool,args,expected",
     [
-        ("hash_not_found", "mb_lookup", {"file_hash": "a" * 64},
+        ("hash_not_found", "mb_lookup", ("a" * 64,),
          "Hash not found in MalwareBazaar."),
-        ("no_results", "mb_search", {"tag": "nosuchtag"}, "No results found."),
-        ("tag_not_found", "mb_search", {"tag": "nosuchtag"}, "No results found."),
-        ("signature_not_found", "mb_search", {"signature": "NoSuchFamily"},
+        ("no_results", "mb_search", ("tag", "nosuchtag"), "No results found."),
+        ("tag_not_found", "mb_search", ("tag", "nosuchtag"), "No results found."),
+        ("signature_not_found", "mb_search", ("signature", "NoSuchFamily"),
          "No results found."),
     ],
 )
 def test_empty_result_reports_the_miss_not_an_error(
-    monkeypatch, status, tool, kwargs, expected
+    monkeypatch, status, tool, args, expected
 ):
     _capture(monkeypatch, {"query_status": status, "data": None})
 
-    out = _register(monkeypatch)[tool](**kwargs)
+    out = _register(monkeypatch)[tool](*args)
 
     assert expected in out
     assert "error" not in out.lower()
@@ -562,19 +580,19 @@ def test_query_returns_no_rows_rather_than_raising(monkeypatch):
 
 # A caller asking for 1000 wants the count, not 1000 rendered blocks.
 @pytest.mark.parametrize(
-    "tool,kwargs,query_status_key",
+    "tool,args,query_status_key",
     [
-        ("mb_search", {"tag": "exe", "limit": 1000}, "ok"),
-        ("mb_recent", {}, "ok"),
+        ("mb_search", ("tag", "exe"), "ok"),
+        ("mb_recent", (), "ok"),
     ],
 )
 def test_reports_are_bounded_but_still_carry_the_total(
-    monkeypatch, tool, kwargs, query_status_key
+    monkeypatch, tool, args, query_status_key
 ):
     rows = [_sample(sha256_hash=f"{index:064x}") for index in range(40)]
     _capture(monkeypatch, {"query_status": query_status_key, "data": rows})
 
-    out = _register(monkeypatch)[tool](**kwargs)
+    out = _register(monkeypatch)[tool](*args)
 
     assert "Found 40 sample(s):" in out
     assert f"(showing {mb_tools._ROW_LIMIT} of 40)" in out
@@ -585,7 +603,7 @@ def test_a_report_under_the_limit_says_nothing_about_showing(monkeypatch):
     rows = [_sample(sha256_hash=f"{index:064x}") for index in range(3)]
     _capture(monkeypatch, {"query_status": "ok", "data": rows})
 
-    out = _register(monkeypatch)["mb_search"](tag="exe")
+    out = _register(monkeypatch)["mb_search"]("tag", "exe")
 
     assert "Found 3 sample(s):" in out
     assert "showing" not in out

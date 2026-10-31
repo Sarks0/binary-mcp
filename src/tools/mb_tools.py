@@ -44,6 +44,7 @@ import json
 import logging
 import re
 from pathlib import Path
+from typing import Literal
 from urllib.error import HTTPError
 
 from src.integrations import IntegrationClient, IntegrationError, ProviderConfig
@@ -628,84 +629,60 @@ def register_mb_tools(app, session_manager=None):
 
     @app.tool()
     def mb_search(
-        tag: str = "",
-        signature: str = "",
-        file_type: str = "",
-        clamav: str = "",
-        imphash: str = "",
-        tlsh: str = "",
-        telfhash: str = "",
-        gimphash: str = "",
-        dhash_icon: str = "",
-        yara_rule: str = "",
+        pivot: Literal[
+            "tag", "signature", "file_type", "clamav", "imphash",
+            "tlsh", "telfhash", "gimphash", "dhash_icon", "yara_rule",
+        ],
+        value: str,
         limit: int = 20,
     ) -> str:
         """
         Find samples on MalwareBazaar by one corpus pivot.
 
-        Exactly ONE pivot per call: MalwareBazaar has a separate query per
-        selector. After a static pass the structural ones are what to reach
-        for -- imphash and gimphash cluster by import table, TLSH by byte
-        similarity, dhash_icon by icon, yara_rule by a rule that fired.
+        MalwareBazaar has a separate query per selector, so a search takes
+        exactly one: name it in `pivot` and put the term in `value`.
+
+        After a static pass the structural ones are what to reach for --
+        imphash and gimphash cluster by import table, TLSH by byte similarity,
+        dhash_icon by icon, yara_rule by a rule that fired.
 
         Args:
-            tag: Community tag, e.g. "AgentTesla", "exe", "RAT"
-            signature: Malware family label, e.g. "Emotet"
-            file_type: File extension as MalwareBazaar records it, e.g. "dll"
-            clamav: ClamAV signature name
-            imphash: PE import hash (32 hex chars)
-            tlsh: TLSH fuzzy hash
-            telfhash: telfhash (ELF import hash)
-            gimphash: gimphash (Go binary import hash)
-            dhash_icon: Perceptual hash of the embedded icon
-            yara_rule: Name of a YARA rule that matched
+            pivot: Which selector to search by, from the list above
+            value: The term to search for, e.g. "AgentTesla" for a tag
             limit: Maximum samples to return (1-1000, default 20)
 
         Returns:
             Matching samples with hashes, family labels and tags.
 
         Example:
-            mb_search(tag="AgentTesla", limit=10)
-            mb_search(imphash="f34d5f2d4577ed6d9ceec516c1f5a744")
-            mb_search(signature="Emotet", limit=50)
+            mb_search("tag", "AgentTesla", limit=10)
+            mb_search("imphash", "f34d5f2d4577ed6d9ceec516c1f5a744")
+            mb_search("signature", "Emotet", limit=50)
         """
         try:
-            # Bind the arguments to the pivot table by name once, here, rather
-            # than reading them back out of locals(): the table is the single
-            # place the (argument, query, field) triple is written down, and a
-            # pivot added to it without a matching parameter should fail
-            # loudly at registration rather than silently never match.
-            values = {
-                "tag": tag,
-                "signature": signature,
-                "file_type": file_type,
-                "clamav": clamav,
-                "imphash": imphash,
-                "tlsh": tlsh,
-                "telfhash": telfhash,
-                "gimphash": gimphash,
-                "dhash_icon": dhash_icon,
-                "yara_rule": yara_rule,
-            }
-            supplied = {
-                argument: values[argument].strip()
-                for argument, _query, _field in MB_SEARCH_PIVOTS
-                if values.get(argument) and values[argument].strip()
-            }
+            # One parameter naming the selector, rather than one parameter per
+            # selector. The API takes exactly one, and eleven optional
+            # arguments of which ten must be empty said the opposite in the
+            # schema -- the rule only appeared at runtime, after the model had
+            # already been shown a shape that allowed any combination.
+            argument = (pivot or "").strip().lower()
+            value = (value or "").strip()
 
-            if not supplied:
-                names = ", ".join(argument for argument, _q, _f in MB_SEARCH_PIVOTS)
-                return f"Error: Provide exactly one search pivot. One of: {names}"
-            if len(supplied) > 1:
-                return (
-                    "Error: MalwareBazaar accepts one pivot per query; "
-                    f"got {', '.join(sorted(supplied))}. Call mb_search once per pivot."
-                )
+            names = ", ".join(a for a, _q, _f in MB_SEARCH_PIVOTS)
+            if not argument:
+                return f"Error: Provide a search pivot. One of: {names}"
 
-            argument, value = next(iter(supplied.items()))
-            api_query, api_field = next(
-                (q, f) for a, q, f in MB_SEARCH_PIVOTS if a == argument
-            )
+            # Literal puts the valid names in the schema, so a conforming
+            # client rejects an unknown pivot before it arrives. This check
+            # stays because that depends on the client honouring the schema,
+            # and it is what the direct callers in the tests exercise.
+            match = next((row for row in MB_SEARCH_PIVOTS if row[0] == argument), None)
+            if match is None:
+                return f"Error: Unknown pivot {pivot!r}. One of: {names}"
+            if not value:
+                return f"Error: Provide a value to search for with pivot {argument!r}"
+
+            _argument, api_query, api_field = match
 
             try:
                 limit = int(limit)

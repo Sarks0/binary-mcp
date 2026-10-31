@@ -150,7 +150,7 @@ def test_yaraify_posts_json_and_uses_search_term_for_every_pivot(monkeypatch):
 
     for argument, api_query in expected.items():
         seen.clear()
-        tools["yaraify_search"](**{argument: "value"})
+        tools["yaraify_search"](argument, "value")
         assert seen[0].full_url == "https://yaraify-api.abuse.ch/api/v1/"
         assert json.loads(seen[0].data) == {"query": api_query, "search_term": "value"}
 
@@ -170,11 +170,20 @@ def test_yaraify_accepts_a_sha3_384_hash(monkeypatch):
     assert json.loads(seen[0].data)["search_term"] == "d" * 96
 
 
-def test_search_requires_exactly_one_pivot(monkeypatch):
+def test_search_validates_the_pivot_it_was_given(monkeypatch):
+    """One selector argument, so the schema carries "exactly one"; what is
+    left is that a blank or unknown pivot says so and names the valid ones."""
     _capture(monkeypatch, abusech_tools.yaraify_client)
     tools = _register(monkeypatch)
-    assert "exactly one search pivot" in tools["yaraify_search"]()
-    assert "one pivot per query" in tools["yaraify_search"](imphash="a", tlsh="b")
+
+    blank = tools["yaraify_search"]("", "value")
+    assert "Provide a search pivot" in blank
+    assert "yara_rule" in blank
+
+    unknown = tools["yaraify_search"]("sha256", "value")
+    assert "Unknown pivot" in unknown
+
+    assert "Provide a value" in tools["yaraify_search"]("imphash", "  ")
 
 
 def test_no_request_body_carries_anything_but_scalars():

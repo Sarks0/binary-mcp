@@ -43,6 +43,7 @@ request body is a mapping of scalars.
 
 import logging
 import re
+from typing import Literal
 from urllib.error import HTTPError
 
 from src.integrations import IntegrationClient, IntegrationError, ProviderConfig
@@ -875,67 +876,56 @@ def register_abusech_tools(app, session_manager=None):
 
     @app.tool()
     def yaraify_search(
-        yara_rule: str = "",
-        imphash: str = "",
-        tlsh: str = "",
-        telfhash: str = "",
-        gimphash: str = "",
-        dhash_icon: str = "",
-        clamav: str = "",
+        pivot: Literal[
+            "yara_rule", "imphash", "tlsh", "telfhash",
+            "gimphash", "dhash_icon", "clamav",
+        ],
+        value: str,
     ) -> str:
         """
         Find files in the YARAify corpus by rule name or structural hash.
 
-        Exactly ONE pivot per call -- YARAify has a separate query per selector.
+        YARAify has a separate query per selector, so a search takes exactly
+        one: name it in `pivot` and put the term in `value`.
 
-        This is the counterpart to this server's own YARA generation and
-        similarity hashing: take the imphash or TLSH from compute_similarity_hashes,
-        or the name of a rule generate_yara_rule_from_session produced, and ask
+        The counterpart to this server's own YARA generation and similarity
+        hashing: take the imphash or TLSH from compute_similarity_hashes, or
+        the name of a rule generate_yara_rule_from_session produced, and ask
         what else in the public corpus it matches.
 
         Args:
-            yara_rule: Name of a YARA rule, e.g. "MALWARE_Win_Neshta"
-            imphash: PE import hash
-            tlsh: TLSH fuzzy hash
-            telfhash: telfhash (ELF import hash)
-            gimphash: gimphash (Go binary import hash)
-            dhash_icon: Perceptual hash of the embedded icon
-            clamav: ClamAV signature name
+            pivot: Which selector to search by, from the list above
+            value: The term to search for, e.g. "MALWARE_Win_Neshta"
 
         Returns:
             Matching files with hashes and metadata.
 
         Example:
-            yaraify_search(yara_rule="MALWARE_Win_Neshta")
-            yaraify_search(imphash="f34d5f2d4577ed6d9ceec516c1f5a744")
+            yaraify_search("yara_rule", "MALWARE_Win_Neshta")
+            yaraify_search("imphash", "f34d5f2d4577ed6d9ceec516c1f5a744")
         """
         try:
-            values = {
-                "yara_rule": yara_rule,
-                "imphash": imphash,
-                "tlsh": tlsh,
-                "telfhash": telfhash,
-                "gimphash": gimphash,
-                "dhash_icon": dhash_icon,
-                "clamav": clamav,
-            }
-            supplied = {
-                argument: values[argument].strip()
-                for argument, _query in YARAIFY_PIVOTS
-                if values.get(argument) and values[argument].strip()
-            }
+            # One parameter naming the selector, as in mb_search next door:
+            # the API takes exactly one, and seven optional arguments of which
+            # six must be empty put that rule only in the runtime check.
+            argument = (pivot or "").strip().lower()
+            value = (value or "").strip()
 
-            if not supplied:
-                names = ", ".join(argument for argument, _q in YARAIFY_PIVOTS)
-                return f"Error: Provide exactly one search pivot. One of: {names}"
-            if len(supplied) > 1:
-                return (
-                    "YARAify accepts one pivot per query; got "
-                    f"{', '.join(sorted(supplied))}. Call yaraify_search once per pivot."
-                )
+            names = ", ".join(a for a, _q in YARAIFY_PIVOTS)
+            if not argument:
+                return f"Error: Provide a search pivot. One of: {names}"
 
-            argument, value = next(iter(supplied.items()))
-            api_query = next(q for a, q in YARAIFY_PIVOTS if a == argument)
+            # Literal puts the valid names in the schema, so a conforming
+            # client rejects an unknown pivot before it arrives. This check
+            # stays because that depends on the client honouring the schema,
+            # and it is what the direct callers in the tests exercise.
+            match = next((row for row in YARAIFY_PIVOTS if row[0] == argument), None)
+            if match is None:
+                return f"Error: Unknown pivot {pivot!r}. One of: {names}"
+            if not value:
+                return f"Error: Provide a value to search for with pivot {argument!r}"
+
+            _argument, api_query = match
 
             payload = query(
                 yaraify_client,

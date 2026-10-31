@@ -136,14 +136,19 @@ def test_yaraify_posts_json_and_uses_search_term_for_every_pivot(monkeypatch):
                     {"query_status": "ok", "data": []})
     tools = _register(monkeypatch)
 
+    # Written out rather than read from YARAIFY_PIVOTS: the table is what is
+    # under test, and a test that reads it would pass whatever it said. These
+    # names came from the API documentation and abuse.ch's own scripts -- see
+    # the audit beside the table -- after an earlier guess at query_* that
+    # would have failed silently against every one of them.
     expected = {
         "yara_rule": "get_yara",
-        "imphash": "query_imphash",
-        "tlsh": "query_tlsh",
-        "telfhash": "query_telfhash",
-        "gimphash": "query_gimphash",
-        "dhash_icon": "query_dhash_icon",
-        "clamav": "query_clamav",
+        "imphash": "get_imphash",
+        "tlsh": "get_tlsh",
+        "telfhash": "get_telfhash",
+        "gimphash": "get_gimphash",
+        "dhash_icon": "get_dhash_icon",
+        "clamav": "get_clamav",
     }
     # Every pivot in the table is exercised, so one cannot be added untested.
     assert set(expected) == {a for a, _q in abusech_tools.YARAIFY_PIVOTS}

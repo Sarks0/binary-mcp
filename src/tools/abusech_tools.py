@@ -352,14 +352,30 @@ _YARAIFY_TRUSTED = (
 #: YARAify corpus pivots, as (tool argument, API query). Every one takes its
 #: value in ``search_term``. Pinned as a table for the same reason as
 #: MB_SEARCH_PIVOTS: one reviewable place to check against the abuse.ch docs.
+#: (argument, YARAify ``query`` value). Every one takes ``search_term``.
+#:
+#: These were written as ``query_*`` when abuse.ch was unreachable from the
+#: build environment and the names had to be inferred. They are ``get_*``.
+#: Nothing in YARAify's confirmed vocabulary uses a ``query_`` prefix --
+#: abuse.ch's own scripts send ``lookup_hash``, ``get_yara``, ``get_results``
+#: and ``list_tasks`` -- and the published API documents ``get_imphash`` and
+#: ``get_gimphash`` with ``search_term``, in the same shape MalwareBazaar
+#: uses next door. A wrong name here fails silently: the service answers
+#: "nothing matched" rather than rejecting the query, which is why this table
+#: carries its evidence.
+#:
+#: Confirmed: get_yara (abuse.ch's yaraify_lookup_yara-rule.py), get_imphash
+#: and get_gimphash (the API documentation). Still taken from the pattern,
+#: and the first to check against a live key: get_tlsh, get_telfhash,
+#: get_dhash_icon, get_clamav.
 YARAIFY_PIVOTS: tuple[tuple[str, str], ...] = (
     ("yara_rule", "get_yara"),
-    ("imphash", "query_imphash"),
-    ("tlsh", "query_tlsh"),
-    ("telfhash", "query_telfhash"),
-    ("gimphash", "query_gimphash"),
-    ("dhash_icon", "query_dhash_icon"),
-    ("clamav", "query_clamav"),
+    ("imphash", "get_imphash"),
+    ("tlsh", "get_tlsh"),
+    ("telfhash", "get_telfhash"),
+    ("gimphash", "get_gimphash"),
+    ("dhash_icon", "get_dhash_icon"),
+    ("clamav", "get_clamav"),
 )
 
 

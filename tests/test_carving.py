@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
+import re
 import struct
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from src.utils import carving
 from src.utils.carving import (
     CarvedBlob,
     CarvingResult,
@@ -514,6 +517,87 @@ class TestCarveIntegration:
         pe_path = _write_pe(tmp_path, _build_pe_with_resources())
         with pytest.raises(StructuredBaseError):
             carve(pe_path, tmp_path / "out", max_total_mb=0)
+
+
+# Binary-mode open flags (Windows CRT text-mode translation)
+
+
+class TestBlobOpenFlags:
+    """``carve()`` must open blob and sidecar descriptors in binary mode.
+
+    On Windows ``os.open()`` returns a descriptor in the C runtime's text
+    mode unless ``O_BINARY`` is in the flags, and that translation lives in
+    the descriptor -- ``os.fdopen(fd, "wb")`` does not undo it. Every 0x0A
+    written would become 0x0D 0x0A, so a carved PE/ELF/ZIP/OLE payload lands
+    corrupt and stops matching the sha256 in its sidecar.
+
+    Note which test does the real work here. The runtime flag check is
+    vacuous on POSIX (``os.O_BINARY`` is undefined, so the guard is trivially
+    true), so on its own it would let a deletion sail through a POSIX CI run.
+    The source-level checks are the ones that fail on Linux, which is the only
+    place this gets caught before it reaches a Windows user.
+    """
+
+    def test_flag_constant_still_asks_for_o_binary(self):
+        """Fails on POSIX too -- unlike the runtime check below."""
+        definition = re.search(
+            r"^_BLOB_OPEN_FLAGS\s*=\s*(.+)$",
+            inspect.getsource(carving),
+            re.MULTILINE,
+        )
+        assert definition, "the flag constant was renamed or moved"
+        assert 'getattr(os, "O_BINARY", 0)' in definition.group(1), definition.group(1)
+
+    def test_flags_carry_o_binary_where_the_platform_defines_it(self):
+        assert not hasattr(os, "O_BINARY") or (carving._BLOB_OPEN_FLAGS & os.O_BINARY)
+
+    def test_flags_keep_the_atomic_never_overwrite_contract(self):
+        flags = carving._BLOB_OPEN_FLAGS
+        assert flags & os.O_WRONLY == os.O_WRONLY
+        assert flags & os.O_CREAT
+        assert flags & os.O_EXCL
+
+    def test_both_write_sites_use_the_shared_flags(self):
+        """Neither os.open() in carve() may hand-roll its flags again."""
+        body = inspect.getsource(carve)
+        calls = re.findall(r"os\.open\((?:[^()]|\([^()]*\))*\)", body, re.DOTALL)
+        assert len(calls) == 2, calls  # the blob and its sidecar
+        for call in calls:
+            assert "_BLOB_OPEN_FLAGS" in call, call
+            assert "0o600" in call, call  # owner-only mode is deliberate
+        # A hand-rolled flag set is what loses O_BINARY again.
+        assert "os.O_WRONLY" not in body
+
+    def test_payload_with_newlines_round_trips_byte_for_byte(self, tmp_path: Path):
+        """A carved blob full of 0x0A bytes must hit disk unmodified.
+
+        Fails on Windows without ``O_BINARY`` (the file grows a 0x0D before
+        every 0x0A); passes on every platform with it.
+        """
+        import hashlib
+
+        # Flagged via magic:pe, so it is actually written out, and packed with
+        # the bytes a text-mode descriptor would mangle.
+        payload = b"MZ" + (b"\n\x00\r\n" * 64) + b"\n" * 32 + os.urandom(64)
+        assert b"\n" in payload
+
+        pe_bytes = _build_pe_with_resources([(10, 700, 0, payload)])
+        pe_path = _write_pe(tmp_path, pe_bytes)
+        out = tmp_path / "out"
+
+        result = carve(pe_path, out)
+        assert len(result.blobs) == 1
+        b = result.blobs[0]
+        assert b.written_path is not None
+
+        on_disk = Path(b.written_path).read_bytes()
+        assert on_disk == payload
+        assert len(on_disk) == len(payload)
+
+        # The recorded digest has to describe the file that is actually there.
+        meta = json.loads((out / f"{b.sha256}.json").read_text(encoding="utf-8"))
+        assert meta["sha256"] == hashlib.sha256(on_disk).hexdigest()
+        assert meta["size"] == len(on_disk)
 
 
 # output_dir traversal hardening (T19 HIGH)

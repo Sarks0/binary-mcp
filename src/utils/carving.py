@@ -35,6 +35,21 @@ ENTROPY_MIN_SIZE = 2048
 DEFAULT_MAX_DEPTH = 8
 DEFAULT_MAX_TOTAL_MB = 64
 
+# Open flags for every file carve() creates (blob + sidecar).
+#
+# O_WRONLY | O_CREAT | O_EXCL is the atomic create-or-fail that gives the
+# never-overwrite contract; see the call sites. O_BINARY is a Windows-only
+# flag (hence getattr -- POSIX does not define it, where it resolves to 0 and
+# changes nothing). On Windows os.open() hands back a descriptor in the C
+# runtime's *text* mode unless O_BINARY is passed, and that translation lives
+# in the descriptor: os.fdopen(fd, "wb") does not undo it, so every 0x0A
+# written would be expanded to 0x0D 0x0A. Carved PE/ELF/ZIP/OLE payloads would
+# then be corrupt on disk and no longer match the sha256 recorded in their
+# sidecar. CPython's own tempfile guards this exact case the same way
+# (tempfile._bin_openflags). Do not remove it because CI is POSIX and the
+# tests still pass without it -- there is nothing to see on POSIX.
+_BLOB_OPEN_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+
 # Magic byte signatures. We rely on triage_tools.detect_file_type for the
 # coverage it already implements (PE / ELF / Mach-O / OLE / MSI / ZIP / PDF /
 # .NET) and add archive-and-shellcode patterns it does not cover.
@@ -655,11 +670,12 @@ def carve(
                     # Atomic create-or-fail: O_EXCL closes the TOCTOU window
                     # in the previous "if target.exists(): ... else: write"
                     # pattern. 0o600 keeps potentially-malicious payloads
-                    # readable only by the owning user.
+                    # readable only by the owning user. Flags (including the
+                    # O_BINARY this write depends on) are _BLOB_OPEN_FLAGS.
                     try:
                         fd = os.open(
                             str(target),
-                            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                            _BLOB_OPEN_FLAGS,
                             0o600,
                         )
                     except FileExistsError:
@@ -684,11 +700,18 @@ def carve(
                             # Atomic sidecar create -- if a sidecar already
                             # exists at this sha256, leave it alone (honours
                             # the never-overwrite contract for both blob and
-                            # metadata).
+                            # metadata). Same flags as the blob. This one is
+                            # a *text* write, so O_BINARY matters differently:
+                            # it keeps the descriptor out of the CRT's text
+                            # mode, leaving the "w" wrapper below as the only
+                            # thing translating newlines. Without it the two
+                            # stack on Windows -- the wrapper turns \n into
+                            # \r\n, then the CRT expands that \n again, and
+                            # the sidecar lands with \r\r\n line endings.
                             try:
                                 sfd = os.open(
                                     str(sidecar),
-                                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                                    _BLOB_OPEN_FLAGS,
                                     0o600,
                                 )
                             except FileExistsError:

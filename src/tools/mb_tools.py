@@ -203,6 +203,19 @@ _STATUS_MESSAGES: dict[str, str] = {
     ),
 }
 
+#: Control characters in a caller-chosen archive name. Refused rather than
+#: written: a newline in a file name is legal on POSIX and rejected outright
+#: by the Windows CRT, so writing one means the same call succeeds on one
+#: platform and fails on the other with an OSError the caller cannot act on.
+#: It is also the F-7 problem at its source. Every line of a download report
+#: echoes this name outside any untrusted envelope, and a break in it would
+#: start a line the reader cannot attribute, able to name a real tool in this
+#: server. The report flattens the name as well, because defence for a claim
+#: this load-bearing should not rest on one check; this is the one that keeps
+#: such a name off the filesystem, where it would go on to confuse every
+#: shell, archiver and script the analyst points at the download directory.
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+
 #: A name of this shape is this server's content-addressed slot for one
 #: sample, so only that sample may be written to it. Matched case-folded
 #: because a case-insensitive filesystem makes "AAAA....zip" the same slot.
@@ -261,6 +274,17 @@ def _refusal(headline: str, name: str, default_name: str, *body: str) -> str:
         f'Retry with output_name="{flatten_to_one_line(default_name)}" -- or '
         "omit output_name, which uses that same SHA256-derived default.",
     ])
+
+
+def _control_character_message(name: str, default_name: str) -> str:
+    """Refuse an ``output_name`` carrying a control character."""
+    return _refusal(
+        "that name contains a control character.", name, default_name,
+        "Archive names are restricted to printable characters: a line break "
+        "or a NUL is legal in a POSIX file name and rejected outright by "
+        "Windows, and either way it would start a line of this report that "
+        "the reader cannot tell from the server's own.",
+    )
 
 
 def _name_taken_message(name: str, default_name: str) -> str:
@@ -1027,6 +1051,12 @@ def register_mb_tools(app, session_manager=None):
             name = (output_name or "").strip() or default_name
             if not name.lower().endswith(".zip"):
                 name = f"{name}.zip"
+
+            # Before the path is resolved, because a control character makes
+            # this a caller error on every platform rather than a name that is
+            # writeable here and rejected there.
+            if _CONTROL_CHARS_RE.search(name):
+                return _control_character_message(name, default_name)
 
             MB_DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
             try:

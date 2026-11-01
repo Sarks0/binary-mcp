@@ -93,6 +93,26 @@ def raise_http(monkeypatch, client, code: int, payload: dict | None = None,
     monkeypatch.setattr(client, "api_key", lambda: api_key)
 
 
+def set_api_key(monkeypatch, client, value: str | None) -> None:
+    """
+    Make ``client`` resolve this key, or none at all.
+
+    Patches ``client.api_key``, which is the ONE source every provider
+    resolves through: ``IntegrationClient.require_key()`` calls it, and each
+    module's ``_get_api_key()`` is a thin delegate to it. Stubbing the
+    module hook instead replaces the delegate and leaves what it delegates to
+    untouched, so the lookup tools kept resolving a real key. That is how two
+    "missing key" tests came to pass only on a machine with no key configured,
+    and to perform a LIVE LOOKUP WITH THE REAL KEY on a machine with one.
+    """
+    monkeypatch.setattr(client, "api_key", lambda: value)
+
+
+def without_key(monkeypatch, client) -> None:
+    """Make ``client`` see no configured key at all."""
+    set_api_key(monkeypatch, client, None)
+
+
 def shrink_response_cap(monkeypatch, client, max_response_bytes: int) -> None:
     """Lower a client's response ceiling; ProviderConfig is frozen."""
     monkeypatch.setattr(

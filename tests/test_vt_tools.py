@@ -23,7 +23,7 @@ from urllib.error import HTTPError
 import pytest
 
 from src.integrations import base as integration_base
-from src.tools import vt_tools
+from src.tools import mb_tools, vt_tools
 from src.tools.vt_tools import (
     VirusTotalError,
     _utc_iso,
@@ -36,7 +36,9 @@ from tests.integration_stubs import (
     FakeResponse,
     capture_requests,
     raise_http,
+    set_api_key,
     shrink_response_cap,
+    without_key,
 )
 
 # Helpers
@@ -606,7 +608,7 @@ def test_a_json_array_reply_never_becomes_a_clean_verdict(monkeypatch):
 
 def test_check_api_masks_the_key_and_never_prints_it_whole(monkeypatch):
     key = "0123456789abcdef0123456789abcdef"
-    monkeypatch.setattr(vt_tools, "_get_api_key", lambda: key)
+    set_api_key(monkeypatch, vt_tools._client, key)
     monkeypatch.setattr(
         vt_tools, "lookup_hash",
         lambda h: {"attributes": {"last_analysis_stats": {"malicious": 60,
@@ -628,7 +630,7 @@ def test_quota_failure_never_surfaces_the_url_that_carries_the_key(monkeypatch):
     surface.
     """
     key = "0123456789abcdef0123456789abcdef"
-    monkeypatch.setattr(vt_tools, "_get_api_key", lambda: key)
+    set_api_key(monkeypatch, vt_tools._client, key)
 
     def boom(*_args, **_kwargs):
         raise VirusTotalError(f"Network error connecting to https://x/users/{key}/overall_quotas")
@@ -641,7 +643,7 @@ def test_quota_failure_never_surfaces_the_url_that_carries_the_key(monkeypatch):
 
 
 def test_quota_lines_render_used_and_allowed(monkeypatch):
-    monkeypatch.setattr(vt_tools, "_get_api_key", lambda: "k" * 64)
+    set_api_key(monkeypatch, vt_tools._client, "k" * 64)
     monkeypatch.setattr(
         vt_tools,
         "_vt_request",
@@ -658,9 +660,37 @@ def test_quota_lines_render_used_and_allowed(monkeypatch):
 
 
 def test_missing_api_key_is_a_configuration_error_not_a_crash(monkeypatch):
-    monkeypatch.setattr(vt_tools, "_get_api_key", lambda: None)
+    """
+    Stubbed on the client, not on vt_tools._get_api_key.
+
+    vt_lookup resolves its key through IntegrationClient.require_key(), and
+    _get_api_key is only a delegate to the same client method, so patching the
+    delegate left the real resolution in place: this test passed only on a
+    machine with no VT_API_KEY, and on a machine with one it performed a live
+    /files/{hash} lookup with the real key and then failed on the assertion.
+    """
+    without_key(monkeypatch, vt_tools._client)
     out = _register(monkeypatch)["vt_lookup"](file_hash="a" * 64)
     assert "not configured" in out
+
+
+def test_the_module_key_hook_cannot_drift_from_the_client():
+    """
+    _get_api_key must stay a delegate, or the two sources disagree again.
+
+    The *_check_api tools read the module hook while every lookup tool reads
+    the client. That is only safe while the hook IS the client's method; the
+    moment it resolves a key some other way, a test stubbing one path stops
+    covering the other.
+    """
+    import inspect
+
+    for module in (vt_tools, mb_tools):
+        body = inspect.getsource(module._get_api_key)
+        assert "_client.api_key()" in body, (
+            f"{module.__name__}._get_api_key no longer delegates to the client; "
+            "tests stubbing the client would stop covering the check_api tools"
+        )
 
 
 def test_detections_are_truncated_once_and_counted_against_the_real_total(monkeypatch):

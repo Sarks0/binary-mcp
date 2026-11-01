@@ -206,8 +206,9 @@ def test_distil_drops_entities_with_no_attack_id(index):
 def test_tactic_labels_come_from_the_bundle_not_a_hardcoded_table(index):
     """
     ATT&CK renames tactics between versions -- v19 files T1055 under "stealth"
-    where earlier releases said "defense-evasion". A hardcoded map would
-    silently mislabel techniques after an upgrade.
+    where earlier releases said "defense-evasion", and v20 keeps that
+    spelling. A hardcoded map would silently mislabel techniques after an
+    upgrade; the fixture's shortnames are the ones a live v20.0 bundle uses.
     """
     assert index["tactics"] == {
         "stealth": "Stealth", "privilege-escalation": "Privilege Escalation"

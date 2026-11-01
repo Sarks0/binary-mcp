@@ -216,15 +216,18 @@ def _yara_matches(entry: dict) -> list:
     """
     The YARA matches for one file, wherever YARAify put them.
 
-    Which placement YARAify uses for ``lookup_hash`` matches is still open.
-    With a live Auth-Key it answers ``ok`` and ``no_results`` as expected, but
-    no reply carrying matches has been observed.
-    YARAify's own examples show `static_results` on the file object, but its
-    task-oriented endpoints nest per-scan results under `tasks[]`. Reading only
-    the first shape would, if the second is what arrives, report "No public
-    YARA rules matched this sample" for a file that matched several -- a silent
-    wrong answer rather than an error. So accept either, and prefer the
-    documented one.
+    YARAify's own examples show ``static_results`` on the file object, but its
+    task-oriented endpoints nest per-scan results under ``tasks[]``. Reading
+    only the first shape would, if the second is what arrives, report "No
+    public YARA rules matched this sample" for a file that matched several --
+    a silent wrong answer rather than an error. So accept either, and prefer
+    the documented one.
+
+    A reply carrying matches has now been observed against a live Auth-Key:
+    ``yaraify_lookup_hash`` returned six rules for one sample, and this reader
+    handled it. Which of the two placements that reply used was not recorded,
+    so BOTH branches stay. Deleting the ``tasks[]`` arm on the strength of one
+    observation would be trading a silent wrong answer for a saved loop.
     """
     matches = entry.get("static_results")
     if isinstance(matches, list) and matches:

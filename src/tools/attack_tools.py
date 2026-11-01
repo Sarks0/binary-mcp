@@ -29,8 +29,11 @@ need for one.
 
 Tactic names are read from the bundle's own ``x-mitre-tactic`` objects rather
 than hardcoded. ATT&CK renames tactics between versions -- v19 reports T1055
-under "stealth" where earlier versions said "defense-evasion" -- and a
-hardcoded table would silently mislabel techniques after an upgrade.
+under "stealth" where earlier versions said "defense-evasion", and v20 keeps
+that spelling, so the rename is the current state rather than one release's
+blip -- and a hardcoded table would silently mislabel techniques after an
+upgrade. Confirmed live on v20.0: attack_lookup_technique("T1055") answers
+"Stealth, Privilege Escalation".
 
 Trust note: unlike every other integration in this server, ATT&CK content is
 NOT attacker-authored. It is a curated knowledge base written by MITRE, in the

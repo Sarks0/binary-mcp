@@ -601,10 +601,12 @@ def test_the_family_signature_is_fenced_like_malwarebazaars(monkeypatch):
 @pytest.mark.parametrize("shape", ["top-level", "nested-in-tasks"])
 def test_yara_matches_are_found_in_either_response_shape(monkeypatch, shape):
     """
-    YARAify's ``lookup_hash`` match placement is still unconfirmed: a live key
-    answers ok/no_results, but no reply carrying matches has been observed.
     Reading only one placement would report "no rules matched" for a file that
     matched several -- a silent wrong answer. Accept both.
+
+    A live reply carrying matches has since been seen (six rules for one
+    sample) without recording which placement it used, so neither branch can
+    be retired on that evidence and both stay pinned here.
     """
     match = {"rule_name": "MALWARE_Win_Neshta", "description": "detects Neshta"}
     entry = {"sha256_hash": "e" * 64, "file_size": 1024}

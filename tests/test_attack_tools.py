@@ -38,6 +38,9 @@ _G_APT = "intrusion-set--4444"
 _S_MAL = "malware--5555"
 _TOOL = "tool--6666"
 _C_CAMP = "campaign--7777"
+# The deprecated ``tool`` twin Enterprise v8.2-v16.1 shipped under S0154
+# alongside the live ``malware`` Cobalt Strike, ~21,000 objects later.
+_S_MAL_OLD = "tool--5555-deprecated"
 
 
 def _bundle() -> dict:
@@ -102,6 +105,17 @@ def _bundle() -> dict:
              "external_references": [{"source_name": "mitre-attack",
                                       "external_id": "C0023"}]},
 
+            # Two objects, one ATT&CK ID: Enterprise shipped S0154 as a live
+            # malware AND a deprecated tool for five releases, the deprecated
+            # one far later in the bundle. Placed after the live twin so plain
+            # assignment would keep the retired record.
+            {"type": "tool", "id": _S_MAL_OLD, "name": "Cobalt Strike",
+             "description": "Deprecated duplicate.",
+             "x_mitre_aliases": ["Cobalt Strike"],
+             "x_mitre_deprecated": True,
+             "external_references": [{"source_name": "mitre-attack",
+                                      "external_id": "S0154"}]},
+
             # An entity with no mitre-attack reference must be dropped.
             {"type": "malware", "id": "malware--9999", "name": "Unlisted",
              "external_references": [{"source_name": "Vendor", "external_id": "X1"}]},
@@ -126,6 +140,12 @@ def _bundle() -> dict:
             {"type": "relationship", "id": "relationship--f",
              "relationship_type": "attributed-to",
              "source_ref": _C_CAMP, "target_ref": _G_APT},
+            # Drawn to the DISCARDED twin's UUID: the deprecated S0154
+            # recorded its own uses -> T1064, so the mapping has to resolve
+            # both UUIDs to the surviving record.
+            {"type": "relationship", "id": "relationship--h",
+             "relationship_type": "uses",
+             "source_ref": _S_MAL_OLD, "target_ref": _T_OLD},
             # Dangling: one end is an object that was dropped.
             {"type": "relationship", "id": "relationship--g",
              "relationship_type": "uses",
@@ -213,7 +233,93 @@ def test_relationships_are_resolved_to_attack_ids(index):
 
 def test_relationships_to_dropped_objects_are_discarded(index):
     assert all("malware--9999" not in rel for rel in index["relationships"])
-    assert len(index["relationships"]) == 6
+    # 7 of the 8 relationships in the fixture: one end of the eighth is an
+    # object with no ATT&CK ID. The edge drawn to the DISCARDED S0154 twin is
+    # kept -- its UUID still resolves (see the twin test below).
+    assert len(index["relationships"]) == 7
+
+
+@pytest.mark.parametrize("twin_first", [False, True])
+def test_a_live_object_wins_an_attack_id_shared_with_a_retired_twin(twin_first):
+    """
+    Enterprise v8.2 through v16.1 shipped S0154 twice: a live ``malware``
+    Cobalt Strike and a deprecated ``tool`` Cobalt Strike ~21,000 objects
+    later. Plain assignment let the later object win, so the server answered
+    "Cobalt Strike (Tool) [retired]" -- with the "ATT&CK has deprecated or
+    revoked this entry" note -- about the most-cited post-exploitation
+    framework there is. Order must not decide it.
+    """
+    bundle = _bundle()
+    objects = bundle["objects"]
+    twin = next(obj for obj in objects if obj["id"] == _S_MAL_OLD)
+    if twin_first:
+        objects.remove(twin)
+        objects.insert(objects.index(next(o for o in objects if o["id"] == _S_MAL)), twin)
+
+    entity = distil(bundle, "16.1")["entities"]["S0154"]
+
+    assert entity["kind"] == "malware"
+    assert entity["retired"] is False
+    assert entity["platforms"] == ["Windows"]
+
+
+def test_a_relationship_drawn_to_the_discarded_twin_still_resolves(index):
+    """
+    The loser is dropped from ``entities`` but stays in the UUID map: the
+    deprecated S0154 recorded its own ``uses -> T1064``, and that edge has to
+    land on the record that survived rather than vanish.
+    """
+    assert ["uses", "S0154", "T1064"] in index["relationships"]
+    assert index["entities"]["S0154"]["kind"] == "malware"
+
+
+def test_equal_retirement_keeps_the_later_object_as_it_always_did(index):
+    """
+    Retirement is the only axis ranked on. G0058 shipped as two retired
+    intrusion-sets for the same five releases as S0154, and the 224 legacy
+    "T#### Mitigation" objects in today's Enterprise bundle are 129 retired
+    pairs whose mitigation comes FIRST -- so a first-wins tie-break would
+    answer T1174 with "Password Filter DLL Mitigation" if those types were
+    ever distilled. Equal retirement therefore keeps what plain assignment
+    kept: the later object.
+    """
+    bundle = _bundle()
+    bundle["objects"].append(
+        {"type": "attack-pattern", "id": "attack-pattern--3333-twin",
+         "name": "Retired Twin", "description": "Also retired.",
+         "revoked": True,
+         "external_references": [{"source_name": "mitre-attack",
+                                  "external_id": "T1064"}]})
+
+    entity = distil(bundle, "16.1")["entities"]["T1064"]
+
+    assert entity["name"] == "Retired Twin"
+    assert entity["retired"] is True
+    # ...and the unmodified fixture is unchanged by the guard.
+    assert index["entities"]["T1064"]["name"] == "Retired Thing"
+
+
+def test_related_does_not_repeat_an_entity_two_uuids_resolve_to(index):
+    """
+    Both twins' UUIDs map to one ATT&CK ID, so the deprecated S0154's own
+    ``uses -> T1064`` and any edge on the live twin land on the same record.
+    Appending printed the identical line twice.
+    """
+    from src.tools.attack_tools import related
+
+    bundle = _bundle()
+    bundle["objects"].append(
+        {"type": "relationship", "id": "relationship--i",
+         "relationship_type": "uses",
+         "source_ref": _S_MAL, "target_ref": _T_OLD})
+    rebuilt = distil(bundle, "16.1")
+
+    triples = [r for r in rebuilt["relationships"] if r == ["uses", "S0154", "T1064"]]
+    assert len(triples) == 2, "the fixture must actually produce the duplicate"
+
+    found = [e["id"] for e in related(rebuilt, "S0154", "uses")]
+    assert found.count("T1064") == 1
+    assert found == sorted(set(found))
 
 
 def test_deprecated_entries_are_flagged_not_dropped(index):
@@ -423,7 +529,7 @@ def test_status_reports_version_and_counts(cached, monkeypatch):
     assert "19.2" in out
     assert "enterprise-attack" in out
     assert "Technique: 3" in out
-    assert "Relationships: 6" in out
+    assert "Relationships: 7" in out
 
 
 def test_technique_lookup_lists_its_users_and_subtechniques(cached, monkeypatch):

@@ -184,6 +184,9 @@ def distil(bundle: dict, version: str) -> dict:
         relationships as ``[type, source_id, target_id]`` triples. STIX UUIDs
         are resolved to ATT&CK IDs here so nothing downstream has to carry a
         second identifier space.
+
+        Where two objects share one ATT&CK ID, the one ATT&CK has not retired
+        is kept; equal retirement keeps the later in bundle order.
     """
     objects = bundle.get("objects") or []
 
@@ -202,7 +205,39 @@ def distil(bundle: dict, version: str) -> dict:
         attack_id, url = _external_id(obj)
         if not attack_id:
             continue
+        # Mapped for every object carrying the ID, including one that loses
+        # the tie below: a relationship drawn to either twin then resolves to
+        # whichever record was kept. The retired twin had its own edge -- the
+        # deprecated S0154 recorded uses -> T1064.
         by_stix[obj["id"]] = attack_id
+
+        # Deprecated and revoked objects are KEPT, flagged rather than
+        # dropped: an old report citing T1064 should still resolve, with a
+        # note that ATT&CK has retired it, instead of coming back "unknown".
+        retired = bool(obj.get("x_mitre_deprecated") or obj.get("revoked"))
+
+        # Two objects can carry one ATT&CK ID, so a live one must not be
+        # displaced by a retired one. Enterprise v8.2 through v16.1 shipped
+        # S0154 as both a live ``malware`` Cobalt Strike and a deprecated
+        # ``tool`` Cobalt Strike, the deprecated twin ~21,000 objects later;
+        # plain assignment answered "Cobalt Strike (Tool) [retired]" about the
+        # most-cited post-exploitation framework there is. v17.0 dropped those
+        # duplicates, but nothing in the format forbids them: today's bundle
+        # still holds 224 legacy "T#### Mitigation" objects reusing technique
+        # IDs, kept out of here only by _ENTITY_TYPES.
+        #
+        # Retirement is the ONLY axis ranked on. Equal retirement keeps the
+        # LATER object, which is what plain assignment did, so this guard is a
+        # no-op wherever retirement does not discriminate. Deliberately not
+        # "first wins": of those 224 mitigation collisions only 95 pair a live
+        # technique with a retired mitigation, while 129 are retired on both
+        # sides with the MITIGATION first in bundle order -- so first-wins
+        # would answer T1174 with "Password Filter DLL Mitigation", breaking
+        # 129 lookups to fix 95, in the very extension this comment is for.
+        kept = entities.get(attack_id)
+        if kept is not None and retired and not kept["retired"]:
+            continue
+
         entities[attack_id] = {
             "id": attack_id,
             "name": obj.get("name", ""),
@@ -217,10 +252,7 @@ def distil(bundle: dict, version: str) -> dict:
                 if phase.get("kill_chain_name") == "mitre-attack"
             ],
             "subtechnique": bool(obj.get("x_mitre_is_subtechnique")),
-            # Deprecated and revoked objects are KEPT, flagged rather than
-            # dropped: an old report citing T1064 should still resolve, with a
-            # note that ATT&CK has retired it, instead of coming back "unknown".
-            "retired": bool(obj.get("x_mitre_deprecated") or obj.get("revoked")),
+            "retired": retired,
         }
 
     relationships = []
@@ -530,7 +562,11 @@ def related(index: dict, attack_id: str, relationship: str,
             as_source: bool = True, kinds: tuple[str, ...] = ()) -> list[dict]:
     """Entities linked to ``attack_id`` by one relationship type."""
     entities = index.get("entities") or {}
-    found = []
+    # Keyed by ATT&CK ID rather than appended, because two STIX UUIDs can
+    # resolve to one ATT&CK ID -- the twin kept out of ``entities`` by the
+    # retirement guard in distil() still has its own edges, and both map to
+    # the surviving record. Appending printed the same line twice.
+    found: dict[str, dict] = {}
     for rel_type, source, target in index.get("relationships") or []:
         if rel_type != relationship:
             continue
@@ -539,8 +575,8 @@ def related(index: dict, attack_id: str, relationship: str,
             continue
         entity = entities.get(other)
         if entity and (not kinds or entity["kind"] in kinds):
-            found.append(entity)
-    return sorted(found, key=lambda e: e["id"])
+            found[entity["id"]] = entity
+    return sorted(found.values(), key=lambda e: e["id"])
 
 
 def _summary(entity: dict) -> str:

@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from http.client import HTTPException
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -106,8 +106,14 @@ class ProviderConfig:
 
     user_agent: str = "binary-mcp"
 
-    #: Extra request headers, if the provider needs any.
-    extra_headers: dict = field(default_factory=dict)
+    #: Extra request headers, if the provider needs any. A tuple of
+    #: ``(name, value)`` pairs rather than a dict: ``frozen=True`` blocks
+    #: rebinding the attribute, not mutating what it points at, and these
+    #: configs are module-level singletons that live for the process. A tuple
+    #: also keeps the dataclass hashable -- one mutable field makes the
+    #: generated ``__hash__`` raise. Applied before the credential below, so a
+    #: pair can never displace the API key.
+    extra_headers: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -239,8 +245,8 @@ class IntegrationClient:
         headers = {
             "Accept": "application/json",
             "User-Agent": self.config.user_agent,
-            **self.config.extra_headers,
         }
+        headers.update(self.config.extra_headers)
         if api_key and self.config.auth_header:
             headers[self.config.auth_header] = api_key
 

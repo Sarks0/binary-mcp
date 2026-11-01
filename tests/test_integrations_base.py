@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ast
 import json
+from dataclasses import fields
 from http.client import IncompleteRead
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -157,6 +158,85 @@ def test_the_key_travels_in_the_providers_header(monkeypatch):
     client = _client(auth_header="Auth-Key")
     seen = capture_requests(monkeypatch, client, {}, api_key="secret-value")
     client.request()
+    assert seen[0].headers["Auth-key"] == "secret-value"
+
+
+def test_provider_config_is_immutable_all_the_way_down():
+    """
+    frozen=True blocks rebinding an attribute, not mutating what it holds.
+
+    These configs are module-level singletons that live for the process, so a
+    mutable container on one is a per-provider table any code in the server
+    could edit for every later call through that provider. Asserted over every
+    field rather than pinned to one, and with hash(), because a single mutable
+    field makes the generated __hash__ raise -- which is most of what
+    frozen=True is there to provide. This guards the DECLARED DEFAULTS; the
+    sweep below guards the construction sites.
+    """
+    config = _config()
+    for declared in fields(config):
+        value = getattr(config, declared.name)
+        assert not isinstance(value, (dict, list, set, bytearray)), (
+            f"ProviderConfig.{declared.name} is a mutable "
+            f"{type(value).__name__}; frozen=True does not protect contents"
+        )
+    hash(config)
+
+
+def test_every_live_provider_config_is_immutable_and_hashable():
+    """
+    The declaration is a default; a construction site can still pass a dict.
+
+    ``headers.update()`` in request() takes a mapping or an iterable of pairs,
+    so a provider that passes ``extra_headers={...}`` works -- and puts a
+    per-provider header table back on a process-lifetime singleton. Nothing
+    else would catch it: ruff does not type-check and there is no type checker
+    in this project's dev dependencies. So assert it over the real configs,
+    not just over this module's test defaults.
+    """
+    from src.tools.abusech_tools import (
+        threatfox_client,
+        urlhaus_client,
+        yaraify_client,
+    )
+    from src.tools.attack_tools import client as attack_client
+    from src.tools.mb_tools import _client as mb_client
+    from src.tools.vt_tools import _client as vt_client
+
+    live = {
+        "VirusTotal": vt_client.config,
+        "MalwareBazaar": mb_client.config,
+        "ThreatFox": threatfox_client.config,
+        "URLhaus": urlhaus_client.config,
+        "MITRE ATT&CK": attack_client.config,
+        "YARAify": yaraify_client.config,
+    }
+    for provider, config in live.items():
+        for declared in fields(config):
+            value = getattr(config, declared.name)
+            assert not isinstance(value, (dict, list, set, bytearray)), (
+                f"{provider} passes a mutable {type(value).__name__} as "
+                f"{declared.name}; frozen=True does not protect contents"
+            )
+        hash(config)
+
+
+def test_extra_headers_reach_the_wire_without_displacing_the_key(monkeypatch):
+    """
+    A provider quirk header is allowed; overriding the credential is not.
+
+    The collision is spelled in a different case from the configured header on
+    purpose: urllib normalises header names on add_header, so the guarantee
+    rests on the credential being inserted LAST, not on the two spellings
+    being distinct keys in the dict this builds.
+    """
+    client = _client(
+        auth_header="Auth-Key",
+        extra_headers=(("X-Provider-Quirk", "1"), ("auth-key", "not-the-key")),
+    )
+    seen = capture_requests(monkeypatch, client, {}, api_key="secret-value")
+    client.request()
+    assert seen[0].headers["X-provider-quirk"] == "1"
     assert seen[0].headers["Auth-key"] == "secret-value"
 
 

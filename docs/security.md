@@ -53,6 +53,46 @@ nothing can leave your host through it, deliberately or by accident.
 Sending a hash still tells VirusTotal you have the sample; sending the file
 would tell everyone with VT Intelligence access.
 
+The abuse.ch integrations (MalwareBazaar, ThreatFox, URLhaus, YARAify) hold the
+same property by a different mechanism, and the difference is worth stating
+plainly: those APIs are POST-only, so unlike the VirusTotal tools these calls
+do carry a request body. What goes in it is a hash, a tag, a family name or a
+rule name, never file content. `mb_lookup(file_path=...)` hashes the file
+locally and sends the digest alone. There is no `add_file` call anywhere in
+the module, and `tests/test_mb_tools.py` plus `tests/test_integrations_base.py`
+pin that every request body is assembled only from scalar fields, so sample
+bytes have no path to the wire.
+
+The MITRE ATT&CK tools send nothing at all about the sample: they fetch a
+public dataset once and then answer from a local cache.
+
+## Downloading a sample is off by default
+
+`mb_download` is the one tool in this server that writes malware to disk. It
+refuses unless the operator sets `MB_ALLOW_DOWNLOAD=1`; it writes only inside
+`~/.binary_mcp_output/malwarebazaar/`, via `sanitize_output_path`; and it
+stores abuse.ch's **encrypted** zip without ever extracting it, so nothing this
+server does leaves a runnable copy on the host. The archive password is the
+abuse.ch convention, `infected`. Extract it in your analysis VM, not on the
+machine running this server.
+
+The write is an atomic `O_CREAT | O_EXCL` create-or-fail at mode `0o600`, the
+same contract the carver uses for the blobs it dumps. Two properties follow.
+An archive already on disk is never overwritten -- a repeat download reports
+what is there and writes nothing, so it cannot destroy a sample mid-analysis --
+and a stored sample is readable only by the user running the server, rather
+than left world-readable at the process umask.
+
+Never overwriting makes every claim about an existing file permanent, so two
+further rules guard what the tool is willing to say about one. A
+`<sha256>.zip` name is this server's record of which sample a file holds, so
+only that sample may be written to it: an *empty* slot is not permission to
+put a different sample there, and `output_name` naming another sample's digest
+is refused before the download. And the tool only calls a file the sample if
+it is a zip at all -- a zero-byte residue, a directory or a text file at that
+name is reported as unusable and left alone, rather than announced as the
+sample with its extraction password.
+
 ## File access is confined by default
 
 Binary paths go through `sanitize_binary_path` (`src/utils/security.py`), which

@@ -390,7 +390,37 @@ class TestUntrustedEnvelopeOverhead:
 # instead of forwarding them). Both are framework-emitted and not description
 # bloat, so the baseline rose once to take them in; this test still catches a
 # contributor growing a description from here.
-TOOLS_LIST_BYTE_BUDGET = 132_000
+#
+# Raised once more for the threat-intel integrations, which add 19 tools
+# (147 -> 166). The arithmetic, because "it did not fit" is not a reason on
+# its own: the roster measured 145,262 bytes with them, against 132,000, and
+# the budget had 978 bytes of headroom. Nineteen tools do not fit in 978
+# bytes even with every description deleted -- prose was only 6,445 of the
+# 16,098 bytes they cost -- so the choice was to raise the figure or to ship
+# fewer tools.
+#
+# Both levers were pulled first, as this comment requires. Descriptions: the
+# five fattest came down by 796 bytes, keeping every sentence that carries a
+# safety claim. Schema: mb_search declared 11 pivot parameters and
+# yaraify_search 8, where each API takes exactly one per call; both now take
+# (pivot, value), which is 907 bytes smaller and puts the one-pivot rule in
+# the schema instead of a runtime check. pivot is a Literal, so the valid
+# names are an enum a conforming client enforces rather than prose the model
+# has to read and obey -- and that costs 3 bytes less than a bare str.
+#
+# 145,262 -> 143,666 measured. The figure below keeps roughly the slack main
+# left itself, and the same ratchet behaviour: lower it when something
+# shrinks the list.
+#
+# Later review passes on the same branch spent 311 of that slack on Args and
+# Returns prose for mb_download's no-overwrite contract, so the roster now
+# measures 143,977 and the headroom is 623 bytes rather than 934. Recorded
+# because the figures above are what a contributor subtracts from, and a
+# stale one reads as three times the room that is actually there. Returns
+# sections are dropped whole by src/utils/tool_docs.py, so the cost was the
+# Args lines; the next addition here almost certainly has to trim before it
+# fits.
+TOOLS_LIST_BYTE_BUDGET = 144_600
 
 # Clients cut tool descriptions (and server instructions) at this many
 # characters, and tool search only matches what is left.

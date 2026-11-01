@@ -367,15 +367,35 @@ def format_detection_summary(vt_data: dict) -> dict:
     """
     Format VirusTotal data into a readable summary.
 
-    ``detection_ratio`` follows VirusTotal's own convention -- *malicious over
-    the engines that returned a verdict*. The previous implementation reported
-    ``(malicious + suspicious) / sum(stats.values())``, which differs from the
-    number on the VT web page in both directions at once: the numerator folded
-    in "suspicious" hits, and the denominator counted ``type-unsupported`` and
-    ``failure`` engines that never examined the file. On a sample where 8 of
-    70 engines do not handle the file type, that turned VT's "45/62" into
-    "47/70". ``flagged`` keeps the malicious+suspicious count available for
-    callers that want it, under a name that says what it is.
+    ``detection_ratio`` is *malicious over the engines that returned a
+    verdict*. The first implementation reported ``(malicious + suspicious) /
+    sum(stats.values())``, which was wrong in both directions at once: the
+    numerator folded in "suspicious" hits, and the denominator counted every
+    engine that never examined the file. Its replacement subtracted the
+    no-verdict buckets BY NAME -- ``type-unsupported`` and ``failure`` -- and
+    so still counted ``timeout`` and ``confirmed-timeout`` engines, which ran
+    out of time and returned nothing, as scanners: a stats block of
+    ``{malicious: 45, undetected: 17, timeout: 5, type-unsupported: 8}`` read
+    "45/67" over the 62 engines that actually answered. The denominator is
+    therefore summed from the four VERDICT buckets (``malicious``,
+    ``suspicious``, ``undetected``, ``harmless``) instead, so every no-verdict
+    bucket is excluded by construction, including any VirusTotal adds later,
+    and ``total_engines - scanned_engines`` still surfaces the difference to
+    the caller. VirusTotal does not document how its own page computes the
+    denominator it displays, so this claims to be the ratio its name
+    describes, not parity with that page. ``flagged`` keeps the
+    malicious+suspicious count available for callers that want it, under a
+    name that says what it is.
+
+    ``detection_ratio`` is display text, not a parseable ratio.
+    ``analysis_state`` says which: ``"scanned"`` (a real ``m/n``),
+    ``"no-verdicts"`` (engines were present, none returned a verdict -- 70 of
+    70 ``type-unsupported``, or every engine timed out) or ``"unanalysed"``
+    (VirusTotal returned no stats at all). The latter two used to render as
+    ``"0/0"`` and ``"0/70"``, which a reader takes for "scanned clean".
+    Callers branch on ``analysis_state`` and do arithmetic on
+    ``malicious``/``scanned_engines``/``total_engines``; nothing should parse
+    the shape of ``detection_ratio``.
 
     Args:
         vt_data: Raw VirusTotal API response data
@@ -403,11 +423,36 @@ def format_detection_summary(vt_data: dict) -> dict:
         except (TypeError, ValueError):
             continue
 
-    # Engines that never produced a verdict are not part of the denominator VT
-    # displays: "type-unsupported" means the engine does not handle this file
-    # type at all, and "failure" means it errored out.
-    scanned_engines = total_engines - _stat("type-unsupported") - _stat("failure")
+    # Build the denominator from the engines that RETURNED a verdict rather
+    # than by subtracting the ones that did not. VirusTotal has four
+    # no-verdict buckets -- "type-unsupported" (the engine does not handle
+    # this file type at all), "failure" (it errored out) and
+    # "timeout"/"confirmed-timeout" (it ran out of time) -- and subtracting a
+    # hand-written list of them is what counted timed-out engines as scanners
+    # here. Summing the verdict side keeps any bucket VirusTotal adds next out
+    # of the ratio by construction.
+    scanned_engines = malicious + suspicious + _stat("undetected") + _stat("harmless")
     scanned_engines = max(scanned_engines, 0)
+
+    # With no engine verdicts there is no ratio to print, and "0/0" is the one
+    # rendering a model cannot read: it was what "no engine handles this file
+    # type" (70 of 70 type-unsupported) and "VirusTotal returned no analysis
+    # for this hash" both came out as, and both reached the model as "scanned,
+    # nothing found". An all-timeout scan was worse still -- it rendered
+    # "0/70" under the old denominator, which reads as authoritative. Carry
+    # the state as data and let detection_ratio hold a ratio only where a
+    # verdict exists. Each branch is one line of fixed wording plus integers
+    # computed here -- detection_ratio is printed OUTSIDE the untrusted
+    # envelope (audit F-7), so nothing submitter-supplied may reach it.
+    if scanned_engines > 0:
+        analysis_state = "scanned"
+        detection_ratio = f"{malicious}/{scanned_engines}"
+    elif total_engines > 0:
+        analysis_state = "no-verdicts"
+        detection_ratio = f"no verdicts (0 of {total_engines} engines returned one)"
+    else:
+        analysis_state = "unanalysed"
+        detection_ratio = "no analysis data"
 
     # Get top detections
     detections = []
@@ -425,7 +470,8 @@ def format_detection_summary(vt_data: dict) -> dict:
     names = attributes.get("names") or []
 
     return {
-        "detection_ratio": f"{malicious}/{scanned_engines}",
+        "detection_ratio": detection_ratio,
+        "analysis_state": analysis_state,
         "malicious": malicious,
         "suspicious": suspicious,
         "flagged": malicious + suspicious,
@@ -568,8 +614,8 @@ def register_vt_tools(app, session_manager=None):
 
         Nothing is uploaded: with file_path the file is hashed locally and only
         the hash is sent -- though sending a hash still tells VirusTotal you
-        hold the sample. The detection ratio is malicious engines over engines
-        that returned a verdict, matching VirusTotal's own page.
+        hold the sample. The detection ratio counts only engines that returned
+        a verdict, and says in words when none did.
 
         Args:
             file_hash: MD5, SHA1, or SHA256 hash to look up
@@ -610,8 +656,28 @@ def register_vt_tools(app, session_manager=None):
             # Format results
             summary = format_detection_summary(vt_data)
 
-            # Detection summary
-            if summary["malicious"] > 0:
+            # Detection summary. The state is checked before the counts: with
+            # no verdicts, malicious and suspicious are both 0, so the old
+            # code fell through to CLEAN and reported a file no engine could
+            # scan as a clean file. The flagged/detections guard keeps that
+            # check from inverting the error -- if the stats block says
+            # nothing was scanned while engine verdicts are present anyway,
+            # the detections take the headline, because "no engine verdict
+            # exists" must never print above the "Detections (...)" list
+            # further down.
+            flagged_engines = max(summary["flagged"], len(summary["detections"]))
+            if summary["analysis_state"] != "scanned" and flagged_engines:
+                output.append(
+                    f"MALICIOUS: {flagged_engines} engines flagged this file "
+                    "(VirusTotal returned no engine counts for it)"
+                )
+            elif summary["analysis_state"] != "scanned":
+                output.append(f"NOT SCANNED: {summary['detection_ratio']}")
+                output.append(
+                    "  (no engine verdict exists for this file, which is not "
+                    "evidence that it is clean)"
+                )
+            elif summary["malicious"] > 0:
                 output.append(f"MALICIOUS: {summary['detection_ratio']} engines detected this file")
             elif summary["suspicious"] > 0:
                 output.append(
@@ -629,8 +695,8 @@ def register_vt_tools(app, session_manager=None):
             if summary["total_engines"] != summary["scanned_engines"]:
                 skipped = summary["total_engines"] - summary["scanned_engines"]
                 output.append(
-                    f"  ({skipped} engines did not return a verdict: unsupported file "
-                    "type or scan failure)"
+                    f"  ({skipped} engines did not return a verdict: unsupported "
+                    "file type, timeout or scan failure)"
                 )
 
             output.append("")

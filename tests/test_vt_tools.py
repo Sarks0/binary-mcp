@@ -245,7 +245,8 @@ def test_detection_ratio_matches_virustotals_own_convention():
         }
     )
 
-    assert summary["detection_ratio"] == "45/62"   # 70 total - 7 unsupported - 1 failure
+    # 45 malicious + 2 suspicious + 15 undetected = 62 verdicts, of 70 engines
+    assert summary["detection_ratio"] == "45/62"
     assert summary["total_engines"] == 70
     assert summary["scanned_engines"] == 62
     assert summary["flagged"] == 47
@@ -253,13 +254,148 @@ def test_detection_ratio_matches_virustotals_own_convention():
 
 def test_detection_ratio_survives_missing_and_junk_stats():
     summary = format_detection_summary({"attributes": {"last_analysis_stats": {}}})
-    assert summary["detection_ratio"] == "0/0"
+    assert summary["analysis_state"] == "unanalysed"
+    assert summary["detection_ratio"] == "no analysis data"
 
     summary = format_detection_summary(
         {"attributes": {"last_analysis_stats": {"malicious": "3", "undetected": None}}}
     )
     assert summary["malicious"] == 3
     assert summary["scanned_engines"] == 3
+    assert summary["analysis_state"] == "scanned"
+    assert summary["detection_ratio"] == "3/3"
+
+
+def test_timed_out_engines_are_not_in_the_denominator():
+    """
+    An engine that timed out returned no verdict, same as one that failed.
+
+    The first version of this ratio subtracted a hand-written list of the
+    no-verdict buckets -- "type-unsupported" and "failure" -- and so counted
+    "timeout" and "confirmed-timeout" engines as scanners. These stats read
+    "45/70" under that arithmetic, over 62 engines that actually answered.
+    """
+    summary = format_detection_summary(
+        {
+            "attributes": {
+                "last_analysis_stats": {
+                    "malicious": 45,
+                    "undetected": 17,
+                    "timeout": 5,
+                    "confirmed-timeout": 3,
+                    "type-unsupported": 8,
+                },
+            }
+        }
+    )
+
+    assert summary["detection_ratio"] == "45/62"
+    assert summary["scanned_engines"] == 62
+    assert summary["total_engines"] == 78
+
+
+def test_lookup_counts_timeouts_among_the_engines_that_did_not_answer(monkeypatch):
+    """The renderer's "did not return a verdict" line has to cover timeouts."""
+    monkeypatch.setattr(
+        vt_tools,
+        "lookup_hash",
+        lambda h: {
+            "attributes": {
+                "last_analysis_stats": {
+                    "malicious": 45,
+                    "undetected": 17,
+                    "timeout": 5,
+                    "confirmed-timeout": 3,
+                    "type-unsupported": 8,
+                }
+            }
+        },
+    )
+
+    out = _register(monkeypatch)["vt_lookup"](file_hash="a" * 64)
+
+    assert "MALICIOUS: 45/62" in out
+    assert "16 engines did not return a verdict" in out
+    assert "timeout" in out.lower()
+
+
+def test_a_file_no_engine_could_scan_is_not_reported_as_clean(monkeypatch):
+    """
+    "0/0" was the rendering for both "70 of 70 engines do not handle this file
+    type" and "VirusTotal has no analysis for this hash", and the renderer
+    turned both into "CLEAN: 0/0 - No detections" -- which a model cannot tell
+    from a sample 62 engines examined and cleared.
+    """
+    summary = format_detection_summary(
+        {"attributes": {"last_analysis_stats": {"type-unsupported": 70}}}
+    )
+    assert summary["analysis_state"] == "no-verdicts"
+    assert summary["scanned_engines"] == 0
+    assert summary["total_engines"] == 70
+    assert "0/0" not in summary["detection_ratio"]
+    assert summary["detection_ratio"] == "no verdicts (0 of 70 engines returned one)"
+    # Printed outside the untrusted envelope (F-7): one line, fixed wording.
+    assert "\n" not in summary["detection_ratio"]
+
+    nothing = format_detection_summary({"attributes": {"last_analysis_stats": {}}})
+    assert nothing["analysis_state"] == "unanalysed"
+    assert nothing["detection_ratio"] == "no analysis data"
+
+    monkeypatch.setattr(
+        vt_tools,
+        "lookup_hash",
+        lambda h: {
+            "attributes": {
+                "last_analysis_stats": {"type-unsupported": 70},
+                "last_analysis_results": {},
+            }
+        },
+    )
+    out = _register(monkeypatch)["vt_lookup"](file_hash="a" * 64)
+    assert "NOT SCANNED: no verdicts (0 of 70 engines returned one)" in out
+    assert "not evidence that it is clean" in out
+    assert "CLEAN" not in out
+
+
+def test_an_all_timeout_scan_is_not_reported_as_clean():
+    """
+    A timed-out engine examined nothing, so 70 engines that all timed out must
+    not read as a clean scan. Under the old denominator this rendered
+    "CLEAN: 0/70 - No detections" -- the 0/0 bug with a denominator that makes
+    it look authoritative.
+    """
+    summary = format_detection_summary(
+        {"attributes": {"last_analysis_stats": {"timeout": 68, "confirmed-timeout": 2}}}
+    )
+    assert summary["analysis_state"] == "no-verdicts"
+    assert summary["scanned_engines"] == 0
+    assert summary["total_engines"] == 70
+    assert summary["detection_ratio"] == "no verdicts (0 of 70 engines returned one)"
+
+
+def test_detections_without_usable_stats_still_lead_with_the_detections(monkeypatch):
+    """
+    The state check must not invert the bug it fixes. With engine results but
+    no stats, scanned_engines is 0, and a state-first renderer would print
+    "no engine verdict exists for this file" directly above the
+    "Detections (...)" list -- the mirror-image wrong answer.
+    """
+    monkeypatch.setattr(
+        vt_tools,
+        "lookup_hash",
+        lambda h: {
+            "attributes": {
+                "last_analysis_results": {
+                    "Eng1": {"category": "malicious", "result": "Trojan.X"},
+                    "Eng2": {"category": "malicious", "result": "Trojan.Y"},
+                }
+            }
+        },
+    )
+    out = _register(monkeypatch)["vt_lookup"](file_hash="a" * 64)
+    assert "MALICIOUS: 2 engines flagged this file" in out
+    assert "no engine verdict exists" not in out
+    assert "CLEAN" not in out
 
 
 def test_summary_skips_engine_results_that_are_not_objects():

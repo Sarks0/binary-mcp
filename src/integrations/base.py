@@ -53,9 +53,10 @@ class IntegrationError(RuntimeError):
     drops through to ``safe_error_message``.
 
     Every raise site in this module was audited for host detail: the messages
-    below carry a status line, a provider-authored reason, or a byte count.
-    ``URLError.reason`` for an https:// request is a socket or TLS error, not
-    a filesystem path.
+    below carry a status line, a provider-authored reason, a byte ceiling
+    named through ``format_bytes``, or one word from the closed table of JSON
+    shape names. ``URLError.reason`` for an https:// request is a socket or
+    TLS error, not a filesystem path.
     """
 
 

@@ -398,6 +398,31 @@ def test_detections_without_usable_stats_still_lead_with_the_detections(monkeypa
     assert "CLEAN" not in out
 
 
+def test_a_negative_engine_count_never_reaches_the_caller():
+    """
+    A junk stats block must not print a negative population.
+
+    total_engines was summed with no clamp, and the renderer prints
+    total_engines - scanned_engines as the engines that did not answer, so
+    {"malicious": 5, "undetected": -100, "type-unsupported": 10} rendered
+    "(-85 engines did not return a verdict: ...)".
+    """
+    summary = format_detection_summary(
+        {
+            "attributes": {
+                "last_analysis_stats": {
+                    "malicious": 5,
+                    "undetected": -100,
+                    "type-unsupported": 10,
+                }
+            }
+        }
+    )
+    assert summary["total_engines"] == 0
+    assert summary["scanned_engines"] == 0
+    assert summary["total_engines"] >= summary["scanned_engines"]
+
+
 def test_summary_skips_engine_results_that_are_not_objects():
     summary = format_detection_summary(
         {

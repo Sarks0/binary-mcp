@@ -422,6 +422,12 @@ def format_detection_summary(vt_data: dict) -> dict:
             total_engines += int(value or 0)
         except (TypeError, ValueError):
             continue
+    # Clamped for the same reason the denominator below is: a negative count
+    # in the stats block is junk, but it used to reach the caller as one. The
+    # renderer prints total_engines - scanned_engines as the engines that did
+    # not answer, so {"malicious": 5, "undetected": -100} rendered
+    # "(-85 engines did not return a verdict)".
+    total_engines = max(total_engines, 0)
 
     # Build the denominator from the engines that RETURNED a verdict rather
     # than by subtracting the ones that did not. VirusTotal has four

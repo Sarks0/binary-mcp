@@ -554,8 +554,13 @@ def test_o_excl_is_what_enforces_no_overwrite_not_the_exists_check(
     real_open = os.open
 
     def racing_open(path, flags, mode=0o777, **kwargs):
-        # Another process wins the name inside the window.
-        Path(path).write_bytes(b"WRITTEN BY SOMEBODY ELSE")
+        # Touch ONLY the archive this test is about. mb_tools.os is the real os
+        # module, so this patch is process-wide for the duration: clobbering
+        # every path opened in the window would also hit pytest's own writes,
+        # a coverage data file, or a .pyc being written by an import.
+        if Path(path) == destination:
+            # Another process wins the name inside the window.
+            Path(path).write_bytes(b"WRITTEN BY SOMEBODY ELSE")
         return real_open(path, flags, mode, **kwargs)
 
     monkeypatch.setattr(mb_tools.os, "open", racing_open)

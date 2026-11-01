@@ -874,7 +874,7 @@ def register_mb_tools(app, session_manager=None):
                     # Raced away between the check and here. Not worth failing
                     # the call over -- the only claim that matters is that
                     # this tool did not write anything.
-                    size = "size unavailable"
+                    size = "unknown"
                 return "\n".join([
                     "MALWAREBAZAAR DOWNLOAD -- ALREADY PRESENT",
                     f"SHA256: {digest}",

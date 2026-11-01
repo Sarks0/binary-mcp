@@ -411,6 +411,15 @@ class TestUntrustedEnvelopeOverhead:
 # 145,262 -> 143,666 measured. The figure below keeps roughly the slack main
 # left itself, and the same ratchet behaviour: lower it when something
 # shrinks the list.
+#
+# Later review passes on the same branch spent 311 of that slack on Args and
+# Returns prose for mb_download's no-overwrite contract, so the roster now
+# measures 143,977 and the headroom is 623 bytes rather than 934. Recorded
+# because the figures above are what a contributor subtracts from, and a
+# stale one reads as three times the room that is actually there. Returns
+# sections are dropped whole by src/utils/tool_docs.py, so the cost was the
+# Args lines; the next addition here almost certainly has to trim before it
+# fits.
 TOOLS_LIST_BYTE_BUDGET = 144_600
 
 # Clients cut tool descriptions (and server instructions) at this many

@@ -83,6 +83,16 @@ what is there and writes nothing, so it cannot destroy a sample mid-analysis --
 and a stored sample is readable only by the user running the server, rather
 than left world-readable at the process umask.
 
+Never overwriting makes every claim about an existing file permanent, so two
+further rules guard what the tool is willing to say about one. A
+`<sha256>.zip` name is this server's record of which sample a file holds, so
+only that sample may be written to it: an *empty* slot is not permission to
+put a different sample there, and `output_name` naming another sample's digest
+is refused before the download. And the tool only calls a file the sample if
+it is a zip at all -- a zero-byte residue, a directory or a text file at that
+name is reported as unusable and left alone, rather than announced as the
+sample with its extraction password.
+
 ## File access is confined by default
 
 Binary paths go through `sanitize_binary_path` (`src/utils/security.py`), which

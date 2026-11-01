@@ -203,6 +203,120 @@ _STATUS_MESSAGES: dict[str, str] = {
     ),
 }
 
+#: A name of this shape is this server's content-addressed slot for one
+#: sample, so only that sample may be written to it. Matched case-folded
+#: because a case-insensitive filesystem makes "AAAA....zip" the same slot.
+_HASH_SLOT_RE = re.compile(r"\A[0-9a-f]{64}\.zip\Z")
+
+#: The trailer on every download report. Hoisted out of the handler so the
+#: "already present" and "freshly written" replies cannot drift apart.
+_MB_ENCRYPTED_NOTE = (
+    "The archive is left encrypted on purpose. Extract it only inside an "
+    "isolated analysis VM -- extracting it here puts a live sample on this "
+    "host, where your own AV will likely quarantine it."
+)
+
+
+def _looks_like_archive(destination: Path) -> bool:
+    """
+    Whether the file already at ``destination`` is a zip at all.
+
+    ``exists()`` is not identity, and the no-overwrite contract makes that
+    gap permanent: a zero-byte residue, a directory, or a text file at the
+    content-addressed name would otherwise be announced as "this sample,
+    already present" -- with its extraction password -- and no later call
+    could repair it. Reads two bytes, the same ``b"PK"`` test
+    :func:`download_sample` already applies to the wire, and never decrypts:
+    this module does not open these archives.
+    """
+    try:
+        with open(destination, "rb") as handle:
+            return handle.read(2) == b"PK"
+    except OSError:
+        # A directory, a permission failure, a dangling symlink: not something
+        # this server may claim is the sample.
+        return False
+
+
+def _refusal(headline: str, name: str, default_name: str, *body: str) -> str:
+    """
+    One shape for every "nothing was downloaded" reply.
+
+    Echoes the caller's OWN argument and nothing else -- not the resolved
+    destination, which is rooted at ``Path.home()`` and so carries the
+    operator's username (audit F-10, the same reasoning as the OSError arm of
+    the handler). These are refusals, so the success path's deliberate path
+    disclosure does not extend to them.
+
+    flatten_to_one_line because the value is caller-chosen and printed OUTSIDE
+    any untrusted envelope (audit F-7): a line break is a legal POSIX file
+    name character, and one here would start a second line the reader cannot
+    attribute -- a working injection channel, since the name reaches the model
+    verbatim and can name a real tool in this server.
+    """
+    return "\n".join([
+        f"Nothing was downloaded: {headline}",
+        f"Name: {flatten_to_one_line(name)}",
+        *body,
+        f'Retry with output_name="{flatten_to_one_line(default_name)}" -- or '
+        "omit output_name, which uses that same SHA256-derived default.",
+    ])
+
+
+def _name_taken_message(name: str, default_name: str) -> str:
+    """Refuse a caller-chosen ``output_name`` that already holds an archive."""
+    return _refusal(
+        "that archive name is already in use.", name, default_name,
+        "mb_download never overwrites. The file already under that name may "
+        "be a different sample, and replacing it would destroy the only copy "
+        "while an earlier report still points at it.",
+    )
+
+
+def _reserved_name_message(name: str, default_name: str) -> str:
+    """
+    Refuse writing one sample into another sample's content-addressed slot.
+
+    This is the hole an ``exists()``-only guard leaves open, and never
+    overwriting is what makes it lasting. A ``<sha256>.zip`` name means "this
+    is that sample" everywhere in this server, and the slot being EMPTY is not
+    permission to put something else in it:
+    ``mb_download(A, output_name="<B's digest>.zip")`` passes every existence
+    check, writes A there with a plain success report, and a later honest
+    ``mb_download(B)`` then finds the slot occupied and reports "already
+    present -- that name is this sample's own SHA256" about a file that is not
+    B. So the reservation is checked on the name's SHAPE, before the file
+    system is consulted at all.
+    """
+    return _refusal(
+        "that name is another sample's SHA256.", name, default_name,
+        "A <sha256>.zip name is how this server records which sample a file "
+        "is, so only that sample may be written to it -- an empty slot is not "
+        "permission to put a different sample in it.",
+    )
+
+
+def _unusable_archive_message(name: str, default_name: str) -> str:
+    """
+    Refuse when something that is not a zip already occupies the name.
+
+    Deliberately a refusal rather than a replacement, even at the sample's own
+    content-addressed name where the occupant cannot be another sample: this
+    is the one tool that writes malware to disk, and it does not delete what
+    it did not create. A successful write unlinks its own partial output, so
+    reaching this state means something unusual happened -- the process was
+    killed mid-write, or a human put the file there -- and the caller is told
+    exactly what to remove rather than having it removed for them.
+    """
+    return _refusal(
+        "something that is not a zip archive already has that name.",
+        name, default_name,
+        "It may be a directory, or the residue of a write that was killed "
+        "part-way. mb_download will not replace a file it did not write: "
+        "delete that name from the download directory (mb_check_api names the "
+        "directory) and retry.",
+    )
+
 
 class _MalwareBazaarClient(IntegrationClient):
     """abuse.ch's status codes; most failures arrive inside a 200 instead."""
@@ -882,7 +996,8 @@ def register_mb_tools(app, session_manager=None):
         Args:
             sha256: Full SHA256 of the sample (MalwareBazaar requires SHA256)
             output_name: Optional file name for the archive, relative to the
-                download directory. Defaults to "<sha256>.zip".
+                download directory. Defaults to "<sha256>.zip". A name that is
+                a different sample's SHA256 is refused.
 
         Returns:
             The path written, the archive size, and the extraction password --
@@ -908,12 +1023,31 @@ def register_mb_tools(app, session_manager=None):
             # whitespace-only output_name counted as supplied and then stripped
             # to nothing -- every such download landing on the same empty name
             # instead of its own hash.
-            name = (output_name or "").strip() or f"{digest}.zip"
+            default_name = f"{digest}.zip"
+            name = (output_name or "").strip() or default_name
             if not name.lower().endswith(".zip"):
                 name = f"{name}.zip"
 
             MB_DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-            destination = sanitize_output_path(Path(name), MB_DOWNLOAD_DIR)
+            try:
+                destination = sanitize_output_path(Path(name), MB_DOWNLOAD_DIR)
+            except ValueError as e:
+                # sanitize_output_path's ValueError arms interpolate a RESOLVED
+                # path ("Parent directory does not exist: ...", "Invalid path:
+                # ..."), rooted at Path.home(), so they carry the operator's
+                # username. The handler's `except ValueError` arm below echoes
+                # its exception verbatim, which is right for normalise_hash --
+                # that one quotes the caller's own argument -- and wrong for
+                # this one, so it is routed here rather than widening that arm
+                # (audit F-10).
+                return safe_path_error("mb_download", e, "output path")
+
+            # Which sample a name claims to hold. Split by NAME SHAPE, not by
+            # bytes: the archive is an encrypted zip whose bytes differ between
+            # two downloads of the same sample, and comparing contents would
+            # mean decrypting it, which this module never does.
+            slot = destination.name.lower()
+            own_slot = slot == default_name
 
             def _already_present() -> str:
                 """The reply for an archive this tool declined to overwrite."""
@@ -927,23 +1061,48 @@ def register_mb_tools(app, session_manager=None):
                 return "\n".join([
                     "MALWAREBAZAAR DOWNLOAD -- ALREADY PRESENT",
                     f"SHA256: {digest}",
-                    f"Kept: {destination}",
+                    # flatten_to_one_line for the same F-7 reason as the
+                    # success path below: the tail of this path is a
+                    # caller-chosen name.
+                    f"Kept: {flatten_to_one_line(str(destination))}",
                     f"Size: {size} (existing archive, left untouched)",
                     f'Password: "{MB_ZIP_PASSWORD}"',
                     "",
-                    "Nothing was downloaded or written: an archive already exists at "
-                    "this path, and this tool never overwrites one -- overwriting it "
-                    "would destroy a sample you may already be working from. Delete it "
-                    "yourself for a fresh copy, or pass output_name to save alongside "
-                    "it.",
+                    "Nothing was downloaded or written: that name is this "
+                    "sample's own SHA256 and the archive there is a zip, so it "
+                    "is this sample. Delete it yourself for a fresh copy.",
+                    "",
+                    _MB_ENCRYPTED_NOTE,
                 ])
+
+            # The reservation is checked FIRST, and on the shape alone: an
+            # empty slot is the hole an exists()-only guard leaves open, and
+            # never overwriting is what makes it lasting. See
+            # _reserved_name_message.
+            if not own_slot and _HASH_SLOT_RE.match(slot):
+                return _reserved_name_message(name, default_name)
+
+            def _occupied() -> str:
+                """
+                What to say when something already holds this name.
+
+                One function for both arms below, because the exists() check
+                and the O_EXCL failure are the same question asked at two
+                moments, and a reply that differed between them would be a
+                difference in what the server claims about the same file.
+                """
+                if not _looks_like_archive(destination):
+                    return _unusable_archive_message(name, default_name)
+                if own_slot:
+                    return _already_present()
+                return _name_taken_message(name, default_name)
 
             # Fast path only. The point is to not spend a multi-megabyte
             # transfer fetching a sample that is already on disk; it is NOT the
             # guard. This check can lose a race, O_EXCL below cannot, and the
             # FileExistsError arm is what actually enforces no-overwrite.
             if destination.exists():
-                return _already_present()
+                return _occupied()
 
             archive = download_sample(digest)
 
@@ -954,26 +1113,49 @@ def register_mb_tools(app, session_manager=None):
             try:
                 fd = os.open(str(destination), _ARCHIVE_OPEN_FLAGS, 0o600)
             except FileExistsError:
-                return _already_present()
+                # Lost the race. Re-report rather than overwrite: whichever
+                # call won wrote a whole archive, and under the default name
+                # that archive is this sample.
+                return _occupied()
 
             try:
                 with os.fdopen(fd, "wb") as handle:
                     handle.write(archive)
-            except OSError:
-                # Never leave a short write looking like a complete sample.
-                destination.unlink(missing_ok=True)
+            except BaseException:
+                # Never leave a short write looking like a complete sample --
+                # under never-overwrite, no later call could repair it.
+                #
+                # Not `except OSError`: a MemoryError or a KeyboardInterrupt
+                # inside the write would otherwise skip this cleanup entirely.
+                # And os.fdopen only takes ownership of the descriptor once it
+                # RETURNS, so if that call raises, nothing closes the fd and it
+                # leaks for the life of the server. The close is guarded
+                # because in the common case the `with` block's own exit
+                # already closed it, and a second close raises EBADF -- which
+                # would skip the unlink below.
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                try:
+                    destination.unlink(missing_ok=True)
+                except OSError:
+                    pass
                 raise
 
             return "\n".join([
                 "MALWAREBAZAAR DOWNLOAD",
                 f"SHA256: {digest}",
-                f"Saved: {destination}",
+                # flatten_to_one_line: output_name is caller-chosen, a line
+                # break is a legal POSIX file name character, and this line is
+                # printed outside any untrusted envelope -- so without it the
+                # name is a working injection channel into the model's own
+                # transcript, able to name a real tool in this server (F-7).
+                f"Saved: {flatten_to_one_line(str(destination))}",
                 f"Size: {len(archive)} bytes (zip archive, not extracted)",
                 f'Password: "{MB_ZIP_PASSWORD}"',
                 "",
-                "The archive is left encrypted on purpose. Extract it only inside an "
-                "isolated analysis VM -- extracting it here puts a live sample on this "
-                "host, where your own AV will likely quarantine it.",
+                _MB_ENCRYPTED_NOTE,
             ])
 
         except PathTraversalError as e:

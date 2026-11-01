@@ -424,6 +424,22 @@ def test_non_json_response_is_reported_as_such(monkeypatch):
         vt_tools.lookup_hash("a" * 64)
 
 
+def test_a_json_array_reply_never_becomes_a_clean_verdict(monkeypatch):
+    """
+    The payload that made the non-object case worth fixing.
+
+    A body that decoded to a bare array used to arrive as ``{}``, reach
+    format_detection_summary, and print "CLEAN: 0/0 - No detections" -- a
+    clean verdict on a sample VirusTotal never answered for.
+    """
+    _capture_requests(monkeypatch)
+    monkeypatch.setattr(
+        integration_base, "urlopen", lambda req, timeout=None: FakeResponse(b"[]")
+    )
+    with pytest.raises(VirusTotalError, match="not an object"):
+        vt_tools.lookup_hash("a" * 64)
+
+
 # API key handling
 
 

@@ -16,8 +16,10 @@ What is genuinely shared, and therefore lives here:
   structurally unable to become one;
 * HTTP and network failures mapped to a provider-authored sentence -- never
   a raw exception string, which can carry host detail (audit F-10);
-* a JSON decode that says "that was not JSON" instead of raising
-  ``JSONDecodeError`` out of a tool handler.
+* a JSON decode that says "that was not JSON" -- or "that was a JSON array,
+  not an object" -- instead of raising ``JSONDecodeError`` out of a tool
+  handler or handing one back an empty payload it cannot tell from a
+  legitimately empty reply.
 
 What is NOT shared, and stays with each provider: which status codes mean
 what (``map_http_error``), how a provider signals failure inside a 200 (abuse.ch
@@ -112,9 +114,12 @@ class ProviderConfig:
 class IntegrationResponse:
     """A decoded reply plus the bytes it came from."""
 
-    #: Parsed JSON object, or ``{}`` when the body was not a JSON object.
-    #: For an endpoint whose success body is binary (a sample archive), an
-    #: empty payload alongside non-empty ``raw`` is the success case.
+    #: Parsed JSON object. Always an object when the call asked for JSON --
+    #: anything else raised rather than arriving as ``{}``. ``{}`` therefore
+    #: means one of two things: the object was genuinely empty, or the call
+    #: passed ``expect_json=False``. For an endpoint whose success body is
+    #: binary (a sample archive), that empty payload alongside non-empty
+    #: ``raw`` is the success case.
     payload: dict
 
     raw: bytes
@@ -217,6 +222,8 @@ class IntegrationClient:
             json_body: ``application/json`` body.
             expect_json: ``False`` when a successful reply is binary; the
                 returned payload is then ``{}`` and ``raw`` holds the bytes.
+                ``True`` additionally requires a top-level JSON object -- an
+                array or scalar raises rather than decoding to ``{}``.
             max_bytes: Override the provider's response cap for this call --
                 a sample download has a different ceiling than a JSON reply.
 
@@ -297,6 +304,22 @@ class IntegrationClient:
 
         return IntegrationResponse(payload=self._decode(raw, expect_json), raw=raw)
 
+    #: What a non-object top-level value is called in the sentence raised for
+    #: it. Keyed on the EXACT type so ``bool`` is not swallowed by its ``int``
+    #: superclass, and spoken in JSON's vocabulary rather than Python's: the
+    #: operator reading the message has the provider's API docs open, not a
+    #: Python REPL. The lookup is closed -- stdlib ``json`` yields no other
+    #: top-level type -- so nothing in the response body can steer a sentence
+    #: that is printed outside any untrusted envelope (audit F-7).
+    _JSON_SHAPE_NAMES: dict[type, str] = {
+        list: "array",
+        str: "string",
+        bool: "boolean",
+        int: "number",
+        float: "number",
+        type(None): "null",
+    }
+
     def _decode(self, raw: bytes, expect_json: bool) -> dict:
         try:
             parsed = json.loads(raw.decode("utf-8"))
@@ -306,7 +329,36 @@ class IntegrationClient:
                     f"{self.config.name} returned a response that was not JSON"
                 ) from None
             return {}
-        return parsed if isinstance(parsed, dict) else {}
+
+        if isinstance(parsed, dict):
+            return parsed
+
+        # A top-level array, string, number, boolean or null decodes cleanly
+        # and is still not the payload contract. Returning {} for it is the
+        # same silent failure the clause above refuses two lines up, minus the
+        # error: every provider here answers with a JSON OBJECT, and every
+        # caller reads the reply BY KEY -- query_status, data, collections,
+        # objects. {} satisfies none of those keys and says nothing about why.
+        # For abuse.ch, MalwareBazaar and ATT&CK the absent key raised
+        # something eventually, but named the wrong fault. For VirusTotal
+        # nothing raised at all: format_detection_summary({}) rendered a clean
+        # verdict on a sample VirusTotal never answered for. So a decoded
+        # non-object is a protocol failure, raised like a body that was not
+        # JSON at all -- with its own sentence, because the remedy differs:
+        # "not JSON" means something other than the API answered (a proxy
+        # page, a captive portal), while this means the contract moved.
+        if expect_json:
+            shape = self._JSON_SHAPE_NAMES.get(type(parsed), "value")
+            raise self.error_cls(
+                f"{self.config.name} returned a JSON {shape}, not an object"
+            )
+
+        # expect_json=False is the mb_download zip path, where a JSON body is
+        # read only as a sign the download failed and download_sample's
+        # ``if payload:`` check is the whole protocol. A non-object there is
+        # not a zip either, and the ``raw.startswith(b"PK")`` check in that
+        # tool already reports it in the words of the tool that asked.
+        return {}
 
     # error mapping
 

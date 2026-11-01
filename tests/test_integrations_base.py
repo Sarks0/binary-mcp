@@ -293,11 +293,55 @@ def test_non_json_reply_is_fine_when_not_expected(monkeypatch):
     assert response.raw == b"PK\x03\x04binary"
 
 
-def test_a_json_array_decodes_to_an_empty_payload(monkeypatch):
-    """The payload contract is a dict; a bare array is not one."""
+def test_a_top_level_json_array_is_a_protocol_error(monkeypatch):
+    """
+    The payload contract is an object, and every caller reads the reply by key.
+
+    Decoding a bare array to {} made a shape mismatch indistinguishable from
+    an empty answer: VirusTotal's renderer turned it into
+    "CLEAN: 0/0 - No detections" for a sample VirusTotal never answered for,
+    and abuse.ch's into "returned an unrecognised response", which names the
+    wrong fault.
+    """
     client = _client()
     capture_requests(monkeypatch, client, raw=b"[1, 2, 3]")
+    with pytest.raises(IntegrationError, match="returned a JSON array, not an object"):
+        client.request()
+
+
+@pytest.mark.parametrize(
+    "body,shape",
+    [
+        (b"[]", "array"),
+        (b'"text"', "string"),
+        (b"123", "number"),
+        (b"1.5", "number"),
+        (b"true", "boolean"),
+        (b"null", "null"),
+    ],
+)
+def test_every_non_object_json_body_names_its_shape(monkeypatch, body, shape):
+    """``true`` must not report as a number: bool is an int subclass."""
+    client = _client()
+    capture_requests(monkeypatch, client, raw=body)
+    with pytest.raises(IntegrationError, match=f"JSON {shape}, not an object"):
+        client.request()
+
+
+def test_an_empty_json_object_is_not_an_error(monkeypatch):
+    """{} is a legitimate object; only a non-object raises."""
+    client = _client()
+    capture_requests(monkeypatch, client, raw=b"{}")
     assert client.request().payload == {}
+
+
+def test_a_non_object_json_body_is_fine_when_json_is_not_expected(monkeypatch):
+    """mb_download reads a JSON body only as a sign the download failed."""
+    client = _client()
+    capture_requests(monkeypatch, client, raw=b"[]")
+    response = client.request(expect_json=False)
+    assert response.payload == {}
+    assert response.raw == b"[]"
 
 
 # Error mapping

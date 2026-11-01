@@ -769,8 +769,11 @@ _AST_ALLOWED_HANDLERS = {
     "VirusTotalError",
     #   * MalwareBazaarError (src/tools/mb_tools.py) -- the same construction
     #     as VirusTotalError, audited the same way. Its raise sites are: the
-    #     curated Auth-Key / rate-limit / response-cap / "not JSON" / "not a
-    #     zip archive" sentences written in that module; the HTTP status line
+    #     curated Auth-Key / rate-limit / response-cap / "not JSON" / "not an
+    #     object" / "not a zip archive" sentences written in that module (the
+    #     response-cap one names the ceiling through format_bytes, and the
+    #     not-an-object one names the shape through a closed six-entry table,
+    #     so neither interpolates anything from the reply); the HTTP status line
     #     (``{e.code} {e.reason}``) and the URLError reason, neither of which
     #     can carry a filesystem path for an https:// request; and
     #     ``_status_message()``, whose only variable part is a ``query_status``

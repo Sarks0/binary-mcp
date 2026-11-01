@@ -259,8 +259,10 @@ def _request(fields: dict[str, str | int], expect_json: bool = True) -> tuple[di
         expect_json: ``False`` for ``get_file``, whose success body is a zip.
 
     Returns:
-        ``(parsed_json, raw_body)``. ``parsed_json`` is ``{}`` when the body
-        was not JSON, which for ``get_file`` is the success case.
+        ``(parsed_json, raw_body)``. ``parsed_json`` is ``{}`` only when
+        ``expect_json`` is ``False`` and the body was not a JSON object --
+        which for ``get_file`` is the success case. With ``expect_json=True``
+        a body that is not a JSON object raises instead of arriving empty.
 
     Raises:
         ValueError: If the Auth-Key is not configured.

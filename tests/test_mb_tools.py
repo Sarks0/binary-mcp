@@ -16,7 +16,12 @@ Three things are worth pinning here beyond ordinary behaviour:
 from __future__ import annotations
 
 import ast
+import inspect
 import json
+import os
+import re
+import stat
+import textwrap
 import zipfile
 from io import BytesIO
 from pathlib import Path
@@ -456,6 +461,173 @@ def test_download_writes_the_encrypted_archive_without_extracting(monkeypatch, t
     assert 'Password: "infected"' in out
     # Nothing was unpacked next to it.
     assert sorted(child.name for child in (tmp_path / "mb").iterdir()) == [written.name]
+
+
+def _newline_heavy_zip() -> bytes:
+    """A real zip whose bytes are full of 0x0A, stored uncompressed.
+
+    Compression would hide the point: the payload has to reach the descriptor
+    with literal newlines in it for a text-mode write to be able to mangle it.
+    """
+    buffer = BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_STORED) as archive:
+        archive.writestr("sample.bin", b"MZ\n" + b"\n\x00\r\n" * 64 + b"\n" * 32)
+    data = buffer.getvalue()
+    assert b"\n" in data
+    return data
+
+
+def test_download_writes_the_archive_byte_for_byte(monkeypatch, tmp_path):
+    """The zip on disk must still be the zip abuse.ch served.
+
+    mb_download takes its own descriptor with os.open, which on Windows is in
+    the C runtime's text mode unless O_BINARY is in the flags -- and
+    os.fdopen(fd, "wb") does not undo that, so every 0x0A would be expanded to
+    0x0D 0x0A and the archive would stop opening. Path.write_bytes used to
+    apply that flag for us inside io.FileIO; taking the fd by hand means
+    naming it ourselves. This fails on Windows without it, passes everywhere
+    with it.
+    """
+    archive = _newline_heavy_zip()
+    _capture(monkeypatch, raw=archive)
+    monkeypatch.setattr(mb_tools, "_download_allowed", lambda: True)
+    monkeypatch.setattr(mb_tools, "MB_DOWNLOAD_DIR", tmp_path / "mb")
+
+    out = _register(monkeypatch)["mb_download"]("a" * 64)
+
+    written = tmp_path / "mb" / f"{'a' * 64}.zip"
+    on_disk = written.read_bytes()
+    assert on_disk == archive
+    assert len(on_disk) == len(archive)
+    assert f"Size: {len(archive)} bytes" in out
+    # The strongest form of the same claim: it is still a readable archive.
+    with zipfile.ZipFile(written) as reopened:
+        assert reopened.read("sample.bin").endswith(b"\n" * 32)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+def test_download_writes_the_archive_owner_only(monkeypatch, tmp_path):
+    """A live sample must not land world-readable at the process umask."""
+    _capture(monkeypatch, raw=_zip_bytes())
+    monkeypatch.setattr(mb_tools, "_download_allowed", lambda: True)
+    monkeypatch.setattr(mb_tools, "MB_DOWNLOAD_DIR", tmp_path / "mb")
+
+    _register(monkeypatch)["mb_download"]("a" * 64)
+
+    written = tmp_path / "mb" / f"{'a' * 64}.zip"
+    assert stat.S_IMODE(written.stat().st_mode) == 0o600
+
+
+def test_download_refuses_to_overwrite_an_existing_archive(monkeypatch, tmp_path):
+    """A repeat download must not destroy a sample already being worked on."""
+    seen = _capture(monkeypatch, raw=_zip_bytes())
+    monkeypatch.setattr(mb_tools, "_download_allowed", lambda: True)
+    monkeypatch.setattr(mb_tools, "MB_DOWNLOAD_DIR", tmp_path / "mb")
+
+    existing = tmp_path / "mb" / f"{'a' * 64}.zip"
+    existing.parent.mkdir(parents=True)
+    existing.write_bytes(b"DO NOT OVERWRITE")
+
+    out = _register(monkeypatch)["mb_download"]("a" * 64)
+
+    assert existing.read_bytes() == b"DO NOT OVERWRITE"
+    assert "ALREADY PRESENT" in out
+    assert "never overwrites one" in out
+    # The fast path also means no pointless multi-megabyte transfer.
+    assert seen == [], "an archive already on disk must not be re-fetched"
+
+
+def test_o_excl_is_what_enforces_no_overwrite_not_the_exists_check(
+    monkeypatch, tmp_path
+):
+    """Lose the exists() race on purpose and the write must still refuse.
+
+    The exists() check in mb_download is a bandwidth optimisation, not the
+    guard. Here the file appears *after* that check has passed, which is
+    exactly the window O_EXCL exists to close.
+    """
+    seen = _capture(monkeypatch, raw=_zip_bytes())
+    monkeypatch.setattr(mb_tools, "_download_allowed", lambda: True)
+    monkeypatch.setattr(mb_tools, "MB_DOWNLOAD_DIR", tmp_path / "mb")
+
+    destination = tmp_path / "mb" / f"{'a' * 64}.zip"
+    real_open = os.open
+
+    def racing_open(path, flags, mode=0o777, **kwargs):
+        # Another process wins the name inside the window.
+        Path(path).write_bytes(b"WRITTEN BY SOMEBODY ELSE")
+        return real_open(path, flags, mode, **kwargs)
+
+    monkeypatch.setattr(mb_tools.os, "open", racing_open)
+
+    out = _register(monkeypatch)["mb_download"]("a" * 64)
+
+    assert destination.read_bytes() == b"WRITTEN BY SOMEBODY ELSE"
+    assert "ALREADY PRESENT" in out
+    assert seen, "this path is reached only after the download"
+
+
+def test_archive_flag_constant_still_asks_for_o_binary():
+    """Fails on POSIX too, unlike the runtime check below.
+
+    os.O_BINARY does not exist on POSIX, so a runtime assertion about it is
+    vacuous here and a deletion would sail through a Linux CI run. Reading the
+    definition is what catches that.
+    """
+    definition = re.search(
+        r"^_ARCHIVE_OPEN_FLAGS\s*=\s*(.+)$",
+        inspect.getsource(mb_tools),
+        re.MULTILINE,
+    )
+    assert definition, "the flag constant was renamed or moved"
+    assert 'getattr(os, "O_BINARY", 0)' in definition.group(1), definition.group(1)
+
+
+def test_archive_flags_carry_o_binary_where_the_platform_defines_it():
+    assert not hasattr(os, "O_BINARY") or (mb_tools._ARCHIVE_OPEN_FLAGS & os.O_BINARY)
+
+
+def test_archive_flags_keep_the_atomic_never_overwrite_contract():
+    flags = mb_tools._ARCHIVE_OPEN_FLAGS
+    assert flags & os.O_WRONLY == os.O_WRONLY
+    assert flags & os.O_CREAT
+    assert flags & os.O_EXCL
+
+
+def test_the_download_write_uses_the_shared_flags(monkeypatch):
+    """Going back to write_bytes would silently drop O_EXCL and the 0o600.
+
+    Read as a syntax tree rather than as text, so prose in the comments
+    cannot satisfy or break the assertions.
+    """
+    tree = ast.parse(
+        textwrap.dedent(inspect.getsource(_register(monkeypatch)["mb_download"]))
+    )
+
+    opens = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "open"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "os"
+    ]
+    assert len(opens) == 1, "mb_download no longer takes exactly one descriptor"
+
+    args = opens[0].args
+    assert any(
+        isinstance(a, ast.Name) and a.id == "_ARCHIVE_OPEN_FLAGS" for a in args
+    ), "the flags are hand-rolled again, which is how O_BINARY gets lost"
+    assert any(
+        isinstance(a, ast.Constant) and a.value == 0o600 for a in args
+    ), "the owner-only mode is gone"
+
+    attributes = {
+        node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)
+    }
+    assert "write_bytes" not in attributes, (
+        "back on write_bytes: that silently drops both O_EXCL and the 0o600"
+    )
 
 
 def test_download_confines_the_output_name(monkeypatch, tmp_path):

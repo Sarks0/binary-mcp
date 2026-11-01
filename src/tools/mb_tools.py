@@ -36,12 +36,16 @@ Downloading. ``mb_download`` writes malware to disk, which nothing else in this
 server does. It is therefore off unless the operator sets
 ``MB_ALLOW_DOWNLOAD=1``, it writes only inside ``~/.binary_mcp_output/malwarebazaar``,
 and it leaves the archive **encrypted** -- the tool never extracts it, so
-nothing on the host ever holds a runnable copy that this server put there.
+nothing on the host ever holds a runnable copy that this server put there. The
+write itself is an atomic create-or-fail at mode ``0o600``: an archive already
+on disk is never overwritten, and a sample this server stores is readable only
+by the user running it.
 """
 
 import hashlib
 import json
 import logging
+import os
 import re
 from pathlib import Path
 from typing import Literal
@@ -84,6 +88,25 @@ MB_DEFAULT_TIMEOUT = 30
 #: path allow-list by ``security.server_artifact_dirs()`` -- so a downloaded
 #: archive is reachable by the rest of the server without widening anything.
 MB_DOWNLOAD_DIR = Path.home() / ".binary_mcp_output" / "malwarebazaar"
+
+#: Open flags for the one write this server makes into ``MB_DOWNLOAD_DIR``.
+#:
+#: ``O_WRONLY | O_CREAT | O_EXCL`` is an atomic create-or-fail, the same
+#: contract as ``src/utils/carving.py::_BLOB_OPEN_FLAGS``. It matters more here
+#: than almost anywhere else in the server: the file that would be clobbered is
+#: a live malware sample an analyst may already be working from.
+#:
+#: ``O_BINARY`` is Windows-only (hence the ``getattr`` -- POSIX does not define
+#: it, where it resolves to 0 and changes nothing). On Windows ``os.open()``
+#: returns a descriptor in the C runtime's *text* mode without it, and that
+#: translation lives in the descriptor: ``os.fdopen(fd, "wb")`` does not undo
+#: it, so every 0x0A in the zip would be expanded to 0x0D 0x0A and the archive
+#: would no longer open. Note why it has to be named here at all -- the
+#: ``Path.write_bytes()`` this replaced applied the identical guard for us
+#: inside ``io.FileIO`` (``flags |= getattr(os, 'O_BINARY', 0)``), so taking
+#: the descriptor by hand means taking the flag by hand too. Do not drop it
+#: because the tests still pass: CI is POSIX, where there is nothing to see.
+_ARCHIVE_OPEN_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
 
 #: abuse.ch ships every sample inside a zip encrypted with this password, so
 #: that a download cannot be executed by accident and so that AV on the
@@ -802,13 +825,20 @@ def register_mb_tools(app, session_manager=None):
         ~/.binary_mcp_output/malwarebazaar/ and NEVER extracts it -- do that
         yourself, in an isolated analysis VM.
 
+        It also never overwrites. If an archive is already at the target path
+        the download is skipped and the existing file is left untouched, so a
+        repeat call cannot destroy a sample you are working from. Delete it
+        yourself, or pass output_name, to fetch a fresh copy.
+
         Args:
             sha256: Full SHA256 of the sample (MalwareBazaar requires SHA256)
             output_name: Optional file name for the archive, relative to the
                 download directory. Defaults to "<sha256>.zip".
 
         Returns:
-            The path written, the archive size, and the extraction password.
+            The path written, the archive size, and the extraction password --
+            or, if an archive was already there, a note that nothing was
+            downloaded and the existing file was kept.
 
         Example:
             mb_download("094fd325049b8a9cf6d3e5ef2a6d4cc6a567d7d49c35f8bb8dd9e3c6acf3d78d")
@@ -836,8 +866,54 @@ def register_mb_tools(app, session_manager=None):
             MB_DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
             destination = sanitize_output_path(Path(name), MB_DOWNLOAD_DIR)
 
+            def _already_present() -> str:
+                """The reply for an archive this tool declined to overwrite."""
+                try:
+                    size = f"{destination.stat().st_size} bytes"
+                except OSError:
+                    # Raced away between the check and here. Not worth failing
+                    # the call over -- the only claim that matters is that
+                    # this tool did not write anything.
+                    size = "size unavailable"
+                return "\n".join([
+                    "MALWAREBAZAAR DOWNLOAD -- ALREADY PRESENT",
+                    f"SHA256: {digest}",
+                    f"Kept: {destination}",
+                    f"Size: {size} (existing archive, left untouched)",
+                    f'Password: "{MB_ZIP_PASSWORD}"',
+                    "",
+                    "Nothing was downloaded or written: an archive already exists at "
+                    "this path, and this tool never overwrites one -- overwriting it "
+                    "would destroy a sample you may already be working from. Delete it "
+                    "yourself for a fresh copy, or pass output_name to save alongside "
+                    "it.",
+                ])
+
+            # Fast path only. The point is to not spend a multi-megabyte
+            # transfer fetching a sample that is already on disk; it is NOT the
+            # guard. This check can lose a race, O_EXCL below cannot, and the
+            # FileExistsError arm is what actually enforces no-overwrite.
+            if destination.exists():
+                return _already_present()
+
             archive = download_sample(digest)
-            destination.write_bytes(archive)
+
+            # Atomic create-or-fail (see _ARCHIVE_OPEN_FLAGS). 0o600 keeps a
+            # live sample readable only by the owning user, which write_bytes
+            # did not do -- it left the archive at the process umask, normally
+            # 0o644, i.e. world-readable malware.
+            try:
+                fd = os.open(str(destination), _ARCHIVE_OPEN_FLAGS, 0o600)
+            except FileExistsError:
+                return _already_present()
+
+            try:
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(archive)
+            except OSError:
+                # Never leave a short write looking like a complete sample.
+                destination.unlink(missing_ok=True)
+                raise
 
             return "\n".join([
                 "MALWAREBAZAAR DOWNLOAD",

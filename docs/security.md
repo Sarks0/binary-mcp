@@ -76,6 +76,13 @@ server does leaves a runnable copy on the host. The archive password is the
 abuse.ch convention, `infected`. Extract it in your analysis VM, not on the
 machine running this server.
 
+The write is an atomic `O_CREAT | O_EXCL` create-or-fail at mode `0o600`, the
+same contract the carver uses for the blobs it dumps. Two properties follow.
+An archive already on disk is never overwritten -- a repeat download reports
+what is there and writes nothing, so it cannot destroy a sample mid-analysis --
+and a stored sample is readable only by the user running the server, rather
+than left world-readable at the process umask.
+
 ## File access is confined by default
 
 Binary paths go through `sanitize_binary_path` (`src/utils/security.py`), which

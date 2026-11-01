@@ -82,8 +82,13 @@ def roster(tmp_path_factory):
 
             import src.server as server_module
 
-            # The full roster, whatever host runs the suite.
-            server_module.register_all_tools(windows=True, raw_windbg=True)
+            # The full roster, whatever host runs the suite. Every
+            # host-dependent flag has to be named here: leaving one to
+            # detection is what made this fixture drop the GDB tools on macOS
+            # and report their catalog entries as stale.
+            server_module.register_all_tools(
+                windows=True, raw_windbg=True, linux=True
+            )
             tools = {t.name: t for t in asyncio.run(server_module.app.list_tools())}
             yield server_module.app, tools, Client
     finally:
@@ -103,6 +108,35 @@ def _body_source(tool) -> str:
     if doc:
         src = src.replace(doc, "", 1)
     return src
+
+
+def test_the_full_roster_fixture_really_is_full(roster):
+    """Every host-dependent engine must be present, on any host.
+
+    register_all_tools gates three families on the host: the WinDbg tools on
+    Windows, windbg_execute_command on an env var, and the GDB tools on Linux.
+    A caller that wants the full roster has to name all three, and one left to
+    detection fails somewhere far away -- a missing flag here surfaced as
+    "catalog names tools the server no longer registers: ['gdb_disassemble']"
+    on the macOS runner and nowhere else.
+
+    Asserted on the roster rather than on the call site so it holds however
+    the flags are spelled, and phrased per family so the message names the one
+    that is missing.
+    """
+    _, tools, _ = roster
+    for prefix, flag in (
+        ("windbg_", "windows=True"),
+        ("x64dbg_", "(registered on every host)"),
+        ("gdb_", "linux=True"),
+    ):
+        assert any(name.startswith(prefix) for name in tools), (
+            f"no {prefix}* tools in the full roster; the fixture is missing "
+            f"{flag} in its register_all_tools call"
+        )
+    assert "windbg_execute_command" in tools, (
+        "the raw WinDbg tool is absent; the fixture is missing raw_windbg=True"
+    )
 
 
 def test_every_registered_tool_is_classified(roster):

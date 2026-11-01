@@ -16,11 +16,7 @@ not have -- which is exactly the bug this layer can introduce.
 from __future__ import annotations
 
 import ast
-import asyncio
-import importlib
-import sys
 from pathlib import Path
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -32,28 +28,46 @@ from src.utils.formatters import UNTRUSTED_END_MARKER, UNTRUSTED_OPEN_SENTINEL
 from src.utils.security import HardLinkError
 
 
-def _real_fastmcp():
-    """Get the genuine FastMCP class past other modules' import-time stubs.
+class _RecordedTool:
+    """What a test needs from a registered tool: its callable and its text."""
 
-    Same problem and same remedy as tests/test_x64dbg_tool_groups.py: several
-    suites install MagicMock stubs for fastmcp/mcp and never restore them, so a
-    plain import here can yield a mock whose get_tools() is not awaitable.
+    def __init__(self, fn):
+        self.fn = fn
+        self.description = fn.__doc__ or ""
+
+
+class RecordingApp:
+    """A stand-in for FastMCP that records what @app.tool() decorates.
+
+    Deliberately NOT the real FastMCP. The obvious harness -- drop the
+    fastmcp/mcp MagicMock stubs other suites install at import time, import
+    the real package, then put the stubs back -- is what tests/
+    test_x64dbg_tool_groups.py does, and it depends on the state of
+    sys.modules at the moment this module's fixtures run. That made this file
+    pass on Linux and fail on macOS with 82 fixture errors: real fastmcp had
+    been imported while `mcp` was still a MagicMock, so the FastMCP class it
+    built had no get_tools().
+
+    Nothing here needs a real server. register_gdb_tools only ever calls
+    app.tool(), and what the assertions want is each handler's callable and
+    its docstring. Recording those is deterministic on every platform and in
+    any test order. Real registration is still covered elsewhere, through
+    src.server: test_docs_accuracy counts the live roster and
+    test_tool_catalog classifies it.
     """
-    stubbed = {
-        name: module for name, module in sys.modules.items()
-        if isinstance(module, MagicMock)
-        and (name == "fastmcp" or name.startswith("fastmcp.")
-             or name == "mcp" or name.startswith("mcp."))
-    }
-    if not stubbed:
-        return importlib.import_module("fastmcp").FastMCP
 
-    for name in stubbed:
-        del sys.modules[name]
-    try:
-        return importlib.import_module("fastmcp").FastMCP
-    finally:
-        sys.modules.update(stubbed)
+    def __init__(self):
+        self.tools: dict[str, _RecordedTool] = {}
+
+    def tool(self, *args, **kwargs):
+        def register(fn):
+            # @app.tool() sits above @log_gdb_tool, so fn is already wrapped;
+            # functools.wraps keeps __name__ and __doc__ pointing at the
+            # handler, which is what the roster should be keyed on.
+            self.tools[fn.__name__] = _RecordedTool(fn)
+            return fn
+
+        return register
 
 
 class FakeBridge:
@@ -172,9 +186,9 @@ class FakeBridge:
 @pytest.fixture(scope="module")
 def tools():
     """Register the GDB tools once and return them by name."""
-    app = _real_fastmcp()("test")
+    app = RecordingApp()
     gdb_tools.register_gdb_tools(app)
-    return asyncio.run(app.get_tools())
+    return app.tools
 
 
 @pytest.fixture
@@ -700,10 +714,10 @@ class TestSessionLogging:
             def log_tool_call(self, **kwargs):
                 recorded.update(kwargs)
 
-        app = _real_fastmcp()("test-logging")
+        app = RecordingApp()
         gdb_tools.register_gdb_tools(app, Manager())
         try:
-            registered = asyncio.run(app.get_tools())
+            registered = app.tools
             monkeypatch.setattr(gdb_tools.platform, "system", lambda: "Linux")
             monkeypatch.setattr(gdb_tools, "_gdb_bridge", FakeBridge())
             registered["gdb_get_registers"].fn()

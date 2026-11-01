@@ -824,7 +824,7 @@ def _registered_path_tools(server):
         # The full roster on every host. register_all_tools() otherwise leaves
         # the WinDbg tools out off Windows, and this sweep is the
         # whole-surface guarantee, Windows-only tools included.
-        module.register_all_tools(windows=True, raw_windbg=True)
+        module.register_all_tools(windows=True, raw_windbg=True, linux=True)
     finally:
         module.app = real_app
 

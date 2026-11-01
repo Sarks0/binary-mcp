@@ -31,6 +31,8 @@ below.
 | `WINDBG_TIMEOUT` | Timeout for a single WinDbg command, in seconds | 30 |
 | `WINDBG_DEBUG` | Verbose dbgeng diagnostics | Off |
 | `KDNET_TIMEOUT` | Timeout for establishing a KDNET kernel connection, in seconds | 60 |
+| `GDB_PATH` | Path to the `gdb` executable, for the Linux debugging engine | First `gdb` on `PATH` |
+| `GDB_TIMEOUT` | Timeout for a single GDB/MI command, in seconds | 30 |
 
 ## Storage and scheduling
 

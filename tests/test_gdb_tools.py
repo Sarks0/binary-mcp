@@ -227,7 +227,12 @@ class TestRegistration:
 
 
 class TestPlatformGate:
-    """Registration is unconditional; refusal happens per call."""
+    """register_all_tools omits these off Linux; each still refuses per call.
+
+    Both layers matter. The registration gate keeps 21 definitions out of a
+    Windows client's tools/list, and the per-call check is what holds when
+    register_gdb_tools is called directly -- which is what these tests do.
+    """
 
     @pytest.mark.parametrize("system", ["Windows", "Darwin", "FreeBSD"])
     def test_every_tool_refuses_off_linux(self, tools, monkeypatch, system):

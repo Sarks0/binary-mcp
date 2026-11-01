@@ -117,8 +117,10 @@ blocks attaching to a process that is not a descendant of the debugger, and
 `gdb_attach` reports that explicitly rather than passing on GDB's own
 unhelpful error.
 
-Linux only; every tool returns a platform message elsewhere. macOS is not
-supported, because its GDB cannot ptrace without a codesigning entitlement.
+Linux only: off Linux these tools are not registered at all, so they do not
+cost a client their definitions, and each one also refuses at call time. macOS
+is not supported, because its GDB cannot ptrace without a codesigning
+entitlement.
 
 ### .NET Analysis (ILSpyCmd) - 7 tools
 

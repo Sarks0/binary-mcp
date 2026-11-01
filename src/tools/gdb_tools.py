@@ -181,10 +181,16 @@ def register_gdb_tools(
 ) -> None:
     """Register the GDB Linux debugging tools with the MCP server.
 
-    Registration is unconditional, matching ``register_windbg_tools``: the
-    roster an integrator sees must not depend on the host OS, or a cached tool
-    list taken on one platform would be wrong on another. Each handler refuses
-    at call time instead.
+    Called only on Linux: ``register_all_tools`` gates it on the host, the way
+    it gates the WinDbg tools on Windows, because a tool the host can never
+    run still costs every session its definition. The GDB engine drives a
+    local ``gdb --interpreter=mi2``, so unlike the x64dbg bridge it cannot
+    reach a debugger on another host and there is nothing for it to do
+    elsewhere.
+
+    Every handler still checks the platform itself. Registration is one
+    decision taken at startup; the check is what holds if this is ever called
+    directly, as the tests do.
 
     Args:
         app: FastMCP server instance.

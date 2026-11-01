@@ -350,7 +350,7 @@ def _main() -> None:
     from src.server import app, register_all_tools
 
     # The full roster, whatever host generates the manifest.
-    register_all_tools(windows=True, raw_windbg=True)
+    register_all_tools(windows=True, raw_windbg=True, linux=True)
     tools = {t.name: t for t in asyncio.run(app.list_tools())}
     print(manifest_json(tools), end="")
 

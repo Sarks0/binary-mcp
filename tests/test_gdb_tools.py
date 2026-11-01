@@ -29,6 +29,7 @@ from src.engines.dynamic.base import DebuggerState
 from src.engines.dynamic.gdb.bridge import GdbBridgeError
 from src.engines.dynamic.gdb.mi_session import MISessionError
 from src.utils.formatters import UNTRUSTED_END_MARKER, UNTRUSTED_OPEN_SENTINEL
+from src.utils.security import HardLinkError
 
 
 def _real_fastmcp():
@@ -299,6 +300,41 @@ class TestLoadBinaryConfinement:
         result = _call(tools, "gdb_load_binary", binary_path="/etc/shadow")
         assert fake.calls == [], "GDB was told about a path that was refused"
         assert "/etc/shadow" not in result
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            gdb_tools.PathTraversalError("Access denied"),
+            gdb_tools.FileSizeError("File too large"),
+            FileNotFoundError("File does not exist"),
+            IsADirectoryError("Path is a directory, not a file"),
+            HardLinkError("is a hard link"),
+            ValueError("Path is not a regular file"),
+        ],
+        ids=["traversal", "size", "missing", "directory", "hardlink", "irregular"],
+    )
+    def test_every_confinement_refusal_is_returned_not_raised(
+        self, tools, monkeypatch, on_linux, error
+    ):
+        """sanitize_binary_path raises six distinct types, and they do not
+        share one base.
+
+        IsADirectoryError is a builtin OSError subclass and HardLinkError
+        subclasses PathTraversalError, so naming only the SecurityError types
+        leaves the directory case escaping as a raw traceback that carries the
+        resolved path. That is what main's confinement sweep caught here, and
+        a parametrised arm per type is what stops the next added type from
+        slipping through the same gap.
+        """
+        monkeypatch.setattr(gdb_tools, "_gdb_bridge", FakeBridge())
+
+        def deny(path, *a, **kw):
+            raise error
+
+        monkeypatch.setattr(gdb_tools, "sanitize_binary_path", deny)
+        result = _call(tools, "gdb_load_binary", binary_path="/outside/secret")
+        assert isinstance(result, str), f"{type(error).__name__} escaped"
+        assert "/outside/secret" not in result
 
     def test_a_confined_path_reaches_the_bridge(
         self, tools, monkeypatch, on_linux, tmp_path

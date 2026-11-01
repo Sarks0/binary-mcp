@@ -253,7 +253,16 @@ def register_gdb_tools(
             # The engine's link-base read opens the file, so a check after the
             # fact would already have followed a traversal.
             safe = sanitize_binary_path(binary_path)
-        except (PathTraversalError, FileSizeError, FileNotFoundError, ValueError) as e:
+        except (
+            PathTraversalError, FileSizeError, FileNotFoundError,
+            IsADirectoryError, ValueError,
+        ) as e:
+            # IsADirectoryError is a builtin OSError subclass, not a
+            # SecurityError, so it does not arrive via PathTraversalError and
+            # has to be named. HardLinkError does subclass PathTraversalError
+            # and is already covered. Missing the directory case let a raw
+            # traceback -- carrying the resolved path -- cross the MCP
+            # boundary; the confinement sweep catches exactly that.
             return safe_path_error("gdb_load_binary", e, "binary path")
 
         try:

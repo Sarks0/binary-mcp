@@ -297,9 +297,17 @@ class IntegrationClient:
             ) from None
 
         if len(raw) > cap:
+            # Name the cap at its own scale. Floor-dividing by 1MiB rendered
+            # every sub-megabyte ceiling as "the 0MB response cap", which
+            # reads as a zeroed cap -- a misconfiguration -- rather than as an
+            # oversize reply, and truncated every fractional one (1.5MiB ->
+            # "1MB"). max_bytes is a public per-call override with no floor,
+            # so the formatter has to be right at KB scale too.
+            from src.utils.formatters import format_bytes
+
             raise self.error_cls(
                 f"{self.config.name} response exceeded the "
-                f"{cap // (1024 * 1024)}MB response cap"
+                f"{format_bytes(cap)} response cap"
             )
 
         return IntegrationResponse(payload=self._decode(raw, expect_json), raw=raw)

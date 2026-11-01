@@ -274,6 +274,44 @@ def test_per_call_cap_overrides_the_provider_default(monkeypatch):
         client.request(expect_json=False, max_bytes=8)
 
 
+def test_a_sub_megabyte_cap_is_named_at_its_own_scale(monkeypatch):
+    """
+    The breach sentence has to name the ceiling the caller actually set.
+
+    Floor-dividing the cap by 1MiB rendered every KB-scale ceiling as
+    "the 0MB response cap" -- which reads to the model as a cap set to zero,
+    i.e. a misconfiguration, rather than as a reply that came back too big.
+    max_bytes is a public per-call override with no floor, so this is
+    reachable by any caller that wants a small probe budget.
+    """
+    client = _client()
+    capture_requests(monkeypatch, client, {})
+    monkeypatch.setattr(
+        integration_base,
+        "urlopen",
+        lambda r, timeout=None: FakeResponse(b"x" * (128 * 1024)),
+    )
+    with pytest.raises(IntegrationError) as caught:
+        client.request(expect_json=False, max_bytes=64 * 1024)
+    message = str(caught.value)
+    assert "64.0 KB response cap" in message
+    assert "0MB" not in message
+
+
+def test_a_megabyte_cap_is_still_named_in_megabytes(monkeypatch):
+    """The MB-scale reading the old floor division got right must survive."""
+    client = _client()
+    capture_requests(monkeypatch, client, {})
+    shrink_response_cap(monkeypatch, client, 2 * 1024 * 1024)
+    monkeypatch.setattr(
+        integration_base,
+        "urlopen",
+        lambda r, timeout=None: FakeResponse(b"x" * (2 * 1024 * 1024 + 8)),
+    )
+    with pytest.raises(IntegrationError, match=r"2\.0 MB response cap"):
+        client.request(expect_json=False)
+
+
 # Decoding
 
 

@@ -207,8 +207,9 @@ def _yara_matches(entry: dict) -> list:
     """
     The YARA matches for one file, wherever YARAify put them.
 
-    This is the one response shape in this module that could not be verified
-    against the live API (abuse.ch is unreachable from the build environment).
+    Which placement YARAify uses for ``lookup_hash`` matches is still open.
+    With a live Auth-Key it answers ``ok`` and ``no_results`` as expected, but
+    no reply carrying matches has been observed.
     YARAify's own examples show `static_results` on the file object, but its
     task-oriented endpoints nest per-scan results under `tasks[]`. Reading only
     the first shape would, if the second is what arrives, report "No public
@@ -349,25 +350,38 @@ _YARAIFY_TRUSTED = (
     ("dhash_icon", "Icon dhash"),
 )
 
-#: YARAify corpus pivots, as (tool argument, API query). Every one takes its
-#: value in ``search_term``. Pinned as a table for the same reason as
-#: MB_SEARCH_PIVOTS: one reviewable place to check against the abuse.ch docs.
-#: (argument, YARAify ``query`` value). Every one takes ``search_term``.
+#: YARAify corpus pivots, as (tool argument, YARAify ``query`` value). Every
+#: one takes its value in ``search_term``. Pinned as a table for the same
+#: reason as MB_SEARCH_PIVOTS: one reviewable place to check against the
+#: abuse.ch docs.
 #:
-#: These were written as ``query_*`` when abuse.ch was unreachable from the
-#: build environment and the names had to be inferred. They are ``get_*``.
-#: Nothing in YARAify's confirmed vocabulary uses a ``query_`` prefix --
-#: abuse.ch's own scripts send ``lookup_hash``, ``get_yara``, ``get_results``
-#: and ``list_tasks`` -- and the published API documents ``get_imphash`` and
-#: ``get_gimphash`` with ``search_term``, in the same shape MalwareBazaar
-#: uses next door. A wrong name here fails silently: the service answers
-#: "nothing matched" rather than rejecting the query, which is why this table
-#: carries its evidence.
+#: All seven are ``get_*``. Six shipped as ``query_*`` -- inferred when
+#: abuse.ch was unreachable from the build environment -- and the published
+#: API (https://yaraify.abuse.ch/api/) names all six: get_imphash, get_tlsh,
+#: get_telfhash, get_gimphash, get_dhash_icon and get_clamav. abuse.ch's own
+#: scripts send get_yara, lookup_hash, get_results and list_tasks. No query
+#: VALUE in YARAify's vocabulary carries a ``query_`` prefix -- only the
+#: ``query_status`` field of the reply does.
 #:
-#: Confirmed: get_yara (abuse.ch's yaraify_lookup_yara-rule.py), get_imphash
-#: and get_gimphash (the API documentation). Still taken from the pattern,
-#: and the first to check against a live key: get_tlsh, get_telfhash,
-#: get_dhash_icon, get_clamav.
+#: Live evidence, as recorded in the PR feedback of 2026-10-31: get_yara and
+#: get_imphash each answer ``ok`` with rows, and query_imphash answers
+#: ``query_status: error`` for the same ``search_term``. Those two ``ok``
+#: replies confirm the ``search_term`` field as well as the two names. No
+#: live reply is recorded for get_tlsh, get_telfhash, get_dhash_icon or
+#: get_clamav; they rest on the documentation, which has been right about
+#: every name tested. Check get_clamav first: MalwareBazaar spells its
+#: equivalent ``get_clamavinfo`` next door, so a reader harmonising the two
+#: tables would break this one.
+#:
+#: A stale name here is loud, not silent -- the opposite of what this comment
+#: claimed before the live check. YARAify rejects an unknown query rather
+#: than answering "nothing matched", and ``error`` is in neither
+#: _EMPTY_STATUSES nor _STATUS_MESSAGES, so query() raises and yaraify_search
+#: returns the generic "abuse.ch error: YARAify returned status: error" (the
+#: reply's own ``data`` text is not carried). The silent-failure risk in this
+#: module is in the FIELD names: a wrong field inside an ACCEPTED query
+#: returns an empty ``data`` that reads as a true negative, which is why
+#: ``search_term`` being confirmed above matters as much as the query names.
 YARAIFY_PIVOTS: tuple[tuple[str, str], ...] = (
     ("yara_rule", "get_yara"),
     ("imphash", "get_imphash"),

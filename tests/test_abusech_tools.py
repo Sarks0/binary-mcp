@@ -131,6 +131,49 @@ def test_urlhaus_says_so_rather_than_guessing_for_a_sha1(monkeypatch):
     assert seen == []
 
 
+def _yaraify_audit() -> str:
+    """
+    The ``#:`` block above YARAIFY_PIVOTS, unwrapped into one string.
+
+    Unwrapped because the block is prose wrapped at ~75 columns: a phrase
+    straddling two ``#:`` lines must still read as one phrase here, or this
+    guard would turn on where the text happens to break. Only the CONTIGUOUS
+    run immediately above the table is taken -- a global filter would collect
+    every ``#:`` comment in the module and let a mention anywhere satisfy it.
+    """
+    source = Path(abusech_tools.__file__).read_text(encoding="utf-8")
+    head, marker, _ = source.partition("YARAIFY_PIVOTS: tuple")
+    assert marker, "YARAIFY_PIVOTS moved or was renamed; re-check this guard"
+    run: list[str] = []
+    for line in reversed(head.splitlines()):
+        if not line.startswith("#:"):
+            break
+        run.append(line[len("#:"):].strip())
+    assert run, "the audit block above YARAIFY_PIVOTS is gone"
+    return " ".join(reversed(run))
+
+
+def test_the_yaraify_audit_records_every_query_in_the_table():
+    """
+    The audit block is the only place a reader checks these names against the
+    abuse.ch docs, so it must stay in step with the table -- and must not
+    accumulate stranded half-edits, which is how the query_* correction
+    shipped a duplicated header that nothing caught.
+    """
+    audit = _yaraify_audit()
+
+    for _argument, api_query in abusech_tools.YARAIFY_PIVOTS:
+        assert api_query in audit, (
+            f"{api_query} is in the table but the audit does not record where "
+            "its name came from"
+        )
+
+    assert audit.count("Every one takes") == 1, (
+        "the audit states its subject twice -- a half-applied edit left the "
+        "header it was meant to replace in place"
+    )
+
+
 def test_yaraify_posts_json_and_uses_search_term_for_every_pivot(monkeypatch):
     seen = _capture(monkeypatch, abusech_tools.yaraify_client,
                     {"query_status": "ok", "data": []})
@@ -138,9 +181,10 @@ def test_yaraify_posts_json_and_uses_search_term_for_every_pivot(monkeypatch):
 
     # Written out rather than read from YARAIFY_PIVOTS: the table is what is
     # under test, and a test that reads it would pass whatever it said. These
-    # names came from the API documentation and abuse.ch's own scripts -- see
-    # the audit beside the table -- after an earlier guess at query_* that
-    # would have failed silently against every one of them.
+    # are the published API's names -- see the audit beside the table, which
+    # records which two were also exercised against a live key. The earlier
+    # guess at query_* would have been REJECTED, not quietly answered:
+    # YARAify sends query_status: error for an unknown query.
     expected = {
         "yara_rule": "get_yara",
         "imphash": "get_imphash",
@@ -557,7 +601,8 @@ def test_the_family_signature_is_fenced_like_malwarebazaars(monkeypatch):
 @pytest.mark.parametrize("shape", ["top-level", "nested-in-tasks"])
 def test_yara_matches_are_found_in_either_response_shape(monkeypatch, shape):
     """
-    YARAify's `lookup_hash` shape could not be verified against the live API.
+    YARAify's ``lookup_hash`` match placement is still unconfirmed: a live key
+    answers ok/no_results, but no reply carrying matches has been observed.
     Reading only one placement would report "no rules matched" for a file that
     matched several -- a silent wrong answer. Accept both.
     """

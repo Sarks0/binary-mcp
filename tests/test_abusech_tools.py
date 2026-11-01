@@ -682,11 +682,13 @@ def test_query_returns_an_empty_payload_rather_than_raising(monkeypatch):
     assert abusech_tools._rows(payload) == []
 
 
-def test_threatfox_probe_asks_for_one_row(monkeypatch):
+def test_threatfox_probe_is_a_hash_fetch_not_a_working_set(monkeypatch):
     """
-    get_iocs takes only `days`, whose minimum of 1 is still a day of IOCs --
-    a working set pulled to answer "is the key accepted". taginfo takes a
-    documented limit, which is the shape mb_check_api already probes with.
+    get_iocs takes only `days`, whose minimum of 1 is still a day of IOCs -- a
+    working set pulled to answer "is the key accepted". `taginfo` with a limit
+    is no better: a limit bounds the rows returned, not the work done to find
+    them, which is how the same shape made mb_check_api report a failure on a
+    live MalwareBazaar key. A hash fetch is a primary-key lookup.
     """
     seen = _capture(monkeypatch, abusech_tools.threatfox_client,
                     {"query_status": "ok", "data": []})
@@ -696,9 +698,11 @@ def test_threatfox_probe_asks_for_one_row(monkeypatch):
     _register(monkeypatch)["abusech_check_api"]()
 
     body = json.loads(seen[0].data.decode())
-    assert body["query"] == "taginfo"
-    assert body["limit"] == 1
+    assert body["query"] == "search_hash"
+    assert body["hash"] == abusech_tools._PROBE_SHA256
     assert "days" not in body
+    assert "tag" not in body
+    assert "limit" not in body
 
 
 def test_check_api_reports_an_empty_probe_as_reachable(monkeypatch):

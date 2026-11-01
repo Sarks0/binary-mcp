@@ -41,6 +41,7 @@ call in this module, and ``tests/test_abusech_tools.py`` pins that every
 request body is a mapping of scalars.
 """
 
+import hashlib
 import logging
 import re
 from typing import Literal
@@ -159,6 +160,14 @@ _STATUS_MESSAGES: dict[str, str] = {
 #: clean miss into "abuse.ch error: No records matched." -- which reads as a
 #: broken lookup to the model consuming it, and left those branches dead.
 _EMPTY_STATUSES = frozenset({"no_result", "no_results"})
+
+#: The hash ``abusech_check_api`` probes ThreatFox with. Same reasoning as
+#: ``mb_tools._PROBE_SHA256``, audited there: the digest of a fixed string
+#: rather than a round number, because ``illegal_hash`` is in
+#: :data:`_STATUS_MESSAGES` and would raise. Either answer is success-shaped
+#: -- a miss is ``no_result``, in :data:`_EMPTY_STATUSES`, and a hit is rows
+#: the probe only counts.
+_PROBE_SHA256 = hashlib.sha256(b"binary-mcp abusech_check_api probe").hexdigest()
 
 
 def _status(payload: dict) -> str:
@@ -435,14 +444,26 @@ def register_abusech_tools(app, session_manager=None):
             output.append(f"Auth-Key configured: {masked}")
             output.append("")
 
-            # Each probe is the cheapest documented call the service has, so
-            # a reachability check does not pull a working set. ThreatFox's
-            # get_iocs takes only `days` -- its minimum, one day, is still
-            # every IOC the platform saw yesterday -- where `taginfo` takes a
-            # documented `limit`, which is what mb_check_api already uses.
+            # Each probe is justified on its own terms: it has to prove the
+            # service answered and the Auth-Key was accepted, and nothing
+            # more, so none of them may pull a working set.
+            #
+            # ThreatFox searches one hash. `get_iocs` takes only `days`, whose
+            # minimum of one is still every IOC the platform saw yesterday,
+            # and `taginfo` with a documented `limit` is no better: a limit
+            # bounds the rows RETURNED, not the work done to find them. That
+            # is why mb_check_api no longer probes MalwareBazaar that way --
+            # `get_taginfo` with `tag="exe", limit=1` exceeded abuse.ch's
+            # execution-time threshold against a live key, so a working key
+            # read as a failure. A hash fetch is a primary-key lookup, so its
+            # cost cannot grow with the corpus, and abuse.ch's `no_result` is
+            # already reachability (see _EMPTY_STATUSES).
+            #
+            # URLhaus answers one host; YARAify's `recent_yararules` is a
+            # fixed-size list.
             probes = (
                 ("ThreatFox", threatfox_client, "",
-                 {"json_body": {"query": "taginfo", "tag": "exe", "limit": 1}}),
+                 {"json_body": {"query": "search_hash", "hash": _PROBE_SHA256}}),
                 ("URLhaus", urlhaus_client, "host/",
                  {"form": {"host": "urlhaus.abuse.ch"}}),
                 ("YARAify", yaraify_client, "",

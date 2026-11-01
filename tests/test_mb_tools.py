@@ -706,6 +706,72 @@ def test_check_api_points_at_the_canonical_variable(monkeypatch):
     )
 
 
+def test_check_api_probes_with_a_hash_lookup_not_a_corpus_scan(monkeypatch):
+    """
+    get_taginfo(tag="exe", limit=1) answered "Query execution time exceeded
+    threshold" against a live key -- `limit` bounds the rows returned, not the
+    work done to find them -- so a fully working key read as a MalwareBazaar
+    failure. The probe is a primary-key lookup, whose cost cannot grow with
+    the corpus, and whose miss is already success-shaped via _EMPTY_STATUSES.
+    """
+    seen = _capture(monkeypatch, {"query_status": "hash_not_found", "data": None})
+
+    out = _register(monkeypatch)["mb_check_api"]()
+
+    assert len(seen) == 1, "one request answers 'is the key accepted'"
+    assert seen[0].data == b"query=get_info&hash=" + mb_tools._PROBE_SHA256.encode()
+    # The invariant is the ABSENCE of a selector and a limit, not the absence
+    # of one query name: any selector scan is the bug, whichever one it is.
+    assert b"tag" not in seen[0].data
+    assert b"limit" not in seen[0].data
+    assert b"selector" not in seen[0].data
+    assert "API connection successful" in out
+    assert "0 sample(s)" not in out  # the miss is the answer, not a shortfall
+
+
+def test_the_probe_hash_is_not_a_value_a_service_can_special_case():
+    """
+    illegal_hash is in _STATUS_MESSAGES, so it RAISES. A degenerate digest --
+    64 zeroes, 64 f's -- is the kind of input a service may reject as
+    malformed, which would reinstate the false alarm by another route.
+    """
+    probe = mb_tools._PROBE_SHA256
+    assert len(probe) == 64
+    assert set(probe) <= set("0123456789abcdef")
+    assert len(set(probe)) > 4, "a round number is special-case bait"
+
+
+def test_a_heavy_query_names_the_condition_without_misdirecting(monkeypatch):
+    """
+    _status_message() is shared by all five MalwareBazaar tools, so a sentence
+    added for mb_search has to read correctly for a tool that has neither a
+    selector nor a limit.
+    """
+    _capture(monkeypatch, {
+        "query_status": "error",
+        "data": "Query execution time exceeded threshold. Try a different query.",
+    })
+    tools = _register(monkeypatch)
+
+    search = tools["mb_search"]("tag", "exe", limit=1000)
+    assert "status: error" in search  # the raw token stays visible
+    assert "narrower selector" in search
+    # F-7: the service's own sentence is not echoed outside the envelope.
+    assert "Query execution time exceeded threshold" not in search
+
+    lookup = tools["mb_lookup"](file_hash="a" * 64)
+    assert "generic failure" in lookup
+    assert "On a corpus pivot" in lookup, "advice a hash lookup cannot act on"
+
+
+def test_check_api_still_reports_a_rejected_key(monkeypatch):
+    """A cheap probe that calls everything healthy is the opposite bug."""
+    _capture(monkeypatch, {"query_status": "unknown_auth_key"})
+    out = _register(monkeypatch)["mb_check_api"]()
+    assert "API connection successful" not in out
+    assert "rejected the Auth-Key" in out
+
+
 # A clean miss is a result, not a failure. Before _EMPTY_STATUSES these came
 # back as "MalwareBazaar error: Hash not found in MalwareBazaar.", throwing
 # away the report header the caller had already built -- which carries the

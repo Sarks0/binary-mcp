@@ -160,6 +160,19 @@ _STATUS_MESSAGES: dict[str, str] = {
     # file_not_found is, because it answers mb_download, which asks for one
     # specific archive rather than a result set.
     "file_not_found": "MalwareBazaar has no downloadable file for that SHA256.",
+    # abuse.ch's catch-all, and the one status reachable by a query a caller
+    # chose: mb_search sends a limit up to 1000, and a broad tag exceeds the
+    # server's execution-time threshold. This sentence is read by all five
+    # tools, so it names the condition instead of prescribing a repair only
+    # mb_search could make -- mb_lookup and mb_download have no selector and
+    # no limit, mb_recent's selector is a two-value enum, and mb_check_api
+    # probes with a single hash.
+    "error": (
+        "MalwareBazaar returned status: error, its generic failure. On a "
+        "corpus pivot this is usually a selector too broad to finish inside "
+        "the server's execution-time threshold (tag:exe is one): retry with a "
+        "narrower selector or a lower limit."
+    ),
     "illegal_hash": "MalwareBazaar rejected the hash format.",
     "illegal_sha256_hash": "MalwareBazaar requires a full SHA256 for this query.",
     "illegal_tag": "MalwareBazaar rejected the tag.",
@@ -289,6 +302,34 @@ _EMPTY_STATUSES = frozenset({
     "tag_not_found",
     "signature_not_found",
 })
+
+#: The hash ``mb_check_api`` probes with. It is the digest of a fixed string
+#: written here, not a round number: a degenerate value such as 64 zeroes is
+#: the kind of input a service may special-case as malformed, and
+#: ``illegal_hash`` is in :data:`_STATUS_MESSAGES`, so it would RAISE -- the
+#: same false alarm this probe exists to remove, reached a different way.
+#:
+#: The probe has two things to prove -- the service answered, and the Auth-Key
+#: was accepted -- and it has to prove them the same way on every host, on
+#: every day, against every key. The probe it replaces proved them by scanning
+#: a selector: ``get_taginfo`` with ``tag="exe"`` and ``limit=1``. ``limit``
+#: bounds the rows RETURNED, not the work done to find them, and ``exe`` is
+#: one of the largest tags in the corpus, so against a live key that query
+#: answers ``query_status: error`` -- "Query execution time exceeded
+#: threshold. Try a different query." -- confirmed twice, minutes apart, while
+#: lighter tags answered at once. A health check that reports a failure on a
+#: fully working key is worse than no health check, and a narrower tag is not
+#: the fix: tag weight is corpus state, so today's light tag is next year's
+#: ``exe``.
+#:
+#: A hash lookup is the one query whose cost cannot grow with the corpus -- it
+#: is a primary-key fetch -- and BOTH of its answers are success-shaped here.
+#: A miss arrives as ``hash_not_found``, which is in :data:`_EMPTY_STATUSES`,
+#: so :func:`query` returns no rows instead of raising; a hit returns rows the
+#: probe discards. Nothing is riding on this digest being unmatchable. What is
+#: left that CAN raise is exactly what this tool exists to report: a rejected
+#: Auth-Key, an unreachable service, a reply the module did not expect.
+_PROBE_SHA256 = hashlib.sha256(b"binary-mcp mb_check_api probe").hexdigest()
 
 
 def _status(payload: dict) -> str:
@@ -510,16 +551,22 @@ def register_mb_tools(app, session_manager=None):
             output.append(f"Auth-Key configured: {masked}")
 
             try:
-                rows = query({"query": "get_taginfo", "tag": "exe", "limit": 1})
+                query({"query": "get_info", "hash": _PROBE_SHA256})
                 output.append("API connection successful")
-                output.append(f"Test query (tag:exe, limit 1) returned {len(rows)} sample(s)")
+                output.append(
+                    "Probe: get_info on one hash -- a primary-key fetch, the "
+                    "cheapest query here. It matches nothing, which is the "
+                    "expected answer and proves the Auth-Key was accepted"
+                )
             except MalwareBazaarError as e:
-                # A probe that matched nothing no longer arrives here: it is a
-                # successful reply with no rows, reported as a connection above.
-                # What reaches this branch is a rejected Auth-Key or a reply
-                # the module did not expect -- the distinction this tool exists
-                # to draw. Echoed verbatim because MalwareBazaarError carries
-                # only this module's own sentences (audit F-10).
+                # The probe cannot fail by matching nothing: a miss is the
+                # DESIGNED answer and arrives as a successful reply with no
+                # rows, reported as a connection above. What reaches this
+                # branch is a rejected Auth-Key, an unreachable service, or a
+                # reply the module did not expect -- the distinction this tool
+                # exists to draw. The sentence is this module's own apart from
+                # a bare query_status token, already constrained to
+                # [a-z0-9_]{1,64} before it is echoed (audit F-7, F-10).
                 output.append(f"API test returned: {e}")
 
             output.append("")

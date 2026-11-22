@@ -39,6 +39,10 @@ logger = logging.getLogger(__name__)
 # Security: Maximum size for memory dumps (100MB) to prevent memory exhaustion
 MAX_DUMP_SIZE = 100 * 1024 * 1024
 
+# Passed on every call to the plugin: a per-call None overrides HTTP_PROXY /
+# HTTPS_PROXY from the environment, so the bearer token never goes to a proxy.
+_NO_PROXIES: dict[str, str | None] = {"http": None, "https": None}
+
 
 # x64dbg command-string structure (audit findings F-9 / F-16)
 #
@@ -744,8 +748,21 @@ class X64DbgBridge(Debugger):
             )
 
         try:
-            with open(token_file) as f:
-                token = f.read().strip()
+            try:
+                with open(token_file) as f:
+                    token = f.read().strip()
+            except PermissionError as e:
+                # The plugin labels the file at x64dbg's integrity level with
+                # no-read-up, so an elevated x64dbg's token cannot be read by a
+                # non-elevated process -- including this one. That is the
+                # point of the label, so say how to proceed rather than fail
+                # opaquely.
+                raise RuntimeError(
+                    f"Access denied reading {token_file}. x64dbg is probably "
+                    "running elevated, and its token file is readable only by "
+                    "elevated processes. Run this server elevated, or pin a "
+                    f"token in obsidian.ini and set {ENV_OBSIDIAN_TOKEN} here."
+                ) from e
 
             # Verify file permissions (defense-in-depth)
             import stat
@@ -839,14 +856,32 @@ class X64DbgBridge(Debugger):
             # _request_kwargs carries verify= (the CA that signs the plugin
             # host's certificate) and cert= (this server's client certificate,
             # when mutual TLS is configured). Empty for a loopback endpoint.
+            #
+            # proxies/allow_redirects (review finding M3): requests honours
+            # HTTP_PROXY/HTTPS_PROXY by default and, with no NO_PROXY, routes
+            # even http://127.0.0.1 through the proxy -- sending the bearer
+            # token, which is code execution on the debugger host, to the proxy
+            # in cleartext. The debugger is never reached through a proxy, so
+            # proxying is switched off per call (a per-call None overrides the
+            # environment). Redirects are refused for the same reason: nothing
+            # legitimate on this API redirects, and a 307 would re-send a
+            # memory write somewhere else.
             if data is None:
                 response = requests.get(
-                    url, headers=headers, timeout=self.timeout, **self._request_kwargs
+                    url, headers=headers, timeout=self.timeout,
+                    proxies=_NO_PROXIES, allow_redirects=False,
+                    **self._request_kwargs,
                 )
             else:
                 response = requests.post(
                     url, json=data, headers=headers, timeout=self.timeout,
+                    proxies=_NO_PROXIES, allow_redirects=False,
                     **self._request_kwargs,
+                )
+            if getattr(response, "is_redirect", False) is True:
+                raise ConnectionError(
+                    f"The x64dbg plugin endpoint {self.base_url} answered with a "
+                    f"redirect ({response.status_code}); refusing to follow it."
                 )
 
             duration_ms = int((time.time() - start_time) * 1000)

@@ -77,6 +77,17 @@ struct Options {
     // that dial a DNS name.
     std::vector<std::string> allowedHosts;
 
+    // Named pipe to the plugin. Empty means the legacy fixed name
+    // (Protocol::PIPE_NAME), which is only used when the server is started by
+    // hand. The plugin always passes a per-session random name so that
+    // nothing can pre-create the pipe the server is about to dial.
+    std::string pipeName;
+
+    // PID of the x64dbg process that owns the pipe. When set, the server
+    // refuses to talk to a pipe served by any other process -- the mirror of
+    // the plugin checking the server's PID on its side of the same pipe.
+    unsigned long pluginPid = 0;
+
     bool TlsEnabled() const { return !tlsCertThumbprint.empty(); }
     bool MutualTls() const { return !tlsClientCaThumbprint.empty(); }
 };
@@ -382,7 +393,192 @@ inline bool HostAllowed(const Options& options, const std::string& hostValue) {
     return false;
 }
 
+// Is this Origin one this listener could actually have served a page from?
+//
+// HostAllowed alone compares only the host, so a page served from ANY port on
+// localhost (a dev server, a notebook, something the sample under analysis
+// started) passed the Origin check of a loopback listener. There is no
+// browser client for this API, so the only Origin worth accepting is this
+// listener's own: same scheme, same host, same port. "null" (sandboxed iframes,
+// file: pages) is never accepted.
+inline bool OriginAllowed(const Options& options, const std::string& value) {
+    const std::string origin = AsciiLower(Trim(value));
+    if (origin.empty() || origin == "null") {
+        return false;
+    }
+    const size_t schemeEnd = origin.find("://");
+    if (schemeEnd == std::string::npos) {
+        return false;
+    }
+    const std::string scheme = origin.substr(0, schemeEnd);
+    const std::string wantedScheme = options.TlsEnabled() ? "https" : "http";
+    if (scheme != wantedScheme) {
+        return false;
+    }
+
+    std::string authority = origin.substr(schemeEnd + 3);
+    const size_t end = authority.find_first_of("/?#");
+    if (end != std::string::npos) {
+        // A serialised Origin never carries a path; one that does is not
+        // something a browser sent.
+        return false;
+    }
+    if (authority.empty() || authority.find('@') != std::string::npos) {
+        return false;
+    }
+
+    // Split off the port. Bracketed IPv6 keeps its colons inside the brackets.
+    std::string hostPart = authority;
+    std::string portPart;
+    if (authority[0] == '[') {
+        const size_t close = authority.find(']');
+        if (close == std::string::npos) return false;
+        hostPart = authority.substr(0, close + 1);
+        if (close + 1 < authority.size()) {
+            if (authority[close + 1] != ':') return false;
+            portPart = authority.substr(close + 2);
+        }
+    } else {
+        const size_t colon = authority.find(':');
+        if (colon != std::string::npos) {
+            hostPart = authority.substr(0, colon);
+            portPart = authority.substr(colon + 1);
+        }
+    }
+
+    int port = options.TlsEnabled() ? 443 : 80;
+    if (!portPart.empty()) {
+        if (portPart.size() > 5) return false;
+        for (size_t i = 0; i < portPart.size(); i++) {
+            if (portPart[i] < '0' || portPart[i] > '9') return false;
+        }
+        port = atoi(portPart.c_str());
+    }
+    if (port != options.port) {
+        return false;
+    }
+    return HostAllowed(options, hostPart);
+}
+
+// Per-peer throttling of failed connections
+//
+// The server handles one connection at a time, so a peer that keeps opening
+// connections which never authenticate (a slow handshake, a dribbled header,
+// a wrong token) can hold the bridge for the full deadline each time, back to
+// back. This bounds that: a non-loopback peer that fails MAX_FAILURES times
+// within WINDOW_MS is refused at accept() for BLOCK_MS.
+//
+// Loopback peers are deliberately exempt. Every local client -- including the
+// legitimate bridge -- arrives from 127.0.0.1, so throttling it would let any
+// local process lock the real client out, which is the denial this exists to
+// prevent. Local abuse is bounded by the per-connection deadlines instead.
+//
+// Fixed-size table, oldest entry evicted: a peer spraying source addresses
+// cannot grow memory, it can only evict its own earlier entries.
+class PeerThrottle {
+public:
+    static const size_t CAPACITY = 64;
+    static const unsigned MAX_FAILURES = 8;
+    static const unsigned long long WINDOW_MS = 60000;
+    static const unsigned long long BLOCK_MS = 120000;
+
+    bool Allowed(uint32_t addr, unsigned long long nowMs) const {
+        if (IsLoopbackAddr(addr)) return true;
+        const Entry* entry = Find(addr);
+        return entry == nullptr || entry->blockedUntil <= nowMs;
+    }
+
+    void RecordFailure(uint32_t addr, unsigned long long nowMs) {
+        if (IsLoopbackAddr(addr)) return;
+        Entry* entry = Find(addr);
+        if (entry == nullptr) {
+            entry = Slot();
+            entry->addr = addr;
+            entry->used = true;
+            entry->windowStart = nowMs;
+            entry->failures = 0;
+            entry->blockedUntil = 0;
+        }
+        if (nowMs - entry->windowStart > WINDOW_MS) {
+            entry->windowStart = nowMs;
+            entry->failures = 0;
+        }
+        entry->lastSeen = nowMs;
+        if (++entry->failures >= MAX_FAILURES) {
+            entry->blockedUntil = nowMs + BLOCK_MS;
+            entry->failures = 0;
+            entry->windowStart = nowMs;
+        }
+    }
+
+    void RecordSuccess(uint32_t addr) {
+        Entry* entry = Find(addr);
+        if (entry != nullptr) {
+            entry->used = false;
+        }
+    }
+
+    static bool IsLoopbackAddr(uint32_t addr) {
+        return (addr & 0xFF000000u) == 0x7F000000u;
+    }
+
+private:
+    struct Entry {
+        bool used = false;
+        uint32_t addr = 0;
+        unsigned failures = 0;
+        unsigned long long windowStart = 0;
+        unsigned long long blockedUntil = 0;
+        unsigned long long lastSeen = 0;
+    };
+
+    const Entry* Find(uint32_t addr) const {
+        for (size_t i = 0; i < CAPACITY; i++) {
+            if (m_entries[i].used && m_entries[i].addr == addr) return &m_entries[i];
+        }
+        return nullptr;
+    }
+    Entry* Find(uint32_t addr) {
+        return const_cast<Entry*>(static_cast<const PeerThrottle*>(this)->Find(addr));
+    }
+    Entry* Slot() {
+        Entry* oldest = &m_entries[0];
+        for (size_t i = 0; i < CAPACITY; i++) {
+            if (!m_entries[i].used) return &m_entries[i];
+            if (m_entries[i].lastSeen < oldest->lastSeen) oldest = &m_entries[i];
+        }
+        return oldest;
+    }
+
+    Entry m_entries[CAPACITY];
+};
+
 // Command line
+
+// The plugin names its pipe \\.\pipe\x64dbg_mcp_<random hex>. Anything else
+// arriving in --pipe is refused rather than dialled: the server must never be
+// talked into connecting to an arbitrary object path (\\server\pipe\x would
+// even make it an outbound SMB client).
+static const char* const PIPE_NAME_PREFIX = "\\\\.\\pipe\\x64dbg_mcp";
+
+inline bool IsValidPipeName(const std::string& name) {
+    const size_t prefixLength = strlen(PIPE_NAME_PREFIX);
+    if (name.size() <= prefixLength || name.size() > prefixLength + 65) {
+        return false;
+    }
+    if (name.compare(0, prefixLength, PIPE_NAME_PREFIX) != 0) {
+        return false;
+    }
+    if (name[prefixLength] != '_') {
+        return false;
+    }
+    for (size_t i = prefixLength + 1; i < name.size(); i++) {
+        const char c = name[i];
+        const bool ok = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+        if (!ok) return false;
+    }
+    return name.size() > prefixLength + 1;
+}
 
 // A pinned bearer token has to be long enough to be worth pinning. The
 // generated one is 64 hex characters and dies when x64dbg unloads; a pinned one
@@ -510,7 +706,7 @@ inline bool ParseOptions(int argc, const char* const* argv, Options& outOptions,
         const bool needsValue =
             (arg == "--bind" || arg == "--port" || arg == "--tls-cert-thumbprint" ||
              arg == "--tls-client-ca-thumbprint" || arg == "--allow-client" ||
-             arg == "--allow-host");
+             arg == "--allow-host" || arg == "--pipe" || arg == "--plugin-pid");
         std::string value;
         if (needsValue) {
             if (i + 1 >= argc || argv[i + 1] == nullptr) {
@@ -569,6 +765,30 @@ inline bool ParseOptions(int argc, const char* const* argv, Options& outOptions,
                 return false;
             }
             options.allowedHosts.push_back(host);
+        } else if (arg == "--pipe") {
+            if (!IsValidPipeName(value)) {
+                outError = "--pipe must be " + std::string(PIPE_NAME_PREFIX) +
+                           "_ followed by lowercase hex; got '" + value + "'";
+                return false;
+            }
+            options.pipeName = value;
+        } else if (arg == "--plugin-pid") {
+            if (value.empty() || value.size() > 10) {
+                outError = "--plugin-pid must be a process id";
+                return false;
+            }
+            for (size_t c = 0; c < value.size(); c++) {
+                if (value[c] < '0' || value[c] > '9') {
+                    outError = "--plugin-pid must be a process id";
+                    return false;
+                }
+            }
+            const unsigned long long pid = strtoull(value.c_str(), nullptr, 10);
+            if (pid == 0 || pid > 0xFFFFFFFFull) {
+                outError = "--plugin-pid must be a non-zero 32-bit process id";
+                return false;
+            }
+            options.pluginPid = static_cast<unsigned long>(pid);
         } else {
             outError = "unknown argument '" + arg + "'";
             return false;
@@ -664,7 +884,11 @@ inline const char* UsageText() {
         "  --allow-client <ipv4[/prefix]>    only this address or range may "
         "connect (repeatable)\n"
         "  --allow-host <name>               extra Host/Origin value to accept "
-        "(repeatable)\n";
+        "(repeatable)\n"
+        "  --pipe <name>                     plugin pipe (set by the plugin; "
+        "\\\\.\\pipe\\x64dbg_mcp_<hex>)\n"
+        "  --plugin-pid <pid>                refuse a pipe not served by this "
+        "process (set by the plugin)\n";
 }
 
 }  // namespace Listener

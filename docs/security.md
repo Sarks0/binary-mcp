@@ -287,21 +287,61 @@ configured by an `obsidian.ini` beside the plugin. With no ini it binds
   with the thing that performs the bind is one that can be walked past. Both
   now read the same parser.
 - **`Host` and `Origin` are validated** against the bind address plus
-  `allow_hosts`, before the token is compared. The
+  `allow_hosts`, before the token is compared. An `Origin` must match this
+  listener exactly: scheme, host and port. Matching the host alone let a page
+  served from any other port on localhost through. The
   `Access-Control-Allow-Origin: *` header that used to be on every response;
   including the 401: is gone; there is no browser client, so it granted
   nothing legitimate. `OPTIONS` is no longer exempt from authentication,
   because there is no preflight left to serve.
+- **The port is bound exclusively** (`SO_EXCLUSIVEADDRUSE`). It used to set
+  `SO_REUSEADDR`, which on Windows lets a process running as any user bind the
+  same address and port, after which connections go to either socket. On the
+  plaintext loopback default that handed the bearer token to whoever bound
+  second.
 - **An optional client allowlist** (`allow_clients`, addresses or CIDRs) is
   checked at `accept()`: before the TLS handshake, before any HTTP is parsed,
   and before the token is compared.
+- **Repeatedly failing remote peers are throttled.** The server handles one
+  connection at a time, so a non-loopback address that fails 8 times in a
+  minute (handshake, timeout, wrong token) is refused at `accept()` for two
+  minutes. Loopback is exempt, because the legitimate bridge also arrives from
+  127.0.0.1; local abuse is bounded by the deadlines instead (5 s for the
+  header section, 10 s for a TLS handshake, 15 s for a whole request).
 - **Optional mutual TLS** (`tls_client_ca_thumbprint`). Both halves of this
   are enforced after the handshake, not by it: with `ASC_REQ_MUTUAL_AUTH` set,
   Schannel asks for a certificate but still completes the handshake when the
   client answers with an empty list. The server then requires that a
   certificate was presented *and* that its chain reaches *that* CA: the
   thumbprint pinned in `obsidian.ini`, not anything in the machine's trust
-  stores.
+  stores. Building that chain makes **no network requests**: AIA fetching,
+  URL retrieval and root auto-update are all disabled, because the certificate
+  being checked was chosen by a client that has not authenticated yet.
+  Intermediates the client sends are used. Revocation is not checked.
+- **The bearer token is code execution on this host, and is treated that
+  way.** The token file the plugin writes to `%TEMP%` carries an integrity
+  label at x64dbg's own level with no-read-up, so a lower-integrity process of
+  the same user cannot read it. When x64dbg runs elevated, that includes a
+  non-elevated MCP server: run it elevated too, or pin a token and set
+  `OBSIDIAN_AUTH_TOKEN`. A pinned token is never written to `%TEMP%`. The
+  token reaches `obsidian_server.exe` in a private environment block, never
+  through x64dbg's own environment, so debuggees started later cannot inherit
+  it.
+- **`/api/load` is off by default.** It starts an arbitrary executable under
+  the debugger. No MCP tool uses it; set `allow_load_binary=1` under `[api]`
+  in `obsidian.ini` to allow direct HTTP clients to use it.
+- **The pipe between server and plugin is authenticated both ways.** Its name
+  is random per session and created with `FILE_FLAG_FIRST_PIPE_INSTANCE`, the
+  plugin checks the server's PID, and the server checks that the pipe is
+  served by the x64dbg that spawned it. Responses are capped at the pipe's
+  1 MiB frame size, and a framing error resets the pipe instead of ending the
+  server.
+- **Commands built by request handlers cannot be chained.** Only
+  `EXECUTE_COMMAND` runs caller-supplied command text, behind its allowlist.
+  Every other handler validates its fields strictly, and any command it builds
+  is refused if it contains a `;` or a control character.
+- **Request bodies are parsed strictly.** A body that is not a single JSON
+  object, or that repeats a key, is refused before any handler runs.
 - **A malformed `obsidian.ini` is refused whole.** Any value containing a
   character its flag cannot legitimately hold fails the file, rather than one
   setting being quietly dropped: a listener configured differently from how it
@@ -318,6 +358,11 @@ Two things it does not do: there is no keep-alive (every request is one
 connection), and TLS 1.3 is not negotiated: that needs an SSPI credential
 structure this code does not use. A TLS terminator in front of a loopback
 listener remains supported and is the way to get either.
+
+What none of this protects against: code running as the same user at the
+same integrity level as x64dbg, the sample under analysis included. Such code
+can read the token file and the plugin's process memory directly. Detonate
+untrusted samples as a separate, lower-privileged user, or in a disposable VM.
 
 See [Remote access](remote-access.md#option-2-direct-with-the-plugins-own-tls-listener)
 for the setup.

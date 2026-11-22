@@ -411,7 +411,10 @@ set -a; . ./.env; set +a
 **The token changes every time x64dbg restarts.** The plugin generates one on
 load and deletes the file on unload, so every restart of the debugger means
 re-reading `%TEMP%\x64dbg_mcp_token.txt` and updating that line. This is the
-single most common reason a working setup starts answering 401.
+single most common reason a working setup starts answering 401. A token pinned
+under `[listener]` as `token=` does not change, and is **not** written to
+`%TEMP%` at all: copy it from `obsidian.ini` instead. If x64dbg runs elevated,
+only an elevated prompt can read the token file.
 
 #### Adding mutual TLS
 
@@ -517,7 +520,11 @@ removes the first.
 | Server log says `client certificate chain is not trusted (status 0x00000020)` | `CERT_TRUST_IS_UNTRUSTED_ROOT`: the client CA is not in a trust store the server can read. Import it into `Cert:\CurrentUser\Root` |
 | Server log says `was not issued under the CA named by --tls-client-ca-thumbprint` | The certificate is trusted but came from a different CA than the pinned one |
 | Nothing listens, and the server log says `no certificate with that thumbprint` | The thumbprint is from a different store. `--machine-store` / `machine_store=1` selects `LocalMachine\My`; the default is `CurrentUser\My`, which is what x64dbg's own user can read |
-| Connection reset, or a timeout, reaching a host that is clearly up | `HTTPS_PROXY` is set in the server's environment and `requests` is routing the debugger connection through it. Add the debugger host to `no_proxy` |
+| Connection reset, or a timeout, reaching a host that is clearly up | Not a proxy: the bridge never routes the debugger connection through `HTTP_PROXY`/`HTTPS_PROXY` (it would send the token to the proxy). Check the firewall rule and `allow_clients` |
+| `Access denied reading ...x64dbg_mcp_token.txt` | x64dbg is running elevated, and its token file is readable only by elevated processes. Run the MCP server elevated, or pin a token in `obsidian.ini` and set `OBSIDIAN_AUTH_TOKEN` |
+| `LOAD_BINARY is disabled` | `/api/load` starts executables and is off by default. Load the target in x64dbg, or set `allow_load_binary=1` under `[api]` in `obsidian.ini` |
+| `Response too large (... bytes, limit 1048576)` | One reply must fit the plugin's 1 MiB pipe frame. Ask for less: a smaller size or range |
+| Remote client refused at connect after several failures | The server throttles a non-loopback address that fails 8 times in a minute, for two minutes. Fix the token or certificate, then wait |
 | A client denied by `allow_clients` sees a connection reset, not a 403 | Expected. The check runs before the TLS handshake, so there is no channel to answer on; `obsidian_server.log` records the peer address |
 | `entry '10.0.0.5/24' is not an address or CIDR: ... has host bits set` | Write the network address (`10.0.0.0/24`) or drop the prefix for one host (`10.0.0.5`) |
 | `host=... is not the configured debugger endpoint` | `x64dbg_connect` may restate the configured endpoint but not replace it. Set `X64DBG_HOST` / `X64DBG_PORT` and reconnect |

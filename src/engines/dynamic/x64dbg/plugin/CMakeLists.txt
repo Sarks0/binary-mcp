@@ -155,6 +155,24 @@ if(MSVC)
     message(STATUS "Server: Using STATIC runtime library (/MT) - no VC++ Redist required")
 endif()
 
+# Exploit mitigations (review finding I3)
+#
+# Both binaries parse input an attacker can influence: the server parses
+# network input before authentication, and the plugin handles strings the
+# debuggee chose. MSVC already defaults to /GS, /DYNAMICBASE and /NXCOMPAT;
+# Control Flow Guard and CET shadow-stack compatibility are opt-in, so they
+# are turned on here. /CETCOMPAT is an x64-only linker flag.
+if(MSVC)
+    foreach(hardened_target obsidian obsidian_server)
+        target_compile_options(${hardened_target} PRIVATE /guard:cf)
+        target_link_options(${hardened_target} PRIVATE /guard:cf)
+        if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+            target_link_options(${hardened_target} PRIVATE /CETCOMPAT)
+        endif()
+    endforeach()
+    message(STATUS "Hardening: /guard:cf on both targets; /CETCOMPAT on x64")
+endif()
+
 # Installation
 
 # Install both plugin and server

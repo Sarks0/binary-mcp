@@ -121,7 +121,7 @@ Base URL: `http://localhost:8765`
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/api/status` | GET/POST | Get debugger status |
-| `/api/load` | POST | Load binary into debugger |
+| `/api/load` | POST | Load binary into debugger. Off unless `allow_load_binary=1` under `[api]` in `obsidian.ini`: it starts an executable |
 | `/api/run` | POST | Start/resume execution |
 | `/api/pause` | POST | Pause execution |
 | `/api/step_into` | POST | Step into next instruction |

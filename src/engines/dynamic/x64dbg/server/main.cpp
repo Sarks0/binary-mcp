@@ -56,6 +56,13 @@ static void InitLogging() {
     // If log file can't be opened, logging still works via stdout (if console exists)
 }
 
+// The text log had no ceiling, and unauthenticated requests write to it (the
+// request line, a rejected Host), so a peer could grow it until the disk was
+// full. Past this size it stops, saying so once.
+static const long long MAX_TEXT_LOG_BYTES = 32LL * 1024 * 1024;
+static long long g_textLogBytes = 0;
+static bool g_textLogCapped = false;
+
 // Simple logging -- writes to log file and stdout
 void Log(const char* format, ...) {
     char buffer[1024];
@@ -64,19 +71,37 @@ void Log(const char* format, ...) {
     vsnprintf(buffer, sizeof(buffer), format, args);
     va_end(args);
 
+    // Several callers format text that arrived before authentication (method,
+    // path, Host, Origin). A CR or LF in it would let a peer forge whole lines
+    // in obsidian_server.log, so control characters are neutralised here, at
+    // the single sink, rather than at each call site.
+    for (char* p = buffer; *p != '\0'; p++) {
+        const unsigned char c = static_cast<unsigned char>(*p);
+        if (c < 0x20 || c == 0x7F) {
+            *p = '?';
+        }
+    }
+
     // Always try stdout (works when console is attached)
     std::cout << "[Obsidian] " << buffer << std::endl;
 
     // Also write to log file (works when running headless via CREATE_NO_WINDOW)
-    if (g_logFile) {
-        fprintf(g_logFile, "[Obsidian] %s\n", buffer);
+    if (g_logFile && !g_textLogCapped) {
+        if (g_textLogBytes >= MAX_TEXT_LOG_BYTES) {
+            fprintf(g_logFile, "[Obsidian] log size cap reached; further lines dropped\n");
+            g_textLogCapped = true;
+        } else {
+            const int written = fprintf(g_logFile, "[Obsidian] %s\n", buffer);
+            if (written > 0) g_textLogBytes += written;
+        }
         fflush(g_logFile);  // Flush immediately so logs survive crashes
     }
 
     // Mirror into the JSONL so it is a complete record. This text already goes
-    // to obsidian_server.log, so nothing new reaches disk here.
+    // to obsidian_server.log, so nothing new reaches disk here. Low priority:
+    // free text is the first thing dropped when the activity log nears its cap.
     if (ActivityLog::Active()) {
-        ActivityLog::Event("log").Str("msg", buffer);
+        ActivityLog::Event("log", ActivityLog::LOW_PRIORITY).Str("msg", buffer);
     }
 }
 
@@ -89,14 +114,32 @@ bool SecureCompare(const char* a, const char* b, size_t len) {
     return result == 0;
 }
 
+// The same rule the plugin applies to a pinned token (length 32-256, RFC 6750
+// token68 characters). It used to be applied only to pinned tokens: a manual
+// launch with OBSIDIAN_AUTH_TOKEN=x served a one-character bearer token.
+static bool AcceptToken(const std::string& candidate, const char* source) {
+    std::string error;
+    if (!Listener::IsPinnedToken(candidate, error)) {
+        Log("Refusing the auth token from %s: %s", source, error.c_str());
+        return false;
+    }
+    g_authToken = candidate;
+    Log("Auth token loaded from %s (%zu bytes)", source, g_authToken.size());
+    return true;
+}
+
 // Load authentication token (env var first, file fallback)
 bool LoadAuthToken() {
-    // Try environment variable first (set by plugin, inherited by child process)
+    // Try environment variable first. The plugin hands it over in this
+    // process's private environment block (never its own environment).
     const char* envToken = getenv("OBSIDIAN_AUTH_TOKEN");
     if (envToken && envToken[0] != '\0') {
-        g_authToken = envToken;
-        Log("Auth token loaded from environment variable (%zu bytes)", g_authToken.size());
-        return true;
+        const std::string candidate = envToken;
+        // Nothing this process starts needs the token; don't leave it lying in
+        // the environment for one to inherit.
+        SetEnvironmentVariableA("OBSIDIAN_AUTH_TOKEN", nullptr);
+        _putenv_s("OBSIDIAN_AUTH_TOKEN", "");
+        return AcceptToken(candidate, "the environment");
     }
 
     Log("No OBSIDIAN_AUTH_TOKEN env var, trying token file...");
@@ -147,9 +190,9 @@ bool LoadAuthToken() {
         return false;
     }
 
-    g_authToken = std::string(tokenBuf, bytesRead);
-    Log("Auth token loaded from file (%zu bytes)", g_authToken.size());
-    return true;
+    const std::string candidate(tokenBuf, bytesRead);
+    SecureZeroMemory(tokenBuf, sizeof(tokenBuf));
+    return AcceptToken(candidate, "the token file");
 }
 
 // HTTP header lookup (CWE-20)
@@ -292,31 +335,127 @@ bool ValidateAuthHeader(const std::string& request) {
 }
 
 // Named Pipe client to communicate with plugin
+//
+// Hardening (review findings M2, M6, L1, L7):
+//
+//   * The pipe SERVER is authenticated, not just the client. The plugin checks
+//     that the process dialling it is the obsidian_server it spawned; this
+//     side now checks, via GetNamedPipeServerProcessId, that the process
+//     serving the pipe is the x64dbg that spawned it (--plugin-pid). A process
+//     that squatted the pipe name would otherwise receive every authenticated
+//     request and could answer with fabricated debugger state.
+//   * SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION: whoever serves the pipe
+//     may learn who we are, never act as us.
+//   * Every read is exact-length and every I/O has a timeout. A short read used
+//     to splice a zero-filled tail onto the response; a hung plugin used to
+//     hang this single-threaded server forever.
+//   * Any framing failure (oversized or short frame, timeout) RESETS the
+//     connection instead of leaving unread bytes in the pipe. Leaving them was
+//     fatal: the next read took four bytes of stale JSON as a length, every
+//     later request failed, and the idle ping made the server exit for the
+//     rest of the session.
 class PipeClient {
 private:
     HANDLE m_pipe = INVALID_HANDLE_VALUE;
     std::atomic<bool> m_connected{false};
+    std::string m_name = Protocol::PIPE_NAME;
+    unsigned long m_expectedServerPid = 0;
+
+    // Writing the request and reading a frame body are quick; waiting for the
+    // response LENGTH is where the plugin does its work, and its wait handlers
+    // legitimately take up to five minutes. Bounded, but above that.
+    static const DWORD WRITE_TIMEOUT_MS = 10000;
+    static const DWORD RESPONSE_WAIT_TIMEOUT_MS = 330000;
+    static const DWORD BODY_TIMEOUT_MS = 30000;
+
+    // One overlapped ReadFile/WriteFile bounded by timeoutMs. On timeout the
+    // I/O is cancelled and fully completed before returning, so the buffer is
+    // never written after this function has handed it back.
+    bool OverlappedIo(bool write, void* buffer, DWORD length, DWORD timeoutMs,
+                      DWORD& transferred) {
+        transferred = 0;
+        OVERLAPPED overlapped = {};
+        overlapped.hEvent = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+        if (overlapped.hEvent == nullptr) {
+            return false;
+        }
+        BOOL ok = write ? WriteFile(m_pipe, buffer, length, nullptr, &overlapped)
+                        : ReadFile(m_pipe, buffer, length, nullptr, &overlapped);
+        DWORD error = ok ? ERROR_SUCCESS : GetLastError();
+        if (!ok && error != ERROR_IO_PENDING) {
+            CloseHandle(overlapped.hEvent);
+            SetLastError(error);
+            return false;
+        }
+        if (WaitForSingleObject(overlapped.hEvent, timeoutMs) != WAIT_OBJECT_0) {
+            CancelIoEx(m_pipe, &overlapped);
+            GetOverlappedResult(m_pipe, &overlapped, &transferred, TRUE);
+            CloseHandle(overlapped.hEvent);
+            transferred = 0;
+            SetLastError(WAIT_TIMEOUT);
+            return false;
+        }
+        ok = GetOverlappedResult(m_pipe, &overlapped, &transferred, FALSE);
+        error = ok ? ERROR_SUCCESS : GetLastError();
+        CloseHandle(overlapped.hEvent);
+        SetLastError(error);
+        return ok != FALSE;
+    }
+
+    bool WriteExact(const void* data, DWORD length, DWORD timeoutMs) {
+        const char* cursor = static_cast<const char*>(data);
+        while (length > 0) {
+            DWORD written = 0;
+            if (!OverlappedIo(true, const_cast<char*>(cursor), length, timeoutMs, written) ||
+                written == 0) {
+                return false;
+            }
+            cursor += written;
+            length -= written;
+        }
+        return true;
+    }
+
+    // The client end of a pipe reads in byte mode, so a frame can arrive in
+    // pieces. Loop until all of it is here or the pipe fails.
+    bool ReadExact(void* data, DWORD length, DWORD timeoutMs) {
+        char* cursor = static_cast<char*>(data);
+        while (length > 0) {
+            DWORD got = 0;
+            if (!OverlappedIo(false, cursor, length, timeoutMs, got) || got == 0) {
+                return false;
+            }
+            cursor += got;
+            length -= got;
+        }
+        return true;
+    }
 
 public:
+    void Configure(const std::string& name, unsigned long expectedServerPid) {
+        if (!name.empty()) {
+            m_name = name;
+        }
+        m_expectedServerPid = expectedServerPid;
+    }
+
     bool Connect() {
-        Log("Connecting to plugin pipe: %s", Protocol::PIPE_NAME);
+        Log("Connecting to plugin pipe: %s", m_name.c_str());
 
         // Try to connect to the named pipe (plugin is the server)
         for (int attempts = 0; attempts < 10; attempts++) {
             m_pipe = CreateFileA(
-                Protocol::PIPE_NAME,
+                m_name.c_str(),
                 GENERIC_READ | GENERIC_WRITE,
                 0,
                 nullptr,
                 OPEN_EXISTING,
-                0,
+                FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
                 nullptr
             );
 
             if (m_pipe != INVALID_HANDLE_VALUE) {
-                m_connected = true;
-                Log("Connected to plugin pipe");
-                return true;
+                break;
             }
 
             if (GetLastError() != ERROR_PIPE_BUSY) {
@@ -328,8 +467,38 @@ public:
             Sleep(500);  // Wait before retry
         }
 
-        Log("Failed to connect: pipe busy");
-        return false;
+        if (m_pipe == INVALID_HANDLE_VALUE) {
+            Log("Failed to connect: pipe busy");
+            return false;
+        }
+
+        if (m_expectedServerPid != 0) {
+            ULONG serverPid = 0;
+            if (!GetNamedPipeServerProcessId(m_pipe, &serverPid) ||
+                serverPid != m_expectedServerPid) {
+                Log("Refusing pipe %s: served by PID %lu, expected the x64dbg "
+                    "that spawned this server (PID %lu)", m_name.c_str(),
+                    static_cast<unsigned long>(serverPid), m_expectedServerPid);
+                CloseHandle(m_pipe);
+                m_pipe = INVALID_HANDLE_VALUE;
+                return false;
+            }
+        } else {
+            Log("WARNING: no --plugin-pid given (manual launch?); the pipe "
+                "server's identity is not being verified");
+        }
+
+        m_connected = true;
+        Log("Connected to plugin pipe");
+        return true;
+    }
+
+    // Drop the current connection and dial again. Used after a framing failure
+    // so the next request starts on a clean frame boundary; the plugin keeps
+    // its pipe instance and accepts the reconnect.
+    bool Reconnect() {
+        Disconnect();
+        return Connect();
     }
 
     // The plugin round-trip is where hangs and stalls actually happen, and it
@@ -363,43 +532,58 @@ private:
             return false;
         }
 
-        // Send length prefix + JSON
-        uint32_t length = static_cast<uint32_t>(jsonRequest.size());
-        DWORD bytesWritten = 0;
-
-        if (!WriteFile(m_pipe, &length, sizeof(length), &bytesWritten, nullptr)) {
-            Log("Failed to write length: %d", GetLastError());
-            return false;
+        if (jsonRequest.size() > Protocol::MAX_MESSAGE_SIZE) {
+            Log("Request too large for the pipe: %zu bytes", jsonRequest.size());
+            return false;  // nothing written, framing intact
         }
 
-        if (!WriteFile(m_pipe, jsonRequest.c_str(), length, &bytesWritten, nullptr)) {
+        // Send length prefix + JSON
+        uint32_t length = static_cast<uint32_t>(jsonRequest.size());
+
+        if (!WriteExact(&length, sizeof(length), WRITE_TIMEOUT_MS) ||
+            !WriteExact(jsonRequest.data(), length, WRITE_TIMEOUT_MS)) {
             Log("Failed to write request: %d", GetLastError());
+            ResetAfterFramingFailure();
             return false;
         }
 
         // Read response length
         uint32_t responseLength = 0;
-        DWORD bytesRead = 0;
-
-        if (!ReadFile(m_pipe, &responseLength, sizeof(responseLength), &bytesRead, nullptr)) {
+        if (!ReadExact(&responseLength, sizeof(responseLength), RESPONSE_WAIT_TIMEOUT_MS)) {
             Log("Failed to read response length: %d", GetLastError());
+            ResetAfterFramingFailure();
             return false;
         }
 
         if (responseLength > Protocol::MAX_MESSAGE_SIZE) {
-            Log("Response too large: %u bytes", responseLength);
+            // The plugin caps its own responses, so this means the two ends
+            // disagree about framing. The unread body must not stay in the
+            // pipe -- reset rather than read it as the next length.
+            Log("Response too large: %u bytes; resetting the pipe", responseLength);
+            ResetAfterFramingFailure();
             return false;
         }
 
-        // Read response data
-        std::vector<char> buffer(responseLength);
-        if (!ReadFile(m_pipe, buffer.data(), responseLength, &bytesRead, nullptr)) {
-            Log("Failed to read response: %d", GetLastError());
+        // Read response data. std::string, not vector<char>: a zero-length
+        // frame then needs no special case.
+        std::string buffer(responseLength, '\0');
+        if (responseLength > 0 &&
+            !ReadExact(&buffer[0], responseLength, BODY_TIMEOUT_MS)) {
+            Log("Failed to read response body: %d", GetLastError());
+            ResetAfterFramingFailure();
             return false;
         }
 
-        jsonResponse = std::string(buffer.data(), responseLength);
+        jsonResponse.swap(buffer);
         return true;
+    }
+
+    void ResetAfterFramingFailure() {
+        const DWORD savedError = GetLastError();
+        if (!Reconnect()) {
+            Log("Could not re-establish the plugin pipe after a framing failure");
+        }
+        SetLastError(savedError);
     }
 
 public:
@@ -457,6 +641,10 @@ static const size_t MAX_CONTENT_LENGTH = Protocol::MAX_MESSAGE_SIZE;
 // Wall-clock budget for reading one complete request, independent of the
 // per-recv socket timeout. This is the part that actually stops slowloris.
 static const unsigned long long REQUEST_DEADLINE_MS = 15000;
+
+// Budget for the header section alone, within REQUEST_DEADLINE_MS. A real
+// client sends its headers immediately; only a stalling peer needs longer.
+static const unsigned long long HEADER_DEADLINE_MS = 5000;
 
 // Parse a Content-Length header value. Returns false if the value is absent-
 // but-present-looking, malformed, negative, or above MAX_CONTENT_LENGTH.
@@ -553,6 +741,76 @@ std::string BuildHTTPResponse(int statusCode, const std::string& statusText,
     return response;
 }
 
+// Whether the request currently being handled presented a valid token. Read by
+// the accept loop to decide whether the peer earns a throttle strike, and by
+// HandleHTTPRequest to decide the priority of its completion event. Plain
+// global for the same single-connection reason as g_currentRequestId.
+static bool g_requestAuthenticated = false;
+
+// The body a POST actually carries: exactly Content-Length bytes after the
+// header terminator, or nothing when Content-Length is absent. The accept loop
+// can read past Content-Length (its header-phase recv takes up to 8 KiB), and
+// those extra bytes used to be forwarded to the plugin as part of the body.
+static std::string ExtractDeclaredBody(const std::string& request) {
+    const size_t headerEnd = request.find("\r\n\r\n");
+    if (headerEnd == std::string::npos) {
+        return std::string();
+    }
+    bool found = false;
+    size_t contentLength = 0;
+    std::string value;
+    if (FindHeaderValue(request, "Content-Length", value)) {
+        found = true;
+        contentLength = static_cast<size_t>(strtoull(value.c_str(), nullptr, 10));
+    }
+    if (!found) {
+        return std::string();
+    }
+    const size_t bodyStart = headerEnd + 4;
+    const size_t available = request.size() - bodyStart;
+    return request.substr(bodyStart, contentLength < available ? contentLength : available);
+}
+
+// Build the pipe request from the endpoint's type and the client's JSON body.
+//
+// The body used to be spliced in unexamined: everything after its first '{'
+// was appended to "{\"type\":N,", whatever preceded that brace was silently
+// dropped, and a body that was not an object at all still went through. The
+// plugin now parses strictly and refuses duplicate keys (so a body carrying its
+// own "type" is refused rather than resolved), and this side refuses anything
+// that is not a single JSON object before it reaches the pipe.
+static bool BuildPluginRequest(int requestType, const std::string& body,
+                               std::string& outRequest) {
+    size_t begin = 0;
+    size_t end = body.size();
+    while (begin < end && (body[begin] == ' ' || body[begin] == '\t' ||
+                           body[begin] == '\r' || body[begin] == '\n')) begin++;
+    while (end > begin && (body[end - 1] == ' ' || body[end - 1] == '\t' ||
+                           body[end - 1] == '\r' || body[end - 1] == '\n')) end--;
+
+    const std::string typeField = "{\"type\":" + std::to_string(requestType);
+    if (begin == end) {
+        outRequest = typeField + "}";
+        return true;
+    }
+    if (body[begin] != '{' || body[end - 1] != '}') {
+        return false;
+    }
+    // Inner content between the braces, trimmed: empty means "{}".
+    size_t innerBegin = begin + 1;
+    size_t innerEnd = end - 1;
+    while (innerBegin < innerEnd && (body[innerBegin] == ' ' || body[innerBegin] == '\t' ||
+                                     body[innerBegin] == '\r' || body[innerBegin] == '\n')) {
+        innerBegin++;
+    }
+    if (innerBegin == innerEnd) {
+        outRequest = typeField + "}";
+        return true;
+    }
+    outRequest = typeField + "," + body.substr(innerBegin, end - innerBegin);
+    return true;
+}
+
 // HTTP request handler
 static std::string HandleHTTPRequestInner(const std::string& request) {
     // Parse HTTP method and path
@@ -575,7 +833,9 @@ static std::string HandleHTTPRequestInner(const std::string& request) {
     const unsigned long long reqStartMs = ActivityLog::NowMs();
     g_currentRequestId = reqId;
 
-    ActivityLog::Event("request.received")
+    // Low priority: emitted before the token is checked, so an unauthenticated
+    // peer can produce any number of these.
+    ActivityLog::Event("request.received", ActivityLog::LOW_PRIORITY)
         .Num("id", static_cast<long long>(reqId))
         .Str("method", method)
         .Str("path", path)
@@ -597,7 +857,7 @@ static std::string HandleHTTPRequestInner(const std::string& request) {
     if (Listener::CountHeaderOccurrences(request, "Host") > 1 ||
         Listener::CountHeaderOccurrences(request, "Origin") > 1) {
         Log("Rejecting request with a duplicated Host or Origin header");
-        ActivityLog::Event("header.duplicated")
+        ActivityLog::Event("header.duplicated", ActivityLog::LOW_PRIORITY)
             .Num("id", static_cast<long long>(reqId));
         return BuildHTTPResponse(400, "Bad Request", "application/json",
                                  "{\"error\":\"Duplicate Host or Origin header\"}");
@@ -608,7 +868,7 @@ static std::string HandleHTTPRequestInner(const std::string& request) {
         !Listener::HostAllowed(g_listener, hostHeader)) {
         Log("Rejecting request for Host '%s': not an address this listener "
             "answers for (add it with --allow-host)", hostHeader.c_str());
-        ActivityLog::Event("host.rejected")
+        ActivityLog::Event("host.rejected", ActivityLog::LOW_PRIORITY)
             .Num("id", static_cast<long long>(reqId))
             .Str("host", hostHeader);
         // The body says only what was refused: echoing the Host back would turn
@@ -617,12 +877,13 @@ static std::string HandleHTTPRequestInner(const std::string& request) {
                                  "{\"error\":\"Host not allowed\"}");
     }
 
+    // Exact origin: scheme, host AND port must be this listener's own. Host
+    // alone let a page on any other localhost port through (review finding I1).
     std::string originHeader;
     if (FindHeaderValue(request, "Origin", originHeader)) {
-        const std::string origin = Listener::StripOrigin(originHeader);
-        if (!Listener::HostAllowed(g_listener, origin)) {
+        if (!Listener::OriginAllowed(g_listener, originHeader)) {
             Log("Rejecting cross-origin request (Origin '%s')", originHeader.c_str());
-            ActivityLog::Event("origin.rejected")
+            ActivityLog::Event("origin.rejected", ActivityLog::LOW_PRIORITY)
                 .Num("id", static_cast<long long>(reqId))
                 .Str("origin", originHeader);
             return BuildHTTPResponse(400, "Bad Request", "application/json",
@@ -635,7 +896,7 @@ static std::string HandleHTTPRequestInner(const std::string& request) {
     // for an unauthenticated method.
     if (!ValidateAuthHeader(request)) {
         Log("Authentication failed for %s %s", method.c_str(), path.c_str());
-        ActivityLog::Event("auth.failed")
+        ActivityLog::Event("auth.failed", ActivityLog::LOW_PRIORITY)
             .Num("id", static_cast<long long>(reqId))
             .Str("method", method)
             .Str("path", path)
@@ -648,6 +909,7 @@ static std::string HandleHTTPRequestInner(const std::string& request) {
         return BuildHTTPResponse(401, "Unauthorized", "application/json",
                                 "{\"error\":\"Invalid or missing authentication token\"}");
     }
+    g_requestAuthenticated = true;
 
     // Handle GET /health
     if (method == "GET" && path == "/health") {
@@ -655,13 +917,11 @@ static std::string HandleHTTPRequestInner(const std::string& request) {
                                 "{\"status\":\"ok\",\"message\":\"Obsidian server running\"}");
     }
 
-    // Extract request body for POST requests
-    std::string requestBody = "";
+    // Extract request body for POST requests: exactly what Content-Length
+    // declared, never the bytes that happened to arrive after it.
+    std::string requestBody;
     if (method == "POST") {
-        size_t bodyStart = request.find("\r\n\r\n");
-        if (bodyStart != std::string::npos) {
-            requestBody = request.substr(bodyStart + 4);
-        }
+        requestBody = ExtractDeclaredBody(request);
     }
 
     // Map endpoint URL to request type number
@@ -868,19 +1128,9 @@ static std::string HandleHTTPRequestInner(const std::string& request) {
     if (requestType != -1) {
         // Build JSON request with type field
         std::string pluginRequest;
-        if (requestBody.empty() || requestBody == "{}" || requestBody == "{}") {
-            // No body or empty body - just send type
-            pluginRequest = "{\"type\":" + std::to_string(requestType) + "}";
-        } else {
-            // Merge type into existing JSON body
-            // Simple approach: inject "type" at the beginning
-            size_t firstBrace = requestBody.find('{');
-            if (firstBrace != std::string::npos) {
-                pluginRequest = "{\"type\":" + std::to_string(requestType) + ",";
-                pluginRequest += requestBody.substr(firstBrace + 1);
-            } else {
-                pluginRequest = "{\"type\":" + std::to_string(requestType) + "}";
-            }
+        if (!BuildPluginRequest(requestType, requestBody, pluginRequest)) {
+            return BuildHTTPResponse(400, "Bad Request", "application/json",
+                                     "{\"error\":\"Request body must be a JSON object\"}");
         }
 
         // Forward to plugin via Named Pipe
@@ -902,6 +1152,7 @@ static std::string HandleHTTPRequestInner(const std::string& request) {
 // adds a ninth.
 std::string HandleHTTPRequest(const std::string& request) {
     g_currentRequestId = 0;
+    g_requestAuthenticated = false;
     const unsigned long long startMs = ActivityLog::NowMs();
 
     std::string response = HandleHTTPRequestInner(request);
@@ -914,7 +1165,9 @@ std::string HandleHTTPRequest(const std::string& request) {
         status = atoi(response.c_str() + firstSpace + 1);
     }
 
-    ActivityLog::Event("request.completed")
+    ActivityLog::Event("request.completed",
+                       g_requestAuthenticated ? ActivityLog::NORMAL_PRIORITY
+                                              : ActivityLog::LOW_PRIORITY)
         .Num("id", static_cast<long long>(g_currentRequestId))
         .Num("status", status)
         .Num("resp_bytes", static_cast<long long>(response.size()))
@@ -991,9 +1244,23 @@ bool StartHTTPServer(const Listener::Options& options) {
         return false;
     }
 
-    // Allow port reuse
+    // Exclusive use of the port (review finding M4).
+    //
+    // This used to set SO_REUSEADDR. On Windows that does not mean "rebind
+    // after TIME_WAIT" as it does on POSIX: it marks the port SHAREABLE, after
+    // which a socket from any process -- including one running as a different
+    // user -- may bind the same address and port, and which socket receives
+    // each connection is undefined. On the plaintext loopback default that let
+    // another local account take the bridge's connection and read its bearer
+    // token. Microsoft's guidance is that every server sets
+    // SO_EXCLUSIVEADDRUSE. Refuse to start if it cannot be set.
     int optval = 1;
-    setsockopt(listenSocket, SOL_SOCKET, SO_REUSEADDR, (const char*)&optval, sizeof(optval));
+    if (setsockopt(listenSocket, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+                   (const char*)&optval, sizeof(optval)) == SOCKET_ERROR) {
+        Log("Refusing to start: SO_EXCLUSIVEADDRUSE failed (%d)", WSAGetLastError());
+        closesocket(listenSocket);
+        return false;
+    }
 
     // Set socket to non-blocking mode for accept() timeout
     u_long mode = 1;
@@ -1038,6 +1305,9 @@ bool StartHTTPServer(const Listener::Options& options) {
     Log("HTTP server listening on %s", Listener::Describe(options).c_str());
     Log("Press Ctrl+C to stop server");
 
+    // Failure counts per remote peer; see Listener::PeerThrottle.
+    static Listener::PeerThrottle throttle;
+
     // Accept and handle connections
     while (true) {
         sockaddr_in clientAddr = {};
@@ -1057,11 +1327,18 @@ bool StartHTTPServer(const Listener::Options& options) {
         }
 
         if (selectResult == 0) {
-            // Timeout - periodically check if plugin is still alive
+            // Timeout - periodically check if plugin is still alive. A failed
+            // ping first gets one reconnect: a framing error resets the pipe
+            // rather than killing it, so only a plugin that is really gone
+            // (x64dbg exited, plugin unloaded) ends the server.
             std::string response;
             if (!g_pipeClient.SendRequest("{\"type\":99}", response)) {
-                Log("Lost connection to plugin, exiting...");
-                break;
+                if (!g_pipeClient.Reconnect() ||
+                    !g_pipeClient.SendRequest("{\"type\":99}", response)) {
+                    Log("Lost connection to plugin, exiting...");
+                    break;
+                }
+                Log("Plugin pipe re-established after a failed health check");
             }
             continue;
         }
@@ -1084,7 +1361,17 @@ bool StartHTTPServer(const Listener::Options& options) {
         if (!Listener::ClientAllowed(options, peerAddr)) {
             const std::string peer = FormatIPv4(peerAddr);
             Log("Refusing connection from %s: not in --allow-client", peer.c_str());
-            ActivityLog::Event("client.rejected").Str("peer", peer);
+            ActivityLog::Event("client.rejected", ActivityLog::LOW_PRIORITY).Str("peer", peer);
+            closesocket(clientSocket);
+            continue;
+        }
+
+        // Review finding M6: one connection is served at a time, so a peer
+        // that keeps failing (slow handshake, dribbled headers, wrong token)
+        // could hold the bridge back to back. Repeat offenders are turned away
+        // here, before they cost a handshake. Loopback is exempt -- see
+        // Listener::PeerThrottle.
+        if (!throttle.Allowed(peerAddr, GetTickCount64())) {
             closesocket(clientSocket);
             continue;
         }
@@ -1110,8 +1397,9 @@ bool StartHTTPServer(const Listener::Options& options) {
         if (options.TlsEnabled()) {
             if (!tlsChannel.Handshake(credentials, options.MutualTls(),
                                       options.tlsClientCaThumbprint)) {
-                ActivityLog::Event("tls.handshake_failed")
+                ActivityLog::Event("tls.handshake_failed", ActivityLog::LOW_PRIORITY)
                     .Str("peer", FormatIPv4(peerAddr));
+                throttle.RecordFailure(peerAddr, GetTickCount64());
                 closesocket(clientSocket);
                 continue;
             }
@@ -1124,7 +1412,13 @@ bool StartHTTPServer(const Listener::Options& options) {
         std::string request;
         std::string earlyReject;  // non-empty => respond with this and close
         {
-            const unsigned long long deadline = GetTickCount64() + REQUEST_DEADLINE_MS;
+            const unsigned long long requestStart = GetTickCount64();
+            const unsigned long long deadline = requestStart + REQUEST_DEADLINE_MS;
+            // The header section of a legitimate request arrives in one or two
+            // segments; it gets a much shorter budget than the body, so a peer
+            // that connects and says nothing costs seconds, not the full
+            // request deadline.
+            const unsigned long long headerDeadline = requestStart + HEADER_DEADLINE_MS;
             // The TLS channel loops recv() internally, so the deadline checks
             // in this block cannot see a peer that drips bytes inside one
             // conn.Recv(). Hand the channel the same instant so the bound
@@ -1148,7 +1442,7 @@ bool StartHTTPServer(const Listener::Options& options) {
                                                     "{\"error\":\"Header section too large\"}");
                     break;
                 }
-                if (GetTickCount64() >= deadline) {
+                if (GetTickCount64() >= headerDeadline) {
                     Log("Rejecting request: deadline expired while reading headers");
                     earlyReject = BuildHTTPResponse(408, "Request Timeout", "application/json",
                                                     "{\"error\":\"Request timed out\"}");
@@ -1214,10 +1508,19 @@ bool StartHTTPServer(const Listener::Options& options) {
             // Rejected before authentication and before any parsing of the
             // request. Answer, then close -- never fall through to the handler.
             conn.Send(earlyReject.c_str(), earlyReject.size());
+            throttle.RecordFailure(peerAddr, GetTickCount64());
         } else if (!request.empty()) {
             // Handle request and send response
             std::string response = HandleHTTPRequest(request);
             conn.Send(response.c_str(), response.size());
+            if (g_requestAuthenticated) {
+                throttle.RecordSuccess(peerAddr);
+            } else {
+                throttle.RecordFailure(peerAddr, GetTickCount64());
+            }
+        } else {
+            // Connected and closed (or timed out) without a request.
+            throttle.RecordFailure(peerAddr, GetTickCount64());
         }
 
         if (tls != nullptr) {
@@ -1272,7 +1575,9 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Connect to plugin via Named Pipe
+    // Connect to plugin via Named Pipe -- the per-session name and owning PID
+    // the plugin passed, when it passed them.
+    g_pipeClient.Configure(g_listener.pipeName, g_listener.pluginPid);
     if (!g_pipeClient.Connect()) {
         Log("Failed to connect to plugin - make sure x64dbg is running with plugin loaded");
         ActivityLog::Shutdown(false, "pipe connect failed");

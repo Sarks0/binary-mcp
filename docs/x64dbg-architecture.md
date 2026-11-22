@@ -133,7 +133,7 @@ enforces.
 
 ### Named Pipe Protocol
 
-**Pipe Name:** `\\.\pipe\x64dbg_mcp`
+**Pipe Name:** `\\.\pipe\x64dbg_mcp_<random hex>`, chosen per session by the plugin and passed to the server as `--pipe`, together with `--plugin-pid`. The pipe is created with `FILE_FLAG_FIRST_PIPE_INSTANCE`, each side checks the other's PID, and every frame is capped at 1 MiB. `\\.\pipe\x64dbg_mcp` itself is only dialled by a server started by hand without `--pipe`.
 
 **Message Format:**
 ```

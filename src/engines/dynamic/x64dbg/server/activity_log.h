@@ -42,6 +42,19 @@ static const size_t MAX_LOG_FILES = 10;
 // session can produce events far faster than anyone will read them.
 static const long long MAX_LOG_BYTES = 16LL * 1024 * 1024;
 
+// Past this size, LOW_PRIORITY events are dropped (and counted) while normal
+// ones keep being written up to MAX_LOG_BYTES.
+//
+// Why: most events an unauthenticated peer can cause -- a refused Host, a 401,
+// a failed handshake, the free-text mirror of every log line -- used to be
+// written exactly like the events that record authenticated activity. A peer
+// that sent ~16k bad requests filled the file, after which NOTHING was
+// recorded, including whatever it did once it had a token. Pre-auth noise now
+// stops at the soft cap and leaves the remainder for the record that matters.
+static const long long SOFT_LOG_BYTES = 12LL * 1024 * 1024;
+
+enum Priority { NORMAL_PRIORITY = 0, LOW_PRIORITY = 1 };
+
 namespace detail {
 
 inline FILE*& File() {
@@ -60,6 +73,11 @@ inline bool& Truncated() {
 }
 
 inline unsigned long long& RequestCounter() {
+    static unsigned long long counter = 0;
+    return counter;
+}
+
+inline unsigned long long& SuppressedCounter() {
     static unsigned long long counter = 0;
     return counter;
 }
@@ -102,9 +120,13 @@ inline std::string Escape(const std::string& value) {
     return out;
 }
 
-inline void WriteLine(const std::string& line) {
+inline void WriteLine(const std::string& line, bool lowPriority = false) {
     FILE* file = File();
     if (!file || Truncated()) {
+        return;
+    }
+    if (lowPriority && BytesWritten() >= SOFT_LOG_BYTES) {
+        SuppressedCounter()++;
         return;
     }
     if (BytesWritten() >= MAX_LOG_BYTES) {
@@ -164,7 +186,8 @@ inline bool BodiesEnabled() {
 // Writing on destruction means a call site cannot forget to emit.
 class Event {
 public:
-    explicit Event(const char* name) {
+    explicit Event(const char* name, Priority priority = NORMAL_PRIORITY)
+        : lowPriority_(priority == LOW_PRIORITY) {
         line_ = "{\"ts\":\"" + detail::Timestamp() + "\",\"ev\":\"";
         line_ += detail::Escape(name);
         line_ += "\"";
@@ -208,10 +231,11 @@ public:
 
     ~Event() {
         line_ += "}";
-        detail::WriteLine(line_);
+        detail::WriteLine(line_, lowPriority_);
     }
 
 private:
+    bool lowPriority_;
     std::string line_;
 
     Event(const Event&);
@@ -283,7 +307,9 @@ inline void Shutdown(bool ok, const char* reason) {
         Event("server.stop")
             .Bool("ok", ok)
             .Str("reason", reason)
-            .Num("requests", static_cast<long long>(detail::RequestCounter()));
+            .Num("requests", static_cast<long long>(detail::RequestCounter()))
+            .Num("suppressed_low_priority",
+                  static_cast<long long>(detail::SuppressedCounter()));
     }
     fclose(detail::File());
     detail::File() = nullptr;

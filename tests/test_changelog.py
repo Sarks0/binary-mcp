@@ -47,8 +47,16 @@ class Repo:
             ["git", *args], cwd=self.path, env=env, check=True, capture_output=True, text=True
         ).stdout
 
-    def commit(self, message: str, author: str = "Maintainer <maintainer@example.invalid>"):
+    def commit(
+        self,
+        message: str,
+        author: str = "Maintainer <maintainer@example.invalid>",
+        files: tuple[str, ...] = (),
+    ):
         self.day += 1
+        for name in files:
+            (self.path / name).write_text(f"changed on day {self.day}\n", encoding="utf-8")
+            self.git("add", name)
         message_file = self.path.parent / f"message-{self.day}.txt"
         message_file.write_text(message, encoding="utf-8")
         self.git("commit", "-q", "--allow-empty", "--author", author, "-F", str(message_file))
@@ -242,6 +250,79 @@ def test_an_unknown_tag_fails_loudly(repo, capsys, tag, message):
     repo.tag("v1.0.0")
 
     code, out, err = run(repo, "notes", tag, capsys=capsys)
+
+    assert code == 1
+    assert out == ""
+    assert message in err
+
+
+def test_a_footer_line_starting_with_a_url_is_not_a_trailer(repo, capsys):
+    repo.commit("Initial commit")
+    repo.tag("v1.0.0")
+    repo.commit(
+        "Move the config (#1)\n\n"
+        "BREAKING CHANGE: the config file moved, see\n"
+        "https://example.invalid/install for the new location.\n"
+        "Signed-off-by: Maintainer <maintainer@example.invalid>\n"
+    )
+    repo.tag("v2.0.0")
+
+    _, out, _ = run(repo, "notes", "v2.0.0", capsys=capsys)
+
+    assert (
+        "- the config file moved, see https://example.invalid/install for the new location."
+    ) in out
+    assert "Signed-off-by" not in out
+
+
+def test_the_commit_that_writes_the_changelog_is_not_listed(repo, capsys):
+    repo.commit("Initial commit")
+    repo.tag("v1.0.0")
+    repo.commit("Add a feature (#1)", files=("feature.py",))
+    repo.commit("Prepare 1.1.0 (#2)", files=("CHANGELOG.md", "version.txt"))
+    repo.tag("v1.1.0")
+
+    _, out, _ = run(repo, "notes", "v1.1.0", capsys=capsys)
+
+    assert "- Add a feature" in out
+    assert "Prepare 1.1.0" not in out
+
+
+def test_next_describes_the_branch_head_as_the_coming_release(repo, capsys):
+    repo.commit("Initial commit")
+    repo.tag("v1.0.0")
+    repo.commit("Add a feature (#1)")
+    repo.git("switch", "-q", "-c", "release-prep")
+    repo.commit("Unmerged release-prep work")
+
+    code, out, err = run(repo, "changelog", "--next", "v1.1.0", "--head", "main", capsys=capsys)
+
+    assert code == 0, err
+    headings = [line for line in out.splitlines() if line.startswith("## ")]
+    assert headings[0].startswith("## v1.1.0 - ")
+    assert headings[1] == "## v1.0.0 - 2026-01-01"
+    # --head is main as merged, so the release branch's own commits are not in it.
+    assert "- Add a feature" in out
+    assert "Unmerged release-prep work" not in out
+    assert "v1.0.0...v1.1.0" in out
+
+
+@pytest.mark.parametrize(
+    ("version", "head", "message"),
+    [
+        ("v1.0.0", "main", "v1.0.0 is already tagged"),
+        ("v0.9.0", "main", "is below the newest release, v1.0.0"),
+        ("v1.1.0-rc1", "main", "is not a full release version"),
+        ("v1.1.0", "no-such-branch", "--head no-such-branch is not a commit"),
+    ],
+)
+def test_next_refuses_a_version_or_head_that_cannot_be_the_coming_release(
+    repo, capsys, version, head, message
+):
+    repo.commit("Initial commit")
+    repo.tag("v1.0.0")
+
+    code, out, err = run(repo, "changelog", "--next", version, "--head", head, capsys=capsys)
 
     assert code == 1
     assert out == ""

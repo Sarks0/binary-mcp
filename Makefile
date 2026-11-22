@@ -10,7 +10,7 @@ help:
 	@echo "  make compile-sample - Compile test malware sample"
 	@echo "  make diagnose      - Run diagnostic checks"
 	@echo "  make token-report  - Show what tools/list and the instructions cost a model"
-	@echo "  make changelog     - Regenerate CHANGELOG.md from the git tags"
+	@echo "  make changelog VERSION=vX.Y.Z - Regenerate CHANGELOG.md for the release being prepared"
 	@echo "  make clean         - Clean cache and temporary files"
 	@echo "  make clean-all     - Clean everything including dependencies"
 	@echo "  make lint          - Run code linting with ruff"
@@ -43,9 +43,11 @@ diagnose:
 token-report:
 	uv run python -m src.token_report
 
+# --prune-tags drops local tags that are not on GitHub, so every clone builds
+# the same file. A stray local tag would otherwise add a section nobody else has.
 changelog:
-	git fetch --tags --quiet
-	python3 scripts/changelog.py changelog --output CHANGELOG.md
+	git fetch origin --prune --prune-tags --tags --quiet
+	python3 scripts/changelog.py changelog $(if $(VERSION),--next $(VERSION)) --output CHANGELOG.md
 
 clean:
 	@echo "Cleaning cache and temporary files..."

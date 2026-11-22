@@ -1,4 +1,4 @@
-.PHONY: help install install-dev test test-cov run compile-sample diagnose token-report clean clean-all lint format
+.PHONY: help install install-dev test test-cov run compile-sample diagnose token-report changelog clean clean-all lint format
 
 help:
 	@echo "Binary MCP Server - Development Commands"
@@ -10,6 +10,7 @@ help:
 	@echo "  make compile-sample - Compile test malware sample"
 	@echo "  make diagnose      - Run diagnostic checks"
 	@echo "  make token-report  - Show what tools/list and the instructions cost a model"
+	@echo "  make changelog VERSION=vX.Y.Z - Regenerate CHANGELOG.md for the release being prepared"
 	@echo "  make clean         - Clean cache and temporary files"
 	@echo "  make clean-all     - Clean everything including dependencies"
 	@echo "  make lint          - Run code linting with ruff"
@@ -42,6 +43,12 @@ diagnose:
 token-report:
 	uv run python -m src.token_report
 
+# --prune-tags drops local tags that are not on GitHub, so every clone builds
+# the same file. A stray local tag would otherwise add a section nobody else has.
+changelog:
+	git fetch origin --prune --prune-tags --tags --quiet
+	python3 scripts/changelog.py changelog $(if $(VERSION),--next $(VERSION)) --output CHANGELOG.md
+
 clean:
 	@echo "Cleaning cache and temporary files..."
 	rm -rf ~/.ghidra_mcp_cache/
@@ -62,9 +69,9 @@ clean-all: clean
 	@echo "Clean all complete!"
 
 lint:
-	uv run ruff check src/ tests/
+	uv run ruff check src/ tests/ scripts/
 
 format:
-	uv run ruff format src/ tests/
+	uv run ruff format src/ tests/ scripts/
 
 .DEFAULT_GOAL := help

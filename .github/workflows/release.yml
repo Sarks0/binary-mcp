@@ -374,89 +374,18 @@ jobs:
     # verify them, how to install. The old "Features" blurb is gone rather
     # than corrected: it duplicated the README, which is where it can be
     # maintained in one place instead of two.
+    #
+    # The changes and breaking changes come from scripts/changelog.py, the same
+    # code that writes CHANGELOG.md, so the release page and the changelog can
+    # never describe one release two different ways.
     - name: Create Release Notes
       env:
         VERSION: ${{ steps.version.outputs.version }}
       run: |
         set -euo pipefail
 
-        # The previous release to describe changes against. Two rules:
-        #
-        # Same kind: a FULL release spans from the last full release, not from
-        # its own release candidate, or the range would omit everything the rc
-        # introduced.
-        #
-        # Strictly below: walk down from this tag's own position in version
-        # order rather than taking "the highest tag that is not this one" --
-        # otherwise a patch tagged on an older line would compare against a
-        # NEWER release and describe the range backwards.
-        if [[ "${VERSION}" == *-* ]]; then FULL_ONLY=0; else FULL_ONLY=1; fi
-        # versionsort.suffix=- makes git order a hyphen-suffixed tag BELOW the
-        # release it precedes (1.2.0-rc1 < 1.2.0), which is semver's rule and
-        # the opposite of git's default -- by default the longer string sorts
-        # higher, so an rc would count as newer than its own final.
-        PREV=$(git -c versionsort.suffix=- tag --list --sort=-v:refname | awk \
-          -v cur="${VERSION}" -v full_only="${FULL_ONLY}" '
-            seen && (full_only == 0 || $0 !~ /-/) { print; exit }
-            $0 == cur { seen = 1 }
-          ')
-        echo "Previous tag: ${PREV:-<none>}"
-
-        if [[ -n "${PREV}" ]]; then RANGE="${PREV}..HEAD"; else RANGE="HEAD"; fi
-
-        # A breaking change is the one thing a reader must not miss, and it is
-        # exactly what a generated commit list buries: the squash commit that
-        # deleted 159 tool names has a title about consolidation, and the word
-        # BREAKING appears only in its body.
-        #
-        # Read as a conventional-commits footer: a line BEGINNING with
-        # "BREAKING CHANGE:" or "BREAKING:", continuing over wrapped lines so a
-        # footer running to three lines is not clipped to its first. It ends at
-        # a blank line, the end of the commit, OR the next trailer -- git
-        # trailers are conventionally written with no blank line between them,
-        # so without that last rule a following Co-Authored-By or Signed-off-by
-        # is swallowed into the middle of the bullet.
-        #
-        # Anchored at the line start deliberately: the token mid-sentence in
-        # running prose describes a break rather than declaring one, and
-        # matching it there yields clipped fragments.
-        git log "${RANGE}" --format='%B%n~~COMMIT~~' \
-          | awk '
-              function flush() { if (buf != "") { print buf; buf = "" } }
-              /^~~COMMIT~~$/           { flush(); next }
-              /^[[:space:]]*$/         { flush(); next }
-              {
-                # Tested first, and separately from the trailer pattern below:
-                # "BREAKING CHANGE:" has a SPACE, so it does not match the
-                # single-token trailer shape and would otherwise be dropped on
-                # the floor -- while the spaceless "BREAKING:" was matched.
-                if (match($0, /^BREAKING( CHANGE)?:[[:space:]]*/)) {
-                  flush()
-                  buf = "- " substr($0, RSTART + RLENGTH)
-                  next
-                }
-                # Some other trailer (Co-Authored-By:, Signed-off-by:, Refs:)
-                # -- ends any footer in progress, and is not itself one.
-                if ($0 ~ /^[A-Za-z][A-Za-z0-9-]*:/) { flush(); next }
-                # Otherwise a wrapped continuation of the footer in progress.
-                if (buf != "") { line = $0; sub(/^[[:space:]]+/, "", line); buf = buf " " line }
-              }
-              END { flush() }
-            ' \
-          | sed -E 's/[[:space:]]+$//' \
-          | sort -u > breaking.txt || true
-
-        : > release_notes.md
-        if [[ -s breaking.txt ]]; then
-          {
-            echo "## Breaking changes"
-            echo
-            cat breaking.txt
-            echo
-            echo "Read these before upgrading."
-            echo
-          } >> release_notes.md
-        fi
+        python3 scripts/changelog.py notes "${VERSION}" > release_notes.md
+        echo >> release_notes.md
 
         # Version-derived so the names always match the assets actually
         # attached; the old text named a zip by hand.
@@ -539,13 +468,10 @@ jobs:
       uses: softprops/action-gh-release@v3
       with:
         name: obsidian-${{ steps.version.outputs.version }}
+        # GitHub's own generated "What's Changed" is deliberately off: the body
+        # already lists the changes, from the same source as CHANGELOG.md, and
+        # a second list built by different rules would disagree with it.
         body_path: release_notes.md
-        # Appends GitHub's own "What's Changed" -- the merged PRs and commits
-        # since the previous release -- underneath the body above. This is the
-        # part that was missing entirely: the notes are now derived from what
-        # shipped rather than restating a fixed feature list that nobody
-        # remembers to update.
-        generate_release_notes: true
         # F-3: upload from dist/ - the exact directory the SHA256SUMS step
         # hashed - so the published manifest cannot describe a different copy of
         # the assets than the one users download.
@@ -564,3 +490,61 @@ jobs:
         prerelease: ${{ contains(steps.version.outputs.version, '-') }}
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # CHANGELOG.md is generated, never hand-edited, so something has to rewrite
+  # it. This runs after the release is published, so a failure here cannot
+  # block or half-publish a release: rerun the job, or run `make changelog`
+  # and commit the result.
+  #
+  # Full releases only. A release candidate has no changelog section, so
+  # cutting one would change nothing in the file.
+  update-changelog:
+    name: Update CHANGELOG.md
+    needs: create-release
+    if: ${{ !contains(github.ref_name, '-') }}
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    # Two releases finishing close together would otherwise race to push.
+    concurrency:
+      group: update-changelog
+      cancel-in-progress: false
+
+    steps:
+    - name: Checkout main
+      uses: actions/checkout@v7
+      with:
+        # main, not the tag: the commit lands on the branch, and the guard job
+        # has already proved the tag is an ancestor of it. Full history and
+        # tags are needed to build every section.
+        ref: main
+        fetch-depth: 0
+
+    - name: Regenerate and push
+      run: |
+        set -euo pipefail
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+        # Retried because main can move between checkout and push. The file is
+        # rebuilt from scratch on each attempt rather than rebased, since it is
+        # a pure function of the tags and nothing else writes it.
+        for attempt in 1 2 3; do
+          python3 scripts/changelog.py changelog --output CHANGELOG.md
+          git add CHANGELOG.md
+          if git diff --cached --quiet; then
+            echo "CHANGELOG.md is already current."
+            exit 0
+          fi
+          git commit -q -m "docs(changelog): update for ${GITHUB_REF_NAME}"
+          if git push origin HEAD:main; then
+            exit 0
+          fi
+          echo "main moved, refetching (attempt ${attempt})." >&2
+          git fetch -q origin main
+          git reset -q --hard origin/main
+        done
+        echo "::error::Could not push CHANGELOG.md to main after 3 attempts." >&2
+        exit 1

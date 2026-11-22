@@ -33,7 +33,7 @@ jobs:
 
     - name: Lint with ruff
       run: |
-        uv run ruff check src/ tests/
+        uv run ruff check src/ tests/ scripts/
 
     - name: Run tests
       run: |

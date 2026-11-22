@@ -58,3 +58,5 @@ LICENSE text eol=lf
 *.c linguist-detectable=false
 samples/* linguist-vendored
 tests/* linguist-documentation
+# Written by scripts/changelog.py; collapsed in PR diffs like any generated file.
+CHANGELOG.md linguist-generated

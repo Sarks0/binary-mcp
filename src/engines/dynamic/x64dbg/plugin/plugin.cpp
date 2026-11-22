@@ -1046,6 +1046,311 @@ std::string HandleReadMemory(const std::string& request) {
     return BuildJsonResponse(true, data.str());
 }
 
+// Read [address, address + size) into buffer without letting one unreadable
+// page sink the whole read.
+//
+// DbgMemRead is all-or-nothing: a range that crosses a single uncommitted or
+// guard page fails outright. That is the normal shape of a dump or a scan --
+// regions end, sections have gaps -- so on failure this falls back to one read
+// per page, zero-fills the pages that still fail, and records the readable
+// runs in `spans` as (offset, length) pairs so callers can tell real bytes from
+// filler. Returns the number of readable bytes.
+static size_t ReadMemoryTolerant(duint address, unsigned char* buffer, size_t size,
+                                 std::vector<std::pair<size_t, size_t>>* spans) {
+    if (spans) spans->clear();
+    if (size == 0) return 0;
+
+    if (DbgMemRead(address, buffer, (duint)size)) {
+        if (spans) spans->push_back({0, size});
+        return size;
+    }
+
+    const duint PAGE = 0x1000;
+    size_t readable = 0;
+    size_t offset = 0;
+    while (offset < size) {
+        duint cur = address + offset;
+        size_t len = (size_t)(PAGE - (cur & (PAGE - 1)));
+        if (len > size - offset) len = size - offset;
+
+        if (DbgMemRead(cur, buffer + offset, (duint)len)) {
+            readable += len;
+            if (spans) {
+                if (!spans->empty() &&
+                    spans->back().first + spans->back().second == offset) {
+                    spans->back().second += len;
+                } else {
+                    spans->push_back({offset, len});
+                }
+            }
+        } else {
+            memset(buffer + offset, 0, len);
+        }
+        offset += len;
+    }
+    return readable;
+}
+
+// Parse a byte pattern -- "90 ?? E8", "90??E8", "4D5A" -- into (byte,
+// isWildcard) pairs. Characters other than hex digits and '?' are ignored, and
+// a byte with a '?' in either nibble is a whole-byte wildcard: the rules
+// PATTERN_SCAN has always applied, shared so the two scanners cannot disagree
+// about what a pattern means.
+static bool ParseBytePattern(const std::string& pattern,
+                             std::vector<std::pair<unsigned char, bool>>& out,
+                             std::string& error) {
+    out.clear();
+
+    std::string clean;
+    for (char c : pattern) {
+        if (isxdigit((unsigned char)c) || c == '?') {
+            clean += (char)toupper((unsigned char)c);
+        }
+    }
+
+    if (clean.length() % 2 != 0) {
+        error = "Invalid pattern length";
+        return false;
+    }
+
+    auto nibble = [](char c) -> unsigned char {
+        return (unsigned char)(c <= '9' ? c - '0' : c - 'A' + 10);
+    };
+
+    for (size_t i = 0; i < clean.length(); i += 2) {
+        if (clean[i] == '?' || clean[i + 1] == '?') {
+            out.push_back({0, true});
+        } else {
+            out.push_back({(unsigned char)((nibble(clean[i]) << 4) | nibble(clean[i + 1])), false});
+        }
+    }
+
+    if (out.empty()) {
+        error = "Empty pattern";
+        return false;
+    }
+    return true;
+}
+
+// Largest range one DUMP_MEMORY reply carries. Hex doubles it to 512 KB, which
+// leaves room under Protocol::MAX_MESSAGE_SIZE (1 MB) -- obsidian_server drops
+// any pipe reply larger than that, so a bigger chunk would not fail here, it
+// would vanish in transit. The bridge splits larger dumps into chunks this size.
+static const int DUMP_CHUNK_MAX = 256 * 1024;
+
+// Handler: DUMP_MEMORY - Read one chunk of a memory dump
+//
+// Unlike READ_MEMORY this tolerates unreadable pages: they come back as zeros
+// and are counted in "unreadable_bytes", so a dump of a region with a hole in
+// it still lines up byte-for-byte with the address space. Only a range with no
+// readable byte at all is an error.
+std::string HandleDumpMemory(const std::string& request) {
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+    }
+
+    std::string addressStr = ExtractStringField(request, "address");
+    int size = ExtractIntField(request, "size", 0);
+
+    // The lower bound is load-bearing: ExtractIntField accepts negatives, and a
+    // negative size would reach std::vector(size) as a huge size_t.
+    if (addressStr.empty() || size <= 0) {
+        return BuildJsonResponse(false, "\"error\":\"Missing or invalid address/size\"");
+    }
+    if (size > DUMP_CHUNK_MAX) {
+        return BuildJsonResponse(false,
+            "\"error\":\"Size too large for one dump chunk (max 262144 bytes)\"");
+    }
+
+    std::string errorMsg;
+    duint address = ResolveAddress(addressStr, errorMsg);
+    if (address == 0 && !errorMsg.empty()) {
+        return BuildAddressError(errorMsg, addressStr);
+    }
+
+    std::vector<unsigned char> buffer((size_t)size);
+    size_t readable = ReadMemoryTolerant(address, buffer.data(), buffer.size(), nullptr);
+    if (readable == 0) {
+        return BuildJsonResponse(false, "\"error\":\"No readable memory in the requested range\"");
+    }
+
+    static const char HEX[] = "0123456789abcdef";
+    std::string hex;
+    hex.resize(buffer.size() * 2);
+    for (size_t i = 0; i < buffer.size(); i++) {
+        hex[2 * i] = HEX[buffer[i] >> 4];
+        hex[2 * i + 1] = HEX[buffer[i] & 0x0F];
+    }
+
+    std::stringstream data;
+    data << "\"address\":\"" << std::hex << address << std::dec << "\","
+         << "\"size\":" << size << ","
+         << "\"unreadable_bytes\":" << (buffer.size() - readable) << ","
+         << "\"data\":\"" << hex << "\"";
+
+    return BuildJsonResponse(true, data.str());
+}
+
+// SEARCH_MEMORY limits. The reply has to fit in one pipe message (1 MB), so
+// the match count is capped and each match's context string is truncated.
+// The time limit keeps one search from holding the pipe -- which every other
+// request waits behind -- for longer than a client will wait for it.
+static const int SEARCH_MAX_MATCHES_DEFAULT = 1000;
+static const int SEARCH_MAX_MATCHES_CAP = 2000;
+static const size_t SEARCH_CHUNK = 1024 * 1024;
+static const size_t SEARCH_CONTEXT_MAX = 64;
+static const long long SEARCH_TIME_LIMIT_MS = 90000;
+
+// Handler: SEARCH_MEMORY - Search the debuggee's committed memory for a pattern
+//
+// Walks x64dbg's memory map rather than one caller-supplied range (that is
+// what PATTERN_SCAN is for). `region` selects "all", "executable" or
+// "writable" pages by their current protection. Uncommitted, PAGE_NOACCESS and
+// PAGE_GUARD regions are skipped: guard pages because touching one is itself a
+// classic anti-debug tripwire.
+std::string HandleSearchMemory(const std::string& request) {
+    if (!DbgIsDebugging()) {
+        return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
+    }
+
+    std::string pattern = ExtractStringField(request, "pattern");
+    std::string region = ExtractStringField(request, "region", "all");
+    int maxMatches = ExtractIntField(request, "max_matches", SEARCH_MAX_MATCHES_DEFAULT);
+
+    if (pattern.empty()) {
+        return BuildJsonResponse(false, "\"error\":\"Missing pattern\"");
+    }
+    if (maxMatches < 1) maxMatches = 1;
+    if (maxMatches > SEARCH_MAX_MATCHES_CAP) maxMatches = SEARCH_MAX_MATCHES_CAP;
+
+    std::transform(region.begin(), region.end(), region.begin(),
+                   [](unsigned char c) { return (char)tolower(c); });
+
+    const DWORD EXEC_MASK = PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                            PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    const DWORD WRITE_MASK = PAGE_READWRITE | PAGE_WRITECOPY |
+                             PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    DWORD requiredMask = 0;
+    if (region == "executable") {
+        requiredMask = EXEC_MASK;
+    } else if (region == "writable") {
+        requiredMask = WRITE_MASK;
+    } else if (region != "all") {
+        return BuildJsonResponse(false,
+            "\"error\":\"Invalid region (use all, executable or writable)\"");
+    }
+
+    std::vector<std::pair<unsigned char, bool>> parsed;
+    std::string parseError;
+    if (!ParseBytePattern(pattern, parsed, parseError)) {
+        return BuildJsonResponse(false, "\"error\":\"" + JsonEscape(parseError) + "\"");
+    }
+    bool anyFixed = false;
+    for (const auto& b : parsed) {
+        if (!b.second) { anyFixed = true; break; }
+    }
+    if (!anyFixed) {
+        return BuildJsonResponse(false,
+            "\"error\":\"Pattern must contain at least one non-wildcard byte\"");
+    }
+    const size_t patLen = parsed.size();
+
+    MEMMAP memMap;
+    if (!DbgMemMap(&memMap)) {
+        return BuildJsonResponse(false, "\"error\":\"Failed to get memory map\"");
+    }
+    // Freed on every exit, including an exception out of the scan below (the
+    // pipe thread catches those and keeps going, so a leak here would repeat).
+    struct MemMapGuard {
+        MEMMAP& map;
+        ~MemMapGuard() { if (map.page) BridgeFree(map.page); }
+    } memMapGuard{memMap};
+
+    struct Match { duint address; std::string context; };
+    std::vector<Match> matches;
+    const char* stopReason = "";
+    unsigned long long bytesScanned = 0;
+    int regionsScanned = 0;
+
+    std::vector<unsigned char> buffer;
+    std::vector<std::pair<size_t, size_t>> spans;
+    auto startTime = std::chrono::steady_clock::now();
+
+    for (int i = 0; i < memMap.count && stopReason[0] == '\0'; i++) {
+        const MEMPAGE* page = &memMap.page[i];
+        const DWORD protect = page->mbi.Protect;
+
+        if (page->mbi.State != MEM_COMMIT) continue;
+        if (protect & (PAGE_NOACCESS | PAGE_GUARD)) continue;
+        if (requiredMask != 0 && (protect & requiredMask) == 0) continue;
+
+        const duint base = (duint)page->mbi.BaseAddress;
+        const size_t regionSize = (size_t)page->mbi.RegionSize;
+        if (regionSize < patLen) continue;
+
+        regionsScanned++;
+        std::string context(page->info);
+        if (context.size() > SEARCH_CONTEXT_MAX) context.resize(SEARCH_CONTEXT_MAX);
+
+        for (size_t off = 0; off < regionSize; ) {
+            if (!g_running) { stopReason = "shutdown"; break; }
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - startTime).count();
+            if (elapsed >= SEARCH_TIME_LIMIT_MS) { stopReason = "time_limit"; break; }
+
+            // Read patLen - 1 bytes past the chunk (within the region) so a
+            // match straddling the chunk edge is still seen. Matches are only
+            // counted if they START inside this chunk, so none is reported twice.
+            const size_t chunk = std::min(SEARCH_CHUNK, regionSize - off);
+            const size_t readLen = std::min(chunk + patLen - 1, regionSize - off);
+            buffer.resize(readLen);
+            ReadMemoryTolerant(base + off, buffer.data(), readLen, &spans);
+
+            for (const auto& span : spans) {
+                const size_t spanEnd = span.first + span.second;
+                for (size_t j = span.first; j + patLen <= spanEnd && j < chunk; j++) {
+                    bool hit = true;
+                    for (size_t k = 0; k < patLen; k++) {
+                        if (!parsed[k].second && buffer[j + k] != parsed[k].first) {
+                            hit = false;
+                            break;
+                        }
+                    }
+                    if (hit) {
+                        matches.push_back({base + off + j, context});
+                        if ((int)matches.size() >= maxMatches) {
+                            stopReason = "max_matches";
+                            break;
+                        }
+                    }
+                }
+                if (stopReason[0] != '\0') break;
+            }
+
+            bytesScanned += chunk;
+            off += chunk;
+            if (stopReason[0] != '\0') break;
+        }
+    }
+
+    std::stringstream data;
+    data << "\"count\":" << matches.size() << ","
+         << "\"region\":\"" << JsonEscape(region) << "\","
+         << "\"regions_scanned\":" << regionsScanned << ","
+         << "\"bytes_scanned\":" << bytesScanned << ","
+         << "\"truncated\":" << (stopReason[0] != '\0' ? "true" : "false") << ","
+         << "\"stop_reason\":\"" << stopReason << "\","
+         << "\"matches\":[";
+    for (size_t i = 0; i < matches.size(); i++) {
+        if (i > 0) data << ",";
+        data << "{\"address\":\"" << std::hex << matches[i].address << std::dec << "\","
+             << "\"context\":\"" << JsonEscape(matches[i].context) << "\"}";
+    }
+    data << "]";
+
+    return BuildJsonResponse(true, data.str());
+}
+
 // Handler: STEP_INTO - Single-step into next instruction
 std::string HandleStepInto(const std::string& request) {
     if (!DbgIsDebugging()) {
@@ -3256,30 +3561,9 @@ std::string HandlePatternScan(const std::string& request) {
 
     // Parse pattern - format: "90 ?? E8 ?? ?? ?? ??" or "90??E8??????"
     std::vector<std::pair<unsigned char, bool>> parsedPattern;  // (byte, isWildcard)
-
-    std::string cleanPattern;
-    for (char c : pattern) {
-        if (isxdigit(c) || c == '?') {
-            cleanPattern += toupper(c);
-        }
-    }
-
-    if (cleanPattern.length() % 2 != 0) {
-        return BuildJsonResponse(false, "\"error\":\"Invalid pattern length\"");
-    }
-
-    for (size_t i = 0; i < cleanPattern.length(); i += 2) {
-        if (cleanPattern[i] == '?' || cleanPattern[i + 1] == '?') {
-            parsedPattern.push_back({0, true});  // Wildcard
-        } else {
-            unsigned int byte;
-            sscanf(cleanPattern.c_str() + i, "%02X", &byte);
-            parsedPattern.push_back({(unsigned char)byte, false});
-        }
-    }
-
-    if (parsedPattern.empty()) {
-        return BuildJsonResponse(false, "\"error\":\"Empty pattern\"");
+    std::string parseError;
+    if (!ParseBytePattern(pattern, parsedPattern, parseError)) {
+        return BuildJsonResponse(false, "\"error\":\"" + JsonEscape(parseError) + "\"");
     }
 
     // Resolve start address
@@ -4957,6 +5241,12 @@ static DWORD WINAPI PipeServerThread(LPVOID lpParam) {
                         break;
                     case WRITE_MEMORY:
                         response = HandleWriteMemory(request);
+                        break;
+                    case DUMP_MEMORY:
+                        response = HandleDumpMemory(request);
+                        break;
+                    case SEARCH_MEMORY:
+                        response = HandleSearchMemory(request);
                         break;
 
                     // Execution control

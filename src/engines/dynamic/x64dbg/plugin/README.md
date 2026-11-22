@@ -164,6 +164,8 @@ Essential for automation scripts - block until debugger reaches desired state.
 |----------|--------|-------------|
 | `/api/memory/read` | POST | Read memory |
 | `/api/memory/write` | POST | Write memory |
+| `/api/memory/dump` | POST | Read up to 256 KB, zero-filling unreadable pages (`address`, `size`); the bridge chunks larger dumps |
+| `/api/memory/search` | POST | Search committed memory for a byte pattern with `??` wildcards (`pattern`, `region`: all/executable/writable, `max_matches` ≤ 2000) |
 | `/api/disassemble` | POST | Disassemble at address |
 
 ### Memory Allocation (NEW - Phase 3)

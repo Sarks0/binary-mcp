@@ -10,7 +10,7 @@ from typing import Any
 
 from src.utils.formatters import neutralise_untrusted_delimiters
 
-from .bridge import X64DbgBridge
+from .bridge import X64DbgAPIError, X64DbgBridge
 
 logger = logging.getLogger(__name__)
 
@@ -85,32 +85,84 @@ class X64DbgCommands:
 
         return "\n".join(status)
 
-    def run_to_address(self, address: str) -> dict[str, Any]:
+    def run_to_address(self, address: str, timeout: int = 30000) -> dict[str, Any]:
         """
-        Run until reaching specified address.
+        Run until execution reaches ``address``.
 
-        Sets temporary breakpoint, runs, then removes breakpoint.
+        Sets a temporary breakpoint (unless one is already there), resumes,
+        and waits for the debugger to pause. The temporary breakpoint is
+        removed afterwards whatever happened; a breakpoint the caller had
+        already set at that address is left alone.
+
+        Execution can pause somewhere else first -- another breakpoint, an
+        exception -- or not pause before the timeout. Both are reported
+        rather than raised, because the debuggee's state after them is
+        exactly what the caller needs to know.
 
         Args:
-            address: Target address
+            address: Target address (hex string)
+            timeout: Maximum wait in milliseconds
 
         Returns:
-            Execution state when breakpoint hit
+            Dictionary with ``reached`` (paused at the target), ``target``,
+            ``address`` (where execution is now), ``state``, ``elapsed_ms``,
+            and ``error`` when it did not pause in time.
         """
         self.ensure_connected()
 
-        # Set breakpoint
-        self.bridge.set_breakpoint(address)
+        target_hex = self.bridge._normalize_address(address)
+        target = int(target_hex, 16)
 
-        # Run
-        self.bridge.run()
+        def _same_address(value: Any) -> bool:
+            try:
+                return int(str(value), 16) == target
+            except (TypeError, ValueError):
+                return False
 
-        # TODO: Wait for breakpoint hit (needs event system)
+        already_set = any(
+            _same_address(bp.get("address"))
+            for bp in self.bridge.list_breakpoints()
+        )
+        if not already_set:
+            self.bridge.set_breakpoint(target_hex)
 
-        # Remove breakpoint
-        self.bridge.delete_breakpoint(address)
+        wait_result: dict[str, Any] = {}
+        wait_error: str | None = None
+        try:
+            self.bridge.run()
+            try:
+                wait_result = self.bridge.wait_until_paused(timeout=timeout)
+            except X64DbgAPIError as e:
+                # The plugin reports a wait timeout as an API failure. That is
+                # an outcome here, not a fault: the debuggee is still running.
+                wait_error = e.api_message
+        finally:
+            if not already_set:
+                try:
+                    self.bridge.delete_breakpoint(target_hex)
+                except Exception as e:
+                    logger.warning(
+                        f"Could not remove temporary breakpoint at 0x{target_hex}: {e}"
+                    )
 
-        return self.bridge.get_current_location()
+        location = self.bridge.get_current_location()
+        result: dict[str, Any] = {
+            "target": target_hex,
+            "address": location.get("address", "unknown"),
+            "state": location.get("state", "unknown"),
+            "elapsed_ms": wait_result.get("elapsed_ms", 0),
+        }
+        if wait_error is not None:
+            result["reached"] = False
+            result["error"] = wait_error
+            # GET_STATE cannot see "running" (it only answers while paused),
+            # so say what the wait established.
+            result["state"] = "running"
+        else:
+            result["reached"] = _same_address(
+                wait_result.get("current_address", result["address"])
+            )
+        return result
 
     def dump_registers(self) -> str:
         """

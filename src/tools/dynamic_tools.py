@@ -2493,23 +2493,51 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             return safe_error_message("x64dbg_get_api_params failed", e)
 
     @log_dynamic_tool
-    def x64dbg_run_to_address(address: str) -> str:
+    def x64dbg_run_to_address(address: str, timeout_seconds: int = 30) -> str:
         """
         Run until reaching specified address.
 
-        Sets temporary breakpoint and runs until hit.
+        Sets a temporary breakpoint, runs, and waits for the debugger to
+        pause. The temporary breakpoint is removed afterwards; an existing
+        breakpoint at the address is kept.
 
         Args:
             address: Target address
+            timeout_seconds: Maximum wait in seconds (default: 30, max: 300)
 
         Returns:
-            Execution state when address reached
+            Where execution stopped, and whether that is the target. Stopping
+            elsewhere (another breakpoint, an exception) or timing out is
+            reported, not treated as an error.
         """
         try:
+            if timeout_seconds <= 0:
+                return "Error: timeout_seconds must be positive"
             commands = get_x64dbg_commands()
-            state = commands.run_to_address(address)
+            state = commands.run_to_address(
+                address, timeout=min(timeout_seconds, 300) * 1000
+            )
 
-            return f"Reached address: 0x{state['address']}\nState: {state['state']}"
+            if state["reached"]:
+                return (
+                    f"Reached address: 0x{state['address']}\n"
+                    f"State: paused\n"
+                    f"Elapsed: {state['elapsed_ms']}ms"
+                )
+            if "error" in state:
+                return (
+                    f"Did not reach 0x{state['target']} within {timeout_seconds}s\n"
+                    f"State: running\n"
+                    f"Error: {state['error']}\n\n"
+                    f"The program is still running. Use x64dbg_pause() to stop it."
+                )
+            return (
+                f"Stopped before reaching 0x{state['target']}\n"
+                f"Current address: 0x{state['address']}\n"
+                f"State: {state['state']}\n\n"
+                f"Execution paused elsewhere first (another breakpoint or an "
+                f"exception). Use x64dbg_get_events() to see why."
+            )
 
         except Exception as e:
             logger.error(f"x64dbg_run_to_address failed: {e}")
@@ -3037,7 +3065,8 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             - Reconstruct PE files
 
         Note:
-            Requires x64dbg plugin C++ implementation
+            Pages the debuggee cannot read are zero-filled so file offsets
+            still match addresses; the result says how many bytes that was.
         """
         # Security: Validate size to prevent memory exhaustion
         if size <= 0:
@@ -3072,17 +3101,24 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         try:
             bridge = get_x64dbg_bridge()
-            bridge.dump_memory(address, size, str(safe_path))
+            result = bridge.dump_memory(address, size, str(safe_path))
 
-            return f"Memory dumped successfully\n" \
-                   f"Address: {address}\n" \
-                   f"Size: {size} bytes ({size / 1024:.2f} KB)\n" \
-                   f"Output: {safe_path}"
+            lines = [
+                "Memory dumped successfully",
+                f"Address: {address}",
+                f"Size: {size} bytes ({size / 1024:.2f} KB)",
+                f"Output: {safe_path}",
+            ]
+            unreadable = result.get("unreadable_bytes", 0)
+            if unreadable:
+                lines.append(
+                    f"Unreadable: {unreadable} bytes were not readable in the "
+                    "debuggee and are zero-filled in the file"
+                )
+            return "\n".join(lines)
 
         except Exception as e:
             logger.error(f"x64dbg_dump_memory failed: {e}")
-            if "Not yet implemented" in str(e):
-                return "Not available: Memory dump is not yet implemented in the x64dbg plugin."
             return safe_error_message("x64dbg_dump_memory failed", e)
 
     @log_dynamic_tool
@@ -3110,27 +3146,52 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             - Find injected code
 
         Note:
-            Requires x64dbg plugin C++ implementation
+            Scans committed memory only, skipping no-access and guard pages.
+            Use ?? for wildcard bytes. Stops after 1000 matches or 90 seconds.
         """
         try:
             bridge = get_x64dbg_bridge()
-            matches = bridge.search_memory(pattern, region)
+            search = bridge.search_memory(pattern, region)
+            matches = search["matches"]
+
+            stop_notes = {
+                "max_matches": "stopped at the match limit; narrow the pattern or region",
+                "time_limit": "stopped at the plugin's time limit; results are partial",
+                "shutdown": "stopped because the plugin is shutting down",
+            }
+            scanned = (
+                f"Scanned: {search['regions_scanned']} region(s), "
+                f"{search['bytes_scanned'] / (1024 * 1024):.1f} MB"
+            )
 
             if not matches:
-                return f"No matches found for pattern: {pattern}"
+                lines = [f"No matches found for pattern: {pattern}", f"Region: {region}", scanned]
+                if search["truncated"]:
+                    lines.append(f"Note: {stop_notes.get(search['stop_reason'], 'search incomplete')}")
+                return "\n".join(lines)
 
             result = [
                 "Memory Search Results:",
                 f"Pattern: {pattern}",
                 f"Region: {region}",
-                f"Found {len(matches)} match(es)",
-                "-" * 60
+                f"Found {search['count']} match(es)",
+                scanned,
             ]
+            if search["truncated"]:
+                result.append(f"Note: {stop_notes.get(search['stop_reason'], 'search incomplete')}")
+            result.append("-" * 60)
 
+            # The context is x64dbg's label for the region -- module and
+            # section names the sample chose -- so it is fenced as untrusted.
+            match_lines = []
             for i, match in enumerate(matches[:50]):  # Limit to 50 results
                 addr = match.get("address", "unknown")
                 context = match.get("context", "")
-                result.append(f"{i+1}. 0x{addr} {context}")
+                match_lines.append(f"{i+1}. 0x{addr} {context}".rstrip())
+            result.append(wrap_untrusted(
+                "\n".join(match_lines),
+                kind="memory search matches with region labels from the target",
+            ))
 
             if len(matches) > 50:
                 result.append(f"\n... and {len(matches) - 50} more matches")
@@ -3139,8 +3200,6 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
 
         except Exception as e:
             logger.error(f"x64dbg_search_memory failed: {e}")
-            if "Not yet implemented" in str(e):
-                return "Not available: Memory search is not yet implemented in the x64dbg plugin."
             return safe_error_message("x64dbg_search_memory failed", e)
 
     # Advanced search tools

@@ -6,6 +6,7 @@ Communicates with the x64dbg native plugin via HTTP API.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import re
@@ -38,6 +39,14 @@ logger = logging.getLogger(__name__)
 
 # Security: Maximum size for memory dumps (100MB) to prevent memory exhaustion
 MAX_DUMP_SIZE = 100 * 1024 * 1024
+
+# Bytes per /api/memory/dump request. Must not exceed DUMP_CHUNK_MAX in
+# plugin.cpp: the hex-encoded reply has to fit in one 1 MB pipe message.
+DUMP_CHUNK_SIZE = 256 * 1024
+
+# SEARCH_TIME_LIMIT_MS in plugin.cpp, in seconds: how long one memory search
+# may run before the plugin stops and returns what it has.
+SEARCH_TIME_LIMIT_S = 90
 
 
 # x64dbg command-string structure (audit findings F-9 / F-16)
@@ -989,6 +998,21 @@ class X64DbgBridge(Debugger):
         finally:
             self.timeout = previous_timeout
 
+    @contextlib.contextmanager
+    def _http_timeout_at_least(self, seconds: float):
+        """
+        Raise the HTTP timeout to at least ``seconds`` for the enclosed calls.
+
+        For requests the plugin deliberately holds open (waits, memory search);
+        everything else keeps the normal, shorter timeout.
+        """
+        previous = self.timeout
+        self.timeout = max(previous, seconds)
+        try:
+            yield
+        finally:
+            self.timeout = previous
+
     def disconnect(self) -> None:
         """Disconnect from x64dbg plugin."""
         self.connected = False
@@ -1796,9 +1820,15 @@ class X64DbgBridge(Debugger):
         except Exception:
             return False
 
-    def dump_memory(self, address: str, size: int, output_file: str) -> bool:
+    def dump_memory(self, address: str, size: int, output_file: str) -> dict[str, Any]:
         """
         Dump memory region to file.
+
+        The plugin returns at most DUMP_CHUNK_SIZE bytes per request (its reply
+        has to fit in one 1 MB pipe message once hex-encoded), so larger dumps
+        are fetched chunk by chunk and streamed to the file. Pages the debuggee
+        cannot read come back as zeros, keeping file offsets aligned with
+        addresses; their total is reported as ``unreadable_bytes``.
 
         Args:
             address: Start address (hex string)
@@ -1806,13 +1836,11 @@ class X64DbgBridge(Debugger):
             output_file: Path to save dumped memory
 
         Returns:
-            True if dump successful
+            Dictionary with ``output_file``, ``bytes_written`` and
+            ``unreadable_bytes``.
 
         Raises:
             ValueError: If size is invalid or exceeds maximum
-
-        Note:
-            Requires C++ plugin implementation of /api/memory/dump
         """
         # Security: Validate size to prevent memory exhaustion (defense-in-depth)
         if size <= 0:
@@ -1831,51 +1859,102 @@ class X64DbgBridge(Debugger):
         except (PathTraversalError, ValueError) as e:
             raise ValueError(f"Invalid output path: {e}")
 
-        address = self._normalize_address(address)
+        base = int(self._normalize_address(address), 16)
 
-        data = {
-            "address": address,
-            "size": size
+        written = 0
+        unreadable = 0
+        try:
+            with open(output_file, "wb") as f:
+                while written < size:
+                    chunk = min(DUMP_CHUNK_SIZE, size - written)
+                    result = self._request(
+                        "/api/memory/dump",
+                        {"address": f"{base + written:x}", "size": chunk},
+                    )
+                    chunk_bytes = bytes.fromhex(result.get("data", ""))
+                    if len(chunk_bytes) != chunk:
+                        raise RuntimeError(
+                            f"Plugin returned {len(chunk_bytes)} bytes for a "
+                            f"{chunk}-byte chunk at 0x{base + written:x}"
+                        )
+                    f.write(chunk_bytes)
+                    written += chunk
+                    unreadable += int(result.get("unreadable_bytes", 0))
+        except BaseException:
+            # A partial dump looks like a complete one to anything that opens
+            # it later; do not leave it behind.
+            Path(output_file).unlink(missing_ok=True)
+            raise
+
+        logger.info(
+            f"Dumped {written} bytes to {output_file} "
+            f"({unreadable} unreadable, zero-filled)"
+        )
+        return {
+            "output_file": output_file,
+            "bytes_written": written,
+            "unreadable_bytes": unreadable,
         }
 
-        result = self._request("/api/memory/dump", data)
-        hex_data = result.get("data", "")
+    _SEARCH_REGIONS = ("all", "executable", "writable")
 
-        # Convert hex string to bytes and write to file
-        memory_bytes = bytes.fromhex(hex_data)
-        with open(output_file, 'wb') as f:
-            f.write(memory_bytes)
-
-        logger.info(f"Dumped {len(memory_bytes)} bytes to {output_file}")
-        return True
-
-    def search_memory(self, pattern: str, memory_region: str = "all") -> list[dict[str, str]]:
+    def search_memory(
+        self,
+        pattern: str,
+        memory_region: str = "all",
+        max_matches: int = 1000,
+    ) -> dict[str, Any]:
         """
-        Search memory for byte pattern.
+        Search the debuggee's committed memory for a byte pattern.
 
         Args:
-            pattern: Hex pattern to search for (e.g., "90 90 90" or "909090")
-            memory_region: Region to search ("all", "executable", "writable")
+            pattern: Hex bytes, optionally spaced, with ``??`` wildcards
+                (e.g. "90 90 90", "E8 ?? ?? ?? ??", "4D5A")
+            memory_region: "all", "executable" or "writable"
+            max_matches: Stop after this many matches (plugin caps at 2000)
 
         Returns:
-            List of addresses where pattern was found
-
-        Note:
-            Requires C++ plugin implementation of /api/memory/search
+            Dictionary with ``matches`` (list of ``{"address", "context"}``),
+            ``count``, ``truncated``, ``stop_reason`` ("max_matches",
+            "time_limit" or ""), ``regions_scanned`` and ``bytes_scanned``.
         """
-        # Normalize pattern
-        hex_pattern = pattern.replace(" ", "").replace("0x", "")
+        region = memory_region.strip().lower()
+        if region not in self._SEARCH_REGIONS:
+            raise ValueError(
+                f"Invalid region '{memory_region}': use one of "
+                f"{', '.join(self._SEARCH_REGIONS)}"
+            )
+
+        hex_pattern = re.sub(r"0x", "", pattern, flags=re.IGNORECASE)
+        hex_pattern = re.sub(r"\s+", "", hex_pattern)
+        if not hex_pattern or not re.fullmatch(r"(?:[0-9A-Fa-f?]{2})+", hex_pattern):
+            raise ValueError(
+                f"Invalid pattern '{pattern}': expected hex byte pairs, "
+                "optionally with ?? wildcards"
+            )
+        if set(hex_pattern) <= {"?"}:
+            raise ValueError("Pattern must contain at least one non-wildcard byte")
 
         data = {
             "pattern": hex_pattern,
-            "region": memory_region
+            "region": region,
+            "max_matches": max_matches,
         }
 
-        result = self._request("/api/memory/search", data)
-        matches = result.get("matches", [])
+        # The plugin may scan for up to SEARCH_TIME_LIMIT_S before answering.
+        with self._http_timeout_at_least(SEARCH_TIME_LIMIT_S + 30):
+            result = self._request("/api/memory/search", data)
 
+        matches = result.get("matches", [])
         logger.debug(f"Found {len(matches)} matches for pattern {pattern}")
-        return matches
+        return {
+            "matches": matches,
+            "count": result.get("count", len(matches)),
+            "truncated": bool(result.get("truncated", False)),
+            "stop_reason": result.get("stop_reason", ""),
+            "regions_scanned": result.get("regions_scanned", 0),
+            "bytes_scanned": result.get("bytes_scanned", 0),
+        }
 
     def get_memory_map(self) -> list[dict[str, Any]]:
         """
@@ -3226,7 +3305,10 @@ class X64DbgBridge(Debugger):
                 print(f"Timeout after {result['elapsed_ms']}ms")
         """
         data = {"timeout": timeout}
-        result = self._request("/api/wait/paused", data)
+        # The plugin holds the reply until it pauses or `timeout` passes, so
+        # the HTTP read must outlast the wait or a long wait fails client-side.
+        with self._http_timeout_at_least(timeout / 1000 + 10):
+            result = self._request("/api/wait/paused", data)
         return result
 
     def wait_until_running(self, timeout: int = 10000) -> dict[str, Any]:

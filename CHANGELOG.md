@@ -4,6 +4,27 @@
 Do not edit by hand. Regenerate it in the release PR with
 `make changelog VERSION=vX.Y.Z`. -->
 
+## Unreleased
+
+### Security
+
+- Label the plugin's token file with a no-read-up integrity level, so a lower-integrity process cannot read the token of an elevated x64dbg
+- Disable `/api/load` unless `obsidian.ini` sets `[api] allow_load_binary=1`
+- Validate `SET_REGISTER` values and `bpx` symbols in the plugin, and refuse `;` or control characters in every handler-built x64dbg command
+- Cap plugin responses at the 1 MiB pipe frame; the server now reads exact lengths with timeouts and resets the pipe on a framing error instead of exiting
+- Stop the bridge sending the bearer token through `HTTP_PROXY`/`HTTPS_PROXY`, and refuse redirects
+- Bind the listener with `SO_EXCLUSIVEADDRUSE` instead of `SO_REUSEADDR`
+- Make no network requests while checking a client certificate, and use the intermediates the client sends
+- Throttle repeatedly failing remote peers and shorten the header and TLS handshake deadlines; bound pattern scans
+- Use a per-session random pipe name created with `FILE_FLAG_FIRST_PIPE_INSTANCE`; the server verifies the pipe server's PID and connects at identification level
+- Never write a pinned token to `%TEMP%`; pass the token to the server in a private environment block
+- Open plugin output files by handle and verify their final location before writing
+- Parse plugin requests as strict JSON and refuse duplicate keys; forward exactly `Content-Length` bytes
+- Escape debuggee strings in coverage exports, decode `WRITE_MEMORY` hex strictly, reply to empty pipe frames, and terminate the server reliably on unload
+- Require an exact `Origin` match, check the negotiated TLS protocol, and validate the server's token
+- Build both binaries with `/guard:cf`, and `/CETCOMPAT` on x64
+- Stop logging request bodies, cap the server text log, and keep pre-auth noise from filling the activity log
+
 ## v1.3.0 - 2026-11-22
 
 ### Changes

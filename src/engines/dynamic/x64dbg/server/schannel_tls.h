@@ -66,7 +66,11 @@ static const size_t INITIAL_IO_BUFFER = 32 * 1024;
 // peer sending one byte every four seconds -- under the 5 s SO_RCVTIMEO --
 // never returned control to it. The server handles one connection at a time,
 // so that was a single unauthenticated peer denying the whole bridge.
-static const unsigned long long HANDSHAKE_DEADLINE_MS = 15000;
+//
+// 10 s rather than the request's 15: a resumed handshake is one round trip and
+// a full one a few, so this is generous for a real client and caps what a
+// stalling peer can hold the single-threaded server for.
+static const unsigned long long HANDSHAKE_DEADLINE_MS = 10000;
 
 // Convert 40 hex characters into the 20 raw bytes CERT_FIND_HASH wants.
 inline bool ThumbprintToBytes(const std::string& hex, BYTE* out20) {
@@ -242,9 +246,27 @@ inline bool ClientCertificateChainsTo(PCCERT_CONTEXT clientCert,
     chainParameters.RequestedUsage.Usage.cUsageIdentifier = 1;
     chainParameters.RequestedUsage.Usage.rgpszUsageIdentifier = clientAuthOid;
 
+    // No network during this check (review finding M5).
+    //
+    // This runs BEFORE the client is authenticated, on a certificate the
+    // client chose. With dwFlags 0 the chain engine was free to chase the
+    // certificate's Authority Information Access URL and to fetch root
+    // updates, so an unauthenticated peer could make this host -- an analysis
+    // machine that is meant to be isolated -- issue outbound requests to a
+    // URL of its choosing, while the single-threaded server waited on them.
+    // Chain building must use only what is on this machine plus what the
+    // client sent in the handshake.
+    const DWORD chainFlags = CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL |
+                             CERT_CHAIN_DISABLE_AIA |
+                             CERT_CHAIN_DISABLE_AUTH_ROOT_AUTO_UPDATE;
+
+    // The intermediates the client presented live in the certificate
+    // context's own store. Passing it means a CA hierarchy with an
+    // intermediate works without installing that intermediate locally --
+    // which matters more now that it can no longer be fetched.
     PCCERT_CHAIN_CONTEXT chain = nullptr;
-    if (!CertGetCertificateChain(nullptr, clientCert, nullptr, nullptr,
-                                 &chainParameters, 0, nullptr, &chain)) {
+    if (!CertGetCertificateChain(nullptr, clientCert, nullptr, clientCert->hCertStore,
+                                 &chainParameters, chainFlags, nullptr, &chain)) {
         Log("TLS: cannot build a chain for the client certificate (error %lu)",
             GetLastError());
         return false;
@@ -484,6 +506,28 @@ public:
         m_headerSize = sizes.cbHeader;
         m_trailerSize = sizes.cbTrailer;
         m_maxMessage = sizes.cbMaximumMessage;
+
+        // Check what was actually negotiated rather than trusting that the
+        // credential's protocol mask is the only thing that decides it
+        // (review finding I2). Anything below TLS 1.2 is refused outright.
+        SecPkgContext_ConnectionInfo connectionInfo = {};
+        const SECURITY_STATUS infoStatus =
+            QueryContextAttributes(&m_context, SECPKG_ATTR_CONNECTION_INFO, &connectionInfo);
+        if (infoStatus != SEC_E_OK) {
+            Log("TLS: cannot query the negotiated protocol (0x%08lx)",
+                static_cast<unsigned long>(infoStatus));
+            return false;
+        }
+        const DWORD allowedProtocols = SP_PROT_TLS1_2_SERVER
+#ifdef SP_PROT_TLS1_3_SERVER
+                                       | SP_PROT_TLS1_3_SERVER
+#endif
+            ;
+        if ((connectionInfo.dwProtocol & allowedProtocols) == 0) {
+            Log("TLS: refusing a connection negotiated as protocol 0x%08lx",
+                static_cast<unsigned long>(connectionInfo.dwProtocol));
+            return false;
+        }
 
         if (requireClientCert && !VerifyClientCertificate(clientCaThumbprint)) {
             return false;

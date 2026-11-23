@@ -16,6 +16,11 @@
 #include <atomic>      // g_running / g_serverProcessId cross thread boundaries
 #include <cstring>
 #include <cstdlib>
+#include <cerrno>      // ERANGE from strtoll in ExtractIntField
+#include <climits>     // INT_MIN / INT_MAX
+#include <chrono>      // wait handlers and the pattern-scan time budget
+#include <io.h>        // _open_osfhandle for confined output files
+#include <fcntl.h>     // _O_WRONLY / _O_TEXT
 #include <wincrypt.h>  // For CryptGenRandom
 #include <sddl.h>      // For ConvertSidToStringSid / SDDL security descriptors
 
@@ -181,6 +186,18 @@ static std::atomic<bool> g_running{false};
 // read by PipeServerThread to authenticate the pipe peer (finding F-17). Zero
 // means "no server spawned yet", which must be treated as "reject everything".
 static std::atomic<DWORD> g_serverProcessId{0};
+
+// This session's pipe name: Protocol::PIPE_NAME plus a random suffix, chosen in
+// pluginSetup before the pipe thread starts and handed to the server on its
+// command line (review finding L1). A fixed, well-known name could be created
+// by any local process before x64dbg started.
+static std::string g_pipeName = Protocol::PIPE_NAME;
+
+// LOAD_BINARY starts an arbitrary executable under the debugger, i.e. code
+// execution on this host for anyone holding the bearer token. No MCP tool uses
+// it; direct HTTP clients get it only when obsidian.ini opts in with
+// [api] allow_load_binary=1 (review finding H1). Read once in pluginSetup.
+static std::atomic<bool> g_allowLoadBinary{false};
 
 // Serialises access to g_pipeServer between PipeServerThread (which owns and
 // is the ONLY closer of the handle) and pluginStop (which may only cancel I/O
@@ -437,97 +454,318 @@ std::string JsonEscape(const std::string& str) {
     return result;
 }
 
-// Extract integer value from JSON string
+// STRICT REQUEST PARSING (review finding L6)
 //
-// AUDIT (silent parse failure): this used to discard sscanf's return value, so
-// an unparseable value ("timeout":"abc", "timeout":null, a truncated request)
-// left `value` at its initialiser 0 and the function returned 0 instead of the
-// caller's defaultValue. That is not a cosmetic difference: every caller picked
-// its default deliberately, and 0 is frequently the WORST possible value for
-// the field -- `ExtractIntField(request, "type", -1)` would report request type
-// 0 rather than "absent", and the wait handlers would collapse their timeout.
-// Honour the conversion result and fall back to defaultValue on failure.
-int ExtractIntField(const std::string& json, const char* fieldName, int defaultValue = 0) {
-    std::string searchStr = std::string("\"") + fieldName + "\":";
-    size_t pos = json.find(searchStr);
-    if (pos == std::string::npos) return defaultValue;
+// Request fields used to be located with json.find("\"field\":") -- the FIRST
+// occurrence anywhere in the text. That ignored nesting, never decoded \uXXXX
+// escapes, read integers with sscanf("%d") (undefined behaviour on overflow),
+// and resolved duplicate keys first-wins while the Python bridge's json module
+// resolves them last-wins. Two parsers reading the same bytes differently is
+// how gates end up validating one value while another is executed.
+//
+// Requests are now parsed as one JSON object, top level only:
+//   * anything that is not a single well-formed object is refused;
+//   * a duplicated key is refused -- including a client-supplied "type"
+//     arriving next to the one obsidian_server injects;
+//   * string escapes, \uXXXX and surrogate pairs included, are decoded to UTF-8;
+//   * nested objects/arrays are validated and kept as raw text.
+// ExtractIntField / ExtractStringField keep their signatures, so the handlers
+// are unchanged; they now read from the parsed object.
 
-    pos += searchStr.length();
-    while (pos < json.length() && (json[pos] == ' ' || json[pos] == '\t')) pos++;
-    if (pos >= json.length()) return defaultValue;
+struct JsonField {
+    enum Kind { STRING, NUMBER, BOOLEAN, NULL_VALUE, COMPOUND } kind;
+    std::string text;  // decoded string, or the raw token for anything else
+};
 
-    // JSON booleans reach integer fields all the time here, because several
-    // request fields are conceptually flags (trace_into, peek) and the Python
-    // side is free to send real booleans. Map them explicitly rather than
-    // letting them fail parsing and silently take the default -- "false" taking
-    // a default of 1 would invert the caller's intent.
-    if (json.compare(pos, 4, "true") == 0) return 1;
-    if (json.compare(pos, 5, "false") == 0) return 0;
+typedef std::map<std::string, JsonField> JsonObject;
 
-    int value = 0;
-    if (sscanf(json.c_str() + pos, "%d", &value) != 1) {
-        return defaultValue;
+static const size_t JSON_MAX_DEPTH = 32;
+
+class StrictJsonParser {
+public:
+    explicit StrictJsonParser(const std::string& text) : m_text(text) {}
+
+    bool ParseObject(JsonObject& out, std::string& error) {
+        out.clear();
+        SkipSpace();
+        if (!Consume('{')) return Fail(error, "request is not a JSON object");
+        SkipSpace();
+        if (Consume('}')) return Finish(error);
+        for (;;) {
+            SkipSpace();
+            std::string key;
+            if (Peek() != '"' || !ParseString(key)) return Fail(error, "expected a string key");
+            SkipSpace();
+            if (!Consume(':')) return Fail(error, "expected ':' after a key");
+            SkipSpace();
+            JsonField field;
+            if (!ParseValue(field, 0)) return Fail(error, "malformed value for key '" + key + "'");
+            if (out.find(key) != out.end()) {
+                return Fail(error, "duplicate key '" + key + "'");
+            }
+            out[key] = field;
+            SkipSpace();
+            if (Consume(',')) continue;
+            if (Consume('}')) return Finish(error);
+            return Fail(error, "expected ',' or '}'");
+        }
     }
-    return value;
+
+private:
+    bool Finish(std::string& error) {
+        SkipSpace();
+        if (m_pos != m_text.size()) return Fail(error, "trailing data after the object");
+        return true;
+    }
+    bool Fail(std::string& error, const std::string& message) {
+        error = message;
+        return false;
+    }
+    char Peek() const { return m_pos < m_text.size() ? m_text[m_pos] : '\0'; }
+    bool Consume(char c) {
+        if (Peek() == c && m_pos < m_text.size()) { m_pos++; return true; }
+        return false;
+    }
+    void SkipSpace() {
+        while (m_pos < m_text.size()) {
+            const char c = m_text[m_pos];
+            if (c != ' ' && c != '\t' && c != '\r' && c != '\n') break;
+            m_pos++;
+        }
+    }
+
+    static int HexValue(char c) {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    }
+    bool ReadHex4(unsigned& out) {
+        if (m_pos + 4 > m_text.size()) return false;
+        out = 0;
+        for (int i = 0; i < 4; i++) {
+            const int v = HexValue(m_text[m_pos + i]);
+            if (v < 0) return false;
+            out = (out << 4) | static_cast<unsigned>(v);
+        }
+        m_pos += 4;
+        return true;
+    }
+    static void AppendUtf8(std::string& out, unsigned cp) {
+        if (cp < 0x80) {
+            out += static_cast<char>(cp);
+        } else if (cp < 0x800) {
+            out += static_cast<char>(0xC0 | (cp >> 6));
+            out += static_cast<char>(0x80 | (cp & 0x3F));
+        } else if (cp < 0x10000) {
+            out += static_cast<char>(0xE0 | (cp >> 12));
+            out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+            out += static_cast<char>(0x80 | (cp & 0x3F));
+        } else {
+            out += static_cast<char>(0xF0 | (cp >> 18));
+            out += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+            out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+            out += static_cast<char>(0x80 | (cp & 0x3F));
+        }
+    }
+
+    // m_pos is on the opening quote.
+    bool ParseString(std::string& out) {
+        out.clear();
+        if (!Consume('"')) return false;
+        while (m_pos < m_text.size()) {
+            const unsigned char c = static_cast<unsigned char>(m_text[m_pos++]);
+            if (c == '"') return true;
+            if (c < 0x20) return false;  // raw control characters are not JSON
+            if (c != '\\') { out += static_cast<char>(c); continue; }
+            if (m_pos >= m_text.size()) return false;
+            const char e = m_text[m_pos++];
+            switch (e) {
+                case '"': out += '"'; break;
+                case '\\': out += '\\'; break;
+                case '/': out += '/'; break;
+                case 'b': out += '\b'; break;
+                case 'f': out += '\f'; break;
+                case 'n': out += '\n'; break;
+                case 'r': out += '\r'; break;
+                case 't': out += '\t'; break;
+                case 'u': {
+                    unsigned cp = 0;
+                    if (!ReadHex4(cp)) return false;
+                    if (cp >= 0xD800 && cp <= 0xDBFF) {
+                        unsigned low = 0;
+                        if (m_pos + 2 > m_text.size() || m_text[m_pos] != '\\' ||
+                            m_text[m_pos + 1] != 'u') return false;
+                        m_pos += 2;
+                        if (!ReadHex4(low) || low < 0xDC00 || low > 0xDFFF) return false;
+                        cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
+                    } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
+                        return false;  // lone low surrogate
+                    }
+                    AppendUtf8(out, cp);
+                    break;
+                }
+                default:
+                    return false;
+            }
+        }
+        return false;  // unterminated
+    }
+
+    bool ParseNumber(std::string& out) {
+        const size_t start = m_pos;
+        Consume('-');
+        if (Peek() == '0') {
+            m_pos++;
+        } else if (Peek() >= '1' && Peek() <= '9') {
+            while (Peek() >= '0' && Peek() <= '9') m_pos++;
+        } else {
+            return false;
+        }
+        if (Consume('.')) {
+            if (!(Peek() >= '0' && Peek() <= '9')) return false;
+            while (Peek() >= '0' && Peek() <= '9') m_pos++;
+        }
+        if (Peek() == 'e' || Peek() == 'E') {
+            m_pos++;
+            if (Peek() == '+' || Peek() == '-') m_pos++;
+            if (!(Peek() >= '0' && Peek() <= '9')) return false;
+            while (Peek() >= '0' && Peek() <= '9') m_pos++;
+        }
+        out = m_text.substr(start, m_pos - start);
+        return true;
+    }
+
+    bool ParseLiteral(const char* word) {
+        const size_t n = strlen(word);
+        if (m_text.compare(m_pos, n, word) != 0) return false;
+        m_pos += n;
+        return true;
+    }
+
+    // Validate a nested object/array; its raw text is all a handler sees.
+    bool SkipCompound(size_t depth) {
+        if (depth >= JSON_MAX_DEPTH) return false;
+        const char open = Peek();
+        const char close = (open == '{') ? '}' : ']';
+        m_pos++;
+        SkipSpace();
+        if (Consume(close)) return true;
+        for (;;) {
+            SkipSpace();
+            if (open == '{') {
+                std::string key;
+                if (Peek() != '"' || !ParseString(key)) return false;
+                SkipSpace();
+                if (!Consume(':')) return false;
+                SkipSpace();
+            }
+            JsonField ignored;
+            if (!ParseValue(ignored, depth + 1)) return false;
+            SkipSpace();
+            if (Consume(',')) continue;
+            return Consume(close);
+        }
+    }
+
+    bool ParseValue(JsonField& field, size_t depth) {
+        const char c = Peek();
+        if (c == '"') {
+            field.kind = JsonField::STRING;
+            return ParseString(field.text);
+        }
+        if (c == '{' || c == '[') {
+            const size_t start = m_pos;
+            if (!SkipCompound(depth)) return false;
+            field.kind = JsonField::COMPOUND;
+            field.text = m_text.substr(start, m_pos - start);
+            return true;
+        }
+        if (c == 't' || c == 'f') {
+            const bool truth = (c == 't');
+            if (!ParseLiteral(truth ? "true" : "false")) return false;
+            field.kind = JsonField::BOOLEAN;
+            field.text = truth ? "true" : "false";
+            return true;
+        }
+        if (c == 'n') {
+            if (!ParseLiteral("null")) return false;
+            field.kind = JsonField::NULL_VALUE;
+            field.text = "null";
+            return true;
+        }
+        field.kind = JsonField::NUMBER;
+        return ParseNumber(field.text);
+    }
+
+    const std::string& m_text;
+    size_t m_pos = 0;
+};
+
+// Parse once per request, not once per field. All handlers run on the pipe
+// thread, so a thread_local cache keyed on the exact request text is enough.
+static const JsonObject* ParsedRequest(const std::string& json, std::string* errorOut = nullptr) {
+    thread_local std::string cachedText;
+    thread_local JsonObject cachedObject;
+    thread_local bool cachedOk = false;
+    thread_local std::string cachedError;
+    thread_local bool primed = false;
+
+    if (!primed || cachedText.size() != json.size() || cachedText != json) {
+        cachedText = json;
+        cachedError.clear();
+        StrictJsonParser parser(cachedText);
+        cachedOk = parser.ParseObject(cachedObject, cachedError);
+        if (!cachedOk) cachedObject.clear();
+        primed = true;
+    }
+    if (errorOut != nullptr) *errorOut = cachedError;
+    return cachedOk ? &cachedObject : nullptr;
 }
 
-// Extract string value from JSON string
-// Handles both quoted strings ("field":"value") and unquoted values ("field":123)
-std::string ExtractStringField(const std::string& json, const char* fieldName, const char* defaultValue = "") {
-    std::string searchStr = std::string("\"") + fieldName + "\":";
-    size_t pos = json.find(searchStr);
-    if (pos == std::string::npos) {
-        // Log for debugging
-        LogInfo("ExtractStringField: field '%s' not found in: %.100s...", fieldName, json.c_str());
+// Is this request a single well-formed JSON object with unique keys? Checked by
+// the dispatcher before any handler sees the request.
+static bool ValidateRequestJson(const std::string& json, std::string& error) {
+    return ParsedRequest(json, &error) != nullptr;
+}
+
+// Integer field. Numbers must be integral and fit an int; true/false map to
+// 1/0 because several fields are conceptually flags. Anything else -- absent,
+// a string, null, a fraction, out of range -- takes the caller's default.
+int ExtractIntField(const std::string& json, const char* fieldName, int defaultValue = 0) {
+    const JsonObject* object = ParsedRequest(json);
+    if (object == nullptr) return defaultValue;
+    const JsonObject::const_iterator it = object->find(fieldName);
+    if (it == object->end()) return defaultValue;
+    const JsonField& field = it->second;
+    if (field.kind == JsonField::BOOLEAN) return field.text == "true" ? 1 : 0;
+    if (field.kind != JsonField::NUMBER) return defaultValue;
+
+    errno = 0;
+    char* end = nullptr;
+    const long long value = strtoll(field.text.c_str(), &end, 10);
+    if (end == field.text.c_str() || *end != '\0' || errno == ERANGE ||
+        value < INT_MIN || value > INT_MAX) {
         return defaultValue;
     }
+    return static_cast<int>(value);
+}
 
-    pos += searchStr.length();
-
-    // Skip whitespace
-    while (pos < json.length() && (json[pos] == ' ' || json[pos] == '\t')) pos++;
-
-    if (pos >= json.length()) return defaultValue;
-
-    // Check if value is quoted or not
-    if (json[pos] == '"') {
-        // Quoted string value
-        pos++;  // Skip opening quote
-        std::string result;
-        while (pos < json.length() && json[pos] != '"') {
-            // Handle escape sequences
-            if (json[pos] == '\\' && pos + 1 < json.length()) {
-                pos++;
-                switch (json[pos]) {
-                    case 'n': result += '\n'; break;
-                    case 'r': result += '\r'; break;
-                    case 't': result += '\t'; break;
-                    case '\\': result += '\\'; break;
-                    case '"': result += '"'; break;
-                    default: result += json[pos]; break;
-                }
-            } else {
-                result += json[pos];
-            }
-            pos++;
-        }
-        return result;
-    } else {
-        // Unquoted value (number, boolean, null)
-        // Read until comma, closing brace, or end
-        size_t endPos = pos;
-        while (endPos < json.length() &&
-               json[endPos] != ',' &&
-               json[endPos] != '}' &&
-               json[endPos] != ']' &&
-               json[endPos] != ' ' &&
-               json[endPos] != '\t' &&
-               json[endPos] != '\n' &&
-               json[endPos] != '\r') {
-            endPos++;
-        }
-        return json.substr(pos, endPos - pos);
+// String field. A string value is returned decoded; a number or boolean is
+// returned as its literal text (the plugin has always accepted "size":"256"
+// and "address":4198400 interchangeably). null, objects and arrays take the
+// default.
+std::string ExtractStringField(const std::string& json, const char* fieldName, const char* defaultValue = "") {
+    const JsonObject* object = ParsedRequest(json);
+    if (object == nullptr) return defaultValue;
+    const JsonObject::const_iterator it = object->find(fieldName);
+    if (it == object->end()) return defaultValue;
+    const JsonField& field = it->second;
+    if (field.kind == JsonField::STRING || field.kind == JsonField::NUMBER ||
+        field.kind == JsonField::BOOLEAN) {
+        return field.text;
     }
+    return defaultValue;
 }
 
 // Build JSON response
@@ -813,6 +1051,122 @@ static bool ResolveConfinedOutputPath(const std::string& requested,
     return true;
 }
 
+// Resolve a handle's real location, without the \\?\ prefix, with a trailing
+// separator added for directories.
+static bool FinalPathOf(HANDLE handle, std::string& out, bool directory) {
+    char buffer[MAX_PATH * 2];
+    const DWORD length = GetFinalPathNameByHandleA(handle, buffer, sizeof(buffer),
+                                                   FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    if (length == 0 || length >= sizeof(buffer)) {
+        return false;
+    }
+    out.assign(buffer, length);
+    if (out.compare(0, 4, "\\\\?\\") == 0) {
+        out.erase(0, 4);
+    }
+    if (directory && (out.empty() || out.back() != '\\')) {
+        out += '\\';
+    }
+    return true;
+}
+
+// Open a path ResolveConfinedOutputPath accepted, and prove -- on the OPEN
+// HANDLE -- that it is where the check said it would be (review finding L4).
+//
+// The path checks are made on names, and fopen() then opened the name again:
+// a junction swapped in between (the root is under %TEMP%, which the debuggee
+// can write) redirected the write, and a hard link to a file elsewhere was
+// never detected at all. Here the file is opened first, without following a
+// final-component reparse point, and only then checked: its normalised final
+// path must lie under the root's own final path, it must not be a reparse
+// point, and it must have exactly one link. Only after that is it truncated.
+// A file this call created in the wrong place is deleted again through the
+// handle, so a refused open leaves nothing behind.
+static FILE* OpenConfinedOutputFile(const std::string& path, std::string& outError) {
+    std::string root;
+    if (!GetOutputRoot(root)) {
+        outError = "Could not prepare the plugin output directory";
+        return nullptr;
+    }
+    HANDLE rootHandle = CreateFileA(root.c_str(), FILE_READ_ATTRIBUTES,
+                                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                    nullptr, OPEN_EXISTING,
+                                    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                                    nullptr);
+    if (rootHandle == INVALID_HANDLE_VALUE) {
+        outError = "Could not open the plugin output directory";
+        return nullptr;
+    }
+    std::string rootFinal;
+    const bool haveRoot = FinalPathOf(rootHandle, rootFinal, true);
+    CloseHandle(rootHandle);
+    if (!haveRoot) {
+        outError = "Could not resolve the plugin output directory";
+        return nullptr;
+    }
+
+    bool created = false;
+    HANDLE file = CreateFileA(path.c_str(), GENERIC_WRITE | DELETE, FILE_SHARE_READ, nullptr,
+                              OPEN_EXISTING,
+                              FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (file == INVALID_HANDLE_VALUE && GetLastError() == ERROR_FILE_NOT_FOUND) {
+        file = CreateFileA(path.c_str(), GENERIC_WRITE | DELETE, FILE_SHARE_READ, nullptr,
+                           CREATE_NEW,
+                           FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+        created = (file != INVALID_HANDLE_VALUE);
+    }
+    if (file == INVALID_HANDLE_VALUE) {
+        outError = "Failed to open file for writing";
+        return nullptr;
+    }
+
+    const auto reject = [&](const char* why) -> FILE* {
+        if (created) {
+            FILE_DISPOSITION_INFO disposition = {};
+            disposition.DeleteFile = TRUE;
+            SetFileInformationByHandle(file, FileDispositionInfo, &disposition,
+                                       sizeof(disposition));
+        }
+        CloseHandle(file);
+        outError = why;
+        return nullptr;
+    };
+
+    BY_HANDLE_FILE_INFORMATION info = {};
+    if (!GetFileInformationByHandle(file, &info)) {
+        return reject("Could not inspect the output file");
+    }
+    if (info.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) {
+        return reject("Output file is a link or directory");
+    }
+    if (info.nNumberOfLinks != 1) {
+        return reject("Output file has multiple hard links");
+    }
+    std::string fileFinal;
+    if (!FinalPathOf(file, fileFinal, false) || fileFinal.size() <= rootFinal.size() ||
+        _strnicmp(fileFinal.c_str(), rootFinal.c_str(), rootFinal.size()) != 0) {
+        return reject("File path resolves outside the plugin output directory");
+    }
+
+    // Verified: now truncate (an existing file was opened without truncation).
+    if (SetFilePointer(file, 0, nullptr, FILE_BEGIN) == INVALID_SET_FILE_POINTER ||
+        !SetEndOfFile(file)) {
+        return reject("Could not truncate the output file");
+    }
+
+    const int fd = _open_osfhandle(reinterpret_cast<intptr_t>(file), _O_WRONLY | _O_TEXT);
+    if (fd == -1) {
+        return reject("Could not wrap the output file handle");
+    }
+    FILE* stream = _fdopen(fd, "w");
+    if (stream == nullptr) {
+        _close(fd);  // closes the handle too
+        outError = "Could not open a stream on the output file";
+        return nullptr;
+    }
+    return stream;
+}
+
 // Extensions each writer may produce. Executable/script extensions are absent
 // on purpose: a confined directory still should not become a drop point for
 // something another process might later run.
@@ -872,6 +1226,76 @@ std::string NormalizeSymbolFormat(const std::string& input) {
     }
 
     return result;
+}
+
+// COMMAND CONSTRUCTION CHOKE POINT (review finding M1)
+//
+// Every handler other than EXECUTE_COMMAND builds an x64dbg command string
+// itself and hands it to the dispatcher. x64dbg splits that string on ';' and
+// runs each piece, so any request text that reaches one of these strings
+// unfiltered is a second command that never passes IsCommandAllowed. Two
+// handlers did exactly that: SET_REGISTER interpolated "value" (only its length
+// was checked) and SET_BREAKPOINT's bpx fallback interpolated "address". The
+// Python bridge validated both, but this plugin is the last line of defence
+// for anything that reaches the HTTP port with a token.
+//
+// So, two layers:
+//   1. each handler validates its own fields strictly (see below); and
+//   2. InternalCmdExec refuses ANY handler-built command carrying a separator
+//      or control character. No handler-built command needs one, so this
+//      cannot break a legitimate call, and a future handler that forgets
+//      layer 1 still cannot chain commands.
+// EXECUTE_COMMAND keeps calling DbgCmdExec directly behind its own allowlist.
+static bool InternalCmdExec(const char* cmd) {
+    for (const char* p = cmd; *p != '\0'; p++) {
+        const unsigned char c = static_cast<unsigned char>(*p);
+        if (c == ';' || c < 0x20 || c == 0x7F) {
+            LogError("Refusing internally built command containing a separator or "
+                     "control character");
+            return false;
+        }
+    }
+    return DbgCmdExec(cmd);
+}
+
+// A value interpolated into "mov <reg>, <value>": a hex literal, optionally
+// 0x-prefixed, at most 16 digits. Strict on purpose -- there is no legitimate
+// register value outside this set, and a pattern this small cannot be got
+// subtly wrong. Matches the bridge's own rule.
+static bool IsRegisterValueLiteral(const std::string& value) {
+    size_t start = 0;
+    if (value.size() > 2 && value[0] == '0' && (value[1] == 'x' || value[1] == 'X')) {
+        start = 2;
+    }
+    const size_t digits = value.size() - start;
+    if (digits == 0 || digits > 16) return false;
+    for (size_t i = start; i < value.size(); i++) {
+        if (!isxdigit(static_cast<unsigned char>(value[i]))) return false;
+    }
+    return true;
+}
+
+// A symbol interpolated into "bpx <symbol>". Module and export names, the
+// module!symbol and module.symbol forms, and the characters MSVC mangling
+// uses (?@$). No whitespace, quotes, commas, separators or controls: each of
+// those changes how x64dbg parses the line.
+static bool IsBreakpointSymbol(const std::string& value) {
+    if (value.empty() || value.size() > 255) return false;
+    for (size_t i = 0; i < value.size(); i++) {
+        const unsigned char c = static_cast<unsigned char>(value[i]);
+        const bool ok = isalnum(c) || c == '_' || c == '.' || c == '!' || c == '@' ||
+                        c == '?' || c == '$' || c == ':' || c == '<' || c == '>' ||
+                        c == '~' || c == '-' || c == '+' || c == '#';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+static int HexDigitValue(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
 }
 
 // Helper: Resolve address string to duint with detailed error reporting
@@ -1013,9 +1437,15 @@ std::string HandleReadMemory(const std::string& request) {
         return BuildJsonResponse(false, "\"error\":\"Missing or invalid address/size\"");
     }
 
-    // Validate size (max 1MB)
-    if (size > 1024 * 1024) {
-        return BuildJsonResponse(false, "\"error\":\"Size too large (max 1MB)\"");
+    // The reply is hex, two characters per byte, and must fit one pipe frame
+    // (review finding M2). The old 1 MiB ceiling produced a 2 MiB reply that
+    // the server could never accept.
+    const int maxReadSize = static_cast<int>((Protocol::MAX_MESSAGE_SIZE - 4096) / 2);
+    if (size > maxReadSize) {
+        std::stringstream err;
+        err << "\"error\":\"Size too large (max " << maxReadSize
+            << " bytes per read; read larger ranges in chunks)\"";
+        return BuildJsonResponse(false, err.str());
     }
 
     // Parse and resolve address
@@ -1053,7 +1483,7 @@ std::string HandleStepInto(const std::string& request) {
     }
 
     // Execute step into
-    DbgCmdExec("StepInto");
+    InternalCmdExec("StepInto");
 
     // Wait for step to complete
     Sleep(100);
@@ -1075,7 +1505,7 @@ std::string HandleStepOver(const std::string& request) {
         return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
     }
 
-    DbgCmdExec("StepOver");
+    InternalCmdExec("StepOver");
 
     // Wait for step to complete
     Sleep(100);
@@ -1096,7 +1526,7 @@ std::string HandleStepOut(const std::string& request) {
         return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
     }
 
-    DbgCmdExec("StepOut");
+    InternalCmdExec("StepOut");
 
     // Step out may take longer - wait for completion
     Sleep(500);
@@ -1142,10 +1572,19 @@ std::string HandleSetBreakpoint(const std::string& request) {
     // If direct resolution failed and it looks like a symbol, try bpx command
     // bpx is designed for setting breakpoints on exported symbols
     if (address == 0 && isSymbol) {
+        // normalizedAddr comes from the request and is about to become part of
+        // a command string. Only symbol characters may reach it (review M1).
+        if (!IsBreakpointSymbol(normalizedAddr)) {
+            std::stringstream errData;
+            errData << "\"error\":\"Invalid symbol: only letters, digits and "
+                    << "_ . ! @ ? $ : < > ~ - + # are allowed\","
+                    << "\"input\":\"" << JsonEscape(addressStr) << "\"";
+            return BuildJsonResponse(false, errData.str());
+        }
         char bpxCmd[512];
         snprintf(bpxCmd, sizeof(bpxCmd), "bpx %s", normalizedAddr.c_str());
 
-        if (DbgCmdExec(bpxCmd)) {
+        if (InternalCmdExec(bpxCmd)) {
             LogInfo("Breakpoint set on symbol: %s (using bpx)", normalizedAddr.c_str());
 
             std::stringstream data;
@@ -1177,7 +1616,7 @@ std::string HandleSetBreakpoint(const std::string& request) {
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "bp %llx", (unsigned long long)address);
 
-    if (!DbgCmdExec(cmd)) {
+    if (!InternalCmdExec(cmd)) {
         // Try to determine why it failed
         std::stringstream errData;
         errData << "\"error\":\"Failed to set breakpoint at 0x" << std::hex << address << std::dec << "\","
@@ -1231,7 +1670,7 @@ std::string HandleDeleteBreakpoint(const std::string& request) {
 
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "bc %llx", (unsigned long long)address);
-    DbgCmdExec(cmd);
+    InternalCmdExec(cmd);
 
     LogInfo("Breakpoint deleted at 0x%llx", (unsigned long long)address);
 
@@ -1644,13 +2083,24 @@ std::string HandleWriteMemory(const std::string& request) {
         return BuildAddressError(errorMsg, addressStr);
     }
 
-    // Convert hex string to bytes
+    // Convert hex string to bytes -- strictly (review finding L9).
+    //
+    // sscanf("%02x") accepted a sign, leading whitespace and a lone digit, and
+    // an odd trailing nibble was silently dropped, so the bytes written to the
+    // debuggee could differ from the bytes requested with nothing reported.
+    // Every character must be a hex digit and the length must be even.
+    if (dataHex.length() % 2 != 0) {
+        return BuildJsonResponse(false, "\"error\":\"Invalid hex data: odd number of digits\"");
+    }
     std::vector<unsigned char> bytes;
-    for (size_t i = 0; i + 1 < dataHex.length(); i += 2) {
-        unsigned int byte;
-        if (sscanf(dataHex.c_str() + i, "%02x", &byte) == 1) {
-            bytes.push_back(static_cast<unsigned char>(byte));
+    bytes.reserve(dataHex.length() / 2);
+    for (size_t i = 0; i < dataHex.length(); i += 2) {
+        const int high = HexDigitValue(dataHex[i]);
+        const int low = HexDigitValue(dataHex[i + 1]);
+        if (high < 0 || low < 0) {
+            return BuildJsonResponse(false, "\"error\":\"Invalid hex data: non-hex character\"");
         }
+        bytes.push_back(static_cast<unsigned char>((high << 4) | low));
     }
 
     if (bytes.empty()) {
@@ -1674,7 +2124,7 @@ std::string HandleRun(const std::string& request) {
         return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
     }
 
-    DbgCmdExec("run");
+    InternalCmdExec("run");
 
     return BuildJsonResponse(true, "\"message\":\"Execution resumed\"");
 }
@@ -1685,7 +2135,7 @@ std::string HandlePause(const std::string& request) {
         return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
     }
 
-    DbgCmdExec("pause");
+    InternalCmdExec("pause");
 
     return BuildJsonResponse(true, "\"message\":\"Execution paused\"");
 }
@@ -1729,15 +2179,19 @@ std::string HandleSetRegister(const std::string& request) {
         return BuildJsonResponse(false, "\"error\":\"Invalid register name\"");
     }
 
-    // Validate value length (prevent injection)
-    if (valueStr.length() > 32) {
-        return BuildJsonResponse(false, "\"error\":\"Value too long\"");
+    // The value is interpolated into a command string, so it must be a plain
+    // hex literal. A length cap alone (the previous check) still admitted a
+    // ';' and a second command (review finding M1).
+    if (!IsRegisterValueLiteral(valueStr)) {
+        return BuildJsonResponse(false,
+            "\"error\":\"Invalid register value: expected 1-16 hexadecimal digits "
+            "(optional 0x prefix)\"");
     }
 
     // Use x64dbg command to set register
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "mov %s, %s", regName.c_str(), valueStr.c_str());
-    if (!DbgCmdExec(cmd)) {
+    if (!InternalCmdExec(cmd)) {
         return BuildJsonResponse(false, "\"error\":\"Failed to set register\"");
     }
 
@@ -1929,7 +2383,7 @@ std::string HandleSkipInstruction(const std::string& request) {
     duint newCip = cip + instr.instr_size;
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "rip=%llx", (unsigned long long)newCip);
-    DbgCmdExec(cmd);
+    InternalCmdExec(cmd);
 
     std::stringstream data;
     data << "\"old_address\":\"" << std::hex << cip << "\","
@@ -1946,7 +2400,7 @@ std::string HandleRunUntilReturn(const std::string& request) {
     }
 
     // Execute "rtr" command (run to return)
-    DbgCmdExec("rtr");
+    InternalCmdExec("rtr");
 
     return BuildJsonResponse(true, "\"message\":\"Running until return\"");
 }
@@ -1980,7 +2434,7 @@ std::string HandleSetHardwareBreakpoint(const std::string& request) {
 
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "bph %llx, %s, %d", (unsigned long long)address, hwType.c_str(), size);
-    if (!DbgCmdExec(cmd)) {
+    if (!InternalCmdExec(cmd)) {
         return BuildJsonResponse(false, "\"error\":\"Failed to set hardware breakpoint\"");
     }
 
@@ -2016,7 +2470,7 @@ std::string HandleSetMemoryBreakpoint(const std::string& request) {
 
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "bpm %llx, %s", (unsigned long long)address, memType.c_str());
-    if (!DbgCmdExec(cmd)) {
+    if (!InternalCmdExec(cmd)) {
         return BuildJsonResponse(false, "\"error\":\"Failed to set memory breakpoint\"");
     }
 
@@ -2044,7 +2498,7 @@ std::string HandleDeleteMemoryBreakpoint(const std::string& request) {
 
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "bpmc %llx", (unsigned long long)address);
-    DbgCmdExec(cmd);
+    InternalCmdExec(cmd);
 
     LogInfo("Memory breakpoint deleted at 0x%llx", (unsigned long long)address);
     return BuildJsonResponse(true, "\"message\":\"Memory breakpoint deleted\"");
@@ -2057,7 +2511,7 @@ std::string HandleHideDebugger(const std::string& request) {
     }
 
     // Use x64dbg's built-in hide debugger functionality
-    DbgCmdExec("hide");
+    InternalCmdExec("hide");
 
     return BuildJsonResponse(true, "\"message\":\"Debugger hidden from target\"");
 }
@@ -2438,7 +2892,7 @@ std::string HandleVirtAlloc(const std::string& request) {
         snprintf(cmd, sizeof(cmd), "alloc %d", size);
     }
 
-    if (!DbgCmdExec(cmd)) {
+    if (!InternalCmdExec(cmd)) {
         return BuildJsonResponse(false, "\"error\":\"Failed to allocate memory\"");
     }
 
@@ -2480,7 +2934,7 @@ std::string HandleVirtFree(const std::string& request) {
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "free %llx", (unsigned long long)address);
 
-    if (!DbgCmdExec(cmd)) {
+    if (!InternalCmdExec(cmd)) {
         return BuildJsonResponse(false, "\"error\":\"Failed to free memory\"");
     }
 
@@ -2537,7 +2991,7 @@ std::string HandleVirtProtect(const std::string& request) {
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "setpagerights %llx, %d, %x", (unsigned long long)address, size, protection);
 
-    if (!DbgCmdExec(cmd)) {
+    if (!InternalCmdExec(cmd)) {
         return BuildJsonResponse(false, "\"error\":\"Failed to change memory protection\"");
     }
 
@@ -2648,7 +3102,7 @@ std::string HandleToggleBreakpoint(const std::string& request) {
         snprintf(cmd, sizeof(cmd), "bpd %llx", (unsigned long long)address);
     }
 
-    if (!DbgCmdExec(cmd)) {
+    if (!InternalCmdExec(cmd)) {
         return BuildJsonResponse(false, "\"error\":\"Failed to toggle breakpoint\"");
     }
 
@@ -2681,7 +3135,7 @@ std::string HandleDeleteHardwareBreakpoint(const std::string& request) {
 
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "bphc %llx", (unsigned long long)address);
-    DbgCmdExec(cmd);
+    InternalCmdExec(cmd);
 
     LogInfo("Hardware breakpoint deleted at 0x%llx", (unsigned long long)address);
     return BuildJsonResponse(true, "\"message\":\"Hardware breakpoint deleted\"");
@@ -2714,7 +3168,7 @@ std::string HandleToggleHardwareBreakpoint(const std::string& request) {
         snprintf(cmd, sizeof(cmd), "bphd %llx", (unsigned long long)address);
     }
 
-    if (!DbgCmdExec(cmd)) {
+    if (!InternalCmdExec(cmd)) {
         return BuildJsonResponse(false, "\"error\":\"Failed to toggle hardware breakpoint\"");
     }
 
@@ -2754,7 +3208,7 @@ std::string HandleToggleMemoryBreakpoint(const std::string& request) {
         snprintf(cmd, sizeof(cmd), "bpmd %llx", (unsigned long long)address);
     }
 
-    if (!DbgCmdExec(cmd)) {
+    if (!InternalCmdExec(cmd)) {
         return BuildJsonResponse(false, "\"error\":\"Failed to toggle memory breakpoint\"");
     }
 
@@ -2906,12 +3360,14 @@ std::string HandleStartTrace(const std::string& request) {
     // Open log file if specified (path already confined above)
     if (!resolvedLogPath.empty()) {
         g_traceState.logFile = resolvedLogPath;
-        g_traceState.logFileHandle = fopen(resolvedLogPath.c_str(), "w");
+        std::string openError;
+        g_traceState.logFileHandle = OpenConfinedOutputFile(resolvedLogPath, openError);
         if (g_traceState.logFileHandle) {
             fprintf(g_traceState.logFileHandle, "# Trace started at %llu\n", g_traceState.startTime);
             fprintf(g_traceState.logFileHandle, "# Format: timestamp,address,module,instruction,thread_id\n");
         } else {
-            LogError("Could not open confined trace log '%s'", resolvedLogPath.c_str());
+            LogError("Could not open confined trace log '%s': %s", resolvedLogPath.c_str(),
+                     openError.c_str());
         }
     }
 
@@ -3038,7 +3494,7 @@ std::string HandleSetApiBreakpoint(const std::string& request) {
     // Set conditional breakpoint with logging
     char cmd[512];
     snprintf(cmd, sizeof(cmd), "bp %llx", (unsigned long long)address);
-    if (!DbgCmdExec(cmd)) {
+    if (!InternalCmdExec(cmd)) {
         return BuildJsonResponse(false, "\"error\":\"Failed to set breakpoint\"");
     }
 
@@ -3168,6 +3624,7 @@ std::string HandleFindStrings(const std::string& request) {
     // Find strings
     std::vector<std::pair<duint, std::string>> foundStrings;
     const int maxStrings = 1000;
+    const size_t MAX_STRING_CHARS = 1024;
 
     // Search for ASCII strings
     if (searchAscii && foundStrings.size() < maxStrings) {
@@ -3186,9 +3643,13 @@ std::string HandleFindStrings(const std::string& request) {
                 end++;
             }
 
-            // Check length
+            // Check length. A single printable run can be megabytes long (the
+            // sample chooses its own memory), so each stored string is capped
+            // at MAX_STRING_CHARS; "length" reports the stored text.
             if (end - start >= (size_t)minLength) {
-                std::string str(buffer.begin() + start, buffer.begin() + end);
+                const size_t keep = (end - start < MAX_STRING_CHARS) ? (end - start)
+                                                                     : MAX_STRING_CHARS;
+                std::string str(buffer.begin() + start, buffer.begin() + start + keep);
                 foundStrings.push_back({startAddr + start, str});
             }
 
@@ -3204,9 +3665,11 @@ std::string HandleFindStrings(const std::string& request) {
                 size_t start = i;
                 std::string str;
 
-                // Collect characters
+                // Collect characters (capped, as for ASCII above)
                 while (i + 1 < buffer.size() && buffer[i] >= 0x20 && buffer[i] <= 0x7E && buffer[i + 1] == 0) {
-                    str += (char)buffer[i];
+                    if (str.size() < MAX_STRING_CHARS) {
+                        str += (char)buffer[i];
+                    }
                     i += 2;
                 }
 
@@ -3250,8 +3713,15 @@ std::string HandlePatternScan(const std::string& request) {
     // Validate size. Lower bound is load-bearing -- a negative size reaches
     // std::vector<unsigned char> buffer(size) below and throws
     // std::length_error, which with no exception boundary crashes x64dbg.
-    if (size <= 0 || size > 100 * 1024 * 1024) {
-        return BuildJsonResponse(false, "\"error\":\"Invalid size (must be 1 to 100MB)\"");
+    // Review finding M6: cost is scan size x pattern length, all on the one
+    // pipe thread that serves every request. 100 MB with a long, mostly
+    // wildcard pattern was effectively unbounded. Both factors are capped,
+    // and the scan itself carries a wall-clock budget (below).
+    if (size <= 0 || size > 16 * 1024 * 1024) {
+        return BuildJsonResponse(false, "\"error\":\"Invalid size (must be 1 to 16MB)\"");
+    }
+    if (pattern.size() > 4096) {
+        return BuildJsonResponse(false, "\"error\":\"Pattern too long\"");
     }
 
     // Parse pattern - format: "90 ?? E8 ?? ?? ?? ??" or "90??E8??????"
@@ -3281,6 +3751,18 @@ std::string HandlePatternScan(const std::string& request) {
     if (parsedPattern.empty()) {
         return BuildJsonResponse(false, "\"error\":\"Empty pattern\"");
     }
+    const size_t MAX_PATTERN_BYTES = 256;
+    if (parsedPattern.size() > MAX_PATTERN_BYTES) {
+        return BuildJsonResponse(false, "\"error\":\"Pattern too long (max 256 bytes)\"");
+    }
+    // An all-wildcard pattern matches everywhere and says nothing.
+    size_t anchor = parsedPattern.size();
+    for (size_t k = 0; k < parsedPattern.size(); k++) {
+        if (!parsedPattern[k].second) { anchor = k; break; }
+    }
+    if (anchor == parsedPattern.size()) {
+        return BuildJsonResponse(false, "\"error\":\"Pattern needs at least one non-wildcard byte\"");
+    }
 
     // Resolve start address
     duint startAddr;
@@ -3294,16 +3776,30 @@ std::string HandlePatternScan(const std::string& request) {
         }
     }
 
-    // Read memory
+    // Read memory. The result used to be ignored, so an unreadable range was
+    // scanned as zeroes and reported matches that did not exist.
     std::vector<unsigned char> buffer(size);
-    duint bytesRead = 0;
-    DbgMemRead(startAddr, buffer.data(), size);
+    if (!DbgMemRead(startAddr, buffer.data(), size)) {
+        return BuildJsonResponse(false, "\"error\":\"Failed to read memory\"");
+    }
 
     // Search for pattern
     std::vector<duint> matches;
     const int maxMatches = 100;
+    const unsigned long long budgetEnd = GetTickCount64() + 10000;
+    bool timedOut = false;
+    unsigned long long fullCompares = 0;
+    const unsigned char anchorByte = parsedPattern[anchor].first;
 
     for (size_t i = 0; i + parsedPattern.size() <= buffer.size() && matches.size() < maxMatches; i++) {
+        // Cheap reject on the first concrete byte before the full compare.
+        if (buffer[i + anchor] != anchorByte) {
+            continue;
+        }
+        if ((++fullCompares & 0xFFF) == 0 && GetTickCount64() > budgetEnd) {
+            timedOut = true;
+            break;
+        }
         bool match = true;
         for (size_t j = 0; j < parsedPattern.size(); j++) {
             if (!parsedPattern[j].second && buffer[i + j] != parsedPattern[j].first) {
@@ -3319,6 +3815,7 @@ std::string HandlePatternScan(const std::string& request) {
     // Build response
     std::stringstream data;
     data << "\"count\":" << matches.size() << ","
+         << "\"timed_out\":" << (timedOut ? "true" : "false") << ","
          << "\"pattern\":\"" << JsonEscape(pattern) << "\","
          << "\"matches\":[";
 
@@ -3690,7 +4187,7 @@ std::string HandleHideDebugFull(const std::string& request) {
     }
 
     // Use x64dbg's built-in hide debugger command
-    DbgCmdExec("HideDebugger");
+    InternalCmdExec("HideDebugger");
 
     LogInfo("Full anti-debug bypass applied: %d patches", totalPatches);
 
@@ -3816,8 +4313,8 @@ std::string HandleStartCoverage(const std::string& request) {
     LeaveCriticalSection(&g_coverageLock);
 
     // Enable tracing to collect coverage
-    DbgCmdExec("TraceSetLogFile \"\"");  // Disable trace file
-    DbgCmdExec("TraceSetCondition 1");   // Always trace
+    InternalCmdExec("TraceSetLogFile \"\"");  // Disable trace file
+    InternalCmdExec("TraceSetCondition 1");   // Always trace
 
     LogInfo("Coverage started for module: %s", moduleName.empty() ? "(all)" : moduleName.c_str());
 
@@ -3962,6 +4459,28 @@ std::string HandleGetCoverageStats(const std::string& request) {
     return BuildJsonResponse(true, data.str());
 }
 
+// One CSV field: always quoted, embedded quotes doubled, line breaks replaced,
+// and a leading = + - @ (or tab/CR) prefixed with ' so a spreadsheet does not
+// evaluate a debuggee-chosen name as a formula.
+static std::string CsvField(const std::string& value) {
+    std::string out = "\"";
+    if (!value.empty()) {
+        const char first = value[0];
+        if (first == '=' || first == '+' || first == '-' || first == '@' ||
+            first == '\t' || first == '\r') {
+            out += '\'';
+        }
+    }
+    for (size_t i = 0; i < value.size(); i++) {
+        const char c = value[i];
+        if (c == '"') out += "\"\"";
+        else if (c == '\r' || c == '\n') out += ' ';
+        else out += c;
+    }
+    out += '"';
+    return out;
+}
+
 // Handler: EXPORT_COVERAGE - Export coverage data to file
 std::string HandleExportCoverage(const std::string& request) {
     std::string filePath = ExtractStringField(request, "file");
@@ -3995,21 +4514,29 @@ std::string HandleExportCoverage(const std::string& request) {
     InitCoverageLock();
     EnterCriticalSection(&g_coverageLock);
 
-    FILE* file = fopen(resolvedPath.c_str(), "w");
+    std::string openError;
+    FILE* file = OpenConfinedOutputFile(resolvedPath, openError);
     if (!file) {
         LeaveCriticalSection(&g_coverageLock);
-        return BuildJsonResponse(false, "\"error\":\"Failed to open file for writing\"");
+        std::stringstream err;
+        err << "\"error\":\"" << JsonEscape(openError) << "\"";
+        return BuildJsonResponse(false, err.str());
     }
 
     size_t entryCount = g_coverageState.entries.size();
 
+    // Module and symbol names come from the debuggee (file names it chose,
+    // export names it wrote), so they are escaped for the format being
+    // written (review finding L5): an export name containing a quote used to
+    // break out of its JSON string, and one containing a comma or newline
+    // forged CSV fields and rows.
     if (format == "csv") {
         fprintf(file, "address,hit_count,module,symbol\n");
         for (const auto& pair : g_coverageState.entries) {
             const CoverageEntry& entry = pair.second;
             fprintf(file, "0x%llx,%llu,%s,%s\n",
-                entry.address, entry.hitCount,
-                entry.module.c_str(), entry.symbol.c_str());
+                (unsigned long long)entry.address, (unsigned long long)entry.hitCount,
+                CsvField(entry.module).c_str(), CsvField(entry.symbol).c_str());
         }
     } else if (format == "json") {
         fprintf(file, "{\n  \"coverage\": [\n");
@@ -4018,7 +4545,8 @@ std::string HandleExportCoverage(const std::string& request) {
             const CoverageEntry& entry = pair.second;
             if (count > 0) fprintf(file, ",\n");
             fprintf(file, "    {\"address\": \"0x%llx\", \"hits\": %llu, \"module\": \"%s\", \"symbol\": \"%s\"}",
-                entry.address, entry.hitCount, entry.module.c_str(), entry.symbol.c_str());
+                (unsigned long long)entry.address, (unsigned long long)entry.hitCount,
+                JsonEscape(entry.module).c_str(), JsonEscape(entry.symbol).c_str());
             count++;
         }
         fprintf(file, "\n  ]\n}\n");
@@ -4037,6 +4565,11 @@ std::string HandleExportCoverage(const std::string& request) {
             DbgGetModuleAt(mainBase, mainModule);
             // Get module size (simplified)
             mainSize = 0x100000;  // Default estimate
+        }
+        // One line per module in this table: a line break in the name would
+        // start a forged row.
+        for (char* p = mainModule; *p != '\0'; p++) {
+            if (*p == '\r' || *p == '\n') *p = '_';
         }
         fprintf(file, " 0, 0x%llx, 0x%llx, 0x%llx, %s\n",
             (unsigned long long)mainBase, (unsigned long long)(mainBase + mainSize),
@@ -4584,6 +5117,17 @@ static bool ContainsCommandMetacharacters(const std::string& value) {
 
 // Handler: LOAD_BINARY - Load binary into debugger
 std::string HandleLoadBinary(const std::string& request) {
+    // Review finding H1: this endpoint starts an arbitrary executable, so the
+    // bearer token alone used to be code execution on this host. The
+    // "never execute the sample from the server" rule was enforced only by no
+    // MCP tool calling it. It is now off unless the operator opts in.
+    if (!g_allowLoadBinary.load()) {
+        return BuildJsonResponse(false,
+            "\"error\":\"LOAD_BINARY is disabled. Load the target in x64dbg "
+            "directly, or set allow_load_binary=1 under [api] in obsidian.ini "
+            "to allow the HTTP API to start executables.\"");
+    }
+
     std::string path = ExtractStringField(request, "path");
     std::string args = ExtractStringField(request, "arguments");
     std::string workingDir = ExtractStringField(request, "working_directory");
@@ -4612,7 +5156,7 @@ std::string HandleLoadBinary(const std::string& request) {
         cmd += ", \"" + workingDir + "\"";
     }
 
-    if (!DbgCmdExec(cmd.c_str())) {
+    if (!InternalCmdExec(cmd.c_str())) {
         return BuildJsonResponse(false, "\"error\":\"Failed to load binary\"");
     }
 
@@ -4691,6 +5235,54 @@ static bool IsPipeClientAuthorised(HANDLE pipe) {
     return true;
 }
 
+// Write one framed response: 4-byte length, then the body.
+//
+// Review finding M2 -- an oversized response killed the bridge. Responses
+// were written at whatever size the handler produced, while obsidian_server
+// refuses any frame above Protocol::MAX_MESSAGE_SIZE. It refused WITHOUT
+// reading the body, so the next read took four bytes of leftover JSON as a
+// length, and the server's idle health check then gave up and exited for the
+// rest of the session. Several responses are sized by the debuggee, not the
+// caller -- the memory map (one entry per region), the thread list, the module
+// list, a strings scan over printable memory -- so a sample could end the
+// analysis session simply by allocating enough regions.
+//
+// Responses are now capped HERE, the one place they leave the plugin: an
+// oversized one is replaced by an explicit, small error naming the size, so the
+// caller learns to narrow the request and the frame stays within what the
+// server accepts. (The server additionally resets the pipe on any framing
+// error rather than reading stale bytes.)
+static bool WritePipeResponse(const std::string& candidate) {
+    std::string tooLarge;
+    const std::string* response = &candidate;
+    if (candidate.size() > Protocol::MAX_MESSAGE_SIZE) {
+        LogError("Response of %zu bytes exceeds the %zu byte pipe limit; replacing "
+                 "it with an error", candidate.size(), Protocol::MAX_MESSAGE_SIZE);
+        std::stringstream data;
+        data << "\"error\":\"Response too large (" << candidate.size()
+             << " bytes, limit " << Protocol::MAX_MESSAGE_SIZE
+             << "). Narrow the request: a smaller size or range.\","
+             << "\"response_too_large\":true,"
+             << "\"response_bytes\":" << candidate.size();
+        tooLarge = BuildJsonResponse(false, data.str());
+        response = &tooLarge;
+    }
+
+    const uint32_t responseLength = static_cast<uint32_t>(response->size());
+    DWORD bytesWritten = 0;
+    if (!WriteFile(g_pipeServer, &responseLength, sizeof(responseLength), &bytesWritten, nullptr) ||
+        bytesWritten != sizeof(responseLength)) {
+        LogError("Failed to write response length: %d", GetLastError());
+        return false;
+    }
+    if (!WriteFile(g_pipeServer, response->data(), responseLength, &bytesWritten, nullptr) ||
+        bytesWritten != responseLength) {
+        LogError("Failed to write response: %d", GetLastError());
+        return false;
+    }
+    return true;
+}
+
 // Named Pipe server thread (handles requests from HTTP server process)
 static DWORD WINAPI PipeServerThread(LPVOID lpParam) {
     LogInfo("Named Pipe server thread starting...");
@@ -4703,6 +5295,14 @@ static DWORD WINAPI PipeServerThread(LPVOID lpParam) {
     bool signalledReady = false;
 
     while (g_running) {
+      // Review finding L1: ONE pipe instance per session, created once and
+      // re-listened on after every disconnect. The old loop closed the
+      // instance after each session and after each rejected peer and then
+      // created a new one -- and in between, no instance of the name existed,
+      // so any process could create it first and be dialled by the server.
+      // FILE_FLAG_FIRST_PIPE_INSTANCE makes creation fail outright if anyone
+      // else already owns the (per-session, random) name.
+      if (g_pipeServer == INVALID_HANDLE_VALUE) {
         // F-17: explicit user-only DACL instead of the process default.
         SECURITY_ATTRIBUTES pipeSa;
         PSECURITY_DESCRIPTOR pipeSd = nullptr;
@@ -4715,8 +5315,8 @@ static DWORD WINAPI PipeServerThread(LPVOID lpParam) {
 
         // Create named pipe instance with FILE_FLAG_OVERLAPPED for async operations
         HANDLE pipe = CreateNamedPipeA(
-            Protocol::PIPE_NAME,
-            PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+            g_pipeName.c_str(),
+            PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
             // F-17: PIPE_REJECT_REMOTE_CLIENTS -- without it this pipe is
             // openable across SMB by anything that can authenticate to the box.
             PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
@@ -4734,7 +5334,13 @@ static DWORD WINAPI PipeServerThread(LPVOID lpParam) {
         }
 
         if (pipe == INVALID_HANDLE_VALUE) {
-            LogError("Failed to create named pipe: %d", GetLastError());
+            const DWORD createError = GetLastError();
+            if (createError == ERROR_ACCESS_DENIED) {
+                LogError("Failed to create named pipe %s: another process already "
+                         "owns that name. Refusing to share it.", g_pipeName.c_str());
+            } else {
+                LogError("Failed to create named pipe: %d", createError);
+            }
             return 1;
         }
         // Publish the handle UNDER THE LOCK (CWE-362). pluginStop reads
@@ -4758,6 +5364,7 @@ static DWORD WINAPI PipeServerThread(LPVOID lpParam) {
             SetEvent(g_pipeReadyEvent);
             signalledReady = true;
         }
+      }
 
         LogInfo("Waiting for HTTP server to connect...");
 
@@ -4817,12 +5424,12 @@ static DWORD WINAPI PipeServerThread(LPVOID lpParam) {
         CloseHandle(overlapped.hEvent);
 
         // F-17: authenticate the peer BEFORE dispatching anything. A rejected
-        // client is disconnected and the instance recreated, so a hostile
-        // process cannot hold the single pipe instance open to lock the real
-        // server out either.
+        // client is forcibly disconnected, so a hostile process cannot hold
+        // the single pipe instance open to lock the real server out -- and
+        // the instance is KEPT and listened on again (L1), so there is never
+        // a moment where the name is free for someone else to create.
         if (!IsPipeClientAuthorised(g_pipeServer)) {
             DisconnectNamedPipe(g_pipeServer);
-            ClosePipeServerHandle();
             continue;
         }
 
@@ -4875,12 +5482,8 @@ static DWORD WINAPI PipeServerThread(LPVOID lpParam) {
                     break;
                 }
 
-                std::string tooLarge = BuildJsonResponse(false,
-                    "\"error\":\"Request exceeds the maximum message size\"");
-                uint32_t tooLargeLength = static_cast<uint32_t>(tooLarge.size());
-                DWORD tooLargeWritten = 0;
-                if (!WriteFile(g_pipeServer, &tooLargeLength, sizeof(tooLargeLength), &tooLargeWritten, nullptr) ||
-                    !WriteFile(g_pipeServer, tooLarge.c_str(), tooLargeLength, &tooLargeWritten, nullptr)) {
+                if (!WritePipeResponse(BuildJsonResponse(false,
+                        "\"error\":\"Request exceeds the maximum message size\""))) {
                     LogError("Failed to report oversized request: %d", GetLastError());
                     break;
                 }
@@ -4892,7 +5495,14 @@ static DWORD WINAPI PipeServerThread(LPVOID lpParam) {
             // from a null pointer is UB even with a zero count. Answer and
             // carry on rather than tearing the connection down.
             if (requestLength == 0) {
-                LogError("Empty request frame; ignoring");
+                // Every frame gets a reply (review finding L7). This used to
+                // `continue` without writing one, while the server blocked
+                // waiting for it -- a deadlock on both ends of the pipe.
+                LogError("Empty request frame");
+                if (!WritePipeResponse(BuildJsonResponse(false,
+                        "\"error\":\"Empty request frame\""))) {
+                    break;
+                }
                 continue;
             }
 
@@ -4916,13 +5526,27 @@ static DWORD WINAPI PipeServerThread(LPVOID lpParam) {
             }
 
             std::string request(buffer.data(), bytesRead);
-            LogInfo("Received request: %s", request.c_str());
+            // Size only (review finding I4): the body carries memory-write data
+            // and sample-chosen strings, and x64dbg can persist its log.
+            LogInfo("Received request (%lu bytes)", (unsigned long)bytesRead);
 
             // Parse request type and route to appropriate handler
             std::string response;
-            int requestType = ExtractIntField(request, "type", -1);
+            std::string jsonError;
+            int requestType = -1;
+            if (!ValidateRequestJson(request, jsonError)) {
+                // Strict parse first (review finding L6): malformed JSON and
+                // duplicated keys never reach a handler.
+                LogError("Rejecting malformed request: %s", jsonError.c_str());
+                response = BuildJsonResponse(false,
+                    "\"error\":\"Malformed request: " + JsonEscape(jsonError) + "\"");
+            } else {
+                requestType = ExtractIntField(request, "type", -1);
+            }
 
-            if (requestType == -1) {
+            if (!response.empty()) {
+                // already answered
+            } else if (requestType == -1) {
                 response = BuildJsonResponse(false, "\"error\":\"Missing 'type' field\"");
             } else {
                 LogInfo("Request type: %d", requestType);
@@ -5224,33 +5848,76 @@ static DWORD WINAPI PipeServerThread(LPVOID lpParam) {
                 }
             }
 
-            // Send response
-            uint32_t responseLength = static_cast<uint32_t>(response.size());
-            DWORD bytesWritten = 0;
-
-            if (!WriteFile(g_pipeServer, &responseLength, sizeof(responseLength), &bytesWritten, nullptr)) {
-                LogError("Failed to write response length: %d", GetLastError());
-                break;
-            }
-
-            if (!WriteFile(g_pipeServer, response.c_str(), responseLength, &bytesWritten, nullptr)) {
-                LogError("Failed to write response: %d", GetLastError());
+            // Send response (capped -- see WritePipeResponse)
+            if (!WritePipeResponse(response)) {
                 break;
             }
         }
 
-        // Disconnect client. ClosePipeServerHandle (not a bare CloseHandle) so
-        // the close is serialised against pluginStop's CancelIoEx.
+        // Disconnect the client and keep the instance for its reconnect (the
+        // server reconnects after a framing error, review finding M2).
         DisconnectNamedPipe(g_pipeServer);
-        ClosePipeServerHandle();
     }
 
+    // ClosePipeServerHandle (not a bare CloseHandle) so the close is
+    // serialised against pluginStop's CancelIoEx.
+    ClosePipeServerHandle();
     LogInfo("Named Pipe server thread stopped");
     return 0;
 }
 
+// The environment block for the server: this process's environment with any
+// inherited OBSIDIAN_AUTH_TOKEN removed and the session token added.
+//
+// Review finding L3: the token used to be put into x64dbg's OWN environment
+// with SetEnvironmentVariableA before CreateProcessA, and removed afterwards on
+// some paths only. On the others it stayed, and every process x64dbg started
+// later -- debuggees included -- inherited it. Building a private block for
+// the one child that needs it means x64dbg's environment never holds the token.
+static std::vector<char> BuildServerEnvironment(const std::string& token) {
+    std::vector<char> block;
+    LPCH current = GetEnvironmentStringsA();
+    if (current != nullptr) {
+        static const char kVar[] = "OBSIDIAN_AUTH_TOKEN=";
+        const size_t kVarLength = sizeof(kVar) - 1;
+        for (LPCH entry = current; *entry != '\0'; entry += strlen(entry) + 1) {
+            if (_strnicmp(entry, kVar, kVarLength) == 0) {
+                continue;
+            }
+            block.insert(block.end(), entry, entry + strlen(entry) + 1);
+        }
+        FreeEnvironmentStringsA(current);
+    }
+    const std::string ours = "OBSIDIAN_AUTH_TOKEN=" + token;
+    block.insert(block.end(), ours.begin(), ours.end());
+    block.push_back('\0');
+    block.push_back('\0');  // the block ends with an empty string
+    return block;
+}
+
+// Random lowercase hex from the system CSPRNG.
+static bool RandomHex(size_t byteCount, std::string& out) {
+    out.clear();
+    HCRYPTPROV provider = 0;
+    if (!CryptAcquireContextA(&provider, nullptr, nullptr, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
+        return false;
+    }
+    std::vector<unsigned char> bytes(byteCount);
+    const BOOL ok = CryptGenRandom(provider, static_cast<DWORD>(byteCount), bytes.data());
+    CryptReleaseContext(provider, 0);
+    if (!ok) {
+        return false;
+    }
+    static const char hexChars[] = "0123456789abcdef";
+    for (size_t i = 0; i < bytes.size(); i++) {
+        out += hexChars[(bytes[i] >> 4) & 0x0F];
+        out += hexChars[bytes[i] & 0x0F];
+    }
+    return true;
+}
+
 // Spawn HTTP server process
-static bool SpawnHTTPServer() {
+static bool SpawnHTTPServer(const std::string& token) {
     // Get plugin directory
     char pluginPath[MAX_PATH];
     if (!GetModuleFileNameA(g_hModule, pluginPath, MAX_PATH)) {
@@ -5390,14 +6057,21 @@ static bool SpawnHTTPServer() {
     if (haveClients) appendList(allowClients, "--allow-client");
     if (haveHosts) appendList(allowHosts, "--allow-host");
 
+    // Which pipe to dial and who must be serving it (review finding L1). Both
+    // are generated here, never read from the ini, and the server validates
+    // the name's shape before dialling it.
+    const std::string listenerArguments = arguments;
+    arguments += " --pipe " + g_pipeName;
+    arguments += " --plugin-pid " + std::to_string(GetCurrentProcessId());
+
     LogInfo("Spawning Obsidian server: %s", serverPath);
     // The effective listener, in the x64dbg log, at startup. Whether this
     // instance is reachable from the network is the one thing an analyst should
     // be able to see at a glance rather than infer from an ini.
-    if (arguments.empty()) {
+    if (listenerArguments.empty()) {
         LogInfo("Listener: 127.0.0.1:8765, no TLS (default; no obsidian.ini settings)");
     } else {
-        LogInfo("Listener options from obsidian.ini:%s", arguments.c_str());
+        LogInfo("Listener options from obsidian.ini:%s", listenerArguments.c_str());
         if (haveBind && bindAddress != "127.0.0.1") {
             LogInfo("NOTE: this listener is configured for %s -- it may be "
                     "reachable from the network.", bindAddress.c_str());
@@ -5418,18 +6092,22 @@ static bool SpawnHTTPServer() {
     si.cb = sizeof(si);
     PROCESS_INFORMATION pi = {};
 
-    if (!CreateProcessA(
+    std::vector<char> environment = BuildServerEnvironment(token);
+    const BOOL created = CreateProcessA(
         nullptr,       // lpApplicationName: NULL so lpCommandLine is used
         cmdLine.data(),  // Command line (writable buffer, quoted for spaces)
         nullptr,       // Process attributes
         nullptr,       // Thread attributes
         FALSE,         // Inherit handles
         CREATE_NEW_CONSOLE,  // Explicitly create console window for server diagnostics
-        nullptr,       // Environment
+        environment.data(),  // Private block carrying the token (L3)
         pluginPath,    // Current directory: plugin directory
         &si,
         &pi
-    )) {
+    );
+    // The block held the token; don't leave it in freed heap.
+    SecureZeroMemory(environment.data(), environment.size());
+    if (!created) {
         DWORD err = GetLastError();
         LogError("Failed to spawn Obsidian server (error %d)", err);
         if (err == 740) {
@@ -5452,9 +6130,6 @@ static bool SpawnHTTPServer() {
     // waited for the real server to exit.
     g_serverProcessId.store(pi.dwProcessId);
     CloseHandle(pi.hThread);  // Don't need thread handle
-
-    // Clear token from environment immediately after spawn (child already inherited it)
-    SetEnvironmentVariableA("OBSIDIAN_AUTH_TOKEN", nullptr);
 
     // Verify the process is still alive after a brief moment
     // (catches immediate crashes from missing DLLs, Smart App Control blocks, etc.)
@@ -5528,7 +6203,7 @@ void MenuEntryCallback(CBTYPE cbType, PLUG_CB_MENUENTRY* info) {
         }
 
         case 1: {  // Status
-            char statusMsg[512];
+            char statusMsg[768];
 
             const char* pipeStatus = (g_pipeServer != INVALID_HANDLE_VALUE) ? "Connected" : "Disconnected";
             const char* serverStatus = (g_serverProcess != nullptr) ? "Running" : "Not Running";
@@ -5545,12 +6220,13 @@ void MenuEntryCallback(CBTYPE cbType, PLUG_CB_MENUENTRY* info) {
                 "HTTP Server:   %s\n"
                 "Server PID:    %lu\n\n"
                 "Endpoints:\n"
-                "  Pipe: \\\\.\\pipe\\x64dbg_mcp\n"
-                "  HTTP: http://127.0.0.1:8765",
+                "  Pipe: %s\n"
+                "  HTTP: see obsidian_server.log (default http://127.0.0.1:8765)",
                 g_running ? "Running" : "Stopped",
                 pipeStatus,
                 serverStatus,
-                serverPid
+                (unsigned long)serverPid,
+                g_pipeName.c_str()
             );
 
             MessageBoxA(nullptr, statusMsg, "Obsidian Status", MB_OK | MB_ICONINFORMATION);
@@ -5678,13 +6354,19 @@ void pluginStop() {
     if (g_serverProcess) {
         LogInfo("Terminating HTTP server process...");
 
-        // Try graceful shutdown first
-        if (!GenerateConsoleCtrlEvent(CTRL_C_EVENT, GetProcessId(g_serverProcess))) {
-            // If that fails, terminate forcefully
+        // Review finding L8. This used to call
+        // GenerateConsoleCtrlEvent(CTRL_C_EVENT, <pid>), but that parameter is
+        // a process GROUP id and CTRL+C cannot be targeted at a group: the
+        // call could "succeed" without delivering anything, which skipped
+        // TerminateProcess and left the listener running after the plugin had
+        // gone. The graceful path is the pipe: the thread above has closed it,
+        // so the server's next health check (at most ~1 s away) fails and it
+        // exits on its own. Give it that long, then make sure.
+        if (WaitForSingleObject(g_serverProcess, 3000) != WAIT_OBJECT_0) {
+            LogInfo("Server did not exit after the pipe closed; terminating it");
             TerminateProcess(g_serverProcess, 0);
+            WaitForSingleObject(g_serverProcess, 2000);
         }
-
-        WaitForSingleObject(g_serverProcess, 2000);
         CloseHandle(g_serverProcess);
         g_serverProcess = nullptr;
         // F-17: the PID stops being pinned the moment this handle closes.
@@ -5809,6 +6491,38 @@ static bool GenerateSecureToken(char* outToken, size_t tokenLength) {
 //
 // On success the caller owns *outSd and must LocalFree it after the file is
 // created. On failure sa is left usable as "no explicit descriptor".
+// Integrity level RID of this process's token (SECURITY_MANDATORY_*_RID).
+// Medium if it cannot be read, which yields the least surprising label.
+static DWORD CurrentIntegrityRid() {
+    DWORD rid = SECURITY_MANDATORY_MEDIUM_RID;
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+        return rid;
+    }
+    DWORD length = 0;
+    GetTokenInformation(token, TokenIntegrityLevel, nullptr, 0, &length);
+    if (length != 0) {
+        std::vector<char> buffer(length);
+        if (GetTokenInformation(token, TokenIntegrityLevel, buffer.data(), length, &length)) {
+            const TOKEN_MANDATORY_LABEL* label =
+                reinterpret_cast<const TOKEN_MANDATORY_LABEL*>(buffer.data());
+            const UCHAR count = *GetSidSubAuthorityCount(label->Label.Sid);
+            if (count > 0) {
+                rid = *GetSidSubAuthority(label->Label.Sid, count - 1);
+            }
+        }
+    }
+    CloseHandle(token);
+    return rid;
+}
+
+static const char* IntegrityLevelSddl(DWORD rid) {
+    if (rid < SECURITY_MANDATORY_MEDIUM_RID) return "LW";
+    if (rid < SECURITY_MANDATORY_HIGH_RID) return "ME";
+    if (rid < SECURITY_MANDATORY_SYSTEM_RID) return "HI";
+    return "SI";
+}
+
 static bool BuildCurrentUserOnlySecurity(SECURITY_ATTRIBUTES& sa, PSECURITY_DESCRIPTOR& outSd) {
     outSd = nullptr;
     sa.nLength = sizeof(SECURITY_ATTRIBUTES);
@@ -5833,6 +6547,7 @@ static bool BuildCurrentUserOnlySecurity(SECURITY_ATTRIBUTES& sa, PSECURITY_DESC
         return false;
     }
     CloseHandle(hToken);
+    const char* labelLevel = IntegrityLevelSddl(CurrentIntegrityRid());
 
     TOKEN_USER* tokenUser = reinterpret_cast<TOKEN_USER*>(buffer.data());
     LPSTR sidString = nullptr;
@@ -5849,6 +6564,21 @@ static bool BuildCurrentUserOnlySecurity(SECURITY_ATTRIBUTES& sa, PSECURITY_DESC
     sddl += sidString;
     sddl += ")";
     LocalFree(sidString);
+
+    // S:(ML;;NRNWNX;;;<level>) -> mandatory label at THIS process's integrity
+    // level with no-read-up, no-write-up and no-execute-up (review finding H1).
+    //
+    // The DACL above names the user, and every process of that user carries
+    // the user SID whatever its integrity level. Without a label, Windows'
+    // default mandatory policy only stops lower-integrity WRITES, so a medium
+    // (or low) process could still READ the token. With x64dbg elevated, that
+    // token drives LOAD_BINARY/RUN under the elevated debugger: a medium
+    // process gained high-integrity code execution. No-read-up closes it, and
+    // costs nothing when x64dbg is not elevated (the label is then Medium,
+    // which shuts out Low-integrity sandboxes only).
+    sddl += "S:(ML;;NRNWNX;;;";
+    sddl += labelLevel;
+    sddl += ")";
 
     PSECURITY_DESCRIPTOR sd = nullptr;
     if (!ConvertStringSecurityDescriptorToSecurityDescriptorA(
@@ -5907,6 +6637,79 @@ static std::string ReadPinnedToken() {
     return value.substr(begin, end - begin);
 }
 
+// Write the session token to %TEMP%\x64dbg_mcp_token.txt for the loopback
+// Python bridge, with a user-only DACL (F-15) and a no-read-up integrity label
+// at this process's level (H1).
+static void WriteTokenFile(const std::string& token) {
+    char tempPath[MAX_PATH];
+    if (!GetTempPathA(MAX_PATH, tempPath)) {
+        LogError("Failed to locate %%TEMP%% for the token file: %d", GetLastError());
+        return;
+    }
+    char tokenPath[MAX_PATH];
+    snprintf(tokenPath, MAX_PATH, "%sx64dbg_mcp_token.txt", tempPath);
+
+    // F-15: create the token file with an explicit DACL naming only the
+    // current user, instead of relying on the process default DACL.
+    SECURITY_ATTRIBUTES sa;
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    bool haveSecurity = BuildCurrentUserOnlySecurity(sa, sd);
+    if (!haveSecurity) {
+        // Fail closed (H1): without the label a lower-integrity process could
+        // read the token, so no file is better than an exposed one. The
+        // client can still be given the token via OBSIDIAN_AUTH_TOKEN.
+        LogError("Could not build the security descriptor for the token file: %d; "
+                 "not writing it", GetLastError());
+        return;
+    }
+
+    // A security descriptor passed to CreateFileA applies only when the
+    // file is CREATED. With CREATE_ALWAYS an existing file is truncated
+    // and KEEPS ITS OLD DACL, so a stale token file from an earlier run
+    // (or one pre-created by someone else) would silently defeat the ACL
+    // above. Remove it first; a failure here is only interesting if the
+    // file actually exists. CREATE_NEW then refuses anything that appears
+    // in between, rather than writing through it.
+    if (!DeleteFileA(tokenPath) && GetLastError() != ERROR_FILE_NOT_FOUND) {
+        LogError("Could not remove stale token file before recreate: %d", GetLastError());
+    }
+
+    HANDLE hFile = CreateFileA(
+        tokenPath,
+        GENERIC_WRITE,
+        FILE_SHARE_READ,
+        haveSecurity ? &sa : nullptr,   // explicit user-only DACL + label
+        CREATE_NEW,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+        nullptr
+    );
+
+    // The descriptor is consumed at creation time; the file keeps its ACL.
+    if (sd) {
+        LocalFree(sd);
+        sd = nullptr;
+    }
+
+    if (hFile == INVALID_HANDLE_VALUE) {
+        LogError("Failed to create auth token file: %d (set OBSIDIAN_AUTH_TOKEN on "
+                 "the client instead)", GetLastError());
+        return;
+    }
+    DWORD bytesWritten = 0;
+    if (WriteFile(hFile, token.c_str(), (DWORD)token.size(), &bytesWritten, nullptr)) {
+        LogInfo("Created auth token file: %s", tokenPath);
+        if (CurrentIntegrityRid() >= SECURITY_MANDATORY_HIGH_RID) {
+            LogInfo("NOTE: x64dbg is elevated, so the token file is readable only "
+                    "by elevated processes. A non-elevated MCP server cannot read it: "
+                    "run it elevated, or pin a token in obsidian.ini and set "
+                    "OBSIDIAN_AUTH_TOKEN for it.");
+        }
+    } else {
+        LogError("Failed to write token file: %d", GetLastError());
+    }
+    CloseHandle(hFile);
+}
+
 void pluginSetup() {
     LogInfo("Setting up plugin");
 
@@ -5948,71 +6751,39 @@ void pluginSetup() {
                 "stays valid for a remote client -- and stays valid if it leaks.");
     }
 
-    // Pass token to server via environment variable (inherited by child process)
-    // This avoids file system issues (permissions, 8.3 paths, FILE_ATTRIBUTE_TEMPORARY)
-    if (!SetEnvironmentVariableA("OBSIDIAN_AUTH_TOKEN", token.c_str())) {
-        LogError("Failed to set auth token environment variable: %d", GetLastError());
-        return;
-    }
-    LogInfo("Auth token set via environment variable");
-
-    // Also write token file as fallback for the Python bridge
-    char tempPath[MAX_PATH];
-    if (GetTempPathA(MAX_PATH, tempPath)) {
-        char tokenPath[MAX_PATH];
-        snprintf(tokenPath, MAX_PATH, "%sx64dbg_mcp_token.txt", tempPath);
-
-        // F-15: create the token file with an explicit DACL naming only the
-        // current user, instead of relying on the process default DACL.
-        SECURITY_ATTRIBUTES sa;
-        PSECURITY_DESCRIPTOR sd = nullptr;
-        bool haveSecurity = BuildCurrentUserOnlySecurity(sa, sd);
-        if (!haveSecurity) {
-            // Non-fatal: fall back to the default DACL (the previous
-            // behaviour) rather than leaving the bridge with no token file.
-            LogError("Could not build restrictive DACL for token file: %d "
-                     "(falling back to default security)", GetLastError());
+    // obsidian.ini [api] allow_load_binary (review finding H1). Off unless
+    // the operator opts in: LOAD_BINARY is arbitrary process launch on this
+    // host for any holder of the token, and no MCP tool needs it.
+    {
+        char pluginPath[MAX_PATH];
+        if (GetModuleFileNameA(g_hModule, pluginPath, MAX_PATH)) {
+            char* lastSlash = strrchr(pluginPath, '\\');
+            if (lastSlash) *(lastSlash + 1) = '\0';
+            char iniPath[MAX_PATH];
+            snprintf(iniPath, sizeof(iniPath), "%sobsidian.ini", pluginPath);
+            g_allowLoadBinary.store(
+                GetPrivateProfileIntA("api", "allow_load_binary", 0, iniPath) == 1);
         }
-
-        // A security descriptor passed to CreateFileA applies only when the
-        // file is CREATED. With CREATE_ALWAYS an existing file is truncated
-        // and KEEPS ITS OLD DACL, so a stale token file from an earlier run
-        // (or one pre-created by someone else) would silently defeat the ACL
-        // above. Remove it first; a failure here is only interesting if the
-        // file actually exists.
-        if (!DeleteFileA(tokenPath) && GetLastError() != ERROR_FILE_NOT_FOUND) {
-            LogError("Could not remove stale token file before recreate: %d", GetLastError());
-        }
-
-        HANDLE hFile = CreateFileA(
-            tokenPath,
-            GENERIC_WRITE,
-            FILE_SHARE_READ,
-            haveSecurity ? &sa : nullptr,   // explicit user-only DACL
-            CREATE_ALWAYS,
-            FILE_ATTRIBUTE_NORMAL,
-            nullptr
-        );
-
-        // The descriptor is consumed at creation time; the file keeps its ACL.
-        if (sd) {
-            LocalFree(sd);
-            sd = nullptr;
-        }
-
-        if (hFile != INVALID_HANDLE_VALUE) {
-            DWORD bytesWritten;
-            if (WriteFile(hFile, token.c_str(), (DWORD)token.size(),
-                          &bytesWritten, nullptr)) {
-                LogInfo("Created auth token file: %s", tokenPath);
-            } else {
-                LogError("Failed to write token file: %d", GetLastError());
-            }
-            CloseHandle(hFile);
-        } else {
-            LogError("Failed to create auth token file: %d (non-fatal, env var is primary)", GetLastError());
+        if (g_allowLoadBinary.load()) {
+            LogInfo("NOTE: [api] allow_load_binary=1 -- the HTTP API may start "
+                    "executables under the debugger.");
         }
     }
+
+    // Per-session pipe name (review finding L1).
+    {
+        std::string suffix;
+        if (!RandomHex(16, suffix)) {
+            LogError("Failed to generate a pipe name");
+            return;
+        }
+        g_pipeName = std::string(Protocol::PIPE_NAME) + "_" + suffix;
+    }
+
+    // The token is NOT put into this process's environment any more (review
+    // finding L3): SpawnHTTPServer hands it to the server in a private
+    // environment block, so nothing x64dbg starts later -- debuggees included
+    // -- can inherit it, whichever way setup ends.
 
     // Create shutdown event for graceful termination
     g_shutdownEvent = CreateEventA(nullptr, TRUE, FALSE, nullptr);
@@ -6063,21 +6834,32 @@ void pluginSetup() {
         WaitForSingleObject(g_pipeThread, 1000);
         CloseHandle(g_pipeThread); g_pipeThread = nullptr;
         CloseHandle(g_shutdownEvent); g_shutdownEvent = nullptr;
-        SetEnvironmentVariableA("OBSIDIAN_AUTH_TOKEN", nullptr);
         return;
     }
 
     // Spawn HTTP server process
-    if (!SpawnHTTPServer()) {
+    if (!SpawnHTTPServer(token)) {
         LogError("Failed to spawn HTTP server");
         g_running = false;
         SetEvent(g_shutdownEvent);
         WaitForSingleObject(g_pipeThread, 1000);
         CloseHandle(g_pipeThread); g_pipeThread = nullptr;
         CloseHandle(g_shutdownEvent); g_shutdownEvent = nullptr;
-        SetEnvironmentVariableA("OBSIDIAN_AUTH_TOKEN", nullptr);
         return;
     }
+
+    // Token file for the loopback Python bridge -- written only now that the
+    // server is actually running, so no failure path above can leave a live
+    // token on disk (L3), and only for a GENERATED token (L2). A pinned token
+    // is long-lived and the operator already has it from obsidian.ini; copying
+    // it into %TEMP% only widened where it could be read from.
+    if (pinned.empty()) {
+        WriteTokenFile(token);
+    } else {
+        LogInfo("Token is pinned in obsidian.ini; not writing a token file "
+                "(set OBSIDIAN_AUTH_TOKEN on the client)");
+    }
+    SecureZeroMemory(&token[0], token.size());
 
     // Register menu callback
     _plugin_registercallback(g_pluginHandle, CB_MENUENTRY, (CBPLUGIN)MenuEntryCallback);

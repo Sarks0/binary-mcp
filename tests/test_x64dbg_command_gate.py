@@ -338,9 +338,11 @@ def test_token_file_uses_explicit_user_only_dacl():
 def test_token_file_security_descriptor_is_freed():
     """The descriptor from ConvertStringSecurityDescriptor... must be LocalFree'd."""
     source = _plugin_source()
-    setup = source[source.index("void pluginSetup()"):]
-    setup = setup[: setup.index("// Create shutdown event")]
-    assert "LocalFree(sd)" in setup
+    # The token file is written by WriteTokenFile (after the server is
+    # spawned, review finding L3), so that is where the descriptor is freed.
+    writer = source[source.index("static void WriteTokenFile("):]
+    writer = writer[: writer.index("\n}\n")]
+    assert "LocalFree(sd)" in writer
 
 
 # Second remediation pass -- F-16 / F-17 / F-19 / F-20 / F-27 and the
@@ -721,8 +723,9 @@ def test_export_coverage_confines_its_file_argument():
         until="// EVENT HANDLERS",
     )
     assert "ResolveConfinedOutputPath(filePath, COVERAGE_OUTPUT_EXTENSIONS" in body
-    assert "fopen(filePath.c_str()" not in body
-    assert "fopen(resolvedPath.c_str()" in body
+    assert "fopen(" not in _strip_comments(body)
+    # Opened by handle and re-verified on the handle (review finding L4).
+    assert "OpenConfinedOutputFile(resolvedPath" in body
 
 
 def test_start_trace_confines_its_log_file_argument():
@@ -733,8 +736,9 @@ def test_start_trace_confines_its_log_file_argument():
         until="// Handler: STOP_TRACE",
     )
     assert "ResolveConfinedOutputPath(logFile, TRACE_LOG_EXTENSIONS" in body
-    assert "fopen(logFile.c_str()" not in body
-    assert "fopen(resolvedLogPath.c_str()" in body
+    assert "fopen(" not in _strip_comments(body)
+    # Opened by handle and re-verified on the handle (review finding L4).
+    assert "OpenConfinedOutputFile(resolvedLogPath" in body
 
 
 def test_start_trace_closes_a_live_log_handle_before_replacing_it():
@@ -746,7 +750,7 @@ def test_start_trace_closes_a_live_log_handle_before_replacing_it():
         until="// Handler: STOP_TRACE",
     )
     close_pos = body.index("fclose(g_traceState.logFileHandle)")
-    open_pos = body.index("g_traceState.logFileHandle = fopen(")
+    open_pos = body.index("g_traceState.logFileHandle = OpenConfinedOutputFile(")
     assert close_pos < open_pos
 
 
@@ -773,9 +777,11 @@ def test_extract_int_field_honours_the_default_on_parse_failure():
     source = _plugin_source()
     body = _strip_comments(_function_body(source, "int ExtractIntField(", until="\n}\n"))
 
-    assert re.search(r"if\s*\(\s*sscanf\(.*\)\s*!=\s*1\s*\)", body), (
-        "sscanf's result is discarded again"
-    )
+    # sscanf("%d") is gone entirely (review finding L6: undefined behaviour on
+    # overflow). The value comes from strtoll with a full-consumption, ERANGE
+    # and int-range check, and every failure takes the default.
+    assert "sscanf" not in body
+    assert "strtoll(" in body and "ERANGE" in body and "INT_MAX" in body
     assert "return defaultValue;" in body
 
 

@@ -406,8 +406,13 @@ class TestBridgePassesTlsToRequests:
             bridge._request("/api/status")
         assert get.call_args.kwargs["verify"] == str(ca_file.resolve())
 
-    def test_loopback_call_is_byte_for_byte_what_it_was(self):
-        """No verify, no cert: the common path must not change shape."""
+    def test_loopback_call_has_no_tls_kwargs_and_never_proxies(self):
+        """No verify, no cert on loopback -- and never through a proxy.
+
+        The call used to be exactly {headers, timeout}, which left requests
+        free to honour HTTP_PROXY: with no NO_PROXY it sent
+        http://127.0.0.1:8765 and the bearer token to the proxy in cleartext.
+        """
         bridge = X64DbgBridge()
         bridge._auth_token = "token"
         with patch("requests.get", return_value=self._response()) as get:
@@ -415,7 +420,58 @@ class TestBridgePassesTlsToRequests:
         kwargs = get.call_args.kwargs
         assert "verify" not in kwargs
         assert "cert" not in kwargs
-        assert set(kwargs) == {"headers", "timeout"}
+        assert set(kwargs) == {"headers", "timeout", "proxies", "allow_redirects"}
+        assert kwargs["proxies"] == {"http": None, "https": None}
+        assert kwargs["allow_redirects"] is False
+
+    def test_post_never_proxies_or_redirects(self):
+        bridge = X64DbgBridge()
+        bridge._auth_token = "token"
+        with patch("requests.post", return_value=self._response()) as post:
+            bridge._request("/api/status", {"a": 1})
+        kwargs = post.call_args.kwargs
+        assert kwargs["proxies"] == {"http": None, "https": None}
+        assert kwargs["allow_redirects"] is False
+
+    def test_token_is_not_sent_through_http_proxy(self, monkeypatch):
+        """End to end against a real socket: the proxy must see nothing."""
+        import socket
+        import threading
+
+        seen: list[bytes] = []
+        proxy = socket.socket()
+        proxy.bind(("127.0.0.1", 0))
+        proxy.listen(1)
+        proxy.settimeout(2)
+
+        def accept() -> None:
+            try:
+                conn, _ = proxy.accept()
+            except OSError:
+                return
+            seen.append(conn.recv(4096))
+            conn.close()
+
+        thread = threading.Thread(target=accept, daemon=True)
+        thread.start()
+        for name in ("NO_PROXY", "no_proxy", "ALL_PROXY", "all_proxy"):
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv("HTTP_PROXY", f"http://127.0.0.1:{proxy.getsockname()[1]}")
+
+        # A port nothing listens on: the direct connection fails, which is
+        # the expected outcome -- the point is where the bytes went.
+        free = socket.socket()
+        free.bind(("127.0.0.1", 0))
+        port = free.getsockname()[1]
+        free.close()
+
+        bridge = X64DbgBridge(host="127.0.0.1", port=port, timeout=2)
+        bridge._auth_token = "SECRET-TOKEN-VALUE"
+        with pytest.raises(Exception):
+            bridge._request("/api/status")
+        thread.join(timeout=3)
+        proxy.close()
+        assert not any(b"SECRET-TOKEN-VALUE" in chunk for chunk in seen)
 
 
 class TestTokenSourcing:

@@ -561,7 +561,7 @@ class TestCommandEndpointChokepoint:
         return bridge
 
     def _fake_post(self, sent):
-        def post(url, json=None, headers=None, timeout=None):
+        def post(url, json=None, headers=None, timeout=None, **_kwargs):
             sent.append(json.get("command") if json else None)
 
             class Response:
@@ -646,7 +646,7 @@ class TestSetRegisterValue:
     def test_hex_values_are_accepted(self, value):
         sent: list = []
 
-        def post(url, json=None, headers=None, timeout=None):
+        def post(url, json=None, headers=None, timeout=None, **_kwargs):
             sent.append(json)
 
             class Response:

@@ -5,7 +5,7 @@
 | Document | What it covers |
 |----------|----------------|
 | [Installation](../INSTALL.md) | Every install path, prerequisites, supply-chain integrity, release verification |
-| [Tool reference](tools.md) | All 147 tools by engine, supported formats, architecture |
+| [Tool reference](tools.md) | All 168 tools by engine, supported formats, architecture |
 | [Configuration](configuration.md) | Environment variables, optional dependencies, Jython setup |
 | [Security model](security.md) | What the code enforces, and what it does not |
 

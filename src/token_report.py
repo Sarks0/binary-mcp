@@ -31,11 +31,15 @@ import tempfile
 from pathlib import Path
 
 
-def load_server(windows: bool | None = None, raw_windbg: bool | None = None):
+def load_server(
+    windows: bool | None = None,
+    raw_windbg: bool | None = None,
+    linux: bool | None = None,
+):
     """Import src.server and register its tools, stubbing Ghidra if absent.
 
-    ``windows`` and ``raw_windbg`` pick the host-dependent part of the roster
-    (see register_all_tools); left None they follow this machine.
+    ``windows``, ``raw_windbg`` and ``linux`` pick the host-dependent part of
+    the roster (see register_all_tools); left None they follow this machine.
     """
     try:
         import src.server as server_module
@@ -49,7 +53,9 @@ def load_server(windows: bool | None = None, raw_windbg: bool | None = None):
         os.environ["GHIDRA_HOME"] = str(stub)
         import src.server as server_module
 
-    server_module.register_all_tools(windows=windows, raw_windbg=raw_windbg)
+    server_module.register_all_tools(
+        windows=windows, raw_windbg=raw_windbg, linux=linux
+    )
     return server_module
 
 
@@ -148,11 +154,26 @@ def _main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="measure the roster a Windows host lists, whatever this host is",
     )
+    parser.add_argument(
+        "--linux",
+        action="store_true",
+        help="measure the roster a Linux host lists, whatever this host is",
+    )
     args = parser.parse_args(argv)
     if args.count_tokens and not args.model:
         parser.error("--count-tokens needs --model")
 
-    server_module = load_server(windows=True if args.windows else None)
+    # No host is both, so --windows and --linux each pin BOTH flags rather
+    # than one: asking for the Windows roster on a Linux box has to turn the
+    # GDB tools off, or the report measures a roster no client receives.
+    if args.windows and args.linux:
+        parser.error("--windows and --linux are exclusive: no host is both")
+    if args.windows:
+        server_module = load_server(windows=True, linux=False)
+    elif args.linux:
+        server_module = load_server(windows=False, linux=True)
+    else:
+        server_module = load_server()
     tools = wire_tools(server_module.app)
     instructions = server_module.app.instructions or ""
     print(report(tools, instructions, args.top))

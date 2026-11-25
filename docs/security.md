@@ -7,19 +7,42 @@ Some of that advice is enforced by the code, and it is worth being precise
 about which parts.
 
 Most of the claims below are pinned against the source by a test, so they
-cannot quietly stop being true: the no-execution, never-uploaded,
+cannot quietly stop being true: the execution-boundary, never-uploaded,
 confinement-default and symbol-policy claims by `tests/test_docs_accuracy.py`,
 the command gates by `tests/test_windbg_gate_allowlist.py` and
 `tests/test_x64dbg_command_gate.py`, and the installer claims by
 `tests/test_installer_integrity.py`.
 
-## No tool can execute a sample
+## Only the GDB engine can execute a sample
 
-Nothing in `src/tools/` starts a process from a file on disk. The x64dbg bridge
-has a `load_binary()` method and the C++ plugin has a `LOAD_BINARY` handler, but
-no MCP tool calls either, so neither is reachable from a client.
-`x64dbg_attach` attaches to a PID that is *already running*: you decide what
+This claim was once absolute, and is not any more. Debugging a Linux sample
+means running it, so the GDB engine added in the Linux dynamic tier is the one
+part of this server that starts a process from a file on disk. What bounds it:
+
+- **One tool starts execution.** `gdb_run` is the only entry point that runs
+  anything. `gdb_load_binary` is deliberately inert -- it issues
+  `-file-exec-and-symbols` and records argv, and nothing else -- because GDB
+  with no breakpoints and a bare run command executes a sample to completion.
+- **It stops before user code by default.** `gdb_run` defaults to
+  `stop_at="entry"`, which halts the inferior before any instruction of the
+  program itself. `stop_at="main"` skips the loader and ELF constructors, and
+  `stop_at="none"` is the only value that lets a sample run unsupervised; both
+  are opt-in and say so in the tool's docstring.
+- **Linux only.** Every GDB tool returns a platform message on any other OS.
+- **The path is confined first.** `gdb_load_binary` runs the path through
+  `sanitize_binary_path` before GDB or the ELF reader ever opens it, so the
+  allow-list below bounds what can be loaded at all.
+
+Everywhere else the original claim still holds, and is still asserted:
+nothing else in `src/tools/` starts a process. The x64dbg bridge has a
+`load_binary()` method and the C++ plugin has a `LOAD_BINARY` handler, but no
+MCP tool calls either, so neither is reachable from a client. `x64dbg_attach`
+and `gdb_attach` attach to a PID that is *already running*: you decide what
 runs, and where.
+
+`tests/test_docs_accuracy.py::test_only_the_gdb_tool_layer_can_launch_a_sample`
+pins exactly that split, so a second engine cannot quietly acquire the
+ability.
 
 ## Raw debugger commands are filtered, not sandboxed
 

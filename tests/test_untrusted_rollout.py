@@ -1029,6 +1029,7 @@ _SAMPLE_TEXT_MODULES = {
     "dynamic_tools",
     "fid_tools",
     "function_hash_tools",
+    "gdb_tools",
     "indirect_call_tools",
     "malware_tools",
     "mb_tools",

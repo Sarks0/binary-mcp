@@ -68,8 +68,16 @@ def _server_roster(tmp_path_factory, **register_kwargs):
 def roster(tmp_path_factory):
     # A Windows host with default settings: the largest roster a client sees
     # unless an operator opts in to the raw WinDbg tool.
-    with _server_roster(tmp_path_factory, windows=True, raw_windbg=False) as r:
+    #
+    # linux=False is explicit, not incidental. Registration of the GDB tools
+    # is host-dependent too, so leaving it to detection made this fixture's
+    # size depend on the machine running the suite -- the exact thing the
+    # explicit arguments exist to prevent. A Windows host has no GDB tools.
+    with _server_roster(
+        tmp_path_factory, windows=True, raw_windbg=False, linux=False
+    ) as r:
         yield r
+
 
 
 def _listed(roster):
@@ -439,6 +447,33 @@ class TestToolListBudget:
             "request. Trim a description (cut Args/Returns prose the schema already "
             "carries) rather than raising the budget; run `python -m src.token_report` "
             "to see the heaviest tools."
+        )
+
+    def test_the_linux_roster_stays_inside_the_same_budget(self, tmp_path_factory):
+        """The Windows check above is no longer the only roster that ships.
+
+        Since the GDB engine landed there is no single largest roster: no host
+        is both Windows and Linux, so the WinDbg tools and the GDB tools never
+        appear together. Without this arm, 21 GDB definitions could grow
+        without limit and the Windows-only check would never notice.
+
+        The size is taken inside the context and the live objects are not kept,
+        following TestHostDependentRoster._names: _server_roster swaps fastmcp
+        in sys.modules, so two open roster contexts hand out apps and Clients
+        from different imports and the transport cannot be inferred.
+        """
+        from src.token_report import wire_size, wire_tools
+
+        with _server_roster(
+            tmp_path_factory, windows=False, raw_windbg=False, linux=True
+        ) as (server_module, _):
+            size = wire_size(wire_tools(server_module.app))
+
+        assert size <= TOOLS_LIST_BYTE_BUDGET, (
+            f"the Linux tools/list is {size:,} bytes, over its "
+            f"{TOOLS_LIST_BYTE_BUDGET:,}-byte budget. The GDB tools are the "
+            "difference between this roster and the Windows one; trim their "
+            "descriptions rather than raising the budget."
         )
 
     def test_no_description_is_cut_off_by_clients(self, roster):

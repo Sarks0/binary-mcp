@@ -79,7 +79,10 @@ CATEGORIES: dict[str, str] = {
         "derived from the sample leaves the host: the dataset is fetched once "
         "and then queried locally."
     ),
-    "debugger": "Live debugging via x64dbg or WinDbg against a running target or dump.",
+    "debugger": (
+        "Live debugging via x64dbg, WinDbg or GDB against a running target or "
+        "dump."
+    ),
 }
 
 FACETS: dict[str, str] = {
@@ -277,9 +280,10 @@ TOOL_CATALOG: dict[str, ToolEntry] = {
 PREFIX_RULES: dict[str, ToolEntry] = {
     "x64dbg_": _e("debugger"),
     "windbg_": _e("debugger"),
+    "gdb_": _e("debugger"),
 }
 
-DEBUGGER_CODE_OUTPUT = ("x64dbg_disasm", "windbg_disassemble")
+DEBUGGER_CODE_OUTPUT = ("x64dbg_disasm", "windbg_disassemble", "gdb_disassemble")
 for _name in DEBUGGER_CODE_OUTPUT:
     TOOL_CATALOG[_name] = _e("debugger", CODE)
 
@@ -346,7 +350,7 @@ def _main() -> None:
     from src.server import app, register_all_tools
 
     # The full roster, whatever host generates the manifest.
-    register_all_tools(windows=True, raw_windbg=True)
+    register_all_tools(windows=True, raw_windbg=True, linux=True)
     tools = {t.name: t for t in asyncio.run(app.list_tools())}
     print(manifest_json(tools), end="")
 

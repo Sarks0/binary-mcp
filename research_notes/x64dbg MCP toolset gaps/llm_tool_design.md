@@ -180,7 +180,7 @@ Debugger tools help, but agents use them imperfectly. The gains come from lettin
 - Results must state clearly when nothing happened, for example "no event; target still running", so that soliloquizing or hallucinated observations are less likely to be mistaken for real state.
 
 ### Gaps
-- I could not verify the commonly quoted per-model debug-gym figures (e.g. Claude 3.7 Sonnet with/without pdb). The blog shows them only in a figure, and I did not read the arXiv report in full.
+- I did not find the exact format of debug-gym's per-command pdb observations (frame or listing) in the parts of the report I read.
 - I found no CyberGym or AutoCodeRover details on debugger abstractions within this budget.
 - I found no published agent study using a Windows user-mode debugger (x64dbg or WinDbg) specifically.
 
@@ -231,6 +231,21 @@ Annotations are hints only, not enforcement.
 ### Cited Findings
 **Prompt injection via binaries**
 - Crawford & McClure (May 2026) show that agentic RE systems are vulnerable to prompt injection hidden in the source of executables, demonstrate detecting injection strings in decompiler output, and study obfuscations and counter-defences. — [arXiv 2605.30677](https://arxiv.org/abs/2605.30677)
+- Crawford & McClure's setup was Cline with GhidraMCP and Qwen3-8B. Payloads were compiled into binaries and reached the model through the `list_strings` and `decompile_function` tool outputs. Payloads used fake chat-template tokens such as `<|im_start|>`. — [arXiv 2605.30677 (HTML)](https://arxiv.org/html/2605.30677)
+- Attack success fell from 100% to 40% on Qwen3-8B, and from 65% to 50% on OSS-120B, when angle brackets were swapped for square brackets. — [arXiv 2605.30677 (HTML)](https://arxiv.org/html/2605.30677)
+- Detection results:
+
+  | Detector | F1 | Recall |
+  |---|---|---|
+  | Regex on `<...>` | 0.750 | 0.600 |
+  | Neural classifier (Qwen3-1.7B backbone) | 0.909 | 1.000 |
+
+  The classifier caught every `list_strings` payload but only 62.5–70.8% of injected functions in decompiler output. — [arXiv 2605.30677 (HTML)](https://arxiv.org/html/2605.30677)
+- Obfuscations defeated detection:
+  - Non-printing characters such as `\x01` hide the payload from strings extraction.
+  - Learned pseudo-system tokens evaded the `list_strings` detector in 20 of 20 programs.
+
+  The authors advise against relying on regex alone and recommend screening both strings and decompiler output before they enter context. — [arXiv 2605.30677 (HTML)](https://arxiv.org/html/2605.30677)
 - A practitioner write-up demonstrates weaponized binaries attacking Cline and GhidraMCP-based RE workflows. — [it4sec Substack](https://it4sec.substack.com/p/attacking-ai-based-reverse-engineering)
 - The "lethal trifecta" is private data, untrusted content and external communication together. The only reliable defence is to cut one leg, for example making an MCP server read-only. — [Simon Willison](https://simonwillison.net/2025/Jun/16/the-lethal-trifecta/); [Supabase MCP example](https://simonwillison.net/2025/Jul/06/supabase-mcp-lethal-trifecta/)
 
@@ -251,13 +266,17 @@ Annotations are hints only, not enforcement.
   - Put it in dedicated structured fields (e.g. `untrusted: {strings: [...]}`) so it is never mixed into server-authored instructions or error messages.
   - Escape or neutralize fence-closing sequences inside the data.
   - Cap string length.
+  - Neutralize chat-template tokens (`<|im_start|>`, `<|...|>`, role markers) and non-printing bytes in strings and labels. Do this before data reaches the model, because these were the payload mechanics in arXiv 2605.30677.
+  - Optionally add a lightweight injection classifier. Regex alone had a recall of 0.6.
+  - The same channels exist in x64dbg: strings, labels and comments, memory dumps rendered as ASCII, and module or export names.
 - Split read-only ops (registers, memory read, disasm, modules) from state-changing ops (memory write, patch, register set, breakpoint changes, run/step). Set `readOnlyHint: true` on the first group. Give memory writes and patching `destructiveHint: true`. Set `openWorldHint: false` on everything, because the server is local and closed-domain.
   - In an op-grouped design, a single tool cannot carry different annotations per op. That is an argument for separating read and write tool groups.
 - Add a server-side "allow writes" or "unsafe" flag that defaults off, in the style of ChatDBG and ida-pro-mcp. That makes the guarantee enforced rather than only hinted.
 - binary-mcp's "never launches a sample" stance plus the absence of network tools removes the exfiltration leg. Document this as a security property.
 
 ### Gaps
-- I did not read the full text of the Crawford & McClure paper, so specific attack vectors, success rates and mitigations are unverified.
+- The Crawford & McClure paper is internally inconsistent: §II-I says no benign-classified injection was found across λ values, while §III-C2 reports benign-classified attacks. Treat its obfuscation numbers with caution.
+- That paper tested a small open model (Qwen3-8B). I found no published measurement of injection success against frontier models in an RE setting.
 
 ## 6. Structured outputs (structuredContent/outputSchema) vs text; resources vs tools for large data — plus final checklist
 

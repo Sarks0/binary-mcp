@@ -263,6 +263,42 @@ x64dbg starts Scylla only as a GUI through `StartScylla`, which calls `ScyllaSta
 - I did not research TitanHide, HyperHide, SharpOD, xAnalyzer or Multiline Ultimate Assembler beyond the TitanHide pointer in the ScyllaHide README. Their features are unverified.
 - I did not investigate TitanEngine internals.
 
+## 4b. Third-party plugins, OutputDebugString and child processes (follow-up pass)
+
+### Takeaway
+x64dbg captures OutputDebugString itself. It logs ASCII strings as `DebugString: "..."`, has no Unicode support yet, and hands every string to plugins through CB_OUTPUTDEBUGSTRING. A plugin can therefore capture ODS without the debugger pausing. Of the third-party plugins, xAnalyzer (API argument annotation) and the TitanHide/HyperHide kernel hiders are the most relevant. The kernel hiders need PatchGuard and DSE disabled, so they belong to lab setup rather than MCP tools.
+
+### Cited Findings
+- **OutputDebugString handling in the debugger.**
+  - `cbOutputDebugString` first calls `plugincbcall(CB_OUTPUTDEBUGSTRING, ...)`.
+  - It then reads ASCII strings from debuggee memory and logs them as `DebugString: "..."`. Duplicates are suppressed.
+  - Unicode debug strings are marked `//TODO: implement Windows 10 unicode debug string`.
+  - It pauses on a debug string only if the `Events/DebugStrings` setting is true. The default is false.
+  - — [debugger.cpp](https://github.com/x64dbg/x64dbg/blob/development/src/dbg/debugger.cpp)
+- **TitanHide** is a kernel driver that hooks Nt* functions through SSDT hooks. Each hidden process gets a PID plus a set of hide options.
+  - Hidden: ProcessDebugFlags, ProcessDebugPort, ProcessDebugObjectHandle, the DebugObject (NtQueryObject), SystemKernelDebuggerInformation and SystemDebugControl.
+  - It also covers NtClose exceptions and ThreadHideFromDebugger, and protects DRx against reads and writes through Get/SetContextThread.
+  - It requires PatchGuard and DSE to be disabled.
+  - — [TitanHide README](https://github.com/mrexodia/TitanHide)
+- **HyperHide** has a feature list of more than 30 items, among them:
+  - PEB, heap flags, process and thread flags, KUserSharedData and KiExceptionDispatch.
+  - Query APIs: NtQueryInformationProcess/Thread/JobObject, NtQueryObject, NtQuerySystemInformation, NtQuerySystemTime/PerformanceCounter.
+  - Set and control APIs: NtSetInformationThread/Process, NtSystemDebugControl, NtClose, NtGet/SetContextThread.
+  - Creation and open APIs: NtCreateThreadEx/ProcessEx/UserProcess/File, NtOpenProcess/Thread, NtGetNextProcess.
+  - Other: NtContinue, NtYieldExecution, NtUserFindWindowEx/GetForegroundWindow.
+  - — [HyperHide README](https://github.com/Air14/HyperHide)
+- **xAnalyzer** extends function-call analysis using more than 13,000 API definitions from almost 200 DLLs. It recognises functions, arguments and data types, detects loops automatically, and uses user-maintained definition files. — [xAnalyzer README](https://github.com/ThunderCls/xAnalyzer)
+
+### Inferences
+- **ODS capture.** Registering CB_OUTPUTDEBUGSTRING in Obsidian and pushing the string into the existing debug-event queue would be cheap and safe. The handler must read Unicode strings itself, because x64dbg does not.
+- **Annotation.** xAnalyzer's comments are written into the x64dbg database, so the existing `labels/comments` tools already read them back. The only new piece an MCP needs is "run xAnalyzer on module", which is a plugin command and therefore falls under the plugin-loading block. An optional allowlisted plugin command is the cleanest route.
+- **Kernel hiders.** TitanHide and HyperHide should be documented as lab prerequisites. They should not be MCP-controlled.
+
+### Gaps
+- **Child processes.** I found no child-process auto-attach option in `debugger.cpp`, and a grep for "Child" gave no hits. x64dbg appears to debug only the launched process. A child must be handled by attaching after a CB_CREATEPROCESS-style notification or by pausing on CreateProcess. This is not confirmed by documentation.
+- **Other plugins.** I did not verify the feature lists of SharpOD, Multiline Ultimate Assembler or x64dbgpy within this budget.
+- **Scope of the TitanHide note.** The README says "Windows 10" as its newest tested OS. I did not check Windows 11 support.
+
 ## 5. Not yet exposed by binary-mcp: ranked candidates
 
 ### Takeaway
@@ -274,7 +310,7 @@ Ranked by value to malware analysis against risk.
 1. **Call stack per thread and SEH chain.** Source: `GetCallStackByThread`, `GetSEHChain` ([DBGF](https://github.com/x64dbg/x64dbg/blob/development/src/dbg/_dbgfunctions.h)). Read-only. It gives "who called this API" and SEH-based anti-debug and control-flow tricks.
 2. **Logging/conditional breakpoints with fast resume.** Source: `bpcond`/`bplog`/`bplogcondition`/`SetBreakpointFastResume`/`Silent`/`Singleshoot`/hit counts for all five breakpoint kinds ([CMDS](https://github.com/x64dbg/x64dbg/blob/development/src/dbg/x64dbg.cpp)), or the typed `BpSetFieldText`/`BpGetFieldNumber`. The semantics are in [ConditionalBreakpoint.md](https://github.com/x64dbg/docs/blob/master/introduction/ConditionalBreakpoint.md) and [Formatting.md](https://github.com/x64dbg/docs/blob/master/introduction/Formatting.md). This enables in-debugger API monitors such as `{utf16@[esp+4]}` and `{winerror@eax}`. Block or validate `bpcommand` and `SetBreakpointLogFile`.
 3. **Handles, with names and types.** Source: `EnumHandles` and `GetHandleName` ([DBGF](https://github.com/x64dbg/x64dbg/blob/development/src/dbg/_dbgfunctions.h)). Read-only. It shows mutexes, files, registry keys and sections. Keep `handleclose` out.
-4. **OutputDebugString and raw debug-event capture.** Source: CB_OUTPUTDEBUGSTRING and CB_DEBUGEVENT, which binary-mcp does not register ([PLUG](https://github.com/x64dbg/x64dbg/blob/development/src/dbg/_plugins.h)). Read-only. Malware often uses ODS for anti-debug or leaks debug strings through it.
+4. **OutputDebugString and raw debug-event capture.** Source: CB_OUTPUTDEBUGSTRING and CB_DEBUGEVENT, which binary-mcp does not register ([PLUG](https://github.com/x64dbg/x64dbg/blob/development/src/dbg/_plugins.h)). Read-only. Malware often uses ODS for anti-debug or leaks debug strings through it. The x64dbg core does not decode Unicode ODS ([debugger.cpp](https://github.com/x64dbg/x64dbg/blob/development/src/dbg/debugger.cpp)), so the plugin should read the string itself.
 5. **Patch list and patched-file export.** Source: `PatchEnum`, `PatchGetEx`, `PatchRestore`, `PatchFile` ([DBGF](https://github.com/x64dbg/x64dbg/blob/development/src/dbg/_dbgfunctions.h)). Reads are safe. `PatchFile` writes a file, so pin its path.
 6. **Trace recording and trace-file query.** Source: `StartRunTrace`/`StopRunTrace`, plus a parser for the format in [tracefile.md](https://github.com/x64dbg/docs/blob/master/developers/tracefile.md). It needs a pinned path and a size cap.
 7. **Headless Scylla.** Source: `ScyllaIatSearch`, `ScyllaIatFixAutoW`, `ScyllaDumpProcessW`, `ScyllaRebuildFileW` ([FunctionExport.h](https://github.com/NtQuery/Scylla/blob/master/Scylla/FunctionExport.h)). Used for unpacking. It writes files and loads a bundled DLL into the debugger.

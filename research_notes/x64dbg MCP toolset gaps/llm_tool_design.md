@@ -120,6 +120,18 @@ Debugger tools help, but agents use them imperfectly. The gains come from lettin
 **debug-gym (Microsoft)**
 - debug-gym gives LLM agents pdb plus tools to view, rewrite, eval and listdir. Agents can set breakpoints, navigate code and print variables. Observations are structured text (e.g. JSON), and code runs in Docker sandboxes. — [Microsoft Research blog](https://www.microsoft.com/en-us/research/blog/debug-gym-an-environment-for-ai-coding-tools-to-learn-how-to-debug-code-like-programmers); [arXiv 2503.21557](https://arxiv.org/pdf/2503.21557)
 - Agents with debugging tools beat agents without them across nine LLMs on SWE-bench Lite. Even so, a simple agent "rarely solves more than half" of the issues. The authors attribute the limit to "the scarcity of data representing sequential decision-making behavior" in training data. — [Microsoft Research blog](https://www.microsoft.com/en-us/research/blog/debug-gym-an-environment-for-ai-coding-tools-to-learn-how-to-debug-code-like-programmers)
+- debug-gym SWE-bench Lite success rates (mean of 3 runs), rewrite-only vs pdb from the start vs pdb added after the 5th rewrite ("debug(5)"):
+
+  | Model | rewrite | debug | debug(5) |
+  |---|---|---|---|
+  | Claude 3.7 Sonnet | 37.2 | 48.4 | 52.1 |
+  | o1-preview | 10.7 | 30.2 | 30.8 |
+  | o3-mini | 8.5 | 22.1 | 19.8 |
+  | GPT-4o | 19.1 | 17.2 | 23.6 |
+
+  On Aider, pdb did not help. The authors suspect agents issued pdb commands "without a clear strategy." — [debug-gym, arXiv 2503.21557](https://arxiv.org/html/2503.21557)
+- Starting with pdb hurt weaker models (GPT-4o, GPT-4o-mini, Llama-3.3-70B) on SWE-bench but helped stronger ones. Claude over-explored, trying tools that returned nothing useful. — [arXiv 2503.21557](https://arxiv.org/html/2503.21557)
+- debug-gym keeps a server-side breakpoint list and restores it when the terminal session restarts. The agent's prompt includes the current breakpoints (file and line) at every step. — [arXiv 2503.21557](https://arxiv.org/html/2503.21557)
 
 **EnIGMA (CTF agent built on SWE-agent)**
 - EnIGMA added "Interactive Agent Tools": a gdb session and a pwntools server connection. Commands cover start/stop session, breakpoints, step, continue, and arbitrary commands. — [EnIGMA, arXiv 2409.16165](https://arxiv.org/html/2409.16165)
@@ -307,6 +319,8 @@ Each item traces to evidence above.
 11. **Progressive disclosure.** Keep the core always loaded (session, context, exec control, breakpoints, memory read, disasm). Put rare ops behind `describe_op` or extension groups toggled via `list_changed`. Keep the total under about 10K tokens. (§2)
 12. **Batching.** Accept lists for reads (multiple addresses or expressions) and return per-item errors. (ida-pro-mcp)
 13. **Explicit session/target IDs** in calls and results, to avoid acting on a stale target. (ida-pro-mcp)
+13a. **Server-owned breakpoint state.** Keep the breakpoint list server-side and include it, compactly, in the snapshot, so the model never has to remember it. (debug-gym; §3)
+13b. **Guidance in descriptions.** Tool descriptions should say when to use the debugger and suggest a typical workflow: set a breakpoint on the hypothesis, run_until, inspect the snapshot. debug-gym found that weaker models used pdb "without a clear strategy" and were sometimes hurt by it. (§3)
 14. **Evals.** Build 20–50 realistic tasks (e.g. "find the decryption routine's key at runtime", "identify the API resolving loop"), each with a verifiable answer. Track success, calls, tokens and invalid-argument rate, read the transcripts, and iterate on descriptions. (§1)
 
 ### Gaps

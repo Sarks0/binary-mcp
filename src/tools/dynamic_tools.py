@@ -1251,8 +1251,21 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
         """
         try:
             bridge = get_x64dbg_bridge()
-            bridge.run()
-            return "Debugger running...\nUse x64dbg_pause to pause or x64dbg_wait_paused to wait for breakpoint."
+            result = bridge.run()
+            if result["resumed"]:
+                return (
+                    "Debugger running...\n"
+                    "Use x64dbg_pause to pause or x64dbg_wait_paused to wait for a breakpoint."
+                )
+            # X64M-02: the resume did not take effect. Report it instead of the
+            # old blind "Debugger running..." that was true no matter what.
+            return (
+                f"Run issued but the debuggee did not resume.\n"
+                f"State: {result['state']}\n"
+                f"{result['message']}\n\n"
+                f"If it is sitting at a breakpoint this is expected; otherwise "
+                f"check x64dbg_status for the live run state."
+            )
         except Exception as e:
             logger.error(f"x64dbg_run failed: {e}")
             return safe_error_message("x64dbg_run failed", e)
@@ -1430,10 +1443,17 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
         """
         try:
             bridge = get_x64dbg_bridge()
-            bridge.pause()
+            result = bridge.pause()
 
-            location = bridge.get_current_location()
-            return f"Execution paused\nCurrent address: 0x{location['address']}"
+            if result["paused"]:
+                return f"Execution paused\nCurrent address: 0x{result['address']}"
+            # X64M-02: pause did not take effect within the window.
+            return (
+                f"Pause issued but the debuggee is still running.\n"
+                f"{result['message']}\n\n"
+                f"It may be blocked in a long-running call; retry, or arm a "
+                f"breakpoint and use x64dbg_wait_paused."
+            )
 
         except Exception as e:
             logger.error(f"x64dbg_pause failed: {e}")

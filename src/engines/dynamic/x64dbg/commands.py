@@ -44,7 +44,20 @@ class X64DbgCommands:
 
         status = []
         status.append(f"State: {location['state']}")
-        status.append(f"Address: 0x{location['address']}")
+        # When the target is running, the address is the last captured context,
+        # not a live value, so the caller must not read it as "where we are now"
+        # (operator report X64M-01). Older plugin builds send no is_running;
+        # there the field is None and this note is correctly omitted.
+        if location.get("is_running"):
+            status.append(
+                f"Address: 0x{location['address']} "
+                "(last captured context -- debuggee is RUNNING, not paused here)"
+            )
+        else:
+            status.append(f"Address: 0x{location['address']}")
+        tid = location.get("thread_id")
+        if tid:
+            status.append(f"Thread: {tid}")
 
         # A build that cannot report its version is one from before the module
         # and thread fixes, so say so rather than omitting the line: a missing
@@ -133,8 +146,8 @@ class X64DbgCommands:
             try:
                 wait_result = self.bridge.wait_until_paused(timeout=timeout)
             except X64DbgAPIError as e:
-                # The plugin reports a wait timeout as an API failure. That is
-                # an outcome here, not a fault: the debuggee is still running.
+                # A genuine fault (not the ordinary timeout, which now comes
+                # back as a structured success=False body).
                 wait_error = e.api_message
         finally:
             if not already_set:
@@ -146,18 +159,23 @@ class X64DbgCommands:
                     )
 
         location = self.bridge.get_current_location()
+        # A timeout now arrives as a structured success=False body rather than
+        # an exception; treat either as "did not pause in time".
+        timed_out = wait_error is not None or not wait_result.get("success", False)
         result: dict[str, Any] = {
             "target": target_hex,
-            "address": location.get("address", "unknown"),
+            "address": wait_result.get(
+                "current_address", location.get("address", "unknown")
+            ),
             "state": location.get("state", "unknown"),
             "elapsed_ms": wait_result.get("elapsed_ms", 0),
         }
-        if wait_error is not None:
+        if timed_out:
             result["reached"] = False
-            result["error"] = wait_error
-            # GET_STATE cannot see "running" (it only answers while paused),
-            # so say what the wait established.
-            result["state"] = "running"
+            result["error"] = wait_error or wait_result.get(
+                "error", "Timed out waiting for the debugger to pause"
+            )
+            result["state"] = wait_result.get("current_state", "running")
         else:
             result["reached"] = _same_address(
                 wait_result.get("current_address", result["address"])

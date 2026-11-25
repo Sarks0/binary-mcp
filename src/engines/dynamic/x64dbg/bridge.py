@@ -775,7 +775,12 @@ class X64DbgBridge(Debugger):
         except Exception as e:
             raise RuntimeError(f"Failed to read authentication token: {e}")
 
-    def _request(self, endpoint: str, data: dict[str, Any] | None = None) -> dict[str, Any]:
+    def _request(
+        self,
+        endpoint: str,
+        data: dict[str, Any] | None = None,
+        raise_on_api_error: bool = True,
+    ) -> dict[str, Any]:
         """
         Make HTTP request to plugin API with comprehensive error logging.
 
@@ -907,7 +912,15 @@ class X64DbgBridge(Debugger):
                     traceback_str=traceback.format_exc()
                 )
 
-                raise structured_api_error
+                # Some endpoints report an expected non-success outcome in the
+                # body rather than a fault -- /api/wait/paused returns a
+                # structured timeout with current_state, and /api/run reports a
+                # debuggee that would not resume. Those callers pass
+                # raise_on_api_error=False so they receive the body instead of
+                # an opaque exception (operator report X64M-03). Transport and
+                # HTTP errors still raise via raise_for_status above.
+                if raise_on_api_error:
+                    raise structured_api_error
 
             return result
 
@@ -1280,28 +1293,57 @@ class X64DbgBridge(Debugger):
         )
         return True
 
-    def run(self) -> DebuggerState:
+    def run(self) -> dict[str, Any]:
         """
         Start or resume execution.
 
-        Returns:
-            New debugger state
-        """
-        result = self._request("/api/run")
-        state_str = result.get("state", "running")
-        logger.info(f"Debugger running - state: {state_str}")
-        return self._parse_state(state_str)
+        The plugin confirms the resume took effect instead of reporting a
+        blind success, so a debuggee that would not resume comes back as
+        ``resumed=False`` rather than a false success (operator report
+        X64M-02).
 
-    def pause(self) -> bool:
+        Returns:
+            Dictionary with ``resumed`` (bool), ``state``, ``is_running``,
+            ``address`` and a human ``message``.
+        """
+        result = self._request("/api/run", raise_on_api_error=False)
+        # The plugin folds "ran and re-paused at a breakpoint" into
+        # success=True; it only sends success=False when nothing moved.
+        resumed = bool(result.get("success", True))
+        state_str = result.get("state", "running" if resumed else "paused")
+        logger.info(f"Debugger run -> resumed={resumed}, state={state_str}")
+        return {
+            "resumed": resumed,
+            "state": state_str,
+            "is_running": result.get("is_running"),
+            "address": result.get("current_address", "unknown"),
+            "message": result.get("message")
+            or result.get("error")
+            or ("Execution resumed" if resumed else "Debuggee did not resume"),
+        }
+
+    def pause(self) -> dict[str, Any]:
         """
         Pause execution.
 
+        The plugin confirms the debuggee actually halted (X64M-02).
+
         Returns:
-            True if paused successfully
+            Dictionary with ``paused`` (bool), ``state``, ``is_running``,
+            ``address`` and a human ``message``.
         """
-        self._request("/api/pause")
-        logger.info("Debugger paused")
-        return True
+        result = self._request("/api/pause", raise_on_api_error=False)
+        paused = bool(result.get("success", True))
+        logger.info(f"Debugger pause -> paused={paused}")
+        return {
+            "paused": paused,
+            "state": result.get("state", "paused" if paused else "running"),
+            "is_running": result.get("is_running"),
+            "address": result.get("current_address", "unknown"),
+            "message": result.get("message")
+            or result.get("error")
+            or ("Execution paused" if paused else "Debuggee is still running"),
+        }
 
     def step_into(self) -> dict[str, Any]:
         """
@@ -1786,6 +1828,11 @@ class X64DbgBridge(Debugger):
             "address": result.get("current_address", "unknown"),
             "binary_path": result.get("binary_path", ""),
             "state": result.get("state", "unknown"),
+            # The engine's real run state. Older plugin builds hardcoded
+            # "paused" and sent no is_running; there the field is absent and
+            # callers fall back to the state string.
+            "is_running": result.get("is_running"),
+            "thread_id": result.get("thread_id"),
             # Absent on plugin builds from before the version was reported.
             # None means "this build cannot say", which is itself the answer to
             # "am I running the rebuilt plugin?" -- do not fill it with a guess.
@@ -3307,8 +3354,15 @@ class X64DbgBridge(Debugger):
         data = {"timeout": timeout}
         # The plugin holds the reply until it pauses or `timeout` passes, so
         # the HTTP read must outlast the wait or a long wait fails client-side.
+        #
+        # A timeout comes back as a structured body with success=False and a
+        # current_state/elapsed_ms. raise_on_api_error=False keeps that body
+        # intact instead of turning the normal "not paused yet" outcome into an
+        # opaque exception that hid current_state from the caller (X64M-03).
         with self._http_timeout_at_least(timeout / 1000 + 10):
-            result = self._request("/api/wait/paused", data)
+            result = self._request(
+                "/api/wait/paused", data, raise_on_api_error=False
+            )
         return result
 
     def wait_until_running(self, timeout: int = 10000) -> dict[str, Any]:

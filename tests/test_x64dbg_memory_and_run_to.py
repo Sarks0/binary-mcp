@@ -140,14 +140,83 @@ def test_search_rejects_bad_input_locally(bridge, pattern, region):
 def test_wait_until_paused_outlasts_its_own_timeout(bridge):
     seen = {}
 
-    def fake_request(endpoint, data):
+    def fake_request(endpoint, data, raise_on_api_error=True):
         seen["timeout"] = bridge.timeout
+        seen["raise_on_api_error"] = raise_on_api_error
         return {"success": True}
 
     bridge._request = fake_request
     bridge.wait_until_paused(timeout=120000)
     assert seen["timeout"] > 120
     assert bridge.timeout == 30
+    # The timeout body must come back as data, not an exception (X64M-03).
+    assert seen["raise_on_api_error"] is False
+
+
+def test_wait_until_paused_returns_structured_timeout(bridge):
+    """A wait that times out is a result, not an exception (X64M-03)."""
+    timeout_body = {
+        "success": False,
+        "error": "Timeout waiting for debugger to pause",
+        "timeout_ms": 3000,
+        "elapsed_ms": 3000,
+        "current_state": "running",
+    }
+    bridge._request = MagicMock(return_value=timeout_body)
+    result = bridge.wait_until_paused(timeout=3000)
+    assert result["success"] is False
+    assert result["current_state"] == "running"
+    _, kwargs = bridge._request.call_args
+    assert kwargs.get("raise_on_api_error") is False
+
+
+def test_run_reports_failure_to_resume(bridge):
+    """X64M-02: a debuggee that will not resume is not reported as success."""
+    bridge._request = MagicMock(return_value={
+        "success": False,
+        "is_running": False,
+        "state": "paused",
+        "current_address": "7ff895408a34",
+        "message": "run issued but the debuggee did not resume",
+    })
+    result = bridge.run()
+    assert result["resumed"] is False
+    assert "did not resume" in result["message"]
+    _, kwargs = bridge._request.call_args
+    assert kwargs.get("raise_on_api_error") is False
+
+
+def test_run_reports_success(bridge):
+    bridge._request = MagicMock(return_value={
+        "success": True, "is_running": True, "state": "running",
+        "current_address": "401000", "message": "Execution resumed",
+    })
+    result = bridge.run()
+    assert result["resumed"] is True
+    assert result["state"] == "running"
+
+
+def test_pause_reports_still_running(bridge):
+    """X64M-02: pause that does not take effect is not a false success."""
+    bridge._request = MagicMock(return_value={
+        "success": False, "is_running": True, "state": "running",
+        "current_address": "401000",
+        "message": "pause issued but the debuggee is still running",
+    })
+    result = bridge.pause()
+    assert result["paused"] is False
+    assert result["is_running"] is True
+
+
+def test_get_current_location_surfaces_running_state(bridge):
+    bridge._request_with_retry = MagicMock(return_value={
+        "state": "running", "is_running": True, "thread_id": 1808,
+        "current_address": "7ff895408a34", "binary_path": "C:/msdtc.exe",
+    })
+    loc = bridge.get_current_location()
+    assert loc["is_running"] is True
+    assert loc["thread_id"] == 1808
+    assert loc["state"] == "running"
 
 
 # --- run_to_address ------------------------------------------------------

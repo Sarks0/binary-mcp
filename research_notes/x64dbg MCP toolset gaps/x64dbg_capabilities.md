@@ -44,15 +44,15 @@ These commands are dangerous: `loadlib`, `scriptdll`, `scriptload`/`scriptrun`, 
 - The calculator-style commands (`inc`, `add`, `xor`, `mov,set`, `push`, `pop`, `bswap`, ...) operate on variables, registers and memory.
 
 **What the conditional breakpoint machinery does**
-- When a breakpoint is hit, x64dbg sets `$breakpointexceptionaddress` and increments a hit counter (`$breakpointcounter`). It then evaluates the break condition. If fast resume is on and the condition is 0, it resumes immediately and skips plugin callbacks and GUI updates. It also evaluates the log and command conditions, prints the formatted log text, and runs the command text. A command can change `$breakpointcondition` to decide whether to break. An invalid expression always breaks. Numbers are hex by default. — [ConditionalBreakpoint.md](https://github.com/x64dbg/docs/blob/master/introduction/ConditionalBreakpoint.md)
-- Example: a break condition of `0` gives a breakpoint that only logs or runs a command. `arg.get(0)==1` filters on the first argument. — [ConditionalBreakpoint.md](https://github.com/x64dbg/docs/blob/master/introduction/ConditionalBreakpoint.md)
+- When a breakpoint is hit, x64dbg sets `$breakpointexceptionaddress` and increments a hit counter (`$breakpointcounter`). It then evaluates the break condition. If fast resume is on and the condition is 0, it resumes immediately and skips plugin callbacks and GUI updates. It also evaluates the log and command conditions, prints the formatted log text, and runs the command text. A command can change `$breakpointcondition` to decide whether to break. An invalid expression always breaks. Numbers are hex by default. - [ConditionalBreakpoint.md](https://github.com/x64dbg/docs/blob/master/introduction/ConditionalBreakpoint.md)
+- Example: a break condition of `0` gives a breakpoint that only logs or runs a command. `arg.get(0)==1` filters on the first argument. - [ConditionalBreakpoint.md](https://github.com/x64dbg/docs/blob/master/introduction/ConditionalBreakpoint.md)
 - The log format syntax is `{?:expr}`.
   - Basic types: `d`, `u`, `p`, `s`, `x`, `a` (address plus symbol) and `i` (instruction).
   - Floating-point types: `f`/`F`, including XMM/YMM/ZMM registers.
   - Complex types: `{mem;size@addr}`, `{winerror@code}`, `{ntstatus@code}`, `{ascii|ansi|utf8|utf16[;len]@addr}`, `{disasm@}`, `{modname@}`, `{bswap;size@}`, `{label@}`, `{comment@}`.
   - Plugins can add formatters with `_plugin_registerformatfunction`.
-  - — [Formatting.md](https://github.com/x64dbg/docs/blob/master/introduction/Formatting.md)
-- Conditional tracing follows the same pattern: `$tracecounter` and break/log/command conditions, with `$tracecondition` and `$tracelogcondition`. `{p:cip} {i:cip}` logs every traced instruction. Trace Over does not log or record inside the calls it steps over. — [ConditionalTracing.md](https://github.com/x64dbg/docs/blob/master/introduction/ConditionalTracing.md)
+  - - [Formatting.md](https://github.com/x64dbg/docs/blob/master/introduction/Formatting.md)
+- Conditional tracing follows the same pattern: `$tracecounter` and break/log/command conditions, with `$tracecondition` and `$tracelogcondition`. `{p:cip} {i:cip}` logs every traced instruction. Trace Over does not log or record inside the calls it steps over. - [ConditionalTracing.md](https://github.com/x64dbg/docs/blob/master/introduction/ConditionalTracing.md)
 - Expression functions are what conditions, log strings and `eval` can call. All of them are read-only except `arg.set`.
   - Process: `peb()`, `teb()`, `tid()`, `kusd()`.
   - Modules: `mod.party/base/size/hash/entry/system/user/main/rva/offset/isexport/fromname`.
@@ -64,24 +64,24 @@ These commands are dangerous: `loadlib`, `scriptdll`, `scriptload`/`scriptrun`, 
   - Strings: `utf8/utf16/ansi`, `strstr`, `streq`.
   - Arguments: `arg.get/arg.set`.
   - Other: `func.start/end`, `ref.count/addr`, `rdtsc()`, `GetTickCount()`.
-  - — [Expression-functions.md](https://github.com/x64dbg/docs/blob/master/introduction/Expression-functions.md)
+  - - [Expression-functions.md](https://github.com/x64dbg/docs/blob/master/introduction/Expression-functions.md)
 
 **Documented behaviour of individual commands**
-- `savedata file, addr, size` writes memory to disk. The name `:memdump:` produces `memdump_pid_addr_size.bin` in the x64dbg directory, and the filename accepts format strings. Risk: it writes files. — [savedata.md](https://github.com/x64dbg/docs/blob/master/commands/memory-operations/savedata.md)
-- `minidump file.dmp` writes a full-memory minidump that includes handle information. — [minidump.md](https://github.com/x64dbg/docs/blob/master/commands/memory-operations/minidump.md)
-- `HideDebugger/dbh` patches the PEB so that `IsDebuggerPresent()` returns false. It only defeats very simple checks. — [HideDebugger.md](https://github.com/x64dbg/docs/blob/master/commands/misc/HideDebugger.md)
-- `handleclose h` closes a handle in the debuggee. It mutates the debuggee and is destructive. — [handleclose.md](https://github.com/x64dbg/docs/blob/master/commands/operating-system-control/handleclose.md)
-- `imageinfo [base]` prints the PE Characteristics and DllCharacteristics of a module. It is read-only. — [imageinfo.md](https://github.com/x64dbg/docs/blob/master/commands/analysis/imageinfo.md)
-- `RunToParty n` places temporary memory breakpoints on every page of that party (0 = user, 1 = system). `rtu` is the same as `RunToParty 0`. — [RunToParty.md](https://github.com/x64dbg/docs/blob/master/commands/tracing/RunToParty.md), [RunToUserCode.md](https://github.com/x64dbg/docs/blob/master/commands/tracing/RunToUserCode.md)
-- `symdownload [module] [storeURL]` downloads symbols from a symbol store, for all modules if none is given. This makes network requests. — [symdownload.md](https://github.com/x64dbg/docs/blob/master/commands/analysis/symdownload.md)
-- `virtualmod name, base[, size]` treats a memory range as a module. This is useful for unpacked or manually mapped payloads. — [virtualmod.md](https://github.com/x64dbg/docs/blob/master/commands/analysis/virtualmod.md)
-- `SetWatchdog id, changed|unchanged|istrue|isfalse` makes a watch expression act as a tripwire. — [SetWatchdog.md](https://github.com/x64dbg/docs/blob/master/commands/watch-control/SetWatchdog.md)
-- `gpa export[, dll]` resolves an export in the debuggee and stores it in `$result`. — [gpa.md](https://github.com/x64dbg/docs/blob/master/commands/misc/gpa.md)
-- `traceexecute addr` marks an address as traced in trace coverage. — [traceexecute.md](https://github.com/x64dbg/docs/blob/master/commands/analysis/traceexecute.md)
-- `createthread entry[, arg]` creates a thread in the debuggee. It executes code. — [createthread.md](https://github.com/x64dbg/docs/blob/master/commands/thread-control/createthread.md)
-- `chd` calls SetCurrentDirectory in the debugger process. — [chd.md](https://github.com/x64dbg/docs/blob/master/commands/misc/chd.md)
-- `scriptdll` loads a DLL into **x64dbg itself** and calls its `Start`/`AsyncStart`, then unloads it. It executes arbitrary code in the debugger. — [scriptdll.md](https://github.com/x64dbg/docs/blob/master/commands/script/scriptdll.md)
-- `TraceSetStepFilter` and the `rtu` rework are new in the 2026.04.20 release. — [x64dbg releases](https://github.com/x64dbg/x64dbg/releases)
+- `savedata file, addr, size` writes memory to disk. The name `:memdump:` produces `memdump_pid_addr_size.bin` in the x64dbg directory, and the filename accepts format strings. Risk: it writes files. - [savedata.md](https://github.com/x64dbg/docs/blob/master/commands/memory-operations/savedata.md)
+- `minidump file.dmp` writes a full-memory minidump that includes handle information. - [minidump.md](https://github.com/x64dbg/docs/blob/master/commands/memory-operations/minidump.md)
+- `HideDebugger/dbh` patches the PEB so that `IsDebuggerPresent()` returns false. It only defeats very simple checks. - [HideDebugger.md](https://github.com/x64dbg/docs/blob/master/commands/misc/HideDebugger.md)
+- `handleclose h` closes a handle in the debuggee. It mutates the debuggee and is destructive. - [handleclose.md](https://github.com/x64dbg/docs/blob/master/commands/operating-system-control/handleclose.md)
+- `imageinfo [base]` prints the PE Characteristics and DllCharacteristics of a module. It is read-only. - [imageinfo.md](https://github.com/x64dbg/docs/blob/master/commands/analysis/imageinfo.md)
+- `RunToParty n` places temporary memory breakpoints on every page of that party (0 = user, 1 = system). `rtu` is the same as `RunToParty 0`. - [RunToParty.md](https://github.com/x64dbg/docs/blob/master/commands/tracing/RunToParty.md), [RunToUserCode.md](https://github.com/x64dbg/docs/blob/master/commands/tracing/RunToUserCode.md)
+- `symdownload [module] [storeURL]` downloads symbols from a symbol store, for all modules if none is given. This makes network requests. - [symdownload.md](https://github.com/x64dbg/docs/blob/master/commands/analysis/symdownload.md)
+- `virtualmod name, base[, size]` treats a memory range as a module. This is useful for unpacked or manually mapped payloads. - [virtualmod.md](https://github.com/x64dbg/docs/blob/master/commands/analysis/virtualmod.md)
+- `SetWatchdog id, changed|unchanged|istrue|isfalse` makes a watch expression act as a tripwire. - [SetWatchdog.md](https://github.com/x64dbg/docs/blob/master/commands/watch-control/SetWatchdog.md)
+- `gpa export[, dll]` resolves an export in the debuggee and stores it in `$result`. - [gpa.md](https://github.com/x64dbg/docs/blob/master/commands/misc/gpa.md)
+- `traceexecute addr` marks an address as traced in trace coverage. - [traceexecute.md](https://github.com/x64dbg/docs/blob/master/commands/analysis/traceexecute.md)
+- `createthread entry[, arg]` creates a thread in the debuggee. It executes code. - [createthread.md](https://github.com/x64dbg/docs/blob/master/commands/thread-control/createthread.md)
+- `chd` calls SetCurrentDirectory in the debugger process. - [chd.md](https://github.com/x64dbg/docs/blob/master/commands/misc/chd.md)
+- `scriptdll` loads a DLL into **x64dbg itself** and calls its `Start`/`AsyncStart`, then unloads it. It executes arbitrary code in the debugger. - [scriptdll.md](https://github.com/x64dbg/docs/blob/master/commands/script/scriptdll.md)
+- `TraceSetStepFilter` and the `rtu` rework are new in the 2026.04.20 release. - [x64dbg releases](https://github.com/x64dbg/x64dbg/releases)
 
 ### Inferences
 - Several breakpoint commands can be allowlisted safely if we validate their arguments: the `bpcond`, `bplog`, `bplogcondition`, `SetBreakpointFastResume`, `SetBreakpointSilent`, `SetBreakpointSingleshoot` and `Get/ResetBreakpointHitCount` families for all five breakpoint kinds. Together they enable "log every call to X with args, never break", the most useful pattern for an LLM.
@@ -173,7 +173,7 @@ The bridge adds TEB/PEB addresses, xrefs, symbol info, the watch list, function/
 - Tracing: **CB_TRACEEXECUTE** (per traced instruction, can change the break decision), CB_STARTTRACE, CB_STOPTRACE.
 - Analysis and expressions: CB_ANALYZE, CB_ADDRINFO, CB_VALFROMSTRING, CB_VALTOSTRING.
 - Database operations: CB_DBOPERATION, CB_DBLOADOPERATION.
-- The StartTrace and StopTrace plugin callbacks arrived in 2026.04.20 — [releases](https://github.com/x64dbg/x64dbg/releases)
+- The StartTrace and StopTrace plugin callbacks arrived in 2026.04.20 - [releases](https://github.com/x64dbg/x64dbg/releases)
 - binary-mcp's plugin does **not** register CB_OUTPUTDEBUGSTRING, CB_DEBUGEVENT, CB_ATTACH/DETACH, CB_TRACEEXECUTE or CB_START/STOPTRACE. Source: grep of `src/engines/dynamic/x64dbg/plugin/plugin.cpp` in this repo.
 
 ### Inferences
@@ -193,18 +193,18 @@ The bridge adds TEB/PEB addresses, xrefs, symbol info, the watch list, function/
 x64dbg can record a run trace to a `.trace32`/`.trace64` file with `StartRunTrace file` and stop it with `StopRunTrace`/`tc`. The tracing itself comes from `ticnd`/`tocnd` and similar commands. The file format is documented, so an MCP server could parse it offline for register and memory deltas per instruction. Trace coverage hit counts are also available live through `tr.hitcount()` and `GetTraceRecordHitCount`.
 
 ### Cited Findings
-- `StartTraceRecording/StartRunTrace/opentrace file` starts recording and opens the trace view. A tracing command is still needed to produce instructions, and the extension is not added automatically. — [StartRunTrace.md](https://github.com/x64dbg/docs/blob/master/commands/tracing/StartRunTrace.md)
+- `StartTraceRecording/StartRunTrace/opentrace file` starts recording and opens the trace view. A tracing command is still needed to produce instructions, and the extension is not added automatically. - [StartRunTrace.md](https://github.com/x64dbg/docs/blob/master/commands/tracing/StartRunTrace.md)
 - The `.trace32`/`.trace64` file format:
   - The file opens with the magic `"TRAC"`, then a 4-byte length and a JSON header, then binary blocks. It is little-endian.
   - Block type 0 is one executed instruction. It holds a ThreadId (stored only when it changes), the opcode (up to 15 bytes), register changes as relative indices into `REGDUMP` with new values, and memory accesses with flags, address, old data and new data.
-  - — [tracefile.md](https://github.com/x64dbg/docs/blob/master/developers/tracefile.md)
+  - - [tracefile.md](https://github.com/x64dbg/docs/blob/master/developers/tracefile.md)
 - Recent trace features:
   - 2025.08.19 added best-effort memory and stack reconstruction from traces, and searching for intermodular calls in traces.
   - 2026.04.20 added `TraceSetStepFilter`, user-defined blocks in trace, and StartTrace/StopTrace callbacks.
   - 2026.05.27 fixed a memory fault in the trace reader.
-  - — [releases](https://github.com/x64dbg/x64dbg/releases)
-- Trace coverage commands and functions: `tibt`/`tobt` (beyond coverage), `tiit`/`toit` (into coverage), `traceexecute`, `tr.hitcount`, `tr.isrecording`. — [CMDS](https://github.com/x64dbg/x64dbg/blob/development/src/dbg/x64dbg.cpp), [Expression-functions.md](https://github.com/x64dbg/docs/blob/master/introduction/Expression-functions.md)
-- `GetTraceRecordHitCount`, `GetTraceRecordByteType` and `Set/GetTraceRecordType` are in DbgFunctions. — [DBGF](https://github.com/x64dbg/x64dbg/blob/development/src/dbg/_dbgfunctions.h)
+  - - [releases](https://github.com/x64dbg/x64dbg/releases)
+- Trace coverage commands and functions: `tibt`/`tobt` (beyond coverage), `tiit`/`toit` (into coverage), `traceexecute`, `tr.hitcount`, `tr.isrecording`. - [CMDS](https://github.com/x64dbg/x64dbg/blob/development/src/dbg/x64dbg.cpp), [Expression-functions.md](https://github.com/x64dbg/docs/blob/master/introduction/Expression-functions.md)
+- `GetTraceRecordHitCount`, `GetTraceRecordByteType` and `Set/GetTraceRecordType` are in DbgFunctions. - [DBGF](https://github.com/x64dbg/x64dbg/blob/development/src/dbg/_dbgfunctions.h)
 
 ### Inferences
 - The best fit is a pair of tools, `trace_record_start(path in sandbox dir)` and `trace_record_stop`, plus a Python-side parser for the trace file. The parser would answer questions like "which instruction last wrote address X", "values of EAX across the loop" or "all memory writes into region R". This gives post-hoc "time travel" queries without re-running malware.
@@ -220,7 +220,7 @@ x64dbg can record a run trace to a `.trace32`/`.trace64` file with `StartRunTrac
 x64dbg starts Scylla only as a GUI through `StartScylla`, which calls `ScyllaStartGui`. `Scylla.dll`, however, exports headless functions for IAT search, IAT auto-fix, dumping and PE rebuild. A plugin could call them directly to unpack without the GUI. ScyllaHide is far more thorough than our PEB-only hiding.
 
 ### Cited Findings
-- x64dbg's `StartScylla` runs `LoadLibraryW(L"Scylla.dll")` and calls the `ScyllaStartGui` export. — [cmd-plugins.cpp](https://github.com/x64dbg/x64dbg/blob/development/src/dbg/commands/cmd-plugins.cpp)
+- x64dbg's `StartScylla` runs `LoadLibraryW(L"Scylla.dll")` and calls the `ScyllaStartGui` export. - [cmd-plugins.cpp](https://github.com/x64dbg/x64dbg/blob/development/src/dbg/commands/cmd-plugins.cpp)
 - Scylla exports:
   - `ScyllaIatSearch(pid, &iatStart, &iatSize, searchStart, advancedSearch)`
   - `ScyllaIatFixAutoW(iatAddr, iatSize, pid, dumpFile, iatFixFile)`
@@ -228,8 +228,8 @@ x64dbg starts Scylla only as a GUI through `StartScylla`, which calls `ScyllaSta
   - `ScyllaDumpCurrentProcessW`
   - `ScyllaRebuildFileW(file, removeDosStub, updateChecksum, createBackup)`
   - `ScyllaStartGui`, `ScyllaVersionInformation*`
-  - — [FunctionExport.h](https://github.com/NtQuery/Scylla/blob/master/Scylla/FunctionExport.h)
-- ScyllaHide is a user-mode anti-anti-debug library that hooks functions to hide the debugger. It ships an x64dbg plugin and an InjectorCLI, and points to TitanHide for ring 0. — [ScyllaHide README](https://github.com/x64dbg/ScyllaHide)
+  - - [FunctionExport.h](https://github.com/NtQuery/Scylla/blob/master/Scylla/FunctionExport.h)
+- ScyllaHide is a user-mode anti-anti-debug library that hooks functions to hide the debugger. It ships an x64dbg plugin and an InjectorCLI, and points to TitanHide for ring 0. - [ScyllaHide README](https://github.com/x64dbg/ScyllaHide)
 - ScyllaHide profile options:
   - PEB: `PebBeingDebugged`, `PebHeapFlags`, `PebNtGlobalFlag`, `PebStartupInfo`, `PebOsBuildNumber`.
   - Process, thread and object queries: `NtQueryInformationProcessHook`, `NtSetInformationThreadHook`, `NtQueryObjectHook`, `NtQuerySystemInformationHook`, `NtCloseHook`, `NtSetInformationProcessHook`.
@@ -239,8 +239,8 @@ x64dbg starts Scylla only as a GUI through `StartScylla`, which calls `ScyllaSta
   - Debug output and filters: `OutputDebugStringHook`, `NtSetDebugFilterStateHook`.
   - Other: `NtYieldExecutionHook`, `KillAntiAttach`, `RemoveDebugPrivileges`, `PreventThreadCreation`.
   - Each profile is a named INI section, such as a "VMProtect x86/x64" profile.
-  - — [scylla_hide.ini](https://github.com/x64dbg/ScyllaHide/blob/master/ConfigCollection/scylla_hide.ini)
-- The x64dbg-automate plugin uses ZeroMQ request/reply plus pub/sub events with MessagePack. — [x64dbg-automate](https://github.com/dariushoule/x64dbg-automate)
+  - - [scylla_hide.ini](https://github.com/x64dbg/ScyllaHide/blob/master/ConfigCollection/scylla_hide.ini)
+- The x64dbg-automate plugin uses ZeroMQ request/reply plus pub/sub events with MessagePack. - [x64dbg-automate](https://github.com/dariushoule/x64dbg-automate)
 - Its request set:
   - Debugger control and state: `DBG_CMD_EXEC_DIRECT`, `DBG_EVAL`, `DBG_IS_DEBUGGING`, `DBG_IS_RUNNING`, `DBG_IS_ELEVATED`, `DBG_GET_BITNESS`, `DEBUGGER_PID`, `DEBUGGER_VERSION`, `QUIT`.
   - Memory: `DBG_MEMMAP`, `DBG_READ/WRITE_MEMORY`, `DBG_IS_VALID_READ_PTR`.
@@ -248,8 +248,8 @@ x64dbg starts Scylla only as a GUI through `StartScylla`, which calls `ScyllaSta
   - Code: `ASSEMBLE`, `DISASSEMBLE`.
   - Breakpoints and annotations: `GET_BREAKPOINTS`, `GET_COMMENT`, `GET_LABEL`, `GET_SYMBOL`.
   - Log, settings and GUI: `GET_LOG`, `DBG_READ/WRITE_SETTING_SZ/UINT`, `GUI_REFRESH_VIEWS`.
-  - — [commands_xauto.py](https://github.com/dariushoule/x64dbg-automate-pyclient/blob/main/x64dbg_automate/commands_xauto.py)
-- The 2025.08.19 release notes mention the Automate Python library and an MCP server built on it. The 2026.04.20 notes point to an MCP-based "x64dbg-skills" project built on Automate. — [releases](https://github.com/x64dbg/x64dbg/releases)
+  - - [commands_xauto.py](https://github.com/dariushoule/x64dbg-automate-pyclient/blob/main/x64dbg_automate/commands_xauto.py)
+- The 2025.08.19 release notes mention the Automate Python library and an MCP server built on it. The 2026.04.20 notes point to an MCP-based "x64dbg-skills" project built on Automate. - [releases](https://github.com/x64dbg/x64dbg/releases)
 
 ### Inferences
 - binary-mcp exposes no reading of x64dbg's own log (`GET_LOG`), and none of the settings reads and writes that Automate has.
@@ -274,20 +274,20 @@ x64dbg captures OutputDebugString itself. It logs ASCII strings as `DebugString:
   - It then reads ASCII strings from debuggee memory and logs them as `DebugString: "..."`. Duplicates are suppressed.
   - Unicode debug strings are marked `//TODO: implement Windows 10 unicode debug string`.
   - It pauses on a debug string only if the `Events/DebugStrings` setting is true. The default is false.
-  - — [debugger.cpp](https://github.com/x64dbg/x64dbg/blob/development/src/dbg/debugger.cpp)
+  - - [debugger.cpp](https://github.com/x64dbg/x64dbg/blob/development/src/dbg/debugger.cpp)
 - **TitanHide** is a kernel driver that hooks Nt* functions through SSDT hooks. Each hidden process gets a PID plus a set of hide options.
   - Hidden: ProcessDebugFlags, ProcessDebugPort, ProcessDebugObjectHandle, the DebugObject (NtQueryObject), SystemKernelDebuggerInformation and SystemDebugControl.
   - It also covers NtClose exceptions and ThreadHideFromDebugger, and protects DRx against reads and writes through Get/SetContextThread.
   - It requires PatchGuard and DSE to be disabled.
-  - — [TitanHide README](https://github.com/mrexodia/TitanHide)
+  - - [TitanHide README](https://github.com/mrexodia/TitanHide)
 - **HyperHide** has a feature list of more than 30 items, among them:
   - PEB, heap flags, process and thread flags, KUserSharedData and KiExceptionDispatch.
   - Query APIs: NtQueryInformationProcess/Thread/JobObject, NtQueryObject, NtQuerySystemInformation, NtQuerySystemTime/PerformanceCounter.
   - Set and control APIs: NtSetInformationThread/Process, NtSystemDebugControl, NtClose, NtGet/SetContextThread.
   - Creation and open APIs: NtCreateThreadEx/ProcessEx/UserProcess/File, NtOpenProcess/Thread, NtGetNextProcess.
   - Other: NtContinue, NtYieldExecution, NtUserFindWindowEx/GetForegroundWindow.
-  - — [HyperHide README](https://github.com/Air14/HyperHide)
-- **xAnalyzer** extends function-call analysis using more than 13,000 API definitions from almost 200 DLLs. It recognises functions, arguments and data types, detects loops automatically, and uses user-maintained definition files. — [xAnalyzer README](https://github.com/ThunderCls/xAnalyzer)
+  - - [HyperHide README](https://github.com/Air14/HyperHide)
+- **xAnalyzer** extends function-call analysis using more than 13,000 API definitions from almost 200 DLLs. It recognises functions, arguments and data types, detects loops automatically, and uses user-maintained definition files. - [xAnalyzer README](https://github.com/ThunderCls/xAnalyzer)
 
 ### Inferences
 - **ODS capture.** Registering CB_OUTPUTDEBUGSTRING in Obsidian and pushing the string into the existing debug-event queue would be cheap and safe. The handler must read Unicode strings itself, because x64dbg does not.

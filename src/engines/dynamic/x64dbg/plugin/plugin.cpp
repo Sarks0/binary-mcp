@@ -944,23 +944,40 @@ std::string HandleGetState(const std::string& request) {
     // Check if debugger is active
     if (!DbgIsDebugging()) {
         data << "\"state\":\"not_loaded\","
+             << "\"is_running\":false,"
              << "\"current_address\":\"0\","
+             << "\"thread_id\":0,"
              << "\"binary_path\":\"\"";
         return BuildJsonResponse(true, data.str());
     }
 
-    // If we're debugging, assume paused (we can only query when paused)
-    const char* stateStr = "paused";
+    // Report the engine's REAL run state. The previous version hardcoded
+    // "paused" with the comment "we can only query when paused", which was
+    // simply false: DbgIsRunning() answers at any time, and a service or any
+    // target resumed with no breakpoint armed sits in the running state
+    // indefinitely. Hardcoding "paused" made every setter's "debugger is
+    // running" refusal look like a contradiction and left the state
+    // undiagnosable from this endpoint (operator report X64M-01).
+    //
+    // While running, cip and the module are the LAST captured context, not a
+    // live value, so is_running is the field a caller must believe over the
+    // address, which can look frozen.
+    const bool running = DbgIsRunning();
 
-    // Get current instruction pointer
+    // Get current instruction pointer (last-known while running)
     duint cip = DbgValFromString("cip");
 
     // Get binary path
     char modulePath[MAX_PATH] = "";
     DbgGetModuleAt(cip, modulePath);
 
-    data << "\"state\":\"" << stateStr << "\","
+    // Active thread id; 0 if the engine cannot name one (e.g. mid-transition).
+    DWORD tid = DbgGetThreadId();
+
+    data << "\"state\":\"" << (running ? "running" : "paused") << "\","
+         << "\"is_running\":" << (running ? "true" : "false") << ","
          << "\"current_address\":\"" << std::hex << cip << std::dec << "\","
+         << "\"thread_id\":" << tid << ","
          << "\"binary_path\":\"" << JsonEscape(modulePath) << "\"";
 
     return BuildJsonResponse(true, data.str());
@@ -1979,9 +1996,48 @@ std::string HandleRun(const std::string& request) {
         return BuildJsonResponse(false, "\"error\":\"Not debugging\"");
     }
 
-    DbgCmdExec("run");
+    const duint cipBefore = DbgValFromString("cip");
 
-    return BuildJsonResponse(true, "\"message\":\"Execution resumed\"");
+    if (!DbgCmdExec("run")) {
+        return BuildJsonResponse(false, "\"error\":\"Failed to issue run command\"");
+    }
+
+    // DbgCmdExec is asynchronous, so a blind success reply was unverified: the
+    // debuggee might fail to resume (operator report X64M-02) or run and
+    // re-pause at a breakpoint before we look. Poll a short window and report
+    // what actually happened.
+    const int timeoutMs = 2000;
+    const int pollInterval = 20;
+    int waited = 0;
+    bool running = DbgIsRunning();
+    while (!running && waited < timeoutMs) {
+        if (!AbortableSleep((DWORD)pollInterval)) break;
+        waited += pollInterval;
+        running = DbgIsRunning();
+    }
+
+    const duint cipAfter = DbgValFromString("cip");
+
+    std::stringstream data;
+    data << "\"is_running\":" << (running ? "true" : "false") << ","
+         << "\"state\":\"" << (running ? "running" : "paused") << "\","
+         << "\"current_address\":\"" << std::hex << cipAfter << std::dec << "\"";
+
+    if (running) {
+        data << ",\"message\":\"Execution resumed\"";
+        return BuildJsonResponse(true, data.str());
+    }
+    if (cipAfter != cipBefore) {
+        // Resumed and already stopped again (breakpoint/exception) before we
+        // sampled a running state -- still a genuine resume, reported as such.
+        data << ",\"message\":\"Ran and paused again at a new address\"";
+        return BuildJsonResponse(true, data.str());
+    }
+    // Never observed running and the address did not move: the resume did not
+    // take effect. Report it rather than faking success (X64M-02).
+    data << ",\"message\":\"run issued but the debuggee did not resume "
+            "(still paused at the same address)\"";
+    return BuildJsonResponse(false, data.str());
 }
 
 // Handler: PAUSE - Pause execution
@@ -1992,7 +2048,30 @@ std::string HandlePause(const std::string& request) {
 
     DbgCmdExec("pause");
 
-    return BuildJsonResponse(true, "\"message\":\"Execution paused\"");
+    // Confirm the debuggee actually halted instead of reporting success
+    // blindly (X64M-02). If it was already paused this returns at once.
+    const int timeoutMs = 2000;
+    const int pollInterval = 20;
+    int waited = 0;
+    bool running = DbgIsRunning();
+    while (running && waited < timeoutMs) {
+        if (!AbortableSleep((DWORD)pollInterval)) break;
+        waited += pollInterval;
+        running = DbgIsRunning();
+    }
+
+    const duint cip = DbgValFromString("cip");
+    std::stringstream data;
+    data << "\"is_running\":" << (running ? "true" : "false") << ","
+         << "\"state\":\"" << (running ? "running" : "paused") << "\","
+         << "\"current_address\":\"" << std::hex << cip << std::dec << "\"";
+
+    if (!running) {
+        data << ",\"message\":\"Execution paused\"";
+        return BuildJsonResponse(true, data.str());
+    }
+    data << ",\"message\":\"pause issued but the debuggee is still running\"";
+    return BuildJsonResponse(false, data.str());
 }
 
 // Handler: SET_REGISTER - Set register value

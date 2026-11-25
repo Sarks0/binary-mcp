@@ -163,6 +163,20 @@ static HMODULE g_hModule = nullptr;
 
 // Server process handle
 static HANDLE g_serverProcess = nullptr;
+
+// Job object the server is assigned to. With KILL_ON_JOB_CLOSE, a crash of
+// x64dbg (which closes every handle this plugin holds) reaps the server
+// instead of leaving it orphaned. Best-effort: if creation or assignment fails
+// the watchdog below still respawns, we only lose the crash-reap guarantee.
+static HANDLE g_serverJob = nullptr;
+
+// Watchdog thread. Waits on the server process and respawns it (capped
+// backoff) if it exits while g_running. The out-of-process design exists so a
+// server crash cannot take x64dbg down; without this, that same crash left the
+// whole MCP surface dead until x64dbg restarted. Touched only by pluginSetup
+// (before the thread starts) and pluginStop (after it is joined).
+static HANDLE g_watchdogThread = nullptr;
+
 static HANDLE g_pipeServer = INVALID_HANDLE_VALUE;
 static HANDLE g_pipeThread = nullptr;
 static HANDLE g_shutdownEvent = nullptr;  // Event to signal shutdown
@@ -5822,6 +5836,14 @@ static bool SpawnHTTPServer() {
     g_serverProcessId.store(pi.dwProcessId);
     CloseHandle(pi.hThread);  // Don't need thread handle
 
+    // Reap-on-crash: assign the server to the plugin's job object. Best-effort;
+    // x64dbg running inside a job that forbids nesting makes this fail, and the
+    // watchdog still works without it.
+    if (g_serverJob && !AssignProcessToJobObject(g_serverJob, pi.hProcess)) {
+        LogError("Could not assign server to job object: %d (crash-reap disabled)",
+                 GetLastError());
+    }
+
     // Clear token from environment immediately after spawn (child already inherited it)
     SetEnvironmentVariableA("OBSIDIAN_AUTH_TOKEN", nullptr);
 
@@ -5857,6 +5879,70 @@ static bool SpawnHTTPServer() {
     LogInfo("HTTP server process started and verified (PID: %d)", pi.dwProcessId);
     LogInfo("Server log file: %sobsidian_server.log", pluginPath);
     return true;
+}
+
+// Watchdog: respawn obsidian_server.exe if it dies while the plugin is running.
+//
+// Runs on its own thread, started from pluginSetup after the first server is
+// up (never from DllMain). It owns g_serverProcess between respawns -- the only
+// other accessors are pluginSetup, which finishes before this thread starts,
+// and pluginStop, which joins this thread before it touches g_serverProcess --
+// so no lock is needed on that handle. g_serverProcessId is atomic and is
+// cleared the instant a dead server's handle is closed, so the pipe turns away
+// peers until the replacement's PID is recorded (finding F-17).
+static DWORD WINAPI ServerWatchdogThread(LPVOID) {
+    // Capped backoff so a server that crashes on startup cannot spin-respawn.
+    // Reset after a server stays up long enough to look healthy.
+    static const DWORD kBackoffMs[] = { 500, 1000, 2000, 5000, 10000 };
+    static const int kBackoffCount = (int)(sizeof(kBackoffMs) / sizeof(kBackoffMs[0]));
+    int backoffIdx = 0;
+    ULONGLONG lastSpawn = GetTickCount64();
+
+    LogInfo("Server watchdog started");
+
+    while (g_running.load()) {
+        if (!g_serverProcess) {
+            // Respawn path. Wait the backoff first, interruptibly.
+            DWORD delay = kBackoffMs[backoffIdx];
+            if (backoffIdx < kBackoffCount - 1) backoffIdx++;
+            if (g_shutdownEvent &&
+                WaitForSingleObject(g_shutdownEvent, delay) == WAIT_OBJECT_0) {
+                break;
+            }
+            if (!g_running.load()) break;
+            if (SpawnHTTPServer()) {
+                lastSpawn = GetTickCount64();
+                LogInfo("Watchdog respawned obsidian_server");
+            } else {
+                LogError("Watchdog respawn failed; will retry");
+            }
+            continue;
+        }
+
+        // Watch the live server. Wake on its exit or on shutdown.
+        HANDLE handles[2] = { g_serverProcess, g_shutdownEvent };
+        DWORD w = WaitForMultipleObjects(2, handles, FALSE, INFINITE);
+        if (w == WAIT_OBJECT_0 + 1 || !g_running.load()) {
+            break;  // shutdown
+        }
+        if (w != WAIT_OBJECT_0) {
+            LogError("Watchdog wait failed: %lu; stopping", GetLastError());
+            break;  // untrustworthy handles -- do not spin
+        }
+
+        DWORD code = 0;
+        GetExitCodeProcess(g_serverProcess, &code);
+        LogError("obsidian_server exited (code %lu); scheduling respawn", code);
+        CloseHandle(g_serverProcess);
+        g_serverProcess = nullptr;
+        g_serverProcessId.store(0);
+
+        // A server that ran a healthy while earns a fresh backoff budget.
+        if (GetTickCount64() - lastSpawn > 60000) backoffIdx = 0;
+    }
+
+    LogInfo("Server watchdog stopped");
+    return 0;
 }
 
 // Menu callback handler (handles all menu entries)
@@ -6033,7 +6119,23 @@ void pluginStop() {
         g_pipeThread = nullptr;
     }
 
-    // Cleanup events. Safe now: the pipe thread has provably exited.
+    // Stop the watchdog before closing the shutdown event it waits on and
+    // before the server-terminate block touches g_serverProcess. g_running is
+    // already false and g_shutdownEvent is signalled, so the watchdog returns
+    // from its wait at once; the only bounded delay is a respawn's liveness
+    // Sleep. Mirror the pipe thread's leak-on-timeout rule rather than close an
+    // event a live thread still reads.
+    if (g_watchdogThread) {
+        if (WaitForSingleObject(g_watchdogThread, 10000) != WAIT_OBJECT_0) {
+            LogError("Watchdog thread did not stop; leaking its resources");
+            LogInfo("Plugin stopped (watchdog still running; resources intentionally leaked)");
+            return;
+        }
+        CloseHandle(g_watchdogThread);
+        g_watchdogThread = nullptr;
+    }
+
+    // Cleanup events. Safe now: the pipe and watchdog threads have provably exited.
     if (g_shutdownEvent) {
         CloseHandle(g_shutdownEvent);
         g_shutdownEvent = nullptr;
@@ -6058,6 +6160,13 @@ void pluginStop() {
         g_serverProcess = nullptr;
         // F-17: the PID stops being pinned the moment this handle closes.
         g_serverProcessId.store(0);
+    }
+
+    // Close the server's job object. KILL_ON_JOB_CLOSE reaps the server too if
+    // it somehow outlived the terminate above.
+    if (g_serverJob) {
+        CloseHandle(g_serverJob);
+        g_serverJob = nullptr;
     }
 
     // AUDIT (dead Reset() methods): g_traceState / g_apiLogState /
@@ -6436,6 +6545,22 @@ void pluginSetup() {
         return;
     }
 
+    // Create the job object the server is assigned to (crash-reap). Must exist
+    // before the first spawn so that server is covered too. Best-effort.
+    g_serverJob = CreateJobObjectA(nullptr, nullptr);
+    if (g_serverJob) {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli = {};
+        jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if (!SetInformationJobObject(g_serverJob, JobObjectExtendedLimitInformation,
+                                     &jeli, sizeof(jeli))) {
+            LogError("Could not set job limits: %d (crash-reap disabled)", GetLastError());
+            CloseHandle(g_serverJob);
+            g_serverJob = nullptr;
+        }
+    } else {
+        LogError("Could not create job object: %d (crash-reap disabled)", GetLastError());
+    }
+
     // Spawn HTTP server process
     if (!SpawnHTTPServer()) {
         LogError("Failed to spawn HTTP server");
@@ -6444,8 +6569,17 @@ void pluginSetup() {
         WaitForSingleObject(g_pipeThread, 1000);
         CloseHandle(g_pipeThread); g_pipeThread = nullptr;
         CloseHandle(g_shutdownEvent); g_shutdownEvent = nullptr;
+        if (g_serverJob) { CloseHandle(g_serverJob); g_serverJob = nullptr; }
         SetEnvironmentVariableA("OBSIDIAN_AUTH_TOKEN", nullptr);
         return;
+    }
+
+    // Start the watchdog now that the first server is confirmed up. Spawned
+    // here, never from DllMain, which is the loader-lock trap the whole
+    // out-of-process design exists to avoid.
+    g_watchdogThread = CreateThread(nullptr, 0, ServerWatchdogThread, nullptr, 0, nullptr);
+    if (!g_watchdogThread) {
+        LogError("Could not start server watchdog: %d (no auto-respawn)", GetLastError());
     }
 
     // Register menu callback

@@ -946,8 +946,10 @@ std::string BuildAddressError(const std::string& errorMsg, const std::string& ad
 
 // Interruptible sleep used by the run/pause post-condition polls below; the
 // definition lives further down next to the wait handlers. Forward-declared so
-// HandleRun/HandlePause, which appear before it, can call it.
-static bool AbortableSleep(DWORD milliseconds);
+// HandleRun/HandlePause, which appear before it, can call it. The parameter
+// name is omitted deliberately so this declaration is not mistaken for the
+// definition by source-scraping tests that key on the full signature.
+static bool AbortableSleep(DWORD);
 
 // Handler: GET_STATE - Get current debugger state
 std::string HandleGetState(const std::string& request) {

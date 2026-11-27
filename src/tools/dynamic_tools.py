@@ -5169,6 +5169,65 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             return safe_error_message("x64dbg_event_status failed", e)
 
     @log_dynamic_tool
+    def x64dbg_health() -> str:
+        """
+        One-call health and state snapshot of the whole x64dbg surface.
+
+        Answers "is it alive, and is the target running or paused?" in a single
+        call, so a session that looks wedged can be diagnosed without inferring
+        state from separate tools. Reports plugin/server/pipe liveness, whether
+        the auto-respawn watchdog is active, and the real debugger state.
+
+        A transport failure is itself the answer: it means the server or pipe is
+        down, which this reports as an unreachable surface rather than a crash.
+
+        Returns:
+            Health summary (reachability, watchdog, and debugger state)
+        """
+        try:
+            bridge = get_x64dbg_bridge()
+            h = bridge.get_health()
+
+            if h.get("debugging"):
+                state = "running" if h.get("is_running") else "paused"
+                addr = h.get("current_address", "0")
+                if h.get("is_running"):
+                    state_line = (
+                        f"  Debuggee: RUNNING (0x{addr} is the last captured "
+                        f"context, not live)"
+                    )
+                else:
+                    state_line = f"  Debuggee: paused at 0x{addr}"
+                tid = h.get("thread_id", 0)
+                thread_line = f"\n  Thread: {tid}" if tid else ""
+            else:
+                state = "not_loaded"
+                state_line = "  Debuggee: none loaded"
+                thread_line = ""
+
+            watchdog = "active" if h.get("watchdog_active") else "NOT running"
+            return (
+                "x64dbg Surface Health:\n"
+                "  Plugin: alive\n"
+                "  Pipe: connected\n"
+                f"  Server PID: {h.get('server_pid', 0)}\n"
+                f"  Watchdog: {watchdog}\n"
+                f"  State: {state}\n"
+                f"{state_line}{thread_line}\n"
+                f"  Event queue: {h.get('event_queue_size', 0)}"
+            )
+
+        except Exception as e:
+            logger.error(f"x64dbg_health failed: {e}")
+            # The failure IS the health answer: the server or pipe is down.
+            return safe_error_message(
+                "x64dbg surface UNREACHABLE: the obsidian server or its pipe to "
+                "the plugin did not answer. Check that x64dbg is running with the "
+                "plugin loaded; the watchdog respawns the server, so retry shortly.",
+                e,
+            )
+
+    @log_dynamic_tool
     def x64dbg_run_until_event(
         event_types: str = "breakpoint_hit,exception,paused",
         timeout_seconds: int = 30
@@ -10212,6 +10271,7 @@ def register_dynamic_tools(app: FastMCP, session_manager: UnifiedSessionManager 
             "disable_privilege": x64dbg_disable_privilege,
             "enable_privilege": x64dbg_enable_privilege,
             "exec_command": x64dbg_execute_command,
+            "health": x64dbg_health,
             "hide_debugger": x64dbg_hide_debugger,
             "minidump": x64dbg_create_minidump,
             "status": x64dbg_status,

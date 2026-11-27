@@ -208,6 +208,22 @@ def test_pause_reports_still_running(bridge):
     assert result["is_running"] is True
 
 
+def test_get_health_hits_the_health_endpoint(bridge):
+    body = {
+        "success": True, "plugin_alive": True, "pipe_connected": True,
+        "server_pid": 6292, "watchdog_active": True, "debugging": True,
+        "is_running": True, "state": "running",
+        "current_address": "7ff895408a34", "thread_id": 1808,
+        "event_queue_size": 3,
+    }
+    bridge._request = MagicMock(return_value=body)
+    h = bridge.get_health()
+    bridge._request.assert_called_once_with("/api/health")
+    assert h["watchdog_active"] is True
+    assert h["is_running"] is True
+    assert h["server_pid"] == 6292
+
+
 def test_get_current_location_surfaces_running_state(bridge):
     bridge._request_with_retry = MagicMock(return_value={
         "state": "running", "is_running": True, "thread_id": 1808,

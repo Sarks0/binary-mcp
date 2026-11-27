@@ -3491,6 +3491,23 @@ class X64DbgBridge(Debugger):
         """
         return self._request("/api/events/status")
 
+    def get_health(self) -> dict[str, Any]:
+        """
+        One-call liveness and state snapshot of the whole surface.
+
+        A successful reply proves the plugin is alive and the pipe is
+        connected; the body also carries the server PID, whether the watchdog
+        is running, and the real debugger state (running/paused, cip, tid). A
+        transport failure here is itself the diagnosis -- the caller reports it
+        as a degraded surface rather than treating it as a hard error.
+
+        Returns:
+            Dictionary with plugin_alive, pipe_connected, server_pid,
+            watchdog_active, debugging, is_running, state, current_address,
+            thread_id and event_queue_size.
+        """
+        return self._request("/api/health")
+
     def poll_for_event(
         self,
         event_types: list[str] | None = None,

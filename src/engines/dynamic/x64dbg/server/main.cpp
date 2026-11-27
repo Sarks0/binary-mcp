@@ -772,6 +772,8 @@ static std::string HandleHTTPRequestInner(const std::string& request) {
         requestType = 101;  // CLEAR_EVENTS
     } else if (path == "/api/events/status") {
         requestType = 102;  // GET_EVENT_STATUS
+    } else if (path == "/api/health") {
+        requestType = 103;  // GET_HEALTH (rich; distinct from the static GET /health)
 
     // Memory Allocation (Phase 3)
     } else if (path == "/api/memory/alloc") {

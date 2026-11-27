@@ -93,6 +93,7 @@ enum RequestType {
     GET_EVENTS = 100,
     CLEAR_EVENTS = 101,
     GET_EVENT_STATUS = 102,
+    GET_HEALTH = 103,
 
     // Memory allocation (Phase 3)
     VIRT_ALLOC = 110,
@@ -4500,6 +4501,41 @@ std::string HandleGetEventStatus(const std::string& request) {
     return BuildJsonResponse(true, data.str());
 }
 
+// Handler: GET_HEALTH - one-call liveness and state snapshot
+//
+// The operator's wedged-session report asked for a single diagnostic that
+// says, without guesswork, whether the surface is alive and what state the
+// debuggee is really in. That this reply arrives at all proves the plugin is
+// alive and the pipe is connected; the rest is cheap predicates that need no
+// debugger lock, so it answers promptly even when a process is running.
+//
+// It still travels the one pipe, so a long wait-for-pause ahead of it would
+// delay it -- removing that head-of-line blocking is a separate change. What
+// this gives today is the "is it alive, and running or paused?" answer in one
+// call instead of inferring it from a status field that used to lie.
+std::string HandleGetHealth(const std::string& request) {
+    const bool debugging = DbgIsDebugging();
+    const bool running = debugging && DbgIsRunning();
+
+    duint cip = debugging ? DbgValFromString("cip") : 0;
+    DWORD tid = debugging ? DbgGetThreadId() : 0;
+
+    std::stringstream data;
+    data << "\"plugin_version\":\"" << PLUGIN_VERSION_STR << "\","
+         << "\"plugin_alive\":true,"
+         << "\"pipe_connected\":true,"
+         << "\"server_pid\":" << g_serverProcessId.load() << ","
+         << "\"watchdog_active\":" << (g_watchdogThread != nullptr ? "true" : "false") << ","
+         << "\"debugging\":" << (debugging ? "true" : "false") << ","
+         << "\"is_running\":" << (running ? "true" : "false") << ","
+         << "\"state\":\"" << (!debugging ? "not_loaded" : (running ? "running" : "paused")) << "\","
+         << "\"current_address\":\"" << std::hex << cip << std::dec << "\","
+         << "\"thread_id\":" << tid << ","
+         << "\"event_queue_size\":" << EventQueue::Instance().Size();
+
+    return BuildJsonResponse(true, data.str());
+}
+
 // DEBUG EVENT CALLBACKS
 // These are called by x64dbg when debug events occur
 
@@ -5473,6 +5509,9 @@ static DWORD WINAPI PipeServerThread(LPVOID lpParam) {
                         break;
                     case GET_EVENT_STATUS:
                         response = HandleGetEventStatus(request);
+                        break;
+                    case GET_HEALTH:
+                        response = HandleGetHealth(request);
                         break;
 
                     // Memory allocation (Phase 3)

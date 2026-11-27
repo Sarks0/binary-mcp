@@ -944,6 +944,11 @@ std::string BuildAddressError(const std::string& errorMsg, const std::string& ad
 
 // REQUEST HANDLERS
 
+// Interruptible sleep used by the run/pause post-condition polls below; the
+// definition lives further down next to the wait handlers. Forward-declared so
+// HandleRun/HandlePause, which appear before it, can call it.
+static bool AbortableSleep(DWORD milliseconds);
+
 // Handler: GET_STATE - Get current debugger state
 std::string HandleGetState(const std::string& request) {
     std::stringstream data;
@@ -1332,8 +1337,10 @@ std::string HandleSearchMemory(const std::string& request) {
             // Read patLen - 1 bytes past the chunk (within the region) so a
             // match straddling the chunk edge is still seen. Matches are only
             // counted if they START inside this chunk, so none is reported twice.
-            const size_t chunk = std::min(SEARCH_CHUNK, regionSize - off);
-            const size_t readLen = std::min(chunk + patLen - 1, regionSize - off);
+            // Parenthesised so the windows.h min() macro cannot expand these
+            // (NOMINMAX is not set in this translation unit).
+            const size_t chunk = (std::min)(SEARCH_CHUNK, regionSize - off);
+            const size_t readLen = (std::min)(chunk + patLen - 1, regionSize - off);
             buffer.resize(readLen);
             ReadMemoryTolerant(base + off, buffer.data(), readLen, &spans);
 

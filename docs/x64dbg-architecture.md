@@ -78,15 +78,22 @@ Communication Flow:
 
 ```
 src/engines/dynamic/x64dbg/
-├── pipe_protocol.h           # Shared IPC protocol definitions
+├── pipe_protocol.h           # Shared pipe constants (name, max message size)
 ├── plugin/
-│   ├── plugin_new.cpp       # NEW: Minimal plugin stub
-│   ├── plugin.cpp            # OLD: Complex in-process server
-│   ├── CMakeLists_new.txt   # NEW: Dual-target build system
-│   └── CMakeLists.txt        # OLD: Single plugin build
+│   ├── plugin.cpp            # The plugin: spawns the server, owns the pipe,
+│   │                         #   dispatches requests, runs the server watchdog
+│   ├── event_system.{h,cpp}  # Debug-event queue
+│   └── CMakeLists.txt        # Dual-target build (plugin DLL + server EXE), hardened
 └── server/
-    └── main.cpp              # NEW: HTTP server executable
+    ├── main.cpp              # HTTP server executable
+    ├── listener_policy.h     # Bind / allow-list policy
+    ├── schannel_tls.h        # Optional Schannel TLS
+    └── activity_log.h        # JSONL activity log
 ```
+
+The single-process, in-process-server design that caused the crashes above was
+replaced, not kept: there is no `plugin_new.cpp`/`plugin_old.cpp` split and no
+`http_server.cpp`. `plugin.cpp` is the plugin; `server/main.cpp` is the server.
 
 ## Listener
 
@@ -162,33 +169,27 @@ enforces.
 
 ### Request Types
 
+Each request carries a numeric `type`. The authoritative list is the
+`RequestType` enum in `plugin.cpp`, mirrored by the URL-to-number path table in
+`server/main.cpp`; it has grown well past the original handful (there are ~60
+types across state, execution, breakpoints, memory, analysis, tracing, events
+and health). A few anchors:
+
 | Type | Value | Description |
 |------|-------|-------------|
-| GET_STATE | 1 | Get debugger state (running/paused/not_loaded) |
-| EXECUTE_COMMAND | 2 | Execute x64dbg command |
+| GET_STATE | 1 | Debugger state (running/paused/not_loaded), with `is_running`, cip, tid |
 | READ_MEMORY | 3 | Read process memory |
-| WRITE_MEMORY | 4 | Write process memory |
-| GET_REGISTERS | 5 | Get register values |
-| SET_BREAKPOINT | 6 | Set breakpoint |
+| EXECUTE_COMMAND | 16 | Execute an allowlisted x64dbg command |
+| SET_BREAKPOINT | 20 | Set a software breakpoint |
+| GET_HEALTH | 103 | One-call liveness and state snapshot |
 | PING | 99 | Health check |
-| SHUTDOWN | 100 | Server shutting down |
 
-## How to Transition
+`pipe_protocol.h` defines only the shared pipe constants (`PIPE_NAME`,
+`MAX_MESSAGE_SIZE`); its small illustrative `RequestType` enum is historical and
+is not what dispatch uses.
 
-### Step 1: Backup Old Files
-```bash
-cd src/engines/dynamic/x64dbg/plugin/
-cp plugin.cpp plugin_old.cpp
-cp CMakeLists.txt CMakeLists_old.txt
-```
+## Building and deploying
 
-### Step 2: Activate New Architecture
-```bash
-mv plugin_new.cpp plugin.cpp
-mv CMakeLists_new.txt CMakeLists.txt
-```
-
-### Step 3: Build
 ```bash
 cd src/engines/dynamic/x64dbg/plugin
 mkdir build && cd build
@@ -196,25 +197,36 @@ cmake ..
 cmake --build . --config Release
 ```
 
-**Output:**
-- `obsidian.dp64` (or `.dp32`) - Plugin DLL
+**Output (both must live in the same directory):**
+- `obsidian.dp64` (or `.dp32`) - plugin DLL
 - `obsidian_server.exe` - HTTP server executable
 
-### Step 4: Deploy
-Copy **BOTH** files to x64dbg plugins directory:
-```
-C:\x64dbg\x64\plugins\
-├── obsidian.dp64
-└── obsidian_server.exe
-```
+Deploy both into x64dbg's plugins directory, e.g. `C:\x64dbg\x64\plugins\`.
+The build applies exploit mitigations (Control Flow Guard, DEP/ASLR, EH
+Continuation Guard, CET on the server EXE) and LTCG for Release; see
+`CMakeLists.txt` and `research_notes/x64dbg plugin hardening/binary_hardening.md`.
 
-**IMPORTANT:** Both files must be in the same directory!
+**Smoke test:**
+1. Start x64dbg; the log shows `HTTP server process started (PID: ...)` then
+   `HTTP server connected to pipe`.
+2. `curl -H "Authorization: Bearer $(cat "$TEMP/x64dbg_mcp_token.txt")" http://localhost:8765/health`
+   -- `/health` requires the token like every other endpoint.
 
-### Step 5: Test
-1. Start x64dbg
-2. Check log for: `[MCP] HTTP server process started (PID: ...)`
-3. Server connects via pipe: `[MCP] HTTP server connected to pipe`
-4. Test HTTP endpoint: `curl -H "Authorization: Bearer $(cat "$TEMP/x64dbg_mcp_token.txt")" http://localhost:8765/health` -- `/health` requires authentication like every other endpoint
+## Crash isolation and the watchdog
+
+Running the HTTP server in its own process means a server crash cannot take
+x64dbg down. To make that isolation useful rather than just survivable:
+
+- The plugin starts a **watchdog thread** (from `plugsetup`, never `DllMain`)
+  that waits on the server process and **respawns it with capped backoff** if
+  it exits while the plugin is running, clearing the pinned peer PID in between
+  so the pipe turns away impostors until the replacement is up.
+- The server is assigned to a **job object with `KILL_ON_JOB_CLOSE`**, so a
+  crash of x64dbg reaps the server instead of orphaning it.
+
+Both are best-effort and degrade cleanly: if the job cannot be created the
+watchdog still respawns, and if the watchdog cannot start the surface still
+works, it just will not self-heal after a server crash.
 
 ## Advantages
 
@@ -310,27 +322,14 @@ C:\x64dbg\x64\plugins\
 2. Check server console output
 3. Server crash logs don't affect plugin
 
-## Next Steps
+## Status
 
-1. **Port HTTP Server Code:**
-   - Move existing http_server.cpp logic to server/main.cpp
-   - Implement full HTTP request handling
-   - Add pipe client calls for x64dbg operations
-
-2. **Implement Command Handlers:**
-   - Add request parsing in plugin
-   - Implement x64dbg API calls
-   - Return results via pipe
-
-3. **Add Error Handling:**
-   - Server reconnection logic
-   - Graceful degradation
-   - Comprehensive logging
-
-4. **Testing:**
-   - Unit tests for pipe protocol
-   - Integration tests for full flow
-   - Load testing for performance
+This architecture is in place: the out-of-process server, named-pipe IPC,
+per-request HTTP handling, the allowlisted command path, the server watchdog,
+and the pipe-protocol and higher-level tests all ship today. The historical
+to-do list that once sat here (porting the in-process server, wiring the first
+handlers) is done; see the handlers in `plugin.cpp`, the routes in
+`server/main.cpp`, and the `tests/test_x64dbg_*` suites.
 
 ## Conclusion
 

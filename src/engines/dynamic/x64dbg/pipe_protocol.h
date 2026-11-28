@@ -12,6 +12,13 @@ namespace Protocol {
     constexpr const char* PIPE_NAME = "\\\\.\\pipe\\x64dbg_mcp";
 
     // Message types from HTTP server to plugin
+    // HISTORICAL / ILLUSTRATIVE ONLY. Dispatch does NOT use this enum: the
+    // authoritative request-type numbering is the RequestType enum in
+    // plugin.cpp (mirrored by the URL->number path table in server/main.cpp),
+    // which has grown to ~60 values. These originals even disagree with it now
+    // (e.g. EXECUTE_COMMAND is 16 and SET_BREAKPOINT is 20 there). Kept only so
+    // the shared header documents the original minimal protocol; add new types
+    // in plugin.cpp and server/main.cpp, not here.
     enum class RequestType : uint32_t {
         GET_STATE = 1,          // Get debugger state
         EXECUTE_COMMAND = 2,    // Execute x64dbg command

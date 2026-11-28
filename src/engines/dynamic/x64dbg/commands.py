@@ -10,7 +10,7 @@ from typing import Any
 
 from src.utils.formatters import neutralise_untrusted_delimiters
 
-from .bridge import X64DbgBridge
+from .bridge import X64DbgAPIError, X64DbgBridge
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +44,20 @@ class X64DbgCommands:
 
         status = []
         status.append(f"State: {location['state']}")
-        status.append(f"Address: 0x{location['address']}")
+        # When the target is running, the address is the last captured context,
+        # not a live value, so the caller must not read it as "where we are now"
+        # (operator report X64M-01). Older plugin builds send no is_running;
+        # there the field is None and this note is correctly omitted.
+        if location.get("is_running"):
+            status.append(
+                f"Address: 0x{location['address']} "
+                "(last captured context -- debuggee is RUNNING, not paused here)"
+            )
+        else:
+            status.append(f"Address: 0x{location['address']}")
+        tid = location.get("thread_id")
+        if tid:
+            status.append(f"Thread: {tid}")
 
         # A build that cannot report its version is one from before the module
         # and thread fixes, so say so rather than omitting the line: a missing
@@ -85,32 +98,89 @@ class X64DbgCommands:
 
         return "\n".join(status)
 
-    def run_to_address(self, address: str) -> dict[str, Any]:
+    def run_to_address(self, address: str, timeout: int = 30000) -> dict[str, Any]:
         """
-        Run until reaching specified address.
+        Run until execution reaches ``address``.
 
-        Sets temporary breakpoint, runs, then removes breakpoint.
+        Sets a temporary breakpoint (unless one is already there), resumes,
+        and waits for the debugger to pause. The temporary breakpoint is
+        removed afterwards whatever happened; a breakpoint the caller had
+        already set at that address is left alone.
+
+        Execution can pause somewhere else first -- another breakpoint, an
+        exception -- or not pause before the timeout. Both are reported
+        rather than raised, because the debuggee's state after them is
+        exactly what the caller needs to know.
 
         Args:
-            address: Target address
+            address: Target address (hex string)
+            timeout: Maximum wait in milliseconds
 
         Returns:
-            Execution state when breakpoint hit
+            Dictionary with ``reached`` (paused at the target), ``target``,
+            ``address`` (where execution is now), ``state``, ``elapsed_ms``,
+            and ``error`` when it did not pause in time.
         """
         self.ensure_connected()
 
-        # Set breakpoint
-        self.bridge.set_breakpoint(address)
+        target_hex = self.bridge._normalize_address(address)
+        target = int(target_hex, 16)
 
-        # Run
-        self.bridge.run()
+        def _same_address(value: Any) -> bool:
+            try:
+                return int(str(value), 16) == target
+            except (TypeError, ValueError):
+                return False
 
-        # TODO: Wait for breakpoint hit (needs event system)
+        already_set = any(
+            _same_address(bp.get("address"))
+            for bp in self.bridge.list_breakpoints()
+        )
+        if not already_set:
+            self.bridge.set_breakpoint(target_hex)
 
-        # Remove breakpoint
-        self.bridge.delete_breakpoint(address)
+        wait_result: dict[str, Any] = {}
+        wait_error: str | None = None
+        try:
+            self.bridge.run()
+            try:
+                wait_result = self.bridge.wait_until_paused(timeout=timeout)
+            except X64DbgAPIError as e:
+                # A genuine fault (not the ordinary timeout, which now comes
+                # back as a structured success=False body).
+                wait_error = e.api_message
+        finally:
+            if not already_set:
+                try:
+                    self.bridge.delete_breakpoint(target_hex)
+                except Exception as e:
+                    logger.warning(
+                        f"Could not remove temporary breakpoint at 0x{target_hex}: {e}"
+                    )
 
-        return self.bridge.get_current_location()
+        location = self.bridge.get_current_location()
+        # A timeout now arrives as a structured success=False body rather than
+        # an exception; treat either as "did not pause in time".
+        timed_out = wait_error is not None or not wait_result.get("success", False)
+        result: dict[str, Any] = {
+            "target": target_hex,
+            "address": wait_result.get(
+                "current_address", location.get("address", "unknown")
+            ),
+            "state": location.get("state", "unknown"),
+            "elapsed_ms": wait_result.get("elapsed_ms", 0),
+        }
+        if timed_out:
+            result["reached"] = False
+            result["error"] = wait_error or wait_result.get(
+                "error", "Timed out waiting for the debugger to pause"
+            )
+            result["state"] = wait_result.get("current_state", "running")
+        else:
+            result["reached"] = _same_address(
+                wait_result.get("current_address", result["address"])
+            )
+        return result
 
     def dump_registers(self) -> str:
         """

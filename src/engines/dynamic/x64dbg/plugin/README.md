@@ -120,7 +120,8 @@ Base URL: `http://localhost:8765`
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/api/status` | GET/POST | Get debugger status |
+| `/api/status` | GET/POST | Get debugger status (reports the real run state: `state`, `is_running`, `thread_id`, and the current address) |
+| `/api/health` | GET/POST | One-call liveness and state snapshot: plugin/pipe alive, server PID, whether the watchdog is active, and the real running/paused state |
 | `/api/load` | POST | Load binary into debugger |
 | `/api/run` | POST | Start/resume execution |
 | `/api/pause` | POST | Pause execution |
@@ -164,6 +165,8 @@ Essential for automation scripts - block until debugger reaches desired state.
 |----------|--------|-------------|
 | `/api/memory/read` | POST | Read memory |
 | `/api/memory/write` | POST | Write memory |
+| `/api/memory/dump` | POST | Read up to 256 KB, zero-filling unreadable pages (`address`, `size`); the bridge chunks larger dumps |
+| `/api/memory/search` | POST | Search committed memory for a byte pattern with `??` wildcards (`pattern`, `region`: all/executable/writable, `max_matches` ≤ 2000) |
 | `/api/disassemble` | POST | Disassemble at address |
 
 ### Memory Allocation (NEW - Phase 3)
@@ -437,50 +440,47 @@ Response:
 
 ```
 src/engines/dynamic/x64dbg/
-├── (see docs/x64dbg-architecture.md)  # Detailed architecture documentation
-├── pipe_protocol.h        # Shared IPC protocol definitions
+├── pipe_protocol.h          # Shared pipe constants (name, max message size)
+├── bridge.py                # Python HTTP client used by the MCP tools
+├── commands.py              # High-level command wrappers over the bridge
 ├── plugin/
-│   ├── CMakeLists.txt     # Dual-target build (plugin + server)
-│   ├── plugin.h           # Plugin interface
-│   ├── plugin_new.cpp     # Minimal plugin stub (~200 lines)
-│   ├── plugin.cpp         # Old in-process version (deprecated)
-│   ├── http_server.cpp/.h # HTTP server (deprecated)
-│   ├── commands.cpp/.h    # Command handlers
-│   └── debugger_state.cpp/.h  # State management
+│   ├── CMakeLists.txt       # Dual-target build (plugin DLL + server EXE), hardened
+│   ├── plugin.h             # Plugin interface
+│   ├── plugin.cpp           # The plugin: spawns the server, owns the named pipe,
+│   │                        #   dispatches each request to a Handle* function, and
+│   │                        #   runs the server watchdog
+│   ├── event_system.h/.cpp  # Debug-event queue
 └── server/
-    └── main.cpp           # HTTP server executable (separate process)
+    ├── main.cpp             # HTTP server executable (separate process)
+    ├── listener_policy.h    # Bind / allow-list policy (loopback, TLS, Host/Origin)
+    ├── schannel_tls.h       # Optional Schannel TLS
+    └── activity_log.h       # JSONL activity log
 ```
 
-**Active Files** (External Process Architecture):
-- `plugin_new.cpp` - Spawns server, handles Named Pipe
-- `server/main.cpp` - HTTP server with Named Pipe client
-- `pipe_protocol.h` - Shared protocol definitions
-
-**Deprecated Files** (Old In-Process Architecture):
-- `plugin.cpp` - Old monolithic plugin
-- `http_server.cpp/.h` - In-process HTTP server (caused crashes)
+There are no deprecated in-tree files: `plugin.cpp` is the plugin, and the HTTP
+server lives out-of-process in `server/main.cpp`. The in-process server that
+caused the loader-lock/DEP crashes was removed, not kept alongside.
 
 ### Adding New Endpoints
 
-1. **Declare handler** in `commands.h`:
-```cpp
-std::string MyNewCommand(const std::string& jsonBody);
-```
+A request flows MCP tool -> `bridge.py` -> `server/main.cpp` (HTTP) -> named
+pipe -> `plugin.cpp` (the x64dbg SDK call). Adding one touches both C++ files
+and the two Python layers:
 
-2. **Implement handler** in `commands.cpp`:
-```cpp
-std::string MyNewCommand(const std::string& jsonBody) {
-    return Json::Object({
-        {"success", Json::Bool(true)},
-        {"result", Json::String("data")}
-    });
-}
-```
+1. **Request type** - add a value to the `RequestType` enum in `plugin.cpp`
+   (and mirror the shared subset in `pipe_protocol.h` if relevant).
+2. **Handler** - add a `HandleXxx(const std::string& request)` in `plugin.cpp`
+   that returns `BuildJsonResponse(...)`, and a `case` for it in the pipe
+   dispatch switch.
+3. **Route** - map the URL to the request-type number in
+   `server/main.cpp`'s path table.
+4. **Bridge** - add a method to `bridge.py` that calls `self._request("/api/...")`.
+5. **Tool** - expose it as an `op` on the relevant grouped tool in
+   `src/tools/dynamic_tools.py`, and add a test.
 
-3. **Register endpoint** in `Commands::RegisterAll()`:
-```cpp
-HttpServer::RegisterEndpoint("/api/my_command", MyNewCommand);
-```
+Any command string a handler forwards to `DbgCmdExec` must also pass the
+fail-closed allowlists (see Security below); setting execution breakpoints and
+launching are handled by dedicated request types, not the command endpoint.
 
 ### Debugging the Plugin
 
@@ -520,10 +520,22 @@ Script::Module::GetMainModulePath(buffer);
 
 ## Security Considerations
 
-- **Local only**: HTTP server binds to `127.0.0.1` (localhost)
-- **No authentication**: Assumes trusted local environment
-- **Input validation**: Validate all addresses and sizes
-- **Memory safety**: Careful with buffer operations
+- **Authentication**: every endpoint, including `/health`, requires a bearer
+  token. The plugin generates it and writes it to `%TEMP%\x64dbg_mcp_token.txt`
+  (or it is supplied via `OBSIDIAN_AUTH_TOKEN`); the bridge reads the same token.
+- **Loopback by default**: the server binds `127.0.0.1`. A non-loopback bind is
+  refused without TLS, and a wildcard bind is refused outright
+  (`server/listener_policy.h`).
+- **Header screening**: `Host` and `Origin` are validated on every request, so a
+  web page cannot drive the local port via DNS-rebinding/CSRF.
+- **Named pipe**: a user-only DACL, `PIPE_REJECT_REMOTE_CLIENTS`, and a peer-PID
+  check that must match the server the plugin spawned.
+- **Command allowlists**: raw commands pass three fail-closed allowlists (tool,
+  bridge, plugin), each `;`-separated segment validated; the sample is never
+  launched.
+
+See [docs/security.md](../../../../../docs/security.md) for the full model and
+the code that enforces each point.
 
 ## Troubleshooting
 

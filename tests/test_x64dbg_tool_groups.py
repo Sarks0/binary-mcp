@@ -90,7 +90,8 @@ class TestGroupedSurface:
 
     def test_operation_count_is_preserved(self, registered):
         _, ops = registered
-        assert sum(len(group) for group in ops.values()) == 159
+        # 159 original ops + session.health (one-call surface diagnostic).
+        assert sum(len(group) for group in ops.values()) == 160
 
     def test_no_implementation_is_mapped_twice(self, registered):
         _, ops = registered

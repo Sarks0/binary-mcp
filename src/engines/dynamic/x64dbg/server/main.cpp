@@ -667,7 +667,7 @@ static std::string HandleHTTPRequestInner(const std::string& request) {
     // Map endpoint URL to request type number
     int requestType = -1;
 
-    // P0 Handlers (Implemented)
+    // Core debugger state and execution
     if (path == "/api/status") {
         requestType = 1;  // GET_STATE
     } else if (path == "/api/registers") {
@@ -683,7 +683,7 @@ static std::string HandleHTTPRequestInner(const std::string& request) {
     } else if (path == "/api/breakpoint/set") {
         requestType = 20;  // SET_BREAKPOINT
 
-    // Core Functionality (Not Yet Implemented)
+    // Core Functionality
     } else if (path == "/api/command") {
         requestType = 16;  // EXECUTE_COMMAND
     } else if (path == "/api/load") {
@@ -697,7 +697,7 @@ static std::string HandleHTTPRequestInner(const std::string& request) {
     } else if (path == "/api/register/set") {
         requestType = 6;  // SET_REGISTER
 
-    // Breakpoints (Not Yet Implemented)
+    // Breakpoints
     } else if (path == "/api/breakpoint/delete") {
         requestType = 21;  // DELETE_BREAKPOINT
     } else if (path == "/api/breakpoint/list") {
@@ -709,7 +709,7 @@ static std::string HandleHTTPRequestInner(const std::string& request) {
     } else if (path == "/api/breakpoint/memory/delete") {
         requestType = 32;  // DELETE_MEMORY_BREAKPOINT
 
-    // Analysis Tools (Not Yet Implemented)
+    // Analysis Tools
     } else if (path == "/api/disassemble") {
         requestType = 7;  // DISASSEMBLE
     } else if (path == "/api/stack") {
@@ -723,7 +723,7 @@ static std::string HandleHTTPRequestInner(const std::string& request) {
     } else if (path == "/api/evaluate") {
         requestType = 41;  // EVALUATE_EXPRESSION
 
-    // Memory Tools (Not Yet Implemented)
+    // Memory Tools
     } else if (path == "/api/memory/map") {
         requestType = 50;  // GET_MEMORY_MAP
     } else if (path == "/api/memory/info") {
@@ -733,19 +733,19 @@ static std::string HandleHTTPRequestInner(const std::string& request) {
     } else if (path == "/api/memory/search") {
         requestType = 53;  // SEARCH_MEMORY
 
-    // Module Tools (Not Yet Implemented)
+    // Module Tools
     } else if (path == "/api/module/imports") {
         requestType = 60;  // GET_MODULE_IMPORTS
     } else if (path == "/api/module/exports") {
         requestType = 61;  // GET_MODULE_EXPORTS
 
-    // Comments (Not Yet Implemented)
+    // Comments
     } else if (path == "/api/comment/set") {
         requestType = 70;  // SET_COMMENT
     } else if (path == "/api/comment/get") {
         requestType = 71;  // GET_COMMENT
 
-    // Advanced Control (Not Yet Implemented)
+    // Advanced Control
     } else if (path == "/api/skip") {
         requestType = 80;  // SKIP_INSTRUCTION
     } else if (path == "/api/run_until_return") {
@@ -772,6 +772,8 @@ static std::string HandleHTTPRequestInner(const std::string& request) {
         requestType = 101;  // CLEAR_EVENTS
     } else if (path == "/api/events/status") {
         requestType = 102;  // GET_EVENT_STATUS
+    } else if (path == "/api/health") {
+        requestType = 103;  // GET_HEALTH (rich; distinct from the static GET /health)
 
     // Memory Allocation (Phase 3)
     } else if (path == "/api/memory/alloc") {

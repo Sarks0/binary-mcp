@@ -6,6 +6,7 @@ Communicates with the x64dbg native plugin via HTTP API.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import re
@@ -38,6 +39,14 @@ logger = logging.getLogger(__name__)
 
 # Security: Maximum size for memory dumps (100MB) to prevent memory exhaustion
 MAX_DUMP_SIZE = 100 * 1024 * 1024
+
+# Bytes per /api/memory/dump request. Must not exceed DUMP_CHUNK_MAX in
+# plugin.cpp: the hex-encoded reply has to fit in one 1 MB pipe message.
+DUMP_CHUNK_SIZE = 256 * 1024
+
+# SEARCH_TIME_LIMIT_MS in plugin.cpp, in seconds: how long one memory search
+# may run before the plugin stops and returns what it has.
+SEARCH_TIME_LIMIT_S = 90
 
 
 # x64dbg command-string structure (audit findings F-9 / F-16)
@@ -766,7 +775,12 @@ class X64DbgBridge(Debugger):
         except Exception as e:
             raise RuntimeError(f"Failed to read authentication token: {e}")
 
-    def _request(self, endpoint: str, data: dict[str, Any] | None = None) -> dict[str, Any]:
+    def _request(
+        self,
+        endpoint: str,
+        data: dict[str, Any] | None = None,
+        raise_on_api_error: bool = True,
+    ) -> dict[str, Any]:
         """
         Make HTTP request to plugin API with comprehensive error logging.
 
@@ -898,7 +912,15 @@ class X64DbgBridge(Debugger):
                     traceback_str=traceback.format_exc()
                 )
 
-                raise structured_api_error
+                # Some endpoints report an expected non-success outcome in the
+                # body rather than a fault -- /api/wait/paused returns a
+                # structured timeout with current_state, and /api/run reports a
+                # debuggee that would not resume. Those callers pass
+                # raise_on_api_error=False so they receive the body instead of
+                # an opaque exception (operator report X64M-03). Transport and
+                # HTTP errors still raise via raise_for_status above.
+                if raise_on_api_error:
+                    raise structured_api_error
 
             return result
 
@@ -988,6 +1010,21 @@ class X64DbgBridge(Debugger):
             )
         finally:
             self.timeout = previous_timeout
+
+    @contextlib.contextmanager
+    def _http_timeout_at_least(self, seconds: float):
+        """
+        Raise the HTTP timeout to at least ``seconds`` for the enclosed calls.
+
+        For requests the plugin deliberately holds open (waits, memory search);
+        everything else keeps the normal, shorter timeout.
+        """
+        previous = self.timeout
+        self.timeout = max(previous, seconds)
+        try:
+            yield
+        finally:
+            self.timeout = previous
 
     def disconnect(self) -> None:
         """Disconnect from x64dbg plugin."""
@@ -1256,28 +1293,57 @@ class X64DbgBridge(Debugger):
         )
         return True
 
-    def run(self) -> DebuggerState:
+    def run(self) -> dict[str, Any]:
         """
         Start or resume execution.
 
-        Returns:
-            New debugger state
-        """
-        result = self._request("/api/run")
-        state_str = result.get("state", "running")
-        logger.info(f"Debugger running - state: {state_str}")
-        return self._parse_state(state_str)
+        The plugin confirms the resume took effect instead of reporting a
+        blind success, so a debuggee that would not resume comes back as
+        ``resumed=False`` rather than a false success (operator report
+        X64M-02).
 
-    def pause(self) -> bool:
+        Returns:
+            Dictionary with ``resumed`` (bool), ``state``, ``is_running``,
+            ``address`` and a human ``message``.
+        """
+        result = self._request("/api/run", raise_on_api_error=False)
+        # The plugin folds "ran and re-paused at a breakpoint" into
+        # success=True; it only sends success=False when nothing moved.
+        resumed = bool(result.get("success", True))
+        state_str = result.get("state", "running" if resumed else "paused")
+        logger.info(f"Debugger run -> resumed={resumed}, state={state_str}")
+        return {
+            "resumed": resumed,
+            "state": state_str,
+            "is_running": result.get("is_running"),
+            "address": result.get("current_address", "unknown"),
+            "message": result.get("message")
+            or result.get("error")
+            or ("Execution resumed" if resumed else "Debuggee did not resume"),
+        }
+
+    def pause(self) -> dict[str, Any]:
         """
         Pause execution.
 
+        The plugin confirms the debuggee actually halted (X64M-02).
+
         Returns:
-            True if paused successfully
+            Dictionary with ``paused`` (bool), ``state``, ``is_running``,
+            ``address`` and a human ``message``.
         """
-        self._request("/api/pause")
-        logger.info("Debugger paused")
-        return True
+        result = self._request("/api/pause", raise_on_api_error=False)
+        paused = bool(result.get("success", True))
+        logger.info(f"Debugger pause -> paused={paused}")
+        return {
+            "paused": paused,
+            "state": result.get("state", "paused" if paused else "running"),
+            "is_running": result.get("is_running"),
+            "address": result.get("current_address", "unknown"),
+            "message": result.get("message")
+            or result.get("error")
+            or ("Execution paused" if paused else "Debuggee is still running"),
+        }
 
     def step_into(self) -> dict[str, Any]:
         """
@@ -1762,6 +1828,11 @@ class X64DbgBridge(Debugger):
             "address": result.get("current_address", "unknown"),
             "binary_path": result.get("binary_path", ""),
             "state": result.get("state", "unknown"),
+            # The engine's real run state. Older plugin builds hardcoded
+            # "paused" and sent no is_running; there the field is absent and
+            # callers fall back to the state string.
+            "is_running": result.get("is_running"),
+            "thread_id": result.get("thread_id"),
             # Absent on plugin builds from before the version was reported.
             # None means "this build cannot say", which is itself the answer to
             # "am I running the rebuilt plugin?" -- do not fill it with a guess.
@@ -1796,9 +1867,15 @@ class X64DbgBridge(Debugger):
         except Exception:
             return False
 
-    def dump_memory(self, address: str, size: int, output_file: str) -> bool:
+    def dump_memory(self, address: str, size: int, output_file: str) -> dict[str, Any]:
         """
         Dump memory region to file.
+
+        The plugin returns at most DUMP_CHUNK_SIZE bytes per request (its reply
+        has to fit in one 1 MB pipe message once hex-encoded), so larger dumps
+        are fetched chunk by chunk and streamed to the file. Pages the debuggee
+        cannot read come back as zeros, keeping file offsets aligned with
+        addresses; their total is reported as ``unreadable_bytes``.
 
         Args:
             address: Start address (hex string)
@@ -1806,13 +1883,11 @@ class X64DbgBridge(Debugger):
             output_file: Path to save dumped memory
 
         Returns:
-            True if dump successful
+            Dictionary with ``output_file``, ``bytes_written`` and
+            ``unreadable_bytes``.
 
         Raises:
             ValueError: If size is invalid or exceeds maximum
-
-        Note:
-            Requires C++ plugin implementation of /api/memory/dump
         """
         # Security: Validate size to prevent memory exhaustion (defense-in-depth)
         if size <= 0:
@@ -1831,51 +1906,102 @@ class X64DbgBridge(Debugger):
         except (PathTraversalError, ValueError) as e:
             raise ValueError(f"Invalid output path: {e}")
 
-        address = self._normalize_address(address)
+        base = int(self._normalize_address(address), 16)
 
-        data = {
-            "address": address,
-            "size": size
+        written = 0
+        unreadable = 0
+        try:
+            with open(output_file, "wb") as f:
+                while written < size:
+                    chunk = min(DUMP_CHUNK_SIZE, size - written)
+                    result = self._request(
+                        "/api/memory/dump",
+                        {"address": f"{base + written:x}", "size": chunk},
+                    )
+                    chunk_bytes = bytes.fromhex(result.get("data", ""))
+                    if len(chunk_bytes) != chunk:
+                        raise RuntimeError(
+                            f"Plugin returned {len(chunk_bytes)} bytes for a "
+                            f"{chunk}-byte chunk at 0x{base + written:x}"
+                        )
+                    f.write(chunk_bytes)
+                    written += chunk
+                    unreadable += int(result.get("unreadable_bytes", 0))
+        except BaseException:
+            # A partial dump looks like a complete one to anything that opens
+            # it later; do not leave it behind.
+            Path(output_file).unlink(missing_ok=True)
+            raise
+
+        logger.info(
+            f"Dumped {written} bytes to {output_file} "
+            f"({unreadable} unreadable, zero-filled)"
+        )
+        return {
+            "output_file": output_file,
+            "bytes_written": written,
+            "unreadable_bytes": unreadable,
         }
 
-        result = self._request("/api/memory/dump", data)
-        hex_data = result.get("data", "")
+    _SEARCH_REGIONS = ("all", "executable", "writable")
 
-        # Convert hex string to bytes and write to file
-        memory_bytes = bytes.fromhex(hex_data)
-        with open(output_file, 'wb') as f:
-            f.write(memory_bytes)
-
-        logger.info(f"Dumped {len(memory_bytes)} bytes to {output_file}")
-        return True
-
-    def search_memory(self, pattern: str, memory_region: str = "all") -> list[dict[str, str]]:
+    def search_memory(
+        self,
+        pattern: str,
+        memory_region: str = "all",
+        max_matches: int = 1000,
+    ) -> dict[str, Any]:
         """
-        Search memory for byte pattern.
+        Search the debuggee's committed memory for a byte pattern.
 
         Args:
-            pattern: Hex pattern to search for (e.g., "90 90 90" or "909090")
-            memory_region: Region to search ("all", "executable", "writable")
+            pattern: Hex bytes, optionally spaced, with ``??`` wildcards
+                (e.g. "90 90 90", "E8 ?? ?? ?? ??", "4D5A")
+            memory_region: "all", "executable" or "writable"
+            max_matches: Stop after this many matches (plugin caps at 2000)
 
         Returns:
-            List of addresses where pattern was found
-
-        Note:
-            Requires C++ plugin implementation of /api/memory/search
+            Dictionary with ``matches`` (list of ``{"address", "context"}``),
+            ``count``, ``truncated``, ``stop_reason`` ("max_matches",
+            "time_limit" or ""), ``regions_scanned`` and ``bytes_scanned``.
         """
-        # Normalize pattern
-        hex_pattern = pattern.replace(" ", "").replace("0x", "")
+        region = memory_region.strip().lower()
+        if region not in self._SEARCH_REGIONS:
+            raise ValueError(
+                f"Invalid region '{memory_region}': use one of "
+                f"{', '.join(self._SEARCH_REGIONS)}"
+            )
+
+        hex_pattern = re.sub(r"0x", "", pattern, flags=re.IGNORECASE)
+        hex_pattern = re.sub(r"\s+", "", hex_pattern)
+        if not hex_pattern or not re.fullmatch(r"(?:[0-9A-Fa-f?]{2})+", hex_pattern):
+            raise ValueError(
+                f"Invalid pattern '{pattern}': expected hex byte pairs, "
+                "optionally with ?? wildcards"
+            )
+        if set(hex_pattern) <= {"?"}:
+            raise ValueError("Pattern must contain at least one non-wildcard byte")
 
         data = {
             "pattern": hex_pattern,
-            "region": memory_region
+            "region": region,
+            "max_matches": max_matches,
         }
 
-        result = self._request("/api/memory/search", data)
-        matches = result.get("matches", [])
+        # The plugin may scan for up to SEARCH_TIME_LIMIT_S before answering.
+        with self._http_timeout_at_least(SEARCH_TIME_LIMIT_S + 30):
+            result = self._request("/api/memory/search", data)
 
+        matches = result.get("matches", [])
         logger.debug(f"Found {len(matches)} matches for pattern {pattern}")
-        return matches
+        return {
+            "matches": matches,
+            "count": result.get("count", len(matches)),
+            "truncated": bool(result.get("truncated", False)),
+            "stop_reason": result.get("stop_reason", ""),
+            "regions_scanned": result.get("regions_scanned", 0),
+            "bytes_scanned": result.get("bytes_scanned", 0),
+        }
 
     def get_memory_map(self) -> list[dict[str, Any]]:
         """
@@ -3226,7 +3352,17 @@ class X64DbgBridge(Debugger):
                 print(f"Timeout after {result['elapsed_ms']}ms")
         """
         data = {"timeout": timeout}
-        result = self._request("/api/wait/paused", data)
+        # The plugin holds the reply until it pauses or `timeout` passes, so
+        # the HTTP read must outlast the wait or a long wait fails client-side.
+        #
+        # A timeout comes back as a structured body with success=False and a
+        # current_state/elapsed_ms. raise_on_api_error=False keeps that body
+        # intact instead of turning the normal "not paused yet" outcome into an
+        # opaque exception that hid current_state from the caller (X64M-03).
+        with self._http_timeout_at_least(timeout / 1000 + 10):
+            result = self._request(
+                "/api/wait/paused", data, raise_on_api_error=False
+            )
         return result
 
     def wait_until_running(self, timeout: int = 10000) -> dict[str, Any]:
@@ -3354,6 +3490,23 @@ class X64DbgBridge(Debugger):
                 - next_event_id: Next event ID
         """
         return self._request("/api/events/status")
+
+    def get_health(self) -> dict[str, Any]:
+        """
+        One-call liveness and state snapshot of the whole surface.
+
+        A successful reply proves the plugin is alive and the pipe is
+        connected; the body also carries the server PID, whether the watchdog
+        is running, and the real debugger state (running/paused, cip, tid). A
+        transport failure here is itself the diagnosis -- the caller reports it
+        as a degraded surface rather than treating it as a hard error.
+
+        Returns:
+            Dictionary with plugin_alive, pipe_connected, server_pid,
+            watchdog_active, debugging, is_running, state, current_address,
+            thread_id and event_queue_size.
+        """
+        return self._request("/api/health")
 
     def poll_for_event(
         self,

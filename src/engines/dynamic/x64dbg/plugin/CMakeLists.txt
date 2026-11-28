@@ -4,6 +4,26 @@ project(obsidian VERSION 1.0.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Link-time optimization support probe (used for Release builds in
+# obsidian_harden below). Checked once; if the toolchain cannot do it the
+# property is simply not set rather than failing configuration.
+include(CheckIPOSupported)
+check_ipo_supported(RESULT OBSIDIAN_IPO_OK OUTPUT OBSIDIAN_IPO_MSG)
+if(NOT OBSIDIAN_IPO_OK)
+    message(STATUS "LTCG not available: ${OBSIDIAN_IPO_MSG}")
+endif()
+
+# Two hardening flags are opt-in because they can fail a build on a toolchain
+# that is otherwise fine, and CI compiles with warnings-as-errors:
+#   * /Qspectre needs the Spectre-mitigated VC runtime libs installed, or the
+#     build fails MSB8040.
+#   * /sdl elevates a set of security warnings to errors, which can trip
+#     warnings-as-errors on code that was clean before.
+# Enable them once the target toolchain is known to carry the Spectre libs and
+# the tree builds clean under /sdl.
+option(OBSIDIAN_HARDEN_SPECTRE "Add /Qspectre (needs the Spectre-mitigated VC runtime libs)" OFF)
+option(OBSIDIAN_HARDEN_SDL "Add /sdl (extra security checks; may elevate warnings to errors)" OFF)
+
 # x64dbg plugin SDK path
 set(X64DBG_SDK_PATH "${CMAKE_SOURCE_DIR}/../../../../../extern/x64dbg_sdk" CACHE PATH "Path to x64dbg plugin SDK")
 
@@ -23,6 +43,72 @@ else()
 endif()
 
 message(STATUS "Building for ${ARCH_BITS} architecture")
+
+# Security hardening + optimization, applied per target.
+#
+# Rationale and the source check that settles the scary questions are in
+# research_notes/x64dbg plugin hardening/binary_hardening.md. The load-bearing
+# facts: x64dbg itself sets no CFG StrictMode, so Control Flow Guard on the
+# plugin DLL protects its own indirect calls and cannot make the host refuse to
+# load it; the CET shadow stack is a process property owned by the host EXE, so
+# /CETCOMPAT belongs on obsidian_server.exe (our own process) and NOT on a
+# plugin loaded by a non-CET host; /INTEGRITYCHECK is deliberately never used on
+# the plugin because it would make x64dbg's loader reject the module on an
+# analyst VM with an untrusted certificate chain.
+#
+# is_executable: TRUE for obsidian_server.exe, FALSE for the plugin DLL.
+function(obsidian_harden target is_executable)
+    if(NOT MSVC)
+        return()
+    endif()
+
+    # Compiler: Control Flow Guard instrumentation, plus function-level linking
+    # (/Gy) which EH Continuation Guard and /OPT:ICF both require. /GS (stack
+    # cookies) is already on by MSVC default.
+    target_compile_options(${target} PRIVATE /guard:cf /Gy)
+
+    # Linker: pair /GUARD:CF with the compiler flag and assert ASLR + DEP
+    # explicitly so a BinSkim/winchecksec audit can prove them. CFG and LTCG
+    # both require non-incremental linking.
+    target_link_options(${target} PRIVATE
+        /GUARD:CF /DYNAMICBASE /NXCOMPAT /INCREMENTAL:NO
+    )
+
+    if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+        # 64-bit only: high-entropy ASLR and EH Continuation Guard (pairs with
+        # CFG). These are ignored or invalid on x86.
+        target_compile_options(${target} PRIVATE /guard:ehcont)
+        target_link_options(${target} PRIVATE /HIGHENTROPYVA /GUARD:EHCONT)
+        if(is_executable)
+            # Hardware shadow stack. Our own EXE, so enabling it is a real ROP
+            # defense; on the plugin it would be moot (host drives CET) and
+            # potentially harmful, so it is gated to the executable.
+            target_link_options(${target} PRIVATE /CETCOMPAT)
+        endif()
+    else()
+        # x86: mark safe exception handlers (x64 handlers are implicitly safe).
+        target_link_options(${target} PRIVATE /SAFESEH)
+    endif()
+
+    if(OBSIDIAN_HARDEN_SPECTRE)
+        target_compile_options(${target} PRIVATE /Qspectre)
+    endif()
+    if(OBSIDIAN_HARDEN_SDL)
+        target_compile_options(${target} PRIVATE /sdl)
+    endif()
+
+    # Release: link-time code generation (performance, and it lets the
+    # optimizer elide redundant CFG checks) plus dead-code and identical-COMDAT
+    # folding. LTCG only where the toolchain supports it.
+    if(OBSIDIAN_IPO_OK)
+        set_property(TARGET ${target} PROPERTY
+            INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+    endif()
+    target_link_options(${target} PRIVATE
+        $<$<CONFIG:Release>:/OPT:REF>
+        $<$<CONFIG:Release>:/OPT:ICF>
+    )
+endfunction()
 
 # TARGET 1: Plugin DLL (minimal stub)
 
@@ -99,6 +185,9 @@ if(MSVC)
     message(STATUS "Plugin: Using DYNAMIC runtime library (/MD)")
 endif()
 
+# Harden the plugin DLL (is_executable = FALSE: no CET).
+obsidian_harden(obsidian FALSE)
+
 # TARGET 2: HTTP Server Executable (separate process)
 
 set(SERVER_SOURCES
@@ -154,6 +243,9 @@ if(MSVC)
     set_property(TARGET obsidian_server PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
     message(STATUS "Server: Using STATIC runtime library (/MT) - no VC++ Redist required")
 endif()
+
+# Harden the server EXE (is_executable = TRUE: also gets the CET shadow stack).
+obsidian_harden(obsidian_server TRUE)
 
 # Installation
 
